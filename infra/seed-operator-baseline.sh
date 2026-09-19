@@ -9,14 +9,23 @@
 # up. (It used to write audit_log directly via sqlx; that end-around
 # was removed, which is why the old pre-API call sites in the docker
 # init container + the bare-metal quickstart broke.) This script is the
-# converged post-API seed step, called by the quickstart launchers just
-# before the brewery tenant seed — the platform-baseline sibling of
+# converged post-API seed step, called by the quickstart launchers
+# (tenant-launch.sh: BEFORE the generic `boss tenant publish` and the
+# brewery's engine seed — backlog 1ee28274, 2026-09-18; it ran after
+# the publish from 0d2d7daa until the fresh playground could not open
+# the publish's first platform Job for want of the platform-admin this
+# seed creates) — the platform-baseline sibling of
 # infra/seed-brewery-tenant.sh, and the same thing reset-to-baseline
 # does inline at its step 6.
 #
 # Binaries are PATH-resolved: docker ships them in /usr/local/bin;
 # bare-metal callers prepend target/release. Idempotent (409 on a
-# duplicate id = skip); retries while the people-api finishes binding.
+# duplicate id = skip; the bootstrap-admin injection reads the
+# tenant's declared roster at BOSS_TENANT_DIR/seeds/employees.json —
+# the binary takes the variable from the environment — and skips the
+# row a tenant declares itself, then asks the people API who holds the
+# email before injecting); retries while the people-api finishes
+# binding.
 
 set -euo pipefail
 

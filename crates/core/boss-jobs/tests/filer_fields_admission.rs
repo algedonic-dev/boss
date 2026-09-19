@@ -88,6 +88,7 @@ fn app_with(specs: Vec<WorkflowSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -239,6 +240,7 @@ async fn executor_fields_stay_create_legal_and_required_at_done() {
                     required: true,
                     filled_by: FilledBy::Executor,
                     item_keys: Vec::new(),
+                    covers: None,
                 }],
                 ..Default::default()
             },

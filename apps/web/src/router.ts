@@ -40,6 +40,8 @@ export type Route =
   /// IT feedback triage board.
   | { kind: 'systemFeedback' }
   | { kind: 'systemBacklog' }
+  /// The codebase trend — the daily metrics packets, rendered.
+  | { kind: 'systemCodebase' }
   /// Full-page step surface. A step whose UX is a plugin gets the
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
@@ -95,6 +97,11 @@ export type Route =
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
   | { kind: 'systemYard' }
+  /** One of the yard's floors — the Train Yard focused on a region's
+   *  panel (design 0524fc95, car 2). `region` is the map's name for it
+   *  (dock, gates, track, shed, arrivals, garage); the page maps it to
+   *  a selection and an unknown name falls back to the track. */
+  | { kind: 'systemYardFloor'; region: string }
   /// Yard status — where each train sits and why, computed from the SoR
   /// (the-cluster-is-the-system.md Phase 0). An Operate tab, beside the
   /// live-pipeline dashboards it belongs with.
@@ -103,6 +110,9 @@ export type Route =
   /// per-kind dashboard is unique, not a duplicate rendering).
   | { kind: 'systemFleet' }
   | { kind: 'systemMarshallingYard' }
+  /// The Receiving Yard — the INBOUND third: what asked the platform for
+  /// something and is still standing, before the Marshalling Yard sorts it.
+  | { kind: 'systemReceivingYard' }
   /// The Crew Board — who is building what, right now. The MIDDLE third
   /// of the operator surface (backlog 04c5bbc0): the Train Yard shows
   /// landed work, the Marshalling Yard shows work waiting, and the
@@ -114,6 +124,9 @@ export type Route =
   /// the closed ones rendered as a durable archive.
   | { kind: 'incidents' }
   | { kind: 'systemSubjects' }
+  /// The Drift tab on Registry — the newest maintenance-protocol-drift
+  /// packet rendered (4ae9969e, car 2 of 8f4e9cc0).
+  | { kind: 'systemRegistryDrift' }
   | { kind: 'experiments' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
@@ -123,6 +136,11 @@ export type Route =
   | { kind: 'myCalendar' }
   | { kind: 'schedule' }
   | { kind: 'exec' }
+  /// A department's own jobs — its in / working / out over the
+  /// packets whose workflow declares it (cc76f755). The code is Class
+  /// registry data, so the route carries it; the router knows no
+  /// department by name.
+  | { kind: 'department'; code: string }
   | { kind: 'warehouse' }
   | { kind: 'catalog' }
   | { kind: 'device'; sku: string }
@@ -153,8 +171,14 @@ export function parseRoute(pathname: string): Route {
   // falls through to the catch-all like any other unknown route.
   if (raw === '/it' || raw.startsWith('/it/')) {
     const p = raw.slice('/it'.length) || '/';
-    // 1. The landing is the yard — delivery truth first.
+    // 1. The landing is the yard — delivery truth first. Since design
+    //    0524fc95 (car 2) the landing is the yard's MAP: eight region
+    //    cards, each a door to a floor. The floors are the yard page
+    //    itself, opened on a region's panel, at /it/yard[/<region>].
     if (p === '/') return { kind: 'systemYard' };
+    if (p === '/yard') return { kind: 'systemYardFloor', region: 'track' };
+    const floorM = p.match(/^\/yard\/([a-z-]+)$/);
+    if (floorM) return { kind: 'systemYardFloor', region: floorM[1]! };
     // 2. Operate — incidents lead; audit/perf/atlas/bottlenecks tabs.
     if (p === '/operate') return { kind: 'incidents' };
     if (p === '/operate/audit') return { kind: 'systemMonitoringEvents' };
@@ -162,6 +186,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/operate/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/operate/bottlenecks') return { kind: 'systemFleet' };
     if (p === '/operate/marshalling') return { kind: 'systemMarshallingYard' };
+    if (p === '/operate/receiving') return { kind: 'systemReceivingYard' };
     if (p === '/operate/yard-status') return { kind: 'systemYardStatus' };
     if (p === '/operate/conductor') return { kind: 'systemMonitoringConductor' };
     // 3. Registry — one surface over the registry family.
@@ -179,11 +204,15 @@ export function parseRoute(pathname: string): Route {
     if (p === '/registry/dispatcher') return { kind: 'dispatcherRules' };
     if (p === '/registry/policy') return { kind: 'policy' };
     if (p === '/registry/subjects') return { kind: 'systemSubjects' };
+    if (p === '/registry/drift') return { kind: 'systemRegistryDrift' };
     // 4. Design — reviews lead; experiments and feedback tabs.
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/design/experiments') return { kind: 'experiments' };
     if (p === '/design/feedback') return { kind: 'systemFeedback' };
     if (p === '/design/backlog') return { kind: 'systemBacklog' };
+    // /it/codebase is the row (9827c699); the old Design-tab path still
+    // answers so a bookmark or a packet link keeps working.
+    if (p === '/codebase' || p === '/design/codebase') return { kind: 'systemCodebase' };
     // 5. Estate. 6. KB. Plus the unlisted auth door.
     // 5a. The Crew Board — a sidebar row of its own, not an Operate tab.
     // David's decision on 04c5bbc0 (2026-09-11) overrode the proposal to
@@ -249,6 +278,8 @@ export function parseRoute(pathname: string): Route {
   if (p === '/calendar') return { kind: 'calendar' };
   if (p === '/service/schedule') return { kind: 'schedule' };
   if (p === '/exec') return { kind: 'exec' };
+  const deptM = p.match(/^\/departments\/([^/]+)$/);
+  if (deptM) return { kind: 'department', code: decodeURIComponent(deptM[1]!) };
   if (p === '/warehouse') return { kind: 'warehouse' };
   if (p === '/catalog') return { kind: 'catalog' };
   const catM = p.match(/^\/catalog\/(.+)$/);

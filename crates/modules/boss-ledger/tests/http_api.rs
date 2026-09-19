@@ -2793,3 +2793,391 @@ async fn keg_deposit_same_day_settlement_survives_a_rebuild() {
     assert_eq!(debits, 12_000, "liability drains on rebuild too");
     assert_eq!(credits, 12_000);
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/ledger/accounts/batch — the tenant declares its chart
+// (backlog 41af5195; design 18cf4272).
+// ---------------------------------------------------------------------------
+
+/// The seed identity `boss tenant publish` signs with: operator tier.
+async fn post_as_operator(router: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let user_json = json!({
+        "id": "automation:tenant-seed",
+        "role": "platform-admin",
+        "access_tier": "operator",
+        "territory_account_ids": [],
+        "direct_report_ids": [],
+        "department": "platform",
+    })
+    .to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .header("x-boss-user", user_json)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let parsed: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    (status, parsed)
+}
+
+fn chart_state(db: &TestDb) -> LedgerApiState {
+    LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+        policy: None,
+    }
+}
+
+/// The real tenant's chart meets the starter chart: 1000 and 1010 are
+/// starter codes (Cash, Cash in Transit) and are KEPT under the
+/// starter's names with the difference named; the rest insert. One
+/// `ledger.account.declared` per INSERTED row on the outbox, none for
+/// a kept row; a second run inserts and records nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_difference() {
+    let db = TestDb::new().await;
+    let rows = json!([
+        {"code": "1000", "name": "Bank", "kind": "asset", "normal_balance": "debit"},
+        {"code": "1010", "name": "Cash in Transit", "kind": "asset", "normal_balance": "debit"},
+        {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
+        {"code": "4310", "name": "Hosting revenue — managed", "kind": "revenue", "normal_balance": "credit", "parent": "4300"},
+    ]);
+    let (status, body) = post_as_operator(
+        router(chart_state(&db)),
+        "/api/ledger/accounts/batch",
+        rows.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["received"], 4);
+    assert_eq!(body["inserted"], 2);
+    assert_eq!(
+        body["kept"],
+        json!([
+            {"code": "1000", "differs": ["name"]},
+            {"code": "1010", "differs": []},
+        ]),
+        "{body}"
+    );
+
+    // Kept as the starter registered it; the child hangs off its parent.
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM gl_accounts WHERE code = '1000'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name, "Cash",
+        "a colliding code is the SAME account, never renamed"
+    );
+    let (parent_code,): (String,) = sqlx::query_as(
+        "SELECT p.code FROM gl_accounts a JOIN gl_accounts p ON p.id = a.parent_id WHERE a.code = '4310'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(parent_code, "4300");
+
+    // The GET door lists the tenant's rows beside the starter's.
+    let (status, listed) = get(router(chart_state(&db)), "/api/ledger/accounts").await;
+    assert_eq!(status, StatusCode::OK);
+    let codes: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"4300") && codes.contains(&"4310"),
+        "{codes:?}"
+    );
+    // ... and each row names its parent by CODE, the declaration's own
+    // key, so `boss tenant export` can write the chart back in the
+    // file's shape (backlog e618f3ac: the list carried only `parent_id`'s
+    // absence — no parent at all — until 2026-09-18).
+    let by_code = |code: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["code"] == code)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(by_code("4310")["parent"], "4300");
+    assert_eq!(by_code("4300")["parent"], Value::Null);
+
+    // One fact per inserted row, staged on the outbox with the row and
+    // declared_by = the actor the request signed with.
+    let staged: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT source, payload FROM event_outbox WHERE kind = $1 ORDER BY payload->>'code'",
+    )
+    .bind(boss_ledger::chart::ACCOUNT_DECLARED)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(staged.len(), 2, "{staged:?}");
+    assert!(staged.iter().all(|(s, _)| s == "ledger"), "{staged:?}");
+    assert_eq!(staged[0].1["code"], "4300");
+    assert_eq!(staged[0].1["name"], "Hosting revenue");
+    assert_eq!(staged[0].1["normal_balance"], "credit");
+    assert_eq!(staged[0].1["declared_by"], "automation:tenant-seed");
+    assert_eq!(staged[1].1["code"], "4310");
+    assert_eq!(staged[1].1["parent"], "4300");
+
+    // Idempotent: the second run keeps all four and stages nothing.
+    let (status, body) =
+        post_as_operator(router(chart_state(&db)), "/api/ledger/accounts/batch", rows).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["inserted"], 0);
+    assert_eq!(body["kept"].as_array().unwrap().len(), 4);
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM event_outbox WHERE kind = $1")
+        .bind(boss_ledger::chart::ACCOUNT_DECLARED)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "a kept row records nothing");
+}
+
+/// A row outside the table's constraints is refused as a caller error
+/// naming the row — before ANY row is written, so a batch with one bad
+/// row lands nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn chart_batch_refuses_an_invalid_kind_by_row_and_writes_nothing() {
+    let db = TestDb::new().await;
+    let rows = json!([
+        {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
+        {"code": "6200", "name": "Infrastructure", "kind": "cost", "normal_balance": "debit"},
+    ]);
+    let (status, body) =
+        post_as_operator(router(chart_state(&db)), "/api/ledger/accounts/batch", rows).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let text = body.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("account #2 (6200)") && text.contains("cost"),
+        "{text}"
+    );
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM gl_accounts WHERE code = '4300'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "the good row before the bad one did not land");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
+    let db = TestDb::new().await;
+    let rows = json!([
+        {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
+    ]);
+    let (status, _) = post_as_auditor(
+        router(chart_state(&db)),
+        "/api/ledger/accounts/batch",
+        rows.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = post_json(router(chart_state(&db)), "/api/ledger/accounts/batch", rows).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM gl_accounts WHERE code = '4300'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/ledger/tax/batch — the tenant declares its tax regime
+// (backlog 7f163e58): kinds insert-if-absent by kind, rates by state,
+// one fact per INSERTED row, a kept row named with what differs, and
+// an account the chart does not hold refused by name before any row
+// is written. GET /api/ledger/tax-kinds and /api/ledger/sales-tax-rates
+// read the registry back in the declaration's shape.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tax_batch_inserts_if_absent_keeps_a_migration_row_and_names_the_difference() {
+    let db = TestDb::new().await;
+    // The starter chart holds 2300 and 6500; 2900 is the tenant's own.
+    let (status, _) = post_as_operator(
+        router(chart_state(&db)),
+        "/api/ledger/accounts/batch",
+        json!([{"code": "2900", "name": "Other tax payable", "kind": "liability", "normal_balance": "credit"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json!({
+        "tax_kind": [
+            // The migration's row, declared with a different basis: kept, named.
+            {"kind": "sales", "liability_account": "2300", "derive_basis": "monthly-sales-tax"},
+            {"kind": "gross-receipts", "liability_account": "2900", "expense_account": "6500"},
+        ],
+        "sales_tax_rate": [
+            {"state": "CA", "jurisdiction": "US-CA", "rate_bps": 700},
+            {"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400},
+        ]
+    });
+    let (status, out) = post_as_operator(
+        router(chart_state(&db)),
+        "/api/ledger/tax/batch",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["received"], 4);
+    assert_eq!(out["inserted"], 2);
+    assert_eq!(
+        out["kept"],
+        json!([
+            {"id": "tax_kind sales", "differs": ["derive_basis"]},
+            {"id": "sales_tax_rate CA", "differs": ["rate_bps"]},
+        ]),
+        "{out}"
+    );
+
+    // Kept as the migration registered it.
+    let (basis,): (Option<String>,) =
+        sqlx::query_as("SELECT derive_basis FROM tax_kinds WHERE kind = 'sales'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(basis.as_deref(), Some("period-sales-tax"));
+    let (bps,): (i32,) =
+        sqlx::query_as("SELECT rate_bps FROM sales_tax_rate_by_state WHERE state = 'CA'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(bps, 725);
+
+    // The GET doors list the tenant's rows beside the migration's, in
+    // the declaration's shape.
+    let (status, kinds) = get(router(chart_state(&db)), "/api/ledger/tax-kinds").await;
+    assert_eq!(status, StatusCode::OK);
+    let gross = kinds
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kind"] == "gross-receipts")
+        .unwrap_or_else(|| panic!("{kinds}"));
+    assert_eq!(gross["liability_account"], "2900");
+    assert_eq!(gross["expense_account"], "6500");
+    assert!(gross.get("derive_basis").is_none(), "{gross}");
+    let (status, rates) = get(router(chart_state(&db)), "/api/ledger/sales-tax-rates").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        rates
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["state"] == "HI" && r["rate_bps"] == 400),
+        "{rates}"
+    );
+
+    // One fact per inserted row, on the outbox, declared_by the actor.
+    let staged: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT kind, payload FROM event_outbox WHERE kind = $1 OR kind = $2 ORDER BY kind",
+    )
+    .bind(boss_ledger::tax_registry::TAX_KIND_DECLARED)
+    .bind(boss_ledger::tax_registry::SALES_TAX_RATE_DECLARED)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(staged.len(), 2, "{staged:?}");
+    assert_eq!(staged[0].0, "ledger.sales_tax_rate.declared");
+    assert_eq!(staged[0].1["state"], "HI");
+    assert_eq!(staged[0].1["declared_by"], "automation:tenant-seed");
+    assert_eq!(staged[1].0, "ledger.tax_kind.declared");
+    assert_eq!(staged[1].1["kind"], "gross-receipts");
+    assert_eq!(staged[1].1["declared_by"], "automation:tenant-seed");
+
+    // Idempotent: the second run keeps all four and stages nothing.
+    let (status, out) =
+        post_as_operator(router(chart_state(&db)), "/api/ledger/tax/batch", body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["inserted"], 0);
+    assert_eq!(out["kept"].as_array().unwrap().len(), 4);
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM event_outbox WHERE kind LIKE 'ledger.%.declared'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        n, 3,
+        "the chart's one row + the tax batch's two; a kept row records nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tax_batch_refuses_an_account_the_chart_does_not_hold_and_writes_nothing() {
+    let db = TestDb::new().await;
+    let body = json!({
+        "tax_kind": [
+            {"kind": "gross-receipts", "liability_account": "2900"},
+        ],
+        "sales_tax_rate": [{"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400}]
+    });
+    let (status, out) =
+        post_as_operator(router(chart_state(&db)), "/api/ledger/tax/batch", body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    let text = out.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("gross-receipts") && text.contains("`2900`") && text.contains("chart"),
+        "{text}"
+    );
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM sales_tax_rate_by_state WHERE state = 'HI'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "the good rate beside the bad kind did not land");
+
+    // The door's own validation, by row.
+    let (status, out) = post_as_operator(
+        router(chart_state(&db)),
+        "/api/ledger/tax/batch",
+        json!({"sales_tax_rate": [{"state": "hi", "jurisdiction": "US-HI", "rate_bps": 400}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert!(
+        out.as_str()
+            .unwrap_or_default()
+            .contains("sales tax rate #1 (hi)"),
+        "{out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tax_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
+    let db = TestDb::new().await;
+    let body =
+        json!({"sales_tax_rate": [{"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400}]});
+    let (status, _) = post_as_auditor(
+        router(chart_state(&db)),
+        "/api/ledger/tax/batch",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = post_json(router(chart_state(&db)), "/api/ledger/tax/batch", body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM sales_tax_rate_by_state WHERE state = 'HI'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0);
+}

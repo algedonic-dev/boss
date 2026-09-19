@@ -7,12 +7,17 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 mod api;
+mod inquiries;
 mod perf;
 mod plugin_files;
 mod proxy;
+mod public_reads;
 mod role_headers;
+mod site;
+mod sponsors;
 mod static_files;
 mod timing;
+mod visits;
 
 use perf::PerfCollector;
 
@@ -182,7 +187,23 @@ async fn main() -> Result<()> {
         perf: Arc::new(PerfCollector::new()),
     });
 
-    let app = build_router(local_auth_state.clone());
+    // The sessionless read set — the tenant's declaration, resolved
+    // once, refused by name if it names a door the gateway does not
+    // offer (public_reads.rs). Absent → none. A manifest that exists
+    // but does not parse is refused here too, naming the file and
+    // toml's line (api.rs `load_tenant_toml`, backlog 4f1ba1f9): the
+    // configuration the router is built from, not a boot check.
+    let declared = api::load_tenant_toml()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("reading the tenant manifest")?
+        .map(|t| t.gateway.public_reads)
+        .unwrap_or_default();
+    let public_reads = public_reads::PublicReads::resolve(&declared)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("resolving [gateway] public_reads from the tenant manifest")?;
+    tracing::info!(public_reads = ?public_reads.paths(), "sessionless reads declared by the tenant");
+
+    let app = build_router(local_auth_state.clone(), &public_reads);
 
     let app = app
         .layer(axum::middleware::from_fn_with_state(
@@ -195,9 +216,55 @@ async fn main() -> Result<()> {
         ))
         .with_state(state);
 
+    // The tenant site (site.rs), OUTERMOST: a request whose Host names
+    // the instance's site hostname is answered from the site directory
+    // before the session middleware above ever sees it. No site
+    // configured → the router unchanged.
+    // The roll (sponsors.rs) rides every site: its one computed
+    // document, read from the jobs upstream as the gateway itself.
+    // So does the page-view recorder (visits.rs): one www-visits
+    // reading per HTML page served, drained to the jobs upstream in
+    // batches by its own task — on with the site, off without one.
+    let visits_sensor = visits::Recorder::sensor_from_env();
+    let site = site::Site::from_env().map(|s| {
+        s.with_sponsors(sponsors::SponsorRoll::new(Arc::new(
+            sponsors::JobsApi::from_env(),
+        )))
+        .with_visits(visits::Recorder::spawn(
+            Arc::new(visits::JobsApi::from_env()),
+            visits_sensor.clone(),
+        ))
+    });
+    match &site {
+        Some(s) => tracing::info!(
+            site_host = %s.host(),
+            visits_sensor = %visits_sensor,
+            "tenant site mounted; page views recorded"
+        ),
+        None => tracing::info!("no tenant site (BOSS_SITE_HOST / BOSS_SITE_DIR unset)"),
+    }
+    let site_host = site.as_ref().map(|s| s.host().to_string());
+    let app = site::mount(app, site);
+
+    // The site's one write (inquiries.rs), outside the read-only site
+    // layer: `POST /site/inquiries` on the site host opens a
+    // receive-an-inquiry packet through the accounts and jobs doors.
+    // No site → no door.
+    let door = site_host
+        .as_deref()
+        .map(|host| inquiries::Door::new(host, Arc::new(inquiries::Services::from_env())));
+    let app = inquiries::mount(app, door);
+
     tracing::info!(listen = %listen, static_dir = %static_files::static_dir(), "boss-gateway starting");
     let listener = TcpListener::bind(&listen).await?;
-    axum::serve(listener, app).await?;
+    // With the peer address on every request: the inquiry door's
+    // rate limit falls back to it when the tunnel sends no
+    // `CF-Connecting-IP`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -215,7 +282,10 @@ async fn main() -> Result<()> {
 ///
 /// Middleware layers and `.with_state` stay in `main`: they need the
 /// live `AppState`, and tests supply their own.
-fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<Arc<AppState>> {
+fn build_router(
+    local_auth_state: Option<Arc<LocalAuthState>>,
+    public_reads: &public_reads::PublicReads,
+) -> axum::Router<Arc<AppState>> {
     let app = axum::Router::new()
         .route("/health", axum::routing::get(handle_health))
         .route("/api/session", axum::routing::get(api::session))
@@ -300,45 +370,15 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/dispatcher/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
         )
-        // Public read surface for the unauth landing page (`/`) —
-        // live fetch from /api/workflows/{kind}, no session
-        // required. Strict path matchers win over `/api/jobs/{*rest}`
-        // in axum's router.
-        // Writes / step metadata / detail routes stay auth-gated.
-        // The expanded list — `/api/jobs/summary` and the bare
-        // `/api/jobs` GET — turns the landing page from a static
-        // workflow-diagram preview into a live window into the
-        // brewery's running operating company.
-        //
-        // For `/api/workflows` and `/api/workflows/{*rest}` we
-        // pin GET to the public handler so the landing page can
-        // read without auth, AND chain the other methods through
-        // the auth-gated handler on the same MethodRouter — without
-        // the chain, POST/PUT/DELETE would return 405 because axum
-        // picks the most-specific matching path first and these
-        // strict matchers shadow the wildcard `/api/jobs/{*rest}`.
-        .route(
-            "/api/workflows",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
-                .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
-                .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
-                .delete(|s, r| proxy::handle(s, r, &proxy::JOBS)),
-        )
-        .route(
-            "/api/workflows/{*rest}",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
-                .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
-                .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
-                .delete(|s, r| proxy::handle(s, r, &proxy::JOBS)),
-        )
-        .route(
-            "/api/jobs/summary",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS)),
-        )
-        .route(
-            "/api/jobs/live",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS)),
-        )
+        // `/api/workflows[/*]`, `/api/jobs/summary` and `/api/jobs/live`
+        // are registered by `public_reads::mount` below — the reads
+        // an instance MAY answer without a session, each routed by
+        // the tenant's `[gateway] public_reads` declaration (design
+        // 11e60367 Q1, backlog b4afd7b9). They were pinned to
+        // `handle_public` here as demo landing-page reads, which
+        // made every instance's — including the company's — public.
+        // Strict matchers, so they win over `/api/jobs/{*rest}`
+        // either way.
         .route(
             "/api/jobs",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
@@ -401,6 +441,21 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/agent-runs/{*rest}",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // Surface opens (backlog 628f182b): the SPA posts each route
+        // open here and the Codebase page reads the roll-up. The write
+        // is credited to the SESSION — this proxy strips any
+        // `x-boss-user` the client sent and signs the cookie's, which is
+        // the whole reason the record is trustworthy. Session-gated
+        // like /api/jobs; the sweep under `{*rest}` is refused upstream
+        // for a user-tier session. Bare + sub-path, per /api/assets.
+        .route(
+            "/api/surface-opens",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/surface-opens/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // Scheduling routes live alongside jobs on the same upstream.
         // Auth-gated like the rest of /api/*.
         .route(
@@ -459,15 +514,9 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/people/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::PEOPLE)),
         )
-        // Public companion to /api/events/tail — unauth, restricted
-        // to a curated demo-friendly topic set. Powers the public
-        // landing page's right-rail event tail. Upstream (boss-events)
-        // returns the curated allow-list shape; the gateway just
-        // proxies unauth so visitors see it.
-        .route(
-            "/api/events/public-tail",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::EVENTS)),
-        )
+        // `/api/events/public-tail` — the curated companion to
+        // /api/events/tail — is registered by `public_reads::mount`
+        // below, sessionless only where the tenant declares it.
         .route(
             "/api/events/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::EVENTS)),
@@ -598,20 +647,23 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/calendar/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CALENDAR)),
         )
-        // Observability aggregator — the SPA's Operations page reads
-        // /api/snapshot for the cybernetics rollup. Two strict matchers
-        // (no trailing path) plus a wildcard for any future sub-paths.
-        // Public read so the unauth landing-page mode keeps working;
-        // there's no per-tenant data here yet, just synthetic agent
-        // activity from the demo_agents config (or real cross-VM
-        // rollups when [[vms]] is populated).
+        // Observability aggregator — /api/snapshot is the cybernetics
+        // rollup (and /api/snapshot/capabilities the startup census).
+        // Two strict matchers (no trailing path) plus a wildcard for
+        // sub-paths. Session-gated like every other read since
+        // 2026-09-17 (backlog b03f38de): it was public for the unauth
+        // landing-page mode, which no longer reads it — nothing in
+        // apps/web fetches this path — so the pin's only effect in
+        // prod was to answer anyone with the demo-agents figures and
+        // `demo_mode: true`. Pinned by
+        // `the_snapshot_refuses_a_sessionless_caller` below.
         .route(
             "/api/snapshot",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::OBSERVABILITY)),
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
         )
         .route(
             "/api/snapshot/{*rest}",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::OBSERVABILITY)),
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
         )
         // The IT Monitoring page probes /api/<port-name>/health for
         // every PORTS entry. boss-observability exposes its routes
@@ -663,6 +715,9 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         .route("/", axum::routing::get(static_files::handle))
         .route("/{*rest}", axum::routing::get(static_files::handle));
 
+    // The declarable sessionless reads, by this instance's manifest.
+    let app = public_reads::mount(app, public_reads);
+
     // Local-auth routes — only mounted when BOSS_AUTH_PROVIDER=
     // local-auth. These handlers carry their own state (the
     // CredentialStore + the session_key + an http client for
@@ -695,7 +750,12 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
                 )
                 .route(
                     "/api/auth/passkey/credentials",
-                    axum::routing::get(boss_gateway::passkey::credentials_list).with_state(pk),
+                    axum::routing::get(boss_gateway::passkey::credentials_list)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/credentials/{credential_id}",
+                    axum::routing::delete(boss_gateway::passkey::credentials_remove).with_state(pk),
                 )
             }
             Err(e) => {
@@ -955,16 +1015,45 @@ mod routing_tests {
     const MISS: &str = "no such API route";
 
     fn app_with(local_auth: Option<Arc<LocalAuthState>>) -> axum::Router {
+        app_declaring(local_auth, &public_reads::PublicReads::none())
+    }
+
+    fn app_declaring(
+        local_auth: Option<Arc<LocalAuthState>>,
+        reads: &public_reads::PublicReads,
+    ) -> axum::Router {
         let state = Arc::new(AppState {
             session_key: vec![0u8; 32],
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
         });
-        build_router(local_auth).with_state(state)
+        build_router(local_auth, reads).with_state(state)
     }
 
+    /// The default: a manifest that declares nothing.
     fn app() -> axum::Router {
         app_with(None)
+    }
+
+    /// The reads the demo tenant's landing page makes without a
+    /// session — what its seeds/tenant.toml declares, plus the sub-path
+    /// the `/api/workflows` family covers.
+    const DEMO_PUBLIC: &[&str] = &[
+        "/api/workflows",
+        "/api/workflows/some-kind",
+        "/api/jobs/summary",
+        "/api/jobs/live",
+        "/api/events/public-tail",
+    ];
+
+    fn demo() -> public_reads::PublicReads {
+        public_reads::PublicReads::resolve(&[
+            "/api/workflows".to_string(),
+            "/api/jobs/summary".to_string(),
+            "/api/jobs/live".to_string(),
+            "/api/events/public-tail".to_string(),
+        ])
+        .expect("the demo tenant's four are declarable")
     }
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String) {
@@ -1067,6 +1156,13 @@ mod routing_tests {
             // time from an empty panel.
             "/api/agent-runs",
             "/api/agent-runs/cost",
+            // Surface opens (628f182b): the SPA's write and the
+            // Codebase page's roll-up read, both on the jobs upstream.
+            // Listed on the day they shipped, so the fourth instance
+            // of the stations shape is refused here rather than found
+            // from a panel that never fills.
+            "/api/surface-opens",
+            "/api/surface-opens/rollup",
         ];
         for path in REAL {
             let (_, body) = get(app(), path).await;
@@ -1074,6 +1170,76 @@ mod routing_tests {
                 !body.contains(MISS),
                 "`{path}` fell through to the /api catch-all — the catch-all is \
                  shadowing a real service route"
+            );
+        }
+    }
+
+    /// The four former landing-page pins, on an instance whose manifest
+    /// declares none of them (design 11e60367 Q1, backlog b4afd7b9):
+    /// each answers 401 like any other /api route — the session gate
+    /// refuses before anything is forwarded — and none has fallen
+    /// through to the catch-all. This is the company's instance: its
+    /// tenant.toml carries no `[gateway] public_reads`, and prod needs
+    /// no edit for the default to be none.
+    #[tokio::test]
+    async fn an_undeclared_public_read_refuses_a_sessionless_caller() {
+        for path in DEMO_PUBLIC {
+            let (status, body) = get(app(), path).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "`{path}` must be session-gated when the tenant declares nothing: {body}"
+            );
+            assert!(
+                !body.contains(MISS),
+                "`{path}` reached the /api catch-all: {body}"
+            );
+        }
+    }
+
+    /// The same reads on an instance that declares them — the demo
+    /// tenant, whose landing page at `/` is served without a session and reads
+    /// these to render. The discriminator is the same as everywhere in
+    /// this module: the gated proxy answers 401 before it forwards,
+    /// the public one forwards (and, with no upstream in a unit test,
+    /// answers whatever the forward answers — never 401).
+    #[tokio::test]
+    async fn a_declared_public_read_skips_the_session_gate() {
+        for path in DEMO_PUBLIC {
+            let (status, body) = get(app_declaring(None, &demo()), path).await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "`{path}` is declared public by the demo tenant and must not be session-gated: {body}"
+            );
+            assert!(
+                !body.contains(MISS),
+                "`{path}` reached the /api catch-all: {body}"
+            );
+        }
+    }
+
+    /// A declaration opens a GET, never a write: on the demo tenant, a
+    /// POST to `/api/workflows` still meets the session gate (and not
+    /// a 405 — the strict matcher chains the other methods through
+    /// the gated proxy).
+    #[tokio::test]
+    async fn a_declaration_never_makes_a_write_public() {
+        for path in ["/api/workflows", "/api/workflows/some-kind"] {
+            let resp = app_declaring(None, &demo())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST `{path}` must be session-gated on every instance"
             );
         }
     }
@@ -1089,6 +1255,28 @@ mod routing_tests {
     #[tokio::test]
     async fn the_agent_run_reads_refuse_a_sessionless_caller() {
         for path in ["/api/agent-runs", "/api/agent-runs/cost"] {
+            let (status, body) = get(app(), path).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "`{path}` must be gated by the session proxy: {body}"
+            );
+            assert!(
+                !body.contains(MISS),
+                "`{path}` reached the /api catch-all: {body}"
+            );
+        }
+    }
+
+    /// The observability snapshot needs a session like every other read
+    /// (backlog b03f38de, 2026-09-17). It was pinned public for the
+    /// unauth landing-page mode, which no longer reads it — no SPA
+    /// consumer is left — so the pin's only effect in prod was to hand
+    /// anyone the demo-agents figures with `demo_mode: true`. Same
+    /// discriminator as the agent-run reads: 401 before any upstream.
+    #[tokio::test]
+    async fn the_snapshot_refuses_a_sessionless_caller() {
+        for path in ["/api/snapshot", "/api/snapshot/capabilities"] {
             let (status, body) = get(app(), path).await;
             assert_eq!(
                 status,

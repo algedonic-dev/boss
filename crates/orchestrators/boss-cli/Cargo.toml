@@ -18,6 +18,29 @@ boss-nats = { path = "../../core/boss-nats" }
 # calling the SAME `StationPredicate::matches` the /queue endpoint
 # calls — a census that disagrees with the queue is worse than none.
 boss-jobs = { path = "../../core/boss-jobs" }
+boss-people-client = { path = "../../modules/boss-people-client" }
+# `boss tenant check` validates a tenant directory with the SAME
+# types the product reads it with (fcc1d57b): the classes batch row,
+# the people row, the policy grant loader, and the manifest in
+# boss-core. A second parser would be a second contract.
+boss-classes = { path = "../../core/boss-classes" }
+# The locations batch row, for the same reason (1ec8312a): check reads
+# `seeds/locations.toml` with the door's own `LocationInput`.
+boss-locations = { path = "../../core/boss-locations" }
+boss-people = { path = "../../modules/boss-people" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+# `boss tenant publish` sends a tenant through the SAME doors the two
+# engines' prepare compose (ee7b62bb): boss-policy's bootstrap and
+# boss-jobs' bootstrap are those doors. default-features=false keeps
+# the policy service's sqlx/axum tree out of the CLI, as the engines do.
+boss-policy = { path = "../../core/boss-policy", default-features = false }
+# `seeds/rules.toml` (backlog 458971ef) is read with the dispatcher's
+# OWN rule parser and validated by the same `authoring::validate` the
+# publish door applies, and its handler names are checked against the
+# same `cascade::handler_emits` roster the product's rules are — a
+# second parser would be a second contract.
+boss-dispatcher = { path = "../../core/boss-dispatcher" }
+toml = { workspace = true }
 boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
@@ -36,7 +59,15 @@ uuid = { workspace = true }
 # publish-request bundles travel as base64 in packet metadata
 # (workflow publish-request v1, packet 0b1b32f9).
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+# `boss job list --where` sends a JSON document as ONE query value
+# (`metadata=`); percent-encoding it is what keeps a `&` or `+` in a
+# value from splitting the query (backlog 58eef0f5). Same crate
+# boss-classes-client already uses for path segments.
+percent-encoding = "2"
+# `boss ops` applies the allowlist's arg patterns at the terminal, the
+# same regexes ops-runner.sh applies on the host (3d6daea9).
+regex = "1"
 
 [dev-dependencies]
 # dock_preview's tests prove trial_merge against REAL git in a scratch
@@ -56,6 +87,12 @@ boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
 # adapter production runs, not a lookalike. axum is test-only: the
 # shipped binary is an HTTP client of that surface, never a server.
 axum = { workspace = true }
+# The fresh-instance seed proof (backlog 0d2d7daa) serves the REAL
+# people and policy routers over one empty TestDb and runs the shipped
+# `boss tenant publish` and the operator-baseline seed against them.
+# Test-only, like axum: the shipped binary never serves either.
+boss-people = { path = "../../modules/boss-people", features = ["postgres"] }
+boss-policy = { path = "../../core/boss-policy", features = ["postgres"] }
 
 [lints]
 workspace = true

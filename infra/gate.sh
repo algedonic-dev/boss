@@ -16,11 +16,18 @@
 #                                 # tree. Skips cargo entirely when
 #                                 # nothing changed implies a crate —
 #                                 # 74 of 164 live branches are in that
-#                                 # class. Never used by CI.
+#                                 # class. A migration implies every
+#                                 # crate that stands up the schema.
+#                                 # Never used by CI.
 #   infra/gate.sh --self-test     # run the roster loop's own pin and
 #                                 # nothing else. It runs inside every
 #                                 # mode below too; this is the way to
 #                                 # read its verdict on its own.
+#   infra/gate.sh --roster        # print the pre-flight roster, one
+#                                 # `<name> <path>` per lint, and stop
+#   infra/gate.sh --exclusions    # print the lints the pre-flight
+#                                 # leaves out, `<path>\t<why>` each,
+#                                 # read off their own headers
 #   infra/gate.sh -p crate [...]  # car mode — cargo phases scoped to
 #                                 # the named crates (FULL suites, all
 #                                 # features); lints + fmt always run
@@ -36,6 +43,17 @@
 set -u
 
 cd "$(dirname "$0")/.."
+
+# The lint vocabulary, read from its one definition: `LINT_CANNOT_ANSWER`
+# (exit 3) is a lint saying "the machine could not answer", and
+# `check_lint` below turns it into a refusal rather than a red. Sourced
+# rather than spelled as a `3` here so the number cannot drift from the
+# lints that exit it (CLAUDE.md §9a).
+# shellcheck source=infra/lint/lib/git-answer.sh
+. infra/lint/lib/git-answer.sh || {
+    echo "gate.sh: infra/lint/lib/git-answer.sh could not be read — without it the pre-flight cannot tell a lint that could not answer from one that failed. Refusing." >&2
+    exit 2
+}
 
 # Incremental compilation helps REPEATED local builds; a gate build is
 # cold and one-shot, so incremental only writes an incremental/ dir that
@@ -126,6 +144,7 @@ AUTO=0
 QUICK=0
 LINT=0
 ROSTER=0
+EXCLUSIONS=0
 SELFTEST=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -134,8 +153,9 @@ while [ $# -gt 0 ]; do
         --quick) QUICK=1; shift ;;
         --lint) LINT=1; shift ;;
         --roster) ROSTER=1; shift ;;
+        --exclusions) EXCLUSIONS=1; shift ;;
         --self-test) SELFTEST=1; shift ;;
-        *) echo "gate.sh: unknown arg: $1 (accepts -p <crate>, --auto, --quick, --lint, --roster and --self-test)" >&2; exit 2 ;;
+        *) echo "gate.sh: unknown arg: $1 (accepts -p <crate>, --auto, --quick, --lint, --roster, --exclusions and --self-test)" >&2; exit 2 ;;
     esac
 done
 # Alternatives, not companions: --auto derives exactly what -p states,
@@ -148,7 +168,162 @@ if [ "$AUTO" -eq 1 ] && [ ${#NAMED[@]} -gt 0 ]; then
 fi
 
 
-# DISK FLOOR, before anything compiles.
+# ---------------------------------------------------------------------
+# The pre-flight set: every check that needs no build
+# ---------------------------------------------------------------------
+# `cargo fmt -- --check` and the lint roster are repo-wide greps and
+# audits. Together they take ~17 SECONDS on a cold tree. They used to
+# run near the END of the gate, behind clippy, the full test suite and
+# the bun web suite.
+#
+# That ordering is not a bug — `check()` deliberately runs every check
+# even after one fails, "a red gate should report every failure it can
+# see, not make the author fix serially", and reordering saves a red
+# gate nothing because it runs everything regardless.
+#
+# The cost lands somewhere else: there was no way to run the cheap
+# checks WITHOUT the expensive ones. So the only way to find a
+# formatting slip was to spend a gate. On 2026-08-27 a car did exactly
+# that — 17 minutes of cluster time, a scheduled pod and a clone, to
+# learn that `cargo fmt` had been run on one crate and not another.
+# 17 seconds of local work, discovered 60x more slowly.
+#
+# Hence `--quick`, and hence this list existing ONCE. Two rosters would
+# drift (CLAUDE.md §9a) and would drift in the worst direction: a check
+# quietly missing from the local pre-flight still passes locally and
+# still reds a full gate, which is precisely the failure being fixed.
+#
+# The roster is the DIRECTORY. Until 2026-09-05 it was a hand-listed
+# array here, and every car that added a lint edited the same tail
+# line: four cars collided on it in one day, and the fourth was left
+# behind by train #218 ("conflict: infra/gate.sh"). That is the
+# manifest.txt lesson (CLAUDE.md §9a) one level up — a list holding no
+# information its source does not is a merge conflict waiting to
+# happen. Adding a lint is now dropping a file in infra/lint/; this
+# file does not change. The conductor's consist check reads the same
+# directory and asks THIS SCRIPT what to leave out (train/consist.rs
+# `gate_exclusions` runs `gate.sh --exclusions` in the assembled
+# tree), so the two readers agree by construction rather than by
+# being kept in step.
+#
+# What is NOT run here is declared BY THE LINT ITSELF, on one line of
+# its header:
+#
+#     # consist: skip — <what a bare tree cannot answer in seconds>
+#
+# The header, not anywhere in the file: the first line that is not a
+# comment ends it, so a lint that mentions the marker in its prose is
+# not excluded by it. The reason is required — a bare declaration is
+# refused by name, because an exemption nobody explained is one nobody
+# can later judge. Each declaring lint needs something a bare tree
+# cannot answer in seconds: a live database, a built workspace, a
+# package manager.
+#
+# WHY THE LINT DECLARES IT, rather than a list here. Until 2026-09-18
+# the exclusion set lived FIVE times — an array here, a hand copy in
+# boss-testing's gate_sh.rs, the conductor's compiled fallback in
+# delivery_policy.rs, the delivery-policy seed migration, and the live
+# registry row — with two pins holding two of the pairs and NOTHING
+# holding this array equal to what the conductor ran on (tech-debt
+# audit H9, backlog 6fa15484). A fact the lint's author already knows
+# when writing it (this needs psql; this needs a built binary) was
+# being retyped four times by four other people. Now the lint says it
+# once, this function reads it, `--exclusions` prints it, and every
+# other reader asks here. The set is pinned by gate_sh.rs against the
+# roster, both asked of this script rather than re-parsed from it.
+consist_exclusions() {
+    local listed path readable=()
+    # Only files awk can open: a lint it cannot read (a dangling
+    # symlink some car left) declares nothing, and the roster loop
+    # below reports it as a check that could not run — which is the
+    # honest verdict, where an awk refusal here would take the whole
+    # roster down over one name.
+    for path in $(LC_ALL=C ls infra/lint/*.sh); do
+        [ -r "$path" ] && readable+=("$path")
+    done
+    [ ${#readable[@]} -eq 0 ] && return 0
+    listed=$(LC_ALL=C awk '
+        FNR == 1 { header = 1; if (/^#!/) next }
+        !header { next }
+        /^[ \t]*$/ { next }
+        !/^#/ { header = 0; next }
+        sub(/^# consist: skip[ \t]*/, "") {
+            sub(/[ \t]+$/, "")
+            if (!sub(/^—[ \t]*/, "") || $0 == "") {
+                printf "gate.sh: %s declares a consist skip with no reason — the line is: # consist: skip — <why a bare tree cannot answer it>\n", FILENAME > "/dev/stderr"
+                bad = 1
+                next
+            }
+            print FILENAME "\t" $0
+        }
+        END { exit bad }
+    ' "${readable[@]}") || return 1
+    [ -n "$listed" ] && printf '%s\n' "$listed"
+    return 0
+}
+
+# FIRST on purpose: it says what this workspace cannot cover, which
+# frames every result below it. A green pre-flight on a machine with
+# no Postgres is 118 database-backed test targets unrun, and saying
+# so before the rest is the difference between confidence and a
+# gate failure eleven minutes later (design 775f0b35 Q3).
+PREFLIGHT_FIRST="infra/lint/workspace-declares-what-it-runs.sh"
+
+# One `<name> <path>` line per lint, in the order they run: the pinned
+# first, then the directory in C-locale order, so two hosts ask the
+# same questions in the same sequence. The excluded set cannot name a
+# file that does not exist any more — it is read off the files that
+# do — so the only roster entry that can be missing is the pinned one.
+#
+# `cargo-advisories` is the one lint allowed a network fetch: it is
+# report-only (always exits 0) and soft-skips when the tool or the
+# advisory DB is absent, so it cannot red a gate — only add a line.
+preflight_roster() {
+    local excluded path nl=$'\n'
+    excluded=$(consist_exclusions) || return 1
+    excluded=$(printf '%s\n' "$excluded" | cut -f1)
+    if [ ! -f "$PREFLIGHT_FIRST" ]; then
+        echo "gate.sh: the pre-flight roster names a lint that does not exist: $PREFLIGHT_FIRST" >&2
+        return 1
+    fi
+    echo "$(basename "$PREFLIGHT_FIRST" .sh) $PREFLIGHT_FIRST"
+    for path in $(LC_ALL=C ls infra/lint/*.sh); do
+        [ "$path" = "$PREFLIGHT_FIRST" ] && continue
+        case "${nl}${excluded}${nl}" in *"${nl}${path}${nl}"*) continue ;; esac
+        echo "$(basename "$path" .sh) $path"
+    done
+}
+
+# THE LISTINGS ANSWER BEFORE EVERY REFUSAL. `--roster` and `--exclusions`
+# read no tree and run no check: they list infra/lint/ and what its
+# headers declare, and the conductor's consist check asks the assembled
+# tree's gate.sh for exactly that. Until 2026-09-18 this dispatch sat
+# BELOW the disk floor, so at 9GB free on the conductor's volume
+# `gate.sh --exclusions` was refused with "9GB free, need 12GB.
+# Refusing to start." and the consist check recorded a failure it could
+# not judge (backlog 13700f6f; CLAUDE.md Diagnosis: an infrastructure
+# refusal is not a consist failure). The floor guards a gate RUN — a
+# build that fills the volume — not a question about the roster; and
+# the untracked-files refusal (`refuse_untracked_files`, the other
+# exit-2 before a check runs) is asked only by the pre-flight modes,
+# which certify a tree, where a listing certifies nothing. So the two
+# listings dispatch here, in one place, ahead of both — pinned by
+# gate_sh.rs `the_listings_answer_below_the_disk_floor`.
+if [ "$ROSTER" -eq 1 ]; then
+    preflight_roster
+    exit $?
+fi
+
+# `<path>\t<why>` per excluded lint, in directory order — the set the
+# roster above leaves out and the reason each lint gave. This is the
+# print the conductor's consist check and gate_sh.rs both read.
+if [ "$EXCLUSIONS" -eq 1 ]; then
+    consist_exclusions
+    exit $?
+fi
+
+# DISK FLOOR, before anything compiles — and after the listings above,
+# which compile nothing.
 #
 # On 2026-08-16 this box ran out of disk mid-`cargo build`. The failure
 # was not a build error: the volume filled, the tool harness could no
@@ -294,7 +469,7 @@ require_headroom "to start"
 #            test guarding the file being edited — which this very car
 #            would have done to itself.
 #            infra/lint/* ALSO implies boss-cli (added with backlog
-#            294bb7c9): train.rs's `the_roster_is_the_lint_directory
+#            294bb7c9): train/consist.rs's `the_roster_is_the_lint_directory
 #            _itself` reads infra/lint/ and asserts every lint the
 #            delivery policy excuses is STILL a file there, so deleting
 #            or renaming a lint reddens the conductor's consist check.
@@ -447,6 +622,25 @@ crates_from_paths() {
 #   boss-jobs' port defaults mention it in comments), and mapping those
 #   would compile three crates for a shell-script edit.
 #
+#   A PATH BEING JOINED is a path being read, wherever it sits. The
+#   two shapes above left one idiom uncounted: a `#[cfg(test)]` module
+#   under src/ reading `boss_testing::repo_root().join("docs/
+#   tenant-contract.md")` — repo-relative, so not escaping, and not in
+#   tests/. On 2026-09-19 train #470's car 4f1ba1f9 edited that doc
+#   without editing the CONTRACT it is held equal to; the pin lives in
+#   boss-cli's src/tenant.rs, the car derived boss-gateway alone, the
+#   train gate derived the same, and origin/main went red on the pin
+#   the first time anything ran it, striking the next car gated on top
+#   (backlog 1b52c278). Measured at #471: eight (path, crate) pairs sat
+#   outside the index this way (estate.toml, sor-ports.env,
+#   pod-build.env, as-gate-uid.sh, access.toml, tax.toml, the contract
+#   doc). What separates them from the prose the src/ restriction
+#   exists for is the call around the literal: `.join("…")` is a path
+#   being built, and a sentence never sits inside one. So a literal
+#   whose immediate prefix is `.join(` counts in src/ too — still
+#   subject to the existence test, so `dir.join("seeds/x.toml")` on a
+#   scratch base maps to nothing because no such file sits at the root.
+#
 # RESOLVED AGAINST TWO BASES because the two idioms differ:
 # `include_str!` is relative to the source FILE, while
 # `env!("CARGO_MANIFEST_DIR").join("../../../x")` is relative to the
@@ -459,10 +653,11 @@ crates_from_paths() {
 #
 #   infra/postgres/schema/** — boss-testing's build.rs compiles every
 #   migration in, and boss-jobs names one in a test, so this scan would
-#   map migrations to crates. It must not: `--auto` asks `schema_touched`
-#   separately and the unscoped `check "fixture"` below is what judges a
-#   schema change in every mode. Mapping it here would compile two crates
-#   per migration and answer a question the fixture already answers.
+#   map migrations to those TWO crates — an under-count, and a wrong
+#   shape: a migration is read by every crate that stands up the
+#   schema, not by the ones that mention it by path. `schema_readers`
+#   below derives that set, and `path_map` applies it to any change
+#   under this tree (backlog 4711828d).
 #
 #   docs/design/** — boss-jobs' subject_existence_pg.rs uses
 #   "docs/design/subject-identity-and-relationships.md" as a Subject ID,
@@ -513,13 +708,15 @@ file_input_index() {
             rest = $0
             while (match(rest, /"[^"]*"/)) {
                 spec = substr(rest, RSTART + 1, RLENGTH - 2)
+                joined = (substr(rest, 1, RSTART - 1) ~ /\.join\($/)
                 rest = substr(rest, RSTART + RLENGTH)
                 if (spec !~ /\//) continue
                 # A literal with whitespace in it is a sentence that
                 # mentions a path, not a path.
                 if (spec ~ /[[:space:]]/) continue
-                # Outside tests/, only an ESCAPING literal counts.
-                if (!intests && spec !~ /^\.\.\//) continue
+                # Outside tests/, only an ESCAPING literal counts —
+                # or one being `.join`ed onto a base (backlog 1b52c278).
+                if (!intests && !joined && spec !~ /^\.\.\//) continue
                 print resolve(dir, spec) " " crate
                 print resolve(root, spec) " " crate
             }
@@ -537,6 +734,70 @@ file_input_index() {
 # calls it a few dozen times.
 GATE_FILE_INPUTS="$(file_input_index)"
 
+# ---------------------------------------------------------------------
+# Crates that READ THE SCHEMA: derived from the tree, never listed here
+# ---------------------------------------------------------------------
+# A migration is a change to every crate whose tests stand the schema
+# up. On 2026-09-16 two cars each added a credentials-registry
+# migration; `--auto` scoped each to the crates whose FILES changed
+# (boss-dispatcher-handlers, boss-testing) and never ran boss-jobs,
+# whose credentials_pg.rs pins the seeded rows. Both gated green
+# (receipts 4c2f15c5, 719b6e61), the train gate ran boss-jobs on the
+# assembled tree, and all six cars aboard were struck (train 767cfb14,
+# gate-run 06995f6c; backlog 4711828d). Until then a migration-only car
+# ran "fixture + lints only": the fixture proves the schema APPLIES,
+# and nothing proved that what it seeds still agrees with the tests
+# that read it.
+#
+# THE PREDICATE IS THE CONSTRUCTOR, not a feature flag or a file name.
+# `boss_testing::TestDb::new` (and `new_without`) is the one call that
+# applies infra/postgres/schema/ to a fresh database, so a crate that
+# calls it anywhere in src/ or tests/ reads every migration. Measured
+# on 2026-09-16 against the alternatives: "declares a `postgres`
+# feature AND has tests/*_pg.rs" names 13 crates and drops
+# boss-dispatcher (no feature, stands up a TestDb in rules_wait_pg.rs)
+# and eleven others whose DB tests are named differently; the
+# constructor names 25 — which is the whole Pg-tested workspace, and
+# that is the honest answer, not a cost to optimise away. Correctness
+# over speed: a migration-only gate now runs those 25 crates instead of
+# none, ~2 minutes to a workspace-shaped run.
+#
+# Members come from `cargo metadata --no-deps` (~0.05 s, no resolution,
+# no network), so a crate outside the workspace cannot be named and a
+# `-p` it produces is one cargo can satisfy. The crate name is the
+# manifest's directory, the same convention `path_shapes` reads off
+# `crates/<tier>/<name>/`, and `scope_self_test` refuses a name that is
+# not a crate. ~0.12 s in total, once per invocation, in every mode —
+# `--quick` derives no scope and never reads it, but the cost is the
+# same either way and a conditional would be a second code path to
+# keep honest.
+schema_readers() {
+    local dir
+    cargo metadata --no-deps --format-version 1 2>/dev/null \
+        | grep -o '"manifest_path":"[^"]*/Cargo.toml"' \
+        | sed -e 's|^"manifest_path":"||' -e 's|/Cargo.toml"$||' \
+        | while read -r dir; do
+            if grep -rlq --include='*.rs' 'TestDb::new' "$dir/src" "$dir/tests" 2>/dev/null; then
+                basename "$dir"
+            fi
+        done | sort -u | tr '\n' ' '
+}
+GATE_SCHEMA_READERS="$(schema_readers)"
+GATE_SCHEMA_READERS="${GATE_SCHEMA_READERS% }"
+
+# The paths on stdin that are migrations, one per line. Empty when the
+# change touches none.
+schema_paths() {
+    grep -E '^infra/postgres/schema/' || true
+}
+
+# The schema half of the map: a change under infra/postgres/schema/
+# implies every reader. Reads the readers out of the environment for
+# the same reason `input_crates` does.
+schema_crates() {
+    if [ -n "$(schema_paths)" ]; then printf '%s\n' "${GATE_SCHEMA_READERS}"; fi
+}
+
 # The derived half of the map: which crates read the paths on stdin.
 input_crates() {
     awk -v idx="${GATE_FILE_INPUTS}" '
@@ -552,12 +813,14 @@ input_crates() {
 }
 
 path_map() {
-    # Stdin is read ONCE and handed to both halves: the hand-written
-    # shapes below, and the derivation above that reads the tree.
+    # Stdin is read ONCE and handed to all three parts: the hand-written
+    # shapes below, the file-input derivation above that reads the
+    # tree, and the schema readers.
     local paths
     paths="$(cat)"
     { printf '%s\n' "$paths" | path_shapes
       printf '%s\n' "$paths" | input_crates
+      printf '%s\n' "$paths" | schema_crates
     } | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
 }
 
@@ -573,7 +836,7 @@ path_shapes() {
            -e 's|^infra/lint/.*|boss-cli boss-testing|p' \
            -e 's|^\.forgejo/workflows/ci\.yml$|boss-testing|p' \
            -e 's|^infra/dispatcher/rules/[^/]*\.toml$|boss-brewery-engine boss-dispatcher|p' \
-           -e 's|^infra/platform/workflows/[^/]*\.toml$|boss-jobs|p' \
+           -e 's|^infra/platform/[^/]*/[^/]*\.toml$|boss-jobs|p' \
            -e 's|^examples/\([^/]*\)/seeds/workflows\.toml$|boss-jobs boss-\1-engine|p' \
            -e 's|^examples/\([^/]*\)/seeds/tenant\.toml$|boss-sim boss-\1-engine|p' \
            -e 's|^examples/\([^/]*\)/seeds/policy_rules\.toml$|boss-policy-client boss-\1-engine|p' \
@@ -582,7 +845,7 @@ path_shapes() {
 
 
 scope_self_test() {
-    local fails=0 label want got seeds tenant
+    local fails=0 label want got seeds tenant bundle_dir
     _case() {
         label="$1"; want="$2"; shift 2
         got=$(printf '%s\n' "$@" | path_map); got="${got% }"
@@ -612,8 +875,35 @@ scope_self_test() {
     # gate would not have run that lint at all.
     _case "a protocol-only car still has a crate" "boss-jobs" \
         "infra/platform/workflows/ship-a-change.toml"
+    # THE THIRD RE-PIN (backlog f532c345). The line above was written
+    # when infra/platform/ held one registry, and the shape it pinned
+    # named `workflows/`. On 2026-09-18 the bundle grew stations/ and
+    # step-plugins/ (H4 cars 1 and 3), each held equal to the migrations
+    # by a `*_bundle_is_the_migrations_pg.rs` pin in boss-jobs — and a
+    # row in either derived NO crate (measured on main at #452:
+    # stations/repair.toml -> [], step-plugins/sign-off.toml -> []), so
+    # a bundle-only car gated lints + fmt and never ran the pin. The
+    # three bundle cars gated boss-jobs only because each also changed
+    # Rust. Same hole as the tenant bundle two cases down, same fix: the
+    # shape is now `infra/platform/<registry>/*.toml` — the directory,
+    # not a list of names — and this loop walks the directory so a
+    # fourth registry is pinned the day it appears. A fictional row, not
+    # a real one, so the answer is the shape's alone and not the
+    # file-input index's.
+    for bundle_dir in infra/platform/*/; do
+        [ -d "$bundle_dir" ] || continue
+        bundle_dir="${bundle_dir%/}"
+        _case "a row in ${bundle_dir} implies boss-jobs" "boss-jobs" \
+            "${bundle_dir}/zz-a-scratch-row.toml"
+    done
+    # …and the bundle's prose does not: a README beside the rows is read
+    # by nobody a compile can reach, so it must not cost a boss-jobs
+    # build. The shape is keyed on `.toml`, and this is the case that
+    # keeps it so.
+    _case "a README in a platform bundle implies no crate" "" \
+        "infra/platform/stations/README.md"
     _case "two files, one crate" "boss-cli" \
-        "crates/orchestrators/boss-cli/src/train.rs" \
+        "crates/orchestrators/boss-cli/src/train/conductor.rs" \
         "crates/orchestrators/boss-cli/src/gate.rs"
     # The tier segment must not be mistaken for the crate name.
     _case "tier is not the crate" "boss-people" "crates/modules/boss-people/src/http.rs"
@@ -643,8 +933,11 @@ scope_self_test() {
     # engine parses it again in its layer-1 lint test — so a bundle-only
     # car that scoped to no crate ran neither, and a broken predicate or
     # a missing terminal would have gated GREEN on its way to the live
-    # registry.
-    _case "a tenant seed bundle still has a crate" "boss-brewery-engine boss-jobs" \
+    # registry. boss-testing since 2026-09-17 (backlog 18d6a6c9):
+    # the_step_type_registry_names_no_tenant_role.rs reads this bundle
+    # to hold the four steps that once relied on the platform's
+    # required_roles to their own authority_role.
+    _case "a tenant seed bundle still has a crate" "boss-brewery-engine boss-jobs boss-testing" \
         "examples/brewery/seeds/workflows.toml"
     # Derived from the directory, not a list of tenants: the
     # used-device-shop bundle declares 36 kinds and must be covered by
@@ -664,12 +957,16 @@ scope_self_test() {
         "examples/brewery/seeds/policy_rules.toml"
     # tenant.toml is boss-sim's parse fixture — seven of its unit tests
     # load this exact file, so a shape change there reddens the sim.
-    _case "a tenant manifest implies the sim that parses it" "boss-brewery-engine boss-sim" \
+    # boss-testing since 2026-09-17 (backlog b03f38de):
+    # generate_configs_sh.rs runs the config generator against this
+    # manifest and asserts the brewery's id is what turns [demo_agents]
+    # on, so an id change there must run that test too.
+    _case "a tenant manifest implies the sim that parses it" "boss-brewery-engine boss-sim boss-testing" \
         "examples/brewery/seeds/tenant.toml"
     # A bundle edit beside a boss-jobs edit must name boss-jobs ONCE:
     # these rules emit more than one crate, so the split has to happen
     # before the dedupe.
-    _case "a crate named twice is named once" "boss-brewery-engine boss-jobs" \
+    _case "a crate named twice is named once" "boss-brewery-engine boss-jobs boss-testing" \
         "examples/brewery/seeds/workflows.toml" \
         "crates/core/boss-jobs/src/seed_loader.rs"
     # What is deliberately NOT mapped: everything in examples/ outside a
@@ -683,20 +980,17 @@ scope_self_test() {
     # paths nobody got round to listing.
     _case "other infra implies no crate" "" \
         "infra/forge/locomotive.sh" "infra/forge/cluster-watchdog.sh"
-    # THE RE-PIN (backlog 294bb7c9). Until this car, the case above also
+    # THE RE-PIN (backlog 294bb7c9). Until that car, the case above also
     # asserted `infra/deploy-services.sh` implies no crate — and that
-    # answer was WRONG, not merely incomplete. boss-ports `include_str!`s
-    # that script and reads its fallback arrays out of the text
-    # (`solo_fallback_matches_the_registry`,
-    # `paired_fallback_matches_the_registry`), so it is a COMPILE INPUT
-    # of boss-ports and boss-testing's file_store_config_sh.rs reads it
-    # too. CLAUDE.md §9a's own table lists this pair — consequence "two
-    # services silently absent from a deploy", fix "pinned by a test" —
-    # so the gate was scoping out the documented mechanism for a defect
-    # that has already bitten. Nothing was missing; the wrong answer was
-    # asserted, which is why it needed un-asserting rather than adding to.
-    _case "a script a crate include_str!s is that crate's compile input" \
-        "boss-ports boss-testing" "infra/deploy-services.sh"
+    # answer was WRONG, not merely incomplete: boss-ports `include_str!`d
+    # that script, so it was a COMPILE INPUT, and the gate was scoping
+    # out the documented mechanism for a defect that had already bitten.
+    # Nothing was missing; the wrong answer was asserted, which is why it
+    # needed un-asserting rather than adding to. The fixture moved to
+    # host-absent-tools.txt when the bare-metal deploy script was deleted
+    # (2026-09-18, e109bd71); boss-jobs' probe.rs `include_str!`s it.
+    _case "a file a crate include_str!s is that crate's compile input" \
+        "boss-jobs" "infra/forge/host-absent-tools.txt"
     # A build script's read is a compile input too: boss-dispatcher-
     # handlers' build.rs `.expect`s infra/estate/observe-lib.sh to exist
     # and compiles its text in.
@@ -721,12 +1015,31 @@ scope_self_test() {
     # nobody had to notice this one.
     _case "a runbook a test reads implies that crate" "boss-testing" \
         "docs/runbooks/dev-environment-bootstrap.md"
+    # THE FOURTH RE-PIN (backlog 1b52c278). The runbook above is read
+    # from boss-testing's tests/, which the index always counted; this
+    # doc is read from a #[cfg(test)] module under boss-cli's src/
+    # through repo_root().join(...), which it did not — so a docs-only
+    # car derived NO crate, gated lints-only, and train #470 landed a
+    # doc edit that reddened main on the equality pin holding the doc's
+    # table to CONTRACT. The `.join(` prefix is what counts it now.
+    _case "a doc a crate's own test module reads by repo path implies that crate" \
+        "boss-cli" "docs/tenant-contract.md"
     _case "the web app implies no crate" "" "apps/web/src/me/MePage.svelte"
-    # Schema files imply no CRATE, which is why --auto asks
-    # `schema_touched` separately rather than reading it off this map.
-    # Get this wrong in the other direction — map schema to some crate
-    # — and every migration would compile a crate for no reason.
-    _case "a migration implies no crate" "" "infra/postgres/schema/141-x.sql"
+    # THE SECOND RE-PIN (backlog 4711828d). Until this car the line here
+    # asserted "a migration implies no crate", with a note that mapping
+    # schema to a crate "would compile a crate for no reason". The
+    # reason arrived on 2026-09-16: two migration cars gated green
+    # without boss-jobs and struck a six-car train on its
+    # credentials_pg pin. A migration implies every crate that stands
+    # up the schema — derived, so the want is read from the same
+    # derivation and this case pins the WIRING (path_map consults it),
+    # while the checks below pin the derivation itself.
+    _case "a migration implies every crate that stands up the schema" \
+        "${GATE_SCHEMA_READERS}" "infra/postgres/schema/141-x.sql"
+    # And beside a crate change it implies both, named once each.
+    _case "a migration beside a crate change implies both" \
+        "$(printf '%s\n' "${GATE_SCHEMA_READERS}" boss-expr | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//')" \
+        "infra/postgres/schema/141-x.sql" "crates/core/boss-expr/src/lib.rs"
     # The tenant-bundle rules DERIVE a crate name from the directory
     # rather than listing the two tenants, which moves the thing that
     # can rot: a third tenant whose engine crate is not
@@ -770,6 +1083,38 @@ scope_self_test() {
             fails=1
         fi
     done <<< "${GATE_FILE_INPUTS}"
+    # The schema readers rot the same two ways, plus a third: the
+    # derivation could quietly key on the wrong thing and drop a crate
+    # that reads the schema without saying so. Two named readers pin
+    # that — boss-jobs, whose credentials_pg pin is the one the train
+    # found, and boss-dispatcher, which declares no `postgres` feature
+    # and stands up a TestDb anyway, so a derivation keyed on the
+    # manifest instead of the constructor reds here by name. The floor
+    # is a round number well under the live 25, for the reason given
+    # above the index floor.
+    local rd_count=0 rd_crate rd_found rd_manifest
+    for rd_crate in ${GATE_SCHEMA_READERS}; do
+        rd_count=$((rd_count + 1))
+        rd_found=0
+        for rd_manifest in crates/*/"$rd_crate"/Cargo.toml; do
+            [ -f "$rd_manifest" ] && rd_found=1
+        done
+        if [ "$rd_found" -eq 0 ]; then
+            echo "gate.sh scope self-test FAIL: ${rd_crate} was derived as a schema reader, which is not a crate — the map would demand a -p cargo cannot satisfy" >&2
+            fails=1
+        fi
+    done
+    if [ "$rd_count" -lt 10 ]; then
+        echo "gate.sh scope self-test FAIL: only ${rd_count} crate(s) derived as schema readers, which is too few to be a real answer — cargo metadata or the TestDb scan is broken and a migration now implies almost nothing (backlog 4711828d)" >&2
+        fails=1
+    fi
+    for rd_crate in boss-jobs boss-dispatcher; do
+        case " ${GATE_SCHEMA_READERS} " in
+            *" ${rd_crate} "*) ;;
+            *) echo "gate.sh scope self-test FAIL: ${rd_crate} stands up a TestDb and was not derived as a schema reader — a migration car would gate without the crate that reads it (backlog 4711828d)" >&2
+               fails=1 ;;
+        esac
+    done
     if [ "$fails" -ne 0 ]; then
         echo "gate.sh: the scope check cannot be trusted — fix it before relying on -p" >&2
         exit 2
@@ -790,6 +1135,9 @@ if [ ${#NAMED[@]} -gt 0 ]; then
         if [ -n "$MISSING" ]; then
             echo "" >&2
             echo "GATE REFUSED: -p names [${NAMED[*]}] but the tree also changes:${MISSING}" >&2
+            if [ "$(schema_touched)" = "yes" ]; then
+                echo "  (a change under infra/postgres/schema/ is a change to every crate that stands up the schema)" >&2
+            fi
             echo "" >&2
             echo "Those crates would not be compiled or tested by this run. Either add" >&2
             echo "them (-p ${MISSING# }) or run the full gate. If a change is there by" >&2
@@ -817,16 +1165,18 @@ fi
 # the same hole as the mis-scoped `-p` that reddened a three-car train
 # (a6ffcb7c), pointed the other way.
 #
-# THE FIXTURE IS THE SUBTLE PART. `infra/postgres/schema/**` maps to no
-# crate, but the shared fixture LOADS the schema — so a schema-only
-# change has no crate to compile and can still break every DB-backed
-# test in the workspace. Skipping cargo entirely there would scope away
-# the exact break the fixture check exists to catch, which is what the
-# comment above `check "fixture"` warns about. So the derivation
-# answers two questions: which crates, and whether the fixture is
-# implicated.
+# THE SCHEMA IS THE SUBTLE PART. `infra/postgres/schema/**` is not a
+# crate, but the shared fixture LOADS it into every DB-backed test in
+# the workspace, so a schema-only change can break any of them. Until
+# 2026-09-16 the answer was "fixture + lints only": the fixture proved
+# the schema applied and no test that reads it ran (backlog 4711828d —
+# two such cars struck a six-car train). Now `path_map` maps a schema
+# change to every crate that stands up the schema (`schema_readers`),
+# so a migration-only car derives a scope like any other and the
+# fixture runs unscoped ahead of it as before. What remains here is the
+# question the receipt asks: did the schema move at all.
 schema_touched() {
-    if changed_paths | grep -qE '^infra/postgres/schema/'; then echo yes; else echo no; fi
+    if [ -n "$(changed_paths | schema_paths)" ]; then echo yes; else echo no; fi
 }
 
 # Which ref is "the trunk" for deriving a branch's own commits. The
@@ -851,11 +1201,12 @@ if [ "$AUTO" -eq 1 ]; then
     if [ -n "$DERIVED" ]; then
         for c in $DERIVED; do SCOPE+=(-p "$c"); NAMED+=("$c"); done
         echo "gate: --auto scoping to $(echo "$DERIVED" | tr '\n' ' ')"
-    elif [ "$(schema_touched)" = "yes" ]; then
-        # No crate, but the schema moved: the fixture is the one check
-        # that can see that, so it runs and nothing else cargo-shaped.
-        AUTO_LINTS_ONLY=1
-        echo "gate: --auto — no crate changed, but infra/postgres/schema/ did; fixture + lints only"
+        # Say WHY when the schema widened it: an author who changed one
+        # crate and sees twenty-six in the scope should read the reason
+        # here, not infer it.
+        if [ "$(schema_touched)" = "yes" ]; then
+            echo "gate: --auto schema change -> $(changed_paths | schema_paths | tr '\n' ' ')is read by ${GATE_SCHEMA_READERS}"
+        fi
     else
         AUTO_LINTS_ONLY=1
         AUTO_SKIP_FIXTURE=1
@@ -944,6 +1295,20 @@ write_receipt() {
             unver_count=$((unver_count + 1))
         done
     fi
+    # WHY the scope is what it is, for the half of it a reader cannot
+    # infer from the changed files: a migration names no crate, so a
+    # scope of twenty-five crates over a one-file diff looks wrong
+    # until the receipt says the schema moved and these are its
+    # readers. `paths` is the migrations this change carries (empty
+    # when none), `readers` the derived set whether or not it was
+    # pulled in — so a full-mode receipt still states which crates a
+    # migration reaches (backlog 4711828d).
+    local schema_json="" schema_n=0
+    for p in $(changed_paths | schema_paths); do
+        [ "$schema_n" -eq 0 ] || schema_json="${schema_json},"
+        schema_json="${schema_json}\"${p}\""
+        schema_n=$((schema_n + 1))
+    done
     # Only a refusal sets this; it names WHY the gate declined, which is
     # the fact a reader needs to tell "the host was unfit" from "the
     # branch was bad".
@@ -963,6 +1328,7 @@ write_receipt() {
   "ci": ${in_ci},
   "free_gb": $(gate_avail_gb),
   "unverifiable": [${unver}],
+  "schema_change": {"paths": [${schema_json}], "readers": "${GATE_SCHEMA_READERS}"},
   "checks": [${checks}]
 }
 RECEIPT
@@ -999,103 +1365,125 @@ check() {
     # cost around it.
     local t0=$SECONDS
     if "$@" < /dev/null; then
+        CHECK_STATUS=0
         echo "::endgroup::"
         RAN+=("${name}:pass:$((SECONDS - t0))")
     else
+        # Kept for `check_lint`, which needs the NUMBER: a lint's exit 3
+        # is not a failure, and pass/fail cannot carry that.
+        CHECK_STATUS=$?
         echo "::endgroup::"
-        echo "GATE FAIL: ${name} (after $((SECONDS - t0))s)" >&2
+        echo "GATE FAIL: ${name} (exit ${CHECK_STATUS}, after $((SECONDS - t0))s)" >&2
         FAILED+=("${name}")
         RAN+=("${name}:fail:$((SECONDS - t0))")
     fi
 }
+CHECK_STATUS=0
 
-# ---------------------------------------------------------------------
-# The pre-flight set: every check that needs no build
-# ---------------------------------------------------------------------
-# `cargo fmt -- --check` and the lint roster are repo-wide greps and
-# audits. Together they take ~17 SECONDS on a cold tree. They used to
-# run near the END of the gate, behind clippy, the full test suite and
-# the bun web suite.
+# A LINT THAT COULD NOT ANSWER IS A REFUSAL, NOT A RED.
 #
-# That ordering is not a bug — `check()` deliberately runs every check
-# even after one fails, "a red gate should report every failure it can
-# see, not make the author fix serially", and reordering saves a red
-# gate nothing because it runs everything regardless.
+# `infra/lint/lib/git-answer.sh` gives the lints a third exit: 0 clean,
+# 1 a violation — a fact about the BRANCH — and 3, `LINT_CANNOT_ANSWER`,
+# the lint never read what it judges — a fact about the MACHINE, which
+# no author can fix by editing code. It named this mapping as the half
+# still open: `check` knows only pass/fail, so a 3 was a plain red.
 #
-# The cost lands somewhere else: there was no way to run the cheap
-# checks WITHOUT the expensive ones. So the only way to find a
-# formatting slip was to spend a gate. On 2026-08-27 a car did exactly
-# that — 17 minutes of cluster time, a scheduled pod and a clone, to
-# learn that `cargo fmt` had been run on one crate and not another.
-# 17 seconds of local work, discovered 60x more slowly.
+# MEASURED 2026-09-18 (backlog a26f92c4, gate 35f4ff0c): the system of
+# record was rolling under a converge, so
+# `the-live-protocols-are-the-authored-protocols` could not read the
+# registry, and the gate went red on a car that had changed nothing the
+# lint judges. CLAUDE.md §Diagnosis: "an infrastructure refusal is not a
+# consist failure" — recorded as one it strikes every car aboard.
 #
-# Hence `--quick`, and hence this list existing ONCE. Two rosters would
-# drift (CLAUDE.md §9a) and would drift in the worst direction: a check
-# quietly missing from the local pre-flight still passes locally and
-# still reds a full gate, which is precisely the failure being fixed.
+# THE DISK FLOOR'S SHAPE, exactly: `GATE_REFUSAL` set, `write_receipt
+# "refused"`, exit 2. `train_gate::standing` reads that receipt as
+# `Standing::Refused` and relaunches; the yard and `red_verdict_detail`
+# print `refused_because`; nothing takes a strike. Immediate, like the
+# floor, rather than at the end of the roster: a machine that cannot
+# answer one lint is not a machine whose other verdicts are worth
+# recording as the branch's.
 #
-# The roster is the DIRECTORY. Until 2026-09-05 it was a hand-listed
-# array here, and every car that added a lint edited the same tail
-# line: four cars collided on it in one day, and the fourth was left
-# behind by train #218 ("conflict: infra/gate.sh"). That is the
-# manifest.txt lesson (CLAUDE.md §9a) one level up — a list holding no
-# information its source does not is a merge conflict waiting to
-# happen. Adding a lint is now dropping a file in infra/lint/; this
-# file does not change. The conductor's consist check discovers its
-# lints the same way (train.rs `cheap_lints`: every infra/lint/*.sh,
-# sorted, minus the delivery policy's exclusions), so the two readers
-# agree by construction rather than by being kept in step.
-#
-# What is NOT run here is written down once, with its reason. Each
-# needs something a bare tree cannot answer in seconds. The set is
-# pinned by boss-testing's gate_sh.rs, which asks this script (via
-# `--roster`) rather than re-parsing it.
-PREFLIGHT_EXCLUDES=(
-    # live-DB sweeps on systemd timers, not static checks
-    "infra/lint/audit-ordering.sh"
-    "infra/lint/conservation-invariants.sh"
-    # needs a built workspace (boss-ports-list); CI builds, then runs it
-    "infra/lint/no-snapshot-arrays.sh"
-    # installs packages — minutes, not seconds; the web phase below runs it
-    "infra/lint/svelte-check.sh"
-)
-
-# FIRST on purpose: it says what this workspace cannot cover, which
-# frames every result below it. A green pre-flight on a machine with
-# no Postgres is 118 database-backed test targets unrun, and saying
-# so before the rest is the difference between confidence and a
-# gate failure eleven minutes later (design 775f0b35 Q3).
-PREFLIGHT_FIRST="infra/lint/workspace-declares-what-it-runs.sh"
-
-# One `<name> <path>` line per lint, in the order they run: the pinned
-# first, then the directory in C-locale order, so two hosts ask the
-# same questions in the same sequence. An exclusion naming a file that
-# no longer exists is refused: left standing, it would keep a future
-# lint of that name out of the gate without anyone deciding so.
-#
-# `cargo-advisories` is the one lint allowed a network fetch: it is
-# report-only (always exits 0) and soft-skips when the tool or the
-# advisory DB is absent, so it cannot red a gate — only add a line.
-preflight_roster() {
-    local path
-    for path in "${PREFLIGHT_EXCLUDES[@]}" "$PREFLIGHT_FIRST"; do
-        if [ ! -f "$path" ]; then
-            echo "gate.sh: the pre-flight roster names a lint that does not exist: $path" >&2
-            return 1
-        fi
-    done
-    echo "$(basename "$PREFLIGHT_FIRST" .sh) $PREFLIGHT_FIRST"
-    for path in $(LC_ALL=C ls infra/lint/*.sh); do
-        [ "$path" = "$PREFLIGHT_FIRST" ] && continue
-        case " ${PREFLIGHT_EXCLUDES[*]} " in *" $path "*) continue ;; esac
-        echo "$(basename "$path" .sh) $path"
-    done
+# The lint's own stderr is kept to a file so the receipt can carry its
+# first refusal line — the WHY, in the lint's words, which is otherwise
+# a log the runner reaps (§Diagnosis: a verdict someone must go
+# re-derive is not a verdict). It is replayed to the gate's stderr after
+# the lint exits, so nothing is lost, only delayed by one lint's runtime.
+# Only the roster runs through here; cargo, bun and svelte-check have no
+# such vocabulary, and a 3 from them means nothing this maps.
+lint_keeping_stderr() { # <file> <cmd...>
+    local keep="$1" status
+    shift
+    "$@" 2>"$keep"
+    status=$?
+    cat "$keep" >&2
+    return "$status"
 }
 
-if [ "$ROSTER" -eq 1 ]; then
-    preflight_roster
-    exit $?
-fi
+# The lints `--quick` could not run to a verdict, named in its closing
+# line (see the warning branch in `check_lint`). Only `--quick` fills it.
+CANNOT_READ=()
+check_lint() {
+    local name="$1" keep why target
+    shift
+    keep="$(mktemp)" || {
+        echo "gate: could not make a file to keep a lint's stderr — refusing rather than running a lint whose words would be lost." >&2
+        GATE_REFUSAL="no temp file for lint stderr"
+        write_receipt "refused"
+        exit 2
+    }
+    # Through a variable, as `run_roster` invokes its runner: boss-cli's
+    # brief.rs derives the gate's PHASE list from lines that begin
+    # `check "<name>"`, and a literal `check "$name"` here would put a
+    # phase called `$name` in every brief.
+    local runner=check
+    "$runner" "$name" lint_keeping_stderr "$keep" "$@"
+    if [ "$CHECK_STATUS" -ne "$LINT_CANNOT_ANSWER" ]; then
+        rm -f "$keep"
+        return 0
+    fi
+    # `check` recorded a failure; the lint said otherwise. Rewrite that
+    # one entry so the receipt's checks list agrees with its verdict —
+    # a reader counting `fail` entries must not count this one.
+    unset "FAILED[$((${#FAILED[@]} - 1))]"
+    RAN[${#RAN[@]} - 1]="${name}:refused:$(ran_secs "${RAN[${#RAN[@]} - 1]}")"
+    # The first line carrying the marker, else the first line at all,
+    # made safe for a JSON string literal (the receipt is written by
+    # interpolation): quotes and backslashes dropped, control characters
+    # flattened, bounded so a chatty lint cannot bloat the receipt.
+    why="$(grep -m1 -F "$LINT_CANNOT_ANSWER_MARKER" "$keep" || grep -m1 '[^[:space:]]' "$keep" || true)"
+    why="$(printf '%s' "${why:-(the lint printed nothing on stderr)}" | tr -d '"\\' | tr '[:cntrl:]' ' ' | cut -c1-400)"
+    # The lint's own `target: <url> (override with <VAR>)` line, when it
+    # prints one — the two live lints read different variables
+    # (BOSS_JOBS_URL, BOSS_DISPATCHER_URL), and the lint knows which.
+    target="$(grep -m1 -F 'override with' "$keep" | tr -s '[:space:]' ' ' | sed -e 's/^ *//' -e 's/ *$//' || true)"
+    rm -f "$keep"
+    # `--quick` WARNS instead. It is not a gate and says so — its whole
+    # claim is "you will not lose a gate to a lint", and it judges
+    # nothing a gate will not re-judge on the receipt that counts. The
+    # refusal above, landing here for every mode, made a workstation
+    # with no route to the registry (the Mac off the LAN) lose the 80
+    # lints that can read a bare tree to the two that cannot (backlog
+    # c7bea0e2). So: the lint's own CANNOT ANSWER line as a WARNING,
+    # the address it was reading so the operator sees WHICH registry,
+    # and the closing line counts these rather than saying `clean`
+    # bare — a pre-flight must not claim what it could not check.
+    # `--lint` and the gate proper keep refusing: their receipts are
+    # read as verdicts, and a refused check is not a warning there.
+    if [ "$QUICK" -eq 1 ]; then
+        CANNOT_READ+=("$name")
+        echo "pre-flight: WARNING — '${name}' could not answer: ${why}" >&2
+        echo "pre-flight: WARNING — ${target:-BOSS_JOBS_URL=${BOSS_JOBS_URL:-<unset, the lint used its default>}}; the gate will run this lint against the registry it CAN reach." >&2
+        return 0
+    fi
+    echo "gate: REFUSED — the pre-flight lint '${name}' could not answer (exit ${LINT_CANNOT_ANSWER}), so this run judged nothing about the branch." >&2
+    echo "  ${why}" >&2
+    echo "  An infrastructure refusal, recorded as one (the GATE FAIL line above is check's" >&2
+    echo "  pass/fail bookkeeping; the receipt records this check as refused). Fix what the" >&2
+    echo "  lint could not reach and gate again — there is nothing here for the author to edit." >&2
+    GATE_REFUSAL="pre-flight lint ${name} could not answer (exit ${LINT_CANNOT_ANSWER}): ${why}"
+    write_receipt "refused"
+    exit 2
+}
 
 # ---------------------------------------------------------------------
 # Running a roster
@@ -1396,13 +1784,70 @@ run_preflight() {
         RAN+=("preflight-roster:fail:0")
         return
     fi
+    # Say what is NOT asked before asking the rest, the way the first
+    # lint says what the workspace cannot cover: a reader of a clean
+    # pre-flight should not have to open the directory to learn which
+    # lints declared themselves out of it.
+    echo "pre-flight: not run here, by their own headers: $(consist_exclusions | cut -f1 | sed 's|.*/||; s/\.sh$//' | tr '\n' ' ')"
     # A truncated roster is a FAILED check, not a quiet shortfall: the
     # receipt has to carry the fact that the gate did not ask everything
-    # it claims to ask.
-    if ! run_roster "$roster" check; then
+    # it claims to ask. `check_lint`, not `check`: a lint's exit 3 is a
+    # refusal, and only the roster speaks that vocabulary.
+    if ! run_roster "$roster" check_lint; then
         FAILED+=("preflight-roster-complete")
         RAN+=("preflight-roster-complete:fail:0")
     fi
+}
+
+# THE PRE-FLIGHT CERTIFIES ONLY A TREE ITS LINTS CAN READ.
+#
+# Every git-based lint — `pattern_scan`, `git_answer … ls-files`, `git
+# grep` — reads the INDEX. An untracked file is not in it, so a dirty
+# tree with a NEW file is clean here and red at the gate, which checks
+# out the pushed commit where the file IS tracked. MEASURED 2026-09-18
+# (backlog a5efc919): the H12 builder's `--quick` said clean, and gate
+# a3b26113 went red on `the-estate-address-lives-once` over a manifest
+# the pre-flight had never been able to see.
+#
+# ONE refusal here, not `--others` taught to every reader: the readers
+# are many (lib/pattern-scan.sh, lib/git-answer.sh, no-secrets's own
+# `ls-files -z`, and the lints nobody has written yet), the refusal is
+# one place, and a builder has to `git add` the file before committing
+# anyway — this only moves that step in front of the read that depends
+# on it. The roots the lints scan are the WHOLE tree (`no-secrets` and
+# `the-estate-address-lives-once` read every tracked path), so the
+# question is exactly `git ls-files --others --exclude-standard`: a
+# tracked-but-modified file is read from the working copy and is fine;
+# an ignored file never reaches the gate workspace either and is fine.
+#
+# A REFUSAL, not a failed check (exit 2, the disk floor's shape): the
+# lints did not run, so there is no verdict on the branch to record.
+# ONLY the pre-flight modes ask it: the runner's workspace is a fresh
+# checkout of the pushed sha, and `--auto` is exercised on scratch trees
+# that carry untracked files by design (gate_sh.rs `auto_scope_of`).
+# Pinned by boss-testing's
+# a_quick_preflight_refuses_an_untracked_file.rs, which runs THIS
+# script against synthetic trees.
+refuse_untracked_files() {
+    local untracked status
+    untracked=$(git ls-files --others --exclude-standard 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "gate: cannot tell which files are untracked (git ls-files exited ${status}: ${untracked}) — refusing rather than certifying a tree the lints may not have read." >&2
+        GATE_REFUSAL="git ls-files --others exited ${status}"
+        write_receipt "refused"
+        exit 2
+    fi
+    [ -n "$untracked" ] || return 0
+    echo "gate: the tree holds untracked files the lints cannot see. Refusing to certify it." >&2
+    printf '%s\n' "$untracked" | sed 's/^/  /' >&2
+    echo "  Every git-based lint reads the index, so an untracked file is clean here and" >&2
+    echo "  red at the gate, which checks out the pushed commit (backlog a5efc919)." >&2
+    echo "  remediation: git add <file>   # the gate will read it once it is tracked" >&2
+    echo "            or add it to .gitignore, if it is scratch that must never ship" >&2
+    GATE_REFUSAL="$(printf '%s\n' "$untracked" | grep -c '[^[:space:]]') untracked file(s) the lints cannot read"
+    write_receipt "refused"
+    exit 2
 }
 
 # `--quick` stops here. It is a PRE-FLIGHT, not a gate, and says so:
@@ -1410,12 +1855,21 @@ run_preflight() {
 # broken build. Its whole claim is "you will not lose a gate to a lint
 # or a formatting slip", which is the class of red it is answering.
 if [ "$QUICK" -eq 1 ]; then
+    refuse_untracked_files
     run_preflight
     echo ""
     if [ "${#FAILED[@]}" -gt 0 ]; then
         echo "pre-flight: ${#FAILED[@]} check(s) failed: ${FAILED[*]}" >&2
         echo "pre-flight: fix these before spending a gate on them." >&2
         exit 1
+    fi
+    if [ "${#CANNOT_READ[@]}" -gt 0 ]; then
+        # Never a bare `clean` here: the count is the claim's honest
+        # edge, and the WARNING lines above name each lint and why.
+        echo "pre-flight: clean except ${#CANNOT_READ[@]} lint(s) that could not read the registry: ${CANNOT_READ[*]}"
+        echo "pre-flight: no build ran, so this is NOT a gate; the gate runs those lints itself."
+        echo "pre-flight: clippy, build and the test suites are still unproven."
+        exit 0
     fi
     echo "pre-flight: clean — no build ran, so this is NOT a gate."
     echo "pre-flight: clippy, build and the test suites are still unproven."
@@ -1445,6 +1899,7 @@ fi
 # a DB-backed test cannot run here at all. This narrows the red-gate
 # classes by one; it does not replace the gate.
 if [ "$LINT" -eq 1 ]; then
+    refuse_untracked_files
     run_preflight
     LINT_CRATES=$(crates_from_paths)
     if [ -n "$LINT_CRATES" ]; then
@@ -1499,10 +1954,22 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # (see #180). One cheap build closes the class.
     check "build (default features)" cargo build --workspace
     check "test"    cargo test --all-features
+    # Kept out of the pre-flight because it reads the built
+    # boss-ports-list; the build above just produced it. This line was
+    # missing from 2026-08-31 to 2026-09-12: the exclusion said "CI
+    # builds, then runs it", CI did not, and the lint sat red on a page
+    # #161 had deleted, read by nobody (spa-lists-are-generated.toml).
+    check "no-snapshot-arrays" infra/lint/no-snapshot-arrays.sh
 else
     check "clippy"  cargo clippy "${SCOPE[@]}" --all-features --tests -- -D warnings
     check "build (default features)" cargo build "${SCOPE[@]}"
     check "test"    cargo test "${SCOPE[@]}" --all-features
+    # A scoped car pays for the binary only when it could have moved
+    # the answer: the registry crate, or a generated copy of it.
+    if changed_paths | grep -qE '^(crates/core/boss-ports/|apps/(web|simulator)/src/_generated/ports\.ts$)'; then
+        check "build boss-ports-list" cargo build -p boss-ports
+        check "no-snapshot-arrays" infra/lint/no-snapshot-arrays.sh
+    fi
 fi
 
 # THE WEB SUITE. CI's web job runs typecheck + unit + build + the

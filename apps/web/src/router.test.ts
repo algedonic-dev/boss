@@ -57,6 +57,11 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/ux/service/schedule', { kind: 'schedule' }],
     // Exec (User Experiences)
     ['/ux/exec', { kind: 'exec' }],
+    // A department's own jobs view — the tab landing for a department
+    // that declares no surface (cc76f755). The code is registry data,
+    // so the route carries it rather than the router knowing it.
+    ['/ux/departments/sales', { kind: 'department', code: 'sales' }],
+    ['/ux/departments/operations', { kind: 'department', code: 'operations' }],
     // System Model perspective — IT surfaces re-rooted under /system/*.
     // The consolidated IT department (1f6d55e0): six surfaces,
     // families as tabs, /system gone.
@@ -65,16 +70,28 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/it/operate/atlas', { kind: 'systemMonitoringAtlas' }],
     ['/it/operate/bottlenecks', { kind: 'systemFleet' }],
     ['/it/operate/marshalling', { kind: 'systemMarshallingYard' }],
+    ['/it/operate/receiving', { kind: 'systemReceivingYard' }],
     ['/it/operate/conductor', { kind: 'systemMonitoringConductor' }],
     ['/it/kb', { kind: 'systemKb' }],
     ['/it/registry/subjects', { kind: 'systemSubjects' }],
+    // The Drift tab (4ae9969e): declared before the workflow-detail
+    // wildcard, which would otherwise read 'drift' as a kind slug.
+    ['/it/registry/drift', { kind: 'systemRegistryDrift' }],
     // /it/* is the canonical spelling for IT surfaces (0fc8b216); the
     // /system/* rows above stay because bookmarks, the station
     // registry's upstream hrefs and the docs all still use them.
     ['/it/design', { kind: 'systemDesign' }],
     ['/it/design/experiments', { kind: 'experiments' }],
     ['/it/design/feedback', { kind: 'systemFeedback' }],
+    ['/it/design/codebase', { kind: 'systemCodebase' }],
     ['/it', { kind: 'systemYard' }],
+    // The yard's FLOORS (design 0524fc95, car 2): /it is the map of
+    // eight region cards; each yard card opens the Train Yard focused
+    // on its panel, and the bare /it/yard is the yard on its default
+    // selection, the track.
+    ['/it/yard', { kind: 'systemYardFloor', region: 'track' }],
+    ['/it/yard/dock', { kind: 'systemYardFloor', region: 'dock' }],
+    ['/it/yard/shed', { kind: 'systemYardFloor', region: 'shed' }],
     ['/it/crew', { kind: 'systemCrew' }],
     ['/it/estate', { kind: 'systemEstate' }],
     

@@ -364,7 +364,7 @@ fn create_job_with_steps(
     // the `x-sim-origin` header the LiveApiOutput stamps, but the
     // engine says it explicitly so the wire body carries the truth
     // even through a path that drops the header.
-    .with_simulated(true);
+    .with_partition(boss_core::partition::Partition::Simulated);
     job.status = JobStatus::Open;
 
     // Post the Job and let the SERVER materialize its steps from the
@@ -803,6 +803,7 @@ fn synthesized_birth_payload(kind: &str, id: &str, day: chrono::NaiveDate) -> se
                 // get a plausible territory owner instead of the CTO
                 // (which was a placeholder that surfaced in operator
                 // testing).
+                // employee-id-ok: the example tenant's seeded pool ids
                 "territory_rep_id": format!("emp-aa-{:03}", 284 + (seed % 10)),
                 "account_type": "wholesale",
                 "contacts": [],

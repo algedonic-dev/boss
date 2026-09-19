@@ -40,6 +40,26 @@ pub struct DispatcherLiveness {
     schedule_events: AtomicU64,
     /// Wall-clock unix seconds of the most recently handled event (0 = none yet).
     last_event_unix: AtomicI64,
+    /// Dead-letters since start (monotonic): handler failures past their
+    /// budget, or permanent. Counted HERE — a local read — because the
+    /// durable record (an annotation on the packet) needs the jobs API,
+    /// which is exactly what a dead-letter often reports broken
+    /// (8834804a). Six topics carry no packet at all; for those and for
+    /// a failed annotation write, this number is the only record that
+    /// outlives the log line.
+    dead_letters: AtomicU64,
+    /// Of those, how many left NO durable record: no packet to annotate,
+    /// no sink configured, or the annotation write failed.
+    dead_letters_unrecorded: AtomicU64,
+    /// Wall-clock unix seconds of the most recent dead-letter (0 = none).
+    last_dead_letter_unix: AtomicI64,
+    /// Wall-clock unix seconds of the most recent UNRECORDED dead-letter
+    /// (0 = none). Its own stamp, because the estate chain's finding
+    /// (`estate.compare`, 8834804a) is "an unrecorded one happened
+    /// recently" judged against the observation's stamp — and a
+    /// recorded dead-letter moving `last_dead_letter_unix` would keep a
+    /// stale unrecorded one looking fresh.
+    last_unrecorded_dead_letter_unix: AtomicI64,
 }
 
 impl DispatcherLiveness {
@@ -89,6 +109,19 @@ impl DispatcherLiveness {
         self.schedule_running.store(false, Ordering::Relaxed);
     }
     /// Called by the schedule runner per sim-day it fires.
+    /// One dead-letter happened; `recorded` says whether a durable record
+    /// (the packet annotation) landed for it.
+    pub fn record_dead_letter(&self, recorded: bool) {
+        let now = Self::now_unix();
+        self.dead_letters.fetch_add(1, Ordering::Relaxed);
+        if !recorded {
+            self.dead_letters_unrecorded.fetch_add(1, Ordering::Relaxed);
+            self.last_unrecorded_dead_letter_unix
+                .store(now, Ordering::Relaxed);
+        }
+        self.last_dead_letter_unix.store(now, Ordering::Relaxed);
+    }
+
     pub fn record_schedule(&self) {
         self.schedule_events.fetch_add(1, Ordering::Relaxed);
         self.last_event_unix
@@ -115,6 +148,61 @@ impl DispatcherLiveness {
             "schedule_running": self.schedule_running.load(Ordering::Relaxed),
             "schedule_events": self.schedule_events.load(Ordering::Relaxed),
             "last_event_unix": self.last_event_unix.load(Ordering::Relaxed),
+            "dead_letters": self.dead_letters.load(Ordering::Relaxed),
+            "dead_letters_unrecorded": self.dead_letters_unrecorded.load(Ordering::Relaxed),
+            "last_dead_letter_unix": self.last_dead_letter_unix.load(Ordering::Relaxed),
+            "last_unrecorded_dead_letter_unix": self.last_unrecorded_dead_letter_unix.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The finding the estate chain raises on (8834804a) is "an
+    /// unrecorded dead-letter happened RECENTLY", judged against the
+    /// observation's own stamp. `last_dead_letter_unix` cannot carry
+    /// that: a recorded dead-letter after an unrecorded one would move
+    /// it and keep an old unrecorded one looking fresh. So the
+    /// unrecorded ones get a stamp of their own, which a recorded one
+    /// leaves alone.
+    #[test]
+    fn an_unrecorded_dead_letter_has_its_own_stamp_that_a_recorded_one_does_not_move() {
+        let live = DispatcherLiveness::default();
+        let snap = live.snapshot();
+        assert_eq!(snap["last_unrecorded_dead_letter_unix"], 0, "{snap}");
+
+        live.record_dead_letter(true);
+        let snap = live.snapshot();
+        assert!(
+            snap["last_dead_letter_unix"].as_i64().unwrap_or(0) > 0,
+            "{snap}"
+        );
+        assert_eq!(
+            snap["last_unrecorded_dead_letter_unix"], 0,
+            "a recorded dead-letter is not an unrecorded one: {snap}"
+        );
+
+        live.record_dead_letter(false);
+        let snap = live.snapshot();
+        let unrecorded_at = snap["last_unrecorded_dead_letter_unix"]
+            .as_i64()
+            .unwrap_or(0);
+        assert!(unrecorded_at > 0, "{snap}");
+        assert_eq!(snap["dead_letters"], 2, "{snap}");
+        assert_eq!(snap["dead_letters_unrecorded"], 1, "{snap}");
+
+        // Push the stamp into the past and record a RECORDED one: the
+        // unrecorded stamp must not follow it.
+        live.last_unrecorded_dead_letter_unix
+            .store(unrecorded_at - 3600, Ordering::Relaxed);
+        live.record_dead_letter(true);
+        let snap = live.snapshot();
+        assert_eq!(
+            snap["last_unrecorded_dead_letter_unix"],
+            unrecorded_at - 3600,
+            "{snap}"
+        );
     }
 }

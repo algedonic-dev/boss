@@ -73,12 +73,24 @@ impl std::str::FromStr for StationKind {
 }
 
 /// Who may claim a packet FROM this station — Class-registry
-/// vocabulary (role slugs). Checked at the claim CAS when the claim
-/// names its station. Absent = any actor may claim.
+/// vocabulary (role slugs), and since design c87fb59b car 3 the
+/// rate-card models an agent must run. Checked at the claim CAS when
+/// the claim names its station. Absent = any actor may claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StationCapability {
     #[serde(default)]
     pub roles: Vec<String>,
+    /// The models an AGENT claimant must run one of, as
+    /// `agent_rate_card` spells them (`opus-5[1m]`). Written by the
+    /// `(role, model)` projection (`station_projection::agent_stations`)
+    /// so a station stands for "a `platform-admin`-role agent on
+    /// opus-5[1m]"; an agents-registry row serves the station when its
+    /// `default_model` is one of these. Empty gates no agent out, and
+    /// a person — who runs no model — is gated by `roles` alone.
+    /// Skipped on the wire when empty so every roles-only row the
+    /// registry already holds reads back unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 impl StationCapability {
@@ -87,6 +99,16 @@ impl StationCapability {
     /// capability is a vacuous constraint, not a lockout).
     pub fn allows_role(&self, role: &str) -> bool {
         self.roles.is_empty() || self.roles.iter().any(|r| r == role)
+    }
+
+    /// Whether an actor that runs `models` (an agent's `default_model`;
+    /// empty for a person) may claim from this station. Empty on
+    /// either side gates nobody out: no models declared is a roles-only
+    /// station, and no models run is not an agent.
+    pub fn allows_model(&self, models: &[String]) -> bool {
+        self.models.is_empty()
+            || models.is_empty()
+            || models.iter().any(|m| self.models.contains(m))
     }
 }
 
@@ -350,6 +372,29 @@ pub trait StationRegistry: Send + Sync {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<(), StationError>;
+
+    /// Publish `spec` at ITS OWN declared version — the platform
+    /// bundle's write (`crate::station_seed`, backlog 393d3234).
+    ///
+    /// `create_draft` + `publish` assign `max(version) + 1`, which is
+    /// right for an author and wrong for a bundle: a bundle row
+    /// carries its version (a version bump is the edit path), and a
+    /// fresh deployment must land `loading-dock` at v3 — the version
+    /// the migrations produced and every in-flight reference names —
+    /// not at v1 with two versions of history nobody wrote.
+    ///
+    /// In one transaction: the viability gate, retire any active row
+    /// of the same name, INSERT the row active at `spec.version` with
+    /// `created_at = now`, record `jobs.station.published` (payload =
+    /// the row written). `Conflict` when (name, version) already
+    /// exists — the caller decides what an existing row means, this
+    /// never overwrites one.
+    async fn publish_declared(
+        &self,
+        spec: StationSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<StationSpec, StationError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +590,38 @@ impl StationRegistry for InMemoryStations {
             ));
         }
         Ok(())
+    }
+
+    async fn publish_declared(
+        &self,
+        mut spec: StationSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<StationSpec, StationError> {
+        crate::station_lint::gate_active(&spec).map_err(StationError::Unviable)?;
+        let mut rows = self.rows.lock().unwrap();
+        let key = (spec.name.clone(), spec.version);
+        if rows.contains_key(&key) {
+            return Err(StationError::Conflict(format!(
+                "row already exists: {}@{}",
+                spec.name, spec.version
+            )));
+        }
+        for ((n, _), row) in rows.iter_mut() {
+            if *n == spec.name && row.status == WorkflowStatus::Active {
+                row.status = WorkflowStatus::Retired;
+            }
+        }
+        spec.status = WorkflowStatus::Active;
+        spec.created_at = now;
+        rows.insert(key, spec.clone());
+        drop(rows);
+        self.record(crate::events::station_registry_event(
+            crate::events::STATION_PUBLISHED,
+            actor,
+            &spec,
+        ));
+        Ok(spec)
     }
 }
 
@@ -883,6 +960,106 @@ mod pg {
                 .map_err(|e| StationError::Storage(e.to_string()))?;
             Ok(())
         }
+
+        async fn publish_declared(
+            &self,
+            mut spec: StationSpec,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<StationSpec, StationError> {
+            // The viability gate before the transaction opens: an
+            // unviable bundle row never occupies the ACTIVE slot, not
+            // even for the length of a transaction.
+            crate::station_lint::gate_active(&spec).map_err(StationError::Unviable)?;
+
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StationError::Storage(e.to_string()))?;
+
+            let exists: Option<(i32,)> =
+                sqlx::query_as("SELECT version FROM stations WHERE name = $1 AND version = $2")
+                    .bind(&spec.name)
+                    .bind(spec.version)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StationError::Storage(e.to_string()))?;
+            if exists.is_some() {
+                return Err(StationError::Conflict(format!(
+                    "row already exists: {}@{}",
+                    spec.name, spec.version
+                )));
+            }
+
+            // RETIRE FIRST, THEN INSERT: `stations_one_active_per_name`
+            // is a plain partial unique index, enforced per statement,
+            // so the order is load-bearing (130 and 133 each reddened
+            // a train by getting it the other way round).
+            sqlx::query(
+                "UPDATE stations SET status = 'retired'
+                 WHERE name = $1 AND status = 'active'",
+            )
+            .bind(&spec.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))?;
+
+            spec.status = WorkflowStatus::Active;
+            spec.created_at = now;
+            sqlx::query(
+                "INSERT INTO stations
+                    (name, version, status, title, kind, predicate, discipline,
+                     wip_limit, terminal_window_days, capability, rollup_parent,
+                     upstream, lens, created_at)
+                 VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            )
+            .bind(&spec.name)
+            .bind(spec.version)
+            .bind(&spec.title)
+            .bind(spec.kind.as_str())
+            .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
+            .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
+            .bind(spec.wip_limit)
+            .bind(
+                spec.terminal_window_days
+                    .map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
+            )
+            .bind(
+                spec.capability
+                    .as_ref()
+                    .map(|c| serde_json::to_value(c).unwrap_or_default()),
+            )
+            .bind(&spec.rollup_parent)
+            .bind(
+                spec.upstream
+                    .as_ref()
+                    .map(|u| serde_json::to_value(u).unwrap_or_default()),
+            )
+            .bind(
+                spec.lens
+                    .as_ref()
+                    .map(|l| serde_json::to_value(l).unwrap_or_default()),
+            )
+            .bind(spec.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))?;
+
+            let event = crate::events::station_registry_event(
+                crate::events::STATION_PUBLISHED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(StationError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| StationError::Storage(e.to_string()))?;
+            Ok(spec)
+        }
     }
 }
 
@@ -1127,11 +1304,50 @@ mod tests {
     async fn capability_allows_role() {
         let cap = StationCapability {
             roles: vec!["head-brewer".into(), "brewer".into()],
+            ..Default::default()
         };
         assert!(cap.allows_role("brewer"));
         assert!(!cap.allows_role("bookkeeper"));
         // Declared-but-empty gates nobody out.
         assert!(StationCapability::default().allows_role("anyone"));
+    }
+
+    /// The model half of a capability (design c87fb59b car 3): an agent
+    /// serves a station whose `models` name one it runs; a person
+    /// (no models) is gated by `roles` alone; a station with no models
+    /// declared gates no agent out. The wire shape of a roles-only
+    /// capability is unchanged — every row the registry already holds
+    /// reads back byte-for-byte.
+    #[tokio::test]
+    async fn capability_allows_model() {
+        let cap = StationCapability {
+            roles: vec!["platform-admin".into()],
+            models: vec!["opus-5[1m]".into()],
+        };
+        assert!(cap.allows_model(&["opus-5[1m]".to_string()]));
+        assert!(cap.allows_model(&["haiku-4-5".to_string(), "opus-5[1m]".to_string()]));
+        assert!(!cap.allows_model(&["haiku-4-5".to_string()]));
+        assert!(
+            cap.allows_model(&[]),
+            "a claimant with no model is not an agent; roles decide"
+        );
+        assert!(StationCapability::default().allows_model(&["haiku-4-5".to_string()]));
+
+        let roles_only = StationCapability {
+            roles: vec!["bookkeeper".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&roles_only).unwrap(),
+            serde_json::json!({ "roles": ["bookkeeper"] })
+        );
+        let read: StationCapability =
+            serde_json::from_value(serde_json::json!({ "roles": ["bookkeeper"] })).unwrap();
+        assert_eq!(read, roles_only);
+        assert_eq!(
+            serde_json::to_value(&cap).unwrap(),
+            serde_json::json!({ "roles": ["platform-admin"], "models": ["opus-5[1m]"] })
+        );
     }
 
     // -----------------------------------------------------------

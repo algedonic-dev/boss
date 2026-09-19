@@ -26,8 +26,8 @@
 // second half.
 
 import type { RouteName } from '@boss/web-kit/session/permissions';
-import type { AppId, AppTab } from '@boss/web-kit/nav';
-import { DEPARTMENTS, HOME_APP, SIMULATOR_APP } from '@boss/web-kit/nav';
+import type { AppId, AppTab, Department } from '@boss/web-kit/nav';
+import { HOME_APP, SIMULATOR_APP } from '@boss/web-kit/nav';
 
 export type { AppId, AppTab };
 
@@ -78,8 +78,23 @@ export type UngatedSurfaceId =
   // above, and for the same reason — it is a read-only observation
   // surface over the delivery pipeline, readable by any operator, and
   // adding a permKey would mean widening the RouteName vocabulary in
-  // libs/web-kit and hand-editing four role entries in ROUTE_ACCESS.
+  // libs/web-kit and every tenant's declared `surfaces` lists.
   | 'system-crew'
+  // 'system-receiving' / 'system-marshalling' (the Receiving Yard and
+  // Marshalling Yard rows): permKey-less for the Crew Board's reason —
+  // a yard is the department's own floor, readable by any operator
+  // (feedback 92921c2f, design 55417146, 2026-09-18).
+  | 'system-receiving'
+  | 'system-marshalling'
+  // 'system-codebase' (the Codebase row): the department's own numbers,
+  // readable by any operator — same shape as the Crew Board, and for
+  // the same reason (feedback 9827c699, 2026-09-14).
+  | 'system-codebase'
+  // 'system-registry-drift' (the Drift tab on Registry): a view of the
+  // workflow registry against its authored bundle, so it borrows the
+  // `workflows` gate of the family it sits in rather than widening the
+  // RouteName vocabulary (4ae9969e, 2026-09-15).
+  | 'system-registry-drift'
   | 'system-fleet'
   | 'system-backlog'
   | 'hr'
@@ -104,7 +119,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   app: 'finance' },
   people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    app: 'people' },
   assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'maintenance' },
-  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      app: 'sales' },
+  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    app: 'sales' },
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'home' },
   views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     app: 'home' },
   'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'marketing' },
@@ -120,8 +135,21 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // for them; map/flow/model died outright and fleet became Operate's
   // Bottlenecks tab.
   // First IT surface in catalog order = the IT app's landing
-  // (departure-board.md Q1): the yard, now AT /it itself.
+  // (departure-board.md Q1): the yard, now AT /it itself. Catalog
+  // order decides the LANDING (`departmentHref`), not the IT sidebar's
+  // order — that is AppShell's IT_GROUPS list — which is how design
+  // 55417146 (2026-09-18) keeps the Train Yard the /it landing while
+  // the sidebar leads with the two yards upstream of it.
   'system-yard':              { id: 'system-yard',              label: 'Train Yard',          path: '/it',              permKey: 'system-yard',             app: 'it' },
+  // The Receiving Yard and the Marshalling Yard — SIDEBAR ROWS since
+  // David's feedback 92921c2f (2026-09-18): "graduate Receiving Yard
+  // and Marshalling Yard to the left navbar ... the three yards plus
+  // the Crew Board as the top 4". Second doors onto the Operate tabs
+  // that already answer these paths — the routes did not move, and
+  // the tabs stay. PermKey-less like the Crew Board: a yard is the
+  // department's own floor, readable by any operator.
+  'system-receiving':        { id: 'system-receiving',        label: 'Receiving Yard',      path: '/it/operate/receiving', app: 'it' },
+  'system-marshalling':      { id: 'system-marshalling',      label: 'Marshalling Yard',    path: '/it/operate/marshalling', app: 'it' },
   // The Operate row is permKey-less like the incidents surface it
   // leads with — readable by any operator; the tabs behind it keep
   // their own gates.
@@ -133,6 +161,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/registry/step-plugins', permKey: 'system-step-plugins', app: 'it' },
   'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/registry/dispatcher', permKey: 'system-dispatcher', app: 'it' },
   'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/registry/subjects', permKey: 'system-subjects',    app: 'it' },
+  'system-registry-drift':   { id: 'system-registry-drift',   label: 'Protocol drift',      path: '/it/registry/drift', permKey: 'workflows',             app: 'it' },
   'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', app: 'it' },
   'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/registry/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
   'system-design':           { id: 'system-design',           label: 'Design',              path: '/it/design',       permKey: 'system-design',           app: 'it' },
@@ -145,67 +174,83 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // ROW, not a tab: David's decision on backlog 04c5bbc0 (2026-09-11)
   // reversed the proposal to fold it into an existing IT family.
   'system-crew':             { id: 'system-crew',             label: 'Crew Board',          path: '/it/crew',         app: 'it' },
+  // The Codebase — a SIDEBAR ROW, not the Design tab it was: David's
+  // feedback 9827c699 (2026-09-14) asked for "a page to the IT department
+  // showing the Code base stats" while the trend sat one tab in. permKey-
+  // less like the Crew Board: the department's own numbers, readable by
+  // any operator.
+  'system-codebase':         { id: 'system-codebase',         label: 'Codebase',            path: '/it/codebase',     app: 'it' },
   'system-estate':           { id: 'system-estate',           label: 'Estate',              path: '/it/estate',       permKey: 'system-estate',           app: 'it' },
   'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               app: 'it' },
   // Unlisted door: reachable, never a sidebar row.
   'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              app: 'it' },
 };
 
-/// The apps this host offers: Home, Simulator, and one per department
-/// that actually owns a surface.
+/// The apps this host offers: Home, Simulator when the tenant has one,
+/// and one per department the tenant's Class registry declares.
 ///
-/// DERIVED, not listed. The previous version was a hand-maintained
-/// `DEPARTMENT_APP` map from each department to one of eight invented
-/// apps, and its own comment predicted this change — "the app list
-/// probably wants DERIVING from the Class registry rather than
-/// hand-listing". It does, and now it is: an app exists because a
-/// department owns a surface, so adding a surface with a new `app`
-/// creates the tab and nothing here changes (CLAUDE.md §9).
+/// DERIVED, not listed, and since ce68f137 derived from the REGISTRY:
+/// the departments are the `(employee, *, department)` rows the SPA
+/// loads at boot, in their sort order, so a tenant adds a tab by
+/// adding a Class row (CLAUDE.md §9). The previous version filtered a
+/// hardcoded list down to the departments owning a catalog surface,
+/// which read one tenant's org chart and left Algedonic's
+/// `operations` with no tab at all.
 ///
-/// Departments with NO surface get no tab, deliberately. Algedonic
-/// Ales has packaging, taproom and audit employees and not one screen
-/// built for them yet; a tab opening an empty sidebar would claim
-/// otherwise. `departmentsWithoutSurfaces()` reports them so the gap
-/// stays visible instead of silently reading as covered.
+/// A department with no surface of its own still gets its tab — that
+/// is the org chart, and the tenant declared it — and lands on its
+/// own jobs view: the packets whose workflow declares the department,
+/// as in / working / out (cc76f755, 2026-09-18). Until then it landed
+/// on All jobs with Home highlighted, which read as "this department
+/// has no work" for Algedonic's operations, sales, finance and
+/// marketing. `departmentsWithoutSurfaces()` still reports which
+/// departments have no built surface, so the gap stays visible
+/// instead of reading as covered.
 const OWNED = new Set<string>(
   Object.values(ROUTE_CATALOG)
     .map((e) => e.app)
     .filter((a): a is AppId => a !== undefined && a !== 'home' && a !== 'simulator'),
 );
 
-/// Departments that own at least one surface, in registry order.
-export const DEPARTMENT_APPS: ReadonlyArray<AppTab> = DEPARTMENTS.filter((d) =>
-  OWNED.has(d.code),
-).map((d) => ({
-  id: d.code,
-  label: d.label,
-  // The department's landing page is its first surface in catalog
-  // order — the same order the sidebar lists them in, so the tab opens
-  // on the row the sidebar shows first rather than an arbitrary pick.
-  href:
-    Object.values(ROUTE_CATALOG).find((e) => e.app === d.code)?.path ?? '/',
-}));
-
-/// The full tab list, left to right.
-export const APPS: ReadonlyArray<AppTab> = [
-  HOME_APP,
-  SIMULATOR_APP,
-  ...DEPARTMENT_APPS,
-];
-
-/// Departments with no surface of their own. Not an error — a report.
-export function departmentsWithoutSurfaces(): ReadonlyArray<string> {
-  return DEPARTMENTS.filter((d) => !OWNED.has(d.code)).map((d) => d.code);
+/// The department jobs view's path — one surface for every declared
+/// department, keyed by its Class code. The router's `department`
+/// route is the other half of this spelling.
+export function departmentJobsPath(code: string): string {
+  return `/ux/departments/${encodeURIComponent(code)}`;
 }
 
-/// Which app an employee of `department` lands in.
-///
-/// Identity now that apps are departments, except that a department
-/// with no surface falls back to Home rather than a tab that does not
-/// exist. That fallback is the honest one: Home is personal work
-/// whichever department it belongs to.
-export function appForDepartment(department: string): AppId {
-  return OWNED.has(department) ? (department as AppId) : 'home';
+/// Where a department's tab lands: its first surface in catalog order
+/// — the same order the sidebar lists them in, so the tab opens on the
+/// row the sidebar shows first — or its jobs view when it owns none.
+/// IT is the one department whose sidebar order is its own list
+/// (AppShell's IT_GROUPS): it leads with the two yards upstream of the
+/// Train Yard and still lands on the Train Yard, because the catalog
+/// keeps 'system-yard' first (design 55417146, 2026-09-18).
+function departmentHref(code: string): string {
+  return Object.values(ROUTE_CATALOG).find((e) => e.app === code)?.path ?? departmentJobsPath(code);
+}
+
+/// One tab per declared department, in registry order.
+export function departmentApps(departments: ReadonlyArray<Department>): ReadonlyArray<AppTab> {
+  return departments.map((d) => ({ id: d.code, label: d.label, href: departmentHref(d.code) }));
+}
+
+/// The full tab list, left to right. Simulator is a tab only for a
+/// tenant whose manifest lists the `sim` module (ce68f137): it drives
+/// the playground's model, and a company running on BOSS has no
+/// simulation to drive.
+export function appsFor(
+  departments: ReadonlyArray<Department>,
+  opts: Readonly<{ simulator: boolean }>,
+): ReadonlyArray<AppTab> {
+  return [HOME_APP, ...(opts.simulator ? [SIMULATOR_APP] : []), ...departmentApps(departments)];
+}
+
+/// Departments with no surface of their own. Not an error — a report.
+export function departmentsWithoutSurfaces(
+  departments: ReadonlyArray<Department>,
+): ReadonlyArray<string> {
+  return departments.filter((d) => !OWNED.has(d.code)).map((d) => d.code);
 }
 
 /// Which app a surface belongs to, looked up by the `activeSection`

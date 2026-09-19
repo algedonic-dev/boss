@@ -95,14 +95,24 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$LINT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$LINT_DIR/lib/scanned.sh" || exit 3
+# shellcheck source=infra/lint/lib/allowlist.sh
+. "$LINT_DIR/lib/allowlist.sh" || exit 3
 
+LINT=api-path-bypass-smell
 STRICT=0
 
-# Known stop-gaps: "<path-fragment>::<reason>". A hit whose file path contains
-# the fragment is skipped (unless --strict). Removing an entry re-trips the
-# lint — the workflow is: land the API path, drop the entry.
+# Known stop-gaps: "<path>::<reason>", the path relative to the repo root. A
+# hit in that file is skipped (unless --strict). Removing an entry re-trips
+# the lint — the workflow is: land the API path, drop the entry. Held to
+# lib/allowlist.sh's two rules: the path exists, and the entry excused a hit
+# this run. infra/check-service-write-roundtrip.sh sat here after its write
+# stopped being one the classifier reports — an allowance for nothing, which
+# would have excused the next real write in that file (backlog cdf2d959).
 ALLOWLIST=(
     # init runs pre-API (clock-api isn't up yet), so the demo-epoch sim_clock
     # prime is a direct control-plane write here — the API path can't reach it
@@ -112,23 +122,37 @@ ALLOWLIST=(
     # The restart-epoch baseline marker is clock control-plane with no API yet.
     # Follow-up: a clock-api 'stamp current state as baseline' endpoint.
     "infra/seed-brewery-tenant.sh::sim_clock restart-baseline marker — control-plane, no API yet"
-    # Write-roundtrip *diagnostic*: it writes then asserts the write is visible.
-    # Not data-loading; the DELETE is its own cleanup.
-    "infra/check-service-write-roundtrip.sh::diagnostic write-roundtrip probe"
     # Retention/GC, not data-loading: purges expired message events on a timer.
     "crates/modules/boss-messages/src/bin/boss_messages_events_purge.rs::message-events retention GC"
     # Migration bookkeeping, not domain data: schema_migrations records which
     # manifest entries a database has applied. Permanent — DDL's ledger is
     # control-plane by nature (docs/design/schema-migrations.md).
     "infra/postgres/migrate.sh::schema_migrations bookkeeping — control-plane, the migration runner itself"
+    # The undoing of a migration's own INSERTs, not domain data: the example
+    # tenants' reference rows that 01-registries.sql / 40-ledger.sql seeded
+    # into every database arrived by DDL-time SQL with no event behind them,
+    # so no API ever created them and none can remove them; the eviction
+    # (boss-init's first start, the retire-example-reference-rows verb)
+    # deletes only rows nothing references, one transaction per table
+    # (backlog 718ac982). A tenant's OWN rows still arrive through the
+    # batch doors.
+    "infra/postgres/example-reference-rows.sh::eviction of migration-seeded example reference rows — control-plane, undoing DDL-time INSERTs no event backs"
 )
+
+allowlist_paths=()
+for entry in "${ALLOWLIST[@]}"; do allowlist_paths+=("${entry%%::*}"); done
+allowlist_paths_exist "$LINT" "${allowlist_paths[@]}"
+allowlist_used=""
 
 allowlisted() {  # $1 = "file:line:content"
     [[ "$STRICT" == 1 ]] && return 1
     local file="${1%%:*}"
     for entry in "${ALLOWLIST[@]}"; do
         local frag="${entry%%::*}"
-        [[ "$file" == *"$frag"* ]] && return 0
+        if [[ "$file" == *"$frag"* ]]; then
+            allowlist_used="$allowlist_used"$'\n'"$frag"
+            return 0
+        fi
     done
     return 1
 }
@@ -307,13 +331,13 @@ self_test() {
     for base in $(cd "$tmp" && ls ./*.sh | sed 's|^\./||'); do
         case "$base" in
             read-*)
-                if printf '%s\n' "$out" | grep -q "/$base:"; then
+                if grep -q "/$base:" <<< "$out"; then
                     echo "api-path-bypass-smell self-test FAIL: $base is a READ but was reported as a write" >&2
                     printf '%s\n' "$out" | grep "/$base:" >&2
                     fails=1
                 fi ;;
             run-*)
-                if ! printf '%s\n' "$out" | grep -q "/$base:"; then
+                if ! grep -q "/$base:" <<< "$out"; then
                     echo "api-path-bypass-smell self-test FAIL: $base RUNS DML but was not reported" >&2
                     fails=1
                 fi ;;
@@ -322,7 +346,7 @@ self_test() {
 
     # The seed-sql loader must be reported under its own category, and the grep
     # that merely quotes that shape must not be.
-    if ! printf '%s\n' "$out" | grep -q "^shell-seed-sql.*/run-psql-loads-seed-sql.sh:"; then
+    if ! grep -q "^shell-seed-sql.*/run-psql-loads-seed-sql.sh:" <<< "$out"; then
         echo "api-path-bypass-smell self-test FAIL: a psql -f seed load lost its shell-seed-sql category" >&2
         fails=1
     fi
@@ -337,6 +361,10 @@ self_test() {
 
 main_scan() {
     local kind hit line
+    # The scan set the classifier lexes: every shell script under infra/.
+    # Zero is a moved directory, not a clean tree.
+    lint_scanned "$LINT" "$(find infra -type f -name '*.sh' | wc -l | tr -d ' ')" \
+        "shell script(s) under infra/, plus every .rs under crates/ for the sqlx pass"
     while IFS=$'\t' read -r kind hit; do
         [[ -z "${kind:-}" ]] && continue
         report "$kind" "$hit"
@@ -368,6 +396,10 @@ main_scan() {
         exit 1
     fi
 
+    # --strict excuses nothing, so nothing can have been used.
+    if [[ "$STRICT" != 1 ]]; then
+        allowlist_entries_used "$LINT" "$allowlist_used" "${allowlist_paths[@]}"
+    fi
     echo "api-path-bypass-smell: clean — no direct-DB data-write end-arounds."
 }
 

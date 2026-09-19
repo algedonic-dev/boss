@@ -101,6 +101,7 @@ fn build_app() -> (Router, Arc<InMemoryJobs>) {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -161,7 +162,7 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
         closed_on: None,
         metadata: serde_json::json!({}),
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     };
     jobs.create_job(&job).await.unwrap();
     // The step as backlog-item now materializes it: the authored
@@ -183,6 +184,7 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
             required: true,
             filled_by: Default::default(),
             item_keys: Vec::new(),
+            covers: None,
         }],
     ))
     .await

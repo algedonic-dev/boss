@@ -38,12 +38,18 @@ toml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-# Test-only, and only for `run_car_probe_sh.rs`: the probe's reader role
-# is written in infra/forge/run-car-probe.sh and DEFINED in core policy's
-# default rules. Two homes for one fact, so the test pins them equal
-# (CLAUDE.md §9a) — `audit-readonly` must grant Read everywhere a probe
-# reads and no non-Read action anywhere. Core → core; no tier crossing.
-boss-policy-client = { path = "../boss-policy-client" }
+# Test-only, for `the_machine_door_carries_every_read_surface.rs`: the
+# ports the LAN machine door (boss-jobs-internal.yaml) exposes, the table
+# the unattended prove door hands the probe reader (infra/forge/sor-ports.env) and
+# the services that reader routes to are three copies of one fact whose
+# definition is boss-ports. Pinned equal (CLAUDE.md §9a; design 28d2bed9).
+boss-ports = { path = "../boss-ports" }
+# Test-only, for `tag_release_sh.rs`: the answer line tag-release.sh
+# prints and the `verdict_pattern` the dispatcher rule complete-release-
+# tag-on-tag-release-answered reads it with are one fact in two files
+# (the script and the rule), so the test compiles the rule's regex and
+# runs it over the script's real output (CLAUDE.md §9a).
+regex = "1"
 
 [[test]]
 name = "migrate_sh"
@@ -51,6 +57,18 @@ required-features = ["postgres"]
 
 [[test]]
 name = "fixture_smoke"
+required-features = ["postgres"]
+
+[[test]]
+name = "tenant_census_sql"
+required-features = ["postgres"]
+
+[[test]]
+name = "switch_instance_database_sql"
+required-features = ["postgres"]
+
+[[test]]
+name = "example_reference_rows_sql"
 required-features = ["postgres"]
 
 [lints]

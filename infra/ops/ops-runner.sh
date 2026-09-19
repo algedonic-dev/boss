@@ -14,9 +14,12 @@
 # - READ-ONLY. Every verb in the allowlist is a read; mutating verbs
 #   are phase 2, behind per-verb policy, and are NOT in this script's
 #   world at all.
-# - THE ALLOWLIST IS THE AUTHORITY: infra/ops/verbs.json, in-tree,
-#   reviewed, versioned. A packet carries only a verb NAME and args;
-#   the command words come from the file. The runner never executes a
+# - THE ALLOWLIST IS THE AUTHORITY: infra/ops/verbs/<name>.json, one
+#   file per verb, in-tree, reviewed, versioned (the verb's name IS
+#   the file name; infra/ops/verbs-allowlist.sh assembles the
+#   directory — 5086842d, after two verb cars collided on the one file
+#   it used to be). A packet carries only a verb NAME and args; the
+#   command words come from the file. The runner never executes a
 #   packet-supplied string.
 # - NO SHELL INTERPOLATION OF ARGS, EVER. The runner builds an argv
 #   ARRAY (`set -- word word ...`) and execs it directly — no sh -c,
@@ -60,6 +63,10 @@
 #   `PUT .../steps/{id}` swaps `metadata` wholesale, so sending only
 #   new keys silently wipes the rest, including `authority_role`
 #   (the boss-step.sh lesson).
+# - Writes the verb's exit onto the REQUEST's metadata (`exit`) before
+#   the step completes, so the `answered` close carries it where the
+#   yard and the rules read (f47861a5). `answered` means the verb ran;
+#   `exit` says how it went.
 # - A per-packet problem (refusal, missing step) never kills the loop;
 #   a transport failure to the SoR fails the unit loudly, systemd
 #   records it red, and the same loud-local-failure posture as the
@@ -75,7 +82,7 @@
 #
 #   HOST_ID        (required) estate node id this runner answers for
 #   BOSS_JOBS_URL  (required, no default — see below) the SoR
-#   OPS_VERBS_FILE (default: verbs.json beside this script)
+#   OPS_VERBS_DIR  (default: verbs/ beside this script) — one file per verb
 #   OPS_TIMEOUT    (default 30) seconds before a verb is killed, unless
 #                  the verb's allowlist entry declares its own `timeout`
 #   OPS_OUTPUT_CAP (default 102400) bytes of output kept
@@ -105,21 +112,38 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
 fi
 BASE="$BOSS_JOBS_URL"
 
-VERBS_FILE="${OPS_VERBS_FILE:-$(dirname "$0")/verbs.json}"
+VERBS_DIR="${OPS_VERBS_DIR:-$(dirname "$0")/verbs}"
+# THE CHECKOUT THIS RUNNER IS PART OF. A verb's script is named in its
+# verb file RELATIVE to the repo (infra/forge/reach.sh) and resolved
+# here, against the checkout the runner itself runs from — never an
+# absolute path baked into the allowlist. Until 2026-09-12 eleven of
+# sixteen verbs carried /home/david/boss/…, the FORGE's checkout path,
+# so none could run on boss-gcp (/opt/boss) and every reader of the
+# file — two lints, the test harness — substituted that prefix for its
+# own: one assumption in four places (66077f9c, CLAUDE.md §9a). A bare
+# command (systemctl, df) stays a bare command, resolved on PATH.
+OPS_REPO_ROOT="${OPS_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 OPS_TIMEOUT="${OPS_TIMEOUT:-30}"
 OPS_OUTPUT_CAP="${OPS_OUTPUT_CAP:-102400}"
 
-if [ ! -r "$VERBS_FILE" ]; then
-    echo "ops-runner: allowlist $VERBS_FILE is missing or unreadable — refusing to run" >&2
+workdir=$(mktemp -d) || exit 1
+trap 'rm -rf "$workdir"' EXIT
+
+# THE ALLOWLIST IS ASSEMBLED ONCE PER RUN from the directory, by the one
+# script every sh/python reader shares, into a file the per-packet jq
+# below reads. A directory that cannot be loaded — missing, empty, a
+# file that is not one verb — is a refusal to run at all (EX_CONFIG,
+# the fault named by the assembler on stderr), never a partial
+# allowlist that refuses every packet as "unknown verb".
+VERBS_FILE="$workdir/allowlist.json"
+if ! sh "$(dirname "$0")/verbs-allowlist.sh" "$VERBS_DIR" > "$VERBS_FILE"; then
+    echo "ops-runner: allowlist directory $VERBS_DIR could not be loaded — refusing to run" >&2
     exit 78
 fi
 
 # An automated answer should read as automation in the audit trail.
 ACTOR="${BOSS_OPS_ACTOR:-automation:ops-runner}"
 BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
-
-workdir=$(mktemp -d) || exit 1
-trap 'rm -rf "$workdir"' EXIT
 
 if ! jobs_json=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
         "$BASE/api/jobs?kind=ops-request&status=open&limit=100" 2>&1); then
@@ -181,10 +205,10 @@ while [ "$i" -lt "$n" ]; do
         .verbs[$verb] as $spec
         | if $verb == "" then refuse("metadata.verb is missing")
           elif $spec == null then
-            refuse("verb \($verb) is not in the allowlist (infra/ops/verbs.json); phase-1 verbs: "
+            refuse("verb \($verb) is not in the allowlist (infra/ops/verbs/); verbs: "
                    + (.verbs | keys | join(", ")))
           elif (($spec.hosts // []) | index($host)) == null then
-            refuse("verb \($verb) does not serve host \($host) — infra/ops/verbs.json scopes it to "
+            refuse("verb \($verb) does not serve host \($host) — infra/ops/verbs/\($verb).json scopes it to "
                    + (if (($spec.hosts // []) | length) == 0
                       then "no host (a verb that declares no `hosts` is refused everywhere)"
                       else ($spec.hosts | join(", ")) end)
@@ -223,6 +247,7 @@ while [ "$i" -lt "$n" ]; do
           end' "$VERBS_FILE")
 
     outf="$workdir/out"
+    disp=""; rc_str=""; script=""
     reason=$(printf '%s' "$decision" | jq -r '.refuse // empty')
     if [ -n "$reason" ]; then
         disp="refused"; rc_str=""
@@ -238,6 +263,26 @@ while [ "$i" -lt "$n" ]; do
         done <<ARGV
 $(printf '%s' "$decision" | jq -r '.argv[]')
 ARGV
+        # argv[0]: a repo-relative script resolves against this checkout
+        # and must exist there — an absent script is a REFUSAL naming the
+        # path, not an exec error dressed up as an answer. A word with no
+        # slash is a bare command for PATH; an absolute path is left as
+        # the allowlist wrote it (the lint refuses those).
+        script=""
+        case "$1" in
+            /*) script="$1" ;;
+            */*) script="$OPS_REPO_ROOT/$1" ;;
+        esac
+        if [ -n "$script" ] && [ ! -x "$script" ]; then
+            reason="verb $verb names a script not in this checkout: $1 (resolved to $script under OPS_REPO_ROOT=$OPS_REPO_ROOT)"
+            disp="refused"; rc_str=""
+            printf '%s' "$reason" > "$outf"
+        fi
+    fi
+    if [ "$disp" != "refused" ]; then
+        if [ -n "$script" ]; then
+            shift; set -- "$script" "$@"
+        fi
         # A verb may declare its own `timeout` in the allowlist (a
         # reviewed number, like its argv); otherwise the runner's
         # default applies. publish-github-pr's first push of the whole
@@ -250,7 +295,16 @@ ARGV
         # unit's outcome lands back on that packet instead of the
         # `answered` that `systemctl start --no-block` earns by merely
         # being accepted (backlog d66f92b2). Data, not program text.
-        OPS_REQUEST_ID="$job_id" timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" > "$rawf" 2>&1 < /dev/null
+        #
+        # SO DOES THE ACTOR. A verb whose argv is the tree's own CLI
+        # (`boss prove … --unattended`, run-car-probe since backlog
+        # 9f00a805 car 2) signs its jobs-API writes as BOSS_ACTOR and
+        # REFUSES a write unnamed (CLAUDE.md §Doors); this runner's own
+        # account is the one it should sign as, the same identity the
+        # step completion below carries. A unit that set BOSS_ACTOR
+        # itself wins — the drop-in is the operator's say.
+        OPS_REQUEST_ID="$job_id" BOSS_ACTOR="${BOSS_ACTOR:-$ACTOR}" \
+            timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" > "$rawf" 2>&1 < /dev/null
         rc=$?
         size=$(wc -c < "$rawf")
         if [ "$size" -gt "$OPS_OUTPUT_CAP" ]; then
@@ -279,6 +333,31 @@ ARGV
         + (if $d == "refused" then {reason: $out} else {} end)')
     payloadf="$workdir/payload"
     printf '%s' "$merged" | jq -c '{status: "completed", metadata: .}' > "$payloadf"
+
+    # THE EXIT RIDES THE REQUEST, not only the step (backlog f47861a5,
+    # measured 2026-09-19 on c98a782f): publish-github-pr printed FAILED
+    # and exited 1, this runner recorded `exit_code: "1"` on the step,
+    # the request closed `answered` — the verb RAN, which is all the
+    # outcome names — and nothing at the request level said so, so the
+    # yard drew it like any answered request and the publish step it was
+    # filed for sat ready for five hours. The verb's exit goes onto the
+    # request's own metadata through the merge door FIRST, so the close
+    # the step completion triggers is read with the exit already on it.
+    # A refusal ran nothing and carries none. A failed merge does not
+    # withhold the answer — the step completion below still lands — but
+    # it is counted, and the unit goes red for it.
+    if [ "$disp" = "answered" ]; then
+        exitf="$workdir/exit"
+        jq -cn --arg rc "$rc_str" '{exit: $rc}' > "$exitf"
+        if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+                -H "x-boss-user: $BOSS_USER" \
+                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                --data-binary @"$exitf" \
+                "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
+            echo "ops-runner: PATCH exit=$rc_str failed on $short — $patch_err" >&2
+            failed=$((failed + 1))
+        fi
+    fi
 
     if ! put_err=$(curl -fsS -X PUT -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \

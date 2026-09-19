@@ -37,8 +37,10 @@
 //! CALIBRATION, so the alarm is worth trusting:
 //! - HARD findings only — `not_ready` (a declared node that is sick),
 //!   `declared_not_observed` (a declared node that is GONE),
-//!   `disk_tight` (a host below the floor a gate needs), and
-//!   `units_unhealthy` (a watched unit the observer derived sick).
+//!   `disk_tight` (a host below the floor a gate needs),
+//!   `units_unhealthy` (a watched unit the observer derived sick), and
+//!   `dead_letters_unrecorded` (a dispatcher dead-letter with no
+//!   durable record anywhere else, 8834804a).
 //!   `observed_not_declared` is a paperwork gap and `drift` is config
 //!   — real, but not 03:00-urgent, and an alarm that cries over
 //!   paperwork trains operators to ignore it.
@@ -50,6 +52,22 @@
 //!   persistence, already integrated over time.
 //! - DEDUP against open packets carrying the same `estate_finding`
 //!   key: a persisting condition is ONE packet, not one per firing.
+//!
+//! THE PACKET'S `(scope, host)` IS THE SERIES KEY THE ROWS CARRY, not
+//! the series' name. `estate.recover` closes an alarm by finding N
+//! clean rows of the SAME series after the raise, matching on the
+//! packet's `(scope, host)` exactly as persistence filters rows — so a
+//! raise that stamps a key the rows do not carry files an alarm nothing
+//! can ever close. The silence sweep did exactly that for the cluster
+//! observer (3908d555): `unobserved:kubernetes-nodes` was stamped
+//! `host = "kubernetes-nodes"` because the series' NAME is its scope,
+//! while every kubernetes-nodes comparison row is host-less — and the
+//! alarm class that recovers most often (an observer restart) was the
+//! one still closed by hand. A stale entry therefore carries `series`
+//! (what it is called — the host for a self-scoped series, the scope
+//! for the cluster's) for the key and the title, and `host` only when
+//! the rows are stamped with one. The packet describes the series
+//! truthfully: the cluster has no host, so its alarm has none.
 //!
 //! The raise is an URGENT packet on the operator's queue naming host +
 //! condition + the latest evidence excerpt. Delivery beyond the queue
@@ -69,7 +87,7 @@ use serde_json::{Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{api_client, get_json, post_json};
+use super::common::{api_client, get_json, owner_for_filing, post_json};
 use super::estate_compare::{HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE};
 
 /// Consecutive same-series comparisons a hard finding must survive to
@@ -80,7 +98,7 @@ use super::estate_compare::{HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE};
 /// minutes; the daily host-disk series in three readings, which is
 /// what its cadence affords — tightening that is a timer-file change,
 /// not an alarm change.)
-const PERSIST_N: usize = 3;
+pub(super) const PERSIST_N: usize = 3;
 
 /// A series is stale when its newest observation is older than this
 /// many of its own measured cadences. Three, like PERSIST_N and for
@@ -115,14 +133,23 @@ pub struct EstateAlarm {
     /// The dispatcher is not on the no-wallclock allowlist, so this
     /// comes from the clock service like every other stamp.
     clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// Who the packets this handler files are owned by — the platform
+    /// owner through the port (backlog 3c23662d), resolved once per
+    /// invocation by `common::owner_for_filing`; never a literal.
+    owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
 }
 
 impl EstateAlarm {
-    pub fn new(jobs_base: impl Into<String>, clock_url: impl Into<String>) -> Arc<Self> {
+    pub fn new(
+        jobs_base: impl Into<String>,
+        clock_url: impl Into<String>,
+        owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
             jobs_base: jobs_base.into(),
             clock: Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
+            owner,
         })
     }
 
@@ -156,6 +183,13 @@ fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
         // The host scope's disk floor (49a8d842): a machine below the
         // headroom a full gate needs is as hard as a sick node.
         ("disk_tight", "disk_tight"),
+        // A dead-letter that left NO durable record (8834804a): no
+        // packet to annotate, or the annotation write was itself the
+        // failure. The dispatcher counted it on its own surface, the
+        // cluster observer carried the count here, and this is the
+        // reader that owes nothing to the jobs API — the path CLAUDE.md
+        // §Diagnosis asks of an arm. Keyed on the dispatcher's id.
+        ("dead_letters_unrecorded", "dead_letters_unrecorded"),
     ] {
         for v in entries(comparison, field) {
             let id = v
@@ -184,7 +218,7 @@ fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
 
 /// Just the keys of [`hard_findings`] — the set the persistence
 /// intersection runs over.
-fn hard_finding_keys(comparison: &Value) -> BTreeSet<String> {
+pub(super) fn hard_finding_keys(comparison: &Value) -> BTreeSet<String> {
     hard_findings(comparison)
         .into_iter()
         .map(|(k, _)| k)
@@ -234,8 +268,12 @@ fn persistent_keys(
 /// envelope `timestamp`); the cadence is the median gap between
 /// consecutive observations, so the test needs no copy of any timer
 /// file's schedule and survives the schedule changing. Returns one
-/// entry per stale series: host, scope, last_observed_at, cadence_s,
-/// age_s — the evidence the raise will carry.
+/// entry per stale series: series, scope, last_observed_at, cadence_s,
+/// age_s — the evidence the raise will carry — plus `host` on a
+/// per-host series only. `series` is what the series is CALLED (the
+/// host for a self-scoped series, the scope for the cluster's); `host`
+/// is what its comparison rows are STAMPED with, and the cluster's
+/// rows carry none (3908d555).
 fn stale_series(rows: &[Value], per_host: bool, scope: &str, now: DateTime<Utc>) -> Vec<Value> {
     let mut series: BTreeMap<String, Vec<DateTime<Utc>>> = BTreeMap::new();
     for row in rows {
@@ -275,13 +313,17 @@ fn stale_series(rows: &[Value], per_host: bool, scope: &str, now: DateTime<Utc>)
         let cadence = gaps[gaps.len() / 2].max(STALE_MIN_CADENCE_S);
         let age = (now - times[0]).num_seconds();
         if age > STALE_MULTIPLIER * cadence {
-            out.push(json!({
-                "host": id,
+            let mut entry = json!({
+                "series": id,
                 "scope": scope,
                 "last_observed_at": times[0].to_rfc3339(),
                 "cadence_s": cadence,
                 "age_s": age,
-            }));
+            });
+            if per_host {
+                entry["host"] = json!(id);
+            }
+            out.push(entry);
         }
     }
     out
@@ -303,10 +345,16 @@ const SETTLED_DAYS: i64 = 7;
 /// stays well under this in steady state; a `total` past it trips the
 /// truncation HOLD in [`dedup_page_complete`] rather than raising blind.
 /// This is the jobs API's own `MAX_LIMIT`, the largest page it serves.
-const DEDUP_PAGE: usize = 1000;
+pub(super) const DEDUP_PAGE: usize = 1000;
 
-/// `estate_finding` keys whose packet a human closed as `stale` or
+/// `estate_finding` keys whose packet a HUMAN closed as `stale` or
 /// `duplicate` within [`SETTLED_DAYS`] — pure over the closed listing.
+///
+/// A close `estate.recover` made is excluded (ef421cd3): it closes a
+/// recovered alarm as `stale` too, stamped `cleared_by`, and the
+/// machine's answer must not suppress the next genuine raise of the
+/// same finding. A unit that recovers and dies again inside the day
+/// is two conditions, not one settled question.
 fn settled_recently(closed_jobs: &[Value], now: DateTime<Utc>) -> BTreeSet<String> {
     closed_jobs
         .iter()
@@ -321,14 +369,18 @@ fn settled_recently(closed_jobs: &[Value], now: DateTime<Utc>) -> BTreeSet<Strin
             if (now.date_naive() - closed).num_days() > SETTLED_DAYS {
                 return None;
             }
-            let settled = j
-                .get("steps")
-                .and_then(Value::as_array)
+            let steps = j.get("steps").and_then(Value::as_array);
+            let settled = steps
                 .into_iter()
                 .flatten()
                 .filter_map(|s| s.get("metadata")?.get("disposition")?.as_str())
                 .any(|d| d == "stale" || d == "duplicate");
-            settled.then_some(key)
+            let machine_cleared = steps
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("metadata")?.get("cleared_by")?.as_str())
+                .any(|c| c == super::estate_recover::CLEARED_BY);
+            (settled && !machine_cleared).then_some(key)
         })
         .collect()
 }
@@ -376,7 +428,14 @@ fn excerpt(entry: &Value) -> String {
 /// `unit_unhealthy:boss-gcp/boss-train.service`), so the title does
 /// too; the excerpt is the finding's entry from the TRIGGERING
 /// comparison — the latest reading, not a stale one.
-fn alarm_body(key: &str, scope: &str, host: Option<&str>, evidence: &str, excerpt: &str) -> Value {
+fn alarm_body(
+    key: &str,
+    scope: &str,
+    host: Option<&str>,
+    evidence: &str,
+    excerpt: &str,
+    owner: &str,
+) -> Value {
     let mut metadata = json!({
         "area": "estate",
         "estate_finding": key,
@@ -399,7 +458,9 @@ fn alarm_body(key: &str, scope: &str, host: Option<&str>, evidence: &str, excerp
         "kind": "backlog-item",
         "title": format!("ESTATE ALARM: {key} persisted {PERSIST_N} consecutive comparisons"),
         "subject": {"subject_kind": "custom", "id": "bosspipeline"},
-        "owner_id": "emp-david",
+        // The platform owner as the registry answers it, or nobody for
+        // the jobs API to resolve from the kind's owner_role (3c23662d).
+        "owner_id": owner,
         "priority": "urgent",
         "status": "open",
         "tags": [],
@@ -407,13 +468,14 @@ fn alarm_body(key: &str, scope: &str, host: Option<&str>, evidence: &str, excerp
     })
 }
 
-/// The dedup key of one stale series: `unobserved:<host>` — one
-/// condition per quiet host, even when both of its series go dark.
+/// The dedup key of one stale series: `unobserved:<series>` — one
+/// condition per quiet host, even when both of its series go dark;
+/// `unobserved:kubernetes-nodes` for the cluster observer.
 fn unobserved_key(stale: &Value) -> String {
     format!(
         "unobserved:{}",
         stale
-            .get("host")
+            .get("series")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
     )
@@ -421,40 +483,53 @@ fn unobserved_key(stale: &Value) -> String {
 
 /// The urgent packet one quiet series becomes. No persistence count in
 /// the title — the staleness window IS the persistence.
-fn staleness_body(stale: &Value, evidence: &str) -> Value {
-    let host = stale
-        .get("host")
+///
+/// `host` is stamped only when the series has one. The packet's
+/// `(scope, host)` is the key `estate.recover` matches it to its
+/// comparison rows by, so it must be the key the ROWS carry: the
+/// cluster scope's rows are host-less, and a cluster alarm stamped with
+/// the series name as its host matched no series and never auto-closed
+/// (3908d555). The title and detail still name the series.
+fn staleness_body(stale: &Value, evidence: &str, owner: &str) -> Value {
+    let series = stale
+        .get("series")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let scope = stale.get("scope").and_then(Value::as_str).unwrap_or("?");
+    let mut metadata = json!({
+        "area": "estate",
+        "estate_finding": unobserved_key(stale),
+        "scope": scope,
+        "detail": format!(
+            "Raised by estate.alarm's silence sweep (a7a19a1a: an alarm that only \
+             hears what its sources say dies with its patient — an expected series \
+             that stops arriving IS a finding). The `{scope}` observation series \
+             for `{series}` went quiet: {evidence_json}. Either the observer died \
+             (the quiet-observer class) or the host itself is down; either way \
+             nothing downstream of this series can see that host any more. \
+             Evidence: {evidence}. The series rides \
+             /api/estate/observations?scope={scope}.",
+            evidence_json = excerpt(stale),
+        ),
+    });
+    if let (Some(h), Some(obj)) = (
+        stale.get("host").and_then(Value::as_str),
+        metadata.as_object_mut(),
+    ) {
+        obj.insert("host".into(), json!(h));
+    }
     json!({
         "kind": "backlog-item",
         "title": format!(
-            "ESTATE ALARM: {host} unobserved — {scope} series quiet past \
+            "ESTATE ALARM: {series} unobserved — {scope} series quiet past \
              {STALE_MULTIPLIER}x cadence"
         ),
         "subject": {"subject_kind": "custom", "id": "bosspipeline"},
-        "owner_id": "emp-david",
+        "owner_id": owner,
         "priority": "urgent",
         "status": "open",
         "tags": [],
-        "metadata": {
-            "area": "estate",
-            "estate_finding": unobserved_key(stale),
-            "scope": scope,
-            "host": host,
-            "detail": format!(
-                "Raised by estate.alarm's silence sweep (a7a19a1a: an alarm that only \
-                 hears what its sources say dies with its patient — an expected series \
-                 that stops arriving IS a finding). The `{scope}` observation series \
-                 for `{host}` went quiet: {evidence_json}. Either the observer died \
-                 (the quiet-observer class) or the host itself is down; either way \
-                 nothing downstream of this series can see that host any more. \
-                 Evidence: {evidence}. The series rides \
-                 /api/estate/observations?scope={scope}.",
-                evidence_json = excerpt(stale),
-            ),
-        },
+        "metadata": metadata,
     })
 }
 
@@ -483,6 +558,7 @@ impl Handler for EstateAlarm {
             "triggering event {} on topic {}",
             ctx.triggering_event_id, ctx.triggering_topic
         );
+        let owner = owner_for_filing(self.owner.as_ref(), &ctx.rule_name).await;
 
         // First-key-wins map: two stale series on one host collapse to
         // one raise before the dedup fetch ever runs.
@@ -534,7 +610,7 @@ impl Handler for EstateAlarm {
                             .find(|(k, _)| *k == key)
                             .map(|(_, e)| excerpt(e))
                             .unwrap_or_default();
-                        let body = alarm_body(&key, scope, host, &evidence, &latest);
+                        let body = alarm_body(&key, scope, host, &evidence, &latest, &owner);
                         to_raise.entry(key).or_insert(body);
                     }
                 }
@@ -575,7 +651,7 @@ impl Handler for EstateAlarm {
                 .cloned()
                 .unwrap_or_default();
             for stale in stale_series(&rows, per_host, watched_scope, now) {
-                let body = staleness_body(&stale, &evidence);
+                let body = staleness_body(&stale, &evidence, &owner);
                 to_raise.entry(unobserved_key(&stale)).or_insert(body);
             }
         }
@@ -745,6 +821,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecorded_dead_letter_is_hard_and_an_unread_dispatcher_is_not() {
+        // 8834804a: a dead-letter with no packet, or whose annotation
+        // write failed, has the dispatcher's own counter as its only
+        // record that outlives the log line. estate.compare carries it
+        // into the cluster series as `dead_letters_unrecorded`; it has
+        // to be HARD here or the path ends one hop short of a reader.
+        // `dispatcher_unread` is the best-effort read going dark —
+        // informational, like disk_unmeasured, so it does not wake anyone.
+        let mut c = comparison("kubernetes-nodes", &[], &[]);
+        c["findings"]["dead_letters_unrecorded"] = json!([{
+            "id": "boss-dispatcher", "dead_letters": 5,
+            "dead_letters_unrecorded": 2, "age_s": 600 }]);
+        c["findings"]["dispatcher_unread"] = json!(null);
+        assert_eq!(
+            hard_finding_keys(&c).into_iter().collect::<Vec<_>>(),
+            vec!["dead_letters_unrecorded:boss-dispatcher".to_string()],
+        );
+        let mut c = comparison("kubernetes-nodes", &[], &[]);
+        c["findings"]["dead_letters_unrecorded"] = json!([]);
+        c["findings"]["dispatcher_unread"] = json!("curl: (7) Failed to connect");
+        assert!(hard_finding_keys(&c).is_empty(), "unread is informational");
+    }
+
+    #[test]
     fn an_unhealthy_unit_keys_by_host_and_unit() {
         // The quiet conductor: dead boss-train.service on boss-gcp must
         // be a different condition than the same unit dead elsewhere.
@@ -895,8 +995,16 @@ mod tests {
 
     #[test]
     fn the_alarm_packet_is_urgent_and_carries_the_key() {
-        let b = alarm_body("not_ready:cp-2", "kubernetes-nodes", None, "evt", "");
+        let b = alarm_body(
+            "not_ready:cp-2",
+            "kubernetes-nodes",
+            None,
+            "evt",
+            "",
+            "emp-owner",
+        );
         assert_eq!(b["priority"], "urgent");
+        assert_eq!(b["owner_id"], "emp-owner", "the owner is the one handed in");
         assert_eq!(b["metadata"]["estate_finding"], "not_ready:cp-2");
         assert!(b["title"].as_str().unwrap().contains("not_ready:cp-2"));
     }
@@ -911,6 +1019,7 @@ mod tests {
             Some("boss-gcp"),
             "evt",
             &excerpt(&entry),
+            "emp-owner",
         );
         let title = b["title"].as_str().unwrap();
         assert!(title.contains("boss-gcp/boss-train.service"));
@@ -1033,17 +1142,64 @@ mod tests {
         ];
         let stale = stale_series(&rows, false, "kubernetes-nodes", n);
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0]["host"], "kubernetes-nodes");
+        assert_eq!(stale[0]["series"], "kubernetes-nodes");
+        assert!(
+            stale[0].get("host").is_none(),
+            "the cluster series has no host, so its stale entry carries none (3908d555)"
+        );
+    }
+
+    #[test]
+    fn a_per_host_stale_entry_names_its_host_as_the_series() {
+        let n = now();
+        let rows = [
+            obs_row("host-units", "boss-gcp", &at(n, 60)),
+            obs_row("host-units", "boss-gcp", &at(n, 65)),
+            obs_row("host-units", "boss-gcp", &at(n, 70)),
+        ];
+        let stale = stale_series(&rows, true, "host-units", n);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0]["series"], "boss-gcp");
+        assert_eq!(stale[0]["host"], "boss-gcp");
+    }
+
+    #[test]
+    fn the_cluster_silence_alarm_carries_no_host_because_its_series_has_none() {
+        // 3908d555: the raise stamped host = "kubernetes-nodes" (the
+        // series name) while every kubernetes-nodes comparison row is
+        // host-less, so estate.recover — which matches an alarm to its
+        // series on (scope, host) exactly as persistence does — matched
+        // it to nothing and the one alarm that recovers most often (an
+        // observer restart) was the one still closed by hand. The
+        // packet describes the series truthfully: no host. The key and
+        // the title still name the series.
+        let stale = json!({
+            "series": "kubernetes-nodes", "scope": "kubernetes-nodes",
+            "last_observed_at": "2026-09-03T11:20:00+00:00",
+            "cadence_s": 900, "age_s": 3600,
+        });
+        let b = staleness_body(&stale, "evt", "emp-owner");
+        assert_eq!(
+            b["metadata"]["estate_finding"],
+            "unobserved:kubernetes-nodes"
+        );
+        assert_eq!(b["metadata"]["scope"], "kubernetes-nodes");
+        assert!(
+            b["metadata"].get("host").is_none(),
+            "a host-less series raises a host-less alarm, the shape recovery matches"
+        );
+        let title = b["title"].as_str().unwrap();
+        assert!(title.contains("kubernetes-nodes") && title.contains("unobserved"));
     }
 
     #[test]
     fn the_staleness_packet_is_urgent_and_names_host_and_condition() {
         let stale = json!({
-            "host": "boss-gcp", "scope": "host-units",
+            "series": "boss-gcp", "host": "boss-gcp", "scope": "host-units",
             "last_observed_at": "2026-09-03T11:20:00+00:00",
             "cadence_s": 300, "age_s": 2400,
         });
-        let b = staleness_body(&stale, "evt");
+        let b = staleness_body(&stale, "evt", "emp-owner");
         assert_eq!(b["priority"], "urgent");
         assert_eq!(b["metadata"]["estate_finding"], "unobserved:boss-gcp");
         assert_eq!(b["metadata"]["host"], "boss-gcp");
@@ -1058,9 +1214,10 @@ mod tests {
     fn two_quiet_series_on_one_host_share_one_dedup_key() {
         // Both the host and host-units series going dark is ONE sick
         // host, not two packets.
-        let a = json!({"host": "boss-gcp", "scope": "host"});
-        let b = json!({"host": "boss-gcp", "scope": "host-units"});
+        let a = json!({"series": "boss-gcp", "host": "boss-gcp", "scope": "host"});
+        let b = json!({"series": "boss-gcp", "host": "boss-gcp", "scope": "host-units"});
         assert_eq!(unobserved_key(&a), unobserved_key(&b));
+        assert_eq!(unobserved_key(&a), "unobserved:boss-gcp");
     }
 
     fn closed_alarm(key: &str, closed_on: &str, disposition: &str) -> Value {
@@ -1104,6 +1261,39 @@ mod tests {
         assert!(
             !settled.contains("not_ready:cp-2"),
             "closed as BUILT — a recurrence after a fix is a new fact"
+        );
+    }
+
+    #[test]
+    fn a_machine_clear_does_not_suppress_but_a_human_stale_does() {
+        // ef421cd3: `estate.recover` closes a recovered alarm as
+        // `stale`, the same disposition a human uses. Read as a human
+        // answer it would silence the next genuine raise of that
+        // finding for a week — a unit that recovers and then dies
+        // again inside the day would never re-raise. The machine's
+        // close is stamped `cleared_by`, and that stamp is what tells
+        // the two apart.
+        let now = Utc.with_ymd_and_hms(2026, 9, 14, 20, 0, 0).unwrap();
+        let mut machine = closed_alarm(
+            "unit_unhealthy:boss-gcp/boss-codebase-metrics.service",
+            "2026-09-14",
+            "stale",
+        );
+        machine["steps"][0]["metadata"]["cleared_by"] =
+            json!(crate::handlers::estate_recover::CLEARED_BY);
+        let human = closed_alarm(
+            "unit_unhealthy:boss-gcp/other.service",
+            "2026-09-14",
+            "stale",
+        );
+        let settled = settled_recently(&[machine, human], now);
+        assert!(
+            !settled.contains("unit_unhealthy:boss-gcp/boss-codebase-metrics.service"),
+            "a recovery the machine recorded must not suppress the next raise"
+        );
+        assert!(
+            settled.contains("unit_unhealthy:boss-gcp/other.service"),
+            "a human's stale still holds for the week"
         );
     }
 }

@@ -318,7 +318,11 @@ seed_target() {
         return 0
     fi
     local t0=$SECONDS
-    if ( flock -s -w 900 9 && cp -a "$SEED/target/." /gate-target/target/ ) 9>>"$SEED_LOCK"; then
+    # --reflink=auto: on one filesystem (the seed is a local PV on the
+    # build node's xfs since 5b3dabb5) this shares extents and writes
+    # only metadata; anywhere else it falls back to a plain copy. The
+    # timing line below is the measurement either way.
+    if ( flock -s -w 900 9 && cp -a --reflink=auto "$SEED/target/." /gate-target/target/ ) 9>>"$SEED_LOCK"; then
         echo "gate-runner: target seeded from head $(cat "$SEED/.seed-head" 2>/dev/null || echo '<unrecorded>') in $((SECONDS - t0))s"
     else
         echo "gate-runner: seed copy failed or lock timed out after $((SECONDS - t0))s — cold build instead"
@@ -403,10 +407,26 @@ trap - ERR
 # packets carried `[]`. "Nothing failed" and "nobody wrote the field"
 # must not look the same.
 #
+# `fails_excerpt` IS THE REPLAY, ON THE RECORD (backlog 5708cbd5). Train
+# #361's red gate (2026-09-14) took this one level further down: `fails`
+# named the test and said "no panic line for it in this check's output",
+# and the assertion text was in the replay below - which only `kubectl
+# logs` serves, and the forge, the yard and `boss orient` cannot run it.
+# So the SAME lines the replay prints for each failed check are written
+# to the receipt as `fails_excerpt: {"<check>": "..."}`, bounded, so the
+# gate-run packet's record-verdict step carries WHY and the red-train
+# alert can attach it the way it attaches a forge check's log. It is
+# `{}` when nothing failed, for the reason `fails` is `[]`.
+#
 # EVERY CAP BELOW IS DELIBERATE AND STATES ITSELF. A suite failing 200
 # tests must not write a receipt nobody can read; a cap that silently
 # drops the remainder is the 778 KB-log-tailed-to-16 KB defect wearing a
-# different hat, so each one carries the count of what it left out.
+# different hat, so each one carries the count of what it left out. The
+# excerpt's own caps are sized to the transport: the receipt rides the
+# step's metadata as one JSON string, and `report_once` hands it to
+# python as ONE argv string - 128 KB per argument on Linux - so ~24 KB of
+# excerpt in all keeps the whole receipt well inside that with the rest
+# of gate.sh's account beside it.
 python3 - "$RECEIPT" /gate-target/gate.log /gate-target/failed-checks.txt <<'PY' || echo "gate-runner: failure-detail extractor crashed - the receipt keeps whatever gate.sh wrote"
 import json, os, re, sys
 from collections import deque
@@ -420,6 +440,10 @@ PER_CHECK = 5          # named failures per check on the receipt
 TOTAL_ENTRIES = 40     # entries on the whole receipt
 ENTRY_CHARS = 400      # characters per entry
 QUOTE_LINES = 3        # raw lines quoted for a check this cannot parse
+EXCERPT_CHARS = 6000   # characters of `fails_excerpt` per failed check
+EXCERPT_TOTAL = 24000  # characters of `fails_excerpt` on the whole receipt
+EXCERPT_FLOOR = 400    # below this much budget left, a check's excerpt is omitted, stated
+EXCERPT_CONTEXT = 40   # lines kept above the first failure marker
 
 try:
     with open(log_path, errors="replace") as fh:
@@ -535,6 +559,20 @@ def panics(body):
     return out
 
 
+# Playwright's own verdict lines, in the order a reader acts on them:
+# the per-spec `✘` marker (the spec's name), the run's `N failed`
+# roll-up, its `Error:` line, and the Expected/Received diff - whose
+# `+`/`-` lines hold the received value (the 3 s click timeout the
+# operator had to pull the Job log for).
+RE_SPEC_FAIL = re.compile(r"^\s*✘\s")
+RE_SPEC_SUMMARY = re.compile(r"^\s*\d+ failed\b")
+RE_SPEC_DIFF_HEAD = re.compile(r"^\s*[-+] (Expected|Received)\b")
+RE_SPEC_DIFF_LINE = re.compile(r"^\s*[-+] ")
+RE_SPEC_DIFF_END = re.compile(r"^\s*>?\s*\d+ \||^\s*\d+\) ")   # the code frame, or the next failure
+DIFF_LINES = 8         # `+`/`-` lines of one Expected/Received diff kept in its entry
+DIFF_SCAN = 60         # lines read past a diff header before giving up on its end
+
+
 def error_lines(body):
     """Error lines with their `-->` location, for checks that are not
     cargo-test-shaped: a compile error, clippy, svelte-check. This is as
@@ -552,6 +590,91 @@ def error_lines(body):
     return out
 
 
+def spec_verdicts(body):
+    """Playwright's verdict lines, ranked - or `[]` for a check that is
+    not Playwright-shaped (no `✘` marker and no `N failed` roll-up), so
+    an `Error:` line from svelte-check is never called a failing spec.
+    Each Expected/Received diff is ONE entry: its two headers and up to
+    DIFF_LINES of its `+`/`-` lines, saying how many more there were.
+    (Backlog 3a6f61d6, 2026-09-18: until this ranking existed the alert
+    quoted five of the mocked runner's connect-noise lines over the
+    verdict beside them; the noise itself was deleted at its source on
+    2026-09-19, 82b87a09, so nothing here filters it any more.)"""
+    fails, summary, errors, diffs = [], [], [], []
+    i = 0
+    while i < len(body):
+        line = body[i]
+        if RE_SPEC_FAIL.match(line):
+            fails.append(line.strip())
+        elif RE_SPEC_SUMMARY.match(line):
+            summary.append(line.strip())
+        elif RE_SPEC_DIFF_HEAD.match(line):
+            head, rows, scanned = [], [], 0
+            while i < len(body) and RE_SPEC_DIFF_HEAD.match(body[i]):
+                head.append(body[i].strip())
+                i += 1
+            # The diff's rows sit among unmarked context lines (`Array [`,
+            # `]`) and end at the code frame or the next numbered failure.
+            while i < len(body) and scanned < DIFF_SCAN \
+                    and not RE_SPEC_DIFF_END.match(body[i]) \
+                    and not RE_SPEC_FAIL.match(body[i]) \
+                    and not RE_SPEC_SUMMARY.match(body[i]):
+                if RE_SPEC_DIFF_LINE.match(body[i]):
+                    rows.append(body[i].strip())
+                i += 1
+                scanned += 1
+            kept = rows[:DIFF_LINES]
+            if len(rows) > DIFF_LINES:
+                kept.append("(+%d more diff line(s); the excerpt has them)" % (
+                    len(rows) - DIFF_LINES))
+            diffs.append(" / ".join(head + kept))
+            continue
+        elif RE_ERROR.match(line) and line.lstrip().startswith("Error"):
+            errors.append(line.strip())
+        i += 1
+    if not fails and not summary:
+        return []
+    return fails + summary + errors + diffs
+
+
+RE_UNREACHABLE = re.compile(
+    r"Unable to connect|Could not resolve host|Temporary failure in name resolution|"
+    r"failed to lookup address|Connection timed out|Network is unreachable|"
+    r"ConnectionRefused|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|"
+    r"Couldn't connect to server|Could not connect to|error sending request for url")
+# Two ways to say "I could not judge the tree" that must NOT be
+# mistaken for "the tree is bad". A local backend refused (127.0.0.1,
+# localhost) is the CAR's failure — a mocked suite reaching for a
+# service it was never given — and stays a red (478347ad, corrected
+# 2026-09-11 after exactly that misreading).
+RE_LOCAL = re.compile(r"127\.0\.0\.1|localhost|\[::1\]")
+
+
+def network_refusal(name, body):
+    """`None`, or the reason a failed check is a REFUSAL rather than a
+    verdict: its failure lines are connect/resolve errors against
+    somewhere off this machine, and NOTHING judged the tree — no failing
+    test, no panic, no compile error line that is not itself about the
+    network. Gate-run 7522c115 (2026-09-11): 232 bun "Unable to connect"
+    lines against registry.npmjs.org, verdict=failed against a branch
+    that was never judged; the registry answered two minutes later.
+    The receipt's own `fails` said "no cargo test failure" over the
+    connect errors — the diagnosis was on the record and nothing acted.
+    """
+    hits = [l for l in body if RE_UNREACHABLE.search(l) and not RE_LOCAL.search(l)]
+    if len(hits) < 3:
+        return None
+    if failing_tests(body) or panics(body) or spec_verdicts(body):
+        return None
+    judged = [e for e in error_lines(body) if not RE_UNREACHABLE.search(e)
+              and not re.search(r"InstallFailed|install failed|network", e)]
+    if judged:
+        return None
+    return ("network unreachable during %s: %d connect/resolve error line(s) and no test, "
+            "panic or compile failure - the run could not judge the tree; re-gate when the "
+            "network answers (first: %s)" % (name, len(hits), hits[0].strip()[:160]))
+
+
 def clip(entry):
     """One entry, one line, bounded - and saying by how much."""
     entry = " ".join(entry.split())
@@ -559,6 +682,73 @@ def clip(entry):
         return entry
     return entry[:ENTRY_CHARS] + "... (+%d char(s); the Job log replay has the full text)" % (
         len(entry) - ENTRY_CHARS)
+
+
+RE_MARK = (RE_STDOUT, RE_PANIC_OLD, RE_PANIC_NEW, RE_ERROR, RE_SPEC_FAIL)
+
+
+def marks_a_failure(line):
+    """Does this line MARK a failure, for the excerpt's window?"""
+    return any(r.match(line) for r in RE_MARK)
+
+
+def excerpt(lines, budget):
+    """One failed check's `fails_excerpt`: the replay's own lines,
+    bounded to the smaller of EXCERPT_CHARS and what is left of
+    EXCERPT_TOTAL - and saying what the bound removed.
+
+    The selection is the replay's (`lines` IS what it prints), not a
+    new one. The bound spends its budget where a reader acts: from
+    EXCERPT_CONTEXT lines above the first line that MARKS the failure -
+    a `---- <test> stdout ----` header, a panic, an error line - keeping
+    the head from there, because cargo prints the panic first and the
+    `failures:` roll-call last. With no marker the tail is kept: a check
+    that said nothing this parser recognises is best explained by its
+    last words.
+    """
+    cap = min(EXCERPT_CHARS, budget)
+    text = "\n".join(lines)
+    if len(text) <= cap:
+        return text
+    mark = next((i for i, l in enumerate(lines) if marks_a_failure(l)), None)
+    budget_note = "this check's excerpt budget was %d char(s): %d per check, %d in all" % (
+        cap, EXCERPT_CHARS, EXCERPT_TOTAL)
+    if mark is None:
+        kept = text[-cap:]
+        return "... (%d char(s) before this omitted - %s; the Job log replay has them)\n%s" % (
+            len(text) - cap, budget_note, kept)
+
+    def from_line(start):
+        note = ""
+        if start:
+            note = "... (%d line(s) before the first failure marker omitted; the Job log " \
+                   "replay has them)\n" % start
+        return note, "\n".join(lines[start:])
+
+    note, text = from_line(max(mark - EXCERPT_CONTEXT, 0))
+    if len(note) + len(text) <= cap:
+        return note + text
+    # TIGHT: the budget goes to the marker and the check's last words,
+    # and the context above the marker is the first thing to go
+    # (4077889a). For a web-suite red the marker is the per-spec `✘`
+    # deep in Playwright's list, the 40 lines above it are passing
+    # specs, and the `Error:`, the Expected/Received diff and the
+    # `N failed` roll-up are at the END - a head-only cut from 40 lines
+    # above held the chatter and lost the verdict. Cargo reads the same
+    # way: the panic block at the marker, the `failures:` roll-call last.
+    note, text = from_line(mark)
+    if len(note) + len(text) <= cap:
+        return note + text
+    room = max(cap - len(note), 0)
+    mid = "\n... (%%d char(s) omitted between the first failure marker and the check's last " \
+          "words - %s; the Job log replay has the full text)\n" % budget_note
+    share = room - len(mid % 0)
+    if share < 2 * EXCERPT_FLOOR:
+        return note + text[:room] + "\n... (+%d char(s) omitted - %s; the Job log replay " \
+               "has the full text)" % (len(text) - room, budget_note)
+    head = share // 2
+    tail = share - head
+    return note + text[:head] + mid % (len(text) - head - tail) + text[-tail:]
 
 
 def detail(name, got):
@@ -606,6 +796,16 @@ def detail(name, got):
                 name, len(loose) - PER_CHECK, len(loose)))
         return out
 
+    specs = spec_verdicts(body)
+    if specs:
+        out.append("%s: no cargo test failure in this check's output; %d playwright verdict "
+                   "line(s), first %d:" % (name, len(specs), min(PER_CHECK, len(specs))))
+        out += ["%s: | %s" % (name, s) for s in specs[:PER_CHECK]]
+        if len(specs) > PER_CHECK:
+            out.append("%s: + %d more verdict line(s) not quoted here - the excerpt has "
+                       "them" % (name, len(specs) - PER_CHECK))
+        return out
+
     errs = error_lines(body)
     if errs:
         out.append("%s: no cargo test failure in this check's output; %d error line(s), "
@@ -613,18 +813,20 @@ def detail(name, got):
         out += ["%s: | %s" % (name, e) for e in errs[:PER_CHECK]]
         return out
 
-    quoted = [line for line in body[-QUOTE_LINES:] if line.strip()]
-    out.append("%s: nothing this parser recognises - no failing test, no panic, no error line; "
-               "last %d of %d line(s) quoted verbatim:" % (name, len(quoted), total))
+    said = [line for line in body if line.strip()]
+    quoted = said[-QUOTE_LINES:]
+    out.append("%s: nothing this parser recognises - no failing test, no panic, no error "
+               "line; last %d of %d line(s) quoted verbatim:" % (name, len(quoted), total))
     out += ["%s: | %s" % (name, line) for line in quoted]
     return out
 
 
-def write(entries, replay):
+def write(entries, replay, excerpts=None):
     with open(replay_path, "w") as fh:
         fh.write("\n".join(replay) + ("\n" if replay else ""))
     if entries is None:
         return
+    RECEIPT["fails_excerpt"] = excerpts or {}
     if len(entries) > TOTAL_ENTRIES:
         dropped = len(entries) - TOTAL_ENTRIES + 1
         entries = entries[:TOTAL_ENTRIES - 1] + [
@@ -672,7 +874,24 @@ if not failed:
     raise SystemExit(0)
 
 found = sections(failed)
-entries, replay = [], []
+# A run whose EVERY failed check could not reach the network judged
+# nothing: the receipt becomes a refusal in the shape gate.sh writes for
+# its own disk floor (`verdict: refused`, `refused_because`), so the
+# strike rule, the yard and `red_verdict_detail` read it as the
+# infrastructure's failure, not the branch's. One judged failure among
+# the failed checks keeps the red: a test that failed is a verdict.
+refusals = []
+for name in failed:
+    got = found.get(name)
+    why = network_refusal(name, got[0]) if got and got[0] else None
+    if why is None:
+        refusals = []
+        break
+    refusals.append(why)
+if refusals:
+    RECEIPT["verdict"] = "refused"
+    RECEIPT["refused_because"] = "; ".join(refusals)
+entries, replay, excerpts = [], [], {}
 for name in failed:
     got = found.get(name)
     entries += detail(name, got)
@@ -681,15 +900,27 @@ for name in failed:
     if got is None:
         replay.append("  (no ::group:: block for this check in gate.log - it failed before it")
         replay.append("   ran, or gate.sh changed its grouping and this extractor needs updating)")
+        excerpts[name] = "(no ::group:: block for this check in gate.log)"
         continue
     body, total = got
     if not body:
         replay.append("  (the check produced no output at all)")
+        excerpts[name] = "(the check produced no output at all)"
         continue
     tail = body[-REPLAY_TAIL:]
     replay.append("  last %d of %d line(s):" % (len(tail), total))
     replay += ["  " + line for line in tail]
-write(entries, replay)
+    # The receipt's copy of the same lines, within what the total cap
+    # has left. A check the total cannot fit still gets an entry that
+    # says so: an absent key would read as "nothing to say".
+    left = EXCERPT_TOTAL - sum(len(e) for e in excerpts.values())
+    if left < EXCERPT_FLOOR:
+        excerpts[name] = "(excerpt omitted - this receipt caps `fails_excerpt` at %d char(s) " \
+                         "in all and %d check(s) before this one used it; the Job log replay " \
+                         "has it)" % (EXCERPT_TOTAL, len(excerpts))
+    else:
+        excerpts[name] = excerpt(tail, left)
+write(entries, replay, excerpts)
 PY
 # --- failure detail (end) ---
 
@@ -878,6 +1109,40 @@ fi
 #     old seed is removed first because two targets (~74G each) do
 #     not fit the 120Gi volume; the cold window is the price of
 #     fitting, and it only opens on a mid-refresh death.
+# PRUNE THE STALE BINARIES BEFORE THE SEED IS RENAMED INTO PLACE.
+# Measured 2026-09-17 17:58Z, the day the seed grew past the workspace:
+# /gate-seed/target was 154G, 153G of it debug/deps, and 3,226 of those
+# files were TEST AND BIN EXECUTABLES — 138 builds of `boss`, 195 of
+# `boss_dispatcher`, 126 of `rebuild_e2e`, each 50–110 MB, one per
+# gate that ever relinked them. Cargo names an executable
+# <stem>-<16 hex> and never deletes a superseded one, so the seed
+# grows by every relink and a reflink copy of it is measured by the
+# kubelet at full size: the train gate for #424 was evicted two minutes
+# in ("Usage of EmptyDir volume gate-workspace exceeds the limit
+# 160Gi") before a single check ran, and settled LOST. An executable is
+# never reused across source changes — the next gate relinks it in
+# seconds — so the seed keeps ONE per stem (the newest) and drops the
+# rest. Libraries (.rlib/.rmeta/.so/.d) are untouched: those ARE the
+# warmth. Pure over its argument; the refresh calls it on the staged
+# copy, so a torn prune can only ever touch target.partial.
+prune_seed_binaries() { # <deps dir> — prints "pruned N binaries, M MiB"
+    local deps="$1" n=0 bytes=0 f stem
+    [ -d "$deps" ] || { echo "pruned 0 binaries, 0 MiB"; return 0; }
+    # newest first, so the first of each stem is the keeper
+    while IFS= read -r f; do
+        case "$f" in *.*) continue ;; esac
+        [ -f "$deps/$f" ] && [ -x "$deps/$f" ] || continue
+        stem=$(printf '%s' "$f" | sed -E 's/-[0-9a-f]{16}$//')
+        [ "$stem" = "$f" ] && continue
+        case " $KEPT " in *" $stem "*)
+            bytes=$((bytes + $(stat -c %s "$deps/$f")))
+            rm -f -- "$deps/$f" "$deps/$f.d" && n=$((n + 1)) ;;
+        *) KEPT="$KEPT $stem" ;;
+        esac
+    done < <(ls -t "$deps" 2>/dev/null)
+    echo "pruned $n binaries, $((bytes / 1048576)) MiB"
+}
+
 refresh_seed() {
     if [ ! -d "$SEED" ]; then return 0; fi
     if ! [ "$VERDICT" = "green" ]; then return 0; fi
@@ -899,7 +1164,8 @@ refresh_seed() {
     if ( flock -x -n 9 &&
          rm -f "$SEED/.seed-head" &&
          rm -rf "$SEED/target" "$SEED/target.partial" &&
-         cp -a /gate-target/target "$SEED/target.partial" &&
+         cp -a --reflink=auto /gate-target/target "$SEED/target.partial" &&
+         { KEPT=""; prune_seed_binaries "$SEED/target.partial/debug/deps"; } &&
          mv "$SEED/target.partial" "$SEED/target" &&
          echo "$HEAD_SHA" > "$SEED/.seed-head"
        ) 9>>"$SEED_LOCK"; then

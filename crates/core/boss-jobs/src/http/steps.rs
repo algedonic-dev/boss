@@ -181,12 +181,12 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     };
     let mut stamp = state.publisher.stamp_with_actor(actor.clone()).await;
     // Step events inherit the parent packet's admission-fixed
-    // `simulated` flag (the packet, not the request's transport
+    // partition (the packet, not the request's transport
     // context, is the source of truth). A step posted against a
     // missing Job keeps the chain default — Pg rejects it on the FK
     // anyway.
     if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
-        stamp = stamp.with_simulated(job.simulated);
+        stamp = stamp.with_partition(job.partition);
     }
     // The completion stamps are server-owned here as on the PUT
     // (c17871fe): a body cannot name who completed a step or when. A
@@ -322,7 +322,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     };
 
     // The parent packet, fetched ONCE: the event stamp inherits its
-    // `simulated` flag, the step.done / step.assigned markers read
+    // partition, the step.done / step.assigned markers read
     // its Subject identity, and the re-evaluator runs against it.
     // The step write below never touches the jobs row, so this read
     // stays current through all of those. (The auto-close pass at
@@ -576,7 +576,52 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // a resolved branch, not a broken hand-off.
     let is_flipping_to_done =
         old.status != StepStatus::Completed && step.status == StepStatus::Completed;
-    if is_flipping_to_done && !step.blocked_by.is_empty() {
+
+    // AN ABORT COMPLETES FROM ANY OPEN STATE (fd0f92ae, 2026-09-15).
+    //
+    // The gate keeps steps in order, and order is the right thing to
+    // enforce on every step whose meaning is "the work up to here is
+    // done". It is the wrong thing to enforce on exactly one: a
+    // terminal whose materialised `outcome_kind` is `aborted`, whose
+    // meaning is "stop here, wherever here is". Abandonment is not
+    // forward progress, and a blocker is a data dependency of the
+    // forward path — an abort has none.
+    //
+    // Measured when this was written: all 37 aborted terminals in
+    // infra/platform/workflows/*.toml carry a `ready_when` that
+    // references an upstream step (`steps.scope.done AND
+    // job.metadata.abandoned = "true"`), so every one of them is
+    // Pending with a live blocker for most of its Job's life, and the
+    // gate below answered 409 to the abort the accepted design
+    // (c6f9fb3e) allows whenever the Job is open. The control was
+    // enabled exactly where the server refused.
+    //
+    // Read from `old.metadata` — the protocol's materialised row —
+    // and never from the merged body, so a caller cannot claim
+    // `aborted` on the way in to slip past the gate. "Open" is the
+    // same set `close_job_on_terminal` will act on, so an abort that
+    // passes here is one the close can honour. Everything else about
+    // the completion is unchanged: the required-at-done fields
+    // (`reason`) were validated above, the actor cleared policy at
+    // the top, the frozen-terminal refusals still apply, and the
+    // completion is evented as any other. The terminal's `ready_when`
+    // stays as data: it still describes the machine's own path to it.
+    let abort_from_any_state = is_flipping_to_done
+        && old.metadata.get("outcome_kind").and_then(|v| v.as_str()) == Some("aborted")
+        && parent_job.as_ref().is_some_and(|j| {
+            !matches!(
+                j.status,
+                JobStatus::Closed | JobStatus::Cancelled | JobStatus::Draft
+            )
+        });
+    if abort_from_any_state {
+        tracing::info!(
+            job_id = %job_id,
+            step_id = %step_id,
+            from = status_word(old.status),
+            "abort-from-any-state: aborted terminal completing past its blockers",
+        );
+    } else if is_flipping_to_done && !step.blocked_by.is_empty() {
         match state.jobs.resolve_blockers(&step.blocked_by).await {
             Ok(statuses) => {
                 // Missing blockers (returned-length < asked-length) are
@@ -642,6 +687,40 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             is_flipping_to_done,
             proposed,
         );
+    }
+
+    // WHERE THE ABORT FIRED FROM (fd0f92ae). Closure says every Job
+    // reaches a terminal; provenance says the record shows how. An
+    // abort past open blockers is the one completion that skips
+    // work, so the terminal names the steps that were still open when
+    // it fired — the same set `close_job_on_terminal` is about to mark
+    // Skipped, each with its own STEP_UPDATED. Nothing is skipped
+    // silently: the step.done marker carries this list in `metadata`,
+    // and the row keeps it. Slugs in sort order, so the same log
+    // replays to the same list. After the shape-hash read for the
+    // same reason the decision-record stamp is.
+    if abort_from_any_state
+        && let Ok(siblings) = state.jobs.list_steps(&job_id).await
+        && let Some(obj) = step.metadata.as_object_mut()
+    {
+        let mut open: Vec<&Step> = siblings
+            .iter()
+            .filter(|s| {
+                s.id != step_id
+                    && matches!(
+                        s.status,
+                        StepStatus::Pending | StepStatus::Ready | StepStatus::Active
+                    )
+            })
+            .collect();
+        open.sort_by_key(|s| s.sort_order);
+        let slugs: Vec<serde_json::Value> = open
+            .into_iter()
+            .map(|s| {
+                serde_json::Value::String(s.spec_slug.clone().unwrap_or_else(|| s.title.clone()))
+            })
+            .collect();
+        obj.insert("aborted_from".into(), serde_json::Value::Array(slugs));
     }
 
     // Calendar reservation hook — runs BEFORE the persistence
@@ -755,7 +834,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // simulated event, and a sim-chain write to a real Job stays
     // real.
     if let Some(j) = &parent_job {
-        stamp = stamp.with_simulated(j.simulated);
+        stamp = stamp.with_partition(j.partition);
     }
     let stamp = stamp;
     let mut step_events =
@@ -790,13 +869,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         // extra fetch. (Read before the write; the step update
         // doesn't touch the job row.)
         if !step.kind.is_empty() {
-            let (subject_kind, subject_id) = if let Some(job) = &parent_job {
+            let (subject_kind, subject_id, workflow_kind) = if let Some(job) = &parent_job {
                 (
                     boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     boss_core::primitives::Subject::id(&job.subject).to_string(),
+                    job.kind.clone(),
                 )
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), String::new())
             };
             step_events.push(stamp.event(
                 &format!("step.done.{}", step.kind),
@@ -806,6 +886,12 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     "kind": step.kind,
                     "subject_kind": subject_kind,
                     "subject_id": subject_id,
+                    // The parent job's kind, always present ("" when the
+                    // job could not be read, like the subject fields): a
+                    // `spec_slug` repeats across workflows, and the
+                    // ledger's projection `when` picks ONE workflow's step
+                    // out of `step.done.task` by this (backlog a40541cb).
+                    "workflow_kind": workflow_kind,
                     "completed_on": step.completed_on,
                     "metadata": step.metadata,
                     // `notify_on_done` and `spec_slug` are BOTH hoisted
@@ -982,15 +1068,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 // clock's date only if the step somehow lacks one.
                 let job_now = boss_clock_client::now_from(&state.clock).await;
                 job.closed_on = step.completed_on.or(Some(job_now.date_naive()));
-                // The precise instant beside the date — `closed_on` has
-                // one-day resolution by construction, and the terminal
-                // report prefers the `opened_at` / `closed_at` metadata
-                // stamps (`cycle_days_sample`, port.rs). First close
-                // wins; a Job closes once.
-                if let serde_json::Value::Object(map) = &mut job.metadata {
-                    map.entry("closed_at")
-                        .or_insert_with(|| serde_json::json!(job_now.to_rfc3339()));
-                }
+                stamp_close_instant(&mut job, &job_now);
             }
             // OUTBOX (phase 2): the state event (full row state for
             // the rebuild) + status markers record in the SAME
@@ -1003,7 +1081,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 .publisher
                 .stamp_with_actor(actor.clone())
                 .await
-                .with_simulated(job.simulated);
+                .with_partition(job.partition);
             let mut close_events = vec![
                 close_stamp.event(
                     events::JOB_UPDATED,
@@ -1160,7 +1238,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     patch.remove("authority_role");
 
     // The parent packet: the event stamp inherits its admission-fixed
-    // `simulated` flag, and the re-evaluator runs against it.
+    // partition, and the re-evaluator runs against it.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
 
     let actor = user
@@ -1168,7 +1246,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let mut stamp = state.publisher.stamp_with_actor(actor.clone()).await;
     if let Some(j) = &parent_job {
-        stamp = stamp.with_simulated(j.simulated);
+        stamp = stamp.with_partition(j.partition);
     }
     let stamp = stamp;
 
@@ -1335,9 +1413,28 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     // The parent packet: the claim's events inherit its
-    // admission-fixed `simulated` flag, and the assignment marker
+    // admission-fixed partition, and the assignment marker
     // reads its Subject identity.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
+
+    // The claimant's agents row, read once for the two gates below:
+    // the station's model capability and the budget reservation.
+    // `None` is a person or an unregistered login — neither gate
+    // applies — and a registry that cannot answer is a 500, not a
+    // silent pass (no evidence is not a pass).
+    let agent_row = match state.agent_budget.as_ref() {
+        Some(door) => match door.agent_row(&user.id).await {
+            Ok(row) => row,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("agents registry could not answer for {}: {e}", user.id),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
 
     // Station capability gate (stations.md Q3): when the claim names
     // the station it pulls from, the packet must actually be a
@@ -1403,11 +1500,64 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             )
                 .into_response();
         }
+        // The MODEL half of the capability (c87fb59b car 3): a
+        // `(role, model)` station admits an agent that runs one of its
+        // models; a person runs none and is gated by the roles above.
+        if let Some(capability) = &row.capability
+            && !capability.models.is_empty()
+        {
+            let models: Vec<String> = agent_row.iter().map(|a| a.default_model.clone()).collect();
+            if !capability.allows_model(&models) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "model not admitted by station capability",
+                        "station": station_name,
+                        "actor": user.id,
+                        "models": models,
+                        "allowed_models": capability.models,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // THE BUDGET GATE (design c87fb59b car 3, backlog cb78818d). A step
+    // with an agent block names what one run of it may spend
+    // (`agent_budget_usd`, car 1's projection); an agent claiming it
+    // reserves that much of its hour — the priced spend of its runs
+    // finished in the last hour plus this budget must fit under the
+    // row's `hourly_budget_usd_micros` — or is refused with the
+    // numbers, BEFORE the CAS, so a claim the budget does not admit
+    // never enters the race. A person, an unregistered login, and a
+    // row with no cap reserve nothing (see `agent_budget`).
+    if let (Some(door), Some(row), Some(budget_usd)) = (
+        state.agent_budget.as_ref(),
+        agent_row.as_ref(),
+        old.metadata
+            .get(crate::agent_spec::BUDGET_KEY)
+            .and_then(|v| v.as_f64()),
+    ) {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        match door.reserve(row, budget_usd, now).await {
+            Ok(reservation) if reservation.decision.is_allowed() => {}
+            Ok(reservation) => {
+                return (StatusCode::CONFLICT, Json(reservation.refusal_body())).into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("budget gate could not measure the actor's hour: {e}"),
+                )
+                    .into_response();
+            }
+        }
     }
 
     let mut stamp = state.publisher.stamp_with_actor(actor).await;
     if let Some(j) = &parent_job {
-        stamp = stamp.with_simulated(j.simulated);
+        stamp = stamp.with_partition(j.partition);
     }
     let stamp = stamp;
 
@@ -1611,7 +1761,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
     // The signed-off marker inherits the packet's admission-fixed
     // flag, like every other event about the Job.
     if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
-        event_stamp = event_stamp.with_simulated(job.simulated);
+        event_stamp = event_stamp.with_partition(job.partition);
     }
     let signed_off_event = event_stamp.event(
         events::STEP_SIGNED_OFF,
@@ -1666,7 +1816,7 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
         .publisher
         .stamp_with_actor(actor.clone())
         .await
-        .with_simulated(job.simulated);
+        .with_partition(job.partition);
 
     // Skip every still-non-terminal step. The Job is closing on its
     // terminal outcome; any Pending/Ready/Active step is now moot.
@@ -1703,22 +1853,17 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
     job.closed_on = Some(now.date_naive());
     // Stamp the terminal outcome onto the Job metadata so projections
     // / the SPA can render *why* the Job closed — and the precise
-    // close instant beside the one-day-resolution `closed_on`, which
-    // the terminal report prefers (`cycle_days_sample`, port.rs).
-    // First close wins on `closed_at`; a Job closes once.
+    // close instant beside the one-day-resolution `closed_on`
+    // (`stamp_close_instant`, the one write shared by every close).
     if let serde_json::Value::Object(map) = &mut job.metadata {
         map.insert(
             "outcome".to_string(),
             serde_json::Value::String(outcome.to_string()),
         );
-        map.entry("closed_at")
-            .or_insert_with(|| serde_json::json!(now.to_rfc3339()));
     } else {
-        job.metadata = serde_json::json!({
-            "outcome": outcome,
-            "closed_at": now.to_rfc3339(),
-        });
+        job.metadata = serde_json::json!({ "outcome": outcome });
     }
+    stamp_close_instant(&mut job, &now);
 
     // OUTBOX (phase 2): the close's state event + markers record in
     // the SAME transaction as the row.
@@ -1841,7 +1986,7 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 .publisher
                 .stamp_with_actor(actor.clone())
                 .await
-                .with_simulated(job.simulated);
+                .with_partition(job.partition);
             for idx in changed {
                 let changed_step = &steps[idx];
                 // OUTBOX (phase 2): the promoted step's state event +
@@ -1895,7 +2040,7 @@ pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: Event
         .publisher
         .stamp_with_actor(actor.clone())
         .await
-        .with_simulated(job.simulated);
+        .with_partition(job.partition);
     stamp.event(
         &format!("step.ready.{}", step.kind),
         serde_json::json!({

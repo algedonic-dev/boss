@@ -19,9 +19,17 @@
 //! `/api/jobs`), and the ONE write completes the checklist step.
 //! `approval` comes from the registry, never a hardcoded kind name
 //! (CLAUDE.md §9, no-step-kind-match).
+//!
+//! The rule names the sweep target it inspects (`target` arg; absent
+//! means `empty-decisions`, the first one). A second target,
+//! `deploy-convergence`, reads the trains' merged/converged stamps
+//! (`sweep_deploy_convergence`, backlog 8e8311f5); the routing PATCH
+//! and the checklist PUT are shared. Targets that measure a host —
+//! disk, images, conformance — arrive with an ops-request instead
+//! (`measure-*-sweep-on-inspect-ready`) and are not this handler's.
 
 use async_trait::async_trait;
-use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -29,6 +37,7 @@ use std::sync::Arc;
 use super::common::{
     StepEvent, api_client, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
 };
+use super::sweep_deploy_convergence;
 
 /// The keys the machine stamps at materialization or completion — NOT
 /// authored content. A decision whose only metadata is these recorded
@@ -185,6 +194,50 @@ impl MaintenanceSweepInspect {
     }
 }
 
+/// THE ONE BODY the Inspect completion sends, for either target — so a
+/// test can hold it against the fields maintenance-sweep.toml declares
+/// for the step (`inspection_bodies_validate_against_the_step_they_complete`).
+pub(crate) fn inspection_put_body(findings: String, measured: String, items: Vec<Value>) -> Value {
+    json!({
+        "status": "completed",
+        "metadata": {
+            "findings": findings,
+            "measured": measured,
+            "items": items,
+        },
+    })
+}
+
+/// The Inspect step's `findings` field is a STRING (maintenance-sweep.toml:
+/// `field_type = "string", required = true`), one finding per line, or
+/// the word `none`. The handler used to send an array — and from
+/// 2026-09-13 the step API refused it: `400 invalid step metadata:
+/// findings: expected type 'string', got array`, eight attempts, a
+/// dead letter on each sweep, both self-inspections silent for a day
+/// and the daily spawner's dedup guard then filing no new sweeps at all.
+/// The dead letter on the packet is what named it.
+pub(crate) fn findings_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// The sweep target a rule asks this handler to inspect. The first
+/// rule (`inspect-empty-decisions-sweep-on-step-ready`) predates the
+/// arg and names none, so absent means `empty-decisions`; a wrong
+/// type is the rule author's error and is refused as one.
+pub(crate) fn wanted_target(
+    args: &[(String, boss_dispatcher::rules::expr::Value)],
+) -> Result<&str, HandlerError> {
+    match arg_string(args, "target") {
+        Ok(t) => Ok(t),
+        Err(HandlerError::MissingArg(_)) => Ok("empty-decisions"),
+        Err(e) => Err(e),
+    }
+}
+
 fn data_rows(v: &Value) -> Vec<Value> {
     v.get("data")
         .and_then(Value::as_array)
@@ -201,9 +254,10 @@ impl Handler for MaintenanceSweepInspect {
 
     async fn invoke(
         &self,
-        _args: &[(String, boss_dispatcher::rules::expr::Value)],
+        args: &[(String, boss_dispatcher::rules::expr::Value)],
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
+        let wanted = wanted_target(args)?;
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
         // Cheap filter first — this rule rides the shared `step.ready.*`
         // subscription, so it fires on every ready step. The Inspect
@@ -212,7 +266,6 @@ impl Handler for MaintenanceSweepInspect {
         if ev.kind != "checklist" {
             return Ok(());
         }
-        let base = self.jobs_base.trim_end_matches('/');
 
         let job = self.get(&format!("/api/jobs/{}", ev.job_id)).await?;
         let job = job.get("data").cloned().unwrap_or(job);
@@ -223,10 +276,9 @@ impl Handler for MaintenanceSweepInspect {
             .pointer("/metadata/target")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if target != "empty-decisions" {
-            // Other targets (disk, images, conformance) inspect the
-            // forge/cluster and belong to the ops-runner path, not this
-            // SoR-scanning handler.
+        if target != wanted {
+            // Each rule inspects the one target it names; a sweep of
+            // another target is another rule's (or an ops-request's).
             return Ok(());
         }
         // Idempotent: a re-delivery finds the Inspect step already
@@ -243,6 +295,35 @@ impl Handler for MaintenanceSweepInspect {
         };
         if inspect.get("status").and_then(Value::as_str) != Some("ready") {
             return Ok(());
+        }
+        let actor = format!("automation:{}", self.name());
+
+        if target == "deploy-convergence" {
+            // The trains' own stamps are the measurement; `now` is the
+            // sweep's open instant, so a replay reads the same answer.
+            let now = job
+                .pointer("/metadata/opened_at")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .ok_or_else(|| {
+                    HandlerError::Downstream(format!(
+                        "sweep {} has no parseable metadata.opened_at — the daily spawner stamps it",
+                        ev.job_id
+                    ))
+                })?;
+            let trains = self.get("/api/jobs?kind=pr-train&limit=200").await?;
+            let insp = sweep_deploy_convergence::inspect(&data_rows(&trains), now, &actor);
+            return self
+                .complete(
+                    ctx,
+                    &ev,
+                    insp.action_needed,
+                    findings_text(&insp.findings),
+                    insp.measured,
+                    insp.items,
+                )
+                .await;
         }
 
         // The sweep window: decisions completed on/after the day this
@@ -268,36 +349,10 @@ impl Handler for MaintenanceSweepInspect {
         let open = self.get("/api/jobs?status=open&limit=1000").await?;
         let findings = empty_approval_decisions(&data_rows(&open), &approval, &since);
 
-        let action_needed = if findings.is_empty() { "false" } else { "true" };
-
-        // Route FIRST: the Clear/Remediate predicates read
-        // `job.metadata.action_needed`, so it must be set before the
-        // Inspect completion re-evaluates them. PATCH merges top-level
-        // keys.
-        let patch_url = format!("{base}/api/jobs/{}/metadata", ev.job_id);
-        let resp = self
-            .client
-            .patch(&patch_url)
-            .header("content-type", "application/json")
-            .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
-            .header("x-sim-origin", sim_origin_value())
-            .json(&json!({ "action_needed": action_needed }))
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("PATCH {patch_url}: {e}")))?;
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "PATCH {patch_url} returned {st}: {body}"
-            )));
-        }
-
         // Complete the Inspect checklist. Its own fields are `findings`
         // and `measured`; the checklist bundle wants `items`. One item
         // per lost decision (or a single clean item), stamped with the
         // sweep's own open instant — the handler takes no wall clock.
-        let actor = format!("automation:{}", self.name());
         let items: Vec<Value> = if findings.is_empty() {
             vec![json!({
                 "label": format!("no empty approval decisions since {since}"),
@@ -318,14 +373,62 @@ impl Handler for MaintenanceSweepInspect {
                 })
                 .collect()
         };
-        let findings_list: Vec<Value> = findings
+        let finding_lines: Vec<String> = findings
             .iter()
-            .map(|f| json!(format!("{}/{}: {}", f.job_id, f.step_id, f.title)))
+            .map(|f| format!("{}/{}: {}", f.job_id, f.step_id, f.title))
             .collect();
         let measured = format!(
             "{} empty approval decision(s) among open packets since {since}",
             findings.len()
         );
+        self.complete(
+            ctx,
+            &ev,
+            !findings.is_empty(),
+            findings_text(&finding_lines),
+            measured,
+            items,
+        )
+        .await
+    }
+}
+
+impl MaintenanceSweepInspect {
+    /// The two writes every target shares. Route FIRST: the
+    /// Clear/Remediate predicates read `job.metadata.action_needed`, so
+    /// it must be set before the Inspect completion re-evaluates them
+    /// (PATCH merges top-level keys). Then complete the checklist with
+    /// `findings`, `measured` and its `items`.
+    async fn complete(
+        &self,
+        ctx: &InvocationContext,
+        ev: &StepEvent<'_>,
+        action_needed: bool,
+        findings: String,
+        measured: String,
+        items: Vec<Value>,
+    ) -> Result<(), HandlerError> {
+        let base = self.jobs_base.trim_end_matches('/');
+        let action_needed = if action_needed { "true" } else { "false" };
+        let patch_url = format!("{base}/api/jobs/{}/metadata", ev.job_id);
+        let resp = self
+            .client
+            .patch(&patch_url)
+            .header("content-type", "application/json")
+            .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
+            .json(&json!({ "action_needed": action_needed }))
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("PATCH {patch_url}: {e}")))?;
+        if !resp.status().is_success() {
+            let st = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "PATCH {patch_url} returned {st}: {body}"
+            )));
+        }
+
         let put_url = format!("{base}/api/jobs/{}/steps/{}", ev.job_id, ev.step_id);
         let resp = self
             .client
@@ -333,14 +436,7 @@ impl Handler for MaintenanceSweepInspect {
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
             .header("x-sim-origin", sim_origin_value())
-            .json(&json!({
-                "status": "completed",
-                "metadata": {
-                    "findings": findings_list,
-                    "measured": measured,
-                    "items": items,
-                },
-            }))
+            .json(&inspection_put_body(findings, measured, items))
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("PUT {put_url}: {e}")))?;
@@ -430,6 +526,96 @@ mod tests {
     fn a_decision_before_the_window_is_ignored() {
         let jobs = vec![job(json!([step(json!({ "completed_on": "2026-08-20" }))]))];
         assert!(empty_approval_decisions(&jobs, &kinds(), "2026-09-01").is_empty());
+    }
+
+    /// The step declares `findings` a string; an array is a 400 at the
+    /// step API (2026-09-13, both self-inspections dead-lettered).
+    #[test]
+    fn findings_are_one_string_the_step_accepts() {
+        assert_eq!(findings_text(&[]), "none");
+        assert_eq!(
+            findings_text(&["a/b: x".to_string(), "c/d: y".to_string()]),
+            "a/b: x\nc/d: y"
+        );
+    }
+
+    /// THE PIN (CLAUDE.md §9a): the body this handler PUTs and the
+    /// fields the workflow declares for the step are two homes for one
+    /// shape. Read the step off infra/platform/workflows/maintenance-
+    /// sweep.toml and validate both targets' bodies against it with the
+    /// core's own validator — the check the step API ran when it
+    /// refused the array (2026-09-13: eight attempts, two dead letters,
+    /// a day of uninspected sweeps).
+    #[test]
+    fn inspection_bodies_validate_against_the_step_they_complete() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows"
+        );
+        let specs = boss_jobs::seed_loader::load_workflows(dir).expect("the platform bundle loads");
+        let sweep = specs
+            .iter()
+            .find(|w| w.kind == "maintenance-sweep")
+            .expect("maintenance-sweep is a platform protocol");
+        let inspect = sweep
+            .steps
+            .iter()
+            .find(|st| st.title == "inspect")
+            .expect("the sweep has an inspect step");
+        assert!(
+            !inspect.fields.is_empty(),
+            "the inspect step declares fields"
+        );
+        let stamp = "2026-09-13T00:00:00Z";
+        let item = |label: &str| json!({"label": label, "checked": true, "checked_by": "automation:t", "checked_at": stamp});
+        // empty-decisions, both with and without findings
+        for lines in [vec![], vec!["j1/s1: Approve".to_string()]] {
+            let body = inspection_put_body(
+                findings_text(&lines),
+                "1 empty approval decision(s) among open packets since 2026-09-12".into(),
+                vec![item("x")],
+            );
+            boss_jobs::step_registry::StepRegistry::validate_authored_fields(
+                &inspect.fields,
+                &body["metadata"],
+            )
+            .unwrap_or_else(|e| panic!("the step API would refuse this body: {e:?}"));
+        }
+        // deploy-convergence, from its own inspection
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-13T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let insp = super::super::sweep_deploy_convergence::inspect(&[], now, "automation:t");
+        let body = inspection_put_body(findings_text(&insp.findings), insp.measured, insp.items);
+        boss_jobs::step_registry::StepRegistry::validate_authored_fields(
+            &inspect.fields,
+            &body["metadata"],
+        )
+        .unwrap_or_else(|e| panic!("the step API would refuse the convergence body: {e:?}"));
+        // And the shape that failed live is refused here too.
+        let bad = json!({"findings": ["a"], "measured": "m", "items": [item("x")]});
+        assert!(
+            boss_jobs::step_registry::StepRegistry::validate_authored_fields(&inspect.fields, &bad)
+                .is_err(),
+            "an array for findings must be refused, as the step API refused it"
+        );
+    }
+
+    #[test]
+    fn a_rule_without_a_target_inspects_empty_decisions_as_before() {
+        assert_eq!(wanted_target(&[]).unwrap(), "empty-decisions");
+    }
+
+    #[test]
+    fn a_rule_names_the_target_it_inspects() {
+        use boss_dispatcher::rules::expr::Value as V;
+        let args = vec![("target".to_string(), V::String("deploy-convergence".into()))];
+        assert_eq!(wanted_target(&args).unwrap(), "deploy-convergence");
+        let bad = vec![("target".to_string(), V::Int(3))];
+        assert!(matches!(
+            wanted_target(&bad),
+            Err(HandlerError::BadArgType { .. })
+        ));
     }
 
     #[test]

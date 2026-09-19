@@ -71,11 +71,20 @@
 # do not control — the "an infrastructure refusal is not a consist
 # failure" cost CLAUDE.md records. So it is REPORTED, never failed on.
 #
-# WHEN THE REGISTRY IS UNREACHABLE it SKIPS, loudly, and exits 0 — the
-# gate runs on the forge host, which has no route to the in-cluster read
-# surface, and a lint that reds there would red every car. The static
-# half below still runs, so a skip is never a no-op. What it must never
-# do is treat "could not read" as "nothing to report": a wrong target
+# WHEN THE REGISTRY IS UNREACHABLE it SKIPS, loudly, and exits 3 —
+# `LINT_CANNOT_ANSWER`, lib/git-answer.sh's word for "the machine could
+# not answer": never 0, because a skip prints no `scanned` line and a
+# clean exit with no count is exactly what lib/scanned.sh refuses; never
+# 1, because nothing about the BRANCH was judged. Until 2026-09-18 it
+# exited 0 on the argument that the gate ran on the forge host with no
+# route here — no longer true (the gate runs in-cluster, design
+# 128b5496) — and the day the system of record was rolling under a
+# converge, the lint-of-lints pin redded gate 35f4ff0c for a lint that
+# had scanned nothing (backlog a26f92c4). gate.sh maps exit 3 to a
+# REFUSAL receipt (`refused`, not `failed`), which the conductor
+# relaunches and strikes no car for. The static half below still runs,
+# so a skip is never a no-op. What it must never do is treat "could not
+# read" as "nothing to report": a wrong target
 # answers instead of erroring (CLAUDE.md §Doors), so an answer that
 # parses but is not an array of workflow rows is a FAILURE, and so is an
 # EMPTY one — a registry admitting zero kinds is dead air, not a clean
@@ -98,10 +107,26 @@
 #
 # THREE FIELDS, all scalar strings an operator reads and none of which
 # changes what the protocol does: `description`, `label`, `category`.
-# Structural fields are deliberately out, and so is `owning_team` — the
-# loader overrides the file's key, so a disagreement there could never
-# be cleared by a publish. The comparator's own comment carries the
-# reason for each inclusion and each exclusion.
+# `owning_team` is deliberately out — the loader overrides the file's
+# key, so a disagreement there could never be cleared by a publish. The
+# comparator's own comment carries the reason for each inclusion and
+# each exclusion.
+#
+# AND, SINCE 2026-09-15, FOUR STEP FACETS: the step count, the ordered
+# title list, and each step's required-field set and label
+# (`title_template`). Structural fields were out on the argument that a
+# live row legitimately leads its file between a publish and the car
+# that writes it down — true, and the reason drift is REPORTED rather
+# than failed on, not a reason to leave it unmeasured. The measured
+# cost of not looking (backlog 0ccf23ec): ship-a-change's live v31 had
+# a `settled` step and a required `proof` field its file lacked, the
+# daily measurement said "one description adrift", and publishing the
+# file over the row — the obvious fix for the drift it DID report —
+# would have deleted both. Predicates, kinds, field types and
+# metadata_defaults stay out; they need the publish path's
+# normalisation before an equality means anything. The step's `agent`
+# block joined the facets on 2026-09-19 (backlog 1b847556): it is
+# structural like `fields`, and a live row lacking it read "agree".
 #
 # NOT A CASE FOR WIDENING `kind_body_matches`. That function governs
 # every bootstrap-created row, so widening it would change reconcile's
@@ -121,7 +146,7 @@
 # can act on a verdict.
 #
 # Usage:  infra/lint/the-live-protocols-are-the-authored-protocols.sh
-#           [--require-live] [--self-test]
+#           [--require-live] [--report-json <file>] [--self-test]
 #
 #   --require-live  For a caller with somewhere to put the answer (a
 #                   sweep, a cadence, an operator asking the question
@@ -130,6 +155,15 @@
 #                   0, and a field drift is a verdict (2) rather than a
 #                   report. A check that passes when it could not read
 #                   is worse than no check.
+#   --report-json   Write the SAME facts the text report prints, as one
+#                   JSON object, to <file> — for a caller that files
+#                   them rather than reads them (infra/protocol-drift.sh,
+#                   the daily measurement on boss-gcp; backlog 19dec171).
+#                   The verdict is unchanged by this flag. The file is
+#                   written only when the live comparison RAN: a skip
+#                   writes nothing and says so, because a report of no
+#                   comparison would read as "no drift". Its shape is
+#                   `write_report`'s comment below.
 #   --self-test     Run the fixture cases and say what they proved.
 #                   They run on every invocation regardless; the flag
 #                   only makes them speak.
@@ -139,9 +173,11 @@
 #                  Rust literal, a stale exemption, an unreadable
 #                  bundle file, or a comparison refused as vacuous
 #                2 field drift, under --require-live only
+#                3 LINT_CANNOT_ANSWER — the live comparison could not
+#                  run (bare invocation; the gate records a refusal)
 #               64 unknown argument
-#               75 EX_TEMPFAIL — the live comparison could not run;
-#                  under --require-live only, bare exits 0
+#               75 EX_TEMPFAIL — the same condition under
+#                  --require-live, the code infra/protocol-drift.sh reads
 #
 #   BOSS_JOBS_URL  read surface base (default: the in-cluster machine
 #                  door, boss-jobs-internal:7900)
@@ -149,6 +185,10 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
+# shellcheck source=infra/lint/lib/git-answer.sh
+. infra/lint/lib/git-answer.sh || exit 3
 
 BUNDLE="infra/platform/workflows"
 TENANT_GLOB="examples/*/seeds/workflows.toml"
@@ -179,9 +219,13 @@ FIELD_FLOOR=20
 
 REQUIRE_LIVE=0
 SELF_TEST=0
+REPORT_JSON=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --require-live) REQUIRE_LIVE=1 ;;
+        --report-json)
+            [ -n "${2:-}" ] || { echo "$NAME: --report-json needs a file path" >&2; exit 64; }
+            REPORT_JSON="$2"; shift ;;
         --self-test)    SELF_TEST=1 ;;
         *) echo "$NAME: unknown argument: $1" >&2; exit 64 ;;
     esac
@@ -245,18 +289,111 @@ bundle_dir, live_path, floor = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.a
 # it. A finding no action can close trains a reader to skip the whole
 # report (§Diagnosis, "a check nobody reads").
 #
-# DELIBERATELY NOT COMPARED: `steps`, `subject_kinds`, `metadata_schema`,
-# `entitlements`, `metadata`, `on_complete_create`. Those are
-# STRUCTURAL — they decide what the protocol does — and a live row
-# legitimately leads its file between a published version and the car
-# that writes it down, so comparing them here would report the normal
-# case as drift. They also need the same normalisation the publish path
-# applies (defaults filled, predicates parsed) before an equality means
-# anything, which is a check of its own, not a line in this one. Also
-# out: `version`, `status`, `created_at`, `authoring_job_id` — four
-# columns with no TOML key at all, so the file cannot disagree with
-# them.
+# DELIBERATELY NOT COMPARED: `subject_kinds`, `metadata_schema`,
+# `entitlements`, `metadata`, `on_complete_create`, and the parts of
+# `steps` that STEP_FACETS below does not render (predicates, kinds,
+# field types, metadata_defaults; NOT `agent`, which is compared — see
+# the facet list). Those are STRUCTURAL — they decide
+# what the protocol does — and they need the same normalisation the
+# publish path applies (defaults filled, predicates parsed) before an
+# equality means anything, which is a check of its own, not a line in
+# this one. Also out: `version`, `status`, `created_at`,
+# `authoring_job_id` — four columns with no TOML key at all, so the file
+# cannot disagree with them.
 FIELDS = ("label", "description", "category")
+
+# THE STEP FACETS, compared since 2026-09-15 (backlog 0ccf23ec). Steps
+# were on the not-compared list above, for the reason it still gives
+# about normalisation — and the reason was true of `ready_when` and
+# false of everything the live row and the file both state VERBATIM.
+# The measured cost of leaving them out: ship-a-change's live v31
+# carried a `settled` outcome step, a required `proof` field on
+# `proven` (the machine-probe rule, v22) and a procedure on every step,
+# while its file had eight steps and no `proof`; the daily measurement
+# read "one description adrift" and said nothing about the step, so
+# "fix the drift" — publishing the file over the row — would have
+# DELETED the step and the requirement that makes proven a fact. Each
+# facet is rendered on both sides as one scalar string, so it rides the
+# same DRIFT line, the same windows and the same JSON report as a
+# description, and a reader learns WHICH step and WHAT differs:
+#
+#   steps.count                 how many steps — the headline number
+#   steps.titles                the ordered title list; a step on one
+#                               side only shows up here, once, rather
+#                               than as a per-step line against nothing
+#   steps.<title>.required      the sorted names of that step's
+#                               required fields — the completion
+#                               contract; `proof` is the worked case
+#   steps.<title>.title_template  the step's label as rendered; the
+#                               same class as `label` one level up,
+#                               and where pr-train's live v17 (yard
+#                               grammar) differed from its file with
+#                               nothing else to show for it
+#   steps.<title>.agent         WHO runs the step (design c87fb59b car
+#                               1): the block's keys as canonical JSON,
+#                               `<absent>` when neither side has one.
+#                               Added 2026-09-19 (backlog 1b847556):
+#                               measured 2026-09-18 23:25Z, the live
+#                               backlog-item v2 had no block on any
+#                               step, its file had two, and this read
+#                               "54 live rows agree with their file".
+#                               Numbers compare as floats — the file
+#                               spells `budget_usd = 5`, the registry
+#                               hands back 5.0 through AgentSpec's f64
+#                               — the same rule the publish path's
+#                               step_view applies (publish-workflow.sh,
+#                               #464). Held out for one day after that
+#                               fix so a landing did not red every gate
+#                               before the publish behind it; the loop
+#                               closed on 2026-09-19 (live v3 carries
+#                               both blocks).
+#
+# Per-step facets are compared only for titles BOTH sides hold, so a
+# missing step is one finding (in `steps.titles`), not one per facet.
+# Same tolerance as every other field here: reported, never failed on
+# under a bare invocation, a verdict under --require-live.
+def step_facets(steps):
+    steps = steps if isinstance(steps, list) else []
+    titles = [str(s.get("title", "")) for s in steps if isinstance(s, dict)]
+    out = {"steps.count": str(len(titles)), "steps.titles": ",".join(titles)}
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        t = str(s.get("title", ""))
+        fields = s.get("fields") if isinstance(s.get("fields"), list) else []
+        required = sorted(
+            str(f.get("name", "")) for f in fields
+            if isinstance(f, dict) and f.get("required") is True
+        )
+        out[f"steps.{t}.required"] = ",".join(required)
+        out[f"steps.{t}.title_template"] = str(s.get("title_template", ""))
+        out[f"steps.{t}.agent"] = agent_facet(s.get("agent"))
+    return out, titles
+
+def agent_facet(block):
+    """The agent block as one canonical string, or None for no block.
+
+    Every numeric value is rendered as a float so the TOML integer and
+    the JSON float the registry hands back for it compare equal; a
+    bool is not a number here (Python's is), so it is left alone.
+    """
+    if not isinstance(block, dict):
+        return None
+    canon = {
+        k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+        for k, v in block.items()
+    }
+    return json.dumps(canon, sort_keys=True, ensure_ascii=False)
+
+def facets_to_compare(tree_titles, live_titles):
+    both = set(tree_titles) & set(live_titles)
+    yield "steps.count"
+    yield "steps.titles"
+    for t in tree_titles:
+        if t in both:
+            yield f"steps.{t}.required"
+            yield f"steps.{t}.title_template"
+            yield f"steps.{t}.agent"
 
 try:
     doc = json.load(open(live_path))
@@ -295,6 +432,17 @@ def first_diff(a, b):
             return i
     return min(len(a), len(b))
 
+def drift_line(kind, field, row, tree, live):
+    """One DRIFT finding — the same shape for a field and a step facet."""
+    at = first_diff(tree, live)
+    return "DRIFT\t{}\t{}\tv{}\tat={}\ttree={}\tlive={}\t{}\t{}".format(
+        kind, field, row.get("version", "?"), at,
+        len(tree) if isinstance(tree, str) else "-",
+        len(live) if isinstance(live, str) else "-",
+        window(tree if isinstance(tree, str) or tree is None else str(tree), at),
+        window(live if isinstance(live, str) or live is None else str(live), at),
+    )
+
 files = sorted(bundle_dir.glob("*.toml"))
 parsed = compared = drifted = 0
 lines = []
@@ -330,16 +478,16 @@ for f in files:
             if tree == live:
                 continue
             drifted += 1
-            at = first_diff(tree, live)
-            lines.append(
-                "DRIFT\t{}\t{}\tv{}\tat={}\ttree={}\tlive={}\t{}\t{}".format(
-                    kind, field, row.get("version", "?"), at,
-                    len(tree) if isinstance(tree, str) else "-",
-                    len(live) if isinstance(live, str) else "-",
-                    window(tree if isinstance(tree, str) else str(tree), at),
-                    window(live if isinstance(live, str) else str(live), at),
-                )
-            )
+            lines.append(drift_line(kind, field, row, tree, live))
+        # The TOML key is `step` ([[workflow.step]]); the row's is `steps`.
+        tree_facets, tree_titles = step_facets(wf.get("step"))
+        live_facets, live_titles = step_facets(row.get("steps"))
+        for facet in facets_to_compare(tree_titles, live_titles):
+            tree, live = tree_facets[facet], live_facets[facet]
+            if tree == live:
+                continue
+            drifted += 1
+            lines.append(drift_line(kind, facet, row, tree, live))
 
 print(f"COUNTS\tparsed={parsed}\tcompared={compared}\tdrifted={drifted}")
 print("\n".join(lines)) if lines else None
@@ -367,6 +515,115 @@ if compared < floor:
     )
     sys.exit(7)
 PY
+}
+
+# ---------------------------------------------------------------------------
+# The JSON report — the text report's facts, in a shape a caller can FILE.
+# ---------------------------------------------------------------------------
+# `write_report <file> <verdict>` reads the same variables the text
+# report below prints from — `live_kinds`, `authored`, `unauthored`,
+# `EXEMPT`, `fields_out` (the comparator's TSV lines), `pending`,
+# `tenant_lines`, `problems` — so the two cannot say different things:
+# one source, two renderings (CLAUDE.md §9a). Nothing is re-derived and
+# nothing is reduced that the text does not also reduce: the DRIFT
+# windows are the same 90-character excerpts, with both full copies at
+# their named homes (the file in the tree, the row at GET /api/workflows).
+#
+# Written only when the live comparison RAN. Under a skip there is no
+# report, and the skip says so — a report carrying "0 drifted" from a
+# comparison that never happened is exactly the confident wrong answer
+# the floor in fields_report refuses (§Doors). The shape:
+#
+#   { at, target, verdict, problems,
+#     live:     { admitted },                 what the registry admits
+#     authored: { count },                    what this tree writes down
+#     exempt:   [kind…], unauthored: [kind…], live kinds no file authors
+#     fields:   { parsed, compared, drifted,
+#                 drift:  [{kind, field, live_version, at, tree_len,
+#                           live_len, tree_window, live_window}…],
+#                         `field` is a compared field (`description`)
+#                         or a step facet (`steps.count`, `steps.titles`,
+#                         `steps.<title>.required`,
+#                         `steps.<title>.title_template`)
+#                 absent: [{kind, field}…] }, the file makes no claim
+#     pending:  [kind…],                      authored, not yet admitted
+#     tenants:  [{file, not_admitted, total}…] }
+#
+# `verdict` is the exit code THIS invocation goes on to exit with, so a
+# caller filing the report can record it without parsing stderr — and
+# so a report from a bare run (drift exits 0) and one from --require-live
+# (drift exits 2) are distinguishable on the record.
+write_report() { # <file> <verdict>
+    local out="$1" verdict="$2" t
+    t=$(mktemp -d) || { echo "$NAME: no writable temp dir, so the JSON report could not be assembled" >&2; return 1; }
+    printf '%s\n' "$live_kinds"   > "$t/live"
+    printf '%s\n' "$authored"     > "$t/authored"
+    printf '%s\n' "$unauthored"   > "$t/unauthored"
+    printf '%s\n' "$fields_out"   > "$t/fields"
+    printf '%s\n' "$pending"      > "$t/pending"
+    printf '%s\n' "$tenant_lines" > "$t/tenants"
+    printf '%s\n' ${EXEMPT[@]+"${EXEMPT[@]}"} > "$t/exempt"
+    python3 - "$t" "$out" "$URL" "$verdict" "$problems" <<'PY' || { rm -rf "$t"; return 1; }
+import json, pathlib, sys, datetime
+
+t, out, url, verdict, problems = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+
+def lines(name):
+    return [l for l in (t / name).read_text().split("\n") if l != ""]
+
+def num(s, prefix):
+    v = s[len(prefix):] if s.startswith(prefix) else s
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+counts = {"parsed": None, "compared": None, "drifted": None}
+drift, absent = [], []
+for line in lines("fields"):
+    cells = line.split("\t")
+    tag = cells[0]
+    if tag == "COUNTS":
+        for cell in cells[1:]:
+            k, _, v = cell.partition("=")
+            if k in counts:
+                counts[k] = num(v, "")
+    elif tag == "DRIFT" and len(cells) >= 9:
+        drift.append({
+            "kind": cells[1], "field": cells[2],
+            "live_version": num(cells[3], "v"),
+            "at": num(cells[4], "at="),
+            "tree_len": num(cells[5], "tree="), "live_len": num(cells[6], "live="),
+            "tree_window": cells[7], "live_window": cells[8],
+        })
+    elif tag == "ABSENT" and len(cells) >= 3:
+        absent.append({"kind": cells[1], "field": cells[2]})
+
+tenants = []
+for line in lines("tenants"):
+    cells = line.split("\t")
+    if len(cells) >= 3:
+        tenants.append({"file": cells[0], "not_admitted": num(cells[1], ""), "total": num(cells[2], "")})
+
+report = {
+    "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "target": url,
+    "verdict": verdict,
+    "problems": problems,
+    "live": {"admitted": len(lines("live"))},
+    "authored": {"count": len(lines("authored"))},
+    "exempt": lines("exempt"),
+    "unauthored": lines("unauthored"),
+    "fields": {**counts, "drift": drift, "absent": absent},
+    "pending": lines("pending"),
+    "tenants": tenants,
+}
+if len(drift) != (counts["drifted"] or 0):
+    print(f"the report would carry {len(drift)} DRIFT line(s) against a drifted={counts['drifted']} count — the comparator's lines and its count disagree, so nothing was written", file=sys.stderr)
+    sys.exit(1)
+pathlib.Path(out).write_text(json.dumps(report, indent=2) + "\n")
+PY
+    rm -rf "$t"
 }
 
 # Fixtures, then the six refusals the comparator owes. Run on EVERY
@@ -408,18 +665,18 @@ FX
     # 1. Agreement is silence — and it still says how much it compared.
     out=$(fields_report "$t/bundle" "$t/match.json" 2>&1); rc=$?
     [ "$rc" -eq 0 ] || { echo "self-test FAILED: matching fixtures exited $rc: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "COUNTS	parsed=2	compared=2	drifted=0" \
+    grep -qF "COUNTS	parsed=2	compared=2	drifted=0" <<< "$out" \
         || { echo "self-test FAILED: matching fixtures did not report 2 compared / 0 drifted: $out" >&2; rm -rf "$t"; return 1; }
 
     # 2. THE RED THIS CHECK EXISTS FOR: one description differs, and the
     #    finding must NAME the kind and the field.
     out=$(fields_report "$t/bundle" "$t/drift.json" 2>&1); rc=$?
     [ "$rc" -eq 0 ] || { echo "self-test FAILED: a drifting description exited $rc: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "DRIFT	beta	description	v3" \
+    grep -qF "DRIFT	beta	description	v3" <<< "$out" \
         || { echo "self-test FAILED: the drift was not named by kind, field and live version: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "drifted=1" \
+    grep -qF "drifted=1" <<< "$out" \
         || { echo "self-test FAILED: the drift was not counted: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "deleted last week" \
+    grep -qF "deleted last week" <<< "$out" \
         || { echo "self-test FAILED: the finding carries no excerpt of the live text: $out" >&2; rm -rf "$t"; return 1; }
 
     # 3. A FIELD THE FILE DOES NOT CLAIM is named rather than quietly
@@ -432,10 +689,143 @@ category = "platform"
 FX
     out=$(fields_report "$t/bundle" "$t/drift.json" 2>&1); rc=$?
     [ "$rc" -eq 0 ] || { echo "self-test FAILED: an absent claim exited $rc: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "ABSENT	beta	description" \
+    grep -qF "ABSENT	beta	description" <<< "$out" \
         || { echo "self-test FAILED: a file claiming no description was not named: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "drifted=0" \
+    grep -qF "drifted=0" <<< "$out" \
         || { echo "self-test FAILED: an absent claim was counted as drift: $out" >&2; rm -rf "$t"; return 1; }
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+FX
+
+    # 3b. THE STRUCTURAL RED (2026-09-15, backlog 0ccf23ec). The live row
+    #    carries a step and a required field the file lacks, and one
+    #    step's label differs. The finding must name the step COUNT, the
+    #    title LIST, and the one step whose required set and label
+    #    differ — while a step that agrees stays silent and a step
+    #    present on ONE side only is named by the title list, not by a
+    #    per-step line against `<absent>`. This is the measurement that
+    #    was missing when ship-a-change's live v31 read as "one
+    #    description adrift" beside a file with eight steps to live's
+    #    nine and no `proof` field: publishing the file over the row
+    #    would have deleted both.
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+title_template = "Opened"
+
+[[workflow.step]]
+title = "proven"
+kind = "task"
+ready_when = "steps.opened.done"
+title_template = "Proven"
+[[workflow.step.fields]]
+name = "verified"
+field_type = "string"
+required = true
+FX
+    printf '%s' '[{"kind":"alpha","version":1,"status":"active","label":"Alpha","category":"platform","owning_team":"platform","description":"The first protocol."},
+                  {"kind":"beta","version":3,"status":"active","label":"Beta","category":"platform","owning_team":"platform","description":"The second protocol.",
+                   "steps":[{"title":"opened","kind":"trigger","ready_when":"true","title_template":"Opened","fields":[]},
+                            {"title":"proven","kind":"task","ready_when":"steps.opened.done","title_template":"Proven in prod","fields":[{"name":"verified","field_type":"string","required":true},{"name":"method","field_type":"string","required":false},{"name":"proof","field_type":"string","required":true}]},
+                            {"title":"settled","kind":"outcome","ready_when":"steps.proven.done","title_template":"Settled","fields":[]}]}]' > "$t/steps.json"
+    out=$(fields_report "$t/bundle" "$t/steps.json" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test FAILED: a live row with an extra step exited $rc: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	steps.count	v3" <<< "$out" \
+        || { echo "self-test FAILED: a step the file lacks did not drift the step count: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	steps.titles	v3" <<< "$out" \
+        || { echo "self-test FAILED: a step the file lacks was not named in the title list: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "opened,proven,settled" <<< "$out" \
+        || { echo "self-test FAILED: the title-list finding carries no excerpt of the live titles: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	steps.proven.required	v3" <<< "$out" \
+        || { echo "self-test FAILED: a required field the file lacks was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "proof,verified" <<< "$out" \
+        || { echo "self-test FAILED: the required-set finding carries no excerpt of the live set: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	steps.proven.title_template	v3" <<< "$out" \
+        || { echo "self-test FAILED: a step label that differs was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "drifted=4" <<< "$out" \
+        || { echo "self-test FAILED: four step facets adrift were not counted as four: $out" >&2; rm -rf "$t"; return 1; }
+    grep -q "steps\.opened\." <<< "$out" \
+        && { echo "self-test FAILED: a step that agrees was named: $out" >&2; rm -rf "$t"; return 1; }
+    grep -q "steps\.settled\." <<< "$out" \
+        && { echo "self-test FAILED: a step on one side only got a per-step line: $out" >&2; rm -rf "$t"; return 1; }
+    grep -q "DRIFT	beta	description" <<< "$out" \
+        && { echo "self-test FAILED: an agreeing description was named beside the step drift: $out" >&2; rm -rf "$t"; return 1; }
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+FX
+
+    # 3c. THE AGENT BLOCK (2026-09-19, backlog 1b847556). The file says
+    #    WHO runs `proven` — a profile, a model, a budget, an effort —
+    #    and the live row does not. Measured 2026-09-18 23:25Z: the live
+    #    backlog-item v2 carried no block on any step beside a file with
+    #    two, and this comparator answered "54 live rows agree with
+    #    their file", so a drift in who executes a step was invisible
+    #    to the daily measurement. The finding must name the STEP; the
+    #    same block on both sides must agree although the file spells
+    #    the budget as the integer 5 and the registry hands back 5.0
+    #    (a TOML integer becomes a JSON float through AgentSpec's f64).
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+title_template = "Opened"
+
+[[workflow.step]]
+title = "proven"
+kind = "task"
+ready_when = "steps.opened.done"
+title_template = "Proven"
+agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+FX
+    printf '%s' '[{"kind":"alpha","version":1,"status":"active","label":"Alpha","category":"platform","owning_team":"platform","description":"The first protocol."},
+                  {"kind":"beta","version":3,"status":"active","label":"Beta","category":"platform","owning_team":"platform","description":"The second protocol.",
+                   "steps":[{"title":"opened","kind":"trigger","ready_when":"true","title_template":"Opened","fields":[],"agent":null},
+                            {"title":"proven","kind":"task","ready_when":"steps.opened.done","title_template":"Proven","fields":[],"agent":null}]}]' > "$t/agent-missing.json"
+    out=$(fields_report "$t/bundle" "$t/agent-missing.json" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test FAILED: a live row lacking an agent block exited $rc: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	steps.proven.agent	v3" <<< "$out" \
+        || { echo "self-test FAILED: a live step lacking the agent block its file declares was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF '"profile": "builder"' <<< "$out" \
+        || { echo "self-test FAILED: the agent finding carries no excerpt of the block the file declares: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "drifted=1" <<< "$out" \
+        || { echo "self-test FAILED: one agent block adrift was not counted as one: $out" >&2; rm -rf "$t"; return 1; }
+    grep -q "steps\.opened\.agent" <<< "$out" \
+        && { echo "self-test FAILED: a step with no block on either side was named: $out" >&2; rm -rf "$t"; return 1; }
+    printf '%s' '[{"kind":"alpha","version":1,"status":"active","label":"Alpha","category":"platform","owning_team":"platform","description":"The first protocol."},
+                  {"kind":"beta","version":3,"status":"active","label":"Beta","category":"platform","owning_team":"platform","description":"The second protocol.",
+                   "steps":[{"title":"opened","kind":"trigger","ready_when":"true","title_template":"Opened","fields":[],"agent":null},
+                            {"title":"proven","kind":"task","ready_when":"steps.opened.done","title_template":"Proven","fields":[],"agent":{"profile":"builder","model":"opus-5[1m]","budget_usd":5.0,"effort":"high"}}]}]' > "$t/agent-equal.json"
+    out=$(fields_report "$t/bundle" "$t/agent-equal.json" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test FAILED: a live row carrying the file's agent block exited $rc: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "drifted=0" <<< "$out" \
+        || { echo "self-test FAILED: the same agent block on both sides (TOML 5, JSON 5.0) read as drift: $out" >&2; rm -rf "$t"; return 1; }
     cat > "$t/bundle/beta.toml" <<'FX'
 [[workflow]]
 kind = "beta"
@@ -449,7 +839,7 @@ FX
     #    not hold finds no drift, which must never read as clean.
     out=$(fields_report "$t/bundle" "$t/elsewhere.json" 2>&1); rc=$?
     [ "$rc" -eq 7 ] || { echo "self-test FAILED: a zero-kind comparison exited $rc, expected 7: $out" >&2; rm -rf "$t"; return 1; }
-    printf '%s\n' "$out" | grep -qF "REFUSED" \
+    grep -qF "REFUSED" <<< "$out" \
         || { echo "self-test FAILED: the floor refusal does not say so: $out" >&2; rm -rf "$t"; return 1; }
 
     # 5. A retired row is not an active one — it must not stand in for
@@ -470,6 +860,41 @@ FX
 
     FIELD_FLOOR="$FIELD_FLOOR_SAVED"
 
+    # 9. THE JSON REPORT carries the comparator's facts, not a retelling
+    #    of them: driven from the SAME drift fixture as case 2, in a
+    #    subshell that stands in for the live half's variables, it must
+    #    name the same kind, field, live version and excerpt, count the
+    #    same drift, and carry the verdict it was handed.
+    out=$(fields_report "$t/bundle" "$t/drift.json" 2>/dev/null)
+    (
+        live_kinds=$'alpha\nbeta\ngamma'; authored=$'alpha\nbeta\ndelta'; unauthored="gamma"
+        fields_out="$out"; pending="delta"; tenant_lines=$'examples/x/seeds/workflows.toml\t3\t25'
+        problems=1; EXEMPT=()
+        write_report "$t/report.json" 2
+    ) || { echo "self-test FAILED: write_report refused the drift fixture" >&2; rm -rf "$t"; return 1; }
+    out=$(python3 - "$t/report.json" <<'PY' 2>&1
+import json, sys
+r = json.load(open(sys.argv[1]))
+want = {
+    "live.admitted": (r["live"]["admitted"], 3), "authored.count": (r["authored"]["count"], 3),
+    "unauthored": (r["unauthored"], ["gamma"]), "pending": (r["pending"], ["delta"]),
+    "exempt": (r["exempt"], []), "verdict": (r["verdict"], 2), "problems": (r["problems"], 1),
+    "fields.parsed": (r["fields"]["parsed"], 2), "fields.compared": (r["fields"]["compared"], 2),
+    "fields.drifted": (r["fields"]["drifted"], 1), "len(fields.drift)": (len(r["fields"]["drift"]), 1),
+    "drift.kind": (r["fields"]["drift"][0]["kind"], "beta"),
+    "drift.field": (r["fields"]["drift"][0]["field"], "description"),
+    "drift.live_version": (r["fields"]["drift"][0]["live_version"], 3),
+    "tenants": (r["tenants"], [{"file": "examples/x/seeds/workflows.toml", "not_admitted": 3, "total": 25}]),
+}
+bad = [f"{k}: got {g!r}, want {w!r}" for k, (g, w) in want.items() if g != w]
+if "deleted last week" not in r["fields"]["drift"][0]["live_window"]:
+    bad.append("drift.live_window carries no excerpt of the live text")
+if not r["at"].endswith("Z") or r["target"] == "":
+    bad.append("at/target missing")
+print("\n".join(bad)); sys.exit(1 if bad else 0)
+PY
+    ) || { echo "self-test FAILED: the JSON report does not carry the text report's facts: $out" >&2; rm -rf "$t"; return 1; }
+
     # 8. THE UNREACHABLE CASE, end to end, because it is the one that
     #    must never read as success. `--require-live` is the mode for a
     #    caller with somewhere to put the answer, and it must exit 75
@@ -479,16 +904,16 @@ FX
     if [ -z "${BOSS_LINT_SELFTEST_CHILD:-}" ]; then
         out=$(BOSS_LINT_SELFTEST_CHILD=1 BOSS_JOBS_URL="http://[::1]:9" bash "$0" --require-live 2>&1); rc=$?
         [ "$rc" -eq 75 ] || { echo "self-test FAILED: --require-live against an unreachable registry exited $rc, expected 75: $out" >&2; rm -rf "$t"; return 1; }
-        printf '%s\n' "$out" | grep -qF "SKIPPED the live comparison" \
+        grep -qF "SKIPPED the live comparison" <<< "$out" \
             || { echo "self-test FAILED: the skip is not loud: $out" >&2; rm -rf "$t"; return 1; }
-        printf '%s\n' "$out" | grep -qF "[::1]:9" \
+        grep -qF "[::1]:9" <<< "$out" \
             || { echo "self-test FAILED: the skip does not name what it could not reach: $out" >&2; rm -rf "$t"; return 1; }
-        printf '%s\n' "$out" | grep -qi "OK —" \
+        grep -qi "OK —" <<< "$out" \
             && { echo "self-test FAILED: a skip printed an OK line: $out" >&2; rm -rf "$t"; return 1; }
     fi
 
     rm -rf "$t"
-    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, and --require-live exits 75 naming the target it could not reach"
+    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a step the file lacks is named by count and title list and a required field or step label that differs is named by its step, a live step lacking the agent block its file declares is named by its step while the same block on both sides agrees with the budget as 5 and 5.0, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, and --require-live exits 75 naming the target it could not reach, and the JSON report carries the same kind/field/version/excerpt, counts and verdict as the text"
     return 0
 }
 
@@ -648,10 +1073,11 @@ authored=$(printf '%s\n%s\n%s\n%s\n' \
 
 # An exemption for a kind the tree now authors is refused. Left standing
 # it would keep a future live-authored kind of that name out of this
-# check without anyone deciding so — the same refusal gate.sh applies to
-# a PREFLIGHT_EXCLUDES entry naming a lint that no longer exists.
+# check without anyone deciding so — the same reason gate.sh reads its
+# pre-flight exclusions off the excluded lints' own headers, where a
+# lint that no longer exists cannot be named.
 for kind in ${EXEMPT[@]+"${EXEMPT[@]}"}; do
-    if printf '%s\n' "$authored" | LC_ALL=C grep -qxF "$kind"; then
+    if LC_ALL=C grep -qxF "$kind" <<<"$authored"; then
         fail "the exemption for \`$kind\` is stale — the tree now authors it"
         echo "" >&2
         echo "  Drop \`$kind\` from EXEMPT in this script. An exemption that" >&2
@@ -664,25 +1090,32 @@ done
 # Live half — skips loudly when the read surface is unreachable.
 # ---------------------------------------------------------------------------
 skip() {
-    echo "the-live-protocols-are-the-authored-protocols: SKIPPED the live comparison — $1" >&2
+    echo "$NAME: $LINT_CANNOT_ANSWER_MARKER — SKIPPED the live comparison — $1" >&2
     echo "  target: $URL (override with BOSS_JOBS_URL)" >&2
     echo "  The exemption set was still checked against the tree" >&2
     echo "  (${#EXEMPT[@]} exemptions, $(printf '%s\n' "$authored" | wc -l | tr -d ' ') authored kinds)." >&2
     echo "  NOTHING IS CLAIMED about what the running registry admits, or about" >&2
     echo "  whether any live row still says what its file says — the field" >&2
     echo "  comparison did not run, so ZERO kinds were compared." >&2
+    # A report is the comparison, rendered; with no comparison there is
+    # nothing to render, and a file saying "0 drifted" would be read as
+    # a clean bill by the caller that asked for it (infra/protocol-drift.sh
+    # refuses on exactly this line).
+    [ -z "$REPORT_JSON" ] || echo "  no report was written to $REPORT_JSON — a report of no comparison would read as no drift." >&2
     [ "$problems" -eq 0 ] || exit 1
     # A caller with somewhere to put the answer runs `--require-live`,
     # and for it "I could not read the registry" must not be the same
     # exit as "I read it and it agrees". 75 is EX_TEMPFAIL, the code
     # this tree already uses for a run that could not happen rather
-    # than one that failed (infra/gate-runner/run.sh, checkout-lock.sh).
-    # The bare invocation keeps exiting 0: the gate runs on the forge
-    # host, which has no route to the in-cluster read surface, and a
-    # lint that reds there would red every car for an infrastructure
-    # refusal that says nothing about the branch.
+    # than one that failed (infra/gate-runner/run.sh, checkout-lock.sh),
+    # and the one infra/protocol-drift.sh reads by number.
     [ "$REQUIRE_LIVE" -eq 0 ] || exit 75
-    exit 0
+    # The bare invocation is the gate's, and for it the answer is the
+    # lint vocabulary: 3, "the machine could not answer". No scanned
+    # line is printed on this path — the comparison did not run, so a
+    # count would certify it — and gate.sh turns this exit into a
+    # refusal receipt instead of a red (backlog a26f92c4).
+    exit "$LINT_CANNOT_ANSWER"
 }
 
 command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
@@ -735,17 +1168,52 @@ wrong surface, or an error body; either way nothing read the registry"
     *) skip "could not read kinds from the response" ;;
 esac
 
+# A DELIVERED TENANT'S PROTOCOLS ARE AUTHORED — IN THAT TENANT'S REPO.
+# Since 2026-09-16 (the prod flip, f4f5c387 + ee7b62bb) an instance may
+# take its tenant from a repo the converge checks out (instances.toml
+# `tenant_repo`), and `boss tenant publish` admits that tenant's
+# workflows.toml with `owning_team = <its tenant_id>`. Those rows have a
+# file, a diff and a second reader — in the tenant's own repository,
+# which this tree does not carry and must not (business specifics never
+# enter the product repo: fcc1d57b). Measured 2026-09-17 00:0xZ, the
+# first pre-flight after the flip: `receive-a-sponsorship`
+# (owning_team algedonic) read UNAUTHORED and would have reddened every
+# gate. So when the tree declares at least one repo-sourced instance, a
+# live kind whose owning_team names no team this tree authors for is
+# read as that tenant's, not as unauthored; it is listed, never
+# silently passed. A tree with no repo-sourced instance keeps the old
+# reading in full.
+repo_tenants=$(awk '/^[[:space:]]*#/ { next } $1 == "tenant_repo" { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); print }' infra/cluster/instances.toml 2>/dev/null | LC_ALL=C sort -u)
+delivered_tenant_kinds=""
+if [ -n "$repo_tenants" ]; then
+    delivered_tenant_kinds=$(python3 - "$body" <(printf '%s\n' "$authored") <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = doc.get("workflows") if isinstance(doc, dict) else doc
+authored = set(l.strip() for l in open(sys.argv[2]) if l.strip())
+rows = [r for r in rows if r.get("status", "active") == "active" and "kind" in r]
+tree_teams = {r.get("owning_team") for r in rows if r["kind"] in authored}
+print("\n".join(sorted(r["kind"] for r in rows if r["kind"] not in authored and r.get("owning_team") and r.get("owning_team") not in tree_teams)))
+PY
+)
+fi
+
 unauthored=$(
     LC_ALL=C comm -23 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$authored") \
         | { if [ ${#EXEMPT[@]} -gt 0 ]; then LC_ALL=C grep -vxF -f <(printf '%s\n' "${EXEMPT[@]}"); else cat; fi; } \
+        | { if [ -n "$delivered_tenant_kinds" ]; then LC_ALL=C grep -vxF -f <(printf '%s\n' "$delivered_tenant_kinds"); else cat; fi; } \
         | LC_ALL=C sed '/^$/d'
 )
+if [ -n "$delivered_tenant_kinds" ]; then
+    n=$(printf '%s\n' "$delivered_tenant_kinds" | wc -l | tr -d ' ')
+    echo "$NAME: $n kind(s) authored by a delivered tenant (instances.toml tenant_repo: $(printf '%s' "$repo_tenants" | tr '\n' ' ')), read from the tenant's own repo, not this tree: $(printf '%s' "$delivered_tenant_kinds" | tr '\n' ' ')"
+fi
 
 # A stale exemption in the other direction: named here, not admitted
 # live. Same reason as the authored check above — it would excuse a
 # future kind of that name that nobody decided to excuse.
 for kind in ${EXEMPT[@]+"${EXEMPT[@]}"}; do
-    if ! printf '%s\n' "$live_kinds" | LC_ALL=C grep -qxF "$kind"; then
+    if ! LC_ALL=C grep -qxF "$kind" <<<"$live_kinds"; then
         fail "the exemption for \`$kind\` is stale — the live registry does not admit it"
         echo "" >&2
         echo "  Drop \`$kind\` from EXEMPT in this script." >&2
@@ -824,12 +1292,12 @@ fi
 case "$fields_rc" in
     0) ;;
     3) fail "the live answer could not be read for the field comparison: \
-$(printf '%s' "$fields_out" | head -1)"
+$(head -1 <<<"$fields_out")"
        echo "" >&2
        echo "  The kind comparison above read this same body, so this is a shape" >&2
        echo "  change, not an unreachable registry. Nothing was compared." >&2 ;;
     6) fail "a bundle file under $BUNDLE could not be read: \
-$(printf '%s' "$fields_out" | head -1)"
+$(head -1 <<<"$fields_out")"
        echo "" >&2
        echo "  One [[workflow]] per file, named for the kind — the loader pins" >&2
        echo "  it (platform_bundle.rs) and this reader needs it too." >&2 ;;
@@ -840,16 +1308,16 @@ $(printf '%s' "$fields_out" | head -1)"
        echo "  agreement. Either the bundle reader broke or the registry is" >&2
        echo "  answering about a different world; in both cases a green here" >&2
        echo "  would be the confident wrong answer (CLAUDE.md §Doors)." >&2 ;;
-    *) fail "the field comparison exited $fields_rc: $(printf '%s' "$fields_out" | head -1)" ;;
+    *) fail "the field comparison exited $fields_rc: $(head -1 <<<"$fields_out")" ;;
 esac
 
 drift_lines=$(printf '%s\n' "$fields_out" | LC_ALL=C sed -n 's/^DRIFT\t//p')
-fields_compared=$(printf '%s\n' "$fields_out" | LC_ALL=C sed -n 's/.*\tcompared=\([0-9]*\).*/\1/p' | head -1)
+fields_compared=$(LC_ALL=C sed -n 's/.*\tcompared=\([0-9]*\).*/\1/;T;p;q' <<<"$fields_out")
 fields_compared=${fields_compared:-0}
 drift_n=0
 if [ -n "$drift_lines" ]; then
     drift_n=$(printf '%s\n' "$drift_lines" | wc -l | tr -d ' ')
-    echo "$NAME: $drift_n operator-facing field(s) where the live row disagrees with its file:" >&2
+    echo "$NAME: $drift_n field(s) or step facet(s) where the live row disagrees with its file:" >&2
     printf '%s\n' "$drift_lines" | while IFS=$'\t' read -r kind field ver at tlen llen twin lwin; do
         echo "    $kind.$field — live $ver, first differs $at ($tlen vs $llen chars)" >&2
         echo "      file: $twin" >&2
@@ -872,6 +1340,16 @@ if [ -n "$drift_lines" ]; then
     echo "  the corrected text while the row lags is the safe direction, and it" >&2
     echo "  is the state this check exists to make visible rather than to" >&2
     echo "  forbid." >&2
+    echo "" >&2
+    echo "  A steps.* facet adrift says the two copies disagree about what the" >&2
+    echo "  protocol REQUIRES — a step one side lacks, a required field, a step" >&2
+    echo "  label. Decide which copy is the record BEFORE publishing: when the" >&2
+    echo "  live row is ahead (a version published live and never written" >&2
+    echo "  back), publishing the file over it deletes what the row gained — on" >&2
+    echo "  2026-09-15 that would have been ship-a-change's settled step and" >&2
+    echo "  the proof field that makes proven a machine-run fact (0ccf23ec)." >&2
+    echo "  FOLD the row into the file first: GET $URL/<kind>, write its steps" >&2
+    echo "  and fields into $BUNDLE/<kind>.toml until this reads equal." >&2
 fi
 
 # A file that makes NO claim about a field is not drift — the row can
@@ -887,6 +1365,30 @@ if [ -n "$absent_lines" ]; then
     done
 fi
 
+# Two derived lists the tail prints, computed here so the JSON report
+# can carry them too. Neither is a failure (their comment is below,
+# where they are printed).
+pending=$(LC_ALL=C comm -13 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$bundle_kinds") | LC_ALL=C sed '/^$/d')
+tenant_lines=$(for f in "${tenant_files[@]}"; do
+    all=$(tenant_kinds_of "$f" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+    [ -n "$all" ] || continue
+    absent=$(LC_ALL=C comm -13 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$all") | LC_ALL=C sed '/^$/d' | wc -l | tr -d ' ')
+    total=$(printf '%s\n' "$all" | wc -l | tr -d ' ')
+    printf '%s\t%s\t%s\n' "$f" "$absent" "$total"
+done)
+
+# The verdict, decided once so the report and the exit cannot disagree.
+verdict=0
+if [ "$problems" -gt 0 ]; then verdict=1
+elif [ "$drift_n" -gt 0 ] && [ "$REQUIRE_LIVE" -eq 1 ]; then verdict=2
+fi
+if [ -n "$REPORT_JSON" ]; then
+    write_report "$REPORT_JSON" "$verdict" || {
+        echo "$NAME: the JSON report could not be written to $REPORT_JSON — the caller asked for the record and did not get it" >&2
+        exit 1
+    }
+fi
+
 [ "$problems" -eq 0 ] || exit 1
 
 # A drift is a verdict only for a caller that can act on it.
@@ -900,9 +1402,10 @@ authored_n=$(printf '%s\n' "$authored" | wc -l | tr -d ' ')
 if [ "$drift_n" -eq 0 ]; then
     msg="$NAME: OK — $live_n admitted kinds, $authored_n authored, $fields_compared live rows agree with their file"
 else
-    msg="$NAME: $live_n admitted kinds, $authored_n authored — $drift_n operator-facing field(s) adrift across $fields_compared compared (named above; REPORTED, not failed)"
+    msg="$NAME: $live_n admitted kinds, $authored_n authored — $drift_n field(s) or step facet(s) adrift across $fields_compared compared (named above; REPORTED, not failed)"
 fi
 [ ${#EXEMPT[@]} -eq 0 ] || msg="$msg, ${#EXEMPT[@]} exempt (${EXEMPT[*]})"
+lint_scanned "$NAME" "$authored_n" "authored kind(s) compared against $live_n admitted"
 echo "$msg"
 
 # Neither line below is a failure. A platform kind with no live row is
@@ -912,13 +1415,8 @@ echo "$msg"
 # permanent and correct state for one of the two tenants this tree
 # ships — counted rather than named, so a standing fact cannot train
 # anyone to skim past the line above it.
-pending=$(LC_ALL=C comm -13 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$bundle_kinds") | LC_ALL=C sed '/^$/d')
 [ -z "$pending" ] || printf '  authored in the bundle, not yet admitted (awaiting converge + seed): %s\n' "$(printf '%s\n' $pending | tr '\n' ' ')"
-for f in "${tenant_files[@]}"; do
-    all=$(tenant_kinds_of "$f" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
-    [ -n "$all" ] || continue
-    absent=$(LC_ALL=C comm -13 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$all") | LC_ALL=C sed '/^$/d' | wc -l | tr -d ' ')
-    total=$(printf '%s\n' "$all" | wc -l | tr -d ' ')
+[ -z "$tenant_lines" ] || printf '%s\n' "$tenant_lines" | while IFS=$'\t' read -r f absent total; do
     [ "$absent" -eq 0 ] || printf '  %s: %s of %s kinds not admitted here (a tenant this deployment does not run)\n' "$f" "$absent" "$total"
 done
 exit 0

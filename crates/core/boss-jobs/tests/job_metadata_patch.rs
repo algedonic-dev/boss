@@ -56,7 +56,7 @@ fn job_with_metadata(id: &str, owner: &str, metadata: serde_json::Value) -> Job 
         closed_on: None,
         metadata,
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 
@@ -82,6 +82,7 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }

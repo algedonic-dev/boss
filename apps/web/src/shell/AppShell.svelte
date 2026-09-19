@@ -12,13 +12,16 @@
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
   import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { departmentLabel } from '@boss/web-kit/nav';
-  import { navigate } from '../router';
+  import { departments } from '@boss/web-kit/session/classes.svelte';
+  import { href, navigate } from '../router';
   import {
     ROUTE_CATALOG,
+    departmentJobsPath,
     type AppId,
     type NavItem,
     type NavGroup,
   } from './nav-catalog';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
 
   // NavItem / NavGroup / ROUTE_CATALOG live in ./nav-catalog so both
   // this shell and App.svelte read the same registry — and so the
@@ -50,6 +53,11 @@
     session.value.kind === 'ready' ? session.value.user : null,
   );
   let role = $derived((user?.role ?? null) as Role | null);
+  // The role's Class row: where a tenant narrows this role's sidebar
+  // (`metadata.surfaces`, 18d6a6c9). Loaded at boot with the other
+  // employee classes; undefined until then, which canSeeRoute reads as
+  // "nothing declared" — every module-on surface, never an empty bar.
+  let roleRow = $derived(classesFor('employee', 'role').find((r) => r.code === role));
 
   // Unread badge on Inbox (David, feedback 8c020e6d: "I can't see new
   // inbox messages").
@@ -128,10 +136,11 @@
     people: ['people'],
   };
 
-  // The group header is the department's own label — derived, because
-  // a second spelling of "Finance" is a second thing to keep in step.
+  // The group header is the department's own label — the Class
+  // registry's display name, because a second spelling of "Finance" is
+  // a second thing to keep in step.
   function appGroupLabel(app: AppId): string {
-    return app === 'home' || app === 'simulator' ? '' : departmentLabel(app);
+    return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
   // Work group is role-keyed: each role gets a tailored 3-5 item
@@ -159,11 +168,19 @@
     {
       label: 'IT',
       items: [
+        // The three yards and the Crew Board lead, in flow order —
+        // receiving, marshalling, train yard, crew — then the desk
+        // work (design 55417146 on feedback 92921c2f, 2026-09-18).
+        // The Train Yard is third here and still the /it landing:
+        // the landing is catalog order, not this list.
+        ROUTE_CATALOG['system-receiving'],
+        ROUTE_CATALOG['system-marshalling'],
         ROUTE_CATALOG['system-yard'],
+        ROUTE_CATALOG['system-crew'],
         ROUTE_CATALOG['system-incidents'],
         ROUTE_CATALOG.workflows,
         ROUTE_CATALOG['system-design'],
-        ROUTE_CATALOG['system-crew'],
+        ROUTE_CATALOG['system-codebase'],
         ROUTE_CATALOG['system-estate'],
         ROUTE_CATALOG['system-kb'],
       ],
@@ -190,6 +207,14 @@
     },
   ]);
 
+  // Every department group ends on its Jobs row — the department's in
+  // / working / out over the packets whose workflow declares it
+  // (cc76f755, 2026-09-18). PermKey-less like the Audit Log link: the
+  // listing behind it is policy-scoped by the server, and a permKey
+  // would widen the RouteName vocabulary for a row every department
+  // has. For a department that owns no surface it is the whole group,
+  // which is the point: the tab used to open All jobs under Home with
+  // an empty sidebar here. IT keeps its own three thirds.
   let MAIN = $derived<ReadonlyArray<NavGroup>>(
     activeApp === 'it'
       ? IT_GROUPS
@@ -198,9 +223,10 @@
         : [
             {
               label: appGroupLabel(activeApp),
-              items: (APP_SURFACES[activeApp] ?? []).map(
-                (r: RouteName) => ROUTE_CATALOG[r],
-              ),
+              items: [
+                ...(APP_SURFACES[activeApp] ?? []).map((r: RouteName) => ROUTE_CATALOG[r]),
+                { id: 'department-jobs', label: 'Jobs', path: departmentJobsPath(activeApp) },
+              ],
             },
           ],
   );
@@ -221,7 +247,7 @@
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
-      const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey);
+      const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey, roleRow);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
       return policyOk && moduleOk && inPerspective(i);
     });
@@ -295,10 +321,21 @@
 
     <div class="shell-sidebar-footer">
       {#if user}
-        <div class="shell-user">
+        <!-- The name is the door to the profile — passkeys, assignments,
+             the person's own page (feedback 16414d99: "Let's have the
+             user's name in the bottom right click into the profile"). -->
+        <a
+          class="shell-user"
+          href={href('/ux/me')}
+          title="Your profile and passkeys"
+          onclick={(e) => {
+            e.preventDefault();
+            navigate('/ux/me');
+          }}
+        >
           <div class="shell-user-name">{user.name}</div>
           <div class="shell-user-role">{user.role}</div>
-        </div>
+        </a>
       {/if}
     </div>
   </aside>

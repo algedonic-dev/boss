@@ -52,6 +52,23 @@
 //! and completes the branch the fork opened. Any other kind keeps the
 //! v2 answer (a noop note): a filer's decision is theirs.
 //!
+//! ## One route per kind (v4, 1c704bb8)
+//!
+//! `route` is a LIST — a JSON array of the object above, one entry per
+//! kind — and the single object is still accepted as a list of one. v3
+//! named `backlog-item` alone and left `user-feedback` to its filer;
+//! that held for feedback nobody had acted on, and inverted the moment
+//! a car was PARKED AGAINST the packet: the build decision was made by
+//! whoever linked the car, the landed and proven car is the evidence,
+//! and David ratified exactly this close ("once the user feedback
+//! results in a shipped change it can be closed without the filer
+//! approving"). On 2026-09-14 his own feedback 9827c699 had its car
+//! landed and proven inside seventy minutes and stayed open at triage
+//! while the obligation wrote a noop on the car — closed by hand ten
+//! minutes after the proof, the act this rule exists to remove. The
+//! handler matches the packet's kind against the list; a kind no entry
+//! names still keeps the v2 answer.
+//!
 //! ## Saying so on BOTH ends (ca76d8f9)
 //!
 //! When the obligation can act on neither the branch nor the route, the
@@ -65,6 +82,51 @@
 //! car (`boss_jobs::car::triage_on_park`), so what reaches here is the
 //! residue that remains — an item a person routed somewhere this
 //! obligation cannot act, or a kind whose triage is not its to make.
+//!
+//! ## Reading the answer (v5, 05d301be)
+//!
+//! A closing packet may carry the FACTS the step needs — an ops-request
+//! whose verb read something back from a host — and until this version
+//! the only substitutions were the car's own (`{branch}`, `{car}`,
+//! `{title}`). The tag-release verb prints `tag-release: v1.2.3 at
+//! <sha> (packet <id>)` as its last line, the release packet's `tag`
+//! step requires exactly `tag` and `sha`, and "never a sha you did not
+//! read from git" is that step's own procedure. Two optional args, in
+//! `ops.judge`'s vocabulary so a rule author learns one:
+//!
+//! - `verb` — the closing packet's `metadata.verb` must equal it, or
+//!   the close is not this rule's (every answered ops-request fires a
+//!   `kind = "ops-request" AND outcome = "answered"` rule; the closed
+//!   marker carries no metadata to select on).
+//! - `verdict_pattern` — a regex with NAMED groups over the closing
+//!   packet's `execute` step `output`; the LAST matching line is the
+//!   answer, and each group substitutes `{name}` in `done_metadata`
+//!   beside the car facts. No line matching means the verb did not
+//!   answer (a refusal prints `REFUSED`, which no answer pattern
+//!   matches): the obligation completes nothing and notes why on both
+//!   ends, the way a dead link is noted. A pattern that is not a regex
+//!   is rule authoring — `Permanent`, never retried.
+//!
+//! ## Reading the failure (v6, f47861a5)
+//!
+//! An ops-request closes `answered` when its verb RAN — the runner
+//! records how it went as `exit_code` on the execute step, and nothing
+//! in v5 read it. Measured 2026-09-19 on publish 254177e2: the
+//! publish-github-pr verb printed `FAILED — … dubious ownership …`,
+//! exited 1, and its request closed `answered`; v5 found no answer
+//! line, noted the noop on both ends, and the publish's open-pr step
+//! sat `ready` for five hours with nothing on it and no packet filed —
+//! the yard drew a healthy publish. One optional arg:
+//!
+//! - `on_failure = "annotate-and-alert"` — when the closing packet's
+//!   execute step records a non-zero exit, the step on the far end is
+//!   NOT completed (it is not done) and NOT left alone: the verb's
+//!   last FAILED line lands on it as `failed` (with `failed_exit`,
+//!   `failed_source` = the request, and `alert`), and an URGENT
+//!   backlog-item naming the verb, the request and the line is filed
+//!   to the platform owner through the door every alarm handler uses.
+//!   One alert per failed request (`for_request` dedups while open).
+//!   Without the arg, v5's answer stands.
 //!
 //! ## Idempotence
 //!
@@ -101,22 +163,35 @@ const OPEN_STATUSES: [&str; 2] = ["ready", "active"];
 pub struct JobsCompleteLinkedStep {
     client: reqwest::Client,
     jobs_base: String,
+    /// Who the failure alert (v6) is filed to — the platform owner as
+    /// the port answers it, resolved per invocation by
+    /// `common::owner_for_filing`; never a literal (3c23662d).
+    owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
 }
 
 impl JobsCompleteLinkedStep {
-    pub fn new(jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn new(
+        jobs_base: impl Into<String>,
+        owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: crate::handlers::common::api_client(),
             jobs_base: jobs_base.into(),
+            owner,
         })
     }
 
     /// Construct with a custom reqwest client (tests point it at a
     /// local stand-in for jobs-api).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: reqwest::Client,
+        jobs_base: impl Into<String>,
+        owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
+            owner,
         })
     }
 
@@ -319,7 +394,14 @@ fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
 
 /// Find a Job's step by `spec_slug` — the stable machine-facing
 /// identifier, distinct from the rendered `title`.
-fn step_by_slug<'a>(job: &'a serde_json::Value, slug: &str) -> Option<&'a serde_json::Value> {
+///
+/// Shared with `jobs_complete_step_matching`, along with `is_open`,
+/// `is_unset` and `template_arg`: the two handlers complete a step the
+/// same way and differ only in how they find the packet (c34583cb).
+pub(crate) fn step_by_slug<'a>(
+    job: &'a serde_json::Value,
+    slug: &str,
+) -> Option<&'a serde_json::Value> {
     job.get("steps")?
         .as_array()?
         .iter()
@@ -384,16 +466,37 @@ impl Handler for JobsCompleteLinkedStep {
             Some(Value::String(s)) if !s.is_empty() => s.as_str(),
             _ => DEFAULT_EVIDENCE_KEY,
         };
+        // Parsed before any read: a bad regex is the same on every
+        // delivery, and dying on it after the reads wastes them.
+        let answer = AnswerSpec::from_args(args)?;
 
-        // The `jobs.job.closed` payload carries the closing Job's id.
+        // The `jobs.job.closed` payload carries the closing Job's id;
+        // a `step.done.<kind>` marker carries the same Job under
+        // `job_id` (backlog 8f83cade: a design DECIDES its linked
+        // packet at its review's completion, minutes to hours before
+        // it closes, and the rule that says so listens on the step).
         // A malformed marker is not something a redelivery can fix, so
         // it is a no-op rather than an error that retries forever.
-        let Some(closing_id) = ctx.event_payload.get("id").and_then(|v| v.as_str()) else {
+        let Some(closing_id) = ctx
+            .event_payload
+            .get("id")
+            .or_else(|| ctx.event_payload.get("job_id"))
+            .and_then(|v| v.as_str())
+        else {
             return Ok(());
         };
 
         let closing = self.get_job(closing_id, &ctx.rule_name).await?;
         let closing_meta = closing.get("metadata").cloned().unwrap_or(json!({}));
+
+        // Not this rule's verb: another answered request on the same
+        // topic, possibly carrying the same edge. Silent — it is
+        // somebody else's close, not a dead link.
+        if let Some(verb) = &answer.verb
+            && closing_meta.get("verb").and_then(|v| v.as_str()) != Some(verb.as_str())
+        {
+            return Ok(());
+        }
 
         // No declared edge → no obligation. This is the legacy /
         // free-text case: a car whose motivating item is named only in
@@ -426,6 +529,60 @@ impl Handler for JobsCompleteLinkedStep {
             return Ok(());
         }
 
+        // THE FAILURE (v6, f47861a5). A verb that RAN and exited
+        // non-zero is an answered request — the outcome says the verb
+        // ran, the execute step says how it went — and a rule that
+        // asked for the failure mode gets it here, before the answer
+        // pattern is consulted: a FAILED verb has no answer line, and
+        // v5's "no line matched" note on both ends is what left the
+        // publish step ready and silent for five hours.
+        if let (Some(OnFailure::AnnotateAndAlert), Some(failure)) =
+            (answer.on_failure, verb_failure(&closing))
+        {
+            return self
+                .annotate_and_alert(
+                    closing_id,
+                    &closing_meta,
+                    target_id,
+                    &target,
+                    &allowed,
+                    &failure,
+                    ctx,
+                )
+                .await;
+        }
+
+        // THE ANSWER (v5). A rule that asked for one gets it or gets
+        // nothing: a closing packet whose recorded output carries no
+        // line the pattern matches did not answer — the verb refused,
+        // or was killed before its last line — and the step it would
+        // have completed stays with its person. Said on both ends, like
+        // a dead link; idempotent under redelivery like it too.
+        let answer_groups = match answer.groups(&closing) {
+            Ok(groups) => groups,
+            Err(why) => {
+                tracing::warn!(
+                    rule = %ctx.rule_name,
+                    car = %closing_id,
+                    packet = %target_id,
+                    "obligation completed nothing — {why}"
+                );
+                for (on, key, counterpart) in [
+                    (closing_id, "packet", target_id),
+                    (target_id, "car", closing_id),
+                ] {
+                    if let Err(e) = self
+                        .note_noop(on, key, counterpart, &why, &ctx.rule_name)
+                        .await
+                    {
+                        tracing::warn!(rule = %ctx.rule_name, job = %on,
+                            "could not record the no-op note: {e}");
+                    }
+                }
+                return Ok(());
+            }
+        };
+
         // The rule row's translation of "this shipped" into the step
         // kind's own completion vocabulary (0ab5fa3a, accepted (a)).
         // user-feedback v11 makes design-review an `answer-question`
@@ -438,7 +595,7 @@ impl Handler for JobsCompleteLinkedStep {
         // in hand. Fills ABSENT keys only — metadata a person already
         // wrote is their record, not this obligation's to overwrite.
         let done_metadata = template_arg(args, "done_metadata", &ctx.rule_name);
-        let route = parse_route(args, &ctx.rule_name);
+        let routes = parse_routes(args, &ctx.rule_name);
 
         // GUARD 2 — the open branch, the route to one, or nothing.
         // Exactly one of the named steps is open on a live packet (the
@@ -455,14 +612,13 @@ impl Handler for JobsCompleteLinkedStep {
                 // measurement triage was waiting for. Complete the
                 // routing step with the row's disposition + evidence,
                 // re-read, and the fork's own `ready_when` has opened
-                // the branch this obligation completes. Scoped to
-                // `route.kind`: every other kind keeps the answer
-                // below — a filer's routing decision stays theirs.
-                let routable = route
-                    .as_ref()
-                    .filter(|r| {
-                        target.get("kind").and_then(|v| v.as_str()) == Some(r.kind.as_str())
-                    })
+                // the branch this obligation completes. Scoped to the
+                // kinds the list names (v4, 1c704bb8: one entry per
+                // kind): every other kind keeps the answer below — a
+                // filer's routing decision stays theirs.
+                let routable = routes
+                    .iter()
+                    .find(|r| target.get("kind").and_then(|v| v.as_str()) == Some(r.kind.as_str()))
                     .and_then(|r| {
                         step_by_slug(&target, &r.step)
                             .filter(|s| is_open(s))
@@ -508,7 +664,9 @@ impl Handler for JobsCompleteLinkedStep {
                     }
                     return Ok(());
                 };
-                let facts = self.shipped(closing_id, &closing, &closing_meta, ctx).await;
+                let facts = self
+                    .shipped(closing_id, &closing, &closing_meta, &answer_groups, ctx)
+                    .await;
                 self.complete_step(
                     target_id,
                     &routing_step,
@@ -551,7 +709,10 @@ impl Handler for JobsCompleteLinkedStep {
 
         let facts = match shipped {
             Some(f) => f,
-            None => self.shipped(closing_id, &closing, &closing_meta, ctx).await,
+            None => {
+                self.shipped(closing_id, &closing, &closing_meta, &answer_groups, ctx)
+                    .await
+            }
         };
         self.complete_step(
             target_id,
@@ -573,13 +734,104 @@ struct Shipped {
     branch: String,
     title: String,
     evidence: serde_json::Value,
+    /// The named groups of the closing packet's answer line (v5) —
+    /// empty when the rule asked for none.
+    answer: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What a rule asked the obligation to READ off the closing packet
+/// (v5, 05d301be): which verb's answers are its business, and the
+/// pattern whose named groups are the facts. Both optional; the
+/// pattern's spelling is `ops.judge`'s.
+struct AnswerSpec {
+    verb: Option<String>,
+    pattern: Option<regex::Regex>,
+    /// What to do when the closing packet's verb FAILED (v6) — `None`
+    /// keeps v5's answer: a failed verb has no answer line, and the
+    /// noop note lands on both ends.
+    on_failure: Option<OnFailure>,
+}
+
+/// The one failure mode a rule may ask for (v6, f47861a5): the verb's
+/// last FAILED line is written onto the still-open step and an urgent
+/// backlog-item is filed for it. A second mode is a new variant here
+/// and a new word in `from_args`, never a string compared elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnFailure {
+    AnnotateAndAlert,
+}
+
+/// The word a rule file spells the mode as.
+const ANNOTATE_AND_ALERT: &str = "annotate-and-alert";
+
+impl AnswerSpec {
+    fn from_args(args: &[(String, Value)]) -> Result<Self, HandlerError> {
+        let verb = match arg(args, "verb") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
+        let pattern = match arg(args, "verdict_pattern") {
+            Some(Value::String(src)) if !src.is_empty() => {
+                Some(regex::Regex::new(src).map_err(|e| {
+                    HandlerError::Permanent(format!("verdict_pattern {src:?} is not a regex: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+        let on_failure = match arg(args, "on_failure") {
+            Some(Value::String(s)) if s == ANNOTATE_AND_ALERT => Some(OnFailure::AnnotateAndAlert),
+            Some(Value::String(s)) if !s.is_empty() => {
+                // Rule authoring, identical on every redelivery.
+                return Err(HandlerError::Permanent(format!(
+                    "on_failure {s:?} is not a mode this handler knows; the one mode is {ANNOTATE_AND_ALERT:?}"
+                )));
+            }
+            _ => None,
+        };
+        Ok(Self {
+            verb,
+            pattern,
+            on_failure,
+        })
+    }
+
+    /// PURE over the closing packet: the answer's named groups, or why
+    /// there is no answer. No pattern asked for means no groups and no
+    /// complaint. The line is the LAST one the pattern matches in the
+    /// `execute` step's recorded `output` (`ops_judge::verdict_groups`,
+    /// one definition), because the ops-runner records the two streams
+    /// merged and a verb says its answer last.
+    fn groups(
+        &self,
+        closing: &serde_json::Value,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let Some(pattern) = &self.pattern else {
+            return Ok(serde_json::Map::new());
+        };
+        let output = step_by_slug(closing, super::ops_judge::REPORT_STEP)
+            .and_then(|s| s.get("metadata"))
+            .and_then(|m| m.get("output"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match super::ops_judge::verdict_groups(pattern, output) {
+            Some((_, serde_json::Value::Object(groups))) => Ok(groups),
+            _ => Err(format!(
+                "no line of the closing packet's {} output matches the answer pattern {:?} — \
+                 the verb refused or never reached its answer line, so nothing was read back \
+                 and the step stays with its person",
+                super::ops_judge::REPORT_STEP,
+                pattern.as_str()
+            )),
+        }
+    }
 }
 
 /// The routing a rule row may ask for (v3, dda0713c): when none of
 /// `steps` is open because the packet has not been triaged, complete
 /// `step` on a packet of `kind` with `metadata` — the step kind's
 /// required vocabulary, `{branch}`/`{car}`/`{title}` substituted — and
-/// let the fork open the branch `steps` then completes.
+/// let the fork open the branch `steps` then completes. A rule row
+/// carries one per kind (v4, 1c704bb8).
 struct Route {
     kind: String,
     step: String,
@@ -591,7 +843,7 @@ struct Route {
 /// redelivery cannot fix a malformed template, and dying on it would
 /// also kill the evidence write — so a malformed one is a warning and
 /// `None`, never an error.
-fn template_arg(
+pub(crate) fn template_arg(
     args: &[(String, Value)],
     name: &str,
     rule: &str,
@@ -611,29 +863,45 @@ fn template_arg(
     }
 }
 
-fn parse_route(args: &[(String, Value)], rule: &str) -> Option<Route> {
+/// The `route` arg: a JSON array of `{kind, step, metadata}` objects,
+/// or a single such object read as a list of one (the v3 shape, still
+/// accepted so a tenant's own rule row keeps parsing). Bad rule
+/// authoring is permanent, so a malformed value — or one malformed
+/// entry — is a warning and an EMPTY list, never an error: the
+/// obligation then runs as v2 did.
+fn parse_routes(args: &[(String, Value)], rule: &str) -> Vec<Route> {
     let Some(Value::String(src)) = arg(args, "route") else {
-        return None;
+        return Vec::new();
     };
-    let route = serde_json::from_str::<serde_json::Value>(src)
-        .ok()
-        .and_then(|v| {
+    let entries = match serde_json::from_str::<serde_json::Value>(src) {
+        Ok(serde_json::Value::Array(list)) => list,
+        Ok(one @ serde_json::Value::Object(_)) => vec![one],
+        _ => Vec::new(),
+    };
+    let routes: Option<Vec<Route>> = entries
+        .iter()
+        .map(|v| {
             Some(Route {
                 kind: v.get("kind")?.as_str()?.to_string(),
                 step: v.get("step")?.as_str()?.to_string(),
                 metadata: v.get("metadata")?.as_object()?.clone(),
             })
-        });
-    if route.is_none() {
-        tracing::warn!(
-            rule = %rule,
-            "route is not a JSON object with kind/step/metadata — completing without routing"
-        );
+        })
+        .collect();
+    match routes {
+        Some(routes) if !routes.is_empty() => routes,
+        _ => {
+            tracing::warn!(
+                rule = %rule,
+                "route is not a JSON object (or a non-empty array of objects) with \
+                 kind/step/metadata — completing without routing"
+            );
+            Vec::new()
+        }
     }
-    route
 }
 
-fn is_open(step: &serde_json::Value) -> bool {
+pub(crate) fn is_open(step: &serde_json::Value) -> bool {
     step.get("status")
         .and_then(|v| v.as_str())
         .is_some_and(|st| OPEN_STATUSES.contains(&st))
@@ -656,7 +924,27 @@ fn stamped_by(step: &serde_json::Value, evidence_key: &str, car: &str) -> bool {
         == Some(car)
 }
 
-/// Fill `merged` from a template: absent keys only — metadata a
+/// Is this key unset on the step? Absent, or the `""` placeholder.
+///
+/// `user-feedback` and `backlog-item` default their design-review's
+/// `verdict` to `""` — the key boss-expr needs PRESENT before the step
+/// completes, and (the Workflow's own words) "an empty string can never
+/// be an enum member, so the lint reads it as the unset placeholder".
+/// `fill` read presence alone, so on a design-review this obligation
+/// would have kept the placeholder and PUT `verdict: ""` — a 400 at
+/// the write, and the loop breaking exactly where it was fixed
+/// (backlog 5f0b2661, found by the design-close witness test). A
+/// person's real verdict is never the empty string, so this cannot
+/// overwrite one.
+pub(crate) fn is_unset(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// Fill `merged` from a template: unset keys only — metadata a
 /// person already wrote is their record, not this obligation's to
 /// overwrite — with string values substituting the car's facts.
 fn fill(
@@ -665,22 +953,242 @@ fn fill(
     shipped: &Shipped,
 ) {
     for (k, v) in template {
-        if merged.contains_key(k) {
+        if !is_unset(merged.get(k)) {
             continue;
         }
         let v = match v {
-            serde_json::Value::String(s) => serde_json::Value::String(
-                s.replace("{branch}", &shipped.branch)
+            serde_json::Value::String(s) => {
+                let base = s
+                    .replace("{branch}", &shipped.branch)
                     .replace("{car}", &shipped.car)
-                    .replace("{title}", &shipped.title),
-            ),
+                    .replace("{title}", &shipped.title);
+                // The answer's groups (v5): a numeric group renders as
+                // its digits, a string as itself.
+                serde_json::Value::String(shipped.answer.iter().fold(base, |acc, (name, val)| {
+                    let text = match val {
+                        serde_json::Value::String(t) => t.clone(),
+                        other => other.to_string(),
+                    };
+                    acc.replace(&format!("{{{name}}}"), &text)
+                }))
+            }
             other => other.clone(),
         };
         merged.insert(k.clone(), v);
     }
 }
 
+/// What a verb that ran and failed left behind (v6): its exit, and the
+/// line that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerbFailure {
+    pub exit: String,
+    pub line: String,
+}
+
+/// The dedup key a failure alert carries: the request whose verb
+/// failed. One alert per failed request while it is open.
+pub(crate) const FOR_REQUEST: &str = "for_request";
+
+/// PURE over the closing packet: `Some` when its `execute` step records
+/// a non-zero `exit_code` — the ops-runner's record of a verb that RAN
+/// and failed (a refusal ran nothing and carries no exit, and closes
+/// `refused`, which no answered-rule fires on). The line is the LAST
+/// one containing `FAILED` (the forge verbs' `fail()` spelling), else
+/// the last non-empty line: the runner records both streams merged and
+/// a verb says why it stopped last. c98a782f's line was the 4th of 4.
+pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
+    let meta = step_by_slug(closing, super::ops_judge::REPORT_STEP)?.get("metadata")?;
+    let exit = match meta.get("exit_code")? {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if exit.is_empty() || exit == "0" {
+        return None;
+    }
+    let output = meta.get("output").and_then(|v| v.as_str()).unwrap_or("");
+    let mut lines = output.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines
+        .clone()
+        .rfind(|l| l.contains("FAILED"))
+        .or_else(|| lines.next_back())
+        .unwrap_or("(no output recorded)")
+        .to_string();
+    Some(VerbFailure { exit, line })
+}
+
+/// PURE: the urgent packet one failed verb becomes — named after the
+/// verb, the request and the step it leaves open, the FAILED line
+/// verbatim under `failed`, the request under `for_request` (the dedup
+/// key). Subject: the troubled packet's own, so "what went wrong with
+/// this publish" answers from Subject history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn failure_alert_body(
+    closing_id: &str,
+    verb: &str,
+    target_id: &str,
+    target: &serde_json::Value,
+    step_slug: &str,
+    failure: &VerbFailure,
+    owner: &str,
+    ctx: &InvocationContext,
+) -> serde_json::Value {
+    let target_kind = target
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("packet");
+    let target_title = target.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let req8 = closing_id.get(..8).unwrap_or(closing_id);
+    let tgt8 = target_id.get(..8).unwrap_or(target_id);
+    let subject = target
+        .get("subject")
+        .filter(|s| {
+            s.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| !id.is_empty())
+        })
+        .cloned()
+        .unwrap_or_else(|| json!({ "subject_kind": "custom", "id": "bosspipeline" }));
+    json!({
+        "kind": "backlog-item",
+        "title": format!(
+            "{verb} FAILED (exit {}) on ops-request {req8}: {target_kind} {tgt8} stays at {step_slug}",
+            failure.exit
+        ),
+        "subject": subject,
+        // The platform owner as the registry answers it, or nobody for
+        // the jobs API to resolve from the kind's owner_role (3c23662d).
+        "owner_id": owner,
+        "priority": "urgent",
+        "status": "open",
+        "tags": [],
+        "metadata": {
+            "area": "platform",
+            FOR_REQUEST: closing_id,
+            "for_packet": target_id,
+            "verb": verb,
+            "exit": failure.exit,
+            "failed": failure.line,
+            "step": step_slug,
+            "reporter": ctx.rule_name,
+            "triggered_by_event_id": ctx.triggering_event_id,
+            "detail": format!(
+                "Filed by {} (backlog f47861a5): ops-request {req8} ran `{verb}` on the host and \
+                 the verb FAILED (exit {}); the request closed `answered`, because the verb ran. \
+                 The {target_kind} it was filed for ({tgt8}, \"{target_title}\") is left at its \
+                 `{step_slug}` step, which stays open with the same line under `failed` — the \
+                 verb did not do what the step records. The verb's last line: {}",
+                ctx.rule_name, failure.exit, failure.line
+            ),
+        },
+    })
+}
+
 impl JobsCompleteLinkedStep {
+    /// THE FAILURE MODE (v6, f47861a5): `on_failure = "annotate-and-
+    /// alert"`. The verb the closing request ran FAILED, so the open
+    /// step on the far end is not completed — it is not done — and it
+    /// is not left untouched either, which is what happened to publish
+    /// 254177e2's open-pr for five hours. The alert is filed FIRST and
+    /// the step annotated second, naming the alert: a redelivery after
+    /// the alert landed but before the note did finds the open alert
+    /// by `for_request` and reuses it, and one after both landed finds
+    /// `failed_source` on the step and writes nothing. Nothing open to
+    /// annotate (a person completed it, or the fork never opened it)
+    /// is silent, like a redelivery against a completed branch.
+    #[allow(clippy::too_many_arguments)]
+    async fn annotate_and_alert(
+        &self,
+        closing_id: &str,
+        closing_meta: &serde_json::Value,
+        target_id: &str,
+        target: &serde_json::Value,
+        allowed: &[&str],
+        failure: &VerbFailure,
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let rule = ctx.rule_name.as_str();
+        let Some(step) = open_step(target, allowed) else {
+            return Ok(());
+        };
+        let Some(step_id) = step.get("id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        if step
+            .get("metadata")
+            .and_then(|m| m.get("failed_source"))
+            .and_then(|v| v.as_str())
+            == Some(closing_id)
+        {
+            return Ok(());
+        }
+        let slug = step
+            .get("spec_slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or(allowed.first().copied().unwrap_or("step"));
+        let verb = closing_meta
+            .get("verb")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the verb");
+        let base = self.jobs_base.trim_end_matches('/');
+
+        let open =
+            super::common::open_jobs_of_kind(&self.client, base, "backlog-item", rule).await?;
+        let alert_id = match open
+            .iter()
+            .find(|j| {
+                j.get("metadata")
+                    .and_then(|m| m.get(FOR_REQUEST))
+                    .and_then(|v| v.as_str())
+                    == Some(closing_id)
+            })
+            .and_then(|j| j.get("id").and_then(|v| v.as_str()))
+        {
+            Some(existing) => existing.to_string(),
+            None => {
+                let owner = super::common::owner_for_filing(self.owner.as_ref(), rule).await;
+                let body = failure_alert_body(
+                    closing_id, verb, target_id, target, slug, failure, &owner, ctx,
+                );
+                super::common::post_json_minted_id(
+                    &self.client,
+                    &format!("{base}/api/jobs"),
+                    &body,
+                    rule,
+                )
+                .await?
+            }
+        };
+
+        // The step-side merge door (PATCH .../steps/{id}/metadata):
+        // top-level keys merged server-side, status untouched — the
+        // step stays open, because it is.
+        super::common::write_json(
+            &self.client,
+            reqwest::Method::PATCH,
+            &format!("{base}/api/jobs/{target_id}/steps/{step_id}/metadata"),
+            &json!({
+                "failed": failure.line,
+                "failed_exit": failure.exit,
+                "failed_source": closing_id,
+                "alert": alert_id,
+            }),
+            rule,
+        )
+        .await?;
+        tracing::warn!(
+            rule = %rule,
+            request = %closing_id,
+            packet = %target_id,
+            alert = %alert_id,
+            "{verb} FAILED (exit {}) — `{slug}` annotated and left open; {}",
+            failure.exit,
+            failure.line
+        );
+        Ok(())
+    }
+
     /// The evidence. "The work you asked for shipped" is only worth
     /// saying if it names WHAT shipped — an id and a title a reader
     /// can go look at, plus the train that carried it and the
@@ -691,6 +1199,7 @@ impl JobsCompleteLinkedStep {
         closing_id: &str,
         closing: &serde_json::Value,
         closing_meta: &serde_json::Value,
+        answer: &serde_json::Map<String, serde_json::Value>,
         ctx: &InvocationContext,
     ) -> Shipped {
         let branch = closing_meta.get("branch").and_then(|v| v.as_str());
@@ -742,6 +1251,7 @@ impl JobsCompleteLinkedStep {
                 "generation": generation,
                 "by_rule": ctx.rule_name,
             }),
+            answer: answer.clone(),
         }
     }
 
@@ -840,6 +1350,14 @@ mod tests {
         }
     }
 
+    /// The owner port every case here constructs the handler with. No
+    /// case in this module files an alert (the failure mode's tests
+    /// live in tests/publish_pr_answer.rs, where a fixture may spell
+    /// the forge's address), so the fixed owner is never read.
+    pub(super) fn test_owner() -> Arc<dyn boss_core::platform_owner::PlatformOwner> {
+        Arc::new(boss_core::platform_owner::Fixed("emp-owner".into()))
+    }
+
     fn args() -> Vec<(String, Value)> {
         vec![
             ("link".to_string(), Value::String("backlog_item".into())),
@@ -918,7 +1436,7 @@ mod tests {
         })
     }
 
-    type Puts = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+    pub(super) type Puts = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
 
     /// Stand-in for jobs-api: serves the Jobs by id, records every
     /// step PUT, and records every job-metadata PATCH — the noop-note
@@ -931,7 +1449,7 @@ mod tests {
     /// completes with `disposition = "build"` — standing in for
     /// jobs-api's own re-evaluation on the write. The handler routes,
     /// re-reads, and must find the branch it opened.
-    async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Puts, Puts) {
+    pub(super) async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Puts, Puts) {
         let patches: Puts = Arc::new(Mutex::new(Vec::new()));
         let puts: Puts = Arc::new(Mutex::new(Vec::new()));
         let by_id: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>> =
@@ -1072,6 +1590,48 @@ mod tests {
         })
     }
 
+    /// v4 rule args (1c704bb8): `route` is a LIST — one entry per kind
+    /// whose triage a shipped, proven car may make. The single-object
+    /// form above is still accepted; this is the shape the rule file
+    /// carries now.
+    fn args_with_routes() -> Vec<(String, Value)> {
+        let mut a = args_with_done_metadata();
+        a.push((
+            "route".to_string(),
+            Value::String(
+                r#"[{"kind": "backlog-item", "step": "triage", "metadata": {"disposition": "build", "evidence": "shipped and proven: {branch} — {title} (car {car})"}}, {"kind": "user-feedback", "step": "triage", "metadata": {"disposition": "build", "evidence": "shipped and proven: {branch} — {title} (car {car})"}}]"#.into(),
+            ),
+        ));
+        a
+    }
+
+    /// A live `user-feedback` packet nobody has triaged, in the shape
+    /// the live Workflow gives it: `submitted` fired, `triage` open,
+    /// every branch (and `needs-info`) still `pending`. The packet a
+    /// car parked with `--park-backlog-item` names when what it was
+    /// parked against is feedback rather than a backlog item.
+    fn untriaged_feedback() -> serde_json::Value {
+        json!({
+            "id": PACKET,
+            "kind": "user-feedback",
+            "title": "A page for the codebase stats",
+            "status": "open",
+            "metadata": { "submitted_by": "emp-david" },
+            "steps": [
+                { "id": "s-submitted", "spec_slug": "submitted", "status": "completed",
+                  "metadata": {} },
+                { "id": "s-triage", "spec_slug": "triage", "status": "ready", "metadata": {} },
+                { "id": "s-investigate", "spec_slug": "investigate", "status": "pending",
+                  "metadata": {} },
+                { "id": "s-design-review", "spec_slug": "design-review", "status": "pending",
+                  "metadata": {} },
+                { "id": BRANCH_STEP, "spec_slug": "build", "status": "pending", "metadata": {} },
+                { "id": "s-needs-info", "spec_slug": "needs-info", "status": "pending",
+                  "metadata": {} },
+            ],
+        })
+    }
+
     /// c65110d6: the note saying "this obligation completed nothing"
     /// must actually LAND on the car. It never did — the first
     /// `note_on_car` PUT `/api/jobs/{id}` with a metadata-only body,
@@ -1090,7 +1650,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         assert!(
@@ -1151,7 +1711,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1186,9 +1746,11 @@ mod tests {
         );
     }
 
-    /// The route is scoped to the kind it names. A user-feedback
-    /// packet at triage keeps the v2 answer: a filer's routing
-    /// decision is not made for them, and the noop note lands.
+    /// A route is scoped to the kind it names. The v3 SINGLE-OBJECT
+    /// form is still accepted (1c704bb8 made `route` a list without
+    /// retiring the object), and under it a user-feedback packet at
+    /// triage keeps the v2 answer: no step completed, the noop note
+    /// lands on both ends. The list form below is what routes it.
     #[tokio::test]
     async fn the_route_applies_only_to_the_kind_it_names() {
         let mut feedback = untriaged_packet();
@@ -1199,7 +1761,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1235,7 +1797,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1286,7 +1848,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1307,7 +1869,7 @@ mod tests {
         .await;
         let mut a = args_with_done_metadata();
         a.push(("route".to_string(), Value::String("not json".into())));
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&a, &ctx(close_marker())).await.expect("runs");
 
         assert!(puts.lock().unwrap().is_empty());
@@ -1315,6 +1877,108 @@ mod tests {
             patches.lock().unwrap().len(),
             2,
             "the v2 noop note lands on both ends"
+        );
+    }
+
+    /// 1c704bb8 — the route list. David's feedback 9827c699 had its
+    /// car built, landed and PROVEN inside seventy minutes, and the
+    /// packet stayed open at triage: v3's route named `backlog-item`
+    /// only, so the obligation wrote `obligation_noop` on the car and
+    /// the operator closed the packet by hand ten minutes after the
+    /// proof — the manual act this rule exists to remove. The v3
+    /// reasoning ("a filer's decision is still theirs") does not hold
+    /// when a car was PARKED AGAINST the packet: whoever built and
+    /// linked the car made the routing decision, and the proven car is
+    /// the evidence. So the same two writes the backlog-item route
+    /// makes — triage `build` with the car as evidence, then the
+    /// `build` branch the fork opened — land on a user-feedback packet
+    /// when the rule row lists its kind.
+    #[tokio::test]
+    async fn a_proven_car_routes_the_user_feedback_it_was_parked_against() {
+        let (base, puts, patches) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "feat/codebase-stats" })),
+            untriaged_feedback(),
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_routes(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "triage, then build: {calls:?}");
+
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, "s-triage", "the routing step is completed FIRST");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            body["metadata"]["disposition"], "build",
+            "a disposition the live user-feedback triage admits"
+        );
+        let evidence = body["metadata"]["evidence"].as_str().unwrap_or_default();
+        assert!(
+            evidence.contains("feat/codebase-stats") && evidence.contains(CAR),
+            "the triage evidence names the branch and the car: {evidence}"
+        );
+        assert_eq!(body["metadata"]["arrived_from"]["car"], CAR);
+
+        let (step_id, body) = &calls[1];
+        assert_eq!(step_id, BRANCH_STEP, "the build branch the route opened");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["metadata"]["arrived_from"]["car"], CAR);
+
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "nothing to apologise for — the obligation acted"
+        );
+    }
+
+    /// The list did not narrow what v3 routed: a backlog item at
+    /// triage takes the same two writes under the list form.
+    #[tokio::test]
+    async fn the_route_list_still_routes_the_backlog_item() {
+        let (base, puts, patches) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "fix/x" })),
+            untriaged_packet(),
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_routes(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "triage, then build: {calls:?}");
+        assert_eq!(calls[0].0, "s-triage");
+        assert_eq!(calls[0].1["metadata"]["disposition"], "build");
+        assert_eq!(calls[1].0, BRANCH_STEP);
+        assert!(patches.lock().unwrap().is_empty());
+    }
+
+    /// The list is still a scope, not a licence: a kind no entry names
+    /// keeps the v2 answer — nothing completed, the note on both ends.
+    #[tokio::test]
+    async fn the_route_list_leaves_a_kind_it_does_not_name_alone() {
+        let mut other = untriaged_packet();
+        other["kind"] = json!("ops-request");
+        let (base, puts, patches) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "fix/x" })),
+            other,
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_routes(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        assert!(puts.lock().unwrap().is_empty(), "no step completed");
+        assert_eq!(
+            patches.lock().unwrap().len(),
+            2,
+            "the noop note lands on the car and on the packet"
         );
     }
 
@@ -1328,7 +1992,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         let calls = puts.lock().unwrap().clone();
@@ -1371,7 +2035,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1407,7 +2071,7 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1435,7 +2099,7 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -1460,7 +2124,7 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -1480,7 +2144,7 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "nothing to complete");
     }
@@ -1492,7 +2156,7 @@ mod tests {
         let mut closed = packet("ready");
         closed["status"] = json!("closed");
         let (base, puts, _) = mock_jobs(vec![car(json!({ "backlog_item": PACKET })), closed]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "a closed packet is done");
     }
@@ -1508,7 +2172,7 @@ mod tests {
             packet("completed"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -1525,7 +2189,7 @@ mod tests {
         stamped["steps"][2]["metadata"]["arrived_from"] = json!({ "car": CAR });
         let (base, puts, _) =
             mock_jobs(vec![car(json!({ "backlog_item": PACKET })), stamped]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "already stamped by us");
     }
@@ -1539,7 +2203,7 @@ mod tests {
         nothing_open["status"] = json!("open");
         let (base, puts, _) =
             mock_jobs(vec![car(json!({ "backlog_item": PACKET })), nothing_open]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -1557,7 +2221,7 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         let calls = puts.lock().unwrap().clone();
@@ -1570,7 +2234,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rule_missing_its_link_arg_is_a_permanent_error() {
-        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1", test_owner());
         let res = h
             .invoke(
                 &[("steps".to_string(), Value::String("build".into()))],
@@ -1582,7 +2246,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rule_with_an_empty_steps_arg_is_a_permanent_error() {
-        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1", test_owner());
         let res = h
             .invoke(
                 &[
@@ -1597,7 +2261,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_close_marker_with_no_id_is_a_no_op() {
-        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1", test_owner());
         // Unreachable base URL: a no-op is the only outcome that
         // cannot error here, which is what proves nothing was fetched.
         let res = h
@@ -1606,6 +2270,325 @@ mod tests {
         assert!(
             res.is_ok(),
             "a malformed marker retries into nothing: {res:?}"
+        );
+    }
+
+    const DESIGN: &str = "c6bd173e-3dc9-426f-8fff-866a3b2a6117";
+    const REVIEW_STEP: &str = "55555555-5555-5555-5555-555555555555";
+
+    /// A published design-doc that names the feedback it answers — the
+    /// `answers` edge `boss design --answers` writes (backlog 5f0b2661).
+    fn design(metadata: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": DESIGN,
+            "kind": "design-doc",
+            "title": "A car lands where its change goes live",
+            "status": "closed",
+            "subject": { "subject_kind": "custom", "id": "boss-platform" },
+            "metadata": metadata,
+            "steps": [],
+        })
+    }
+
+    /// A user-feedback packet triage routed to `design`: its
+    /// design-review is open, carrying the question the verb wrote and
+    /// the empty verdict the Workflow defaults — the live shape of
+    /// 61366e5a on 2026-09-15.
+    fn feedback_routed_to_design(review_status: &str) -> serde_json::Value {
+        json!({
+            "id": PACKET,
+            "kind": "user-feedback",
+            "title": "Feedback on /it",
+            "status": "open",
+            "metadata": { "submitted_by": "emp-david" },
+            "steps": [
+                { "id": "s-triage", "spec_slug": "triage", "status": "completed",
+                  "metadata": { "disposition": "design" } },
+                { "id": REVIEW_STEP, "spec_slug": "design-review", "status": review_status,
+                  "metadata": { "authority_role": "platform-admin", "verdict": "",
+                                "question": "Decide design 'A car lands where its change goes live' (c6bd173e)" } },
+                { "id": BRANCH_STEP, "spec_slug": "build", "status": "pending", "metadata": {} },
+            ],
+        })
+    }
+
+    /// The args `complete-feedback-design-review-on-design-doc-published`
+    /// carries: the `answers` edge, the one branch a design decides, the
+    /// verdict + answer the answer-question kind requires at done, and
+    /// an evidence key that says what happened (a design was decided,
+    /// nothing arrived).
+    fn design_rule_args() -> Vec<(String, Value)> {
+        vec![
+            ("link".to_string(), Value::String("answers".into())),
+            ("steps".to_string(), Value::String("design-review".into())),
+            (
+                "done_metadata".to_string(),
+                Value::String(
+                    r#"{"verdict": "approved", "answer": "design decided: {title} ({car}) — every question resolved and the doc published"}"#.into(),
+                ),
+            ),
+            ("evidence_key".to_string(), Value::String("decided_by".into())),
+        ]
+    }
+
+    fn design_close_marker() -> serde_json::Value {
+        json!({
+            "id": DESIGN,
+            "kind": "design-doc",
+            "outcome": "published",
+            "closed_on": "2026-09-15",
+            "title": "A car lands where its change goes live",
+            "parent_step_id": null,
+        })
+    }
+
+    /// Backlog 5f0b2661 — deciding the design decides the feedback. A
+    /// feedback routed to design gave one person two decisions, the
+    /// second an `answer-question` with no question (David's bug
+    /// 4f6019d7). With the design carrying an `answers` edge, its
+    /// `published` close completes the feedback's open design-review
+    /// through THIS handler — the same shape the merge obligation
+    /// uses, with a different link, one step, and the design's facts
+    /// in the answer. No new handler code: the rule row is the whole
+    /// change, and this test is its witness.
+    #[tokio::test]
+    async fn a_published_design_completes_the_design_review_of_the_feedback_it_answers() {
+        let (base, puts, patches) = mock_jobs(vec![
+            design(json!({ "answers": PACKET, "title": "A car lands where its change goes live" })),
+            feedback_routed_to_design("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let mut ctx = ctx(design_close_marker());
+        ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
+        h.invoke(&design_rule_args(), &ctx).await.expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly the design-review completes: {calls:?}"
+        );
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, REVIEW_STEP);
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            body["metadata"]["verdict"], "approved",
+            "a published design has every question resolved — the Workflow's `covers` \
+             contract — so the feedback's verdict is approved and its build opens"
+        );
+        let answer = body["metadata"]["answer"].as_str().unwrap_or_default();
+        assert!(
+            answer.contains("A car lands where its change goes live") && answer.contains(DESIGN),
+            "the answer names the design by title and id: {answer}"
+        );
+        assert_eq!(
+            body["metadata"]["decided_by"]["car"], DESIGN,
+            "the evidence names the design under the rule's own key"
+        );
+        assert_eq!(body["metadata"]["decided_by"]["outcome"], "published");
+        assert!(
+            body["metadata"]["decided_by"]["branch"].is_null(),
+            "a design has no branch; the evidence says null rather than inventing one"
+        );
+        // The step's own keys survive the wholesale metadata replace.
+        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+        assert!(
+            body["metadata"]["question"]
+                .as_str()
+                .is_some_and(|q| q.contains("c6bd173e")),
+            "the question the verb wrote is still on the completed step"
+        );
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "nothing to apologise for"
+        );
+    }
+
+    /// A user-feedback packet in the shape f90ca046 gives the design
+    /// route (2026-09-18): triage routed to `design`, the executor's
+    /// `draft-design` task done carrying the id of the design it
+    /// filed, and `design-review` — `ready_when =
+    /// steps.draft-design.done` — open with the verb's question.
+    fn feedback_drafted_for_design(draft_status: &str, review_status: &str) -> serde_json::Value {
+        let draft_metadata = if draft_status == "completed" {
+            json!({ "authority_role": "platform-admin", "design_id": DESIGN })
+        } else {
+            json!({ "authority_role": "platform-admin" })
+        };
+        json!({
+            "id": PACKET,
+            "kind": "user-feedback",
+            "title": "Feedback on /it/estate",
+            "status": "open",
+            "metadata": { "submitted_by": "emp-david" },
+            "steps": [
+                { "id": "s-triage", "spec_slug": "triage", "status": "completed",
+                  "metadata": { "disposition": "design" } },
+                { "id": "s-draft", "spec_slug": "draft-design", "status": draft_status,
+                  "metadata": draft_metadata },
+                { "id": REVIEW_STEP, "spec_slug": "design-review", "status": review_status,
+                  "metadata": { "authority_role": "platform-admin", "verdict": "",
+                                "question": "Decide design 'A car lands where its change goes live' (c6bd173e)" } },
+                { "id": BRANCH_STEP, "spec_slug": "build", "status": "pending", "metadata": {} },
+            ],
+        })
+    }
+
+    /// Backlog f90ca046: the design route now opens the executor's
+    /// draft first and the founder's review waits on it. The rule is
+    /// unchanged — it names `design-review` and follows `answers` —
+    /// so a published design must still close the review it was
+    /// filed for, now that the review opens one step later. Measured
+    /// 2026-09-18 on 54f0ab33: the design (5fc71f03) was filed by hand
+    /// against a review that had been ready, empty, for the founder
+    /// since triage.
+    #[tokio::test]
+    async fn a_published_design_still_closes_the_review_that_waited_on_its_draft() {
+        let (base, puts, patches) = mock_jobs(vec![
+            design(json!({ "answers": PACKET, "title": "A car lands where its change goes live" })),
+            feedback_drafted_for_design("completed", "ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let mut ctx = ctx(design_close_marker());
+        ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
+        h.invoke(&design_rule_args(), &ctx).await.expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly the design-review completes — never the draft: {calls:?}"
+        );
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, REVIEW_STEP);
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["metadata"]["verdict"], "approved");
+        assert_eq!(body["metadata"]["decided_by"]["car"], DESIGN);
+        assert!(patches.lock().unwrap().is_empty(), "nothing to note");
+    }
+
+    /// The other half of the same shape: a design that publishes while
+    /// the draft is still open — the executor filed it without
+    /// `--answers`, say, and completed nothing — finds the review
+    /// PENDING and writes nothing. A pending review is one the route
+    /// has not opened, and completing it would fabricate the draft's
+    /// record; the handler notes the noop on both ends instead, and
+    /// the draft stays with the executor.
+    #[tokio::test]
+    async fn a_design_published_before_its_draft_is_done_completes_nothing() {
+        let (base, puts, patches) = mock_jobs(vec![
+            design(json!({ "answers": PACKET })),
+            feedback_drafted_for_design("ready", "pending"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let mut ctx = ctx(design_close_marker());
+        ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
+        h.invoke(&design_rule_args(), &ctx).await.expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a pending review is never completed, and the draft is not the rule's to touch"
+        );
+        assert!(
+            !patches.lock().unwrap().is_empty(),
+            "the noop is noted rather than silent — the draft is still open"
+        );
+    }
+
+    /// The person decided the feedback step first (the order the bug
+    /// report describes). The design's close then finds it completed
+    /// and writes nothing — their verdict stands, and no noop note is
+    /// filed, because the work was done.
+    #[tokio::test]
+    async fn a_design_review_a_person_already_decided_is_left_alone() {
+        let (base, puts, patches) = mock_jobs(vec![
+            design(json!({ "answers": PACKET })),
+            feedback_routed_to_design("completed"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&design_rule_args(), &ctx(design_close_marker()))
+            .await
+            .expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a person's decision stands"
+        );
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "the work was done — nothing to say on either end"
+        );
+    }
+
+    /// A `step.done.review-design` marker in the shape `http/steps.rs`
+    /// emits: the design is still OPEN (its fold is the agent's next
+    /// step), and the packet's own id rides as `job_id`, not `id`.
+    fn design_review_done_marker() -> serde_json::Value {
+        json!({
+            "job_id": DESIGN,
+            "step_id": "s-review",
+            "kind": "review-design",
+            "workflow_kind": "design-doc",
+            "spec_slug": "review",
+            "subject_kind": "custom",
+            "subject_id": "boss-platform",
+            "completed_on": "2026-09-18",
+            "metadata": { "resolutions": [{ "anchor": "q1", "decision": "yes" }] },
+            "notify_on_done": false,
+        })
+    }
+
+    /// Backlog 8f83cade — the decision is the review's completion, not
+    /// the fold's. Measured 2026-09-18 23:10Z: David answered both open
+    /// designs (11e60367, 55417146) and saw two 'Decide the design'
+    /// steps (b4afd7b9, 92921c2f) still in his queue with nothing to
+    /// do, because the completion fired on `published`, and between
+    /// the review and `published` sits `fold` — the agent's write-up,
+    /// minutes to hours later. Fired from `step.done.review-design`
+    /// instead: the design is still open, the marker carries `job_id`
+    /// rather than `id`, and the linked Decide step completes with the
+    /// verdict all the same. The fold stays the design packet's own
+    /// obligation.
+    #[tokio::test]
+    async fn a_decided_review_completes_the_linked_decide_step_while_the_design_is_still_open() {
+        let mut open_design =
+            design(json!({ "answers": PACKET, "title": "A car lands where its change goes live" }));
+        open_design["status"] = json!("open");
+        let (base, puts, patches) =
+            mock_jobs(vec![open_design, feedback_routed_to_design("ready")]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let mut ctx = ctx(design_review_done_marker());
+        ctx.rule_name = "complete-feedback-design-review-on-design-review-decided".into();
+        ctx.triggering_topic = "step.done.review-design".into();
+        h.invoke(&design_rule_args(), &ctx).await.expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the design-review completes at the review, not at the fold: {calls:?}"
+        );
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, REVIEW_STEP);
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            body["metadata"]["verdict"], "approved",
+            "a completed review has every question resolved — `resolutions` covers `questions` \
+             at done — so the verdict is approved without waiting for the fold"
+        );
+        assert_eq!(
+            body["metadata"]["decided_by"]["car"], DESIGN,
+            "the evidence names the design read off the marker's job_id"
+        );
+        assert!(
+            body["metadata"]["decided_by"]["outcome"].is_null(),
+            "the design has not closed; the evidence says null rather than inventing an outcome"
+        );
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "nothing to apologise for"
         );
     }
 
@@ -1715,5 +2698,254 @@ mod noop_reason_tests {
             assert!(why.contains(slug), "{why} is missing {slug}");
         }
         assert!(why.contains("needs-info"), "{why}");
+    }
+}
+
+/// THE ANSWER (backlog 05d301be): a rule may ask the obligation to read
+/// the closing packet's recorded output and write what it says.
+#[cfg(test)]
+mod answer_tests {
+    use super::tests::test_owner;
+    use super::*;
+    use boss_dispatcher::rules::expr::NoHelpers;
+    use boss_dispatcher::rules::registry::{Registry, match_event};
+
+    const REQUEST: &str = "55555555-5555-4555-8555-555555555555";
+    const RELEASE: &str = "66666666-6666-4666-8666-666666666666";
+    const TAG_STEP: &str = "77777777-7777-4777-8777-777777777777";
+    const MERGE_SHA: &str = "e4d5d9816d34a1b2c3d4e5f60718293a4b5c6d7e";
+
+    fn ctx(payload: serde_json::Value) -> InvocationContext {
+        InvocationContext {
+            rule_name: "complete-release-tag-on-tag-release-answered".into(),
+            triggering_event_id: "evt-close-9".into(),
+            triggering_topic: "jobs.job.closed".into(),
+            event_payload: payload,
+        }
+    }
+
+    /// The rule complete-release-tag-on-tag-release-answered, read from
+    /// its file and matched against an answered ops-request's close, so
+    /// the args below are exactly what the dispatcher hands this handler
+    /// — not a copy of the file typed here.
+    fn tag_release_rule_args() -> Vec<(String, Value)> {
+        let path = boss_testing::dispatcher_rules_dir()
+            .join("complete-release-tag-on-tag-release-answered.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reg = Registry::from_toml(&toml).expect("the rule file parses");
+        let matched =
+            match_event(&reg, "jobs.job.closed", &request_close_marker(), &NoHelpers).matched;
+        assert_eq!(
+            matched.len(),
+            1,
+            "an answered ops-request fires the rule once"
+        );
+        let inv = &matched[0].invocations[0];
+        assert_eq!(inv.handler, "jobs.complete_linked_step");
+        inv.args.clone()
+    }
+
+    fn request_close_marker() -> serde_json::Value {
+        json!({
+            "id": REQUEST,
+            "kind": "ops-request",
+            "outcome": "answered",
+            "closed_on": "2026-09-18",
+            "title": "Run tag-release on forge",
+            "subject_id": "forge",
+            "parent_step_id": null,
+        })
+    }
+
+    /// An answered tag-release ops-request: the verb's output rides its
+    /// `execute` step, the release packet its `release` edge.
+    fn tag_release_request(verb: &str, output: &str) -> serde_json::Value {
+        json!({
+            "id": REQUEST,
+            "kind": "ops-request",
+            "title": "Run tag-release on forge",
+            "status": "closed",
+            "subject": { "subject_kind": "custom", "id": "forge" },
+            "metadata": { "host": "forge", "verb": verb,
+                          "args": ["v1.2.3", MERGE_SHA, RELEASE],
+                          "release": RELEASE, "outcome": "answered" },
+            "steps": [
+                { "id": "r-filed", "spec_slug": "filed", "status": "completed", "metadata": {} },
+                { "id": "r-execute", "spec_slug": "execute", "status": "completed",
+                  "metadata": { "disposition": "answered", "exit_code": "0",
+                                "output": output, "runner_host": "forge" } },
+            ],
+        })
+    }
+
+    /// The release packet at its `tag` step (cut-a-release: tag and sha
+    /// required at done; `authority_role` on the step keeps it gated).
+    fn release_packet(tag_status: &str) -> serde_json::Value {
+        json!({
+            "id": RELEASE,
+            "kind": "cut-a-release",
+            "title": "Release v1.2.3 decided — boss",
+            "status": "open",
+            "metadata": { "version": "1.2.3" },
+            "steps": [
+                { "id": "s-approve", "spec_slug": "approve", "status": "completed",
+                  "metadata": { "decision": "approved" } },
+                { "id": TAG_STEP, "spec_slug": "tag", "status": tag_status,
+                  "metadata": { "authority_role": "platform-admin" } },
+                { "id": "s-mirror", "spec_slug": "mirror", "status": "pending", "metadata": {} },
+            ],
+        })
+    }
+
+    fn answered_output() -> String {
+        let short = &MERGE_SHA[..12];
+        format!(
+            "tag-release: forge: no tag v1.2.3 on remote forgejo\n\
+             tag-release: record: pr-train 0000abcd merged as {short} (57 closed trains read)\n\
+             tag-release: converged main: {short} carries {short}\n\
+             tag-release: read back: refs/tags/v1.2.3 on remote forgejo peels to {MERGE_SHA}\n\
+             tag-release: v1.2.3 at {MERGE_SHA} (packet {RELEASE})\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn an_answered_tag_release_completes_the_release_tag_step_from_its_read_back() {
+        let (base, puts, patches) = super::tests::mock_jobs(vec![
+            tag_release_request("tag-release", &answered_output()),
+            release_packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly the tag step completed: {calls:?}");
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, TAG_STEP);
+        assert_eq!(body["status"], "completed");
+        // The step's two required fields, COPIED from the read-back line.
+        assert_eq!(body["metadata"]["tag"], "v1.2.3");
+        assert_eq!(body["metadata"]["sha"], MERGE_SHA);
+        // The evidence names the request, under the rule's own key.
+        assert_eq!(body["metadata"]["tagged_by"]["car"], REQUEST);
+        assert_eq!(body["metadata"]["tagged_by"]["outcome"], "answered");
+        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+        assert!(patches.lock().unwrap().is_empty(), "nothing to note");
+    }
+
+    /// A refused run is still an ANSWERED ops-request (the runner ran
+    /// the verb; the verb said no). Its output has no read-back line,
+    /// so the step stays the founder's and both packets say why.
+    #[tokio::test]
+    async fn a_refused_tag_release_completes_nothing_and_says_so_on_both_ends() {
+        let refused = "tag-release: forge: no tag v1.2.3 on remote forgejo\n\
+                       tag-release: REFUSED — sha e4d5d9816d34 is not the merge commit of any of the 57 closed pr-train packets read\n\
+                       tag-release:   Nothing was written.\n";
+        let (base, puts, patches) = super::tests::mock_jobs(vec![
+            tag_release_request("tag-release", refused),
+            release_packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
+            .await
+            .expect("runs");
+
+        assert!(puts.lock().unwrap().is_empty(), "no step completed");
+        let notes = patches.lock().unwrap().clone();
+        let mut on: Vec<&str> = notes.iter().map(|(id, _)| id.as_str()).collect();
+        on.sort_unstable();
+        assert_eq!(on, [REQUEST, RELEASE], "the note lands on both ends");
+        for (_, body) in &notes {
+            let why = body["obligation_noop"]["why"].as_str().unwrap_or("");
+            assert!(
+                why.contains("no line"),
+                "the note says what was missing: {why}"
+            );
+            assert!(why.contains("tag-release"), "and names the pattern: {why}");
+        }
+    }
+
+    /// Another verb's answered request carrying the same `release` edge
+    /// (the GitHub-release verb, one day) is not this rule's.
+    #[tokio::test]
+    async fn another_verbs_answer_is_not_this_rules() {
+        let (base, puts, patches) = super::tests::mock_jobs(vec![
+            tag_release_request("github-release", &answered_output()),
+            release_packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
+            .await
+            .expect("runs");
+        assert!(puts.lock().unwrap().is_empty(), "no step completed");
+        assert!(patches.lock().unwrap().is_empty(), "nothing noted either");
+    }
+
+    /// Redelivery: the tag step already completed by the first delivery
+    /// is left alone, silently.
+    #[tokio::test]
+    async fn a_redelivered_answer_writes_nothing() {
+        let (base, puts, patches) = super::tests::mock_jobs(vec![
+            tag_release_request("tag-release", &answered_output()),
+            release_packet("completed"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
+            .await
+            .expect("runs");
+        assert!(puts.lock().unwrap().is_empty());
+        assert!(patches.lock().unwrap().is_empty());
+    }
+
+    /// A pattern that is not a regex is rule authoring, the same on
+    /// every redelivery: Permanent, never a retry.
+    #[tokio::test]
+    async fn a_malformed_verdict_pattern_is_a_permanent_error() {
+        let (base, _, _) = super::tests::mock_jobs(vec![
+            tag_release_request("tag-release", &answered_output()),
+            release_packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let mut a = tag_release_rule_args();
+        for (k, v) in a.iter_mut() {
+            if k == "verdict_pattern" {
+                *v = Value::String("(?P<tag>[".into());
+            }
+        }
+        let err = h
+            .invoke(&a, &ctx(request_close_marker()))
+            .await
+            .expect_err("a bad regex cannot be retried into a good one");
+        assert!(matches!(err, HandlerError::Permanent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn answer_substitutions_render_every_named_group_as_text() {
+        let groups = json!({ "tag": "v1.2.3", "n": 7 });
+        let shipped = Shipped {
+            car: REQUEST.into(),
+            branch: "(no branch recorded)".into(),
+            title: "t".into(),
+            evidence: json!({}),
+            answer: groups.as_object().cloned().unwrap_or_default(),
+        };
+        let mut merged = serde_json::Map::new();
+        let template: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"tag": "{tag}", "count": "{n} cars", "who": "{car}"}"#)
+                .unwrap();
+        fill(&mut merged, &template, &shipped);
+        assert_eq!(merged["tag"], "v1.2.3");
+        assert_eq!(
+            merged["count"], "7 cars",
+            "a numeric group renders as its digits"
+        );
+        assert_eq!(merged["who"], REQUEST, "the car facts still substitute");
     }
 }

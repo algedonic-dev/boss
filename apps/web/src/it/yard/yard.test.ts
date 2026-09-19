@@ -28,9 +28,14 @@ import {
   trainTrouble,
   troubleLabel,
   toTrainRow,
+  trainGateLabel,
+  trainGateTroubled,
   cancelRequestBody,
   canOfferCancel,
   CANCEL_ROLE,
+  carRow,
+  withdrawnCars,
+  CANCELLED_SHOWN,
   type TrainRow,
 } from './yard';
 
@@ -164,7 +169,7 @@ describe('the dock from the station envelope', () => {
       data: [
         dockJob('s1', {
           tags: ['hotfix'],
-          metadata: { branch: 'feat/s1', skip_reason: 'CI red' },
+          metadata: { branch: 'feat/s1', skip_reason: 'CI red', red_trains: 1 },
           simulated: true,
         }),
         dockJob('s2'),
@@ -178,9 +183,61 @@ describe('the dock from the station envelope', () => {
       // This packet records nothing about proving it — null, not a row
       // of nulls (readCarProof).
       proof: null,
+      // The conductor's strike count, read off the record (2bb0d014).
+      redTrains: 1,
+      // No `delivery_channel` on the packet: an old car, software siding.
+      deliveryChannel: 'software',
     });
     expect(y.dock[1]?.sim).toBe(false);
     expect(y.dock[1]?.skipReason).toBeNull();
+    // Absent on the record is zero strikes, not an unknown.
+    expect(y.dock[1]?.redTrains).toBe(0);
+  });
+
+  // fb3b5ce1 (2026-09-14): a CarRow was built in three places and the
+  // yard's reader learned `red_trains` while the others did not. One
+  // constructor now, exported, and every lens — the dock, the consist,
+  // the /me pages — maps through it.
+  test('a boarded car is the same row the dock would build for it', () => {
+    const car = dockJob('c7', {
+      metadata: { branch: 'fix/c7', red_trains: 1, proof_probe: 'true', proof_expect: 'ok' },
+    });
+    const t = toTrainRow(
+      train({ metadata: { boarded_jobs: ['c7'] }, steps: [s('pr', 'completed')] }),
+      new Map([['c7', car]]),
+      true,
+    );
+    expect(t.cars[0]).toEqual(carRow(car));
+    expect(t.cars[0]?.redTrains).toBe(1);
+    expect(t.cars[0]?.proof?.probe).toBe('true');
+  });
+
+  test('a car outside the window is a packet with nothing on it, named by its id', () => {
+    const t = toTrainRow(
+      train({ metadata: { boarded_jobs: ['0123456789abcdef'] }, steps: [s('pr', 'completed')] }),
+      new Map(),
+      true,
+    );
+    expect(t.cars[0]).toEqual({
+      id: '0123456789abcdef', kind: 'ship-a-change', branch: '01234567',
+      title: '(car not in window)', tags: [], sim: false, skipReason: null,
+      head: null, proof: null, redTrains: 0, deliveryChannel: 'software',
+    });
+  });
+
+  test('a packet naming no branch reads an empty line — the open-car set filters on it', () => {
+    expect(carRow(dockJob('c8', { metadata: {} })).branch).toBe('');
+  });
+
+  // d6e53a35 (2026-09-14): a projection that is not a Job — the My Day
+  // assignment row — carries the conductor's count as a FIELD, the job
+  // carries it in metadata; the constructor reads either, through the
+  // same guard, so the two lenses cannot disagree on one packet.
+  test('a projection\'s red_trains field reads like the job\'s metadata stamp', () => {
+    expect(carRow({ id: 'p1', kind: 'ship-a-change', title: 'p', red_trains: 2 }).redTrains).toBe(2);
+    expect(carRow({ id: 'p1', kind: 'ship-a-change', title: 'p', red_trains: 0 }).redTrains).toBe(0);
+    expect(carRow({ id: 'p1', kind: 'ship-a-change', title: 'p', red_trains: -1 }).redTrains).toBe(0);
+    expect(carRow(dockJob('c9', { metadata: { red_trains: 1 } })).redTrains).toBe(1);
   });
 
   test('the envelope is authoritative: membership does not re-derive from ships', () => {
@@ -1477,3 +1534,170 @@ describe('the yard names every open car', () => {
   });
 });
 
+
+// THE DELIVERY CHANNEL (design c6bd173e, car 1 — backlog 953aaf30). The
+// gate stamps `delivery_channel` on every car it parks (boss-cli
+// channels.rs: data / config / software / infra, the heaviest path
+// winning), and the arrivals yard is four sidings keyed on it. The card
+// reads the stamp; a car without one predates the stamp and lands on
+// software, which is what "landed" meant for every car before the
+// sidings existed.
+describe('a car carries its delivery channel', () => {
+  test('the stamp reads through, one value per channel', () => {
+    for (const ch of ['data', 'config', 'software', 'infra'] as const) {
+      expect(carRow(ship('fix/a', { metadata: { branch: 'fix/a', delivery_channel: ch } })).deliveryChannel).toBe(ch);
+    }
+  });
+
+  test('an old car — no stamp — lands on software, the only siding that existed before the stamp', () => {
+    expect(carRow(ship('fix/old')).deliveryChannel).toBe('software');
+    // A value this reader does not know is not a siding it can draw.
+    expect(carRow(ship('fix/x', { metadata: { branch: 'fix/x', delivery_channel: 'firmware' } })).deliveryChannel).toBe('software');
+    expect(carRow(ship('fix/y', { metadata: { branch: 'fix/y', delivery_channel: 7 } })).deliveryChannel).toBe('software');
+  });
+});
+
+// THE CANCELLED SIDING (design c6bd173e, outcomes): a car withdrawn — its
+// `abandoned` terminal completed — is a terminal outcome, drawn on its
+// own siding; struck and left-behind stay dock badges. Classified the
+// way `trainOutcome` classifies a train: the stamped `metadata.outcome`
+// first, the completed terminal step second. A merged car is never
+// withdrawn, however its other steps read.
+describe('withdrawn cars stand on the cancelled siding', () => {
+  const at = (n: number) => `2026-09-11T03:2${n}:00Z`;
+  const abandoned = (id: string, n: number, over: Partial<JobLite> = {}) =>
+    ship(`fix/${id}`, {
+      id,
+      status: 'closed',
+      metadata: { branch: `fix/${id}`, outcome: 'abandoned', abandoned: 'true' },
+      steps: [
+        { spec_slug: 'merged', title: 'Merged', status: 'skipped' },
+        { spec_slug: 'abandoned', title: 'Abandoned', status: 'completed', completed_at: at(n) },
+      ],
+      ...over,
+    });
+
+  test("a closed car whose abandoned step completed is withdrawn, stamped with that step's instant", () => {
+    const w = withdrawnCars([abandoned('a', 1)]);
+    expect(w.map(x => [x.car.id, x.at])).toEqual([['a', at(1)]]);
+  });
+
+  test('the step alone is enough when the outcome stamp is missing; a merged car is not withdrawn', () => {
+    const unstamped = abandoned('u', 2, { metadata: { branch: 'fix/u' } });
+    const merged = ship('fix/m', {
+      status: 'closed',
+      metadata: { branch: 'fix/m', outcome: 'merged' },
+      steps: [{ spec_slug: 'merged', title: 'Merged', status: 'completed' }, { spec_slug: 'abandoned', title: 'Abandoned', status: 'skipped' }],
+    });
+    // The terminal close marks every step it did not fire as skipped —
+    // a skipped `abandoned` is not a withdrawal.
+    expect(withdrawnCars([unstamped, merged]).map(x => x.car.id)).toEqual(['u']);
+  });
+
+  test('newest first, and no more than the board shows of cancellations', () => {
+    const many = Array.from({ length: CANCELLED_SHOWN + 2 }, (_, i) => abandoned(`w${i}`, i));
+    const w = withdrawnCars(many);
+    expect(w).toHaveLength(CANCELLED_SHOWN);
+    expect(w.map(x => x.car.id)).toEqual(many.slice().reverse().slice(0, CANCELLED_SHOWN).map(j => j.id));
+  });
+
+  test('the yard carries them beside the open cars', () => {
+    const y = assembleYard([], [abandoned('a', 1), ship('fix/open')]);
+    expect(y.withdrawn.map(x => x.car.id)).toEqual(['a']);
+    expect(y.cars.map(c => c.id)).toEqual(['car-fix/open']);
+  });
+});
+
+// THE TRAIN GATE (design 128b5496): the conductor files a cluster
+// gate-run of the train branch when it opens the PR and reads the train
+// as green only when the forge AND that gate are. The row carries both
+// halves off the packet, and the verdict line says which one spoke.
+describe('TrainRow reads the train gate off the train and its ci step', () => {
+  const none = new Map<string, JobLite>();
+
+  test('a train from before the design carries no gate reading', () => {
+    expect(toTrainRow(train({ metadata: {}, steps: [s('ci', 'ready')] }), none, false).gate).toBeNull();
+  });
+
+  test('while the gate runs, the train metadata names its packet', () => {
+    const g = toTrainRow(
+      train({ metadata: { train_gate_run: '0123456789abcdef', train_gate_relaunches: 1 }, steps: [s('ci', 'ready')] }),
+      none,
+      false,
+    ).gate;
+    expect(g).toEqual({ run: '0123456789abcdef', line: null, forge: null, fallback: null, wait_reason: null, relaunches: 1 });
+    expect(g && trainGateLabel(g)).toBe('forge pending · gate running (01234567) · relaunched 1×');
+  });
+
+  test('once judged, the ci step carries both halves in the conductor words', () => {
+    const g = toTrainRow(
+      train({
+        metadata: { train_gate_run: '0123456789abcdef' },
+        steps: [
+          s('ci', 'completed', {
+            result: 'green',
+            forge_result: 'green',
+            train_gate: 'train gate: green',
+            train_gate_run: '0123456789abcdef',
+          }),
+        ],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(g && trainGateLabel(g)).toBe('forge green · gate green');
+    const red = toTrainRow(
+      train({
+        steps: [s('ci', 'completed', { result: 'failing', forge_result: 'green', train_gate: 'train gate: RED — strikes the cars aboard' })],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(red && trainGateLabel(red)).toBe('forge green · gate RED — strikes the cars aboard');
+  });
+
+  test('a train CI alone judged says so, and the row marks it as trouble-worthy', () => {
+    const g = toTrainRow(
+      train({
+        metadata: { train_gate_fallback: 'the train gate could not be filed 3 passes running (no kubectl); CI alone judged this train' },
+        steps: [s('ci', 'completed', { result: 'green', forge_result: 'green' })],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(g?.fallback).toContain('CI alone');
+    expect(g && trainGateLabel(g)).toBe('forge green · gate UNAVAILABLE — CI alone judged this train');
+    expect(g && trainGateTroubled(g)).toBe(true);
+  });
+
+  // Backlog 0d16df6f: the conductor writes `train_gate_wait_reason`
+  // (the bound line naming the running gates) on a train whose gate
+  // could not be filed, and nulls it once it is. Train ccd8b08e sat two
+  // hours that way on 2026-09-18 drawn exactly like a healthy transit
+  // at CI — the yard read run/line/forge/fallback and nothing else. A
+  // troubled packet must look troubled: the reason is read, the label
+  // says it is waiting and why, and the row is marked in the yard's
+  // existing trouble style.
+  test('a train whose gate is waiting at the bound says why, in the trouble style', () => {
+    const why = 'train gate not filed: 2 gates running (fix/a, fix/b), bound is 2';
+    const g = toTrainRow(
+      train({ metadata: { train_gate_launch_failures: 5, train_gate_wait_reason: why }, steps: [s('ci', 'ready')] }),
+      none,
+      false,
+    ).gate;
+    expect(g?.wait_reason).toBe(why);
+    expect(g && trainGateLabel(g)).toBe(`forge pending · gate waiting: ${why}`);
+    expect(g && trainGateTroubled(g)).toBe(true);
+  });
+
+  test('once the gate is filed the conductor nulls the reason and the train is running, not waiting', () => {
+    const g = toTrainRow(
+      train({ metadata: { train_gate_run: '0123456789abcdef', train_gate_wait_reason: null }, steps: [s('ci', 'ready')] }),
+      none,
+      false,
+    ).gate;
+    expect(g?.wait_reason).toBeNull();
+    expect(g && trainGateLabel(g)).toBe('forge pending · gate running (01234567)');
+    expect(g && trainGateTroubled(g)).toBe(false);
+  });
+});

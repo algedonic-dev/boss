@@ -40,7 +40,7 @@
 //! derivation instead of itself. A test that only checked the answers
 //! would pass just as well against two copies that happen to agree today.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, write_exec};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,12 +58,6 @@ const CANNOT_ANSWER: i32 = 4;
 /// test that reds cars for no reason.
 fn scratch(case: &str) -> PathBuf {
     boss_testing::scratch_dir(&format!("undeclared-objects-{case}"))
-}
-
-fn write_exec(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// One object, as JSON. The fixture writes JSON into `.yaml` files —
@@ -179,7 +173,7 @@ fn fixture_tree(root: &Path) -> PathBuf {
 /// The stubbed `kubectl`, answering the shapes the derivation uses and
 /// reading the "cluster" from files:
 ///
-///   $STUB_LIVE/<Kind>.<ns>  one line per live object: name<TAB>ownerKind
+///   $STUB_LIVE/<Kind>.<ns>  one line per live object: name<TAB>ownerKind[<TAB>part-of]
 ///   $STUB_FORBID            "<Kind> <ns>" per line — not listable
 ///   $STUB_FORBID_GET        "<Kind> <ns> <name>" per line — not readable
 ///   $STUB_BADPARSE          a manifest basename that will not parse
@@ -212,11 +206,12 @@ get)
     kind="$2"; shift 2
     name=""
     case "${1:-}" in -*|"") ;; *) name="$1"; shift ;; esac
-    ns=""
+    ns=""; sel=""; out=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -n) ns="$2"; shift 2 ;;
-            -o) shift 2 ;;
+            -o) out="$2"; shift 2 ;;
+            -l) sel="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -225,7 +220,13 @@ get)
         exit 1
     fi
     if [ -z "$name" ]; then
-        live "$kind" "$ns"
+        # A label selector keeps the rows whose third column is the value.
+        if [ -n "$sel" ]; then
+            want="${sel#*=}"
+            live "$kind" "$ns" | awk -F'\t' -v w="$want" '$3 == w'
+        else
+            live "$kind" "$ns"
+        fi
         exit 0
     fi
     if listed_in "${STUB_FORBID_GET:-}" "$kind $ns $name"; then
@@ -237,7 +238,12 @@ get)
         echo "Error from server (NotFound): $kind \"$name\" not found" >&2
         exit 1
     fi
-    printf '%s\n' "$row" | cut -f2 ;;
+    # A single get answers the owner, or the part-of label when the
+    # jsonpath asks for labels.
+    case "$out" in
+        *labels*) printf '%s\n' "$row" | awk -F'\t' '{ print $3 }' ;;
+        *) printf '%s\n' "$row" | cut -f2 ;;
+    esac ;;
 *)
     echo "stub kubectl: unexpected invocation: $*" >&2
     exit 64 ;;
@@ -287,6 +293,15 @@ impl Case {
         let f = self.live.join(format!("{kind}.{ns}"));
         let mut body = std::fs::read_to_string(&f).unwrap_or_default();
         body.push_str(&format!("{name}\t{owner}\n"));
+        std::fs::write(&f, body).unwrap();
+    }
+
+    /// One more object carrying `app.kubernetes.io/part-of=<label>` —
+    /// the tree's own mark on what it created.
+    fn add_live_labelled(&self, kind: &str, ns: &str, name: &str, label: &str) {
+        let f = self.live.join(format!("{kind}.{ns}"));
+        let mut body = std::fs::read_to_string(&f).unwrap_or_default();
+        body.push_str(&format!("{name}\t\t{label}\n"));
         std::fs::write(&f, body).unwrap();
     }
 
@@ -371,6 +386,65 @@ fn list_names_a_genuine_orphan_on_stdout() {
         stdout.trim(),
         "Service\tboss\tboss-docs-internal",
         "the orphan set is not what the cluster holds:\n{all}"
+    );
+}
+
+/// The converge GENERATES ConfigMap/<ns>/boss-tenant for every
+/// repo-sourced instance (instances.toml `tenant_repo`, f4f5c387). No
+/// manifest declares it and it is absent whenever that instance was
+/// skipped, so it is exempt WHEN PRESENT and never stale when absent —
+/// derived from the instance list, not typed into $EXEMPT. Measured
+/// 2026-09-16 23:55Z: the first converge after the prod flip rolled prod
+/// and then failed its own orphan check on exactly this object (d7d23650).
+#[test]
+fn a_repo_sourced_instances_delivered_tenant_is_exempt_by_derivation_and_never_stale() {
+    let c = Case::new(
+        "derived-tenant",
+        &[("ConfigMap", "boss", "boss-tenant", "")],
+    );
+    // Without an instance list the object is an orphan: nothing derives it.
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(stdout.trim(), "ConfigMap\tboss\tboss-tenant", "{all}");
+    let (rc, derived, _) = c.run(&["--exemptions-derived"]);
+    assert_eq!(
+        (rc, derived.trim()),
+        (0, ""),
+        "no instance list, nothing derived"
+    );
+
+    // With prod declared repo-sourced and the playground image-sourced,
+    // exactly prod's delivered ConfigMap is derived — and the object
+    // reads clean.
+    std::fs::write(
+        c.tree.join("infra/cluster/instances.toml"),
+        "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \"david/algedonic-llc\"\ntenant_ref = \"main\"\nsim = false\nhostname = \"h.example\"\nguest = false\n\n[playground]\nnamespace = \"boss-playground\"\ntenant_dir = \"examples/brewery\"\nsim = true\nhostname = \"p.example\"\nguest = true\n",
+    )
+    .unwrap();
+    let (rc, derived, all) = c.run(&["--exemptions-derived"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(derived.trim(), "ConfigMap/boss/boss-tenant");
+    let (rc, hand, _) = c.run(&["--exemptions"]);
+    assert_eq!(rc, 0);
+    assert!(
+        !hand.contains("boss-tenant"),
+        "a derived exemption is not a hand entry, so the lint's stale check never asks the \
+         cluster for it: {hand}"
+    );
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(
+        stdout.trim(),
+        "",
+        "the delivered tenant is not an orphan:\n{all}"
+    );
+    // Only the repo-sourced instance derives one: the image-sourced
+    // playground is not in the derived list (a boss-tenant there would
+    // be an orphan in a tree that manages its namespace).
+    assert_eq!(
+        derived.lines().count(),
+        1,
+        "one derived exemption, prod's: {derived}"
     );
 }
 
@@ -530,12 +604,127 @@ fn check_cannot_answer_when_the_object_itself_cannot_be_read() {
 /// An object that really is absent keeps the verdict it had: NotFound is
 /// a fact about the object, not about the credential. Here so the test
 /// above cannot be satisfied by giving up on every failed read.
+/// THE LAST MANIFEST OF A KIND IN A NAMESPACE. Measured 2026-09-12:
+/// the seed-dir car deleted boss-dev's only CronJob manifest (#341);
+/// the live CronJob stayed (apply does not prune) and failed every
+/// minute against PodSecurity; `delete-orphan-object` REFUSED it —
+/// "the tree declares no CronJob in boss-dev, so there is no declared
+/// set to compare against" — and `--list` did not name it either. The
+/// pair rule is right for Pods and ReplicaSets, which the tree never
+/// declares anywhere; it is wrong for a kind the tree declares in
+/// another namespace, on an object the tree itself labelled
+/// `app.kubernetes.io/part-of=boss`. That label is the tree's own
+/// claim, so the object is in scope by label where the pair is gone.
+#[test]
+fn a_labelled_object_of_a_kind_the_tree_declares_elsewhere_is_in_scope_by_label() {
+    let c = Case::new("last-kind-labelled", &[]);
+    // CronJob is declared in `boss` (boss-backup), never in `boss-dev`.
+    c.add_live_labelled("CronJob", "boss-dev", "gate-seed-prepare", "boss");
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert!(
+        stdout.contains("CronJob\tboss-dev\tgate-seed-prepare"),
+        "the labelled orphan is named on stdout: {stdout}\n{all}"
+    );
+    let (rc, _, all) = c.run(&["--check", "CronJob/boss-dev/gate-seed-prepare"]);
+    assert_eq!(rc, 0, "in scope by label, undeclared, no owner: {all}");
+    assert!(
+        all.contains("by label"),
+        "the answer says WHY it is in scope: {all}"
+    );
+}
+
+/// The same object without the tree's label is still refused — the
+/// pair rule stands for everything the tree never marked as its own —
+/// and the refusal now names the label as the way in.
+#[test]
+fn an_unlabelled_object_of_an_undeclared_pair_is_still_refused() {
+    let c = Case::new("last-kind-unlabelled", &[]);
+    c.add_live("CronJob", "boss-dev", "somebody-elses", "");
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert!(
+        !stdout.contains("somebody-elses"),
+        "unlabelled stays out of the list: {stdout}"
+    );
+    let (rc, _, all) = c.run(&["--check", "CronJob/boss-dev/somebody-elses"]);
+    assert_eq!(rc, 3, "refused: {all}");
+    assert!(
+        all.contains("declares no CronJob in `boss-dev`") && all.contains("part-of"),
+        "the refusal names both the missing pair and the label that would bring it in: {all}"
+    );
+}
+
+/// A kind the tree declares NOWHERE stays out of scope even when
+/// labelled: Pods and ReplicaSets carry the label too (a Deployment's
+/// template propagates it), and they are the controller's, not the
+/// tree's.
+#[test]
+fn a_labelled_object_of_a_kind_the_tree_never_declares_stays_out_of_scope() {
+    let c = Case::new("last-kind-never-declared", &[]);
+    c.add_live_labelled("Pod", "boss-dev", "boss-dev-abc12", "boss");
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert!(!stdout.contains("boss-dev-abc12"), "{stdout}");
+    let (rc, _, all) = c.run(&["--check", "Pod/boss-dev/boss-dev-abc12"]);
+    assert_eq!(rc, 3, "refused: a kind the tree declares nowhere: {all}");
+}
+
 #[test]
 fn check_still_says_not_live_for_an_object_that_is_absent() {
     let c = Case::new("absent", &[]);
     let (rc, _stdout, all) = c.run(&["--check", "Service/boss/boss-ghost"]);
     assert_eq!(rc, 3, "an absent object was not refused as absent:\n{all}");
     names_all(&all, &["boss-ghost", "not live"], "the absent case");
+}
+
+/// The line that fired once in five full-suite runs on 2026-09-19
+/// (backlog 0f2ecbda, found by the builder of 2a056500 under load):
+///
+///   REFUSED Service/boss/boss-docs-internal — the tree does not own
+///   namespace `boss` (no Namespace manifest in infra/cluster/manifests),
+///     so nothing here can be called undeclared. Owned: boss boss-dev
+///
+/// `boss` refused as unowned in the line that lists it as owned. The
+/// owned set was a newline-joined string and the membership test piped
+/// it into `grep -q`; bash's printf wrote `boss` and `boss-dev` as two
+/// writes, grep matched the first and exited, the second was SIGPIPE,
+/// and pipefail turned a PRESENT member into "not found". It is now one
+/// array and one loop, and this asks the derivation for every owned
+/// namespace in the order the string was written — `boss` first, the
+/// one whose match ended grep early — that an object it declares there
+/// is refused as DECLARED and never as unowned. The shape itself is
+/// refused, deterministically, by the producer-coin pin in
+/// a_lint_that_cannot_read_does_not_say_clean.rs; this is the fact.
+#[test]
+fn an_owned_namespace_is_never_refused_as_unowned() {
+    let c = Case::new("owned-is-owned", &[]);
+    for (kind, ns, name) in [
+        ("Service", "boss", "svc-a"),
+        ("Service", "boss-dev", "boss-dev"),
+    ] {
+        let (rc, _stdout, all) = c.run(&["--check", &format!("{kind}/{ns}/{name}")]);
+        assert_eq!(rc, 3, "a declared object was not refused:\n{all}");
+        assert!(
+            !all.contains("does not own namespace"),
+            "the tree owns `{ns}` and the derivation said otherwise — the refusal that \
+             read `Owned: boss boss-dev` and `does not own namespace boss` in one line \
+             (backlog 0f2ecbda):\n{all}"
+        );
+        names_all(&all, &["DECLARES it"], "the declared case");
+    }
+    // The refusal a foreign namespace earns names the owned set, and the
+    // set it names is the set it tested against.
+    let (rc, _stdout, all) = c.run(&["--check", "Service/kube-system/kube-dns"]);
+    assert_eq!(rc, 3, "a foreign namespace was not refused:\n{all}");
+    names_all(
+        &all,
+        &[
+            "does not own namespace `kube-system`",
+            "Owned: boss boss-dev",
+        ],
+        "the foreign-namespace refusal",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -574,10 +763,10 @@ impl LintCase {
 
         let bin = c.root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::copy(&c.kubectl, bin.join("kubectl")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(bin.join("kubectl"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        // Not `std::fs::copy` + chmod: a copy holds the destination open
+        // for writing in this process, which is the same race.
+        let stub = std::fs::read_to_string(&c.kubectl).unwrap();
+        write_exec(&bin.join("kubectl"), &stub);
 
         for rel in [LINT_REL, DERIVE_REL] {
             let dst = c.tree.join(rel);

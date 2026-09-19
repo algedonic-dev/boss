@@ -100,6 +100,12 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("people.terminate", vec!["people.employee.updated"]),
         ("shipping.create", vec!["shipping.shipment.created"]),
         ("jobs.spawn", vec!["jobs.job.created"]),
+        // The week's retros (1dffde5d): one department-retro per
+        // department the classes registry holds, plus the platform's
+        // protocol-retro, each a POST /api/jobs — so the only emit is
+        // the packet it creates, the same as jobs.spawn. The dedup
+        // reads are GETs and a skip is a no-op.
+        ("retro.open", vec!["jobs.job.created"]),
         // Files one ops-request per probed car aboard an arrived
         // train (28ac45ab); the probe itself runs on the forge and
         // writes back through the jobs API as its own actor, so the
@@ -131,13 +137,72 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             "maintenance.sweep.inspect",
             vec!["jobs.step.completed", "jobs.job.updated"],
         ),
+        // An answered sweep measurement judges the sweep that asked
+        // for it (970c0c94): a clean `verdict:` line routes the sweep
+        // (`jobs.job.updated`, action_needed) and completes its inspect
+        // checklist (`jobs.step.completed`); an unclean one merges the
+        // reading onto the still-open step (`jobs.step.updated`). Every
+        // write is on a maintenance-sweep, never an ops-request, so the
+        // close it fires on cannot re-enter it.
+        (
+            "maintenance.sweep.judge",
+            vec![
+                "jobs.step.completed",
+                "jobs.job.updated",
+                "jobs.step.updated",
+            ],
+        ),
+        // An answered ops-request's verdict line files the next verb
+        // (a1d3c762): a follow-on ops-request (`jobs.job.created`) and
+        // a `judged` note on the request it read (`jobs.job.updated`).
+        // The follow-on closes `answered` through the same trigger, but
+        // a rule never judges the packet it files (same verb, same
+        // args), and its answer is a different line, so the chain ends
+        // at the follow-on by construction.
+        ("ops.judge", vec!["jobs.job.created", "jobs.job.updated"]),
+        // A release packet's `tag` step going ready files the
+        // tag-release ops-request for the forge (89c95245): one
+        // `jobs.job.created`, an ops-request, never a task step, so
+        // the shared step.ready.task topic it fires on cannot re-enter
+        // it; the request's answer completes the step through
+        // complete-release-tag-on-tag-release-answered.
+        ("ops.file_tag_release", vec!["jobs.job.created"]),
+        // A chore that closed red opens one backlog-item per RED route
+        // on its recorded step (ac3270c7): items (`jobs.job.created`)
+        // and a `judged` note on the chore it read (`jobs.job.updated`).
+        // Every item is a backlog-item, never the chore kind the close
+        // fires on, so the chain ends at the operator's queue the way
+        // estate.alarm's does.
+        (
+            "maintenance.chore.file_reds",
+            vec!["jobs.job.created", "jobs.job.updated"],
+        ),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
         // Completes the open branch on the Job a declared edge names
         // (a merged car answering its feedback packet). The completion
         // is what closes the loop: jobs.step.completed → step.done.* →
         // the packet's own `closed` terminal → jobs.job.closed, which
         // re-enters the rule set at notify-filer-on-feedback-terminal.
-        ("jobs.complete_linked_step", vec!["jobs.step.completed"]),
+        // Under `on_failure = "annotate-and-alert"` (f47861a5) a FAILED
+        // verb files one urgent backlog-item instead (`jobs.job.created`)
+        // and annotates the open step, which is not a completion; the
+        // item is the operator's queue, where the chain ends.
+        (
+            "jobs.complete_linked_step",
+            vec!["jobs.step.completed", "jobs.job.created"],
+        ),
+        // Completes a step on every open packet whose recorded step
+        // metadata matches a value the closing Job carries — the
+        // converge that records a site's hash making that site's
+        // packet `live` (c34583cb). No rule this tree ships names it;
+        // the rule is the tenant's.
+        ("jobs.complete_step_matching", vec!["jobs.step.completed"]),
+        // A clock rule completes an open step on every packet of a
+        // kind that has gone silent past a bound (c87fb59b car 2: an
+        // agent-run whose builder died). The completion carries the
+        // packet to its own terminal; nothing listens for a run's
+        // close, so the loop ends at the packet.
+        ("jobs.age_out_step", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
         // The packet-loss census (migration 152): reads the whole
@@ -162,6 +227,18 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // terminates at the operator's queue by design (delivery beyond
         // the queue is channel work, not this handler's).
         ("estate.alarm", vec!["jobs.job.created"]),
+        // The raiser's closing half (ef421cd3): when a finding has
+        // been absent N consecutive comparisons, it completes the
+        // alarm packet's triage step (`jobs.step.completed`, which
+        // carries the backlog-item to its `stale` terminal) and
+        // merges `recovered_at` onto the packet (`jobs.job.updated`).
+        // Both are backlog-item writes; neither can make the estate
+        // series it reads look any different, so the loop ends at
+        // the packet the same way the raiser's does.
+        (
+            "estate.recover",
+            vec!["jobs.step.completed", "jobs.job.updated"],
+        ),
         // The cadence silence sweep (ecca2f43): a daily clock rule
         // that reconciles each DECLARED cadence against the newest
         // ACTUAL packet of that kind. Three writes, all through the
@@ -191,6 +268,48 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // `step.done.credential-rotation`: the steps it completes are
         // `task` kind, so the loop cannot re-enter its own trigger.
         ("credential.rotate.forgejo", vec!["jobs.step.completed"]),
+        // Same shape, second issuer (04e5f833): completes `task`
+        // steps of the rotation packet, never a credential-rotation
+        // step, so it cannot re-enter its own trigger.
+        (
+            "credential.rotate.cloudflare-tunnel",
+            vec!["jobs.step.completed"],
+        ),
+        // The zone observer (5e58922c): fires on a dns-zone-observation
+        // packet's `observe` step, reads the zone with the broker's
+        // Cloudflare root token, runs the tree's comparator, and
+        // completes that same `task` step with the verdicts — so it
+        // cannot re-enter its own trigger. On DRIFT/ABSENT it also files
+        // (`jobs.job.created`) or refreshes (`jobs.job.updated`) the
+        // `dns_drift:<zone>` estate alarm, a backlog-item write that ends
+        // at the operator's queue the way estate.alarm's does.
+        (
+            "dns.observe",
+            vec![
+                "jobs.step.completed",
+                "jobs.job.created",
+                "jobs.job.updated",
+            ],
+        ),
+        // The sensor poll (14c9b2ad): a five-minute clock rule that reads
+        // the sensor registry and each due sensor's SOURCE outside BOSS
+        // (Stripe's charges), records readings outside the audit log,
+        // and OPENS one packet per new reading of the kind the sensor
+        // row declares (`jobs.job.created`) — the audit-log fact. An
+        // unreadable sensor files (`jobs.job.created`) or refreshes
+        // (`jobs.job.updated`) the `sensor_unreadable:<id>` estate alarm
+        // and the next good read closes it through its triage step
+        // (`jobs.step.completed`). Nothing it emits reaches a clock, so
+        // it cannot re-enter its own trigger; the opened packet's own
+        // protocol carries on from there.
+        (
+            "sensor.poll",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         ("messages.notify", vec![]),
         // Tells the filer how their packet ended. A sink, like every
         // other notifier — the message is the end of the cascade, not
@@ -279,15 +398,13 @@ mod tests {
 
     /// Drift guard: every handler the shipped registry references must
     /// have a `handler_emits` entry, so the cascade graph never silently
-    /// drops a handler. Reads the real rule directory via CARGO_MANIFEST_DIR
-    /// so it tracks the deployed registry, not a fixture.
+    /// drops a handler. Reads the real rule directory (its one
+    /// definition, `boss_testing::dispatcher_rules_dir`) so it tracks
+    /// the deployed registry, not a fixture.
     #[test]
     fn cascade_handlers_match_rules() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../infra/dispatcher/rules"
-        );
-        let raw = parse_raw_path(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let path = boss_testing::dispatcher_rules_dir();
+        let raw = parse_raw_path(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let emits = handler_emits();
         for rule in &raw.rules {
             for step in &rule.do_steps {

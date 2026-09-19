@@ -2,12 +2,25 @@
 Description=BOSS cluster converges on forge main (build + push + roll)
 
 [Service]
+# The system of record (the wrap pair, the request annotations) and the
+# registry host (forge-defaults.sh derives the image repo from it) come
+# from /etc/boss/sor.env, rendered by install.sh from
+# infra/estate/estate.toml — until 2026-09-18 a per-unit drop-in
+# install.sh wrote carried the address instead (backlog 5222163e).
+EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
 User=david
 # The build is a cached docker build (~minutes warm, ~an hour cold).
 TimeoutStartSec=90min
 # Job visibility. The forge host has no /opt/boss — it runs from
 # this checkout, which is where the installed units already point.
+# The facts the run leaves for its own packet (build_s, push_s, roll_s,
+# verify_s, build_head, or unchanged): run-summary.sh writes them here
+# during ExecStart and boss-step.sh (ExecStopPost) merges them onto the
+# run step and deletes the file. Under $HOME because this unit runs as
+# david and /run is root's; one path, declared once, inherited by both
+# Exec lines (CLAUDE.md §9a).
+Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-converge.summary.json
 ExecStartPre=/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-converge "Cluster converge on forge main"
 ExecStart=/home/david/boss/infra/forge/cluster-deploy-runner.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-cluster-converge run

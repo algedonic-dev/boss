@@ -15,6 +15,7 @@
 //! the same shape against `PgJobs`.
 
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
+use boss_core::partition::Partition;
 use boss_jobs::port::{JobFilter, JobScope, JobsRepository};
 use boss_testing::TestDb;
 use chrono::NaiveDate;
@@ -35,7 +36,7 @@ fn job(id: &str, kind: &str, subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 
@@ -334,7 +335,7 @@ async fn closed_since_overrides_status_rather_than_intersecting_it() {
 /// way this breaks is that one of them gets the clause and the other
 /// does not — which no in-memory test can see.
 #[tokio::test(flavor = "multi_thread")]
-async fn simulated_partitions_the_rows_and_the_total() {
+async fn partition_filters_the_rows_and_the_total() {
     let db = TestDb::new().await;
     let repo = boss_jobs::PgJobs::new(db.pool.clone());
     let board = Subject::new("account", "board");
@@ -350,21 +351,32 @@ async fn simulated_partitions_the_rows_and_the_total() {
         "ship-a-change",
         board.clone(),
     );
-    sim_a.simulated = true;
+    sim_a.partition = Partition::Simulated;
     let mut sim_b = job(
         "00000000-0000-0000-0000-0000000000b3",
         "ship-a-change",
         board.clone(),
     );
-    sim_b.simulated = true;
+    sim_b.partition = Partition::Simulated;
+    // A shadow packet (packet 508cc38c; migration 20260915221611):
+    // created through the port like any other, excluded by the real-
+    // only filter exactly as a simulated one is, AND by the simulated-
+    // only filter (the sim never sees it, Q5).
+    let mut shadow = job(
+        "00000000-0000-0000-0000-0000000000b4",
+        "ship-a-change",
+        board.clone(),
+    );
+    shadow.title = "shadow run".into();
+    shadow.partition = Partition::Shadow;
 
-    for j in [&real, &sim_a, &sim_b] {
+    for j in [&real, &sim_a, &sim_b, &shadow] {
         repo.create_job(j).await.unwrap();
     }
 
     let only_real = JobFilter {
         kind: Some("ship-a-change".into()),
-        simulated: Some(false),
+        partition: Some(Partition::Real),
         ..Default::default()
     };
     let (rows, total) = repo.list_jobs(&only_real, 100, 0).await.unwrap();
@@ -378,12 +390,37 @@ async fn simulated_partitions_the_rows_and_the_total() {
 
     let only_sim = JobFilter {
         kind: Some("ship-a-change".into()),
-        simulated: Some(true),
+        partition: Some(Partition::Simulated),
         ..Default::default()
     };
     let (rows, total) = repo.list_jobs(&only_sim, 100, 0).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(total, 2);
+
+    let only_shadow = JobFilter {
+        kind: Some("ship-a-change".into()),
+        partition: Some(Partition::Shadow),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&only_shadow, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].title, "shadow run");
+    assert_eq!(
+        rows[0].partition,
+        Partition::Shadow,
+        "the column round-trips the third value"
+    );
+
+    // Both columns are written (expand/contract): the derived legacy
+    // bool is TRUE for shadow, so an N-1 reader of `jobs.simulated`
+    // fails closed on it without knowing the word.
+    let (legacy,): (bool,) = sqlx::query_as("SELECT simulated FROM jobs WHERE id = $1")
+        .bind(*shadow.id.inner().as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(legacy, "jobs.simulated is derived as not-real");
 
     // Absent means everything, so nothing that exists today moves.
     let all = JobFilter {
@@ -391,6 +428,164 @@ async fn simulated_partitions_the_rows_and_the_total() {
         ..Default::default()
     };
     let (rows, total) = repo.list_jobs(&all, 100, 0).await.unwrap();
-    assert_eq!(rows.len(), 3);
-    assert_eq!(total, 3);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(total, 4);
+}
+
+/// `metadata_has` and `metadata_contains` at the Postgres layer.
+///
+/// The claim behind 4d9aa761 (2026-09-14): three probes written in one
+/// day each paged 60-200 rows of a kind and filtered by a metadata key
+/// in jq, and one measured the closed listing at 356 rows within 14
+/// days against a 200-row page. A limit is not a filter. Both clauses
+/// here (`metadata ? $n`, `metadata @> $n`) are asserted on the count
+/// query as well as the list query — the two queries are written
+/// separately in the adapter, so this is where they drift.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_has_and_contains_narrow_the_rows_and_the_total() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let net = Subject::new("asset", "BOSSNET");
+
+    let mut car = job(
+        "00000000-0000-0000-0000-0000000000c1",
+        "ship-a-change",
+        net.clone(),
+    );
+    car.title = "the car".into();
+    car.metadata = serde_json::json!({ "branch": "feat/x", "proof_probe": "true" });
+    let mut twin = job(
+        "00000000-0000-0000-0000-0000000000c2",
+        "ship-a-change",
+        net.clone(),
+    );
+    twin.title = "another car".into();
+    twin.metadata = serde_json::json!({ "branch": "feat/y" });
+    // Null metadata — the seeded default — carries no key at all.
+    let mut bare = job(
+        "00000000-0000-0000-0000-0000000000c3",
+        "ship-a-change",
+        net.clone(),
+    );
+    bare.title = "bare".into();
+
+    for j in [&car, &twin, &bare] {
+        repo.create_job(j).await.unwrap();
+    }
+
+    let has_probe = JobFilter {
+        kind: Some("ship-a-change".into()),
+        metadata_has: Some("proof_probe".into()),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&has_probe, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1, "one packet carries proof_probe");
+    assert_eq!(
+        total, 1,
+        "the count query must carry the same `?` clause as the list query"
+    );
+    assert_eq!(rows[0].title, "the car");
+
+    let has_branch = JobFilter {
+        kind: Some("ship-a-change".into()),
+        metadata_has: Some("branch".into()),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&has_branch, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(total, 2, "null metadata does not carry the key");
+
+    let one_branch = JobFilter {
+        kind: Some("ship-a-change".into()),
+        metadata_contains: Some(serde_json::json!({ "branch": "feat/y" })),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&one_branch, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].title, "another car");
+
+    // Both at once intersect: the key filter and the containment
+    // document are separate binds and must both hold.
+    let both = JobFilter {
+        kind: Some("ship-a-change".into()),
+        metadata_has: Some("proof_probe".into()),
+        metadata_contains: Some(serde_json::json!({ "branch": "feat/y" })),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&both, 100, 0).await.unwrap();
+    assert_eq!((rows.len(), total), (0, 0));
+}
+
+/// `kinds` — the kind SET the department listing narrows on — at the
+/// Postgres layer, asserted on the count query as well as the list
+/// query, since the two are written separately in the adapter.
+///
+/// The claim behind cc76f755 (2026-09-18): a packet carries no
+/// department, its workflow does, so `?department=sales` resolves to
+/// the kinds declaring `sales` and asks for exactly those. The leg
+/// that matters most is the EMPTY set: `kind = ANY('{}')` must be a
+/// real bind matching nothing, because a department nobody declares
+/// that answered the unfiltered count is the trap the packet was
+/// filed on (prod answered 1944 for a param it never read).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_set_narrows_the_rows_and_the_total_and_an_empty_set_is_none() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let co = Subject::new("custom", "algedonic");
+
+    for (id, kind) in [
+        ("00000000-0000-0000-0000-0000000000d1", "receive-an-inquiry"),
+        (
+            "00000000-0000-0000-0000-0000000000d2",
+            "receive-a-sponsorship",
+        ),
+        (
+            "00000000-0000-0000-0000-0000000000d3",
+            "publish-the-landing-page",
+        ),
+        ("00000000-0000-0000-0000-0000000000d4", "backlog-item"),
+    ] {
+        repo.create_job(&job(id, kind, co.clone())).await.unwrap();
+    }
+
+    let sales = JobFilter {
+        kinds: Some(vec![
+            "receive-an-inquiry".into(),
+            "receive-a-sponsorship".into(),
+        ]),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&sales, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 2, "two packets are of the two sales kinds");
+    assert_eq!(
+        total, 2,
+        "the count query must carry the same kind-set clause as the list query"
+    );
+    assert!(rows.iter().all(|j| j.kind.starts_with("receive-")));
+
+    // The control leg: an EMPTY set is no packet, not every packet.
+    let nobody = JobFilter {
+        kinds: Some(vec![]),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&nobody, 100, 0).await.unwrap();
+    assert_eq!(
+        (rows.len(), total),
+        (0, 0),
+        "an empty kind set must not fall through"
+    );
+
+    // And `None` is still no filter.
+    let (rows, total) = repo.list_jobs(&JobFilter::default(), 100, 0).await.unwrap();
+    assert_eq!((rows.len(), total), (4, 4));
+
+    // Composes with `kind` as an intersection.
+    let both = JobFilter {
+        kind: Some("backlog-item".into()),
+        kinds: Some(vec!["receive-an-inquiry".into()]),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&both, 100, 0).await.unwrap();
+    assert_eq!((rows.len(), total), (0, 0));
 }

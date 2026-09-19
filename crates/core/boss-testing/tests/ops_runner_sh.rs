@@ -44,15 +44,21 @@ fn write_exec(path: &Path, body: &str) {
 }
 
 /// The stubbed system of record: `bin/curl` serves `jobs.json` on any
-/// GET and copies a PUT's `--data-binary @file` payload to `put.json`.
-/// A `gh` stub stands in for the publish verb's `--check` tool probe.
+/// GET, copies a PUT's `--data-binary @file` payload to `put.json`,
+/// and a PATCH's to `patch.json` — the request-level `exit` the runner
+/// writes through the job metadata door (f47861a5). A `gh` stub stands
+/// in for the publish verb's `--check` tool probe.
 fn stub_sor(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     write_exec(
         &bin.join("curl"),
         "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
+         m=GET; prev=\n\
+         for a in \"$@\"; do [ \"$prev\" = -X ] && m=\"$a\"; prev=\"$a\"; done\n\
+         for a in \"$@\"; do case \"$a\" in @*)\n\
+             if [ \"$m\" = PATCH ]; then cp \"${a#@}\" \"$STUB_PATCH\"; else cp \"${a#@}\" \"$STUB_PUT\"; fi\n\
+             exit 0;; esac; done\n\
          cat \"$STUB_JOBS\"\n",
     );
     write_exec(&bin.join("gh"), "#!/bin/sh\nexit 0\n");
@@ -79,8 +85,10 @@ fn packet(root: &Path, verb: &str, args: &str) {
     packet_for(root, "forge", verb, args);
 }
 
-/// Run the runner once against the stub. Returns (stdout+stderr, the
-/// PUT payload's step metadata if a step was completed).
+/// Run the runner once against the stub, with `verbs` as its allowlist
+/// DIRECTORY (one file per verb — the shape the shipped
+/// `infra/ops/verbs/` has). Returns (stdout+stderr, the PUT payload's
+/// step metadata if a step was completed).
 fn run(
     root: &Path,
     verbs: &Path,
@@ -88,6 +96,7 @@ fn run(
 ) -> (String, Option<serde_json::Value>) {
     let put = root.join("put.json");
     let _ = std::fs::remove_file(&put);
+    let _ = std::fs::remove_file(root.join("patch.json"));
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
@@ -99,9 +108,10 @@ fn run(
         .env("PATH", path)
         .env("HOST_ID", "forge")
         .env("BOSS_JOBS_URL", "http://sor.invalid")
-        .env("OPS_VERBS_FILE", verbs)
+        .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", root.join("jobs.json"))
-        .env("STUB_PUT", &put);
+        .env("STUB_PUT", &put)
+        .env("STUB_PATCH", root.join("patch.json"));
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -118,14 +128,41 @@ fn run(
     (text, payload)
 }
 
-/// The real allowlist, its script paths rewritten from the forge
-/// checkout to this tree.
+/// The real allowlist, verbatim: `infra/ops/verbs/*.json` copied file
+/// by file. Its script paths are repo-relative and the runner resolves
+/// them against its own checkout, so no rewriting is needed here
+/// (66077f9c — this harness used to carry one of the four copies of
+/// the `/home/david/boss/` substitution).
 fn real_verbs(root: &Path) -> PathBuf {
-    let src = std::fs::read_to_string(repo_root().join("infra/ops/verbs.json")).unwrap();
-    let rewritten = src.replace("/home/david/boss/", &format!("{}/", repo_root().display()));
-    let p = root.join("verbs.json");
-    std::fs::write(&p, rewritten).unwrap();
-    p
+    let dir = root.join("verbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in shipped_verb_files() {
+        std::fs::copy(&f, dir.join(f.file_name().unwrap())).unwrap();
+    }
+    dir
+}
+
+/// A fixture allowlist: one file per (name, spec) under `verbs/`.
+fn verbs_dir(root: &Path, specs: &[(&str, &str)]) -> PathBuf {
+    let dir = root.join("verbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, spec) in specs {
+        std::fs::write(dir.join(format!("{name}.json")), spec).unwrap();
+    }
+    dir
+}
+
+/// Every `*.json` under the shipped `infra/ops/verbs/`, sorted — the
+/// directory IS the allowlist, so this is the definition every reader
+/// is measured against.
+fn shipped_verb_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(repo_root().join("infra/ops/verbs"))
+        .expect("infra/ops/verbs/ exists")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files
 }
 
 /// What `publish-github-pr.sh --check` needs to say ok without a
@@ -186,10 +223,25 @@ fn publish_check_env(root: &Path) -> Vec<(&'static str, String)> {
     let token = etc.join("github.token");
     std::fs::write(&token, "not-a-real-token\n").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The forge's address file (/etc/boss/sor.env on the host), rendered
+    // from the one source: the verb derives its forge clone URL from it.
+    let sor_env = etc.join("sor.env");
+    let rendered = Command::new("bash")
+        .arg(repo_root().join("infra/estate/render-sor-env.sh"))
+        .arg("--to")
+        .arg(&sor_env)
+        .output()
+        .expect("render sor.env");
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
     vec![
         ("BOSS_PUBLISH_STATE_DIR", state.display().to_string()),
         ("BOSS_FORGE_REPO_PATH", forge.display().to_string()),
         ("BOSS_GITHUB_TOKEN_FILE", token.display().to_string()),
+        ("BOSS_SOR_ENV", sor_env.display().to_string()),
     ]
 }
 
@@ -200,6 +252,68 @@ macro_rules! needs_jq {
             return;
         }
     };
+}
+
+/// A verb's script is named RELATIVE to the repo and resolved against
+/// the runner's OWN checkout (backlog 66077f9c). Eleven of sixteen verbs
+/// baked `/home/david/boss/infra/forge/…` — the forge checkout's path —
+/// into argv[0], so none could run on boss-gcp (/opt/boss) and every
+/// consumer (two lints, this harness) carried its own substitution of
+/// that prefix: one path assumption in four places. The runner knows
+/// where it is; a relative argv[0] resolves against that, an absent
+/// script is a REFUSAL naming the resolved path, and a bare command is
+/// left to PATH as before.
+#[test]
+fn a_relative_argv0_resolves_against_the_runners_own_checkout() {
+    needs_jq!();
+    let root = scratch("relative-argv0");
+    stub_sor(&root);
+    let verbs = verbs_dir(
+        &root,
+        &[
+            (
+                "probe",
+                r#"{"about": "a tree lint, as a probe of resolution", "hosts": ["forge"],
+                    "argv": ["infra/lint/no-manifest-mounts-a-hostpath.sh"], "params": []}"#,
+            ),
+            (
+                "gone",
+                r#"{"about": "a script this checkout does not carry", "hosts": ["forge"],
+                    "argv": ["infra/ops/does-not-exist.sh"], "params": []}"#,
+            ),
+        ],
+    );
+    packet(&root, "probe", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert!(
+        md["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no-manifest-mounts-a-hostpath: ok"),
+        "the relative script ran from this checkout: {md} / {out}"
+    );
+
+    packet(&root, "gone", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "refused", "{md} / {out}");
+    let reason = md["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("infra/ops/does-not-exist.sh") && reason.contains("not in this checkout"),
+        "the refusal names the resolved path: {md} / {out}"
+    );
+
+    // The shipped allowlist carries NO absolute checkout path any more.
+    for f in shipped_verb_files() {
+        let shipped = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            !shipped.contains("/home/david/boss/"),
+            "{} names a script by one host's checkout, not relative to the repo",
+            f.display()
+        );
+    }
 }
 
 /// The allowed literal reaches the verb: `publish-github-pr --check` is
@@ -298,12 +412,13 @@ fn an_absent_optional_literal_drops_its_placeholder_word() {
     needs_jq!();
     let root = scratch("optional-omitted");
     stub_sor(&root);
-    let verbs = root.join("verbs.json");
-    std::fs::write(
-        &verbs,
-        r#"{"verbs":{"say":{"about":"echo","hosts":["forge"],"argv":["echo","ran","{1}"],"params":[{"name":"mode","one_of":["--check"],"optional":true}]}}}"#,
-    )
-    .unwrap();
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "say",
+            r#"{"about":"echo","hosts":["forge"],"argv":["echo","ran","{1}"],"params":[{"name":"mode","one_of":["--check"],"optional":true}]}"#,
+        )],
+    );
 
     packet(&root, "say", "[]");
     let (out, payload) = run(&root, &verbs, &[]);
@@ -388,12 +503,13 @@ fn a_verb_declaring_no_hosts_is_refused_everywhere() {
     needs_jq!();
     let root = scratch("hosts-absent");
     stub_sor(&root);
-    let verbs = root.join("verbs.json");
-    std::fs::write(
-        &verbs,
-        r#"{"verbs":{"say":{"about":"echo","argv":["echo","ran"],"params":[]}}}"#,
-    )
-    .unwrap();
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "say",
+            r#"{"about":"echo","argv":["echo","ran"],"params":[]}"#,
+        )],
+    );
 
     packet(&root, "say", "[]");
     let (out, payload) = run(&root, &verbs, &[]);
@@ -406,5 +522,288 @@ fn a_verb_declaring_no_hosts_is_refused_everywhere() {
     assert!(
         reason.contains("no host") && reason.contains("refused everywhere"),
         "the refusal must say the allowlist entry declares no hosts: {reason}"
+    );
+}
+
+/// THE ALLOWLIST IS A DIRECTORY, one file per verb, and the verb's
+/// name is its file name (backlog 5086842d). `infra/ops/verbs.json`
+/// was one JSON object, and a JSON object has no uncontended insertion
+/// point: on 2026-09-12 three cars each added a verb, two inserted
+/// before the same key, and the conductor left one behind
+/// (`conflict: infra/ops/verbs.json`) — the shape CLAUDE.md §9a records
+/// for rules.toml before rules became one file each. Now adding a verb
+/// is dropping a file in, touching no shared line.
+///
+/// The runner is the reader that matters most: it runs on two hosts
+/// from their converged checkouts, and if it cannot load the directory
+/// every ops verb dies. So this RUNS it over a directory and asks that
+/// a verb be reachable by its file name, and that an unknown verb's
+/// refusal lists every file — which is the runner saying, on the
+/// packet, that it loaded them all.
+#[test]
+fn the_allowlist_is_the_directory_and_a_verb_is_named_by_its_file() {
+    needs_jq!();
+    let root = scratch("directory-allowlist");
+    stub_sor(&root);
+    let verbs = verbs_dir(
+        &root,
+        &[
+            (
+                "say-hello",
+                r#"{"about":"echo","hosts":["forge"],"argv":["echo","hello"],"params":[]}"#,
+            ),
+            (
+                "say-bye",
+                r#"{"about":"echo","hosts":["forge"],"argv":["echo","bye"],"params":[]}"#,
+            ),
+        ],
+    );
+    // A README beside the verbs is prose, not a verb: the loader must
+    // take only `*.json`.
+    std::fs::write(verbs.join("README.md"), "# not a verb\n").unwrap();
+
+    packet(&root, "say-bye", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert_eq!(md["output"], "bye\n", "{md}");
+
+    packet(&root, "rm-rf", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "refused", "{md} / {out}");
+    let reason = md["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("infra/ops/verbs/") && reason.ends_with("verbs: say-bye, say-hello"),
+        "the refusal names the directory and every verb file in it: {reason}"
+    );
+}
+
+/// The SHIPPED directory loads whole: the runner's own listing of what
+/// it knows equals the file names under `infra/ops/verbs/`. This is the
+/// equality that makes the directory the definition — a verb file the
+/// runner silently skipped would show up here as a name missing from
+/// the refusal.
+#[test]
+fn the_runner_loads_every_shipped_verb_file() {
+    needs_jq!();
+    let root = scratch("shipped-directory");
+    stub_sor(&root);
+    let verbs = real_verbs(&root);
+    let expected: Vec<String> = shipped_verb_files()
+        .iter()
+        .map(|f| f.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(expected.len() >= 16, "{expected:?}");
+    assert!(
+        !repo_root().join("infra/ops/verbs.json").exists(),
+        "infra/ops/verbs.json is back — the directory is the allowlist now (5086842d); \
+         a verb goes in infra/ops/verbs/<name>.json"
+    );
+
+    packet(&root, "rm-rf", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    let reason = md["reason"].as_str().unwrap();
+    let listed = reason
+        .rsplit("verbs: ")
+        .next()
+        .unwrap()
+        .split(", ")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed, expected,
+        "the runner's allowlist is not the directory: {reason}"
+    );
+}
+
+/// A directory the runner cannot load is a REFUSAL TO RUN naming the
+/// directory (EX_CONFIG, the same exit an unreadable allowlist got),
+/// never an empty allowlist that refuses every packet as unknown: no
+/// directory, an empty one, and a file that is not a JSON object each
+/// stop the runner before it touches a packet, and each says which.
+#[test]
+fn a_directory_the_runner_cannot_load_stops_it_by_name() {
+    needs_jq!();
+    let root = scratch("directory-broken");
+    stub_sor(&root);
+    packet(&root, "uptime", "[]");
+
+    let missing = root.join("no-such-dir");
+    let (out, payload) = run(&root, &missing, &[]);
+    assert!(
+        payload.is_none(),
+        "a runner with no allowlist touched a packet: {out}"
+    );
+    assert!(
+        out.contains("no-such-dir") && out.contains("refusing to run"),
+        "{out}"
+    );
+
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (out, payload) = run(&root, &empty, &[]);
+    assert!(payload.is_none(), "{out}");
+    assert!(
+        out.contains("holds no verb") && out.contains("empty"),
+        "an empty directory must be named as the fault, not treated as an allowlist: {out}"
+    );
+
+    let broken = verbs_dir(
+        &root,
+        &[
+            (
+                "ok",
+                r#"{"about":"echo","hosts":["forge"],"argv":["echo","ok"],"params":[]}"#,
+            ),
+            ("bad", "{not json"),
+        ],
+    );
+    let (out, payload) = run(&root, &broken, &[]);
+    assert!(payload.is_none(), "{out}");
+    assert!(
+        out.contains("bad.json"),
+        "the fault must name the file that would not parse: {out}"
+    );
+}
+
+/// A VERB THAT IS THE TREE'S OWN CLI SIGNS AS THE RUNNER. `run-car-probe`
+/// runs `boss prove … --unattended` since backlog 9f00a805 (car 2): the
+/// CLI signs every jobs-API call as `BOSS_ACTOR` and refuses a write
+/// unnamed, so the runner hands its own account over in the verb's
+/// environment — the same identity the step completion carries — and a
+/// unit that set `BOSS_ACTOR` itself wins. Read back through a bare
+/// command on PATH, the way `boss` resolves on the forge.
+#[test]
+fn a_cli_verb_signs_as_the_runners_own_account() {
+    needs_jq!();
+    let root = scratch("cli-verb-actor");
+    let bin = stub_sor(&root);
+    write_exec(
+        &bin.join("who-signs"),
+        "#!/bin/sh\nprintf 'signs-as=%s packet=%s\\n' \"${BOSS_ACTOR:-unset}\" \"${OPS_REQUEST_ID:-unset}\"\n",
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "who-signs",
+            r#"{"about": "prints the actor a CLI verb would sign as", "hosts": ["forge"],
+                "argv": ["who-signs"], "params": []}"#,
+        )],
+    );
+    packet(&root, "who-signs", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let output = md["output"].as_str().unwrap_or("");
+    assert!(
+        output.contains("signs-as=automation:ops-runner"),
+        "the verb must see the runner's own account as BOSS_ACTOR: {md} / {out}"
+    );
+    assert!(
+        output.contains("packet=aaaaaaaa-0000-4000-8000-000000000000"),
+        "the packet id still rides the environment: {md}"
+    );
+
+    // The runner's account is BOSS_OPS_ACTOR when a unit names one…
+    let (out, payload) = run(
+        &root,
+        &verbs,
+        &[("BOSS_OPS_ACTOR", "automation:forge-ops".into())],
+    );
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert!(
+        md["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("signs-as=automation:forge-ops"),
+        "{md}"
+    );
+    // …and an explicit BOSS_ACTOR on the unit outranks both.
+    let (out, payload) = run(&root, &verbs, &[("BOSS_ACTOR", "emp-operator".into())]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert!(
+        md["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("signs-as=emp-operator"),
+        "{md}"
+    );
+
+    // And the shipped verb itself is the CLI, not a script: a bare
+    // `boss` on PATH, with the car first and both flags fixed words.
+    let shipped: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/ops/verbs/run-car-probe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        shipped["argv"],
+        serde_json::json!(["boss", "prove", "{1}", "--from-car", "--unattended"]),
+        "run-car-probe's argv is the tree's CLI (9f00a805 car 2)"
+    );
+    assert!(
+        !repo_root().join("infra/forge/run-car-probe.sh").exists(),
+        "the shell twin was retired with 9f00a805 car 2; a script here is a second definition"
+    );
+}
+
+/// THE EXIT RIDES THE REQUEST, not only the step (backlog f47861a5,
+/// measured 2026-09-19 on ops-request c98a782f): publish-github-pr
+/// printed `FAILED` and exited 1, the runner completed `execute` with
+/// `exit_code: "1"`, the request closed `answered` — the verb RAN, which
+/// is what the outcome names — and nothing above the step level said
+/// so: the yard drew the request like any answered one and the publish
+/// step it was filed for sat ready for five hours. The runner now
+/// writes the verb's exit onto the request's own metadata through the
+/// merge door BEFORE completing the step, so every reader of the close
+/// (the yard, a rule's handler) sees the exit where the outcome is.
+/// The outcome stays `answered`: every judge rule keys on it, and a
+/// verb that ran and said no is an answer, not a refusal.
+#[test]
+fn an_answered_verbs_exit_rides_the_request_metadata() {
+    needs_jq!();
+    let root = scratch("exit-on-request");
+    stub_sor(&root);
+    let fails = root.join("fails.sh");
+    write_exec(
+        &fails,
+        "#!/bin/sh\necho 'fails: step one ok'\necho 'fails: FAILED — the thing did not happen' >&2\nexit 3\n",
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "fails",
+            &format!(
+                r#"{{"about":"a verb that fails","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                fails.display()
+            ),
+        )],
+    );
+    packet(&root, "fails", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert_eq!(md["exit_code"], "3", "{md} / {out}");
+    let patch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("patch.json"))
+            .unwrap_or_else(|e| panic!("no PATCH on the request's metadata: {e}; {out}")),
+    )
+    .expect("the PATCH body is JSON");
+    assert_eq!(
+        patch,
+        serde_json::json!({"exit": "3"}),
+        "the request carries the verb's exit, and nothing else changes: {patch}"
+    );
+    assert!(out.contains("answered fails"), "{out}");
+
+    // A refusal ran nothing, so the request has no exit to carry.
+    packet(&root, "not-a-verb", "[]");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "refused", "{md} / {out}");
+    assert!(
+        !root.join("patch.json").exists(),
+        "a refusal writes no exit on the request: {out}"
     );
 }

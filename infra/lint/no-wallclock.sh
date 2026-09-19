@@ -38,6 +38,14 @@
 #                                      stamp — wall by decision)
 #   * **/tests/                       (test files; no production
 #                                      runtime)
+#   * a whole-file test module        (`#[cfg(test)] mod tests;` in the
+#                                      parent, the tests in tests.rs —
+#                                      lib/test-file.sh, the predicate
+#                                      no-employee-id-literal shares;
+#                                      backlog e9c77544. Until 2026-09-18
+#                                      only the inline shape below was
+#                                      read, so a builder kept 4,651
+#                                      lines' tests inline to stay green)
 #   * #[cfg(test)] items              (inline test blocks — the
 #                                      exemption is the attributed
 #                                      item's BODY, brace-counted; it
@@ -58,7 +66,16 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+LINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$LINT_DIR/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$LINT_DIR/lib/scanned.sh" || exit 3
+# shellcheck source=infra/lint/lib/allowlist.sh
+. "$LINT_DIR/lib/allowlist.sh" || exit 3
+# shellcheck source=infra/lint/lib/test-file.sh
+. "$LINT_DIR/lib/test-file.sh" || exit 3
+
+LINT=no-wallclock
 
 # Path-prefix patterns that are allowed.
 #
@@ -72,6 +89,17 @@ cd "$(dirname "$0")/../.."
 # When in doubt, leave it OUT and audit the callsite. The cost
 # of a false-positive flag is a 30-second look; the cost of a
 # silent wallclock leak is a regen 18 (116k mis-dated rows).
+#
+# And when a callsite is gone, take its entry OUT in the same change.
+# Both lists are held to lib/allowlist.sh's two rules — every entry
+# names a path that exists, and every entry excused at least one
+# production callsite this run. On 2026-09-18 (backlog cdf2d959,
+# audit §4) the two lists held 47 entries: 4 named files that no
+# longer existed, 9 named files with no production Utc::now() left
+# in them, and 9 named port.rs / in_memory.rs files the convention
+# rules in is_allowed() already excuse before the lists are
+# consulted. 22 allowances excusing nothing, each a hole the next
+# leak in that file would have walked through; 25 remain.
 ALLOWED_PREFIXES=(
   # The clock-api itself, the wall-mode path that IS Utc::now()
   "crates/core/boss-clock/"
@@ -105,42 +133,15 @@ ALLOWED_PREFIXES=(
   "crates/core/boss-core/src/clock.rs"
   # Policy rule-engine evaluator: rule expiry math is local
   # decision logic, not audit-emitting. Post-#84 the engine
-  # itself lives in boss-policy-client; boss-policy is now just
-  # the HTTP + Postgres adapter (also allowed because the
-  # bootstrap binary uses chrono parse helpers).
-  "crates/core/boss-policy/"
+  # lives in boss-policy-client. (port.rs and in_memory.rs files
+  # are excused by the convention rules in is_allowed() and are
+  # not listed here — an entry the convention shadows is never
+  # used, and the used-check refuses it.)
   "crates/core/boss-policy-client/src/engine.rs"
-  "crates/core/boss-policy-client/src/in_memory.rs"
-  "crates/core/boss-policy-client/src/seed_loader.rs"
-  # Calendar port.rs trait-default convenience overloads.
-  # The _at variants are what production code calls; the
-  # bare-arg defaults exist for legacy callers.
-  "crates/core/boss-calendar/src/port.rs"
-  # Same pattern for the other port.rs default-method overloads.
-  "crates/modules/boss-people/src/port.rs"
-  "crates/modules/boss-commerce/src/port.rs"
-  "crates/modules/boss-shipping/src/port.rs"
-  "crates/modules/boss-inventory/src/port.rs"
-  "crates/core/boss-content/src/port.rs"
-  # Classes client deprecated wallclock helper.
-  "crates/core/boss-classes-client/src/lib.rs"
-  # Sim-side faker + bridge generators — sim-only; the audit
-  # trail comes from the LiveApiOutput emit path which IS
-  # clock-routed (see v1.0.6 #72 scheduler-driven anchors).
-  "crates/orchestrators/boss-sim/src/shape_driven/faker.rs"
-  "crates/modules/boss-assets/src/bridge.rs"
-  # Fleet system_parts uses Utc::now() for in-memory updated_at;
-  # the audit-emitting handler path is separate + clock-routed.
-  "crates/modules/boss-assets/src/system_parts.rs"
-  # In-memory + test fixture adapters; never deployed.
-  "crates/core/boss-content/src/in_memory.rs"
-  "crates/modules/boss-inventory/src/in_memory.rs"
-  "crates/core/boss-policy/src/in_memory.rs"
-  # ML inference + generators: predictions land in
-  # ml_predictions table, not audit_log. created_at /
-  # updated_at on those rows is wallclock by design.
+  # ML inference: predictions land in the ml_predictions table,
+  # not audit_log. created_at / updated_at on those rows is
+  # wallclock by design.
   "crates/core/boss-ml/"
-  "crates/modules/boss-ml-plugins/"
   # CLI flag defaults (today = Utc::now().date_naive() unless
   # --today is passed). Operators override at runtime.
   "crates/modules/boss-ledger/src/bin/boss_ledger_recognize.rs"
@@ -166,12 +167,6 @@ ALLOWED_PREFIXES=(
   "crates/core/boss-jobs/src/scheduling/http.rs"
   # Internal data struct default constructor — Message, etc.
   "crates/core/boss-core/src/agent.rs"
-  # Rebuilders walk historic audit_log entries; the read_at
-  # backfill timestamp is wallclock by design (synthetic since
-  # the original event didn't carry it).
-  "crates/modules/boss-messages/src/rebuild.rs"
-  # Daily ledger recognition cron — operator-time tick.
-  "crates/modules/boss-ledger/src/recognize.rs"
 )
 
 # Files whose entire body is exempt (e.g. CLI boundary tools
@@ -190,7 +185,7 @@ ALLOWED_FILES=(
   # in the brewery's simulated calendar, and the Job it writes to is
   # non-simulated. Rule 1 is untouched — this is a payload field, and
   # the record stamp is still minted by EventStamp.
-  "crates/orchestrators/boss-cli/src/train.rs"
+  "crates/orchestrators/boss-cli/src/train/conductor.rs"
   # The sim binary's `went_live=` marker on the regenerate-deployment
   # backfill step: when did this regen actually go live, in real time.
   # Deployment bookkeeping on a real Job, not a brewery business date
@@ -198,24 +193,20 @@ ALLOWED_FILES=(
   # below. Surfaced by the same heuristic repair; its mid-file
   # `mod day_cursor_tests` was what hid it.
   "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_sim.rs"
-  # Operator-baseline seed: stamps via BOSS_EPOCH_START now
-  # (v1.0.5 fix), but the binary's own clock fallback is OK
-  "crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs"
-  # Brewery-engine seed + bootstrap: use BOSS_EPOCH_START
-  # explicitly now (#69); main.rs imports chrono just for type
-  # signatures, not Utc::now() calls.
-  "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_data_seed.rs"
-  "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_bootstrap.rs"
   # File-references GC daemon: wallclock IS the right "now"
   # for deciding whether soft-deleted bytes are past their
   # retention window. Operator-time semantics.
   "crates/core/boss-content/src/bin/boss_files_gc.rs"
 )
 
+allowlist_paths_exist "$LINT" "${ALLOWED_PREFIXES[@]}" "${ALLOWED_FILES[@]}"
+allow_used=""
+
 is_allowed() {
   local file="$1"
-  # Test files anywhere are fine.
-  if [[ "$file" == *"/tests/"* ]]; then
+  # Test files anywhere are fine — a tests/ path or a whole-file
+  # cfg(test) module (lib/test-file.sh).
+  if is_test_file "$file"; then
     return 0
   fi
   # In-memory adapters are by convention test fixtures (the prod
@@ -237,11 +228,13 @@ is_allowed() {
   # so they never reach this gate.
   for prefix in "${ALLOWED_PREFIXES[@]}"; do
     if [[ "$file" == "$prefix"* ]]; then
+      allow_used="$allow_used"$'\n'"$prefix"
       return 0
     fi
   done
   for allowed in "${ALLOWED_FILES[@]}"; do
     if [[ "$file" == "$allowed" ]]; then
+      allow_used="$allow_used"$'\n'"$allowed"
       return 0
     fi
   done
@@ -375,11 +368,29 @@ FIXTURE
       st_fail=1
     fi
   done
+  # The whole-file shape, through is_allowed: `#[cfg(test)] mod tests;`
+  # in the parent makes tests.rs a test file; a tests.rs no parent
+  # declares under cfg(test) is production (backlog e9c77544).
+  whole=$(mktemp -d -t no-wallclock-selftest.XXXXXX)
+  trap 'rm -f "$fixture"; rm -rf "$whole"' EXIT
+  mkdir -p "$whole/declared" "$whole/undeclared"
+  printf '#[cfg(test)]\nmod tests;\n' >"$whole/declared/lib.rs"
+  printf 'let _ = Utc::now();\n' >"$whole/declared/tests.rs"
+  printf 'mod tests;\n' >"$whole/undeclared/lib.rs"
+  printf 'let _ = Utc::now();\n' >"$whole/undeclared/tests.rs"
+  if ! is_allowed "$whole/declared/tests.rs"; then
+    echo "self-test FAIL: a tests.rs the parent declares under #[cfg(test)] classified as production"
+    st_fail=1
+  fi
+  if is_allowed "$whole/undeclared/tests.rs"; then
+    echo "self-test FAIL: a tests.rs no parent declares under #[cfg(test)] classified as a test file"
+    st_fail=1
+  fi
   if [ "$st_fail" -eq 0 ]; then
-    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item)"
+    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item; a whole-file test module is exempt by its parent's declaration)"
     exit 0
   fi
-  echo "no-wallclock --self-test: FAILED — the cfg(test) exemption is leaking past the item it applies to."
+  echo "no-wallclock --self-test: FAILED — the cfg(test) exemption is leaking past the item it applies to, or misreads a whole-file test module."
   exit 1
 fi
 
@@ -413,6 +424,10 @@ while IFS= read -r line; do
     violations=$((violations + 1))
   fi
 done <<<"$hits"
+
+# Both passes walk every Rust file under crates/; zero means the tree
+# moved, not that nothing stamps wallclock.
+lint_scanned "$LINT" "$(find crates -type f -name '*.rs' | wc -l | tr -d ' ')" "Rust file(s) under crates/ (both passes)"
 
 if [ "$violations" -eq 0 ]; then
   echo "no-wallclock (Rust): clean"
@@ -534,7 +549,7 @@ sql_is_file_allowed() {
   local file="$1"
   # Same blanket allow as Rust pass for clock crates, in_memory,
   # port.rs, tests, ml (predictions land in own table not audit_log).
-  if [[ "$file" == *"/tests/"* ]]; then return 0; fi
+  if is_test_file "$file"; then return 0; fi
   if [[ "$file" == *"/in_memory.rs" ]]; then return 0; fi
   if [[ "$file" == *"/port.rs" ]]; then return 0; fi
   case "$file" in
@@ -611,4 +626,5 @@ total=$((violations + sql_violations))
 if [ "$total" -gt 0 ]; then
   exit 1
 fi
+allowlist_entries_used "$LINT" "$allow_used" "${ALLOWED_PREFIXES[@]}" "${ALLOWED_FILES[@]}"
 exit 0

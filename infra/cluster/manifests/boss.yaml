@@ -80,7 +80,8 @@ spec:
           image: 10.20.0.15:3000/david/postgres:16
           # ~24 API services each hold an sqlx pool (default max 10), which
           # blows past PG's default max_connections=100 and makes services
-          # fail-closed mid-startup. 400 matches infra/deploy-services.sh.
+          # fail-closed mid-startup. 400 is the one setting; the compose
+          # file's postgres carries the same.
           args: ["postgres", "-c", "max_connections=400"]
           env:
             - {name: POSTGRES_USER, value: boss}
@@ -233,6 +234,26 @@ spec:
       # pinned; the app was not.
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+      # …but NOT cp-2, until its disk is replaced. Every converge rolls
+      # this pod: a 309 MB image pull and layer extraction onto whichever
+      # control-plane node holds it. On cp-2 that disk is a DRAM-less
+      # PM991a (SAMSUNG MZALQ256HBJD) that also carries etcd's WAL, and
+      # the extraction stalled the WHOLE node — etcd, containerd and the
+      # kubelet together, /proc/pressure/io full ≈ 6.7 h — until the
+      # kubelet missed its lease: cp-2 and w-1 (routed to cp-2's
+      # apiserver) NotReady 18:58–19:19Z on 2026-09-11, the SoR dark 22
+      # min (incident a398c4d3). Keeping the roll off that disk is
+      # decision (2) of the incident's prevention; David replaces the
+      # drive (3), and this exclusion is DELETED in the same car that
+      # records the new disk in the estate registry. A hostname here on
+      # purpose: it is the one node with that part, and a label would be
+      # a second, imperative place for the same fact.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: NotIn, values: ["cp-2"]}
       # The image runs as uid/gid 1500 (boss), but a freshly provisioned
       # Longhorn volume mounts root:root 0755 — so the credential store
       # was unwritable and boss-auth failed on the temp file. fsGroup
@@ -286,6 +307,36 @@ spec:
         - name: step-plugins
           configMap:
             name: step-plugins
+        # THE DELIVERED TENANT (backlog f4f5c387): a `tenant_repo`
+        # instance's tenant directory, checked out by the converge and
+        # delivered exactly as step-plugins is — one ConfigMap generated
+        # from a directory, never a committed manifest (§9a). ONE
+        # ConfigMap, mounted at /opt/boss/tenant/seeds, because a
+        # ConfigMap is flat and a mount inside a read-only mount cannot
+        # be created (render-tunnel-config.sh learned it): the tenant's
+        # root tenant.toml rides as seeds/tenant.toml, the spelling the
+        # contract accepts, and BOSS_TENANT_DIR=/opt/boss/tenant finds
+        # it. `optional` because an image-sourced instance — prod and
+        # the playground today — has no such ConfigMap and must still
+        # boot; a repo-sourced instance whose ConfigMap is absent is
+        # refused by the launcher instead (no manifest under the
+        # directory), loud in the pod log, never a silent default.
+        - name: boss-tenant
+          configMap:
+            name: boss-tenant
+            optional: true
+        # THE TENANT SITE (design b64c4377): the tenant repo's site/
+        # directory, staged flat by the converge beside boss-tenant
+        # (cluster-deploy-lib.sh site_stage, the same 1 MiB bound) and
+        # served by the gateway under BOSS_SITE_HOST. `optional` for the
+        # same reason as boss-tenant: an instance that declares no site
+        # has no such ConfigMap, and one whose tenant has no site/ yet
+        # gets an empty one — either way the pod boots, and the site
+        # host answers 404 rather than the application.
+        - name: boss-site
+          configMap:
+            name: boss-site
+            optional: true
         # Break-glass PUBLIC credential records (boss-break-glass-
         # credentials.yaml — the manifest header is the ceremony doc).
         # `optional` so a deployment that has not adopted the ceremony
@@ -309,7 +360,10 @@ spec:
           env:
             - {name: PGHOST, value: postgres}
             - {name: PGUSER, value: boss}
-            - {name: PGDATABASE, value: boss}
+            # No PGDATABASE: boss-init reads the database name off
+            # DATABASE_URL (the Secret), the one source every service
+            # reads — a literal here disagreed with it the day the
+            # database was repointed (Option 3, 063dba4e).
             - name: PGPASSWORD
               valueFrom: {secretKeyRef: {name: boss-secrets, key: postgres-password}}
             - name: DATABASE_URL
@@ -320,8 +374,20 @@ spec:
             - name: BOSS_BOOTSTRAP_ADMIN_PASSWORD
               valueFrom: {secretKeyRef: {name: boss-secrets, key: admin-password}}
             - {name: BOSS_AUTH_FILE, value: /var/lib/boss/auth/credentials.toml}
+            # THE SAME TENANT DIRECTORY the boss container reads (below,
+            # substituted per instance by render-instance.sh): on the
+            # FIRST start of a fresh database boss-init evicts the
+            # example tenants' migration-seeded reference rows when the
+            # tenant it names is not an example (backlog 718ac982), and
+            # keeps them for an image-sourced example instance. Unset,
+            # init keeps the rows — never a silent eviction.
+            - {name: BOSS_TENANT_DIR, value: /opt/boss/tenant}
           volumeMounts:
             - {name: boss-auth, mountPath: /var/lib/boss/auth}
+            # The delivered tenant, read-only, so boss-init can read its
+            # manifest's tenant_id (the boss-tenant volume above; empty
+            # on an image-sourced instance, whose tenant is in the image).
+            - {name: boss-tenant, mountPath: /opt/boss/tenant/seeds, readOnly: true}
       containers:
         - name: boss
           image: 10.20.0.15:3000/david/boss:b2814ef
@@ -359,8 +425,42 @@ spec:
             # visitors get a synthetic audit-readonly session — read every
             # projection, write nothing — so the brewery renders without a
             # login, and the write path is what's under scrutiny.
-            - {name: BOSS_GUEST_ACCESS, value: "1"}
-            - {name: BOSS_TENANT_MANIFEST_TOML, value: /opt/boss/examples/brewery/seeds/tenant.toml}
+            # PER INSTANCE since backlog 0d2d7daa (2026-09-16): the value
+            # is `guest = true|false` in infra/cluster/instances.toml,
+            # rendered "1"|"0" by render-instance.sh. Prod is the source,
+            # so this line and prod's `guest` line change together — the
+            # flip car sets prod to false ("0" here) and the playground
+            # keeps "1".
+            - {name: BOSS_GUEST_ACCESS, value: "0"}
+            # THE TENANT DIRECTORY (backlog f4f5c387, car 2 of fcc1d57b;
+            # David 2026-09-16 'Let's do it'). One directory holding
+            # tenant.toml (or seeds/tenant.toml) and seeds/; the launcher
+            # derives BOSS_TENANT_MANIFEST_TOML (the gateway) and
+            # BOSS_SIM_SEEDS_DIR (the seed scripts, the engine) from it,
+            # once, so nothing else here names a tenant path. The value
+            # is the instance's tenant source, substituted per instance
+            # by render-instance.sh from infra/cluster/instances.toml:
+            # a directory the image ships (`tenant_dir` —
+            # examples/brewery, here) or /opt/boss/tenant, where the
+            # converge delivers a `tenant_repo` as the boss-tenant
+            # ConfigMap below. Prod stays on the baked examples/brewery
+            # until David flips it; the flip is two lines and
+            # instances.toml names both.
+            - {name: BOSS_TENANT_DIR, value: /opt/boss/tenant}
+            # THE TENANT SITE (design b64c4377, decided 2026-09-17;
+            # backlog c8f6b233). A request whose Host is BOSS_SITE_HOST
+            # is answered from BOSS_SITE_DIR with no session — the
+            # company website, static pages from the tenant repo's
+            # site/, delivered by the converge as the boss-site
+            # ConfigMap below (site_stage, beside boss-tenant). The host
+            # is the instance's `site` in infra/cluster/instances.toml,
+            # substituted per instance by render-instance.sh: an
+            # instance without one renders "" here, which the gateway
+            # reads as "no site" (boss-gateway site.rs), and nothing
+            # else changes. The tunnel routes the site hostname to this
+            # same gateway (render-tunnel-config.sh).
+            - {name: BOSS_SITE_HOST, value: "www.algedonic.dev"}
+            - {name: BOSS_SITE_DIR, value: /opt/boss/site}
             # A PATH, NOT A KEY — the name is a trap and this comment is
             # the guard rail. boss-gateway reads this variable as a
             # filename and loads the key from it, generating one only if
@@ -386,11 +486,13 @@ spec:
             # with the CURRENT key bytes (see the volume comment); a new
             # key signs everyone out on the roll.
             - {name: BOSS_SESSION_KEY, value: /etc/boss/session-key/session.key}
-            # Collections loop: dispatcher pushes step.done.<kind> to the
-            # sim's webhook on the same loopback host:port. Both must agree
-            # or zero collections fire and AR balloons.
-            - {name: BOSS_EVENT_WEBHOOK_URL, value: "http://127.0.0.1:7099/callback"}
-            - {name: BOSS_SIM_CALLBACK_BIND, value: "127.0.0.1:7099"}
+            # The dispatcher's event webhook URL and the sim's callback
+            # bind are NOT set here (backlog 18d6a6c9, 2026-09-17): the
+            # pair is the sim engine's loopback wiring, and the
+            # launcher derives both when the sim runs (tenant-modules.sh).
+            # On an instance whose sim is parked, or whose tenant has no
+            # engine, they were dead config — the dispatcher forwarded
+            # every step.done to a port nothing listened on.
             # PARKED: the brewery sim tick daemon is off on the cluster
             # (2026-09-05, park packet 59f063de — the sim is paused behind
             # IT delivery reliability). The tenant is still published, so
@@ -409,6 +511,10 @@ spec:
             - {name: BOSS_DISPATCH_EXECUTOR_ID, value: "claude@algedonic.dev"}
             - {name: BOSS_DISPATCH_EXECUTOR_ROLES, value: "platform-admin"}
             - {name: BOSS_DISPATCHER_RULES, value: /opt/boss/infra/dispatcher/rules}
+            # The DNS zone declarations + comparator (infra/cluster/dns,
+            # 5e58922c) the dns.observe handler runs over the zone it
+            # reads with the broker's Cloudflare root token below.
+            - {name: BOSS_DNS_DECLARATIONS, value: /opt/boss/infra/cluster/dns}
             # Widen the dispatcher off loopback so its machine door
             # (boss-dispatcher-internal.yaml, backlog a757b72a) can serve
             # reads to in-cluster automation — the sanctioned knob named in
@@ -429,10 +535,45 @@ spec:
             - name: BOSS_BROKER_FORGEJO_TOKEN
               valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: forgejo-token, optional: true}}
             - {name: BOSS_BROKER_FORGE_URL, value: "http://10.20.0.15:3000"}
+            # The broker's Cloudflare root (04e5f833): a second key in
+            # the SAME root Secret, one account API token (Cloudflare
+            # Tunnel:Edit, Zone:DNS:Edit, Zone:Read). Same `optional:
+            # true` reasoning; the tunnel rotation rule dead-letters
+            # naming this variable until the key exists.
+            - name: BOSS_BROKER_CLOUDFLARE_TOKEN
+              valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: cloudflare-token, optional: true}}
+            # The first sensor's credential (design 14c9b2ad, backlog
+            # 2d33e111): a RESTRICTED read-only Stripe key (charges,
+            # checkout_sessions, customers: read), a third key in the
+            # SAME root Secret, minted once by David. Same `optional:
+            # true` reasoning; until the key exists the sensor.poll
+            # handler files the sensor_unreadable:<id> alarm naming
+            # this variable instead of failing silently.
+            - name: BOSS_BROKER_STRIPE_KEY
+              valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: stripe-restricted-read, optional: true}}
             # Bind all interfaces so the Service can reach the gateway;
             # the default 127.0.0.1 is right for systemd+Caddy, wrong here.
             - {name: BOSS_LISTEN, value: "0.0.0.0:4443"}
-            - {name: BOSS_PUBLIC_URL, value: "https://playground.algedonic.dev"}
+            # The operating site (198c5fe9): boss.algedonic.dev, behind the
+            # Cloudflare Tunnel and the Access application declared in
+            # infra/cluster/dns/access.toml. Everything the browser must
+            # see derives from this one value — the OIDC redirect_uri
+            # (<url>/api/auth/oidc/callback), the passkey and break-glass
+            # WebAuthn RP id, the reset-mail links — so it may only name a
+            # hostname whose redirect is declared `registered = true` in
+            # access.toml (the lint a-public-url-names-a-registered-oidc-
+            # redirect refuses otherwise; boss.'s was registered on
+            # 2026-08-12 and is declared with that provenance). Was
+            # https://playground.algedonic.dev until this car. Two
+            # consequences, both by design: (1) between this converge and
+            # the first dns-zone-observation after it (daily; or one filed
+            # by hand), boss. is still the grey A record, so a login from
+            # the internet lands on a callback only the LAN/WG reaches —
+            # the observation creates the Access app and flips the record
+            # in one firing; (2) a WebAuthn credential enrolled under the
+            # playground RP id does not verify under this one — re-enrol
+            # presence passkeys and the break-glass key at /break-glass.
+            - {name: BOSS_PUBLIC_URL, value: "https://boss.algedonic.dev"}
             # OIDC against Kanidm (idm-kanidm.md). The gateway is an OIDC
             # client and issues its own session after login (Q1), mapping the
             # id_token email to an EXISTING employee Subject — a login with no
@@ -506,6 +647,15 @@ spec:
             # points at the session.key file inside it.
             - {name: boss-session-key, mountPath: /etc/boss/session-key, readOnly: true}
             - {name: step-plugins, mountPath: /var/lib/boss/step-plugins, readOnly: true}
+            # The delivered tenant (the boss-tenant volume above): the
+            # seeds of a repo-sourced instance, under the directory
+            # BOSS_TENANT_DIR names for one. Empty on an image-sourced
+            # instance, and nothing reads it there.
+            - {name: boss-tenant, mountPath: /opt/boss/tenant/seeds, readOnly: true}
+            # The delivered site (the boss-site volume above), at the
+            # directory BOSS_SITE_DIR names. Empty on an instance
+            # without a site, and nothing reads it there.
+            - {name: boss-site, mountPath: /opt/boss/site, readOnly: true}
             # Public break-glass credential records; the gateway only
             # ever reads them (enrollment emits records for a commit,
             # never a write here — the manifest header explains why).

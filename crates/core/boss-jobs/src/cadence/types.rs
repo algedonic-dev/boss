@@ -10,6 +10,23 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Does a cadence verb put a train on the track? `board` assembles and
+/// departs one; `run` is reconcile-then-board. Exactly these — a
+/// reconcile or a packet-open never needs a clear track.
+///
+/// ONE DEFINITION (CLAUDE.md §9a). The conductor decides serialization
+/// and idle-firing outcomes on it, and the yard decides whether a
+/// `basis=clock` row is a BOARDING trigger worth describing to the
+/// operator ("Boards at 06:05 / 18:05 UTC") on it. It lived only in the
+/// conductor until 634a475b, so the yard selected clock rows by basis
+/// alone and would have named a clock row with any other verb as a
+/// boarding window — latent while the only live clock row is
+/// `train-window` with verb `run`. Tier 1 owns it because Tier 1 cannot
+/// read the orchestrator, and both readers can read here.
+pub fn departs_a_train(verb: &str) -> bool {
+    matches!(verb, "board" | "run")
+}
+
 /// One row of `cadence_rules`, unparsed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CadenceRuleRow {
@@ -36,6 +53,36 @@ pub struct CadenceRuleRow {
     /// every day is a business day.
     #[serde(default)]
     pub business_calendar: Option<String>,
+}
+
+/// One row of `cadence_rules` as DECLARED — the wire row plus the
+/// two columns the conductor never reads (`version`, `status`) and
+/// the one the seed stamps (`created_at`). This is what the platform
+/// bundle (`infra/platform/cadence/<name>.toml`) declares and what
+/// `CadenceRegistry::live_versions` reads back, so the equality pin
+/// compares the same shape on both sides. The columns live ONCE, in
+/// [`CadenceRuleRow`], flattened here rather than repeated (CLAUDE.md
+/// §9a): a basis column added to the row is added to the declaration
+/// by construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CadenceRuleSpec {
+    pub version: i32,
+    pub status: crate::registry::WorkflowStatus,
+    #[serde(flatten)]
+    pub row: CadenceRuleRow,
+    /// When the deployment was built — stamped by the seed's clock on
+    /// the row it writes; never part of the declaration. Defaults on
+    /// the wire (to the epoch) for the same reason: a publish body
+    /// (`POST /api/cadence/rules/{name}/publish`) is a declaration,
+    /// and the door stamps its own clock over whatever was sent.
+    #[serde(default)]
+    pub created_at: DateTime<Utc>,
+}
+
+impl CadenceRuleSpec {
+    pub fn name(&self) -> &str {
+        &self.row.name
+    }
 }
 
 /// The most recent recorded firing of a rule — what the conductor's

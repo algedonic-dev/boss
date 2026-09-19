@@ -30,8 +30,11 @@
 //! title_template = "Mash in"
 //! terminal = { outcome = "brewed" }    # optional; marks a terminal
 //! sign_offs_required = []          # role codes; "@authority_role" resolves
-//! authority_role = "head-brewer"
+//! audience = { role = "head-brewer" }  # who it is for, declared ONCE;
+//!                                  # `authority_role` is its projection
 //! claimable = true              # role queue, not a nomination
+//! agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+//!                                  # how an agent runs it; the prompt is `procedure`
 //! metadata_defaults = { mash_temp_f = 152 }
 //! ```
 //!
@@ -53,7 +56,14 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::registry::{StepSpec, Terminal, WorkflowSpec};
+use crate::agent_spec::AgentSpec;
+use crate::audience::Audience;
+use crate::cadence::{CadenceRuleRow, CadenceRuleSpec};
+use crate::delivery::{DeliveryPolicyRow, DeliveryPolicySpec};
+use crate::registry::{StepSpec, Terminal, WorkflowSpec, WorkflowStatus};
+use crate::station_queue::{DisciplineKey, StationPredicate, default_discipline};
+use crate::stations::{StationCapability, StationKind, StationLens, StationSpec, StationUpstream};
+use crate::step_plugins::StepPluginSpec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedLoaderError {
@@ -152,8 +162,60 @@ struct StepToml {
     /// nominating one holder. See `StepSpec::claimable`.
     #[serde(default)]
     claimable: Option<bool>,
+    /// Who the step is for, declared ONCE — `audience = { role = "x" }`
+    /// / `{ individual = "id" }` / `{ department = "code" }` /
+    /// `{ station = "name" }` (design f5ebd2e1, backlog 67a58840).
+    /// Read as a raw TOML value here, not as [`Audience`], so that a
+    /// shape outside the closed set is refused NAMING THE STEP
+    /// ([`parse_audience`]) rather than a line number: protocol authors
+    /// and the publish verb read by slug.
+    #[serde(default)]
+    audience: Option<toml::Value>,
+    /// How an agent runs the step, declared ONCE — `agent = { profile,
+    /// model, budget_usd, effort }` (design c87fb59b, backlog 028891cf).
+    /// Raw here for the same reason `audience` is: a refusal names the
+    /// step ([`parse_agent`]). The model and budget are the viability
+    /// lint's to judge, which `parse_workflows` runs.
+    #[serde(default)]
+    agent: Option<toml::Value>,
     #[serde(default)]
     metadata_defaults: serde_json::Value,
+}
+
+/// The one closed-set check on an authored audience, phrased for the
+/// author: `step `triage`: audience unknown variant `team`, expected
+/// one of ...`. The set itself is [`Audience`]'s serde derive — this
+/// only adds the step's name to serde's own refusal.
+fn parse_audience(
+    step: &str,
+    value: Option<toml::Value>,
+    source: &str,
+) -> Result<Option<Audience>, SeedLoaderError> {
+    value
+        .map(|v| {
+            Audience::deserialize(v).map_err(|e| {
+                SeedLoaderError::Parse(source.to_string(), format!("step `{step}`: audience {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// The shape check on an authored agent block, phrased for the author:
+/// `step `build`: agent unknown variant `max`, expected one of `low`,
+/// `medium`, `high``. The shape is [`AgentSpec`]'s serde derive — every
+/// key required, unknown keys refused; this only adds the step's name.
+fn parse_agent(
+    step: &str,
+    value: Option<toml::Value>,
+    source: &str,
+) -> Result<Option<AgentSpec>, SeedLoaderError> {
+    value
+        .map(|v| {
+            AgentSpec::deserialize(v).map_err(|e| {
+                SeedLoaderError::Parse(source.to_string(), format!("step `{step}`: agent {e}"))
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,32 +288,54 @@ pub fn bundle_files(dir: &Path) -> Result<Vec<PathBuf>, SeedLoaderError> {
     Ok(files)
 }
 
-fn load_workflow_dir(
+/// The rule every bundle directory shares: one `<key>.toml` per row,
+/// holding exactly one `[[<header>]]` whose `<key>` column is the
+/// file's stem — so `ls` answers "which rows does a deployment seed",
+/// and two cars adding rows touch no shared line. Written once here
+/// (workflows, stations, step plugins, cadence rules and the delivery
+/// policy all read it) rather than once per registry, which is how car
+/// 3 of 393d3234 found it living three times.
+fn load_bundle_dir<T>(
     dir: &Path,
-    default_owner: &str,
-) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
+    header: &str,
+    key: &str,
+    load_file: impl Fn(&Path) -> Result<Vec<T>, SeedLoaderError>,
+    key_of: fn(&T) -> &str,
+) -> Result<Vec<T>, SeedLoaderError> {
     let mut specs = Vec::new();
     for file in bundle_files(dir)? {
-        let file_str = file.display().to_string();
         let stem = file
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let loaded = load_workflow_file(&file, default_owner)?;
-        let kinds: Vec<&str> = loaded.iter().map(|s| s.kind.as_str()).collect();
-        if kinds != [stem.as_str()] {
+        let loaded = load_file(&file)?;
+        let keys: Vec<&str> = loaded.iter().map(key_of).collect();
+        if keys != [stem.as_str()] {
             return Err(SeedLoaderError::Parse(
-                file_str,
+                file.display().to_string(),
                 format!(
-                    "a kind file holds exactly one [[workflow]] named after the file \
-                     (expected kind `{stem}`, found {kinds:?})"
+                    "a {header} file holds exactly one [[{header}]] named after the file \
+                     (expected {key} `{stem}`, found {keys:?})"
                 ),
             ));
         }
         specs.extend(loaded);
     }
     Ok(specs)
+}
+
+fn load_workflow_dir(
+    dir: &Path,
+    default_owner: &str,
+) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
+    load_bundle_dir(
+        dir,
+        "workflow",
+        "kind",
+        |file| load_workflow_file(file, default_owner),
+        |s| &s.kind,
+    )
 }
 
 /// Parse TOML text directly. Useful for inline tests; the file
@@ -273,8 +357,8 @@ pub fn parse_workflows(
     let specs: Vec<WorkflowSpec> = file
         .workflows
         .into_iter()
-        .map(|jk| workflow_toml_to_spec(jk, default_owner))
-        .collect();
+        .map(|jk| workflow_toml_to_spec(jk, default_owner, source))
+        .collect::<Result<_, _>>()?;
 
     let registry = crate::step_registry::StepRegistry::v1();
     let lint_errs = crate::workflow_lint::validate_all(&specs, &registry);
@@ -287,30 +371,50 @@ pub fn parse_workflows(
     Ok(specs)
 }
 
-fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpec {
+fn workflow_toml_to_spec(
+    toml: WorkflowToml,
+    default_owner: &str,
+    source: &str,
+) -> Result<WorkflowSpec, SeedLoaderError> {
     // Flat steps map straight onto StepSpec — the viability lint
     // (run by parse_workflows) owns every structural concern, so the
-    // loader is pure deserialization now.
+    // loader is pure deserialization, plus ONE projection: a step's
+    // `audience` is its single declaration of who it is for, and the
+    // legacy `authority_role` key is written from it (`selectors_for`)
+    // so every reader of the spec row keeps working unchanged
+    // (f5ebd2e1 car 1, expand/contract). An `authority_role` the author
+    // ALSO wrote is kept as written — agreeing is harmless, disagreeing
+    // is the workflow lint's refusal, and overwriting it here would
+    // hide exactly that.
     let steps: Vec<StepSpec> = toml
         .steps
         .into_iter()
-        .map(|s| StepSpec {
-            title: s.title,
-            kind: s.kind,
-            assurance_required: s.assurance_required,
-            duration_hours: s.duration_hours,
-            labor_hours: s.labor_hours,
-            wall_clock_hours: s.wall_clock_hours,
-            ready_when: s.ready_when,
-            terminal: s.terminal.map(|t| Terminal { outcome: t.outcome }),
-            title_template: s.title_template,
-            sign_offs_required: s.sign_offs_required,
-            fields: s.fields,
-            authority_role: s.authority_role,
-            claimable: s.claimable,
-            metadata_defaults: s.metadata_defaults,
+        .map(|s| {
+            let audience = parse_audience(&s.title, s.audience, source)?;
+            let agent = parse_agent(&s.title, s.agent, source)?;
+            let derived_role = audience
+                .as_ref()
+                .and_then(|a| crate::audience::selectors_for(a).authority_role);
+            Ok(StepSpec {
+                title: s.title,
+                kind: s.kind,
+                assurance_required: s.assurance_required,
+                duration_hours: s.duration_hours,
+                labor_hours: s.labor_hours,
+                wall_clock_hours: s.wall_clock_hours,
+                ready_when: s.ready_when,
+                terminal: s.terminal.map(|t| Terminal { outcome: t.outcome }),
+                title_template: s.title_template,
+                sign_offs_required: s.sign_offs_required,
+                fields: s.fields,
+                authority_role: s.authority_role.or(derived_role),
+                claimable: s.claimable,
+                audience,
+                agent,
+                metadata_defaults: s.metadata_defaults,
+            })
         })
-        .collect();
+        .collect::<Result<_, SeedLoaderError>>()?;
 
     let mut spec = WorkflowSpec::platform_seed(
         toml.kind,
@@ -338,7 +442,549 @@ fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpe
         spec.entitlements = toml.entitlements;
     }
     spec.owning_team = default_owner.to_string();
-    spec
+    Ok(spec)
+}
+
+// ---------------------------------------------------------------------------
+// Stations — the platform station bundle (infra/platform/stations/)
+// ---------------------------------------------------------------------------
+
+/// Serde mirror of [`StationSpec`] for a bundle row. Decoupled from
+/// the registry type for the same reason [`StepToml`] is: the TOML
+/// carries no `created_at` (that is when the deployment was built,
+/// stamped by the seed's clock), and `discipline` may be omitted for
+/// the ratified `priority, then age` default. Every other column is
+/// named exactly as the `stations` table names it, so a reader can
+/// hold the file beside `116-stations.sql` and see one row.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StationToml {
+    name: String,
+    version: i32,
+    /// The bundle declares what a FRESH deployment gets, and a fresh
+    /// deployment gets active rows; `draft` and `retired` are live
+    /// verbs (`POST /api/stations/{name}/retire`), not declarations.
+    /// Carried rather than implied so the equality pin compares every
+    /// column, and refused below when it is anything else.
+    status: WorkflowStatus,
+    title: String,
+    kind: StationKind,
+    predicate: StationPredicate,
+    #[serde(default = "default_discipline")]
+    discipline: Vec<DisciplineKey>,
+    #[serde(default)]
+    wip_limit: Option<i32>,
+    #[serde(default)]
+    terminal_window_days: Option<u32>,
+    #[serde(default)]
+    capability: Option<StationCapability>,
+    #[serde(default)]
+    rollup_parent: Option<String>,
+    #[serde(default)]
+    upstream: Option<StationUpstream>,
+    #[serde(default)]
+    lens: Option<StationLens>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StationsFile {
+    #[serde(rename = "station", default)]
+    stations: Vec<StationToml>,
+}
+
+/// Load the platform station bundle: a DIRECTORY of `<name>.toml`
+/// files, each holding exactly one `[[station]]` whose `name` is the
+/// file's stem — the same rules as [`load_workflows_with_owning_team`]
+/// and for the same reason (adding a station is dropping a file in;
+/// two cars touch no shared line). A single file is accepted too.
+///
+/// Since 2026-09-18 (backlog 393d3234, consolidation H4) this bundle
+/// is where a platform station is DECLARED. Seven migrations were the
+/// only home before; they stay as history, and migrations newer than
+/// the cutover stamp in `infra/lint/migrations-declare-schema-only.sh`
+/// may not insert one. `crate::station_seed::seed_stations` publishes
+/// the bundle insert-if-missing by (name, version) at every start.
+///
+/// Every row is run through [`crate::station_lint::gate_active`] here
+/// — the viability gate every API publish passes — so a malformed
+/// bundle fails on the deployment that is booting, not on the first
+/// lens that reads the row. `created_at` is stamped `now` by the
+/// caller (the seed's clock) and is not part of the declaration.
+pub fn load_stations(path: impl AsRef<Path>) -> Result<Vec<StationSpec>, SeedLoaderError> {
+    let path_ref = path.as_ref();
+    if !path_ref.is_dir() {
+        return load_station_file(path_ref);
+    }
+    load_bundle_dir(path_ref, "station", "name", load_station_file, |s| &s.name)
+}
+
+fn load_station_file(path: &Path) -> Result<Vec<StationSpec>, SeedLoaderError> {
+    let path_str = path.display().to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| SeedLoaderError::Io(path_str.clone(), e.to_string()))?;
+    parse_stations(&text, &path_str)
+}
+
+/// Parse TOML text directly — the file loader is a thin wrapper.
+pub fn parse_stations(text: &str, source: &str) -> Result<Vec<StationSpec>, SeedLoaderError> {
+    let file: StationsFile = toml::from_str(text)
+        .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    let specs: Vec<StationSpec> = file
+        .stations
+        .into_iter()
+        .map(|s| station_toml_to_spec(s, source))
+        .collect::<Result<_, _>>()?;
+    let failures: Vec<String> = specs
+        .iter()
+        .filter_map(|spec| {
+            crate::station_lint::gate_active(spec)
+                .err()
+                .map(|problems| {
+                    problems
+                        .iter()
+                        .map(|p| format!("  {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Err(SeedLoaderError::LintFailed {
+            file: source.to_string(),
+            failures,
+        });
+    }
+    Ok(specs)
+}
+
+fn station_toml_to_spec(toml: StationToml, source: &str) -> Result<StationSpec, SeedLoaderError> {
+    if toml.status != WorkflowStatus::Active {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "station `{}` declares status `{}`; a bundle row is what a fresh \
+                 deployment gets, and that is an active row — retiring is a live verb",
+                toml.name,
+                toml.status.as_str()
+            ),
+        ));
+    }
+    if toml.version < 1 {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "station `{}` declares version {}; versions start at 1",
+                toml.name, toml.version
+            ),
+        ));
+    }
+    Ok(StationSpec {
+        name: toml.name,
+        version: toml.version,
+        status: toml.status,
+        title: toml.title,
+        kind: toml.kind,
+        predicate: toml.predicate,
+        discipline: toml.discipline,
+        wip_limit: toml.wip_limit,
+        terminal_window_days: toml.terminal_window_days,
+        capability: toml.capability,
+        rollup_parent: toml.rollup_parent,
+        upstream: toml.upstream,
+        lens: toml.lens,
+        // Not a declaration: the seed stamps its own clock reading on
+        // the row it writes, and the equality pin excludes the column.
+        // The epoch here is a sentinel nothing reads before the seed
+        // overwrites it — never `Utc::now()` in a loader
+        // (infra/lint/no-wallclock.sh).
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Step plugins — the platform step-plugin bundle (infra/platform/step-plugins/)
+// ---------------------------------------------------------------------------
+
+/// Serde mirror of [`StepPluginSpec`] for a bundle row. Every column
+/// of `step_plugins` (03-jobs.sql) but two: `created_at`, which the
+/// seed's clock stamps, and `authoring_job_id`, which is the packet an
+/// operator authored a row FROM — a bundle row is authored in the
+/// tree, so it has none. `metadata_schema` is the JSON Schema as a
+/// TOML table, which reads as the same object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepPluginToml {
+    kind: String,
+    version: i32,
+    /// Carried rather than implied for the same reason a station's is:
+    /// the equality pin compares every column, and anything but
+    /// `active` is refused below.
+    status: WorkflowStatus,
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+    category: String,
+    metadata_schema: serde_json::Value,
+    frontend_url: String,
+    owning_team: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StepPluginsFile {
+    #[serde(rename = "step_plugin", default)]
+    step_plugins: Vec<StepPluginToml>,
+}
+
+/// Load the platform step-plugin bundle: a DIRECTORY of `<kind>.toml`
+/// files, each holding exactly one `[[step_plugin]]` whose `kind` is
+/// the file's stem — the same rules as [`load_stations`], for the same
+/// reason. A single file is accepted too.
+///
+/// Since 2026-09-18 (backlog 393d3234, consolidation H4, car 2) this
+/// bundle is where a step plugin's ROW is declared; the JS it names
+/// stays under `infra/step-plugins/`. Seven migrations were the only
+/// home before; they stay as history, and migrations newer than the
+/// cutover stamp in `infra/lint/migrations-declare-schema-only.sh` may
+/// not insert one. `crate::step_plugin_seed::seed_step_plugins`
+/// publishes the bundle insert-if-missing by (kind, version) at every
+/// start.
+pub fn load_step_plugins(path: impl AsRef<Path>) -> Result<Vec<StepPluginSpec>, SeedLoaderError> {
+    let path_ref = path.as_ref();
+    if !path_ref.is_dir() {
+        return load_step_plugin_file(path_ref);
+    }
+    load_bundle_dir(
+        path_ref,
+        "step_plugin",
+        "kind",
+        load_step_plugin_file,
+        |s| &s.kind,
+    )
+}
+
+fn load_step_plugin_file(path: &Path) -> Result<Vec<StepPluginSpec>, SeedLoaderError> {
+    let path_str = path.display().to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| SeedLoaderError::Io(path_str.clone(), e.to_string()))?;
+    parse_step_plugins(&text, &path_str)
+}
+
+/// Parse TOML text directly — the file loader is a thin wrapper.
+pub fn parse_step_plugins(
+    text: &str,
+    source: &str,
+) -> Result<Vec<StepPluginSpec>, SeedLoaderError> {
+    let file: StepPluginsFile = toml::from_str(text)
+        .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    file.step_plugins
+        .into_iter()
+        .map(|s| step_plugin_toml_to_spec(s, source))
+        .collect()
+}
+
+fn step_plugin_toml_to_spec(
+    toml: StepPluginToml,
+    source: &str,
+) -> Result<StepPluginSpec, SeedLoaderError> {
+    if toml.status != WorkflowStatus::Active {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "step plugin `{}` declares status `{}`; a bundle row is what a fresh \
+                 deployment gets, and that is an active row — retiring is a live verb",
+                toml.kind,
+                toml.status.as_str()
+            ),
+        ));
+    }
+    if toml.version < 1 {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "step plugin `{}` declares version {}; versions start at 1",
+                toml.kind, toml.version
+            ),
+        ));
+    }
+    Ok(StepPluginSpec {
+        kind: toml.kind,
+        version: toml.version,
+        status: toml.status,
+        label: toml.label,
+        description: toml.description,
+        category: toml.category,
+        metadata_schema: toml.metadata_schema,
+        frontend_url: toml.frontend_url,
+        owning_team: toml.owning_team,
+        authoring_job_id: None,
+        // Not a declaration — see `station_toml_to_spec`.
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Cadence rules — the platform cadence bundle (infra/platform/cadence/)
+// ---------------------------------------------------------------------------
+
+/// Serde mirror of [`CadenceRuleSpec`] for a bundle row: every column
+/// of `cadence_rules` (114-cadence-rules.sql, widened by 202608282135)
+/// but `created_at`, which the seed's clock stamps. A basis's unused
+/// columns are simply absent from the file — TOML has no null — and
+/// read as NULL, which is what the table's per-basis CHECK requires of
+/// them. `anchor_date` is a `"YYYY-MM-DD"` string, not a TOML date,
+/// because the row's `NaiveDate` reads a string and a TOML date is a
+/// different serde shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CadenceRuleToml {
+    name: String,
+    version: i32,
+    /// Carried rather than implied for the same reason a station's is:
+    /// the equality pin compares every column, and anything but
+    /// `active` is refused below.
+    status: WorkflowStatus,
+    verb: String,
+    basis: String,
+    #[serde(default)]
+    every_minutes: Option<i32>,
+    #[serde(default)]
+    at_times: Option<serde_json::Value>,
+    #[serde(default)]
+    min_dock_depth: Option<i32>,
+    #[serde(default)]
+    cooldown_minutes: Option<i32>,
+    #[serde(default)]
+    cadence: Option<String>,
+    #[serde(default)]
+    anchor_date: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    business_calendar: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CadenceRulesFile {
+    #[serde(rename = "cadence_rule", default)]
+    cadence_rules: Vec<CadenceRuleToml>,
+}
+
+/// Load the platform cadence bundle: a DIRECTORY of `<name>.toml`
+/// files, each holding exactly one `[[cadence_rule]]` whose `name` is
+/// the file's stem — the same rules as [`load_stations`], for the same
+/// reason. A single file is accepted too.
+///
+/// Since 2026-09-18 (backlog 393d3234, consolidation H4, car 3) this
+/// bundle is where a cadence rule is DECLARED — the baseline a fresh
+/// deployment gets. Nine migrations were the only home before; they
+/// stay as history, and migrations newer than the cutover stamp in
+/// `infra/lint/migrations-declare-schema-only.sh` may not insert one.
+/// `crate::cadence_seed::seed_cadence_rules` publishes the bundle
+/// insert-if-missing by (name, version) at every start; the live table
+/// stays editable, and a live row ahead of its file is reported, not
+/// refused.
+pub fn load_cadence_rules(path: impl AsRef<Path>) -> Result<Vec<CadenceRuleSpec>, SeedLoaderError> {
+    let path_ref = path.as_ref();
+    if !path_ref.is_dir() {
+        return load_cadence_file(path_ref);
+    }
+    load_bundle_dir(path_ref, "cadence_rule", "name", load_cadence_file, |s| {
+        s.name()
+    })
+}
+
+fn load_cadence_file(path: &Path) -> Result<Vec<CadenceRuleSpec>, SeedLoaderError> {
+    let path_str = path.display().to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| SeedLoaderError::Io(path_str.clone(), e.to_string()))?;
+    parse_cadence_rules(&text, &path_str)
+}
+
+/// Parse TOML text directly — the file loader is a thin wrapper.
+pub fn parse_cadence_rules(
+    text: &str,
+    source: &str,
+) -> Result<Vec<CadenceRuleSpec>, SeedLoaderError> {
+    let file: CadenceRulesFile = toml::from_str(text)
+        .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    file.cadence_rules
+        .into_iter()
+        .map(|r| cadence_toml_to_spec(r, source))
+        .collect()
+}
+
+fn cadence_toml_to_spec(
+    toml: CadenceRuleToml,
+    source: &str,
+) -> Result<CadenceRuleSpec, SeedLoaderError> {
+    if toml.status != WorkflowStatus::Active {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "cadence rule `{}` declares status `{}`; a bundle row is what a fresh \
+                 deployment gets, and that is an active row — retiring is a live verb",
+                toml.name,
+                toml.status.as_str()
+            ),
+        ));
+    }
+    if toml.version < 1 {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "cadence rule `{}` declares version {}; versions start at 1",
+                toml.name, toml.version
+            ),
+        ));
+    }
+    Ok(CadenceRuleSpec {
+        version: toml.version,
+        status: toml.status,
+        row: CadenceRuleRow {
+            name: toml.name,
+            verb: toml.verb,
+            basis: toml.basis,
+            every_minutes: toml.every_minutes,
+            at_times: toml.at_times,
+            min_dock_depth: toml.min_dock_depth,
+            cooldown_minutes: toml.cooldown_minutes,
+            cadence: toml.cadence,
+            anchor_date: toml.anchor_date,
+            business_calendar: toml.business_calendar,
+        },
+        // Not a declaration — see `station_toml_to_spec`.
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Delivery policy — the platform delivery-policy bundle
+// (infra/platform/delivery-policy/)
+// ---------------------------------------------------------------------------
+
+/// Serde mirror of [`DeliveryPolicySpec`] for a bundle row: every
+/// column of `delivery_policy` (202608242117, widened by 202609030800
+/// and 202609031000, narrowed by 20260918102236) but `created_at`,
+/// which the seed's clock stamps. Every budget is REQUIRED — the table
+/// has no default a bundle row may lean on — and a column the table
+/// no longer has (`consist_excluded_lints`, dropped by H9) is refused
+/// rather than ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryPolicyToml {
+    name: String,
+    version: i32,
+    /// Carried rather than implied for the same reason a station's is:
+    /// the equality pin compares every column, and anything but
+    /// `active` is refused below.
+    status: WorkflowStatus,
+    max_red_trains: i32,
+    stall_hours: i32,
+    consist_budget_secs: i32,
+    consist_output_budget: i32,
+    consist_files_named: i32,
+    skip_reason_file_budget: i32,
+    blip_cause_budget: i32,
+    ci_host_floor_gb: i32,
+    gate_max_concurrent: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeliveryPoliciesFile {
+    #[serde(rename = "delivery_policy", default)]
+    delivery_policies: Vec<DeliveryPolicyToml>,
+}
+
+/// Load the platform delivery-policy bundle: a DIRECTORY of
+/// `<name>.toml` files, each holding exactly one `[[delivery_policy]]`
+/// whose `name` is the file's stem — the same rules as
+/// [`load_stations`], for the same reason. A single file is accepted
+/// too.
+///
+/// Since 2026-09-18 (backlog 393d3234, consolidation H4, car 4) this
+/// bundle is where the delivery policy is DECLARED — the row a fresh
+/// deployment gets. Two migrations were the only home before; they
+/// stay as history, and migrations newer than the cutover stamp in
+/// `infra/lint/migrations-declare-schema-only.sh` may not insert one.
+/// `crate::delivery_policy_seed::seed_delivery_policies` publishes the
+/// bundle insert-if-missing by (name, version) at every start; a
+/// version bump here is the edit path.
+pub fn load_delivery_policies(
+    path: impl AsRef<Path>,
+) -> Result<Vec<DeliveryPolicySpec>, SeedLoaderError> {
+    let path_ref = path.as_ref();
+    if !path_ref.is_dir() {
+        return load_delivery_policy_file(path_ref);
+    }
+    load_bundle_dir(
+        path_ref,
+        "delivery_policy",
+        "name",
+        load_delivery_policy_file,
+        |s| s.name(),
+    )
+}
+
+fn load_delivery_policy_file(path: &Path) -> Result<Vec<DeliveryPolicySpec>, SeedLoaderError> {
+    let path_str = path.display().to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| SeedLoaderError::Io(path_str.clone(), e.to_string()))?;
+    parse_delivery_policies(&text, &path_str)
+}
+
+/// Parse TOML text directly — the file loader is a thin wrapper.
+pub fn parse_delivery_policies(
+    text: &str,
+    source: &str,
+) -> Result<Vec<DeliveryPolicySpec>, SeedLoaderError> {
+    let file: DeliveryPoliciesFile = toml::from_str(text)
+        .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    file.delivery_policies
+        .into_iter()
+        .map(|r| delivery_policy_toml_to_spec(r, source))
+        .collect()
+}
+
+fn delivery_policy_toml_to_spec(
+    toml: DeliveryPolicyToml,
+    source: &str,
+) -> Result<DeliveryPolicySpec, SeedLoaderError> {
+    if toml.status != WorkflowStatus::Active {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "delivery policy `{}` declares status `{}`; a bundle row is what a fresh \
+                 deployment gets, and that is an active row — retiring is a live verb",
+                toml.name,
+                toml.status.as_str()
+            ),
+        ));
+    }
+    if toml.version < 1 {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "delivery policy `{}` declares version {}; versions start at 1",
+                toml.name, toml.version
+            ),
+        ));
+    }
+    Ok(DeliveryPolicySpec {
+        status: toml.status,
+        row: DeliveryPolicyRow {
+            name: toml.name,
+            version: toml.version,
+            max_red_trains: toml.max_red_trains,
+            stall_hours: toml.stall_hours,
+            consist_budget_secs: toml.consist_budget_secs,
+            consist_output_budget: toml.consist_output_budget,
+            consist_files_named: toml.consist_files_named,
+            skip_reason_file_budget: toml.skip_reason_file_budget,
+            blip_cause_budget: toml.blip_cause_budget,
+            ci_host_floor_gb: toml.ci_host_floor_gb,
+            gate_max_concurrent: toml.gate_max_concurrent,
+        },
+        // Not a declaration — see `station_toml_to_spec`.
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+    })
 }
 
 #[cfg(test)]
@@ -460,6 +1106,229 @@ terminal = { outcome = "brewed" }
         assert_eq!(step.metadata_defaults["mash_temp_f"], 152);
         assert_eq!(step.metadata_defaults["mash_minutes"], 60);
         assert_eq!(specs[0].owning_team, "brewery");
+    }
+
+    /// A step declares its audience ONCE in TOML (f5ebd2e1 car 1,
+    /// 67a58840): `audience = { role = "..." }` is the declaration, and
+    /// the loader writes the legacy `authority_role` as its PROJECTION
+    /// so every reader of the spec row — the editor, the projected
+    /// stations, the owner fallback — keeps working unchanged.
+    #[test]
+    fn a_step_declares_its_audience_and_the_loader_projects_the_legacy_key() {
+        let text = r#"
+[[workflow]]
+kind = "with-audience"
+label = "With audience"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "filed"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "triage"
+kind = "task"
+ready_when = "steps.filed.done"
+title_template = "Triage"
+audience = { role = "platform-admin" }
+
+[[workflow.step]]
+title = "decide"
+kind = "task"
+ready_when = "steps.triage.done"
+title_template = "Decide"
+audience = { individual = "emp-david" }
+terminal = { outcome = "done" }
+"#;
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
+        let triage = &specs[0].steps[1];
+        assert_eq!(
+            triage.audience,
+            Some(crate::audience::Audience::Role("platform-admin".into()))
+        );
+        assert_eq!(
+            triage.authority_role.as_deref(),
+            Some("platform-admin"),
+            "the legacy key is the projection of the one declaration"
+        );
+        let decide = &specs[0].steps[2];
+        assert_eq!(
+            decide.audience,
+            Some(crate::audience::Audience::Individual("emp-david".into()))
+        );
+        assert_eq!(decide.authority_role, None);
+    }
+
+    /// The set of shapes is CLOSED, and the refusal names the STEP —
+    /// a serde error naming a line number is the same fact, but a
+    /// protocol author reads by slug (the publish verb prints this).
+    #[test]
+    fn an_unknown_audience_shape_is_refused_naming_the_step() {
+        let text = r#"
+[[workflow]]
+kind = "bad-audience"
+label = "Bad audience"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "filed"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "triage"
+kind = "task"
+ready_when = "steps.filed.done"
+title_template = "Triage"
+audience = { team = "it" }
+terminal = { outcome = "done" }
+"#;
+        let err = parse_workflows(text, "platform", "<test>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("step `triage`"), "{err}");
+        assert!(err.contains("audience"), "{err}");
+        assert!(err.contains("unknown variant `team`"), "{err}");
+    }
+
+    /// A step declares how an agent runs it ONCE in TOML (c87fb59b car
+    /// 1, 028891cf): `agent = { profile, model, budget_usd, effort }`
+    /// lands on `StepSpec::agent` typed, an integer budget reads as the
+    /// number it is, and a step without the block carries `None`.
+    #[test]
+    fn a_step_declares_its_agent_block_and_the_loader_types_it() {
+        let text = r#"
+[[workflow]]
+kind = "with-agent"
+label = "With agent"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "filed"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "build"
+kind = "task"
+ready_when = "steps.filed.done"
+title_template = "Build"
+audience = { role = "platform-admin" }
+agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+metadata_defaults = { procedure = "Build it." }
+terminal = { outcome = "done" }
+"#;
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
+        assert_eq!(specs[0].steps[0].agent, None);
+        assert_eq!(
+            specs[0].steps[1].agent,
+            Some(crate::agent_spec::AgentSpec {
+                profile: "builder".into(),
+                model: "opus-5[1m]".into(),
+                budget_usd: 5.0,
+                effort: crate::agent_spec::Effort::High,
+            })
+        );
+    }
+
+    /// The refusals name the STEP, like an audience's: an effort
+    /// outside the closed set at parse, an unpriced model or a
+    /// negative budget from the viability lint the loader runs.
+    #[test]
+    fn a_bad_agent_block_is_refused_naming_the_step() {
+        let with = |agent: &str| {
+            format!(
+                r#"
+[[workflow]]
+kind = "bad-agent"
+label = "Bad agent"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "filed"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "build"
+kind = "task"
+ready_when = "steps.filed.done"
+title_template = "Build"
+agent = {agent}
+terminal = {{ outcome = "done" }}
+"#
+            )
+        };
+        let err = |agent: &str| {
+            parse_workflows(&with(agent), "platform", "<test>")
+                .unwrap_err()
+                .to_string()
+        };
+
+        let e =
+            err(r#"{ profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "max" }"#);
+        assert!(e.contains("step `build`"), "{e}");
+        assert!(e.contains("agent"), "{e}");
+        assert!(e.contains("unknown variant `max`"), "{e}");
+
+        let e =
+            err(r#"{ profile = "builder", model = "nope-9", budget_usd = 5, effort = "high" }"#);
+        assert!(e.contains("step `build`"), "{e}");
+        assert!(e.contains("`nope-9`"), "{e}");
+        assert!(e.contains("opus-5[1m]"), "names the priced models: {e}");
+
+        let e = err(
+            r#"{ profile = "builder", model = "opus-5[1m]", budget_usd = -1, effort = "high" }"#,
+        );
+        assert!(e.contains("step `build`"), "{e}");
+        assert!(e.contains("budget_usd"), "{e}");
+
+        let e = err(r#"{ profile = "builder", model = "opus-5[1m]", effort = "high" }"#);
+        assert!(e.contains("step `build`"), "{e}");
+        assert!(e.contains("budget_usd"), "a missing key is named: {e}");
+    }
+
+    /// Declaring both, disagreeing, is the two-declarations defect
+    /// this design ends — refused at load, the same way the publish
+    /// lint refuses it for a JSON-authored spec.
+    #[test]
+    fn an_audience_that_disagrees_with_the_legacy_key_is_refused() {
+        let text = r#"
+[[workflow]]
+kind = "twice"
+label = "Twice"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "filed"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "triage"
+kind = "task"
+ready_when = "steps.filed.done"
+title_template = "Triage"
+audience = { role = "platform-admin" }
+authority_role = "bookkeeper"
+terminal = { outcome = "done" }
+"#;
+        let err = parse_workflows(text, "platform", "<test>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("triage"), "{err}");
+        assert!(err.contains("bookkeeper"), "{err}");
     }
 
     #[test]

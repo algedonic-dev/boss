@@ -14,8 +14,10 @@ Wants=network-online.target
 After=network-online.target docker.service
 
 [Service]
+# JOBS_API and the forge's clone URL from /etc/boss/sor.env, rendered on
+# this host from infra/estate/estate.toml (backlog 5222163e).
+EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
-Environment=JOBS_API=http://10.20.0.34:7900
 # A RED files an urgent packet through the jobs API (the estate-alarm
 # idiom): install breakage surfaces in the queue within hours, not in
 # a journal nobody reads. ~35-45 min on a cold docker cache.

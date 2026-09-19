@@ -1,6 +1,6 @@
 //! `boss-jobs-api` service: jobs domain + NATS event bus + HTTP API.
 //!
-//! Wires the jobs repository (Postgres or in-memory) to NATS for
+//! Wires the jobs repository (Postgres) to NATS for
 //! event distribution and exposes an axum HTTP API.
 
 use std::net::SocketAddr;
@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::in_memory::InMemoryJobs;
 use boss_jobs::jobs_config::JobsApiConfig;
 use boss_jobs::port::JobsRepository;
 use boss_nats::NatsEventBus;
@@ -86,7 +85,6 @@ async fn main() -> Result<()> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
     // Build the publisher: bus + (optional) Postgres audit writer.
-    #[allow(unused_mut)]
     let mut publisher = boss_core::publisher::DomainPublisher::new(
         bus.clone() as std::sync::Arc<dyn boss_core::port::EventBus>,
         "jobs",
@@ -130,8 +128,7 @@ async fn main() -> Result<()> {
     let clock: Arc<dyn boss_clock_client::ClockClient> =
         Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url));
 
-    // Choose storage backend: Postgres when configured, in-memory otherwise.
-    #[cfg(feature = "postgres")]
+    // Postgres, or refuse: the in-memory serving branch is deleted (below).
     if let Some(ref pg_url) = cfg.postgres_url {
         info!("using Postgres jobs storage");
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -177,8 +174,14 @@ async fn main() -> Result<()> {
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
             Arc::new(boss_jobs::scheduling::PgScheduling::new(pool.clone()));
-        let cadence: Arc<dyn boss_jobs::cadence::CadenceRepository> =
-            Arc::new(boss_jobs::cadence::PgCadence::new(pool.clone()));
+        // One adapter, both halves: the conductor's reads and claims,
+        // and the registry the operator's publish / retire door and
+        // the platform seed write through (backlog 13d1fff3).
+        let cadence = Arc::new(boss_jobs::cadence::PgCadence::new(pool.clone()));
+        let cadence: (
+            Arc<dyn boss_jobs::cadence::CadenceRepository>,
+            Arc<dyn boss_jobs::cadence::CadenceRegistry>,
+        ) = (cadence.clone(), cadence);
         // The delivery pipeline's policy content, served to the train
         // conductor through the same door as everything else it reads
         // (docs/design/delivery-as-protocol.md).
@@ -193,6 +196,22 @@ async fn main() -> Result<()> {
         // cost, on the one door `boss-api` already reaches.
         let agent_runs: Arc<dyn boss_jobs::agent_runs::AgentRunLog> =
             Arc::new(boss_jobs::agent_runs::PgAgentRuns::new(pool.clone()));
+        // Which surfaces an operator opens (backlog 628f182b): the SPA's
+        // route opens, credited to the session, rolled up daily. Its own
+        // record — not an audit event, by §Policy & auth.
+        let surface_opens: Arc<dyn boss_jobs::surface_opens::SurfaceOpens> =
+            Arc::new(boss_jobs::surface_opens::PgSurfaceOpens::new(pool.clone()));
+        // The sensor registry and its readings (design 14c9b2ad, backlog
+        // 2d33e111): what the platform polls, tenant-published; the
+        // readings are telemetry outside the audit log, the packets a
+        // poll opens are the audit fact.
+        let sensors: Arc<dyn boss_jobs::sensors::Sensors> =
+            Arc::new(boss_jobs::sensors::PgSensors::new(pool.clone()));
+        // The agents registry (design 6fda05ae): what an agent's login
+        // resolves to at this service's door, the way a human's
+        // resolves at the gateway's.
+        let agents: Arc<dyn boss_jobs::agents::AgentsRegistry> =
+            Arc::new(boss_jobs::agents::PgAgents::new(pool.clone()));
         // Q7: human job-owner resolution over the people roster.
         let people_url =
             std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"));
@@ -219,10 +238,14 @@ async fn main() -> Result<()> {
             Some(delivery),
             Some(credentials),
             Some(agent_runs),
+            Some(surface_opens),
+            Some(sensors),
+            agents,
             calendar,
             subject_kinds,
             subject_existence,
             roster,
+            cfg.classes_api_url.clone(),
             clock.clone(),
             cancel_tx,
             cancel_rx,
@@ -231,45 +254,11 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    boss_core::startup::require_postgres_or_explicit_inmemory("boss-jobs-api")?;
-    info!("using in-memory jobs storage (no postgres_url configured)");
-    let jobs = Arc::new(InMemoryJobs::new());
-    let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
-        Arc::new(boss_jobs::InMemoryWorkflows::new());
-    let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
-        Arc::new(boss_jobs::InMemoryStepPlugins::new());
-    reconcile_platform_workflows(kind_registry.as_ref(), jobs.as_ref(), &clock).await;
-    // No subjects table without Postgres — the in-memory spike path
-    // skips the existence gate, same as before.
-    let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
-        None;
-    run_server(
-        Some(std::sync::Arc::new(boss_jobs::job_edges::InMemoryJobEdges)
-            as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>),
-        Some(Arc::new(boss_jobs::InMemoryStations::new()) as Arc<dyn boss_jobs::StationRegistry>),
-        jobs,
-        bus,
-        publisher,
-        Some(kind_registry),
-        Some(plugin_registry),
-        None,
-        None,
-        None,
-        None,
-        // In-memory spike path: the agent-run record is a projection of
-        // the log and has no in-memory story worth wiring here.
-        None,
-        calendar,
-        subject_kinds,
-        subject_existence,
-        // In-memory spike path: no people stack to resolve against.
-        None,
-        clock,
-        cancel_tx,
-        cancel_rx,
-        &cfg.http_bind,
+    anyhow::bail!(
+        "boss-jobs-api: postgres_url is required. The in-memory serving branch was deleted \
+         (be793304): nothing ever set the opt-in it guarded, every image builds --features postgres, \
+         and a system of record whose writes vanish on restart is not a degraded mode but a lie."
     )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -282,14 +271,21 @@ async fn run_server<R: JobsRepository + 'static>(
     kind_registry: Option<Arc<dyn boss_jobs::WorkflowRegistry>>,
     plugin_registry: Option<Arc<dyn boss_jobs::StepPluginRegistry>>,
     scheduling: Option<Arc<dyn boss_jobs::scheduling::SchedulingRepository>>,
-    cadence: Option<Arc<dyn boss_jobs::cadence::CadenceRepository>>,
+    cadence: Option<(
+        Arc<dyn boss_jobs::cadence::CadenceRepository>,
+        Arc<dyn boss_jobs::cadence::CadenceRegistry>,
+    )>,
     delivery: Option<Arc<dyn boss_jobs::delivery::DeliveryPolicyRepository>>,
     credentials: Option<Arc<dyn boss_jobs::credentials::CredentialsRegistry>>,
     agent_runs: Option<Arc<dyn boss_jobs::agent_runs::AgentRunLog>>,
+    surface_opens: Option<Arc<dyn boss_jobs::surface_opens::SurfaceOpens>>,
+    sensors: Option<Arc<dyn boss_jobs::sensors::Sensors>>,
+    agents: Arc<dyn boss_jobs::agents::AgentsRegistry>,
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>>,
     roster: Option<Arc<dyn boss_jobs::owner_resolution::RosterLookup>>,
+    classes_api_url: Option<String>,
     clock: Arc<dyn boss_clock_client::ClockClient>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
@@ -304,7 +300,7 @@ async fn run_server<R: JobsRepository + 'static>(
 
     // Policy client: wires boss-policy-api for row-level authorization.
     // Default URL pulled from the boss-ports table — single source
-    // of truth shared with `infra/deploy-services.sh`. Override via
+    // of truth shared with the config generator. Override via
     // BOSS_POLICY_URL. The 7060/7250 collision (`bb60c58` +
     // `8bf0f0a`) that motivated boss-ports lived right here.
     let policy_url = std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"));
@@ -321,6 +317,9 @@ async fn run_server<R: JobsRepository + 'static>(
         Arc::new(boss_policy_client::SimBypassPolicyClient::new(Arc::new(
             boss_policy_client::ReqwestPolicyClient::new(policy_url),
         )));
+    // The cadence door's publish / retire ask the same client the
+    // workflow routes do; clone before the state takes it.
+    let cadence_policy = policy.clone();
 
     // Wire the sim-mode probe into the publisher so every stamp
     // injects `_simulated: bool` into the audit_log payload without
@@ -330,7 +329,14 @@ async fn run_server<R: JobsRepository + 'static>(
         clock.clone(),
     )));
     let scheduling_publisher = publisher.clone();
+    let door_publisher = publisher.clone();
 
+    // The department reads below share the jobs repo, the workflow
+    // registry and the sensor registry with the main router and the
+    // sensors door; clone the Arcs before the state takes them.
+    let department_jobs: Arc<dyn JobsRepository> = jobs.clone();
+    let department_kinds = kind_registry.clone();
+    let department_sensors = sensors.clone();
     let state = JobsApiState {
         job_edges,
         stations,
@@ -350,8 +356,18 @@ async fn run_server<R: JobsRepository + 'static>(
         // /api/cadence and /api/delivery doors are operator-only, so the
         // browser cannot). Clone the Arc — the same repos back both the
         // operator doors below and this read-model.
-        cadence: cadence.clone(),
+        cadence: cadence.as_ref().map(|(repo, _)| repo.clone()),
         delivery: delivery.clone(),
+        // The claim door's budget gate (c87fb59b car 3) reads the same
+        // two registries the /api/agents and /api/agent-runs doors
+        // serve; without a run log there is no spend to measure and
+        // every claim is admitted as before.
+        agent_budget: agent_runs.as_ref().map(|log| {
+            Arc::new(boss_jobs::agent_budget::BudgetDoor {
+                agents: agents.clone(),
+                runs: log.clone(),
+            })
+        }),
     };
     let mut app = router(state);
     if let Some(repo) = scheduling {
@@ -364,10 +380,15 @@ async fn run_server<R: JobsRepository + 'static>(
             },
         ));
     }
-    if let Some(repo) = cadence {
+    if let Some((repo, registry)) = cadence {
         info!("cadence routes mounted at /api/cadence/*");
         app = app.merge(boss_jobs::cadence::http::router(
-            boss_jobs::cadence::http::CadenceApiState { repo },
+            boss_jobs::cadence::http::CadenceApiState {
+                repo,
+                registry,
+                policy: cadence_policy,
+                clock: clock.clone(),
+            },
         ));
     }
     if let Some(repo) = delivery {
@@ -390,6 +411,65 @@ async fn run_server<R: JobsRepository + 'static>(
             boss_jobs::agent_runs::http::AgentRunsApiState { log },
         ));
     }
+    if let Some(repo) = surface_opens {
+        info!("surface opens mounted at /api/surface-opens (+ /rollup, /sweep)");
+        app = app.merge(boss_jobs::surface_opens::http::router(
+            boss_jobs::surface_opens::http::SurfaceOpensApiState { repo },
+        ));
+    }
+    if let Some(repo) = sensors {
+        info!("sensors mounted at /api/sensors (+ /batch, /<id>/readings, /<id>/polled, /sweep)");
+        app = app.merge(boss_jobs::sensors::http::router(
+            boss_jobs::sensors::http::SensorsApiState { repo },
+        ));
+    }
+    // The agents roster and the tenant batch (backlog f56155f0): the
+    // same registry the login door below resolves through, so an
+    // alias a tenant declares resolves on the next request.
+    // An agent's role / department are Class codes checked at the
+    // batch door against the same registry an employee's are
+    // (backlog ab192a9f); the client is built from classes_api_url,
+    // the URL the executive-role seed above already reads.
+    let agent_classes: Option<Arc<dyn boss_classes_client::ClassesClient>> =
+        classes_api_url.as_deref().map(|url| {
+            Arc::new(boss_classes_client::ReqwestClassesClient::new(url))
+                as Arc<dyn boss_classes_client::ClassesClient>
+        });
+    info!(
+        class_checked = agent_classes.is_some(),
+        "agents mounted at /api/agents (+ /batch)"
+    );
+    app = app.merge(boss_jobs::agents::http::router(
+        boss_jobs::agents::http::AgentsApiState {
+            registry: agents.clone(),
+            classes: agent_classes.clone(),
+        },
+    ));
+    // The departments the classes registry holds, and which of the six
+    // template parts each has (design 3613f0af, backlog 1dffde5d) —
+    // every part read from a live registry, never a seed. The rules
+    // part reads the dispatcher's own surface (`/api/dispatcher/rules`,
+    // what is FIRING); the all-in-one pod serves it on boss-ports'
+    // dispatcher port, overridable the way the people URL is.
+    let dispatcher_url =
+        std::env::var("BOSS_DISPATCHER_URL").unwrap_or_else(|_| boss_ports::url("dispatcher"));
+    let department_rules: Arc<dyn boss_jobs::department::rules::DispatcherRules> = Arc::new(
+        boss_jobs::department::rules::ReqwestDispatcherRules::new(dispatcher_url.clone()),
+    );
+    info!(
+        class_backed = agent_classes.is_some(),
+        %dispatcher_url,
+        "departments mounted at /api/departments (+ /<code>/readiness)"
+    );
+    app = app.merge(boss_jobs::department::http::router(
+        boss_jobs::department::http::DepartmentsApiState {
+            classes: agent_classes,
+            kinds: department_kinds,
+            jobs: department_jobs,
+            sensors: department_sensors,
+            rules: Some(department_rules),
+        },
+    ));
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -397,6 +477,18 @@ async fn run_server<R: JobsRepository + 'static>(
     let app = app.layer(axum::middleware::from_fn(
         boss_policy_client::request_context_middleware,
     ));
+    // The login door (design 6fda05ae): an X-Boss-User id the
+    // actor_aliases table maps is rewritten to the registered agent's
+    // id BEFORE the request-context middleware above reads it — so
+    // this layer must stay OUTSIDE that one. An address no alias maps
+    // is admitted and counted (`actor.login.unresolved`) while the
+    // migration window is open; the refusal is the next car.
+    let door = Arc::new(boss_jobs::agents::LoginDoor::new(agents, door_publisher));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        door,
+        boss_jobs::agents::resolve_login,
+    ));
+    info!("login door mounted: agent logins resolve through actor_aliases (window open)");
     // The machine door's write gate (7fcd78fa phase 1): when
     // BOSS_MACHINE_TOKEN is set, state-changing requests must carry
     // it. Layered in the binary — this process is the one that knows

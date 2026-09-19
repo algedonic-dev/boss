@@ -151,7 +151,7 @@ prune_ci_images() {
         # Only a per-train sha tag is a candidate. CI stamps the full
         # 40-char sha; the 7-char short form is what the deploy images
         # carry, and admitting both costs nothing.
-        if ! printf '%s' "$tag" | grep -qE '^[0-9a-f]{7,40}$'; then
+        if ! grep -qE '^[0-9a-f]{7,40}$' <<<"$tag"; then
             kept_named=$((kept_named + 1))
             continue
         fi
@@ -205,7 +205,7 @@ prune_ci_images() {
         # unparseable reply, an unresolvable sha) leaves this loop exactly
         # as it was — it prunes less, never more.
         local why="older than ${max_age_h}h" by_train=0
-        if [ -n "$landed" ] && printf '%s\n' "$landed" | grep -qxF "${tag:0:7}"; then
+        if [ -n "$landed" ] && grep -qxF "${tag:0:7}" <<< "$landed"; then
             by_train=1
             why="its train is done (landed or abandoned)"
         elif [ "$epoch" -ge "$cutoff" ]; then

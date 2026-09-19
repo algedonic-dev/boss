@@ -11,9 +11,13 @@
 //!
 //! The policy lives in the `delivery_policy` registry
 //! (`infra/postgres/schema/202608242117-delivery-policy-registry.sql`),
-//! is resolved ONCE per conductor invocation, and is threaded to the
-//! decision points. Changing it is a registry write that takes effect on
-//! the next boarding — no build, no deploy, no train
+//! is DECLARED in `infra/platform/delivery-policy/train-conductor.toml`
+//! (since 2026-09-18, backlog 393d3234: the platform seed publishes the
+//! bundle insert-if-missing by (name, version) at every start; before
+//! it, two migrations were the row's only home), is resolved ONCE per
+//! conductor invocation, and is threaded to the decision points.
+//! Changing it is a version bump in that file that takes effect on the
+//! next boarding — no code change, no train
 //! (docs/design/delivery-as-protocol.md).
 //!
 //! THREE RULES KEEP IT FROM BECOMING WHAT IT REPLACES.
@@ -55,8 +59,18 @@ pub(crate) const NO_VERSION: i32 = 0;
 // These are not defaults in the "sensible starting value" sense. They
 // are the values the pipeline ran on the day the policy moved into the
 // registry, kept here so that losing the registry loses no behaviour.
-// `db_tests::the_seeded_policy_equals_the_compiled_fallback` pins the
-// seed row against them, so the two cannot drift (CLAUDE.md §9a).
+//
+// WHY THEY STAY NOW THAT THE BUNDLE IS THE DECLARED HOME (393d3234,
+// car 4, 2026-09-18). The conductor runs outside the cluster with no
+// tree and no database of its own; when the registry is unreachable,
+// empty, or holds a row that does not parse, THESE are what board the
+// train. A fact that lives twice gets an equality test (CLAUDE.md
+// §9a): `tests::the_bundle_equals_the_compiled_fallback` holds these
+// equal to `infra/platform/delivery-policy/train-conductor.toml` with
+// no database, and `db_tests::the_seeded_policy_equals_the_compiled_
+// fallback` closes the triangle through the migrations' own row.
+// `estate_compare.rs` also reads `COMPILED_CI_HOST_FLOOR_GB` out of
+// this file's text for its headroom-ceiling pin.
 // ---------------------------------------------------------------------------
 
 /// How many red trains a car may ride before boarding leaves it behind.
@@ -115,46 +129,20 @@ pub(crate) const COMPILED_CI_HOST_FLOOR_GB: i64 = 40;
 /// deploy — which is the whole point of moving it here.
 pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 3;
 
-/// The lints the consist check does not run, each with its reason. All
-/// four need something the assembled TREE does not contain — a cargo
-/// build, a package manager, or a live database — and a question the
-/// tree cannot answer is not a question that can be answered in seconds.
-/// Everything else in `infra/lint/` runs, including lints that do not
-/// exist yet.
-pub(crate) const COMPILED_EXCLUDED_LINTS: &[(&str, &str)] = &[
-    (
-        "audit-ordering.sh",
-        "psql against a live database — same: not a question about a tree",
-    ),
-    (
-        "conservation-invariants.sh",
-        "psql + curl against a LIVE deployment — an invariant on the running system, which a \
-         tree cannot answer (it has its own systemd timer)",
-    ),
-    (
-        "no-snapshot-arrays.sh",
-        "reads the built `boss-ports-list` binary; with no target/ it can only report \
-         'not found', and building it is exactly what CI is for",
-    ),
-    (
-        "svelte-check.sh",
-        "runs `bun install --frozen-lockfile` and a typecheck — minutes, plus a network fetch, \
-         and it exits 1 outright on a box without bun",
-    ),
-];
+// WHICH LINTS THE CONSIST CHECK LEAVES OUT IS NOT POLICY ANY MORE. It
+// was, from 2026-08-24 to 2026-09-18 (`consist_excluded_lints` on the
+// row, `COMPILED_EXCLUDED_LINTS` here): a copy of the four names that
+// gate.sh also listed, held equal to gate.sh's by nothing — one of five
+// copies (tech-debt audit H9, backlog 6fa15484). Whether a lint needs
+// more than a tree is a fact about the LINT, known to whoever writes it,
+// so each such lint now declares it in its own header and the conductor
+// asks the assembled tree's gate.sh (`train.rs::gate_exclusions`). The
+// column was dropped with it; the seed migration's four entries stay in
+// history as the row they were.
 
 // ---------------------------------------------------------------------------
 // The resolved policy
 // ---------------------------------------------------------------------------
-
-/// One lint the consist check skips, and why. The reason travels with
-/// the entry because an unexplained exemption is how a check quietly
-/// stops covering anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExcludedLint {
-    pub(crate) script: String,
-    pub(crate) reason: String,
-}
 
 /// The delivery policy in force for one conductor invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,9 +152,6 @@ pub(crate) struct DeliveryPolicy {
     pub(crate) version: i32,
     pub(crate) max_red_trains: i64,
     pub(crate) stall_hours: i64,
-    /// Sorted by script name, so two reads of one row produce one
-    /// roster in one order.
-    pub(crate) excluded_lints: Vec<ExcludedLint>,
     pub(crate) consist_budget: Duration,
     pub(crate) consist_output_budget: usize,
     pub(crate) consist_files_named: usize,
@@ -185,13 +170,6 @@ impl DeliveryPolicy {
             version: NO_VERSION,
             max_red_trains: COMPILED_MAX_RED_TRAINS,
             stall_hours: COMPILED_STALL_HOURS,
-            excluded_lints: COMPILED_EXCLUDED_LINTS
-                .iter()
-                .map(|(script, reason)| ExcludedLint {
-                    script: (*script).to_string(),
-                    reason: (*reason).to_string(),
-                })
-                .collect(),
             consist_budget: Duration::from_secs(COMPILED_CONSIST_BUDGET_SECS),
             consist_output_budget: COMPILED_CONSIST_OUTPUT_BUDGET,
             consist_files_named: COMPILED_CONSIST_FILES_NAMED,
@@ -205,11 +183,6 @@ impl DeliveryPolicy {
     /// Did this come out of the registry, or off the fallback?
     pub(crate) fn is_from_registry(&self) -> bool {
         self.version != NO_VERSION
-    }
-
-    /// Is `script` one the consist check skips?
-    pub(crate) fn excludes(&self, script: &str) -> bool {
-        self.excluded_lints.iter().any(|e| e.script == script)
     }
 }
 
@@ -229,40 +202,12 @@ fn positive_usize(field: &str, v: i32) -> Result<usize> {
         .map_err(|_| anyhow!("{field} does not fit this machine's usize: {v}"))
 }
 
-fn excluded_lints(raw: &Value) -> Result<Vec<ExcludedLint>> {
-    let entries = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("consist_excluded_lints must be a JSON array, got {raw}"))?;
-    let mut out: Vec<ExcludedLint> = Vec::with_capacity(entries.len());
-    for e in entries {
-        let script = e
-            .get("script")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("consist_excluded_lints entry names no script: {e}"))?;
-        // The reason is required, not decorative: an exemption nobody
-        // explained is one nobody can later judge.
-        let reason = e
-            .get("reason")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("consist_excluded_lints entry {script} gives no reason"))?;
-        out.push(ExcludedLint {
-            script: script.to_string(),
-            reason: reason.to_string(),
-        });
-    }
-    out.sort_by(|a, b| a.script.cmp(&b.script));
-    Ok(out)
-}
-
 /// A registry row becomes a policy, or it does not become one at all.
 pub(crate) fn parse(row: DeliveryPolicyRow) -> Result<DeliveryPolicy> {
     Ok(DeliveryPolicy {
         version: row.version,
         max_red_trains: positive_i64("max_red_trains", row.max_red_trains)?,
         stall_hours: positive_i64("stall_hours", row.stall_hours)?,
-        excluded_lints: excluded_lints(&row.consist_excluded_lints)?,
         consist_budget: Duration::from_secs(positive_i64(
             "consist_budget_secs",
             row.consist_budget_secs,
@@ -349,10 +294,6 @@ pub(crate) fn version_to_fetch(train: &Value, active: &DeliveryPolicy) -> Option
 mod tests {
     use super::*;
 
-    fn scripts(p: &DeliveryPolicy) -> Vec<String> {
-        p.excluded_lints.iter().map(|e| e.script.clone()).collect()
-    }
-
     // -- the equality that makes this car a no-op -----------------------
 
     #[test]
@@ -368,22 +309,13 @@ mod tests {
         assert_eq!(
             p.ci_host_floor_gb, 40,
             "policy v3 (approval d99b198d, 2026-09-05): the forge runs lean CI green at \
-             60-70GB free and the locomotive's own door is 70, so the boarding floor sits \
-             under it; the old 90 measured a FULL gate build that now runs in-cluster"
+             60-70GB free and the locomotive's own door was 70 (40 since 2026-09-16, the \
+             same number), so the boarding floor sits at or under it; the old 90 measured \
+             a FULL gate build that now runs in-cluster"
         );
         assert_eq!(
             p.gate_max_concurrent, 3,
             "gate.rs DEFAULT_MAX_CONCURRENT — the measured comfort zone on w-1"
-        );
-        assert_eq!(
-            scripts(&p),
-            vec![
-                "audit-ordering.sh".to_string(),
-                "conservation-invariants.sh".to_string(),
-                "no-snapshot-arrays.sh".to_string(),
-                "svelte-check.sh".to_string(),
-            ],
-            "the four lints that need more than a tree"
         );
         assert_eq!(
             p.version, NO_VERSION,
@@ -400,9 +332,6 @@ mod tests {
             version: 7,
             max_red_trains: 3,
             stall_hours: 9,
-            consist_excluded_lints: json!([
-                {"script": "svelte-check.sh", "reason": "needs bun"},
-            ]),
             consist_budget_secs: 30,
             consist_output_budget: 400,
             consist_files_named: 2,
@@ -426,41 +355,6 @@ mod tests {
         assert_eq!(p.blip_cause_budget, 40);
         assert_eq!(p.ci_host_floor_gb, 120);
         assert_eq!(p.gate_max_concurrent, 4);
-        assert_eq!(scripts(&p), vec!["svelte-check.sh".to_string()]);
-        assert!(p.excludes("svelte-check.sh"));
-        assert!(!p.excludes("migration-numbers-unique.sh"));
-    }
-
-    #[test]
-    fn an_empty_exclusion_list_is_legal() {
-        // "Run every lint in the tree" is a policy someone may choose,
-        // and it must not read as a broken row.
-        let mut r = row();
-        r.consist_excluded_lints = json!([]);
-        assert!(
-            parse(r)
-                .expect("empty is not malformed")
-                .excluded_lints
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn the_exclusion_roster_comes_back_sorted() {
-        // Two reads of one row must ask the same questions in the same
-        // sequence, whatever order the row was authored in.
-        let mut r = row();
-        r.consist_excluded_lints = json!([
-            {"script": "svelte-check.sh", "reason": "bun"},
-            {"script": "audit-ordering.sh", "reason": "psql"},
-        ]);
-        assert_eq!(
-            scripts(&parse(r).unwrap()),
-            vec![
-                "audit-ordering.sh".to_string(),
-                "svelte-check.sh".to_string()
-            ]
-        );
     }
 
     #[test]
@@ -502,25 +396,6 @@ mod tests {
             format!("{e}").contains("gate_max_concurrent"),
             "the complaint names the field: {e}"
         );
-    }
-
-    #[test]
-    fn an_exclusion_that_is_not_a_script_name_is_refused() {
-        let mut r = row();
-        r.consist_excluded_lints = json!([{"reason": "no script key"}]);
-        let e = parse(r).expect_err("an entry with no script names nothing");
-        assert!(
-            format!("{e}").contains("consist_excluded_lints"),
-            "the complaint names the field: {e}"
-        );
-    }
-
-    #[test]
-    fn an_exclusion_with_no_reason_is_refused() {
-        let mut r = row();
-        r.consist_excluded_lints = json!([{"script": "svelte-check.sh"}]);
-        let e = parse(r).expect_err("an unexplained exemption is not reviewable");
-        assert!(format!("{e}").contains("svelte-check.sh"), "{e}");
     }
 
     // -- resolution, and the loud fallback -----------------------------
@@ -597,6 +472,43 @@ mod tests {
             i64::from(boss_jobs::yard::COMPILED_GATE_MAX_CONCURRENT),
             COMPILED_GATE_MAX_CONCURRENT,
             "the yard's no-policy slot count drifted from the gate CLI's compiled bound"
+        );
+    }
+
+    /// §9a pin, the half that needs no database: the bundle row
+    /// `infra/platform/delivery-policy/train-conductor.toml` — the
+    /// declared home of the policy since 393d3234 — parses to exactly
+    /// the compiled fallback, version aside. The conductor runs on
+    /// these numbers whether or not the registry answered, so the file
+    /// an operator edits and the constants a dark registry falls back
+    /// to must be one policy. Which one is authoritative is settled:
+    /// the bundle; this test is what makes editing it without editing
+    /// here a red gate rather than a silent fork.
+    #[test]
+    fn the_bundle_equals_the_compiled_fallback() {
+        let bundle = boss_jobs::seed_loader::load_delivery_policies(
+            boss_jobs::delivery_policy_seed::platform_delivery_policy_path(),
+        )
+        .expect("the platform delivery-policy bundle parses");
+        let declared = bundle
+            .into_iter()
+            .find(|s| s.name() == POLICY_NAME)
+            .unwrap_or_else(|| panic!("the bundle declares `{POLICY_NAME}`"));
+        let declared = parse(declared.row).expect("the declared row parses");
+        assert!(
+            declared.is_from_registry(),
+            "the bundle declares a real version, so a train departing under it pins one"
+        );
+        assert_eq!(
+            DeliveryPolicy {
+                version: NO_VERSION,
+                ..declared
+            },
+            DeliveryPolicy::compiled(),
+            "infra/platform/delivery-policy/train-conductor.toml drifted from the \
+             conductor's compiled fallback — one of them is now changing behaviour \
+             the other does not, and which one runs depends on whether the registry \
+             answered (left = bundle, right = compiled)"
         );
     }
 
@@ -681,7 +593,13 @@ mod db_tests {
     /// written down twice by necessity (a migration cannot read Rust and
     /// a Rust fallback cannot read SQL), so equality is the mechanism
     /// rather than a comment asking the next person to keep them in
-    /// step.
+    /// step. Since 393d3234 the migrations are history and the bundle
+    /// is the declared home — `tests::the_bundle_equals_the_compiled_
+    /// fallback` pins that side with no database, and boss-jobs'
+    /// `the_delivery_policy_bundle_is_the_migrations_pg` holds bundle
+    /// and migrations equal; this test keeps the third side of the
+    /// triangle, the one that sees what a fresh database actually
+    /// serves.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_seeded_policy_equals_the_compiled_fallback() {
         let db = boss_testing::TestDb::new().await;

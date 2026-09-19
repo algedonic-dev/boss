@@ -19,7 +19,7 @@
 // `prefers-color-scheme` block reappearing in apps/ or libs/.
 
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { mountPage } from '../smoke/_helpers';
+import { mountPage } from './_helpers';
 import { AA_FLOOR, describeUnreadable, measureContrast } from './_contrast';
 
 const json = (r: Route, b: unknown, status = 200) =>
@@ -65,7 +65,7 @@ async function mocks(page: Page) {
   });
   await page.route('**/api/**', (r) => json(r, []));
   await page.route(/\/api\/tenant\/manifest$/, (r) =>
-    json(r, { display_name: 'Algedonic Ales', modules: {}, labels: {} }));
+    json(r, { display_name: 'Algedonic Ales', modules: { 'marketing-assets': true }, labels: {} }));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));

@@ -9,22 +9,36 @@
 //! Hexagonal: the domain defines a `JobsRepository` port (trait).
 //! Postgres, in-memory, and other adapters implement the same trait.
 
+pub mod agent_budget;
 pub mod agent_runs;
+pub mod agent_spec;
+pub mod agents;
+pub mod audience;
 pub mod bootstrap;
+pub mod bundle_seed;
 pub mod cadence;
+pub mod cadence_seed;
 pub mod calendar_hook;
 pub mod car;
 pub mod credentials;
 pub mod decision_record;
 pub mod delivery;
+pub mod delivery_policy_seed;
+pub mod department;
 pub mod escalation;
+pub mod estate_seed;
 pub mod events;
 pub mod experiments;
+pub mod flake;
 pub mod http;
 pub mod human_only;
 pub mod in_memory;
 pub mod job_edges;
 pub mod jobs_config;
+pub mod landing;
+pub mod metadata_containment;
+pub mod metadata_key;
+pub mod orphan_steps;
 pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
@@ -34,6 +48,7 @@ pub mod protocol_conversion;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod refusals;
+pub mod regions;
 pub mod registry;
 pub mod scheduling;
 pub mod station_flow;
@@ -41,10 +56,13 @@ pub mod station_lint;
 pub mod station_projection;
 pub mod station_quarantine;
 pub mod station_queue;
+pub mod station_seed;
 pub mod stations;
 pub mod stranded;
+pub mod trust;
 pub mod workflow_lint;
 pub mod workflow_quarantine;
+pub mod workflow_seed;
 pub mod yard;
 // Platform Workflows live in `infra/platform/workflows/<kind>.toml`
 // (`registry::platform_workflows()`, the Rust roster, is empty since
@@ -53,9 +71,12 @@ pub mod yard;
 // See docs/design/platform-vs-tenant-jobkinds.md.
 pub mod owner_resolution;
 pub mod seed_loader;
+pub mod sensors;
+pub mod step_plugin_seed;
 pub mod step_plugins;
 pub mod step_registry;
 pub mod subject_existence;
+pub mod surface_opens;
 
 pub use in_memory::InMemoryJobs;
 pub use port::{JobFilter, JobsError, JobsRepository};

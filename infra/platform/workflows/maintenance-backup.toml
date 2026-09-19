@@ -1,5 +1,4 @@
-# infra/cluster/manifests/boss-backup.yaml (CronJob), and
-# infra/boss-backup.service on a host that runs it under systemd.
+# infra/cluster/manifests/boss-backup.yaml (the boss-pg-backup CronJob)
 #
 # A `maintenance_spec(...)` Rust literal until 2026-09-11, alongside the
 # other two 03:00-ish chores. The form is what made 6c796f75 permanent:
@@ -29,10 +28,12 @@ title = "run"
 kind = "task"
 ready_when = "steps.scheduled.done"
 title_template = "Run to completion"
-# Gated so the simulated workforce cannot role-match and "complete"
-# real maintenance; the timer's boss-step call presents the automation
-# actor with this role.
-authority_role = "platform-admin"
+# The step is the automation's and says so (backlog 4f909642,
+# 2026-09-18): born assigned to the actor boss-step.sh signs as, so the
+# dispatcher's executes-lane never nominates it to the agent and no
+# role queue lists it. The sim workforce is kept off it by the
+# partition rule (88798c96), which the old platform-admin role guarded.
+audience = { individual = "automation:boss-step" }
 fields = [{ name = "result", field_type = "string", required = true }]
 
 [[workflow.step]]

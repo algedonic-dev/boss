@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus};
+use boss_core::partition::Partition;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -42,6 +43,16 @@ pub struct JobFilter {
     /// span related registry kinds (e.g. `refurb-used` + `refurb-oem-new`
     /// both match `kind_prefix = "refurb"`).
     pub kind_prefix: Option<String>,
+    /// Keep only packets whose `kind` is IN this set — and `Some(vec![])`
+    /// keeps NOTHING. The department listing's filter (backlog
+    /// cc76f755, 2026-09-18): jobs carry no department column; the
+    /// workflow row does (`metadata.department`), so the HTTP handler
+    /// resolves a department to the kinds declaring it and asks for
+    /// exactly those. An empty set answering the unfiltered count
+    /// would be the trap the packet was filed on — measured on prod,
+    /// `?department=sales` answered 1944, the unfiltered total,
+    /// because nothing read the parameter at all.
+    pub kinds: Option<Vec<String>>,
     pub status: Option<JobStatus>,
     /// A retention window on TERMINAL packets: keep everything still
     /// live, plus anything closed on or after this date. Drop
@@ -80,15 +91,32 @@ pub struct JobFilter {
     /// Flat string-valued objects only — that is the whole of what
     /// `metadata_equals` expresses.
     pub metadata_contains: Option<serde_json::Value>,
+    /// Jobs whose `metadata` carries this top-level key, whatever its
+    /// value — the JSONB existence shape (`metadata ? $n`). The
+    /// question a probe asks most: "the alerts carrying
+    /// `estate_finding`", "the cars with a `proof_probe`". Before this
+    /// existed (4d9aa761, 2026-09-14) every such reader paged 60-200
+    /// rows and filtered in jq, exact only while the page was bigger
+    /// than the world; one measured 356 closed rows in 14 days against
+    /// a 200-row page.
+    ///
+    /// Top-level keys only: `?` does not walk paths, and the HTTP layer
+    /// refuses anything that is not a plain identifier so a dotted key
+    /// cannot silently match nothing.
+    pub metadata_has: Option<String>,
     /// Row-level policy scope — translated from `boss_policy_client::Predicate`
     /// by the HTTP handler before calling the adapter. Pushing it down
     /// into SQL here means scoped roles get accurate `total` counts
     /// and pages that only contain jobs they can see (no wasted page
     /// space on rows the post-fetch filter would discard).
     pub scope: JobScope,
-    /// Keep only real packets (`Some(false)`) or only simulated ones
-    /// (`Some(true)`). `None` — the default — is every packet, which
-    /// is what every existing caller already gets.
+    /// Keep only the packets of ONE partition — `Some(Real)`,
+    /// `Some(Simulated)` or `Some(Shadow)`. `None` — the default — is
+    /// every packet, which is what every existing caller already gets.
+    /// There is deliberately no "not real" filter: a real-lane surface
+    /// asks for `Real` and so excludes shadow packets without knowing
+    /// the word, and the sim asks for `Simulated` and never sees them
+    /// (packet 508cc38c, Q5).
     ///
     /// WHY IT IS A QUERY FILTER AND NOT A CLIENT-SIDE `.filter()`, for
     /// exactly the reason `closed_since` above is: measured
@@ -99,13 +127,13 @@ pub struct JobFilter {
     /// silently truncates — the same failure the retention window was
     /// added to fix, one order of magnitude worse.
     ///
-    /// `simulated` is set at admission and immutable afterwards
+    /// The partition is set at admission and immutable afterwards
     /// (`update_job` restores it from the existing row), so this is a
     /// stable partition rather than a mutable label. Measured on the
     /// same population: of 39 kinds, **zero are mixed** — a kind is
     /// either entirely simulated or entirely real — so filtering here
     /// never splits a kind's packets across two answers.
-    pub simulated: Option<bool>,
+    pub partition: Option<Partition>,
 }
 
 /// The policy-scope slice applied to a listing. Mirrors the shapes
@@ -259,6 +287,19 @@ fn cycle_days_sample(job: &Job) -> Option<f64> {
         .map(|closed| (closed - job.opened_on).num_days() as f64)
 }
 
+/// Pure selection behind [`JobsRepository::newest_closed_job`]: the
+/// closed packet with the greatest `closed_on`, then the greatest
+/// `opened_on`. `jobs` arrives newest-opened first from `list_jobs`,
+/// and a stable max keeps that order as the last tie-break.
+pub fn newest_closed_from_jobs(jobs: Vec<Job>) -> Option<Job> {
+    jobs.into_iter()
+        .filter(|j| j.status == JobStatus::Closed)
+        .fold(None, |best: Option<Job>, j| match best {
+            Some(b) if (b.closed_on, b.opened_on) >= (j.closed_on, j.opened_on) => Some(b),
+            _ => Some(j),
+        })
+}
+
 /// Pure aggregation behind [`JobsRepository::workflow_terminal_report`]
 /// — a function of the packets, so any adapter's answer is checkable
 /// against it. Versions sort newest first.
@@ -351,6 +392,13 @@ pub struct AssignmentRow {
     /// without a second fetch.
     pub job_title: String,
     pub due_on: Option<chrono::NaiveDate>,
+    /// The day the packet was admitted, so a personal queue can say
+    /// how long each step has waited without a second fetch — the
+    /// same argument as `job_title`. `boss orient`'s MY WORK section
+    /// is the first reader (65a89769: 25 ready steps sat on the
+    /// agent's alias unseen, and a list with no age hides which of
+    /// them has been waiting a week).
+    pub opened_on: chrono::NaiveDate,
     pub workflow: String,
     /// The protocol version this packet was admitted under. Rides on
     /// the row so an executor can resolve the step's spec (its
@@ -360,16 +408,32 @@ pub struct AssignmentRow {
     pub subject_kind: String,
     pub subject_id: String,
     pub priority: Priority,
-    /// The Job's admission-fixed sim-vs-real flag, and its tags. A
+    /// The Job's admission-fixed partition, and its tags. A
     /// projection, not the Job — but a queue lens renders a packet
     /// card from the row alone, and a simulated packet has to look
     /// simulated in a personal queue exactly as it does in the yard.
+    /// On the wire this is `partition` plus the legacy `simulated`
+    /// bool (derived as not-real — `boss_core::partition::wire`), so
+    /// the sim workforce's fail-closed read of the row keeps working
+    /// and a shadow packet reads as not-real to it.
     /// `tags` rides along for the same reason: the shared card
     /// predicate falls back to a `sim` / `simulated` / `synthetic` tag
     /// for packets that predate the column (there was no backfill), so
     /// without it the two lenses would disagree on the same packet.
-    pub simulated: bool,
+    #[serde(flatten, with = "boss_core::partition::wire")]
+    pub partition: Partition,
     pub tags: Vec<String>,
+    /// How many red trains have released this car — the conductor's
+    /// `red_trains` stamp on the job's metadata, absent = 0. The row
+    /// carries the packet's identity and no metadata, so until
+    /// d6e53a35 (2026-09-14) a builder's own struck car read clean on
+    /// their My Day while the yard drew the same car struck — and the
+    /// builder is the one who can act on a strike before the next red
+    /// holds the car out. `default` so a row from an older server reads
+    /// back as 0 rather than failing to parse, as [`crate::yard::DockCar`]
+    /// does.
+    #[serde(default)]
+    pub red_trains: u32,
     pub step: Step,
 }
 
@@ -409,7 +473,8 @@ pub struct QueueAgeRow {
     pub assignee_id: Option<String>,
     /// Rides along for the same reason it rides on [`AssignmentRow`]:
     /// a simulated packet has to look simulated in every lens.
-    pub simulated: bool,
+    #[serde(flatten, with = "boss_core::partition::wire")]
+    pub partition: Partition,
     /// The instant this obligation has been waiting since.
     pub since: DateTime<Utc>,
     /// `true` when `since` is the recorded ready-flip instant;
@@ -423,7 +488,15 @@ pub struct EstateNode {
     pub id: String,
     pub label: String,
     pub address: String,
+    /// The PRIMARY role — what the estate page keys on (`bastion` is
+    /// the jump host). One value, from `nodes.role`.
     pub role: String,
+    /// Every role the node DECLARES, sorted — Classes of `node` joined
+    /// through `node_roles` (202609120300). The set a managed host
+    /// derives its unit roster from; empty when the node declares
+    /// nothing, which the converge reads as "install every row".
+    #[serde(default)]
+    pub roles: Vec<String>,
     pub cpu: Option<i32>,
     pub memory_gb: Option<i32>,
     pub disk_gb: Option<i32>,
@@ -431,6 +504,112 @@ pub struct EstateNode {
     /// Retired machines stay readable so history resolves, exactly as
     /// retired subject kinds do.
     pub retired: bool,
+}
+
+/// A machine as the tree DECLARES it (`[[node]]` in
+/// infra/estate/estate.toml) and as `POST /api/estate/nodes/batch`
+/// takes it — the columns 144-estate-subjects.sql gave `nodes`, plus
+/// the roles 202609120300 gave `node_roles`. Declared capacity only:
+/// free space now is an observation and rides the log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstateNodeInput {
+    pub id: String,
+    pub label: String,
+    pub address: String,
+    /// The PRIMARY role (`talos-control-plane`, `talos-worker`,
+    /// `forge`, `bastion`) — what the estate page keys on and the
+    /// comparison selects on (`talos-*` participates in the cluster
+    /// compare).
+    pub role: String,
+    /// Every role the node declares — Classes of `node`, so an
+    /// undeclared code is refused by the schema's FK, never invented.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub cpu: Option<i32>,
+    #[serde(default)]
+    pub memory_gb: Option<i32>,
+    #[serde(default)]
+    pub disk_gb: Option<i32>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Why a node declaration is refused, named so the refusal says which
+/// check failed; the same check runs at the file, the door and both
+/// adapters.
+pub fn validate_estate_node(n: &EstateNodeInput) -> Result<(), String> {
+    let slug = |field: &str, v: &str| -> Result<(), String> {
+        if v.is_empty() {
+            return Err(format!("node {}: {field} is required", n.id));
+        }
+        if !v
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(format!(
+                "node {}: {field} `{v}` is not kebab-case (lowercase, digits, hyphens)",
+                n.id
+            ));
+        }
+        Ok(())
+    };
+    if n.id.is_empty() {
+        return Err("a node needs an id (e.g. cp-1)".into());
+    }
+    slug("id", &n.id)?;
+    slug("role", &n.role)?;
+    for r in &n.roles {
+        slug("roles entry", r)?;
+    }
+    for (field, v) in [("label", &n.label), ("address", &n.address)] {
+        if v.trim().is_empty() {
+            return Err(format!("node {}: {field} is required", n.id));
+        }
+    }
+    Ok(())
+}
+
+/// What `POST /api/estate/nodes/batch` takes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EstateNodeBatch {
+    pub nodes: Vec<EstateNodeInput>,
+}
+
+/// What a declaration did: nodes received, nodes inserted, and roles
+/// inserted (a role landed on a node already there counts here — the
+/// forge gained `cluster-operator` after its row existed).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EstateBatchOutcome {
+    pub received: usize,
+    pub inserted: usize,
+    pub roles_inserted: usize,
+}
+
+/// The fact one declaration leaves: `node.declared`, once per node the
+/// batch changed (its row inserted, or a role landed on it), carrying
+/// the declaration, what landed, and `declared_by` from the stamp.
+pub const NODE_DECLARED: &str = "node.declared";
+
+pub fn node_declared_event(
+    stamp: &boss_core::publisher::EventStamp,
+    node: &EstateNodeInput,
+    inserted: bool,
+    roles_inserted: &[String],
+) -> Result<boss_core::event::Event, JobsError> {
+    let mut payload = serde_json::to_value(node).map_err(|e| JobsError::Storage(e.to_string()))?;
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(
+            "declared_by".to_string(),
+            serde_json::Value::String(stamp.actor().to_string()),
+        );
+        map.insert(
+            "landed".to_string(),
+            serde_json::json!({ "node": inserted, "roles": roles_inserted }),
+        );
+    }
+    Ok(stamp.event(NODE_DECLARED, payload))
 }
 
 /// Persistence port for jobs and steps.
@@ -453,8 +632,8 @@ pub struct EstateNode {
 /// event-derivation logic (status-transition markers, `step.done` /
 /// `step.ready` dispatcher signals, actor stamping); the adapter
 /// guarantees fact + events commit or fail together. Creation paths
-/// (`create_job_at`, `add_step_at`) are ON CONFLICT DO NOTHING
-/// replay-tolerant — their events record ONLY when the insert
+/// (`create_job_with_steps_at`, `add_step_at`) are ON CONFLICT DO
+/// NOTHING replay-tolerant — their events record ONLY when the insert
 /// actually inserted, so a replayed create records nothing (before,
 /// every replay published duplicate created events). The convenience
 /// overloads pass no events (test-path ergonomics).
@@ -466,11 +645,53 @@ pub trait JobsRepository: Send + Sync {
         self.create_job_at(job, Utc::now(), &[]).await
     }
 
+    /// A job with no steps of its own — the brewery engine's
+    /// `?materialize_steps=false` path, which posts its
+    /// deterministic-UUID steps afterwards, and every test that
+    /// builds a bare job. The one-transaction contract is
+    /// [`JobsRepository::create_job_with_steps_at`]'s; this is that
+    /// call with nothing to add.
     async fn create_job_at(
         &self,
         job: &Job,
         now: DateTime<Utc>,
         events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        self.create_job_with_steps_at(job, &[], now, events, &[])
+            .await
+    }
+
+    /// Admit a job WITH its materialized steps: the job row, every
+    /// step row, the caller's job events and one STEP_CREATED per
+    /// step commit in ONE transaction, or none of them do.
+    ///
+    /// This is the honest shape of admission (backlog f2ba226e). Until
+    /// 2026-09-16 the handler committed the job through
+    /// `create_job_at` and then wrote each step through `add_step_at`
+    /// — ten transactions for a pr-train — warning on a failed step
+    /// and answering 201 regardless. On a slow database (pr-train
+    /// 06e5610f, 02:32Z) the client timed out, axum dropped the
+    /// handler between step nine and step ten, and the terminal was
+    /// never written: no error, a packet that could neither advance
+    /// nor be cancelled, ninety minutes on the track. A dropped
+    /// request now drops one open transaction, and the database
+    /// rolls it back — the row a reader can see is always the whole
+    /// graph.
+    ///
+    /// `step_events` is index-aligned with `steps` — one STEP_CREATED
+    /// each, the event the rebuilder (`rebuild.rs`) reproduces the
+    /// row from. A length mismatch is refused before any write: a
+    /// short zip would record fewer events than rows and the replayed
+    /// projection would hold fewer steps than the live one. The
+    /// replay guard is per row, as before: a job or step whose id
+    /// already exists inserts nothing and records nothing.
+    async fn create_job_with_steps_at(
+        &self,
+        job: &Job,
+        steps: &[Step],
+        now: DateTime<Utc>,
+        job_events: &[boss_core::event::Event],
+        step_events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError>;
@@ -525,19 +746,38 @@ pub trait JobsRepository: Send + Sync {
 
     /// Every machine the estate declares.
     ///
-    /// READ ONLY, AND DELIBERATELY SO. `nodes` is seeded by schema
-    /// migration — declaring a machine is a change to the tree that
-    /// converges, not an API write — so there is no create/update here
-    /// and there should not be. What is missing today is any way to
-    /// READ it: the tables have existed since 144-estate-subjects.sql
-    /// and no service has ever served them, so "what hardware is
-    /// running" was unanswerable from inside BOSS and had to be
-    /// re-derived by shelling into machines (59ef456a).
+    /// Declaring a machine is a change to the TREE that converges
+    /// (infra/estate/estate.toml), never a hand write: until backlog
+    /// ee368d0c (2026-09-18) the tree's copy was a schema migration, so
+    /// every fresh database — every OSS install — carried this LAN's
+    /// nodes; now the launcher publishes the tree's declaration through
+    /// `declare_estate_nodes` on every start, insert-if-absent. What was
+    /// missing before either existed was any way to READ it: the tables
+    /// had existed since 144-estate-subjects.sql and no service served
+    /// them, so "what hardware is running" was unanswerable from inside
+    /// BOSS and had to be re-derived by shelling into machines
+    /// (59ef456a).
     ///
     /// DECLARED capacity, not observed. Free space now is a
     /// measurement with a timestamp and belongs on the log, which is
     /// what the `node` subject kind's own description says.
     async fn list_estate_nodes(&self) -> Result<Vec<EstateNode>, JobsError>;
+
+    /// Land the tree's declaration, insert-if-absent: a `nodes` row and
+    /// its `subjects` identity for each id not already there (a row
+    /// already there is KEPT — its notes and capacity as the last
+    /// declaration or migration left them, never overwritten), and a
+    /// `node_roles` row for each (node, role) pair not already there,
+    /// on kept nodes too. One `node.declared` fact per node the batch
+    /// changed, staged in the write's own transaction; none for a node
+    /// it left alone. A role that is not a Class of `node` is refused
+    /// by the schema's FK — the vocabulary stays registry data
+    /// (202609120300).
+    async fn declare_estate_nodes(
+        &self,
+        declared: &[EstateNodeInput],
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<EstateBatchOutcome, JobsError>;
 
     /// Recent recorded events of ONE exact kind, newest first, as the
     /// raw rows `{event_id, timestamp, source, kind, payload}`.
@@ -776,14 +1016,16 @@ pub trait JobsRepository: Send + Sync {
                         job_id: job.id,
                         job_title: job.title.clone(),
                         due_on: job.due_on,
+                        opened_on: job.opened_on,
                         workflow: job.kind.clone(),
                         workflow_version: job.workflow_version,
                         subject_kind: boss_core::primitives::Subject::kind(&job.subject)
                             .to_string(),
                         subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                         priority: job.priority,
-                        simulated: job.simulated,
+                        partition: job.partition,
                         tags: job.tags.clone(),
+                        red_trains: crate::yard::red_trains_of(&job.metadata),
                         step,
                     });
                     if out.len() >= limit as usize {
@@ -831,13 +1073,15 @@ pub trait JobsRepository: Send + Sync {
                     job_id: job.id,
                     job_title: job.title.clone(),
                     due_on: job.due_on,
+                    opened_on: job.opened_on,
                     workflow: job.kind.clone(),
                     workflow_version: job.workflow_version,
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                     priority: job.priority,
-                    simulated: job.simulated,
+                    partition: job.partition,
                     tags: job.tags.clone(),
+                    red_trains: crate::yard::red_trains_of(&job.metadata),
                     step,
                 });
                 if out.len() >= limit as usize {
@@ -855,8 +1099,8 @@ pub trait JobsRepository: Send + Sync {
     /// `kind` by its PINNED `workflow_version` and reports counts,
     /// closed-outcome distribution, and open→close cycle-time stats.
     ///
-    /// `since` keeps packets opened on/after that date; `simulated`
-    /// partitions like [`JobFilter::simulated`] (`None` is every
+    /// `since` keeps packets opened on/after that date; `partition`
+    /// partitions like [`JobFilter::partition`] (`None` is every
     /// packet). A kind with no packets reports an empty Vec — absence
     /// is a fact, not an error.
     ///
@@ -867,15 +1111,35 @@ pub trait JobsRepository: Send + Sync {
         &self,
         kind: &str,
         since: Option<chrono::NaiveDate>,
-        simulated: Option<bool>,
+        partition: Option<Partition>,
     ) -> Result<Vec<VersionTerminalReport>, JobsError> {
         let filter = JobFilter {
             kind: Some(kind.to_string()),
-            simulated,
+            partition,
             ..Default::default()
         };
         let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;
         Ok(terminal_report_from_jobs(&jobs, since))
+    }
+
+    /// The most recently CLOSED packet of `kind` — the newest terminal
+    /// a department's readiness read reports per protocol (backlog
+    /// 1dffde5d). Newest by `closed_on`, ties broken newest-opened
+    /// first; `None` when no packet of the kind has closed. Cancelled
+    /// packets are terminal but not closed, so they do not count — the
+    /// same line `workflow_terminal_report` draws.
+    ///
+    /// The default impl is the pure [`newest_closed_from_jobs`] over
+    /// every closed packet of the kind — honest but O(packets); the
+    /// Postgres adapter answers with one ordered `LIMIT 1`.
+    async fn newest_closed_job(&self, kind: &str) -> Result<Option<Job>, JobsError> {
+        let filter = JobFilter {
+            kind: Some(kind.to_string()),
+            status: Some(JobStatus::Closed),
+            ..Default::default()
+        };
+        let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;
+        Ok(newest_closed_from_jobs(jobs))
     }
 
     /// Every outstanding obligation in `scope` — `ready` / `active`

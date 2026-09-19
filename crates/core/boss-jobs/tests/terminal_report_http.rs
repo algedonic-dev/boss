@@ -20,6 +20,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
+use boss_core::partition::Partition;
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
@@ -79,6 +80,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -95,7 +97,7 @@ fn packet(
     opened: NaiveDate,
     closed: Option<NaiveDate>,
     outcome: Option<&str>,
-    simulated: bool,
+    partition: Partition,
 ) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::new_v4()),
@@ -114,7 +116,7 @@ fn packet(
             None => serde_json::json!({}),
         },
         tags: vec![],
-        simulated,
+        partition,
     }
 }
 
@@ -161,7 +163,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 10),
             Some(d(2026, 8, 11)),
             Some("approved"),
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -170,7 +172,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 10),
             Some(d(2026, 8, 13)),
             Some("approved"),
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -179,7 +181,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 12),
             Some(d(2026, 8, 17)),
             Some("rejected"),
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -188,7 +190,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 15),
             None,
             None,
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -197,7 +199,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 14),
             None,
             Some("approved"),
-            false,
+            Partition::Real,
         ),
         // v1: two dated closes (cycle days 2, 8) — one with no
         // declared outcome (the catch-all close) — and a cancellation,
@@ -210,7 +212,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 1),
             Some(d(2026, 8, 3)),
             Some("rejected"),
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -219,7 +221,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 1),
             Some(d(2026, 8, 9)),
             None,
-            false,
+            Partition::Real,
         ),
         packet(
             "tasting-panel",
@@ -228,7 +230,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 2),
             None,
             None,
-            false,
+            Partition::Real,
         ),
         // A different kind entirely — must not leak into the report.
         packet(
@@ -238,7 +240,7 @@ fn tasting_panel_fixture() -> Vec<Job> {
             d(2026, 8, 1),
             Some(d(2026, 8, 2)),
             Some("returned"),
-            false,
+            Partition::Real,
         ),
     ]
 }
@@ -274,7 +276,7 @@ async fn precise_stamps_beat_the_one_day_date_resolution() {
                     d(2026, 8, 20),
                     Some(d(2026, 8, 20)),
                     None,
-                    false,
+                    Partition::Real,
                 ),
                 serde_json::json!({
                     "outcome": "done",
@@ -290,7 +292,7 @@ async fn precise_stamps_beat_the_one_day_date_resolution() {
                 d(2026, 8, 20),
                 Some(d(2026, 8, 22)),
                 Some("done"),
-                false,
+                Partition::Real,
             ),
             // v1, half a stamp: no `opened_at`, so the dates answer = 1.
             with_metadata(
@@ -301,7 +303,7 @@ async fn precise_stamps_beat_the_one_day_date_resolution() {
                     d(2026, 8, 20),
                     Some(d(2026, 8, 21)),
                     None,
-                    false,
+                    Partition::Real,
                 ),
                 serde_json::json!({
                     "outcome": "done",
@@ -318,7 +320,7 @@ async fn precise_stamps_beat_the_one_day_date_resolution() {
                     d(2026, 8, 20),
                     None,
                     None,
-                    false,
+                    Partition::Real,
                 ),
                 serde_json::json!({
                     "outcome": "done",
@@ -433,7 +435,7 @@ async fn two_versions_report_their_outcome_mixes_newest_first() {
 }
 
 #[tokio::test]
-async fn simulated_filter_partitions_and_is_labeled() {
+async fn partition_filter_partitions_and_is_labeled() {
     let (app, jobs) = app();
     seed(
         &jobs,
@@ -445,7 +447,7 @@ async fn simulated_filter_partitions_and_is_labeled() {
                 d(2026, 8, 10),
                 Some(d(2026, 8, 11)),
                 Some("returned"),
-                false,
+                Partition::Real,
             ),
             packet(
                 "keg-return",
@@ -454,7 +456,7 @@ async fn simulated_filter_partitions_and_is_labeled() {
                 d(2026, 8, 10),
                 Some(d(2026, 8, 12)),
                 Some("returned"),
-                true,
+                Partition::Simulated,
             ),
             packet(
                 "keg-return",
@@ -463,7 +465,17 @@ async fn simulated_filter_partitions_and_is_labeled() {
                 d(2026, 8, 10),
                 Some(d(2026, 8, 15)),
                 Some("lost"),
-                true,
+                Partition::Simulated,
+            ),
+            // Shadow (packet 508cc38c): in neither legacy lane.
+            packet(
+                "keg-return",
+                4,
+                JobStatus::Closed,
+                d(2026, 8, 10),
+                Some(d(2026, 8, 11)),
+                Some("returned"),
+                Partition::Shadow,
             ),
         ],
     )
@@ -480,7 +492,8 @@ async fn simulated_filter_partitions_and_is_labeled() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["simulated"], "all");
-    assert_eq!(body["versions"][0]["total"], 3);
+    assert_eq!(body["partition"], "all");
+    assert_eq!(body["versions"][0]["total"], 4);
 
     let (status, body) = get_report(
         &app,
@@ -491,7 +504,11 @@ async fn simulated_filter_partitions_and_is_labeled() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["simulated"], "true");
-    assert_eq!(body["versions"][0]["total"], 2);
+    assert_eq!(body["partition"], "simulated");
+    assert_eq!(
+        body["versions"][0]["total"], 2,
+        "the N-1 simulated=true is exactly the simulated company: no shadow"
+    );
     assert_eq!(
         body["versions"][0]["outcomes"],
         serde_json::json!({ "lost": 1, "returned": 1 })
@@ -506,6 +523,24 @@ async fn simulated_filter_partitions_and_is_labeled() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["simulated"], "false");
+    assert_eq!(body["partition"], "real");
+    assert_eq!(
+        body["versions"][0]["total"], 1,
+        "the N-1 simulated=false is real only: the shadow packet is excluded as a simulated one is"
+    );
+
+    // The three-valued spelling: shadow is reachable only by name,
+    // and the legacy label has no word for it.
+    let (status, body) = get_report(
+        &app,
+        "/api/workflows/keg-return/terminal-report?partition=shadow",
+        "emp-1",
+        "reporter",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["partition"], "shadow");
+    assert_eq!(body["simulated"], "all");
     assert_eq!(body["versions"][0]["total"], 1);
 
     let (status, _) = get_report(
@@ -519,6 +554,18 @@ async fn simulated_filter_partitions_and_is_labeled() {
         status,
         StatusCode::BAD_REQUEST,
         "simulated is true|false|all"
+    );
+    let (status, _) = get_report(
+        &app,
+        "/api/workflows/keg-return/terminal-report?partition=nonsense",
+        "emp-1",
+        "reporter",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "partition is real|simulated|shadow"
     );
 }
 
@@ -552,7 +599,7 @@ async fn since_filters_on_opened_date() {
                 d(2026, 8, 1),
                 Some(d(2026, 8, 2)),
                 Some("shipped"),
-                false,
+                Partition::Real,
             ),
             packet(
                 "morning-brew",
@@ -561,7 +608,7 @@ async fn since_filters_on_opened_date() {
                 d(2026, 8, 10),
                 Some(d(2026, 8, 12)),
                 Some("shipped"),
-                false,
+                Partition::Real,
             ),
         ],
     )
@@ -634,7 +681,7 @@ async fn arm_stamped_packets_report_as_their_own_cohorts() {
                     d(2026, 8, 20),
                     Some(d(2026, 8, 21)),
                     None,
-                    false,
+                    Partition::Real,
                 ),
                 arm("candidate", "returned"),
             ),
@@ -647,7 +694,7 @@ async fn arm_stamped_packets_report_as_their_own_cohorts() {
                     d(2026, 8, 20),
                     Some(d(2026, 8, 25)),
                     None,
-                    false,
+                    Partition::Real,
                 ),
                 arm("control", "returned"),
             ),
@@ -660,7 +707,7 @@ async fn arm_stamped_packets_report_as_their_own_cohorts() {
                 d(2026, 8, 1),
                 None,
                 None,
-                false,
+                Partition::Real,
             ),
         ],
     )

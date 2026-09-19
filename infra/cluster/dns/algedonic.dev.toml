@@ -1,0 +1,131 @@
+# infra/cluster/dns/algedonic.dev.toml — what the DNS zone algedonic.dev
+# SHOULD say (design 4c565f8c; backlog 5e58922c). Until 2026-09-16 every
+# record of the zone was hand-set in the Cloudflare UI except one a Job
+# created with an API token, and nothing recorded what the zone should
+# hold — so a record that vanished, or one nobody remembered adding, was
+# invisible until a hostname stopped answering.
+#
+# This file is the DECLARATION. `check-declared.sh` beside it compares
+# the zone's live records against it in the vocabulary design 16115a17
+# decided (MATCH / DRIFT / ABSENT / UNDECLARED); the `dns.observe`
+# dispatcher handler reads the zone daily with the broker's root token
+# and files the comparison as a `dns-zone-observation` packet, raising
+# an estate alarm on DRIFT or ABSENT. A record the zone holds that no
+# entry here names is UNDECLARED: reported on the packet, never a
+# failure — the third state, the honest reading of a zone nobody had
+# measured whole.
+#
+# APPLY, SO FAR, ONLY BEHIND AN INTERLOCK. A record declaring
+# `interlock = "access"` names a hostname that must not be reachable
+# from the internet without a Cloudflare Access application in front
+# of it (backlog 198c5fe9: never expose the production gateway without
+# Access). The `dns.observe` handler APPLIES such a record — creates it
+# when ABSENT, replacing whatever other type the name held; corrects
+# it when DRIFT — only once it has read the application access.toml
+# declares for that name as PRESENT WITH AN ALLOW POLICY, in the same
+# firing; until then the record stays exactly as it is and the
+# observation packet says `flip held — Access app absent` on it (a
+# HELD verdict, reported and not alarmed). A record without the key is
+# compared and reported only — the rotation handler
+# (credential.rotate.cloudflare-tunnel) is the writer of the tunnel
+# CNAMEs it is told about, and applying the whole file (a converge
+# step with a Zone:DNS:Edit-scoped token) remains the follow-on car.
+#
+# EACH ENTRY: `name` is the FQDN as Cloudflare lists it; `type`,
+# `proxied` and `ttl` are compared verbatim against the live record
+# (`ttl = 1` is Cloudflare's "auto", the only TTL a proxied record can
+# carry); `target` is the record's content, or a REFERENCE the
+# comparator resolves at compare time; `why` says what the record is
+# for, so a reader can tell a door from a decoration.
+#
+# `target = "tunnel:<credential id>"` names a Cloudflare Tunnel by the
+# credential-registry row that holds its credentials (see
+# /api/credentials). The tunnel's id changes on EVERY rotation, so a
+# hardcoded `<uuid>.cfargotunnel.com` here would drift the next time
+# the broker rotated — the reference is resolved from the installed
+# Secret's TunnelID (the row's storage_location names the Secret), and
+# the comparator is handed the resolution (`--tunnel <id>=<uuid>`).
+
+zone = "algedonic.dev"
+
+# The operating site — the system of record's door — behind the
+# Cloudflare Tunnel the in-cluster connector serves (the connector
+# already routes boss.algedonic.dev -> boss-gateway.boss; tunnel_ingress
+# on every converge) and behind the Access application access.toml
+# declares for it, so the edge asks who you are before a request
+# reaches the gateway. Applied by dns.observe behind the interlock
+# above; the first observation after 198c5fe9 lands is the flip.
+#
+# HISTORY. From 2026-08-12 until that flip this record was
+# `A 10.20.0.33, proxied = false, ttl = 300`: a grey-cloud A record to
+# the cluster's ingress on the LAN/WireGuard network, DNS-only so that
+# nothing on the internet was told the address answers — the
+# operators' door until Access existed for boss. — created by the
+# dns-record Job in infra/cluster/manifests/boss-tls.yaml (Secret
+# cloudflare-api-token; the 300 s TTL was that Job's). Moving it
+# behind the tunnel before an Access policy existed would have exposed
+# the production gateway, which is why the flip waited, and why it now
+# rides an interlock instead of a hand. That Job is one-shot and
+# completed; re-run, its A upsert would be refused by Cloudflare (a
+# CNAME shares its name with nothing), and it left the tree with the
+# whole Let's Encrypt path on 2026-09-17 (backlog 21c17ebc), once
+# boss. answered through the edge (this record read MATCH).
+[[record]]
+name = "boss.algedonic.dev"
+type = "CNAME"
+target = "tunnel:cloudflare-tunnel-credentials"
+proxied = true
+ttl = 1
+interlock = "access"
+why = "the operating site, behind the Cloudflare Tunnel and the Access application declared for it"
+
+# The public worked example (the demo tenant), served through the
+# Cloudflare Tunnel the in-cluster cloudflared connector runs. Written
+# by the broker's rotation handler on every rotation (first on
+# 2026-09-16, rotation packet e202c7c3), proxied, TTL auto. No
+# interlock key: the rotation handler owns this record (a second
+# writer would race its connector cutover), so the observer compares
+# and reports it only; the Access application in front of it is
+# declared in access.toml and compared there.
+# The identity provider. Until 2026-09-16 this record pointed at the OLD
+# tunnel (the connector on boss-gcp, whose ingress was a hand-written
+# file there) and was declared nowhere; the tunnel was rotated, the old
+# one deleted, and every OIDC login answered 530 for a day (fd75c641).
+# The tunnel routes it as a declared origin (infra/cluster/tunnel-origins.toml)
+# and this record follows the same tunnel reference the instances use,
+# applied by the observer once the converge records the route.
+[[record]]
+name = "id.algedonic.dev"
+type = "CNAME"
+target = "tunnel:cloudflare-tunnel-credentials"
+proxied = true
+ttl = 1
+interlock = "tunnel"
+why = "the identity provider (Kanidm) every OIDC login discovers; routed by the tunnel as a declared origin, so it moves with the tunnel"
+
+[[record]]
+name = "playground.algedonic.dev"
+type = "CNAME"
+target = "tunnel:cloudflare-tunnel-credentials"
+proxied = true
+ttl = 1
+why = "public example tenant, behind the Cloudflare Tunnel the connector serves"
+
+# The company website (design b64c4377, decided by David 2026-09-17):
+# static pages from the tenant repo's site/, served by prod's gateway
+# under this name — instances.toml declares it as prod's `site`, the
+# tunnel routes it to the same gateway boss. reaches (tunnel_ingress on
+# every converge names it `www.algedonic.dev → boss (site)`), and the
+# gateway answers it from the delivered boss-site ConfigMap with no
+# session. Behind Access until the public-launch design (the same
+# interlock as boss.: applied once the application access.toml declares
+# for this name reads present with an allow policy), so the record is
+# never created ahead of the door in front of it.
+[[record]]
+name = "www.algedonic.dev"
+type = "CNAME"
+target = "tunnel:cloudflare-tunnel-credentials"
+proxied = true
+ttl = 1
+interlock = "access"
+why = "the company website, served by prod's gateway from the tenant's site/ through the same tunnel; behind Access until the public launch"

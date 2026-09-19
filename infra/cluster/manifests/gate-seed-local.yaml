@@ -1,0 +1,102 @@
+# gate-seed-local — the gate's warm seed lives on the build node's own
+# filesystem, so a gate's copy of it is a REFLINK, not a rewrite.
+#
+# THE MEASUREMENT (backlog 5b3dabb5, 2026-09-11). Every gate copied the
+# warm target (tens of GB) from a Longhorn block volume into its per-run
+# emptyDir with `cp -a` — 184 s per gate, and every byte of the seed
+# WRITTEN to w-1's SSD each time; every green gate near tip copied it
+# back to refresh the seed. w-1's NVMe had ~61 TB written in 16.7 days
+# (~3.6 TB/day, /sys/block/nvme0n1/stat) with ~38 h of all-tasks IO
+# stall: the seed copy was the single largest writer. A reflink copy
+# (`cp --reflink=auto`, FICLONE) shares extents and writes only metadata
+# — but only within ONE filesystem, and a Longhorn volume carries its
+# own ext4. Talos puts every emptyDir on the EPHEMERAL partition's xfs
+# (nvme0n1p4 on w-1, reflink-capable); a `local` PersistentVolume on a
+# directory of that same partition puts the seed there too.
+#
+# WHAT THIS DECLARES, cluster-scoped, so it is converged from here and
+# not applied by `boss gate` (whose credential is namespaced) — and the
+# one thing it cannot declare:
+#   - a StorageClass with no provisioner and WaitForFirstConsumer, the
+#     standard shape for a hand-declared local volume;
+#   - the PersistentVolume itself: 200Gi of /var/local/gate-seed on
+#     w-1, Retain (a warm seed is minutes of every gate; never reclaim
+#     it by accident), bound only on w-1 by nodeAffinity;
+#   - NOT the directory itself. A local PV refuses a path that does
+#     not exist, and nothing in this cluster may make one: the only
+#     Kubernetes way is a hostPath mount, and boss-dev — no pod-security
+#     labels of its own — enforces the Talos DEFAULT profile, which is
+#     `baseline`, and baseline refuses hostPath. MEASURED 2026-09-12
+#     (backlog d42d4967): the first version of this file carried a
+#     prepare CronJob whose DirectoryOrCreate hostPath was to make the
+#     path; run by hand it created no pod in ten minutes, while the same
+#     Job with an emptyDir completed in twenty seconds, and the gate
+#     could not have told us (it applies nothing). The directory is
+#     therefore the NODE's declaration — TWO entries in w-1's Talos
+#     machine config, DECLARED at infra/cluster/talos/patches/w-1.yaml
+#     (backlog 08430090; until 2026-09-15 they lived only on a laptop,
+#     and this comment restated them — a fact that lived twice). The
+#     first, `machine.files`, makes the directory; Talos creates the
+#     parents at boot. The second, `machine.kubelet.extraMounts`, lets
+#     the kubelet SEE it: on Talos the kubelet runs in its own mount
+#     namespace with a fixed set of host paths, and /var/local is not
+#     one of them — MEASURED 2026-09-12 04:21-13:30Z: with the directory
+#     present on the host (`talosctl ls /var/local/` listed it) a pod
+#     mounting the PVC sat nine hours at ContainerCreating while the
+#     kubelet logged, 296 times, `MountVolume.NewMounter initialization
+#     failed for volume "gate-seed-w-1": path "/var/local/gate-seed"
+#     does not exist`. The same arrangement local-path-provisioner needs
+#     on Talos. How to apply, and how to read the live node against the
+#     declaration (infra/cluster/talos/check-declared.sh), is in
+#     infra/cluster/talos/README.md; the kubelet restarts, running pods
+#     survive, no reboot. The PROOF is a pod in boss-dev that mounts
+#     the PVC and writes a file — `talosctl ls` is the host's view and
+#     passed while the mount failed, so it proves nothing about the
+#     mount. A rebuilt w-1 gets both back from its config, which is
+#     where a node's own filesystem belongs; ownership is the gate pod's
+#     fsGroup (1500) at mount, the arrangement the Longhorn seed relied
+#     on.
+#     infra/lint/no-manifest-mounts-a-hostpath.sh refuses the hostPath
+#     mount coming back.
+#
+# WHAT IT COSTS. The PV's node affinity makes gating REQUIRE w-1: the
+# gate-runner's "preferred, not required" build-node affinity is now
+# effectively required through the claim, so cordoning w-1 stops gating
+# instead of degrading it. That is the honest trade — the seed was
+# always w-1's disk in practice (its Longhorn replica lived there), and
+# the pipeline's other write sinks already assume the build node.
+#
+# THE MIGRATION. The first gate after this lands finds an empty seed —
+# run.sh says "no warm seed — cold build" and pays ~20 min once — and
+# its green refresh writes the seed back BY REFLINK. From the second
+# gate on, the copy is metadata. The old Longhorn claim
+# `gate-runner-disk` stays declared in infra/gate-runner/gate-runner.yaml
+# until the new seed is warm, then a car retires it (delete-orphan-object).
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gate-seed-local
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gate-seed-w-1
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gate-seed-local
+  local:
+    path: /var/local/gate-seed
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: ["w-1"]}

@@ -21,9 +21,11 @@
 #
 # An undeclared uid is not a cosmetic gap, because the cliff is
 # cluster-wide rather than per-namespace: boss.yaml enforces the baseline
-# profile on the boss namespace only, and restricted:latest is the Talos
-# machine-config DEFAULT outside this repo. Tightening that default would
-# hit every namespace at once — so these are not N independent small
+# profile on the boss namespace only, and the Talos machine-config
+# DEFAULT outside this repo — measured 2026-09-12 (d42d4967): enforce
+# baseline, warn restricted:latest — is what every unlabelled namespace
+# takes. Tightening that default to restricted would hit every namespace
+# at once — so these are not N independent small
 # risks, they are one switch away from being one large one. A workload
 # that states runAsNonRoot + runAsUser survives that switch; one that
 # inherits its uid from an image is admitted or refused on a property no
@@ -59,6 +61,8 @@
 # roster that has drifted from its directory (CLAUDE.md §9a).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 DIR="infra/cluster/manifests"
 
@@ -68,8 +72,6 @@ EXEMPT=(
     "boss-dev.yaml	part (3) of 5234cda4, and it is worse than the hard set: the dev container needs SETGID/SETUID for the ssh door, so it can never reach drop-ALL — only baseline compliance. A car editing this file rolls the dev pod on converge and ends the live operator session, so it lands only at a David-timed restart (boss-dev-manifest-cars-restart-the-session)."
     "boss.yaml	holds THREE workloads with three different answers: the SoR postgres StatefulSet (the gate-runner car had to read /proc to establish postgres runs as 999), the nats StatefulSet, and the SoR app Deployment whose strategy is Recreate — so any roll of it is a full outage of :7900. Carries fsGroup: 1500 today, which is the volume half of the answer and not the user half. One car each, measured."
     "boss-backup.yaml	the documented trap: its ship-key is defaultMode 0400 and only ever succeeded because the pod runs as root, so runAsNonRoot breaks the offsite leg and reports it as an SSH failure. Also carries a postgres container and a google/cloud-sdk container, each with its own uid answer."
-    "boss-tls.yaml	goacme/lego writes ACME account + certificate material, and alpine/k8s shells kubectl; neither uid has been measured."
-    "boss-tls-front.yaml	caddy:2.8-alpine, whose data/config dir uid has not been measured."
     "boss-estate-observe.yaml	alpine/k8s, uid unmeasured — and a separate car is holding this file, so declaring it here would collide rather than land."
 )
 
@@ -156,4 +158,5 @@ if [ "$checked" -lt "$MIN_CHECKED" ]; then
 fi
 
 [ "$fail" = 0 ] || exit 1
+lint_scanned a-workload-declares-the-user-it-runs-as "$checked" "workload(s) under $DIR"
 echo "workload-declares-user: OK — $checked workload(s) declare the uid they run as (${#EXEMPT[@]} exempt, each with a reason)"

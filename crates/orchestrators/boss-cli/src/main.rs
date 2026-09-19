@@ -10,11 +10,14 @@ mod census;
 mod channels;
 mod credential;
 mod delivery_policy;
-mod deploy;
 mod design;
+mod dispatch;
+mod dispatch_hook;
 mod dock_preview;
 mod doctor;
+mod documents;
 mod envelope;
+mod estate;
 mod freshness;
 mod gate;
 mod git_auth;
@@ -24,7 +27,9 @@ mod inspect;
 mod job;
 mod merged;
 mod ops;
+mod ops_request;
 mod orient;
+mod owner;
 mod park;
 mod prove;
 mod publish;
@@ -34,12 +39,27 @@ mod receipt;
 mod rerail;
 mod running;
 mod script;
+mod steps;
+mod tenant;
+mod tenant_export;
+mod tenant_publish;
+mod tenant_stamp;
 mod train;
+mod train_gate;
 mod upgrade;
 mod workflow;
 
 #[derive(Parser)]
-#[command(name = "boss", about = "Boss operator + developer CLI", version = built_from::VERSION)]
+#[command(
+    name = "boss",
+    about = "Boss operator + developer CLI",
+    version = built_from::version(),
+    // Backups have no verb: the cluster's boss-pg-backup CronJob
+    // (infra/cluster/manifests/boss-backup.yaml) is the backup, nightly,
+    // with its own packet. `boss backup` ran the bare-metal host
+    // backup script, retired with that path on 2026-09-18 (e109bd71).
+    after_help = "Backups: the cluster's boss-pg-backup CronJob is the backup (infra/cluster/manifests/boss-backup.yaml); there is no `boss backup` verb."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -74,45 +94,6 @@ enum Commands {
         #[command(subcommand)]
         action: ScriptAction,
     },
-    /// Build, install, and restart services
-    Deploy {
-        #[command(subcommand)]
-        action: DeployAction,
-    },
-    /// Check health of all services, Postgres, NATS, and backups
-    Status {
-        /// Output as JSON (for Claude Code / machine parsing)
-        #[arg(long)]
-        json: bool,
-    },
-    /// Restart a service without rebuilding
-    Restart {
-        /// Service name (assets, catalog, people, commerce, etc.)
-        service: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// View service logs via journalctl
-    Logs {
-        /// Service name
-        service: String,
-        /// Number of log lines to show
-        #[arg(short = 'n', long, default_value = "50")]
-        lines: u32,
-        /// Follow log output (like tail -f)
-        #[arg(short, long)]
-        follow: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Trigger a manual backup (pg_dump + configs)
-    Backup {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Asset maintenance subcommands
     Assets {
         #[command(subcommand)]
@@ -144,6 +125,28 @@ enum Commands {
     Train {
         #[command(subcommand)]
         action: TrainAction,
+    },
+    /// File an ops-request to a host — the terminal's handle on the door
+    /// that replaced ssh (729329c6). The call is validated against
+    /// infra/ops/verbs/ HERE, with the rules the host's runner
+    /// applies: an unknown verb, a host the verb does not serve, a
+    /// missing or out-of-pattern arg is refused before a packet exists.
+    /// `--wait` polls the packet to the host's answer and prints its
+    /// output and exit code, the way `boss gate --wait` does for a gate.
+    /// Five of these were filed by hand on 2026-09-12 (3d6daea9).
+    Ops {
+        /// Estate node id the request is for (forge, boss-gcp).
+        host: String,
+        /// A verb name — a file infra/ops/verbs/<verb>.json.
+        verb: String,
+        /// Positional args, one per param the verb declares.
+        args: Vec<String>,
+        /// Poll the packet until the host answers; print output and exit code.
+        #[arg(long)]
+        wait: bool,
+        /// Validate and show what would be filed, without filing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Launch a gate for a branch — files or reuses the gate-run
     /// packet, renders the runner Job, and creates it.
@@ -296,6 +299,16 @@ enum Commands {
         /// `git rebase origin/main`, which the refusal prints.
         #[arg(long, value_name = "REASON")]
         stale_base_anyway: Option<String>,
+        /// Replay a stale car onto origin/main before gating. When the
+        /// base is BEHIND, the car's commits are cherry-picked onto
+        /// origin/main in a TEMPORARY worktree and the branch is moved on
+        /// the forge with a lease on its old head; the gate then judges
+        /// the replayed head. A conflict is refused naming the files, with
+        /// nothing pushed. Your own worktree is never touched. Measured
+        /// 2026-09-12: seven cars rebased by hand, each the same three
+        /// steps, because trains land every ~45 min.
+        #[arg(long)]
+        rebase: bool,
         /// Gate and deliberately do NOT park: stamp `hold: <reason>` on
         /// the gate-run so its green reads HELD (in the yard, `boss
         /// orient` and the stranded-green alarm) rather than stranded.
@@ -359,6 +372,16 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// The cadence registry's write verbs — retire a rule by name,
+    /// publish a version from its bundle file (13d1fff3). The loop
+    /// that RUNS the schedule is `boss train cadence`.
+    ///
+    /// Grouped like `Workflow`: a new cadence verb lands inside
+    /// `CadenceAction`, not as another variant here (84f9fbc0).
+    Cadence {
+        #[command(subcommand)]
+        action: CadenceAction,
+    },
     /// A session's first verb: trains in transit, gates running,
     /// stranded greens, the dock, and the task queue — the approach in
     /// one read, with the startup checklist at the end (CLAUDE.md
@@ -384,10 +407,73 @@ enum Commands {
         /// branch. Omit it to print the invariants alone.
         packet: Option<String>,
     },
+    /// Hand a protocol step to an agent, as a packet (design c87fb59b
+    /// car 2): claims the step as you, opens an `agent-run` with the
+    /// step's own agent block (model, budget, effort — from its
+    /// Workflow row; a step declaring none is refused, naming the
+    /// fix), and PRINTS the exact prompt: `boss brief`'s rendering plus
+    /// the run id. The prompt is stdout and nothing else is, so
+    /// `boss dispatch <packet> > prompt.txt` is what you paste.
+    Dispatch {
+        /// The hook's door (design 511fa7d4 car 2b): read a Claude Code
+        /// PreToolUse payload on stdin and record the Agent call as a
+        /// run — dispatch the packet the prompt names with the prompt as
+        /// its brief (the run section comes back on stdout as the
+        /// tool's updatedInput), link a run the prompt already carries,
+        /// or count an untracked run. <PACKET> is then the work-session
+        /// packet the run belongs to, or `-` for none.
+        #[arg(long)]
+        from_hook: bool,
+        /// The packet: its full uuid, 8+ characters of its id, or its
+        /// branch. With --report, the RUN (the agent-run id `boss
+        /// dispatch` printed).
+        packet: String,
+        /// The step's slug. Omit it when the packet is at exactly one.
+        #[arg(long, conflicts_with = "report")]
+        step: Option<String>,
+        /// Override the block's model (must be on the rate card).
+        #[arg(long, conflicts_with = "report")]
+        model: Option<String>,
+        /// Override the block's budget, in USD.
+        #[arg(long, conflicts_with = "report")]
+        budget: Option<f64>,
+        /// Override the block's effort: low, medium or high.
+        #[arg(long, conflicts_with = "report")]
+        effort: Option<String>,
+        /// The other end of the run: record the builder's handback on
+        /// the run named by <PACKET>, complete its `reported` step when
+        /// the green has opened it, and write the finish to agent_runs.
+        #[arg(long, requires = "summary")]
+        report: bool,
+        /// With --report: the handback (packet, branch, sha, gate, what
+        /// changed, what it saw).
+        #[arg(long, requires = "report")]
+        summary: Option<String>,
+        /// With --report: what the run cost in dollars, as the session's
+        /// usage line reports it.
+        #[arg(long, requires = "report")]
+        spend_usd: Option<f64>,
+        /// With --report: the token count — a total (761000) or the
+        /// input,output split (740000,21000); only a split is priced.
+        #[arg(long, requires = "report")]
+        tokens: Option<String>,
+    },
     /// Where the IT department's work comes from — the input-channel
     /// mix (user-feedback vs monitoring/error-discovery), the algedonic
-    /// reading over recent work (docs/design/it-delivery-channels.md).
-    Channels,
+    /// reading over recent work (docs/design/it-delivery-channels.md) —
+    /// plus the delivery mix over the dock and the per-tier mix
+    /// (ba429e7f): is the core settling while work moves outward.
+    Channels {
+        /// Read each CLOSED train's merge commit in this checkout and
+        /// stamp software_tiers on the train (idempotent: a train that
+        /// carries it is skipped) instead of printing the mixes.
+        #[arg(long)]
+        backfill_tiers: bool,
+        /// The window: trains closed on or after this date (YYYY-MM-DD).
+        /// Default for the mix: the last 30 days; for the backfill: all.
+        #[arg(long)]
+        since: Option<chrono::NaiveDate>,
+    },
     /// A conflict-skipped car back aboard, with the traps encoded:
     /// new branch from current main (never a force-push), rebase with
     /// ONE human stop on a real conflict, gate, receipt machine-copied
@@ -419,9 +505,14 @@ enum Commands {
     Design {
         /// The doc's title.
         title: String,
-        /// The doc body, markdown.
+        /// The doc body, as TEXT. A file name here is refused — two
+        /// designs reached review with a /tmp path for a body (backlog
+        /// 1763d5af); pass the file with --markdown-file instead.
         #[arg(long, default_value = "")]
         markdown: String,
+        /// The doc body, read from this file. Exclusive with --markdown.
+        #[arg(long, conflicts_with = "markdown")]
+        markdown_file: Option<std::path::PathBuf>,
         /// An open question as `anchor|title|proposal`. Repeatable.
         #[arg(long = "question")]
         questions: Vec<String>,
@@ -432,6 +523,14 @@ enum Commands {
         /// The docs/design path this packet mirrors, when there is one.
         #[arg(long)]
         doc_path: Option<String>,
+        /// The user-feedback or backlog-item this design decides (id or
+        /// 8+ char prefix). Records the `answers` job edge on the
+        /// design and gives that packet's open design-review a real
+        /// question; when the design is published, the dispatcher
+        /// completes that step with the verdict — one decision, not
+        /// two (backlog 5f0b2661).
+        #[arg(long)]
+        answers: Option<String>,
     },
     /// Prove a merged car in production by RUNNING a probe.
     ///
@@ -485,6 +584,16 @@ enum Commands {
         /// unrunnable in the other (f9304366).
         #[arg(long, conflicts_with_all = ["probe", "expect", "exit_only"])]
         from_car: bool,
+        /// The machine's door: what the forge's ops-runner runs for a
+        /// `run-car-probe` ops-request (backlog 9f00a805, replacing the
+        /// shell twin infra/forge/run-car-probe.sh). Nobody is reading,
+        /// so every outcome is written on the car and the exit code IS
+        /// the verdict: 0 proven, 1 not proven, 3 did not run, 75 not
+        /// yet, 2 refused. The car is a full id; the probe runs as
+        /// BOSS_PROBE_USER in BOSS_PROBE_DIR under BOSS_PROBE_TIMEOUT
+        /// with the read-only reader on its PATH, never as root.
+        #[arg(long, requires = "from_car", conflicts_with_all = ["recheck", "replace", "dry_run", "verified", "method", "probe_anyway"])]
+        unattended: bool,
         /// Run a probe this verb REFUSES, stating why.
         ///
         /// The refusal it escapes is the one rule `boss gate
@@ -520,9 +629,12 @@ enum Commands {
     /// branch as a bundle on a packet; this verb — run where the forge
     /// credential lives — verifies the bundle against the declared
     /// shas and pushes, or refuses with the reason on the packet.
-    /// Never force-pushes. Also runs inside every `boss train run`,
-    /// before reconcile/board, so a fresh branch can be gated the same
-    /// cycle.
+    /// Never force-pushes. Also runs at the head of every `boss train
+    /// reconcile` (the ten-minute tick) and `boss train run` (the
+    /// twice-daily window), before reconcile/board, so a fresh branch
+    /// can be gated the same cycle — it rode `run` alone until
+    /// 2026-09-15, which after the cadence split left a filed branch
+    /// waiting up to 12 h (backlog 03e81aa9).
     PublishRequests {
         /// Clone to fetch and push in. Defaults to the working
         /// directory.
@@ -597,6 +709,12 @@ enum Commands {
     Receipt(receipt::Cmd),
     #[command(flatten)]
     Running(running::Cmd),
+    #[command(flatten)]
+    Steps(steps::Cmd),
+    #[command(flatten)]
+    Tenant(tenant::Cmd),
+    #[command(flatten)]
+    Estate(estate::Cmd),
 }
 
 #[derive(Subcommand)]
@@ -762,24 +880,6 @@ enum PacketAction {
         #[arg(long)]
         jobs_url: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum DeployAction {
-    /// List all deployable services
-    List,
-    /// Deploy a service (or all if no service specified)
-    Run {
-        /// Service name (e.g. assets, shipping, gateway). Omit for all.
-        service: Option<String>,
-        /// Skip cargo build (install existing binary only)
-        #[arg(long)]
-        skip_build: bool,
-    },
-    /// Build and deploy the web frontend
-    Web,
-    /// Remove debug build artifacts to free disk space
-    Clean,
 }
 
 #[derive(Subcommand)]
@@ -952,6 +1052,27 @@ enum WorkflowAction {
 }
 
 #[derive(Subcommand)]
+enum CadenceAction {
+    /// Retire the active version of a cadence rule — the schedule
+    /// switched off by a verb, recorded as `jobs.cadence.retired`,
+    /// confirmed by reading the lineage back. A name with nothing
+    /// active is refused (the door's 404).
+    Retire {
+        /// The rule's name, e.g. `protocol-retro-daily`.
+        name: String,
+    },
+    /// Publish a cadence rule at the version its bundle file declares
+    /// (`infra/platform/cadence/<name>.toml`, read by the seed loader
+    /// — one definition for the seed and this verb). Retires the prior
+    /// active row; refused (409) unless the version is above the
+    /// newest of the lineage — a publish is a version bump.
+    Publish {
+        /// The bundle file to publish.
+        file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum JobAction {
     /// One packet in a stable shape: kind and protocol version, every
     /// step by slug/kind/status/holder/authority with the ready one
@@ -986,6 +1107,15 @@ enum JobAction {
         /// Max rows (default 50).
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Only packets whose metadata CONTAINS this key=value (string
+        /// values; repeat to require several at once). `--where
+        /// branch=feat/x` is the car, not a page that may hold it.
+        #[arg(long = "where", value_name = "KEY=VALUE")]
+        wheres: Vec<String>,
+        /// Only packets carrying this top-level metadata key, whatever
+        /// its value (e.g. `--has estate_finding`). One key per run.
+        #[arg(long, value_name = "KEY")]
+        has: Vec<String>,
     },
     /// Create a packet with the whole envelope defaulted — no more
     /// one-422-per-missing-field guessing. Confirms by reading the
@@ -1052,24 +1182,6 @@ async fn main() -> Result<()> {
             ScriptAction::List { category } => script::list(category.as_deref()).await,
             ScriptAction::Info { id } => script::info(&id).await,
         },
-        Commands::Deploy { action } => match action {
-            DeployAction::List => deploy::list().await,
-            DeployAction::Run {
-                service,
-                skip_build,
-            } => deploy::run(service.as_deref(), skip_build).await,
-            DeployAction::Web => deploy::deploy_web().await,
-            DeployAction::Clean => deploy::clean().await,
-        },
-        Commands::Status { json } => ops::status(json).await,
-        Commands::Restart { service, json } => ops::restart(&service, json).await,
-        Commands::Logs {
-            service,
-            lines,
-            follow,
-            json,
-        } => ops::logs(&service, lines, follow, json).await,
-        Commands::Backup { json } => ops::backup(json).await,
         Commands::Assets { action } => match action {
             AssetsAction::RebuildProjection { postgres_url } => {
                 cmd_assets_rebuild_projection(&postgres_url).await
@@ -1225,6 +1337,17 @@ async fn main() -> Result<()> {
             } => workflow::publish(&kind, &spec, dry_run).await,
             WorkflowAction::Discard { kind, version } => workflow::discard(&kind, version).await,
         },
+        Commands::Ops {
+            host,
+            verb,
+            args,
+            wait,
+            dry_run,
+        } => ops_request::run(host, verb, args, wait, dry_run).await,
+        Commands::Cadence { action } => match action {
+            CadenceAction::Retire { name } => cadence::retire(&name).await,
+            CadenceAction::Publish { file } => cadence::publish(&file).await,
+        },
         Commands::Job { action } => match action {
             JobAction::Get { job, json } => job::get(&job, json).await,
             JobAction::Station { station, json } => job::station(&station, json).await,
@@ -1232,43 +1355,77 @@ async fn main() -> Result<()> {
                 kind,
                 status,
                 limit,
-            } => job::list(kind, status, limit).await,
+                wheres,
+                has,
+            } => job::list(kind, status, limit, wheres, has).await,
             JobAction::File {
                 kind,
                 title,
                 priority,
                 metadata,
                 subject_id,
-            } => {
-                job::file(
-                    &kind,
-                    &title,
-                    priority,
-                    metadata,
-                    subject_id,
-                    chrono::Utc::now(),
-                )
-                .await
-            }
+            } => job::file(&kind, &title, priority, metadata, subject_id).await,
             JobAction::Patch { job, patch } => job::patch(&job, &patch).await,
         },
         Commands::Orient { all } => orient::run(all).await,
         Commands::Brief { packet } => brief::run(packet).await,
-        Commands::Channels => channels::run().await,
+        Commands::Dispatch {
+            from_hook: true,
+            packet,
+            ..
+        } => dispatch_hook::run(packet).await,
+        Commands::Dispatch {
+            from_hook: false,
+            packet,
+            step,
+            model,
+            budget,
+            effort,
+            report,
+            summary,
+            spend_usd,
+            tokens,
+        } => {
+            if report {
+                dispatch::report(
+                    packet,
+                    summary.unwrap_or_default(),
+                    spend_usd,
+                    tokens,
+                    chrono::Utc::now(),
+                )
+                .await
+            } else {
+                dispatch::run(packet, step, model, budget, effort).await
+            }
+        }
+        Commands::Channels {
+            backfill_tiers,
+            since,
+        } => {
+            if backfill_tiers {
+                channels::backfill_tiers(since).await
+            } else {
+                channels::run(since, chrono::Utc::now()).await
+            }
+        }
         Commands::Design {
             title,
             markdown,
+            markdown_file,
             questions,
             no_questions,
             doc_path,
+            answers,
         } => {
             design::run(
                 title,
                 markdown,
+                markdown_file,
                 questions,
                 no_questions,
                 doc_path,
-                chrono::Utc::now(),
+                answers,
             )
             .await
         }
@@ -1289,8 +1446,12 @@ async fn main() -> Result<()> {
             replace,
             dry_run,
             from_car,
+            unattended,
             probe_anyway,
         } => {
+            if unattended {
+                return prove::run_unattended(&car, chrono::Utc::now()).await;
+            }
             prove::run(
                 &car,
                 probe,
@@ -1341,6 +1502,7 @@ async fn main() -> Result<()> {
             park_proof_event,
             force_regate,
             stale_base_anyway,
+            rebase,
             hold,
         } => {
             let park = gate::ParkIntent {
@@ -1366,6 +1528,7 @@ async fn main() -> Result<()> {
                 park,
                 force_regate,
                 stale_base_anyway,
+                rebase,
                 hold,
                 // Wall-clock at the CLI boundary, minted once: the queue's
                 // ordering key and its heartbeat are real elapsed time on
@@ -1421,6 +1584,9 @@ async fn main() -> Result<()> {
         Commands::Merged(cmd) => merged::dispatch(cmd),
         Commands::Receipt(cmd) => receipt::dispatch(cmd).await,
         Commands::Running(cmd) => running::dispatch(cmd),
+        Commands::Steps(cmd) => steps::dispatch(cmd).await,
+        Commands::Tenant(cmd) => tenant::dispatch(cmd).await,
+        Commands::Estate(cmd) => estate::dispatch(cmd),
     }
 }
 
@@ -1641,9 +1807,9 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         for expected in [
-            "doctor", "emit", "upgrade", "script", "deploy", "status", "restart", "logs", "backup",
-            "assets", "sim", "ledger", "inspect", "train", "gate", "park", "merged", "receipt",
-            "running", "workflow", "job", "prove", "publish", "queue", "packet", "audit",
+            "doctor", "emit", "upgrade", "script", "assets", "sim", "ledger", "inspect", "train",
+            "gate", "park", "merged", "receipt", "running", "workflow", "job", "prove", "publish",
+            "queue", "packet", "audit", "triage", "fold", "hold", "release",
         ] {
             assert!(
                 names.contains(&expected),

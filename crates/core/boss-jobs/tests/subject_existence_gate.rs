@@ -114,6 +114,7 @@ fn build_app(existence: Option<Arc<dyn SubjectExistenceCheck>>) -> (Router, Arc<
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -145,7 +146,7 @@ fn job_with_subject(subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 

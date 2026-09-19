@@ -59,6 +59,53 @@ pub fn repo_root() -> PathBuf {
     compiled
 }
 
+/// The authored dispatcher-rule registry, `infra/dispatcher/rules/` —
+/// the directory the dispatcher seeds `dispatcher_rules` from at boot
+/// (`boss_dispatcher::rules::seed`, backlog 41ba00cd) — under
+/// [`repo_root`], so it inherits the wrong-tree refusal.
+///
+/// One definition of where the rules live. Until 2026-09-14 seven test
+/// files across boss-dispatcher and boss-dispatcher-handlers each
+/// spelled `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../infra/
+/// dispatcher/rules")` (backlog 94f150f9; CLAUDE.md §9a) — a path that
+/// answers about the tree the binary was COMPILED from, without the
+/// check above. It lives here rather than in either crate's test
+/// support because both crates already depend on this one and neither
+/// can reach the other's `tests/common`.
+pub fn dispatcher_rules_dir() -> PathBuf {
+    repo_root().join("infra/dispatcher/rules")
+}
+
+/// Copy the shared lint library — every file under `infra/lint/lib/` —
+/// into a fixture tree at `<fixture>/infra/lint/lib/`, so a lint copied
+/// into that fixture finds what it sources the way it does in the repo.
+///
+/// One definition of "what a copied lint needs beside it". Until
+/// 2026-09-18 each fixture test copied the one or two libs its lint
+/// happened to source, and adding a sourced helper to a lint
+/// (`lib/scanned.sh`, backlog cdf2d959) broke four fixtures at once:
+/// the copied lint ran, failed to source, and the failure read as a
+/// verdict about the fixture. The directory is the definition
+/// (CLAUDE.md §9a), so a lib added tomorrow is carried without this
+/// function changing.
+pub fn copy_lint_libs(fixture: &Path) {
+    let src = repo_root().join("infra/lint/lib");
+    let dst = fixture.join("infra/lint/lib");
+    std::fs::create_dir_all(&dst).unwrap_or_else(|e| panic!("create {}: {e}", dst.display()));
+    let entries = std::fs::read_dir(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+    let mut copied = 0;
+    for entry in entries {
+        let path = entry.expect("a lib entry").path();
+        if path.extension().is_some_and(|e| e == "sh") {
+            let to = dst.join(path.file_name().expect("a file name"));
+            std::fs::copy(&path, &to)
+                .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", path.display(), to.display()));
+            copied += 1;
+        }
+    }
+    assert!(copied > 0, "{} holds no .sh to copy", src.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +164,24 @@ mod tests {
             "these test files define their own repo_root() instead of using \
              boss_testing::repo_root, which refuses a binary from another tree: {offenders:?}"
         );
+    }
+
+    /// The rules directory is the authored registry — one file per rule
+    /// plus its README — resolved under the SAME root, so it carries the
+    /// same wrong-tree refusal rather than a second, unguarded path.
+    #[test]
+    fn the_dispatcher_rules_dir_is_the_authored_registry_under_this_root() {
+        let dir = dispatcher_rules_dir();
+        assert_eq!(dir, repo_root().join("infra/dispatcher/rules"));
+        assert!(dir.join("README.md").is_file(), "{}", dir.display());
+        let rule_files = std::fs::read_dir(&dir)
+            .expect("read the rules dir")
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "toml"))
+            })
+            .count();
+        assert!(rule_files > 0, "no rule files under {}", dir.display());
     }
 
     #[test]

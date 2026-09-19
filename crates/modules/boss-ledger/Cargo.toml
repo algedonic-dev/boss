@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+futures = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "rust_decimal", "uuid"], optional = true }
@@ -93,6 +94,10 @@ name = "http_api"
 required-features = ["postgres"]
 
 [[test]]
+name = "live_facts_e2e"
+required-features = ["postgres"]
+
+[[test]]
 name = "period_ownership_e2e"
 required-features = ["postgres"]
 
@@ -102,6 +107,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "posting_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "posting_rules_e2e"
 required-features = ["postgres"]
 
 [[test]]
@@ -134,4 +143,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "supersede_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "chart_pg"
 required-features = ["postgres"]

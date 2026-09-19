@@ -53,14 +53,18 @@ set -uo pipefail
 LINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$LINT_DIR/../.." || exit 1
 # shellcheck source=infra/lint/lib/trunk-ref.sh
-. "$LINT_DIR/lib/trunk-ref.sh"
+. "$LINT_DIR/lib/trunk-ref.sh" || exit 3
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$LINT_DIR/lib/scanned.sh" || exit 3
 
 LINT=steptype-bundle-ratchet
 BUNDLE="crates/core/boss-jobs/seeds/step_types.toml"
 [ -f "$BUNDLE" ] || { echo "$LINT: $BUNDLE not found" >&2; exit 1; }
 
-# Trunk resolution is lib/trunk-ref.sh, shared with the other three
-# baseline-comparing lints. Absent trunk refs are a refusal here, not a
+# Trunk resolution is lib/trunk-ref.sh, shared with the other two
+# baseline-comparing lints (a third, a-kind-bundle-does-not-tighten,
+# checked a strict subset of this ratchet and was deleted on 2026-09-18,
+# backlog cdf2d959). Absent trunk refs are a refusal here, not a
 # silent pass — a ratchet that cannot see the trunk certifies nothing.
 # A git that could not ANSWER is a different refusal, and saying "fetch
 # the trunk" at it is a wrong remediation: measured on 2026-09-11 in a
@@ -152,14 +156,19 @@ while IFS=$'\t' read -r kind field ftype freq; do
         # A kind existing on trunk must still exist: removal changes
         # the contract of every in-flight step of that kind (unknown
         # kinds validate permissively) through the unversioned door.
-        if ! printf '%s\n' "$head_rows" | grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")"; then
+        # Here-strings, not `printf | grep -q`: under pipefail a `grep -q`
+        # that exits at its match SIGPIPEs the multi-line writer and the
+        # pipeline reports 141 for a row that IS present — here a false
+        # "kind removed"; below, a real tightening waved through as a
+        # new kind (measured in a-kind-bundle-does-not-tighten, 28af807c).
+        if ! grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" <<< "$head_rows"; then
             say "steptype-bundle-ratchet: kind \`$kind\` exists on the trunk and is removed here." \
                 " In-flight steps of that kind lose their contract at the next restart;" \
                 " retire behaviour through the versioned workflow path instead (cdc23602)."
         fi
         continue
     fi
-    head_row=$(printf '%s\n' "$head_rows" | awk -F'\t' -v k="$kind" -v f="$field" '$1==k && $2==f' | head -1)
+    head_row=$(awk -F'\t' -v k="$kind" -v f="$field" '$1==k && $2==f { print; exit }' <<<"$head_rows")
     if [ -z "$head_row" ]; then
         say "steptype-bundle-ratchet: field \`$field\` on kind \`$kind\` exists on the trunk and is removed here — a bundle contract change with no version to pin against."
         continue
@@ -179,7 +188,7 @@ EOF
 # New fields on kinds that already existed on the trunk must be optional.
 while IFS=$'\t' read -r kind field ftype freq; do
     [ -n "$kind" ] && [ "$ftype" != "KIND" ] || continue
-    printf '%s\n' "$base_rows" | grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" || continue  # new kind: free
+    grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" <<< "$base_rows" || continue  # new kind: free
     [ -n "$(printf '%s\n' "$base_rows" | awk -F'\t' -v k="$kind" -v f="$field" '$1==k && $2==f')" ] && continue  # existed: handled above
     if [ "$freq" = "true" ]; then
         say "steptype-bundle-ratchet: NEW required field \`$field\` on existing kind \`$kind\` — this retightens every in-flight \`$kind\` step at the next restart. Declare it required = false, or carry the contract on a new workflow version instead."
@@ -192,4 +201,5 @@ if [ "$problems" -gt 0 ]; then
     echo "steptype-bundle-ratchet: $problems tightening(s) refused — the bundle is the unversioned half of the completion contract." >&2
     exit 1
 fi
+lint_scanned "$LINT" "$base_kinds" "step kind(s) at the merge-base with $trunk"
 echo "steptype-bundle-ratchet: bundle only loosened or grew optional fields ($base_kinds kinds checked against $trunk)"

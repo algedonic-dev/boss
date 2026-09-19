@@ -1,14 +1,16 @@
 // Mocked-backend Playwright config — the CI-gated frontend smoke layer.
 //
-// Unlike playwright.config.ts (which runs the suite against the live
-// backend via the dev-server proxy + seeds a scratch stack in
-// globalSetup), this config runs specs that intercept EVERY `/api/**`
-// call in-browser. So it needs only the dev-server serving the SPA
+// The specs under tests/mocked intercept EVERY `/api/**` call
+// in-browser, so this config needs only the dev-server serving the SPA
 // shell — no backend, no seeding — which makes it fast, deterministic,
 // and safe to gate in the fast `web` CI job. See tests/mocked/_mockApi.ts.
+// (Until 2026-09-18 a sibling playwright.config.ts ran a live-backend
+// suite against a scratch stack; nothing ran it, and it went with
+// design 0e07ce64. The live crawl is playwright.live.config.ts.)
 
 import { defineConfig } from '@playwright/test';
 
+import { MOCKED_FLAG } from './src/dev-mocked';
 import { DEFAULT_PORT } from './src/dev-tree';
 
 // The port the runner chose. It is usually DEFAULT_PORT, but when the
@@ -103,9 +105,11 @@ export default defineConfig({
         timeout: 180_000,
         stdout: 'pipe',
         stderr: 'pipe',
-        // BOSS_SCRATCH is irrelevant (every /api call is mocked), but
-        // 0 avoids the dev-server trying to reach scratch services.
-        env: { BOSS_SCRATCH: '0' },
+        // The same environment tests/run-mocked.ts gives the server:
+        // mocked mode answers an /api/** miss locally (82b87a09), and
+        // BOSS_SCRATCH=0 keeps the unreached proxy table off the
+        // scratch ports.
+        env: { BOSS_SCRATCH: '0', [MOCKED_FLAG]: '1' },
       },
   projects: [
     {

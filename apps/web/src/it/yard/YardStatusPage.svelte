@@ -19,6 +19,7 @@
     fetchYardStatus,
     journeyText,
     phaseLabel,
+    redsCell,
     trainTone,
     type YardStatus,
   } from './yard-status';
@@ -129,7 +130,7 @@
     {:else}
       <table class="ys-table">
         <thead>
-          <tr><th>car</th><th>branch</th><th>parked</th></tr>
+          <tr><th>car</th><th>branch</th><th>parked</th><th>reds</th></tr>
         </thead>
         <tbody>
           {#each s.dock as c (c.id)}
@@ -137,6 +138,41 @@
               <td>{c.title}</td>
               <td class="ys-mono">{c.branch ?? '—'}</td>
               <td class="ys-mono ys-dim">{c.parked_since}</td>
+              <!-- Strikes: one red behind a car is the state in which the
+                   NEXT red holds it out, so it takes the warn token the
+                   page already uses; a clean car's cell is blank (cb6714de). -->
+              <td class="ys-mono ys-reds">{redsCell(c.red_trains)}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+
+    <!-- 01b — HELD CARS: standing on the dock, unable to board, with the
+         reason written on the review step. The server has stated this
+         lane since #367 and the parser has read it; the page drew only
+         the held GREENS below, so a car held out for two reds — the one
+         state an operator must act on — showed on the yard map alone
+         (b6522ff9). Always drawn, empty state included: this lane going
+         quiet is exactly how it went unread. -->
+    <div class="ys-section">01b — HELD CARS</div>
+    {#if s.held_cars.length === 0}
+      <p class="ys-quiet">none held</p>
+    {:else}
+      <p class="ys-quiet">
+        Parked, gated green, and held out — released by clearing the hold, not by another gate.
+      </p>
+      <table class="ys-table">
+        <thead>
+          <tr><th>branch</th><th>reason</th><th>reds</th><th>since</th></tr>
+        </thead>
+        <tbody>
+          {#each s.held_cars as h (h.id)}
+            <tr>
+              <td class="ys-mono">{h.branch ?? '—'}</td>
+              <td>{h.reason}</td>
+              <td class="ys-mono ys-reds">{redsCell(h.red_trains)}</td>
+              <td class="ys-mono ys-dim">{h.parked_since}</td>
             </tr>
           {/each}
         </tbody>
@@ -162,6 +198,16 @@
           {/each}
         </tbody>
       </table>
+    {/if}
+
+    <!-- The recency lanes read a window; the server says when the record
+         held more. Held greens are read by their hold, not by this window
+         (2fa96d34), so the notice names the lanes it is about. -->
+    {#if s.gate_runs?.truncated}
+      <p class="ys-quiet">
+        Slots, garage, limbo and stranded read the newest {s.gate_runs.window} gate-runs;
+        held greens are listed from the whole record.
+      </p>
     {/if}
 
     <!-- 03 — STRANDED: green gates no car claims (cheap signal) -->
@@ -265,6 +311,7 @@
   .ys-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline, #2a3138); }
   .ys-mono { font-family: var(--font-mono, ui-monospace, monospace); }
   .ys-dim { color: var(--static, #7a838c); }
+  .ys-reds { color: var(--warn, #d9a441); }
   .ys-stranded { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }
   .ys-stranded li { color: var(--warn, #d9a441); font-size: 13px; }
   .ys-held { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }

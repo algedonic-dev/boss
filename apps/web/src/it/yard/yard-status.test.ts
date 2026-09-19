@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import {
   blockLabel,
   boardHold,
-  boardsWhen,
   clockText,
   conductorReading,
   elapsedText,
@@ -14,6 +13,7 @@ import {
   parseYardStatus,
   phaseLabel,
   queueLabel,
+  redsCell,
   etaDetail,
   etaReading,
   trainTone,
@@ -122,6 +122,20 @@ describe('parseYardStatus', () => {
     ]);
   });
 
+  // The recency lanes (slots, garage, limbo, stranded) read the newest N
+  // gate-runs and the server says when the record held more (2fa96d34:
+  // a held green fell off that window and the lane said none held). The
+  // held lane is read from the record by its hold, so the notice is
+  // about the OTHER lanes — and an older server that says nothing is no
+  // reading, never "not truncated".
+  test('the gate-run window and whether it was cut are read as stated, or as no reading', () => {
+    const cut = parseYardStatus({ gate_runs_truncated: true, gate_run_window: 60 });
+    expect(cut.gate_runs).toEqual({ truncated: true, window: 60 });
+    const whole = parseYardStatus({ gate_runs_truncated: false, gate_run_window: 60 });
+    expect(whole.gate_runs).toEqual({ truncated: false, window: 60 });
+    expect(parseYardStatus({}).gate_runs).toBeNull();
+  });
+
   // A held CAR is a different answer from a held GREEN: the green has no
   // car yet (release = file one), the car is standing on the dock
   // (release = clear the marker). Two lanes, so a surface never has to
@@ -149,6 +163,29 @@ describe('parseYardStatus', () => {
       },
     ]);
     expect(parseYardStatus({}).held_cars).toEqual([]);
+  });
+
+  // The strike count rides the dock row (the Rust `DockCar`, which the
+  // held row flattens), so both lanes carry it: a stated integer is kept
+  // as stated — 0 included, since a stated 0 is "clean" and not "unknown"
+  // — and a row without it (an older server) leaves it undefined so the
+  // floor can fall back to the client's own reading rather than fabricate
+  // a count (ac80357b). Anything that is not a non-negative integer is
+  // not a count.
+  test('a dock or held row carries its red_trains as stated, or not at all', () => {
+    const row = { id: 'c', title: 'T', branch: 'fix/x', parked_since: '2026-09-08' };
+    const s = parseYardStatus({
+      dock: [{ ...row, red_trains: 1 }, row],
+      held_cars: [
+        { ...row, reason: 'why', red_trains: 2 },
+        { ...row, reason: 'why', red_trains: 0 },
+        { ...row, reason: 'why' },
+        { ...row, reason: 'why', red_trains: '2' },
+        { ...row, reason: 'why', red_trains: -1 },
+      ],
+    });
+    expect(s.dock.map(d => d.red_trains)).toEqual([1, undefined]);
+    expect(s.held_cars.map(h => h.red_trains)).toEqual([2, 0, undefined, undefined, undefined]);
   });
 
   // Every lane row names the gate-run packet behind it and the head it
@@ -184,6 +221,21 @@ describe('parseYardStatus', () => {
     expect(s.garage[0]!.failed_check).toBeNull();
   });
 
+  test('a garaged car carries the line its check failed on; a server without one reads null', () => {
+    // 6730dccb: the receipt has carried WHY since #372 and the garage
+    // said only WHICH. The server now picks the failure's first line;
+    // an older server (or an older receipt) omits the key, and the
+    // absence must not read as a line.
+    const s = parseYardStatus({
+      garage: [
+        { branch: 'fix/why', failed_check: 'test', failed_line: "thread 'x' panicked at yard.rs:9:5:", since: '2026-09-15' },
+        { branch: 'fix/old', failed_check: 'test', since: '2026-09-03' },
+        { branch: 'fix/odd', failed_check: 'test', failed_line: 7, since: '2026-09-03' },
+      ],
+    });
+    expect(s.garage.map(g => g.failed_line)).toEqual(["thread 'x' panicked at yard.rs:9:5:", null, null]);
+  });
+
   test('a missing block is null, not an error', () => {
     const s = parseYardStatus({
       trains: [{ id: 't', title: 'x', phase: 'boarding', car_count: 0 }],
@@ -198,6 +250,74 @@ describe('parseYardStatus', () => {
       boarding: { dock_depth: 0, at_times: [], summary: 'x' },
     });
     expect(s.trains[0]!.block).toBeNull();
+  });
+
+  // The conductor stamps the train's `delivery_channel` — the heaviest
+  // of its cars' — at board, and the server row carries it as
+  // `channel` (cffef553, 2026-09-15). The page names it ('data train');
+  // a train boarded before the stamp, or one whose stamp names no
+  // channel the sidings know, is null and drawn as nothing — an old
+  // train has no default worth asserting.
+  test('a train carries its channel when the server sends one', () => {
+    const boarding = { dock_depth: 0, at_times: [], summary: 'x' };
+    for (const ch of ['data', 'config', 'software', 'infra'] as const) {
+      const s = parseYardStatus({
+        trains: [{ id: 't', title: 'x', phase: 'boarding', car_count: 1, channel: ch }],
+        boarding,
+      });
+      expect(s.trains[0]!.channel).toBe(ch);
+    }
+    const old = parseYardStatus({
+      trains: [{ id: 't', title: 'x', phase: 'boarding', car_count: 1 }],
+      boarding,
+    });
+    expect(old.trains[0]!.channel).toBeNull();
+    const odd = parseYardStatus({
+      trains: [{ id: 't', title: 'x', phase: 'boarding', car_count: 1, channel: 'firmware' }],
+      boarding,
+    });
+    expect(odd.trains[0]!.channel).toBeNull();
+  });
+
+  // EACH SIDING LANDS ON ITS OWN EVIDENCE (design c6bd173e, car 3 —
+  // edae6e8b). The server judges every car of a merged train on its
+  // channel's live evidence and sends the rows as `sidings`, each
+  // landing tagged by `kind`. A server that predates the lane sends
+  // none, and the floor then reads "landed" the way it did before.
+  test('the sidings lane parses each landing by its kind, and an old server sends none', () => {
+    const boarding = { dock_depth: 0, at_times: [], summary: 'x' };
+    const s = parseYardStatus({
+      boarding,
+      sidings: [
+        {
+          id: 'c1',
+          branch: 'fix/manifest',
+          train: 't1',
+          channel: 'config',
+          landing: { kind: 'landed', evidence: 'manifests applied and verified at 34db709', at: '2026-09-15T16:14:46Z' },
+        },
+        { id: 'c2', train: 't1', channel: 'infra', landing: { kind: 'converging', awaiting: 'host converge on 34db709: boss-gcp' } },
+        { id: 'c3', train: 't1', channel: 'software', landing: { kind: 'unread', why: 'the window begins after this merge' } },
+        // A landing kind this reader does not know is no reading at all.
+        { id: 'c4', train: 't1', channel: 'data', landing: { kind: 'teleported' } },
+        // A channel the sidings do not know stands on software, as a car does.
+        { id: 'c5', train: 't1', channel: 'firmware', landing: { kind: 'landed', evidence: 'x' } },
+      ],
+    });
+    expect(s.sidings).toEqual([
+      {
+        id: 'c1',
+        branch: 'fix/manifest',
+        train: 't1',
+        channel: 'config',
+        landing: { kind: 'landed', evidence: 'manifests applied and verified at 34db709', at: '2026-09-15T16:14:46Z' },
+      },
+      { id: 'c2', branch: null, train: 't1', channel: 'infra', landing: { kind: 'converging', awaiting: 'host converge on 34db709: boss-gcp' } },
+      { id: 'c3', branch: null, train: 't1', channel: 'software', landing: { kind: 'unread', why: 'the window begins after this merge' } },
+      { id: 'c4', branch: null, train: 't1', channel: 'data', landing: null },
+      { id: 'c5', branch: null, train: 't1', channel: 'software', landing: { kind: 'landed', evidence: 'x', at: null } },
+    ]);
+    expect(parseYardStatus({ boarding }).sidings).toEqual([]);
   });
 
   test('a null boarding block still parses to a well-formed predicate', () => {
@@ -438,75 +558,49 @@ describe('lastVerbReading', () => {
   });
 });
 
-describe('boardsWhen', () => {
-  const predicate = (over: Partial<BoardingPredicate> = {}): BoardingPredicate => ({
-    dock_threshold: 4,
-    cooldown_minutes: 120,
-    at_times: [],
-    cadence_reading: 'read',
-    dock_depth: 2,
-    threshold_met: false,
-    summary: 'Boards at 4 parked cars (then a 120m cooldown); 2 car(s) parked now.',
-    held_because: null,
-    cooldown_remaining_minutes: null,
-    last_board_at: null,
-    last_board_reading: 'read',
-    next_board: null,
-    ...over,
+// The boarding RULE line is the server's sentence, verbatim. Until
+// dec9c9df the page composed its own — `boardsWhen()` rebuilt "boards
+// when the cooldown (45m) clears · or by the clock…" in the browser
+// from cooldown_minutes / at_times — while the server already published
+// the sentence (`summary`, `next_board`) from the same rule rows. Two
+// derivations of one sentence: the server's cooldown wording changed on
+// 2026-09-14 (#371, the cooldown is the depth rule's) and the client's
+// text did not move, and the next rule change would have split them
+// again (a-surface-may-answer-differently-than-its-server). Pinned on
+// the source, in the yard-page-order idiom.
+describe('the boarding rule line is the server sentence', () => {
+  const here = (f: string): string => readFileSync(join(import.meta.dir, f), 'utf8');
+  const lens = here('yard-status.ts');
+  const yard = here('YardPage.svelte');
+  const statusPage = here('YardStatusPage.svelte');
+
+  test('the lens composes no boarding sentence of its own', () => {
+    expect(lens).not.toContain('function boardsWhen');
+    expect(lens).not.toContain('boards when the dock reaches');
+    expect(lens).not.toContain('or by the clock at');
+    expect(lens).toContain('composes no boarding sentence of its own');
   });
 
-  test('below threshold: states the RULE — depth and cooldown — never a time', () => {
-    const text = boardsWhen(predicate());
-    expect(text).toBe('2/4 parked — boards when the dock reaches 4 and the cooldown (120m) clears');
-    // The board rule is depth-triggered; there is no next-fire clock to
-    // show, and inventing one is the defect this page exists to avoid.
-    expect(text).not.toMatch(/\d\d:\d\d|next at|in \d+m/);
+  test("the yard board's rule line renders boarding.summary, and calls nothing to build it", () => {
+    expect(yard).not.toContain('boardsWhen');
+    expect(yard).toContain('status.data.boarding.summary');
+    const rule = yard.indexOf('<dt>rule</dt>');
+    expect(rule).toBeGreaterThan(-1);
+    expect(yard.slice(rule, rule + 200)).toContain('{boardingRule}');
   });
 
-  test('threshold met: says so, and that the cooldown is what it waits on', () => {
-    expect(boardsWhen(predicate({ dock_depth: 5, threshold_met: true }))).toBe(
-      'threshold met — 5/4 parked; boards when the cooldown (120m) clears',
-    );
+  test("the yard status page renders boarding.summary as the dock's sentence", () => {
+    expect(statusPage).toContain('{s.boarding.summary}');
+    expect(statusPage).not.toContain('boardsWhen');
   });
 
-  test('no cooldown configured: no cooldown clause', () => {
-    expect(boardsWhen(predicate({ cooldown_minutes: null }))).toBe(
-      '2/4 parked — boards when the dock reaches 4',
-    );
-    expect(boardsWhen(predicate({ cooldown_minutes: null, dock_depth: 4, threshold_met: true }))).toBe(
-      "threshold met — 4/4 parked; boards on the conductor's next pass",
-    );
-  });
-
-  test('a clock rule beside the depth rule is quoted verbatim from the registry', () => {
-    expect(boardsWhen(predicate({ at_times: ['06:00', '18:00'] }))).toBe(
-      '2/4 parked — boards when the dock reaches 4 and the cooldown (120m) clears · or by the clock at 06:00 / 18:00 UTC',
-    );
-  });
-
-  test('no depth rule: the server summary stands, or says nothing is configured', () => {
-    expect(boardsWhen(predicate({ dock_threshold: null, threshold_met: null, summary: 'Boards at 06:00 UTC.' })))
-      .toBe('Boards at 06:00 UTC.');
-    expect(boardsWhen(predicate({ dock_threshold: null, threshold_met: null, summary: '' })))
-      .toBe('no boarding rule configured');
-  });
-
-  // efe6ef10: the server says the dock could not be read (dock_depth
-  // null, threshold_met null). A lens that falls through to the
-  // below-threshold branch has reproduced the defect one layer out — and
-  // `0/4 parked — boards when the dock reaches 4` is the sentence an
-  // operator acts on.
-  test('an unread depth states the absence, never a 0/N parked reading', () => {
-    const text = boardsWhen(predicate({ dock_depth: null, threshold_met: null }));
-    expect(text).toBe('dock depth unread — the 4-car threshold cannot be evaluated');
-    expect(text).not.toContain('parked');
-    expect(text).not.toContain('boards when the dock reaches');
-  });
-
-  test('an unread depth still quotes a clock rule, which never reads the depth', () => {
-    expect(boardsWhen(predicate({ dock_depth: null, threshold_met: null, at_times: ['06:00'] }))).toBe(
-      'dock depth unread — the 4-car threshold cannot be evaluated · or by the clock at 06:00 UTC',
-    );
+  test('the parser passes the server sentence through untouched', () => {
+    const sentence =
+      'Boards at 4 parked cars (min 45 min between depth-rule boards) or 06:00 / 18:00 UTC; 2 car(s) parked now — below the dock threshold.';
+    const b = parseYardStatus({
+      boarding: { dock_threshold: 4, cooldown_minutes: 45, dock_depth: 2, at_times: ['06:00', '18:00'], summary: sentence },
+    }).boarding;
+    expect(b.summary).toBe(sentence);
   });
 });
 
@@ -630,20 +724,19 @@ describe('the readings on the wire', () => {
     expect(junk.cadence_reading).toBeNull();
   });
 
-  test("an unread cadence renders the server's sentence, not a rule it invented", () => {
-    const text = boardsWhen(
-      parseYardStatus({
-        boarding: {
-          dock_threshold: null,
-          dock_depth: 2,
-          at_times: [],
-          cadence_reading: 'unread',
-          summary: 'Cannot say when a train boards — the boarding cadence could not be read; 2 car(s) parked now.',
-        },
-      }).boarding,
-    );
-    expect(text).toContain('the boarding cadence could not be read');
-    expect(text).not.toContain('no boarding rule configured');
+  test("an unread cadence keeps the server's sentence, not a rule the lens invented", () => {
+    const b = parseYardStatus({
+      boarding: {
+        dock_threshold: null,
+        dock_depth: 2,
+        at_times: [],
+        cadence_reading: 'unread',
+        summary: 'Cannot say when a train boards — the boarding cadence could not be read; 2 car(s) parked now.',
+      },
+    }).boarding;
+    expect(b.cadence_reading).toBe('unread');
+    expect(b.summary).toContain('the boarding cadence could not be read');
+    expect(b.summary).not.toContain('no boarding rule configured');
   });
 });
 
@@ -734,6 +827,7 @@ describe('trainTone', () => {
     ci_result: null,
     pr_url: null,
     car_count: 0,
+    channel: null,
     boarded_at: null,
     eta: { kind: 'unknown', reason: 'not under test' },
   };
@@ -745,6 +839,20 @@ describe('trainTone', () => {
   });
   test('an arrived train is muted', () => {
     expect(trainTone({ ...base, phase: 'arrived' })).toBe('muted');
+  });
+});
+
+describe('redsCell', () => {
+  test('blank for a clean car — the clean row is unchanged', () => {
+    expect(redsCell(0)).toBe('');
+  });
+  test('an older server that states no count reads blank, not zero', () => {
+    expect(redsCell(undefined)).toBe('');
+  });
+  test('one red is singular, more are plural', () => {
+    expect(redsCell(1)).toBe('1 red');
+    expect(redsCell(2)).toBe('2 reds');
+    expect(redsCell(5)).toBe('5 reds');
   });
 });
 

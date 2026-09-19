@@ -128,6 +128,8 @@ set -uo pipefail
 NAME="a-fixture-path-cannot-be-a-literal"
 LINT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$LINT_DIR/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$LINT_DIR/lib/scanned.sh" || exit 3
 
 # The shared helper when the tree has it, an equivalent inline when it
 # does not. The car that adds lib/git-answer.sh is in flight alongside
@@ -135,11 +137,11 @@ cd "$LINT_DIR/../.." || exit 1
 # either merge order and uses the shared definition the moment it lands.
 # The exit code and the marker text are a PROTOCOL, not a duplicated
 # fact — infra/safe-cargo.sh, infra/forge/journal-read.sh,
-# infra/forge/run-car-probe.sh and infra/cluster/undeclared-objects.sh
+# boss prove --unattended and infra/cluster/undeclared-objects.sh
 # each already speak exit 3 for "could not answer".
 if [ -r "$LINT_DIR/lib/git-answer.sh" ]; then
     # shellcheck source=/dev/null
-    . "$LINT_DIR/lib/git-answer.sh"
+    . "$LINT_DIR/lib/git-answer.sh" || exit 3
 fi
 if ! declare -F git_answer >/dev/null 2>&1; then
     LINT_CANNOT_ANSWER=3
@@ -481,5 +483,6 @@ MSG
     exit 1
 fi
 
+lint_scanned "$NAME" "$scanned" "Rust file(s)"
 echo "$NAME: ok — $scanned Rust file(s) read, none builds a fixture at a fixed path under a shared temp directory"
 exit 0

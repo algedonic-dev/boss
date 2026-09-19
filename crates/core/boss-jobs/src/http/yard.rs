@@ -22,10 +22,10 @@ use super::*;
 use crate::yard;
 
 /// How wide the read windows are. Trains: `yard::TRAIN_WINDOW`, one per
-/// read. Cars / gate-runs: the stranded cross-ref wants the recent
-/// gating history and the dock's backing cars.
+/// read. Gate-runs: `yard::GATE_RUN_WINDOW` for the recency read, and
+/// the held read below. Cars: the dock's backing cars.
 const CAR_WINDOW: i64 = 400;
-const GATE_RUN_WINDOW: i64 = 60;
+use yard::{GATE_RUN_WINDOW, HELD_RUN_PAGE, HELD_RUN_PAGES};
 /// Keep closed trains from the last two weeks in the "recent" window —
 /// "recently arrived/cancelled", the tail the surface shows beside the
 /// in-flight trains.
@@ -55,7 +55,49 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     }
     let scope = job_scope_from_predicate(&user, &predicate);
     let now = boss_clock_client::now_from(&state.clock).await;
+    let YardRead {
+        status,
+        dock_reading,
+        health,
+        gate_runs_truncated,
+        ..
+    } = match read_yard(&state, &user, scope, now).await {
+        Ok(read) => read,
+        Err(resp) => return resp,
+    };
+    Json(with_gate_run_window(
+        with_dock_source(with_conductor(with_now(status, now), health), dock_reading),
+        gate_runs_truncated,
+    ))
+    .into_response()
+}
 
+/// What one pass over the yard's rows read: the assembled status with
+/// the readings that qualify it, and the rows themselves, so a second
+/// read-model over the same pass — the regions map
+/// (`http/regions.rs`, design 0524fc95) — is a function of the SAME
+/// rows the status is, not a second set of queries free to disagree.
+pub(super) struct YardRead {
+    pub status: yard::YardStatus,
+    pub dock_reading: yard::Reading,
+    pub health: yard::ConductorHealth,
+    pub gate_runs_truncated: bool,
+    /// Open pr-trains with their steps — the train-gate wait
+    /// (`regions::train_gate_troubled`) is a fact on the job's metadata
+    /// that the status does not carry.
+    pub open_trains: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>,
+}
+
+/// The yard status handler's read sequence, as a function. Every read
+/// that used to `return` a response returns it as `Err` here; the
+/// posture of each read (fail the request, or degrade to an admitted
+/// `None`) is unchanged and documented at each site.
+pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    scope: crate::port::JobScope,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<YardRead, Response> {
     // Trains: two reads, because one cannot hold both. The in-flight
     // trains are read whole — `status=open`, a handful at most — and the
     // recent tail through the retention window. They used to be ONE
@@ -84,11 +126,11 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
         .await
     {
         Ok((rows, _)) => rows,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
     let recent_rows = match state.jobs.list_jobs(&recent, yard::TRAIN_WINDOW, 0).await {
         Ok((rows, _)) => rows,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
 
     // Attach each train's steps — the phase and the block reason are facts
@@ -108,7 +150,9 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     for job in open_rows {
         let steps = match state.jobs.list_steps(&job.id).await {
             Ok(steps) => steps,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
+            }
         };
         open_trains.push((job, steps));
     }
@@ -119,7 +163,9 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     {
         let steps = match state.jobs.list_steps(&job.id).await {
             Ok(steps) => steps,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
+            }
         };
         closed_trains.push((job, steps));
     }
@@ -162,7 +208,7 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     // the same one the departure board uses. `None` when the row cannot
     // be read: the dock is then UNREAD, which the payload says rather
     // than drawing an empty lane (see [`dock_cars`]).
-    let dock_read = dock_cars(&state, scope.clone(), &user).await;
+    let dock_read = dock_cars(state, scope.clone(), user).await;
     // Derived ONCE, because two consumers answer with it: the boarding
     // block's depth, verdict and sentences, and `dock_source` beside the
     // dock lane. They were two reads of this same `Option` — honest, but
@@ -204,28 +250,40 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     };
     let heartbeat_rule = rules.iter().find(|r| r.name == HEARTBEAT_RULE);
     let heartbeat_minutes = heartbeat_rule.and_then(|r| r.every_minutes).map(i64::from);
-    // The board rule's last firing — the fact the cooldown hold is read
-    // from. The rule is found by SHAPE (the row declaring
-    // `min_dock_depth`), the same way the predicate finds its threshold,
-    // so a renamed row moves both together.
+    // The board rules' last firings — the depth rule's, which the
+    // cooldown hold is read from, and the clock rule's, so the last board
+    // is the newest of ANY rule that departs a train. Read the way the
+    // conductor reads them, one `last_firing(&rule.name)` per row; each
+    // rule is found by SHAPE (`min_dock_depth`, `at_times` + a departing
+    // verb), the same way the predicate finds its threshold and its
+    // windows, so a renamed row moves both together. Until 43fb424f only
+    // the depth rule was read, and a clock-window board never appeared
+    // in `last_board_at` — two trains 16 min apart under a stated 45.
     //
     // Three outcomes, not two: a firing, no firing (the rule has never
-    // boarded — an ANSWER), and a read that did not answer. `.ok()`
-    // collapsed the third into the second, and the three nulls that
-    // follow from it — `last_board_at`, `cooldown_remaining_minutes`,
-    // `held_because` — read together as "no cooldown in force, boards on
-    // the next tick", which is the permissive answer (31783deb).
-    let (last_board, last_board_reading) = match (state.cadence.as_ref(), yard::depth_rule(&rules))
-    {
-        (Some(repo), Some(rule)) => match repo.last_firing(&rule.name).await {
-            Ok(firing) => (firing, yard::Reading::Read),
-            Err(_) => (None, yard::Reading::Unread),
-        },
-        // No depth rule among rows we COULD read: there is no board rule,
-        // so there is no firing, and `None` is the answer. With the rows
-        // unread we cannot say that — and the cadence reading is exactly
-        // the fact that decides which of the two this is.
-        _ => (None, cadence_reading),
+    // boarded, or there is no such rule — an ANSWER), and a read that did
+    // not answer. `.ok()` collapsed the third into the second, and the
+    // three nulls that follow from it — `last_board_at`,
+    // `cooldown_remaining_minutes`, `held_because` — read together as "no
+    // cooldown in force, boards on the next tick", which is the
+    // permissive answer (31783deb). One reading covers both rows: they
+    // are one table on one connection, and a cooldown stated beside an
+    // unknown last board would be half an answer wearing a whole one's
+    // shape.
+    let (depth_firing, clock_firing, last_board_reading) = match state.cadence.as_ref() {
+        Some(repo) if cadence_reading == yard::Reading::Read => {
+            let (depth, clock) = tokio::join!(
+                firing_of(repo.as_ref(), yard::depth_rule(&rules)),
+                firing_of(repo.as_ref(), yard::clock_rule(&rules)),
+            );
+            match (depth, clock) {
+                (Ok(depth), Ok(clock)) => (depth, clock, yard::Reading::Read),
+                _ => (None, None, yard::Reading::Unread),
+            }
+        }
+        // With the rows unread there is nothing to read a firing under,
+        // and the cadence reading is exactly the fact that says so.
+        _ => (None, None, cadence_reading),
     };
     let policy = match state.delivery.as_ref() {
         Some(repo) => repo.active_policy("train-conductor").await.ok().flatten(),
@@ -234,23 +292,80 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
 
     // The stranded cross-ref: recent gate-runs (open and closed), each
     // with its steps so the green verdict can be read.
-    let gate_runs = {
-        let filter = JobFilter {
-            kind: Some("gate-run".to_string()),
-            scope: scope.clone(),
-            ..Default::default()
-        };
-        match state.jobs.list_jobs(&filter, GATE_RUN_WINDOW, 0).await {
-            Ok((rows, _)) => {
-                let mut out = Vec::with_capacity(rows.len());
-                for job in rows {
-                    let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
-                    out.push((job, steps));
-                }
-                out
+    //
+    // TWO READS, because one cannot hold both. The recency read is the
+    // newest GATE_RUN_WINDOW runs — the slots, the garage, limbo and the
+    // stranded lane are about what gated lately. A HELD green is not: it
+    // is the one state that exists to be SEEN until a person releases
+    // it, and it stays exactly as long as the hold does. On 2026-09-15
+    // the dev-pod car (gate-run 3164b0d5, green on `--hold` since 17:56Z
+    // the day before) had 80 gate-runs open behind it, fell out of the
+    // window, and the lane said none held (backlog 2fa96d34). A limit is
+    // not a filter: the held read narrows on the hold itself
+    // (`metadata_has = "hold"`, the `metadata ? $n` shape) and is merged
+    // in by id, so a held green is named whatever gated after it. The
+    // `total` of the recency read rides the payload as
+    // `gate_runs_truncated`, so the page can say the recency lanes were
+    // cut rather than let an empty stranded lane read as a fact.
+    let gate_run = |metadata_has: Option<&str>| JobFilter {
+        kind: Some("gate-run".to_string()),
+        metadata_has: metadata_has.map(str::to_string),
+        scope: scope.clone(),
+        ..Default::default()
+    };
+    let (recent_runs, gate_runs_total) = state
+        .jobs
+        .list_jobs(&gate_run(None), GATE_RUN_WINDOW, 0)
+        .await
+        .unwrap_or_default();
+    let gate_runs_truncated = gate_runs_total > GATE_RUN_WINDOW;
+    let held_runs = {
+        let filter = gate_run(Some("hold"));
+        let mut out = Vec::new();
+        for page in 0..HELD_RUN_PAGES {
+            let Ok((rows, total)) = state
+                .jobs
+                .list_jobs(&filter, HELD_RUN_PAGE, page * HELD_RUN_PAGE)
+                .await
+            else {
+                break;
+            };
+            let read = rows.len() as i64;
+            out.extend(rows);
+            if read < HELD_RUN_PAGE || (page + 1) * HELD_RUN_PAGE >= total {
+                break;
             }
-            Err(_) => Vec::new(),
+            if page + 1 == HELD_RUN_PAGES {
+                tracing::warn!(
+                    total,
+                    read = out.len(),
+                    "yard: held gate-run read hit its page cap — older holds unread"
+                );
+            }
         }
+        out
+    };
+    let gate_runs = {
+        let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> =
+            Vec::with_capacity(recent_runs.len() + held_runs.len());
+        // The recency page first, so `held_greens`' first-seen-wins
+        // de-dup keeps the order the page already had; a held run the
+        // page holds already is not read twice. A TRAIN's own gate-run
+        // carries a hold too (128b5496) and is excluded from every lane
+        // this set feeds, so its steps are not fetched: measured
+        // 2026-09-15, 43 of the 44 held runs on record were train gates.
+        for job in recent_runs.into_iter().chain(
+            held_runs
+                .into_iter()
+                .filter(|j| !crate::stranded::is_train_gate(&j.metadata)),
+        ) {
+            if out.iter().any(|(seen, _)| seen.id == job.id) {
+                continue;
+            }
+            let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
+            out.push((job, steps));
+        }
+        out
     };
 
     // The arrived population the in-flight ETA is measured against — a
@@ -282,6 +397,40 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
             .unwrap_or_default()
     };
 
+    // The converge packets each siding's landing is read from (design
+    // c6bd173e, car 3; `crate::landing`): the newest CONVERGE_WINDOW of
+    // the cluster converge and of each host converge, WITH their steps
+    // — the evidence (`build_head`, `unchanged`, `converge_sha`) is on
+    // the `run` step, which is why the web's converge card fetches these
+    // packets with steps too. A read that fails leaves the kind absent,
+    // and every row it would have decided says `unread` rather than
+    // "converging" (a limit is not a filter, and an empty read is not a
+    // reading of "not yet").
+    let converges = {
+        let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
+        for kind in
+            std::iter::once(crate::landing::CLUSTER_CONVERGE).chain(crate::landing::HOST_CONVERGES)
+        {
+            let filter = JobFilter {
+                kind: Some(kind.to_string()),
+                scope: scope.clone(),
+                ..Default::default()
+            };
+            let Ok((rows, _)) = state
+                .jobs
+                .list_jobs(&filter, crate::landing::CONVERGE_WINDOW, 0)
+                .await
+            else {
+                continue;
+            };
+            for job in rows {
+                let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
+                out.push((job, steps));
+            }
+        }
+        out
+    };
+
     // Every read that can fail QUIETLY states whether it answered: the
     // dock from the `Option` `dock_cars` already returns, the cadence
     // rows from theirs, the firing from its own `Result`. The trains and
@@ -294,13 +443,18 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
             closed_trains: &closed_trains,
             dock_cars: dock_read.as_deref().unwrap_or(&[]),
             rules: &rules,
-            last_board: last_board.as_ref(),
+            board_firings: yard::BoardFirings {
+                depth: depth_firing.as_ref(),
+                clock: clock_firing.as_ref(),
+            },
             policy: policy.as_ref(),
             gate_runs: &gate_runs,
             car_branches: &car_branches,
             settled_car_branches: &settled_car_branches,
             arrived_trains: &arrived_trains,
             now: Some(now),
+            cars: &cars,
+            converges: &converges,
         },
         dock_reading,
         yard::BoardingReadings {
@@ -318,11 +472,48 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
         heartbeat_minutes,
         Some(now),
     );
-    Json(with_dock_source(
-        with_conductor(with_now(status, now), health),
+    Ok(YardRead {
+        status,
         dock_reading,
-    ))
-    .into_response()
+        health,
+        gate_runs_truncated,
+        open_trains,
+    })
+}
+
+/// Whether the recency lanes were cut, stated on the payload beside the
+/// window they read: `gate_runs_truncated` is "the record holds more
+/// gate-runs than `gate_run_window`", so the page can say "the slots,
+/// garage, limbo and stranded lanes read the newest N runs; held greens
+/// are read from the record" instead of letting an empty lane read as a
+/// fact about everything. Injected the way [`with_dock_source`] is, so
+/// the marker composes without widening [`yard::build_status`].
+fn with_gate_run_window(mut v: serde_json::Value, truncated: bool) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "gate_runs_truncated".to_string(),
+            serde_json::json!(truncated),
+        );
+        obj.insert(
+            "gate_run_window".to_string(),
+            serde_json::json!(GATE_RUN_WINDOW),
+        );
+    }
+    v
+}
+
+/// One board rule's newest firing, by the read the conductor makes
+/// (`last_firing(&rule.name)`). `Ok(None)` both for no such rule and for
+/// a rule that has never fired — each an ANSWER; `Err` only when the read
+/// did not answer, which the caller turns into [`yard::Reading::Unread`].
+async fn firing_of(
+    repo: &dyn crate::cadence::CadenceRepository,
+    rule: Option<&crate::cadence::CadenceRuleRow>,
+) -> Result<Option<crate::cadence::LastFiring>, crate::cadence::CadenceError> {
+    match rule {
+        Some(rule) => repo.last_firing(&rule.name).await,
+        None => Ok(None),
+    }
 }
 
 /// The cars standing ON the dock, with their steps, read from the

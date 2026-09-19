@@ -7,9 +7,13 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; repo="$(cd "$here/../.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
-python3 - "$repo" <<'PY' || exit 1
+# The allowlist is the directory infra/ops/verbs/, assembled by the one
+# script the runner itself uses (5086842d) — read here the same way.
+allowlist="$(sh "$repo/infra/ops/verbs-allowlist.sh" "$repo/infra/ops/verbs")" \
+    || fail "infra/ops/verbs-allowlist.sh could not assemble infra/ops/verbs/ (see above)"
+python3 - "$repo" "$allowlist" <<'PY' || exit 1
 import json,re,sys,os
-repo=sys.argv[1]; v=json.load(open(f"{repo}/infra/ops/verbs.json"))["verbs"]
+repo=sys.argv[1]; v=json.loads(sys.argv[2])["verbs"]
 # THE ROSTER IS DERIVED, not listed here. It used to be four names typed
 # into this loop, which meant every mutating verb added after them —
 # reclaim-disk, converge, mirror-base-images, delete-orphan-object — was
@@ -18,9 +22,16 @@ repo=sys.argv[1]; v=json.load(open(f"{repo}/infra/ops/verbs.json"))["verbs"]
 # defect; a verb that declares itself MUTATING is the one definition.
 mutating=sorted(n for n,s in v.items() if "MUTATING" in s.get("about",""))
 len(mutating) >= 8 or sys.exit(f"FAIL: only {len(mutating)} verb(s) declare MUTATING — the roster derivation broke: {mutating}")
+# The scanned line every scanner prints (infra/lint/lib/scanned.sh),
+# from here because the count lives in this program; the floor above
+# is its refusal on zero.
+print(f"the-controls-are-bounded-verbs: scanned {len(mutating)} MUTATING verb(s) of {len(v)} under infra/ops/verbs")
 for name in mutating:
     spec=v[name]
-    script=spec["argv"][0].replace("/home/david/boss/", f"{repo}/")
+    # argv[0] is repo-relative (66077f9c); the runner resolves it against
+    # its own checkout, and so does this lint — one rule, no substitution.
+    argv0=spec["argv"][0]
+    script=argv0 if argv0.startswith("/") else os.path.join(repo, argv0)
     os.path.isfile(script) or sys.exit(f"FAIL: {name} points at a script not in the tree: {spec['argv'][0]}")
     os.access(script, os.X_OK) or sys.exit(f"FAIL: {name}'s script is not executable")
     for p in spec["params"]:
@@ -114,8 +125,8 @@ env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/hold" bash "$repo/infra/forge/conve
 env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/hold" bash "$repo/infra/forge/converge-hold.sh" release >/dev/null || fail "release needs HOME"
 env -i PATH="$PATH" bash -n "$repo/infra/forge/rollback-to.sh" || fail "rollback-to.sh does not parse"
 # Code lines only — a comment may name $HOME to say why it is not used.
-grep -vE '^\s*#' "$repo/infra/forge/rollback-to.sh" | grep -qE '\$HOME' && fail "rollback-to.sh still reads \$HOME"
-grep -vE '^\s*#' "$repo/infra/forge/converge-hold.sh" | grep -qE '\$HOME' && fail "converge-hold.sh still reads \$HOME"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/rollback-to.sh")" && fail "rollback-to.sh still reads \$HOME"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/converge-hold.sh")" && fail "converge-hold.sh still reads \$HOME"
 bash "$repo/infra/forge/converge-hold.sh" hold learning-the-new-runner >/dev/null || fail "hold failed"
 [[ "$(<"$tmp/hold")" == "learning-the-new-runner" ]] || fail "the hold file does not carry the reason"
 # shellcheck source=/dev/null
@@ -131,8 +142,8 @@ bash "$repo/infra/forge/converge-hold.sh" hold 2>/dev/null && fail "a hold with 
 # that NAMES THE PATH — never a silent skip, never the value.
 pub="$repo/infra/forge/publish-github-pr.sh"
 env -i PATH="$PATH" bash -n "$pub" || fail "publish-github-pr.sh does not parse"
-grep -vE '^\s*#' "$pub" | grep -qE '\$HOME' && fail "publish-github-pr.sh reads \$HOME (the ops runner has none)"
-grep -vE '^\s*#' "$pub" | grep -qE '^\s*set .*-x|set -x' && fail "publish-github-pr.sh traces (set -x) — a trace would print the token's environment"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$pub")" && fail "publish-github-pr.sh reads \$HOME (the ops runner has none)"
+grep -qE '^\s*set .*-x|set -x' <<<"$(grep -vE '^\s*#' "$pub")" && fail "publish-github-pr.sh traces (set -x) — a trace would print the token's environment"
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/etc"
 # --check only asks that gh/jq/curl EXIST (this box may lack jq; the
 # forge and the gate image have it), so stubs stand in for all three.
@@ -151,7 +162,12 @@ seed_commit=$(fixture_git commit-tree "$seed_tree" -m seed) \
 fixture_git update-ref refs/heads/main "$seed_commit" \
     || fail "could not point the fixture's main at $seed_commit"
 printf 'not-a-real-token\n' > "$tmp/etc/github.token"; chmod 600 "$tmp/etc/github.token"
-checkenv=(env -i PATH="$tmp/bin:$PATH" BOSS_PUBLISH_STATE_DIR="$tmp/state" BOSS_FORGE_REPO_PATH="$tmp/forge.git")
+# The forge's address file (infra/lib/sor.sh): on the host the verb reads
+# /etc/boss/sor.env for the forge's clone base; here the same file,
+# rendered from the one source into the scratch root (backlog 5222163e).
+bash "$repo/infra/estate/render-sor-env.sh" --to "$tmp/sor.env" >/dev/null \
+    || fail "could not render the address file from infra/estate/estate.toml"
+checkenv=(env -i PATH="$tmp/bin:$PATH" BOSS_PUBLISH_STATE_DIR="$tmp/state" BOSS_FORGE_REPO_PATH="$tmp/forge.git" BOSS_SOR_ENV="$tmp/sor.env")
 out=$("${checkenv[@]}" BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" bash "$pub" --check 2>&1) \
     || fail "publish-github-pr.sh --check refused a complete input set: $out"
 grep -q -- '--check ok' <<<"$out" || fail "--check did not report ok: $out"
@@ -166,8 +182,10 @@ chmod 644 "$tmp/etc/github.token"
 chmod 600 "$tmp/etc/github.token"
 # A run (no --check) with no system of record refuses before touching
 # anything — the ops-runner rule, and the reason nothing here needs a
-# network to prove.
-"${checkenv[@]}" BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" bash "$pub" >/dev/null 2>&1 \
+# network to prove. No address file for this one (the forge's clone URL
+# named explicitly, so the refusal is the record's, not the forge's).
+"${checkenv[@]}" BOSS_SOR_ENV="$tmp/absent.env" BOSS_FORGE_PUSH_URL="http://forge.test/david/boss.git" \
+    BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" bash "$pub" >/dev/null 2>&1 \
     && fail "a run without BOSS_JOBS_URL did not refuse"
 # THROUGH THE RUNNER: the allowed literal is exercised the way a packet
 # would — ops-runner.sh against a stubbed system of record (a GET serves
@@ -188,22 +206,25 @@ for a in "$@"; do case "$a" in @*) cp "${a#@}" "$STUB_PUT"; exit 0;; esac; done
 cat "$STUB_JOBS"
 EOF
     chmod +x "$tmp/rbin/curl"
-    sed "s#/home/david/boss/#$repo/#g" "$repo/infra/ops/verbs.json" > "$tmp/verbs.json"
+    # The allowlist is used VERBATIM — the directory of verb files copied
+    # as-is: its scripts are repo-relative and the runner resolves them
+    # against OPS_REPO_ROOT (66077f9c).
+    mkdir -p "$tmp/verbs" && cp "$repo"/infra/ops/verbs/*.json "$tmp/verbs/"
     packet() { # $1 = args JSON array
         printf '{"data":[{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{"host":"forge","verb":"publish-github-pr","args":%s},"steps":[{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{"authority_role":"platform-admin"}}]}]}' "$1" > "$tmp/jobs.json"
     }
     run_runner() {
         env -i PATH="$tmp/rbin:$PATH" HOST_ID=forge BOSS_JOBS_URL=http://sor.invalid \
-            OPS_VERBS_FILE="$tmp/verbs.json" STUB_JOBS="$tmp/jobs.json" STUB_PUT="$tmp/put.json" \
+            OPS_VERBS_DIR="$tmp/verbs" STUB_JOBS="$tmp/jobs.json" STUB_PUT="$tmp/put.json" \
             BOSS_PUBLISH_STATE_DIR="$tmp/rstate" BOSS_FORGE_REPO_PATH="$tmp/forge.git" \
-            BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" \
+            BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" BOSS_SOR_ENV="$tmp/sor.env" \
             sh "$repo/infra/ops/ops-runner.sh" 2>&1
     }
     rm -f "$tmp/put.json"; packet '["--check"]'
     out=$(run_runner) || fail "the runner failed on publish-github-pr --check: $out"
     [[ -f "$tmp/put.json" ]] || fail "the runner completed no step for --check: $out"
     [[ "$(jq -r .metadata.disposition "$tmp/put.json")" == answered ]] || fail "--check was not answered through the runner: $(cat "$tmp/put.json") / $out"
-    jq -r .metadata.output "$tmp/put.json" | grep -q -- '--check ok' || fail "--check through the runner did not report ok: $(cat "$tmp/put.json")"
+    grep -q -- '--check ok' <<<"$(jq -r .metadata.output "$tmp/put.json")" || fail "--check through the runner did not report ok: $(cat "$tmp/put.json")"
     rm -f "$tmp/put.json"; packet '["--force"]'
     out=$(run_runner) || fail "the runner failed refusing --force: $out"
     [[ "$(jq -r .metadata.disposition "$tmp/put.json")" == refused ]] || fail "--force was not refused: $(cat "$tmp/put.json")"
@@ -223,8 +244,8 @@ dob="$repo/infra/forge/delete-orphan-object.sh"
 der="$repo/infra/cluster/undeclared-objects.sh"
 env -i PATH="$PATH" bash -n "$dob" || fail "delete-orphan-object.sh does not parse"
 env -i PATH="$PATH" bash -n "$der" || fail "undeclared-objects.sh does not parse"
-grep -vE '^\s*#' "$dob" | grep -qE '\$HOME' && fail "delete-orphan-object.sh reads \$HOME (the ops runner has none)"
-grep -vE '^\s*#' "$der" | grep -qE '\$HOME' && fail "undeclared-objects.sh reads \$HOME (the ops runner has none)"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$dob")" && fail "delete-orphan-object.sh reads \$HOME (the ops runner has none)"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$der")" && fail "undeclared-objects.sh reads \$HOME (the ops runner has none)"
 # EVERY git CALL IN THE VERB GOES THROUGH THE OWNER.
 #
 # The ops-runner executes verbs as root and the forge checkout belongs to a

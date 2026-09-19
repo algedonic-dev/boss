@@ -10,6 +10,9 @@
 //   3. Synthesise `x-boss-user` on every proxied API call from the
 //      `boss-persona` cookie so backend policy scoping reflects the
 //      "viewing as" persona chosen by the PersonaSwitcher.
+//   4. Under the mocked suite (BOSS_MOCKED=1, set by tests/run-mocked.ts)
+//      answer an `/api/**` miss locally instead of proxying it — see
+//      src/dev-mocked.ts.
 //
 // The `Bun.serve` routes object holds the bundled-HTML entries; the
 // `fetch` handler is the fallback for everything else. Hot reload
@@ -24,16 +27,25 @@ import { join } from 'node:path';
 // for this path, with HMR attached."
 import index from '../index.html';
 
+import { type Misses, apiHandler, isMocked, missSummary } from './dev-mocked';
+import { readyLine } from './dev-ready';
 import { DEFAULT_PORT, TREE_ID, TREE_PATH, treeResponse } from './dev-tree';
 
 const PORT = Number(process.env['PORT'] ?? DEFAULT_PORT);
 
 // Scratch mode: when BOSS_SCRATCH=1, paired services route to their
 // +1000 scratch ports (boss_scratch DB) so writes don't pollute the
-// live boss DB. Mirrors the PAIRED_SERVICES list in
-// infra/deploy-services.sh. Solo services have no scratch variant
+// live boss DB. PAIRED_NAMES is generated from boss-ports (the
+// registry's PAIRED table). Solo services have no scratch variant
 // and stay on their prod ports.
 const SCRATCH = process.env['BOSS_SCRATCH'] === '1';
+
+// Mocked mode: the Playwright suite mocks every /api call in-browser
+// and runs no backend, so an /api/** miss is answered 404 here and
+// tallied for one summary line at shutdown (82b87a09).
+const MOCKED = isMocked(process.env);
+const misses: Misses = new Map();
+const handleApi = apiHandler(MOCKED, proxyApi, misses);
 const SCRATCH_OFFSET = 1000;
 import { PORTS, PAIRED_NAMES, portFor } from './_generated/ports';
 
@@ -46,6 +58,9 @@ import { PORTS, PAIRED_NAMES, portFor } from './_generated/ports';
 const EXTRA_ROUTES: ReadonlyArray<readonly [string, string]> = [
   // /api/scheduling rides on jobs-api.
   ['/api/scheduling', 'jobs'],
+  // /api/surface-opens (the SPA's route-open record, 628f182b) rides
+  // on jobs-api beside agent-runs.
+  ['/api/surface-opens', 'jobs'],
   // /api/events tail mounts on people-api.
   ['/api/events', 'people'],
   // /api/snapshot is mounted on observability.
@@ -214,7 +229,10 @@ function serveTenantManifest(): Response {
     }
     if (!section || !line) continue;
     if (section === 'modules') {
-      const m = line.match(/^([a-zA-Z_]+)\s*=\s*(true|false)\s*$/);
+      // Hyphenated keys too (`marketing-assets`): a module is on only
+      // when listed true (ce68f137), so a key this parser dropped was
+      // a module the dev server silently switched off.
+      const m = line.match(/^([a-zA-Z0-9_-]+)\s*=\s*(true|false)\s*$/);
       if (m && m[1] && m[2]) modules[m[1]] = m[2] === 'true';
     } else if (section === 'labels') {
       // labels are TOML strings: `key = "value"` (double-quoted).
@@ -253,7 +271,7 @@ serve({
       }),
     '/api/*': (req) => {
       const url = new URL(req.url);
-      return proxyApi(req, url.pathname, url);
+      return handleApi(req, url.pathname, url);
     },
     '/plugins/*': (req) => servePlugin(new URL(req.url).pathname),
     // Bun bundles index.html + all imported Svelte/TS/CSS sources
@@ -263,10 +281,26 @@ serve({
   },
 });
 
-console.log(`boss-web dev server: http://127.0.0.1:${PORT}`);
+// The runner's readiness signal — see src/dev-ready.ts.
+console.log(readyLine(PORT));
 console.log('  HMR: enabled via bun-plugin-svelte + Bun.serve routes');
 console.log(
-  `  api proxy → ${SCRATCH ? 'SCRATCH ports (boss_scratch DB) for paired services' : 'prod service ports (boss DB)'}`,
+  MOCKED
+    ? '  api proxy → OFF (mocked mode: an /api/** miss answers 404 locally, summarised at exit)'
+    : `  api proxy → ${SCRATCH ? 'SCRATCH ports (boss_scratch DB) for paired services' : 'prod service ports (boss DB)'}`,
 );
 console.log('  /plugins/* → /var/lib/boss/step-plugins/');
 console.log(`  serving tree: ${TREE_ID} (named at ${TREE_PATH})`);
+
+// The runner stops this server with SIGTERM once Playwright is done;
+// that is when the misses are complete, so the one summary line prints
+// here. Bun's default SIGTERM handling exits without it.
+if (MOCKED) {
+  const summariseAndExit = (code: number): void => {
+    const line = missSummary(misses);
+    if (line !== null) console.log(line);
+    process.exit(code);
+  };
+  process.on('SIGTERM', () => summariseAndExit(143));
+  process.on('SIGINT', () => summariseAndExit(130));
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # generation.sh — the ONE definition of the deploy generation store.
-# Sourced (not executed) by deploy-services.sh, deploy-web.sh and
-# deploy-confirm.sh so the paths and the atomic-flip mechanics cannot
+# Sourced (not executed) by infra/estate/install-cli-from-image.sh — and,
+# until the bare-metal deploy path was deleted on 2026-09-18, by the
+# three deploy scripts — so the paths and the atomic-flip mechanics cannot
 # drift between the three (CLAUDE.md §9a — a fact that lives twice).
 #
 # Layout (docs/design/deployment-as-network.md, Q1):
@@ -15,8 +16,6 @@
 #     current -> releases/<sha>    the live generation (atomic flip)
 #     previous -> releases/<sha>   the one before it (revert target)
 #     state/
-#       deploy-confirm.pending   marker armed at flip, cleared by the
-#                                confirm verdict (boss-deploy-confirm)
 #       deploy-history.log       append-only activate/confirm/revert log
 #
 # Units exec through the symlink (ExecStart=/usr/local/boss/current/
@@ -28,7 +27,6 @@
 BOSS_GEN_ROOT="${BOSS_GEN_ROOT:-/usr/local/boss}"
 GEN_RELEASES="$BOSS_GEN_ROOT/releases"
 GEN_STATE="$BOSS_GEN_ROOT/state"
-GEN_PENDING="$GEN_STATE/deploy-confirm.pending"
 GEN_HISTORY="$GEN_STATE/deploy-history.log"
 # Q1/Q3: retain the 3 newest generations; prune the rest (with sizes —
 # this box has had its disk-full day).

@@ -4,7 +4,7 @@
 //! things later RUN it: `boss gate --park-probe` admits the text,
 //! `boss prove --probe / --from-car / --recheck` runs it by hand, the
 //! `jobs.run-car-probes` rule ships it to the forge on arrival, and
-//! `infra/forge/run-car-probe.sh` executes it there. The rules about
+//! `boss prove --from-car --unattended` executes it there. The rules about
 //! which text is worth running live HERE, in one place all of those can
 //! reach, because the alternative is what backlog 23b2dffa found: the
 //! gate refused two shapes of bad probe, the hand verb refused neither,
@@ -20,7 +20,9 @@
 //! says what its author meant — a `jq -e` whose success branch is
 //! `empty` ([`asserts_its_own_negation`]), a bare `|| exit n` that
 //! throws away the status naming the cause
-//! ([`rewrites_its_exit_status`]) — which is also true everywhere.
+//! ([`rewrites_its_exit_status`]), a `-lt` on a variable nothing checked
+//! was a number ([`compares_an_unguarded_number`]) — which is also true
+//! everywhere.
 //!
 //! Each door applies the first only about the host it is actually
 //! sending the probe to, and the other two always. The second REFUSES,
@@ -29,8 +31,12 @@
 //! on a proof of nothing. The third only WARNS, because it fails
 //! closed — `boss prove` records nothing on a nonzero exit, so the worst
 //! it does is strand a car and misdescribe why (18 hours of that,
-//! 4fccc595) — and because both its detectors are coarse text scans a
-//! false refusal would be too expensive for.
+//! 4fccc595) — and because its detectors are coarse text scans a
+//! false refusal would be too expensive for. The one third-kind shape
+//! that REFUSES is a git date read with its offset
+//! ([`reads_git_time_with_an_offset`]): a string compare of
+//! mixed-offset timestamps lies in both directions (c0ac92b8), so it
+//! is judged the way the second question is.
 //!
 //! The predicates below are shared; the wording of a refusal or a
 //! warning belongs to the door, because what to do instead differs by
@@ -47,7 +53,7 @@ use serde_json::Value;
 ///
 /// A `--park-probe` is written on the dev pod (kubectl, a kubeconfig,
 /// the cluster one hop away) and RUN on the forge
-/// (`infra/forge/run-car-probe.sh`, as david, in /home/david/boss, when
+/// (`boss prove --from-car --unattended`, as david, in /home/david/boss, when
 /// the car's train arrives). Two machines. The forge is outside the
 /// cluster and holds no kubeconfig, so a probe that reaches for
 /// `kubectl` is correct and unrunnable — and its failure at arrival is
@@ -112,6 +118,44 @@ pub fn needs_absent_tool(probe: &str) -> Option<&'static str> {
         .find_map(|c| absent.iter().find(|a| **a == c).copied())
 }
 
+/// The two variables the CLI reads to learn WHO is running it
+/// (boss-cli `identity.rs`: the env var, then the file the second
+/// names). Spelled here rather than imported because that crate is an
+/// orchestrator this one cannot depend on; the CLI's own test on the
+/// pair is the pin.
+const ACTOR_VARS: [&str; 2] = ["BOSS_ACTOR", "BOSS_ACTOR_FILE"];
+
+/// A PROBE PROVES, IT DOES NOT ACT — and the variable a probe would
+/// have to set to act, if it spells one.
+///
+/// `boss` left the forge's absence list on 2026-09-18 (H8 car 1,
+/// 9f00a805, installed the CLI there; backlog 8a1fcd22 retired the
+/// line), so a recorded probe may shell to a verb. What keeps that a
+/// READ is not a list of read-safe verbs — the CLI holds no such
+/// classification of its subcommands, and the split runs by flag as
+/// often as by verb — but an actor: the probe's env names none
+/// (the unattended door hands it exactly `BOSS_JOBS_URL`,
+/// `BOSS_PROBE_NOTFOUND`, [`SOR_USER_VAR`], `BOSS_SOR_PORTS` and
+/// `PATH`), and the CLI refuses an unnamed WRITE by its own rule while
+/// an unnamed READ goes out signed `operator:unidentified` under the
+/// header's platform-admin role — a whole-world read, not the
+/// header-less narrowed one 61085a9e measured. So the probe's TEXT is
+/// the only place an actor could come from, and a text that assigns
+/// one is refused naming the variable. A mention is not an assignment:
+/// the CLI's own refusal names `BOSS_ACTOR`, and a probe may grep for
+/// it.
+pub fn names_an_actor(probe: &str) -> Option<&'static str> {
+    probe
+        .split_whitespace()
+        .map(|w| w.trim_start_matches(['"', '\'', '(', '{', ';', '&', '|']))
+        .find_map(|w| {
+            ACTOR_VARS
+                .iter()
+                .find(|v| w.strip_prefix(*v).is_some_and(|rest| rest.starts_with('=')))
+                .copied()
+        })
+}
+
 /// HOW A PROBE READS THE SYSTEM OF RECORD — `infra/forge/probe-bin`,
 /// first on the probe's PATH, holding exactly this one reader.
 ///
@@ -132,16 +176,101 @@ pub const SOR_READER: &str = "boss-sor-read";
 /// `audit-readonly`, can change nothing), so it is allowed.
 pub const SOR_USER_VAR: &str = "BOSS_SOR_USER";
 
-/// The spellings a probe reaches the system of record by. All four were
-/// used by real probes: the env var the runner exports, the in-cluster
-/// service DNS (the second measured instance), the LAN address and port
-/// (the first), and a bare `/api/` path through any of them.
-const SOR_SPELLINGS: [&str; 4] = ["BOSS_JOBS_URL", "boss-jobs-internal", ":7900", "/api/"];
+/// The spellings that reach the system of record DIRECTLY — past the
+/// gateway, on the jobs API's own port, which is where policy answers a
+/// nameless reader with a narrower world IN SILENCE. All three were used
+/// by real probes: the env var the runner exports, the in-cluster
+/// service DNS (the second measured instance) and the LAN address and
+/// port (the first).
+const DIRECT_SOR_SPELLINGS: [&str; 3] = ["BOSS_JOBS_URL", "boss-jobs-internal", ":7900"];
+
+/// The fourth spelling, and the loose one: a bare `/api/` path, reaching
+/// the system of record through whatever host the probe computed —
+/// usually the gateway. It stays, because a URL assembled in a variable
+/// (`G=http://…; curl "$G/api/jobs"`) names nothing else a text scan can
+/// see. It is SEPARATE from the three above because the two hosts fail
+/// differently, and the session carve-out below turns on which one a
+/// probe is talking to.
+const SOR_PATH_SPELLING: &str = "/api/";
+
+/// THE GATEWAY IS A THIRD IDENTITY, and the one the rule could not see
+/// until 2026-09-11 (backlog 5dc5159d, nine overrides on correct probes,
+/// four of them in one afternoon).
+///
+/// MEASURED, one moment, three readers. A session obtained from this
+/// endpoint read `total` 22 / 56 / 703 on open ship-a-change, open
+/// backlog-item and gate-run — IDENTICAL to the operator's own door —
+/// while the same queries unidentified against the jobs API's own port
+/// answered 0 / 0 / 0. The session's own `/api/auth/me` reads
+/// `role: audit-readonly`, the same read-scoped role [`SOR_USER_VAR`]
+/// carries. So a session is a full-width READ identity, not a narrowed
+/// one.
+///
+/// AND IT IS NOT THE FORGEABLE-HEADER HOLE. This rule deliberately keys
+/// on [`SOR_USER_VAR`] rather than a header NAME, so a probe cannot
+/// satisfy it by writing its own privileged literal. A cookie is a
+/// different object: measured the same day, `-b
+/// 'boss_session=iamtheoperator'` answered **401**, byte-identical to
+/// sending no cookie at all. A forged header is accepted by a trusting
+/// upstream; a forged session is refused at the door — so admitting a
+/// session cannot produce a false PASS, only a loud failure. That
+/// asymmetry is the whole argument, and it is why the carve-out needs
+/// the text to OBTAIN a session here as well as send one.
+const GATEWAY_AUTH_PATH: &str = "/api/auth/";
+
+/// The flags that SEND a cookie on the read. Receiving one into a jar
+/// (`-c`) is not enough — the read has to carry it.
+const COOKIE_SEND_FLAGS: [&str; 2] = ["-b", "--cookie"];
+
+/// Does this probe hold a session the gateway ISSUED it, and send it?
+/// Both halves are required: the POST is what makes the value
+/// server-issued, the flag is what puts it on the read.
+fn holds_a_gateway_session(probe: &str) -> bool {
+    probe.contains(GATEWAY_AUTH_PATH)
+        && probe
+            .split_whitespace()
+            .any(|w| COOKIE_SEND_FLAGS.contains(&w))
+}
 
 /// Commands that can perform the read. `python`/`python3` are here
 /// because the first measured instance was `urllib.request.urlopen`,
 /// not a curl.
 const HTTP_CLIENTS: [&str; 4] = ["curl", "wget", "python", "python3"];
+
+/// The facilities a `python` would have to name to reach the network at
+/// all. A `python3` on the right of a pipe reads STDIN; it cannot open a
+/// socket without one of these appearing in the text, so their ABSENCE
+/// is what tells a parser from a client.
+///
+/// This is the gap that bit hardest: `boss-api GET … | python3` is the
+/// shape CLAUDE.md §Doors steers an operator toward, it is the MOST
+/// correct way to read the system of record, and it read as unidentified
+/// — measured 28 times across the 449 cars that have ever recorded a
+/// probe. Deliberately coarse (whole-text, not per-invocation) and
+/// deliberately erring toward refusal: a python that names one of these
+/// is a client again whether or not a door is also present, so a door
+/// cannot launder a python that reads.
+const PYTHON_CAN_READ: [&str; 14] = [
+    "urllib",
+    "import requests",
+    "requests.get",
+    "requests.post",
+    "requests.request",
+    "http.client",
+    "httplib",
+    "httpx",
+    "aiohttp",
+    "pycurl",
+    "socket",
+    "subprocess",
+    "os.system",
+    "os.popen",
+];
+
+/// Could the `python` in this text perform the read itself?
+fn python_performs_the_read(probe: &str) -> bool {
+    PYTHON_CAN_READ.iter().any(|f| probe.contains(f))
+}
 
 /// Does this probe read the system of record WITHOUT saying who it is?
 /// Returns the client it would read with.
@@ -152,25 +281,42 @@ const HTTP_CLIENTS: [&str; 4] = ["curl", "wget", "python", "python3"];
 /// `test -n "$BOSS_JOBS_URL"` are mentions, not reads), and the text
 /// naming the system of record at all.
 ///
-/// Identified reads are not this check's business: a probe that sends
-/// the runner's read-scoped actor is already a named reader. That is
-/// keyed on [`SOR_USER_VAR`] and not on the header name, so a probe
-/// cannot satisfy it by writing its own privileged header literal — the
-/// honest bound being that the forge can forge any header it likes, so
-/// this steers an accident rather than stopping an intent. A reader
-/// that is identified some other way (an operator's own door, a
-/// profile-supplied header) reads as a refusal here, which is why every
-/// door that refuses on this rule carries a stated override.
+/// THREE IDENTITIES COUNT, and they are recognised in three different
+/// ways. The runner's read-scoped actor ([`SOR_USER_VAR`]) — keyed on
+/// the env var, not the header name, for the reason written at
+/// [`GATEWAY_AUTH_PATH`]. A gateway session the server ISSUED
+/// ([`holds_a_gateway_session`]) — admitted only for a gateway-shaped
+/// read, because a cookie identifies a reader at the gateway and says
+/// nothing about a read on the jobs API's own port. And a sanctioned
+/// door (`boss-api`, [`SOR_READER`]) doing the read while something else
+/// parses its stdout — recognised not by naming the door but by
+/// [`python_performs_the_read`] finding nothing in the text that could
+/// open a socket.
+///
+/// A reader identified in a FOURTH way still reads as a refusal here,
+/// which is why every door that refuses on this rule carries a stated
+/// override. What the rule no longer does is refuse the three above —
+/// nine such overrides were recorded before 2026-09-11, and an override
+/// that routine is read by nobody (CLAUDE.md §Diagnosis).
 pub fn reads_the_sor_unidentified(probe: &str) -> Option<&'static str> {
-    if !SOR_SPELLINGS.iter().any(|s| probe.contains(s)) {
+    let direct = DIRECT_SOR_SPELLINGS.iter().any(|s| probe.contains(s));
+    if !direct && !probe.contains(SOR_PATH_SPELLING) {
         return None;
     }
     if probe.contains(SOR_USER_VAR) {
         return None;
     }
-    commands_invoked(probe)
-        .into_iter()
-        .find_map(|c| HTTP_CLIENTS.iter().find(|h| **h == c).copied())
+    if !direct && holds_a_gateway_session(probe) {
+        return None;
+    }
+    commands_invoked(probe).into_iter().find_map(|c| {
+        let client = HTTP_CLIENTS.iter().find(|h| **h == c).copied()?;
+        // A python handed a pipe is a parser, not a reader.
+        if matches!(client, "python" | "python3") && !python_performs_the_read(probe) {
+            return None;
+        }
+        Some(client)
+    })
 }
 
 /// WHY AN UNIDENTIFIED READ IS REFUSED RATHER THAN DOCUMENTED — the
@@ -188,7 +334,14 @@ reason and someone investigates, but an ABSENCE assertion PASSES FALSELY — 'no
 of kind X remains' is green against an empty page the probe was never allowed to see — \
 and a recorded proof of nothing closes a car. Prefer asserting the PRESENCE of a named \
 thing over the absence of any thing: a count-is-zero or flag-is-false claim against a \
-policy-scoped surface is what a narrowed read produces anyway.";
+policy-scoped surface is what a narrowed read produces anyway.\n\n\
+Measured 2026-09-11 (5dc5159d), the same three queries, three readers: a gateway session \
+read 22 / 56 / 703 rows — IDENTICAL to the operator's own door — while unidentified \
+against the jobs API's own port they were 0 / 0 / 0. So the silent narrowing is a \
+property of the DIRECT port; the gateway answers an unidentified reader 401, loudly. \
+Three identities this check can see: the runner's BOSS_SOR_USER, a gateway session the \
+server issued (POST /api/auth/guest, sent with curl -b), and a door doing the read while \
+something else parses its stdout.";
 
 /// WHEN A PROBE REPORTS FAILURE PRECISELY BECAUSE THE CLAIM HOLDS —
 /// the third shape, and the only one whose lie points the other way.
@@ -349,10 +502,177 @@ pub fn rewrites_its_exit_status(probe: &str) -> Option<i32> {
     })
 }
 
+/// WHEN A PROBE COMPARES A NUMBER IT NEVER CHECKED WAS ONE — the fourth
+/// shape, and like the two before it one that fails closed.
+///
+/// THE DEFECT (backlog 0df3af1c, measured 2026-09-14T00:00:25Z on
+/// david-asus-minipc). Two landed cars (dd1d872d, 2e4d3bce) and the
+/// daily recheck ran probes of the form
+/// `b=$(… | jq -r '… | first | .build_s'); if [ "${b:-9999}" -lt 200 ]`.
+/// The query matched nothing, so `first` was `null` and `jq -r` printed
+/// the four-character string `null` — which is not empty, so the `:-`
+/// default did nothing — and `[` wrote `[: null: integer expression
+/// expected` to stderr, exited 2, and fell into the else branch. The
+/// cars sat UNPROVEN behind a stderr nobody reads until an operator
+/// rewrote both probes by hand at 16:36Z.
+///
+/// Returns the NAME of the variable under the first unguarded numeric
+/// test, so the warning can say which one to guard, or `None` when
+/// there is no such test or the text guards against a non-number
+/// somewhere. A guard is one of the two things that actually stop the
+/// string reaching `[`:
+///
+/// - a jq-side `// empty` or `select(. != null)` on the VALUE, so that
+///   a missing number prints nothing at all; or
+/// - a shell-side non-digit check — `case "$b" in ''|*[!0-9]*) …` or
+///   `[[ "$b" =~ ^[0-9]+$ ]]` — before the test.
+///
+/// THREE THINGS DELIBERATELY NOT COUNTED, because both measured probes
+/// carried all three and failed anyway: a `${b:-9999}` default (guards
+/// EMPTY, not `null`); a `select(.field != null)` inside the array (the
+/// array is then empty and `first` of it is still `null`); and an
+/// `exit 75` in the else branch (reached only after the test has
+/// already errored). Any one of them counting would have exempted the
+/// probes this exists to catch.
+///
+/// DELIBERATELY COARSE, like its two siblings, and a warning because of
+/// it: a `case` anywhere in the text counts for every test in it, and a
+/// `[ "$n" -lt 3 ]` on a variable the probe set from `wc -l` is
+/// reported though it cannot be `null`. The cost when it is wrong is one
+/// line a builder reads and ignores; the cost of the alternative is a
+/// shell parser, or a car unproven for a day.
+pub fn compares_an_unguarded_number(probe: &str) -> Option<&str> {
+    if guards_against_a_non_number(probe) {
+        return None;
+    }
+    NUMERIC_TEST_OPERATORS.iter().find_map(|op| {
+        probe
+            .match_indices(op)
+            .filter(|(i, _)| {
+                // The operator as a whole word: `-lt` and not `-lte`,
+                // and not the tail of `--lt`.
+                let before = probe[..*i].chars().next_back();
+                let after = probe[i + op.len()..].chars().next();
+                before.is_some_and(char::is_whitespace) && after.is_none_or(char::is_whitespace)
+            })
+            .find_map(|(i, _)| tested_variable(&probe[..i]))
+    })
+}
+
+/// The shell's six integer comparisons — the operators `[` and `[[`
+/// refuse a non-integer operand for.
+const NUMERIC_TEST_OPERATORS: [&str; 6] = ["-lt", "-gt", "-le", "-ge", "-eq", "-ne"];
+
+/// The variable a test's left operand expands, if the operand IS a
+/// variable and the word in front of it is a test command. `head` is
+/// the text up to the operator.
+///
+/// `"${b:-9999}"`, `"$b"`, `${s}` and `$s` all name their variable; a
+/// literal (`[ 1 -lt 2 ]`) or a substitution (`$(wc -l)`) names none. A
+/// `!` in front of the operand is stepped over, and `test` counts
+/// alongside the two brackets because it is the same builtin.
+fn tested_variable(head: &str) -> Option<&str> {
+    let mut words = head.split_whitespace().rev();
+    let operand = words.next()?;
+    let command = words.find(|w| *w != "!")?;
+    if !matches!(command, "[" | "[[" | "test") {
+        return None;
+    }
+    let name = operand
+        .trim_matches('"')
+        .strip_prefix('$')?
+        .trim_start_matches('{');
+    let end = name
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
+/// Does the text, anywhere, stop a non-number before it reaches a
+/// test? Whitespace is dropped first so `select(. != null)` and
+/// `select(.!=null)` read the same; `select(.field != null)` does not,
+/// and must not (see [`compares_an_unguarded_number`]).
+fn guards_against_a_non_number(probe: &str) -> bool {
+    let packed: String = probe.split_whitespace().collect();
+    packed.contains("//empty")
+        || packed.contains("select(.!=null)")
+        || packed.contains("[!0-9]")
+        || packed.contains("[^0-9]")
+        || (packed.contains("=~") && packed.contains("[0-9]"))
+}
+
+/// WHEN A PROBE READS GIT TIME AS A STRING WITH AN OFFSET — the fifth
+/// shape, and unlike the three before it one that fails OPEN, so it is
+/// REFUSED where they are warned about.
+///
+/// THE DEFECT (backlog c0ac92b8, measured 2026-09-18 on car 746a1fac).
+/// The arrival probe asked whether the newest `retire` in the audit
+/// tail came AFTER the train's commit, and asked it as a string
+/// compare: `git log --format=%cI` on one side, the audit row's
+/// timestamp on the other. The conductor writes the train commit with
+/// a -07:00 offset (`2026-09-18T07:43:00-07:00`) and the audit log
+/// writes UTC (`2026-09-18T12:18:29+00:00`), so `12:18` read as later
+/// than `07:43` — though 07:43-07:00 is 14:43Z, two hours LATER. The
+/// probe ran 17 s before the operator's retire, saw only a retire that
+/// predated the fix, and should have said not-yet; it said FAILED, and
+/// the car stood red in the shed until an operator re-ran it by hand.
+/// With the offsets the other way round the same compare answers PASS
+/// for an event that never happened — a string compare of mixed-offset
+/// timestamps lies in BOTH directions, which is why this is a refusal
+/// and not a warning: it can record a proof of nothing.
+///
+/// Returns the first offset-bearing git date spelling in the text.
+/// DELIBERATELY THE TOKEN, NOT THE COMPARE: whether the string reaches
+/// a `[ … \> … ]` would take a shell parser to know honestly, and the
+/// fix is the same either way — `git log --format=%ct` is already an
+/// epoch, `date -u -d "$ts" +%s` makes the other side one, and two
+/// integers compare with `-gt`. Guard the empty case FIRST: `date -d ''`
+/// answers today's midnight, not an error (the reclaim-refs builder hit
+/// that sibling on the same day).
+pub fn reads_git_time_with_an_offset(probe: &str) -> Option<&'static str> {
+    GIT_TIME_WITH_AN_OFFSET
+        .iter()
+        .copied()
+        .find(|t| probe.contains(t))
+}
+
+/// The `git log` spellings that print a timestamp carrying the
+/// committer's or author's UTC offset — ISO strict (`%cI`), ISO-like
+/// (`%ci`), their author twins, and the `--date=` forms that make `%cd`
+/// / `%ad` print the same (`iso`, `iso-strict`, `iso8601`, `rfc2822`).
+/// `%ct` / `%at` and `--date=unix` print epoch seconds and are not here.
+pub const GIT_TIME_WITH_AN_OFFSET: [&str; 6] =
+    ["%cI", "%ci", "%aI", "%ai", "--date=iso", "--date=rfc"];
+
+/// The measured evidence for [`reads_git_time_with_an_offset`], in one
+/// copy, quoted by every door that refuses on it. The doors differ in
+/// what to do instead; they must not differ on what happened
+/// (CLAUDE.md §9a).
+pub const GIT_TIME_STRING_EVIDENCE: &str = "\
+Measured 2026-09-18 (c0ac92b8, car 746a1fac): the arrival probe compared `git log \
+--format=%cI` — the train commit's committer date, which the conductor writes with a \
+-07:00 offset (2026-09-18T07:43:00-07:00) — against the audit tail's UTC timestamps as \
+STRINGS, so 12:18Z read as later than 07:43(-07:00), which is 14:43Z. The probe ran 17 s \
+before the operator's act, saw a retire that predated the fix, and answered FAILED where \
+not-yet was true; the car stood red in the shed until an operator re-ran it. With the \
+offsets the other way round the same compare answers PASS for an event that never \
+happened.\n\
+Compare epochs, never ISO strings with mixed offsets:\n  \
+commit=$(git log -1 --format=%ct HEAD)\n  \
+ts=$(boss-sor-read '/api/...' | jq -r '... // empty')\n  \
+[ -n \"$ts\" ] || { echo 'not yet: no <event> recorded'; exit 75; }\n  \
+seen=$(date -u -d \"$ts\" +%s)\n  \
+[ \"$seen\" -gt \"$commit\" ] && echo claim:ok\n\
+The empty guard comes FIRST: `date -d ''` answers today's midnight, not an error.";
+
 /// The rule id a door records when an operator overrides a refusal on
 /// it. Short, stable, and greppable across recorded proofs — an
 /// override nobody can find later is the defect it was meant to avoid.
 pub const UNIDENTIFIED_RULE: &str = "reads-the-sor-unidentified";
+
+/// The rule id for [`reads_git_time_with_an_offset`], recorded the same
+/// way when overridden.
+pub const GIT_TIME_RULE: &str = "reads-git-time-with-an-offset";
 
 /// The override a door records when it ran a probe its own rule
 /// refused: which rule, and the operator's stated reason. Recorded in
@@ -420,23 +740,76 @@ mod tests {
         }
     }
 
-    /// And the invocation it was added for is still caught. Measured
-    /// on the forge the same day: `boss rerail --help` exited 127 with
-    /// `bash: line 1: boss: command not found`, on a car the arrival
-    /// rule had probed unattended.
+    /// And an invocation of a listed tool is still caught, in every
+    /// position the shell would run it from. Pinned on `kubectl`, the
+    /// tool still measured absent (f9304366), since 2026-09-18: until
+    /// then this test ran on `boss`, which left the list that day.
     #[test]
-    fn invoking_the_boss_binary_on_the_forge_is_refused() {
+    fn invoking_an_absent_tool_on_the_forge_is_refused() {
         for probe in [
-            "boss rerail --help",
-            "cd /home/david/boss && boss receipt main",
-            "echo x $(boss orient)",
+            "kubectl -n boss get deploy boss-jobs",
+            "cd /home/david/boss && kubectl get pods -A",
+            "echo x $(kubectl get nodes)",
         ] {
             assert_eq!(
                 needs_absent_tool(probe),
-                Some("boss"),
-                "the forge has no boss binary: {probe}"
+                Some("kubectl"),
+                "the forge has no kubectl: {probe}"
             );
         }
+    }
+
+    /// `boss` LEFT the list on 2026-09-18 (backlog 8a1fcd22): H8 car 1
+    /// (9f00a805) had the forge's converge install the CLI from the
+    /// cluster image at /usr/local/bin/boss, and car 9ec955c3's probe
+    /// proved it there at the converged sha. A probe may now shell to
+    /// the CLI in command position — that is what the next H8 cars
+    /// (shell twins retiring one verb at a time) need to write.
+    #[test]
+    fn invoking_the_boss_cli_on_the_forge_is_accepted() {
+        for probe in [
+            "boss receipt main",
+            "cd /home/david/boss && boss merged feat/x && echo merged:ok",
+            "echo x $(boss orient)",
+            "/usr/local/bin/boss --version >/dev/null && echo cli:ok",
+        ] {
+            assert_eq!(
+                needs_absent_tool(probe),
+                None,
+                "the forge has the CLI since 9f00a805: {probe}"
+            );
+        }
+    }
+
+    /// A PROBE PROVES, IT DOES NOT ACT. The one thing that turns the
+    /// forge's `boss` into a writer is an actor: the probe's env names
+    /// none (the unattended prove door hands it exactly BOSS_JOBS_URL,
+    /// BOSS_PROBE_NOTFOUND, BOSS_SOR_USER, BOSS_SOR_PORTS and PATH), and
+    /// the CLI refuses an unnamed write by its own rule
+    /// (boss-cli identity.rs). So the probe's TEXT is the only place an
+    /// actor could come from, and a text that spells one is refused
+    /// naming the variable — in either spelling the CLI reads.
+    #[test]
+    fn a_probe_that_names_an_actor_is_seen() {
+        assert_eq!(
+            names_an_actor("BOSS_ACTOR=emp-david boss job close x"),
+            Some("BOSS_ACTOR")
+        );
+        assert_eq!(
+            names_an_actor("export BOSS_ACTOR_FILE=/tmp/a; boss gate x"),
+            Some("BOSS_ACTOR_FILE")
+        );
+        assert_eq!(
+            names_an_actor("env BOSS_ACTOR=\"$BOSS_SOR_USER\" boss receipt main"),
+            Some("BOSS_ACTOR")
+        );
+        // A MENTION is not an assignment: the CLI's own refusal text
+        // names the variable, and a probe may grep for it.
+        assert_eq!(
+            names_an_actor("boss receipt main 2>&1 | grep -c BOSS_ACTOR"),
+            None
+        );
+        assert_eq!(names_an_actor("boss-sor-read /api/yard/status"), None);
     }
 
     /// Every spelling the measured instances used: the env var, the
@@ -464,7 +837,7 @@ mod tests {
     #[test]
     fn a_mention_and_a_named_reader_are_both_allowed() {
         for probe in [
-            "grep -c BOSS_JOBS_URL infra/forge/run-car-probe.sh",
+            "grep -c BOSS_JOBS_URL infra/ops/ops-runner.sh",
             "test -n \"$BOSS_JOBS_URL\" && echo claim-ok",
             "boss-sor-read /api/yard/status | grep -q dock_depth",
             "curl -fsS -H \"x-boss-user: $BOSS_SOR_USER\" $BOSS_JOBS_URL/api/yard/status | grep -q x",
@@ -475,6 +848,154 @@ mod tests {
                 "not an unidentified read: {probe}"
             );
         }
+    }
+
+    /// A DOOR-FED PARSER, verbatim off car 4ef79606. `boss-api` does the
+    /// read; `python3` is handed its stdout on a pipe and only parses.
+    const THE_DOOR_FED_PARSER: &str = r#"boss-api GET "/api/jobs?kind=maintenance-ml-inference-batch&limit=5" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+rows=d.get(\"data\",d.get(\"jobs\",[]))
+ok=[j for j in rows if j.get(\"status\")==\"closed\" and any(s[\"spec_slug\"]==\"run\" and s[\"status\"]==\"completed\" and (s.get(\"metadata\") or {}).get(\"result\")==\"ok\" for s in j.get(\"steps\",[]))]
+print(\"mlbatch:closed-ok\" if ok else \"mlbatch:NONE\")
+""#;
+
+    /// A GATEWAY SESSION, verbatim off car 9e2372cf: POST the auth
+    /// endpoint, keep the `Set-Cookie`, send it with `-b` on the read.
+    const THE_SESSION_PROBE: &str = r#"G=http://10.20.0.30
+SESS=$(curl -s -m 10 -i -X POST "$G/api/auth/guest" | grep -i '^set-cookie: boss_session=' | sed 's/^[Ss]et-[Cc]ookie: //; s/;.*//')
+[ -n "$SESS" ] || { echo "PROBE CANNOT IDENTIFY ITSELF: no guest session from $G/api/auth/guest - a reachability/identity failure, NOT a verdict on the claim"; exit 1; }
+code=$(curl -s -m 15 -b "$SESS" -o /tmp/rulesprobe.$$ -w '%{http_code}' "$G/api/dispatcher/rules") || { echo "PROBE CANNOT READ $G/api/dispatcher/rules (curl exit $?)"; rm -f /tmp/rulesprobe.$$; exit 1; }
+[ "$code" = "200" ] || { echo "PROBE CANNOT READ the rules surface: HTTP $code - NOT a verdict on the claim"; rm -f /tmp/rulesprobe.$$; exit 1; }
+echo "ONE-HOME-FOR-A-DISPATCHER-RULE""#;
+
+    /// THE SHAPE THE DOORS STEER PEOPLE TOWARD MUST NOT BE REFUSED. A
+    /// door does the read and a parser is fed its stdout — measured 28
+    /// times across 449 cars that recorded a probe, five of which needed
+    /// `--probe-anyway` on 2026-09-11 (backlog 5dc5159d). `python3` is
+    /// in [`HTTP_CLIENTS`] because the first measured unidentified read
+    /// was `urllib.request.urlopen`; a `python3` handed a pipe is not
+    /// that, and refusing it made the escape hatch routine.
+    #[test]
+    fn a_parser_fed_by_an_identified_door_is_not_performing_the_read() {
+        for probe in [
+            THE_DOOR_FED_PARSER,
+            "boss-api GET /api/yard/status | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"conductor\"][\"last_verb\"])'",
+            "body=$(boss-api GET '/api/jobs?kind=gate-run&limit=40'); printf '%s' \"$body\" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d[\"data\"]))'",
+            "boss-sor-read /api/workflows | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'",
+        ] {
+            assert_eq!(
+                reads_the_sor_unidentified(probe),
+                None,
+                "the door does the read; the parser is fed its stdout: {probe}"
+            );
+        }
+    }
+
+    /// AND THE PYTHON THAT DOES ITS OWN READ IS STILL REFUSED — the
+    /// first measured instance (61085a9e) and every other spelling of a
+    /// python that can reach the network. The carve-out above keys on
+    /// the ABSENCE of any such facility in the text, so a python with
+    /// one of them is a client again whether or not a door is also
+    /// present.
+    #[test]
+    fn a_python_that_can_reach_the_network_is_still_a_client() {
+        for probe in [
+            "python3 -c \"import urllib.request,os; print(urllib.request.urlopen(os.environ['BOSS_JOBS_URL']+'/api/yard/status').read())\" | grep -q trains",
+            "python3 -c 'import requests,os; print(requests.get(os.environ[\"BOSS_JOBS_URL\"]+\"/api/jobs\").json())' | grep -q x",
+            "python3 -c 'import http.client; c=http.client.HTTPConnection(\"boss-jobs-internal\",7900); c.request(\"GET\",\"/api/yard/status\")'",
+            // A door in the text does not launder a python that reads.
+            "boss-api GET /api/workflows >/dev/null; python3 -c \"import urllib.request; urllib.request.urlopen('$BOSS_JOBS_URL/api/yard/status')\"",
+        ] {
+            assert!(
+                reads_the_sor_unidentified(probe).is_some(),
+                "this python performs the read itself: {probe}"
+            );
+        }
+    }
+
+    /// A GATEWAY SESSION IS AN IDENTITY, and a measured one. 2026-09-11,
+    /// one moment, three readers: a guest session read `total` 22 / 56 /
+    /// 703 on open ship-a-change, open backlog-item and gate-run —
+    /// IDENTICAL to the operator's own door — while the same queries
+    /// unidentified against the jobs API's own port answered 0 / 0 / 0.
+    #[test]
+    fn a_gateway_session_obtained_from_the_server_is_an_identity() {
+        assert_eq!(
+            reads_the_sor_unidentified(THE_SESSION_PROBE),
+            None,
+            "a session the gateway ISSUED is a named reader: {THE_SESSION_PROBE}"
+        );
+    }
+
+    /// WHY THAT IS NOT THE FORGEABLE-HEADER HOLE. The rule keys on
+    /// [`SOR_USER_VAR`] rather than a header NAME so a probe cannot
+    /// satisfy it by writing its own privileged literal. A cookie is a
+    /// different object: measured the same day, `-b
+    /// 'boss_session=iamtheoperator'` against the gateway answered
+    /// **401**, byte-identical to sending no cookie at all. A forged
+    /// header is accepted by a trusting upstream; a forged session is
+    /// refused at the door, so this carve-out cannot produce a false
+    /// PASS — only a loud failure. That is what makes it safe, and it
+    /// is why the carve-out requires the text to OBTAIN a session
+    /// (`/api/auth/…`) as well as send one.
+    #[test]
+    fn a_cookie_flag_alone_is_not_a_session() {
+        for probe in [
+            "curl -fsS -b 'boss_session=iamtheoperator' $BOSS_JOBS_URL/api/yard/status | grep -q trains",
+            "curl -fsS -b \"$SESS\" http://10.20.0.30/api/dispatcher/rules | grep -q authored_registry",
+        ] {
+            assert!(
+                reads_the_sor_unidentified(probe).is_some(),
+                "nothing in this text obtained a session: {probe}"
+            );
+        }
+    }
+
+    /// AND A SESSION DOES NOT EXCUSE A READ THAT BYPASSES THE GATEWAY.
+    /// The cookie identifies a reader AT THE GATEWAY; the jobs API's own
+    /// port does not read cookies, so the same text pointed at
+    /// `$BOSS_JOBS_URL` is the 61085a9e defect with a session fetched
+    /// beside it. The carve-out is therefore refused the moment a
+    /// DIRECT spelling appears.
+    #[test]
+    fn a_session_does_not_excuse_a_read_past_the_gateway() {
+        let probe = "SESS=$(curl -s -i -X POST http://10.20.0.30/api/auth/guest | sed -n 's/^set-cookie: //p'); \
+                     curl -fsS -b \"$SESS\" $BOSS_JOBS_URL/api/jobs?kind=pr-train&status=open | grep -q '\"total\":0'";
+        assert_eq!(
+            reads_the_sor_unidentified(probe),
+            Some("curl"),
+            "a gateway session says nothing about a read on the jobs API's own port"
+        );
+    }
+
+    /// WHAT THIS RULE STILL REFUSES ON PURPOSE, pinned so the next
+    /// reader knows it is a decision and not an oversight (5dc5159d
+    /// asked for three carve-outs and got two).
+    ///
+    /// Both texts are route-SHAPE probes: they read 401-vs-404 through
+    /// the gateway, where an unidentified reader cannot turn a routed
+    /// path into an unrouted one, and both guard that with a control
+    /// that fails closed. They are correct, and they keep their
+    /// override — because what makes them safe is their CONTROL, which
+    /// is program logic, not a target a text scan can recognise. A
+    /// carve-out wide enough to admit them (a `curl` whose assertions
+    /// are status codes) would also admit an absence assertion over
+    /// policy-scoped data, which is the false pass this whole rule
+    /// exists to stop.
+    #[test]
+    fn a_route_shape_probe_still_carries_an_override() {
+        let shape = "G=http://10.20.0.30\n\
+                     ctl=$(curl -s -m 10 -o /dev/null -w '%{http_code}' \"$G/api/yard/status\"); \
+                     [ \"$ctl\" = \"401\" ] || exit 1\n\
+                     code=$(curl -s -m 10 -o /tmp/p.$$ -w '%{http_code}' \"$G/api/design/flush-jobs\"); \
+                     [ \"$code\" = \"404\" ] || exit 1\n\
+                     echo FLUSH-PIPELINE-ROUTES-ARE-GONE";
+        assert_eq!(
+            reads_the_sor_unidentified(shape),
+            Some("curl"),
+            "left deliberately refused: the control is logic, not a target"
+        );
     }
 
     /// THE PROBE THAT COST 18 HOURS, verbatim off car a0ab90a5's
@@ -529,7 +1050,7 @@ mod tests {
             "curl -fsS x | jq 'if (.a==1) then empty else error(\"no\") end'",
             "curl -fsS x | jq -e '.a == 1'",
             "curl -fsS x | jq -e --arg k v '.a == $k'",
-            "grep -c empty infra/forge/run-car-probe.sh",
+            "grep -c empty infra/ops/ops-runner.sh",
         ] {
             assert!(
                 !asserts_its_own_negation(probe),
@@ -574,6 +1095,176 @@ mod tests {
             rewrites_its_exit_status("boss-sor-read /api/x | grep -q y"),
             None
         );
+    }
+
+    /// THE TWO PROBES THAT SAT UNPROVEN ON `null`, verbatim off the
+    /// cars' `proof_attempt.probe` (0df3af1c, run 2026-09-14T00:00:25Z on
+    /// david-asus-minipc). Both read a number out of JSON with `jq -r`,
+    /// both test it with `-lt`, and both carried every shape of guard
+    /// that does NOT work: a `select(.build_s != null)` INSIDE the array
+    /// (so `first` of an empty array is still `null`), a `${b:-9999}`
+    /// default (which fills EMPTY, and `null` is four characters), and an
+    /// `exit 75` in the else branch the test never reached. stderr, both:
+    /// `bash: line 10: [: null: integer expression expected`.
+    const THE_FLOOR_SWEEP_PROBE_THAT_FAILED_ON_NULL: &str = "b=$(boss-sor-read \"/api/jobs?kind=maintenance-cluster-converge&limit=6\" | jq -r \"[.data[] | .steps[] | select(.spec_slug==\\\"run\\\") | .metadata | select(.build_s != null)] | first | .build_s\"); echo \"build_s=$b\"; if [ \"${b:-9999}\" -lt 200 ]; then echo warm-build-kept:ok; else echo \"newest converge built in ${b}s — warm needs a sweep hour to pass without wiping the mounts, then a converge\"; exit 75; fi";
+
+    const THE_IMAGE_BUILD_PROBE_THAT_FAILED_ON_NULL: &str = "b=$(boss-sor-read '/api/jobs?kind=maintenance-cluster-converge&limit=6' | jq -r '[.data[] | .steps[] | select(.spec_slug==\"run\") | .metadata | select(.build_s != null)] | first | \"build_s=\\(.build_s) head=\\(.build_head)\"'); echo \"$b\"; s=${b#build_s=}; s=${s%% *}; if [ \"${s:-9999}\" -lt 300 ]; then echo warm-image-build:ok; else echo \"the newest converge built in ${s}s — a cold cache fill after landing is expected once; the converge after it is the measurement (was 522s before)\"; exit 75; fi";
+
+    /// And the two that REPLACED them by hand at 16:36Z, also verbatim
+    /// off the cars' `proof_probe`: the first guards on both sides
+    /// (`// empty` in jq AND `case … *[!0-9]*` in the shell), the second
+    /// with `first | select(. != null)` in jq and the same `case`. A
+    /// check that flags the correct shape teaches the next builder to
+    /// ignore it.
+    const THE_FLOOR_SWEEP_PROBE_REWRITTEN: &str = "b=$(boss-sor-read \"/api/jobs?kind=maintenance-cluster-converge&limit=60\" | jq -r \"[.data[] | .steps[] | select(.spec_slug==\\\"run\\\") | .metadata | select(.build_s != null)] | first | .build_s // empty\"); echo \"build_s=${b:-none}\"; case \"$b\" in ''|*[!0-9]*) echo \"not yet: no converge in the newest 60 packets recorded a build (every tick was unchanged)\"; exit 75;; esac; if [ \"$b\" -lt 200 ]; then echo warm-build-kept:ok; else echo \"newest converge built in ${b}s — warm needs a sweep hour to pass without wiping the mounts, then a converge\"; exit 75; fi";
+
+    const THE_IMAGE_BUILD_PROBE_REWRITTEN: &str = "b=$(boss-sor-read '/api/jobs?kind=maintenance-cluster-converge&limit=60' | jq -r '[.data[] | .steps[] | select(.spec_slug==\"run\") | .metadata | select(.build_s != null)] | first | select(. != null) | \"build_s=\\(.build_s) head=\\(.build_head)\"'); echo \"${b:-build_s=none}\"; s=${b#build_s=}; s=${s%% *}; case \"$s\" in ''|*[!0-9]*) echo 'not yet: no converge in the newest 60 packets recorded a build (every tick was unchanged)'; exit 75;; esac; if [ \"$s\" -lt 300 ]; then echo warm-image-build:ok; else echo \"the newest converge built in ${s}s — a cold cache fill after landing is expected once; the converge after it is the measurement (was 522s before)\"; exit 75; fi";
+
+    /// The measured instances are seen, and the variable each compares
+    /// is NAMED, because the warning has to say which one to guard. The
+    /// third text is the packet's own schematic of the pattern, which
+    /// is what the daily recheck ran into again.
+    #[test]
+    fn the_probes_that_failed_on_null_are_seen_with_their_variable_named() {
+        assert_eq!(
+            compares_an_unguarded_number(THE_FLOOR_SWEEP_PROBE_THAT_FAILED_ON_NULL),
+            Some("b"),
+            "{THE_FLOOR_SWEEP_PROBE_THAT_FAILED_ON_NULL}"
+        );
+        assert_eq!(
+            compares_an_unguarded_number(THE_IMAGE_BUILD_PROBE_THAT_FAILED_ON_NULL),
+            Some("s"),
+            "{THE_IMAGE_BUILD_PROBE_THAT_FAILED_ON_NULL}"
+        );
+        assert_eq!(
+            compares_an_unguarded_number(
+                "b=$(boss-sor-read /api/jobs | jq -r '.data | first | .build_s'); \
+                 if [ \"$b\" -lt 200 ]; then echo claim:ok; fi"
+            ),
+            Some("b")
+        );
+    }
+
+    /// The hand rewrites are clean — on either side of the pipe.
+    #[test]
+    fn the_probes_rewritten_with_a_guard_are_not_reported() {
+        for probe in [
+            THE_FLOOR_SWEEP_PROBE_REWRITTEN,
+            THE_IMAGE_BUILD_PROBE_REWRITTEN,
+            // Each guard alone is enough: the jq side …
+            "b=$(boss-sor-read /api/x | jq -r '.n // empty'); [ \"$b\" -lt 200 ] && echo claim:ok",
+            "b=$(boss-sor-read /api/x | jq -r 'first | select(. != null) | .n'); [ \"$b\" -lt 200 ] && echo claim:ok",
+            // … or the shell side, as a glob or as a regex.
+            "b=$(boss-sor-read /api/x | jq -r '.n'); case \"$b\" in ''|*[!0-9]*) echo 'not yet: no n'; exit 75;; esac; [ \"$b\" -lt 200 ] && echo claim:ok",
+            "b=$(boss-sor-read /api/x | jq -r '.n'); [[ \"$b\" =~ ^[0-9]+$ ]] || { echo 'not yet: no n'; exit 75; }; [[ \"$b\" -lt 200 ]] && echo claim:ok",
+        ] {
+            assert_eq!(
+                compares_an_unguarded_number(probe),
+                None,
+                "guarded: {probe}"
+            );
+        }
+    }
+
+    /// WHAT DOES NOT COUNT AS A GUARD, each because the failing probes
+    /// HAD it. A `${b:-9999}` default fills the empty string and `jq -r`
+    /// prints `null`, not nothing. A `select(.field != null)` inside the
+    /// array leaves `first` of an empty array as `null`. An `exit 75` in
+    /// the else branch is reached only after `[` has already errored on
+    /// the string. Counting any of these would have exempted both
+    /// measured probes.
+    #[test]
+    fn a_default_a_field_select_and_a_late_exit_75_are_not_guards() {
+        for probe in [
+            "b=$(boss-sor-read /api/x | jq -r '.n'); [ \"${b:-9999}\" -lt 200 ] && echo claim:ok",
+            "b=$(boss-sor-read /api/x | jq -r '[.[] | select(.n != null)] | first | .n'); [ \"$b\" -lt 200 ] && echo claim:ok",
+            "b=$(boss-sor-read /api/x | jq -r '.n'); if [ \"$b\" -lt 200 ]; then echo claim:ok; else echo 'not yet'; exit 75; fi",
+        ] {
+            assert_eq!(
+                compares_an_unguarded_number(probe),
+                Some("b"),
+                "not a guard: {probe}"
+            );
+        }
+    }
+
+    /// No numeric test on a VARIABLE, no finding — whatever else the
+    /// text does. A string test, a `grep -c` piped to nothing numeric, an
+    /// operator mentioned in prose or in a jq filter, and a literal on
+    /// both sides are all not the shape.
+    #[test]
+    fn a_probe_without_a_numeric_test_on_a_variable_is_not_reported() {
+        for probe in [
+            "boss-sor-read /api/workflows/x | grep -q claim:ok",
+            "b=$(boss-sor-read /api/x | jq -r '.name'); [ \"$b\" = ready ] && echo claim:ok",
+            "git show HEAD:infra/gate.sh | grep -c \"integer expression\" && echo claim:ok",
+            "echo 'the -lt test is the shape'; [ 1 -lt 2 ] && echo claim:ok",
+            "boss-sor-read /api/x | jq -e '.n < 200' >/dev/null && echo claim:ok",
+        ] {
+            assert_eq!(
+                compares_an_unguarded_number(probe),
+                None,
+                "not the shape: {probe}"
+            );
+        }
+    }
+
+    /// THE PROBE THAT ANSWERED FAILED FOR A NOT-YET (c0ac92b8, car
+    /// 746a1fac), and its spellings: the committer date with an offset,
+    /// the author's, and the `--date=` forms that make `%cd` print the
+    /// same. Each is named back so the refusal can say which token.
+    #[test]
+    fn a_probe_that_reads_a_git_date_with_an_offset_is_seen_by_its_token() {
+        for (probe, token) in [
+            (
+                "since=$(git log -1 --format=%cI HEAD); \
+                 last=$(boss-sor-read '/api/audit?kind=class.retired&limit=1' | jq -r '.data[0].at // empty'); \
+                 [ \"$last\" \\> \"$since\" ] && echo retire:after-landing",
+                "%cI",
+            ),
+            (
+                "git log -1 --format='%ci' | grep -q 2026 && echo claim:ok",
+                "%ci",
+            ),
+            (
+                "git log -1 --format=%aI | grep -q T && echo claim:ok",
+                "%aI",
+            ),
+            (
+                "git log -1 --pretty=%ai | grep -q T && echo claim:ok",
+                "%ai",
+            ),
+            (
+                "git log -1 --date=iso-strict --format=%cd | grep -q T && echo claim:ok",
+                "--date=iso",
+            ),
+            (
+                "git log -1 --date=rfc2822 --format=%cd | grep -q 2026 && echo claim:ok",
+                "--date=rfc",
+            ),
+        ] {
+            assert_eq!(reads_git_time_with_an_offset(probe), Some(token), "{probe}");
+        }
+    }
+
+    /// The rewrite the refusal names — epochs on both sides, the empty
+    /// case guarded first — is clean, and so is a probe that reads no
+    /// git date at all, or reads one as an integer.
+    #[test]
+    fn a_probe_that_compares_epochs_is_not_reported() {
+        for probe in [
+            "commit=$(git log -1 --format=%ct HEAD); \
+             ts=$(boss-sor-read '/api/audit?kind=class.retired&limit=1' | jq -r '.data[0].at // empty'); \
+             [ -n \"$ts\" ] || { echo 'not yet: no retire recorded'; exit 75; }; \
+             seen=$(date -u -d \"$ts\" +%s); \
+             [ \"$seen\" -gt \"$commit\" ] && echo retire:after-landing",
+            "git log -1 --format=%at | grep -q . && echo claim:ok",
+            "git log -1 --date=unix --format=%cd | grep -q . && echo claim:ok",
+            "git show HEAD:infra/gate.sh | grep -c 'integer expression' && echo claim:ok",
+            "boss-sor-read /api/yard/status | jq -e '.dock_depth == 1' >/dev/null && echo claim:ok",
+        ] {
+            assert_eq!(reads_git_time_with_an_offset(probe), None, "clean: {probe}");
+        }
     }
 
     /// The override record is the same shape wherever a door writes it,

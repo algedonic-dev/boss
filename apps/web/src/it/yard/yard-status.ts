@@ -13,6 +13,7 @@
 // included, computed server-side from the system of record.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { DELIVERY_CHANNELS, type DeliveryChannel } from './yard';
 
 // ---------------------------------------------------------------------
 // Wire types — the shape of GET /api/yard/status. Parsed once, below.
@@ -71,6 +72,13 @@ export type TrainStatus = Readonly<{
   ci_result: string | null;
   pr_url: string | null;
   car_count: number;
+  /** How this train ships — the heaviest of its cars' channels, stamped
+   *  by the conductor at board (`metadata.delivery_channel`, cffef553).
+   *  Named on the card: 'data train · 1 car'. Null for a train boarded
+   *  before the stamp existed, or a server that does not send it —
+   *  drawn as nothing, never guessed: unlike a car, an old train has no
+   *  default worth asserting. */
+  channel: DeliveryChannel | null;
   /** When the train boarded (RFC3339, the collect step's stamp). Null
    *  on a server that does not send it; the floor then reads the
    *  boarding minute off the title. */
@@ -86,6 +94,11 @@ export type DockCar = Readonly<{
   title: string;
   branch: string | null;
   parked_since: string;
+  /** How many red trains have released this car — the conductor's
+   *  stamp, as the server states it. Absent on an older server, and
+   *  ONLY then: a stated 0 is "clean", not "unknown", so a reader falls
+   *  back to its own count only when the field is missing (ac80357b). */
+  red_trains?: number;
 }>;
 
 /** A car standing ON the dock that cannot board: an operator wrote a
@@ -106,6 +119,10 @@ export type HeldCar = Readonly<{
   title: string;
   branch: string | null;
   parked_since: string;
+  /** The dock row's strike count — see `DockCar.red_trains`. This is
+   *  the row the held lane is drawn from once the dock station stops
+   *  listing a held car, so the count must ride HERE or nowhere. */
+  red_trains?: number;
   /** Why it cannot board. A bare `hold: true` reads "no reason
    *  recorded" — the same words the held-green lane uses. */
   reason: string;
@@ -142,6 +159,16 @@ export type BoardingPredicate = Readonly<{
   /** Whether the threshold is met — null when the question has NO
    *  ANSWER: no depth rule configured, or the depth unread. Not false. */
   threshold_met: boolean | null;
+  /** The boarding rule as a sentence — "Boards at 4 parked cars (min 45
+   *  min between depth-rule boards) or 06:00 / 18:00 UTC; 2 car(s) parked
+   *  now — below the dock threshold." Rendered VERBATIM on the yard
+   *  board's rule line and the status page's dock line: the lens
+   *  composes no boarding sentence of its own. Until dec9c9df it did —
+   *  `boardsWhen()` rebuilt one here from the numeric fields — and when
+   *  the server's wording moved (#371: the cooldown is the depth rule's,
+   *  not the track's) the page kept saying the old sentence. Two
+   *  derivations of one sentence diverge on every rule change; one
+   *  cannot. */
   summary: string;
   /** Why the dock is not boarding RIGHT NOW — `track occupied (…)`,
    *  `cooldown — M min left`, `below threshold (…)` — or null when it
@@ -150,8 +177,16 @@ export type BoardingPredicate = Readonly<{
    *  trains, the dock). Null on an older server, with `next_board` null
    *  beside it; the page then states the rule and never a hold. */
   held_because: string | null;
+  /** Minutes left of the DEPTH rule's cooldown — measured on that rule's
+   *  own last firing, never on `last_board_at`. The server names the
+   *  rule beside it (`cooldown_rule`, not parsed here: nothing renders
+   *  it) and its `summary` says "between depth-rule boards", because a
+   *  clock-window board neither waits for this nor resets it (43fb424f:
+   *  two trains 16 min apart under a stated 45). */
   cooldown_remaining_minutes: number | null;
-  /** When the board rule last fired (RFC3339), released or not. */
+  /** When a board rule last fired (RFC3339), released or not — the
+   *  newest across the depth rule AND the clock window, so it is the
+   *  track's last board and not one rule's. */
   last_board_at: string | null;
   /** Whether the server read that firing. `unread` says `last_board_at`
    *  and `cooldown_remaining_minutes` are unknowns — not "it has never
@@ -216,6 +251,10 @@ export type ActiveGate = Readonly<{
    *  like a slow one from here, and the bay must say so. Absent on an
    *  older server → false: no fabricated alarm. */
   stale: boolean;
+  /** The pr-train this run tests when it is a TRAIN gate (128b5496) —
+   *  absent or null for a car's gate. The floor draws such a bay as the
+   *  train under test, not as a PR car (2026-09-14). */
+  train?: string | null;
 }>;
 
 /** One gate-run WAITING for a slot — filed and ordered, but not running.
@@ -237,6 +276,8 @@ export type QueuedGate = Readonly<{
   /** How much longer it expects to wait, seconds — derived server-side
    *  from the MEASURED gate duration. Null when nothing was measured. */
   estimated_wait_seconds: number | null;
+  /** As on ActiveGate: the train this run tests, when it is a train gate. */
+  train?: string | null;
 }>;
 
 /** The gate slots the Approach renders: `capacity` (from the delivery
@@ -253,10 +294,17 @@ export type Gates = Readonly<{
   typical_seconds: number | null;
 }>;
 
-/** A car whose most-recent gate-run is red — waiting for rework. */
+/** A car whose most-recent gate-run is red — waiting for rework.
+ *  Mirrors the Rust `GaragedCar`. */
 export type GaragedCar = Readonly<{
   branch: string;
   failed_check: string | null;
+  /** WHY, in one line: the first line of the failed check's excerpt
+   *  that reads as the failure, as the server picks it off the
+   *  receipt's `fails_excerpt` (#372). Absent on a server from before
+   *  the reading; null when the receipt carries no excerpt (every one
+   *  before #372) — an absence, never a fabricated why (6730dccb). */
+  failed_line?: string | null;
   since: string;
   packet_id: string;
   sha: string | null;
@@ -298,6 +346,35 @@ export type ConductorHealth = Readonly<{
   last_rc: number | null;
 }>;
 
+/** Whether a car's channel evidence exists — the server's judgement of
+ *  one car on its arrivals siding (the Rust `landing::Landing`, tagged
+ *  on `kind`). EACH SIDING LANDS ON ITS OWN EVIDENCE (design c6bd173e,
+ *  car 3 — edae6e8b): a config car on the cluster converge packet that
+ *  applied its manifests, an infra car on the host converge packets, a
+ *  software car on the train's converged step. `landed` names the
+ *  evidence; `converging` names what is awaited; `unread` says the
+ *  server's window of converge packets began after the merge, so it
+ *  could not judge — which is not "converging", and the floor must not
+ *  draw it as such. */
+export type Landing =
+  | Readonly<{ kind: 'landed'; evidence: string; at: string | null }>
+  | Readonly<{ kind: 'converging'; awaiting: string }>
+  | Readonly<{ kind: 'unread'; why: string }>;
+
+/** One car of a merged train on its siding, as the server judged it. */
+export type SidingCar = Readonly<{
+  /** The car's packet id — the floor joins on it. */
+  id: string;
+  branch: string | null;
+  /** The train that carried it. */
+  train: string;
+  /** The siding: the car's channel, software when the server names one
+   *  this reader has no siding for (the same default a car reads). */
+  channel: DeliveryChannel;
+  /** Null for a landing kind this reader does not know: no reading. */
+  landing: Landing | null;
+}>;
+
 export type YardStatus = Readonly<{
   trains: readonly TrainStatus[];
   dock: readonly DockCar[];
@@ -318,8 +395,21 @@ export type YardStatus = Readonly<{
   /** `null` on a server that predates the reading — rendered as "no
    *  reading", never as a healthy conductor. */
   conductor: ConductorHealth | null;
+  /** How the recency lanes (slots, garage, limbo, stranded) were read:
+   *  the newest `window` gate-runs, and whether the record held more
+   *  (`truncated`). The held lane is NOT bounded by this — it is read
+   *  from the record by its hold (2fa96d34: a held green fell off the
+   *  window and the lane said none held). `null` on a server that
+   *  predates the reading. */
+  gate_runs: GateRunWindow | null;
+  /** The arrivals sidings, one row per car of every merged train the
+   *  server judged. Empty on a server that predates the lane — the
+   *  floor then reads "landed" off the train, as before. */
+  sidings: readonly SidingCar[];
   now: string;
 }>;
+
+export type GateRunWindow = Readonly<{ truncated: boolean; window: number }>;
 
 // ---------------------------------------------------------------------
 // Parse — once, at the fetch site (house style). Throws on a bad shape
@@ -404,19 +494,40 @@ function parseTrain(raw: unknown): TrainStatus {
     ci_result: typeof o.ci_result === 'string' ? o.ci_result : null,
     pr_url: typeof o.pr_url === 'string' ? o.pr_url : null,
     car_count: Number(o.car_count ?? 0),
+    channel: parseChannel(o.channel),
     boarded_at: typeof o.boarded_at === 'string' ? o.boarded_at : null,
     eta: parseEta(o.eta),
   };
 }
 
+/** The train's channel when it names one of the four sidings; null
+ *  otherwise. Deliberately NOT `deliveryChannelOf` (which lands an
+ *  unknown car on software): a car without a stamp still ships, but a
+ *  train without one is simply older than the stamp. */
+function parseChannel(v: unknown): DeliveryChannel | null {
+  return (DELIVERY_CHANNELS as readonly unknown[]).includes(v) ? (v as DeliveryChannel) : null;
+}
+
 function parseDockCar(raw: unknown): DockCar {
   const o = asObject(raw, 'dock car');
+  const red_trains = parseRedTrains(o.red_trains);
   return {
     id: String(o.id ?? ''),
     title: String(o.title ?? ''),
     branch: typeof o.branch === 'string' ? o.branch : null,
     parked_since: String(o.parked_since ?? ''),
+    // Set only when stated, so `'red_trains' in row` and `?? fallback`
+    // both read "the server said nothing" on an older server.
+    ...(red_trains === undefined ? {} : { red_trains }),
   };
+}
+
+/** A strike count as the server states it: a non-negative integer, 0
+ *  included. Anything else — absent, a string, a negative, a fraction —
+ *  is NOT a count and reads as "not stated", never as 0 (a stated 0 is a
+ *  clean car; an unstated one lets the reader fall back). */
+function parseRedTrains(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
 }
 
 /** A held car is a dock row plus its reason — parsed through the same
@@ -533,6 +644,7 @@ function parseGaragedCar(raw: unknown): GaragedCar {
   return {
     branch: String(o.branch ?? ''),
     failed_check: typeof o.failed_check === 'string' ? o.failed_check : null,
+    failed_line: typeof o.failed_line === 'string' && o.failed_line !== '' ? o.failed_line : null,
     since: String(o.since ?? ''),
     ...parsePacket(o),
   };
@@ -557,6 +669,12 @@ function parseStrandedGreen(raw: unknown): StrandedGreen {
   };
 }
 
+/** The gate-run window marker — both keys stated, or no reading. */
+function parseGateRunWindow(truncated: unknown, window: unknown): GateRunWindow | null {
+  if (typeof truncated !== 'boolean' || typeof window !== 'number') return null;
+  return { truncated, window };
+}
+
 /** The conductor block. Absent on an older server → `null` (the page
  *  says "no reading"); present with unknowns → nulls, never defaults. */
 function parseConductor(raw: unknown): ConductorHealth | null {
@@ -570,6 +688,31 @@ function parseConductor(raw: unknown): ConductorHealth | null {
     silent: o.silent === true,
     last_verb: typeof o.last_verb === 'string' ? o.last_verb : null,
     last_rc: typeof o.last_rc === 'number' ? o.last_rc : null,
+  };
+}
+
+function parseLanding(raw: unknown): Landing | null {
+  const o = asObjectOrEmpty(raw);
+  switch (o.kind) {
+    case 'landed':
+      return { kind: 'landed', evidence: String(o.evidence ?? ''), at: typeof o.at === 'string' ? o.at : null };
+    case 'converging':
+      return { kind: 'converging', awaiting: String(o.awaiting ?? '') };
+    case 'unread':
+      return { kind: 'unread', why: String(o.why ?? '') };
+    default:
+      return null;
+  }
+}
+
+function parseSidingCar(raw: unknown): SidingCar {
+  const o = asObject(raw, 'siding car');
+  return {
+    id: String(o.id ?? ''),
+    branch: typeof o.branch === 'string' ? o.branch : null,
+    train: String(o.train ?? ''),
+    channel: parseChannel(o.channel) ?? 'software',
+    landing: parseLanding(o.landing),
   };
 }
 
@@ -598,6 +741,8 @@ export function parseYardStatus(raw: unknown): YardStatus {
     limbo: Array.isArray(o.limbo) ? o.limbo.map(parseLimboCar) : [],
     policy: parsePolicy(o.policy),
     conductor: parseConductor(o.conductor),
+    gate_runs: parseGateRunWindow(o.gate_runs_truncated, o.gate_run_window),
+    sidings: Array.isArray(o.sidings) ? o.sidings.map(parseSidingCar) : [],
     now: String(o.now ?? ''),
   };
 }
@@ -659,6 +804,18 @@ export function journeyText(seconds: number | null): string {
   if (seconds === null) return '—';
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
   return `${Math.round((seconds / 3600) * 10) / 10}h`;
+}
+
+/** The dock table's `reds` cell — the conductor's `red_trains` stamp on
+ *  a parked car, as words. Blank for a clean car (and for an older server
+ *  that states no count), so a clean row reads exactly as it did; `1 red`
+ *  / `N reds` otherwise. The status table is the reading an operator uses
+ *  to decide what to look at before the next board, and until 2026-09-14
+ *  a car one red away from being held read identical to a clean one
+ *  there, though the row already carried the count (cb6714de). */
+export function redsCell(n: number | undefined): string {
+  if (n === undefined || n <= 0) return '';
+  return `${n} red${n === 1 ? '' : 's'}`;
 }
 
 /** One gate slot: either the car being assessed in it, or empty. */
@@ -740,35 +897,6 @@ export function lastVerbReading(c: ConductorHealth | null): Reading {
   if (c.last_rc === null) return { tone: 'muted', text: `${c.last_verb} · rc unknown` };
   if (c.last_rc === 0) return { tone: 'ok', text: `${c.last_verb} · rc 0` };
   return { tone: 'err', text: `${c.last_verb} · rc ${c.last_rc} — the last pass failed` };
-}
-
-/** When the next train boards, as the RULE — depth reached, cooldown
- *  cleared — and never as a time. The board rule is queue-depth
- *  triggered; it has no next-fire clock, and inventing one is exactly
- *  the "the board said fine and it was not" the page exists to stop.
- *  A clock rule beside it is quoted verbatim from the registry row. */
-export function boardsWhen(b: BoardingPredicate): string {
-  const t = b.dock_threshold;
-  // No threshold has two causes — a registry with no depth rule, and a
-  // cadence read that failed — and only the SERVER can tell them apart,
-  // so the server's sentence is what renders. `cadence_reading` says
-  // which one it is for anything that needs to branch.
-  if (t === null) return b.summary !== '' ? b.summary : 'no boarding rule configured';
-  const cooldown =
-    b.cooldown_minutes !== null ? `the cooldown (${b.cooldown_minutes}m) clears` : null;
-  const clockOf = (): string =>
-    b.at_times.length > 0 ? ` · or by the clock at ${b.at_times.join(' / ')} UTC` : '';
-  // NO READING comes first. Without a depth the threshold question has no
-  // answer, and "0/4 parked — boards when the dock reaches 4" is the
-  // sentence an operator acts on. The clock rule still boards, and it
-  // never reads the depth, so it is still quoted.
-  if (b.dock_depth === null)
-    return `dock depth unread — the ${t}-car threshold cannot be evaluated${clockOf()}`;
-  const depth = `${b.dock_depth}/${t} parked`;
-  const rule = b.threshold_met
-    ? `threshold met — ${depth}; boards ${cooldown ? `when ${cooldown}` : "on the conductor's next pass"}`
-    : `${depth} — boards when the dock reaches ${t}${cooldown ? ` and ${cooldown}` : ''}`;
-  return rule + clockOf();
 }
 
 /** An RFC3339 stamp as the clock time it names, `HH:MM UTC` — the

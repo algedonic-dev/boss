@@ -104,6 +104,21 @@ impl Extracted {
     fn fails_joined(&self) -> String {
         self.fails().map(|f| f.join("\n")).unwrap_or_default()
     }
+
+    /// `fails_excerpt` as the receipt carries it — check name to the
+    /// bounded text of what that check said (5708cbd5). `None` when the
+    /// receipt is unparseable or the key is absent, for the same reason
+    /// `fails` tells those apart from empty.
+    fn fails_excerpt(&self) -> Option<serde_json::Map<String, Value>> {
+        let v: Value = serde_json::from_str(&self.receipt).ok()?;
+        v.get("fails_excerpt")?.as_object().cloned()
+    }
+
+    fn excerpt_of(&self, check: &str) -> String {
+        self.fails_excerpt()
+            .and_then(|m| m.get(check).and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default()
+    }
 }
 
 /// Run the extractor over a crafted receipt + log.
@@ -232,6 +247,79 @@ fn it_replays_only_the_checks_that_failed() {
 /// ended — a timeout, an OOM kill, a node reset mid-gate. That is one of
 /// the cases most worth explaining, so it must not be dropped for want
 /// of a closing marker.
+/// A CHECK THAT COULD NOT REACH THE NETWORK JUDGED NOTHING (478347ad).
+/// Gate-run 7522c115: `web-suite` failed with 232 lines of bun's
+/// "error: Unable to connect. Is the computer able to access the url?"
+/// and no test or compile failure; two minutes later the registry
+/// answered in 0.06 s. The receipt recorded verdict=failed against the
+/// branch, and its own `fails` line already said "no cargo test failure
+/// in this check's output" over 232 connect errors — the diagnosis was
+/// on the record and nothing acted on it. A check whose failure is only
+/// connect/resolve errors, with no test, panic or compile failure, is a
+/// REFUSAL: the receipt says `refused` with a `refused_because` naming
+/// the check and the count, in the shape gate.sh writes for its own
+/// disk-floor refusal, so every reader that spares the branch on a
+/// refusal spares this one too.
+#[test]
+fn a_check_that_only_failed_to_reach_the_network_is_a_refusal_not_a_red() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let mut connect_errors = String::new();
+    for _ in 0..40 {
+        connect_errors.push_str(
+            "error: Unable to connect. Is the computer able to access the url?\n\
+             \n  https://registry.npmjs.org/svelte\n\n",
+        );
+    }
+    let log = format!(
+        "::group::gate: web install\nbun install v1.2.0\n{connect_errors}error: InstallFailed\n::endgroup::\n"
+    );
+    let receipt = red_receipt(
+        "{\"name\":\"fmt\",\"result\":\"pass\"},\
+         {\"name\":\"web install\",\"result\":\"fail\"}",
+    );
+    let got = run_extractor(&receipt, &log);
+    assert!(got.ok, "{}", got.stdout);
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    assert_eq!(
+        v["verdict"], "refused",
+        "only connect errors and no judged failure: the run was refused, not the branch:\n{}",
+        got.receipt
+    );
+    let why = v["refused_because"].as_str().unwrap_or("");
+    assert!(
+        why.contains("web install") && why.contains("network") && why.contains("40"),
+        "refused_because names the check, the cause and the count: {why}"
+    );
+    assert!(
+        got.fails_joined().contains("no cargo test failure"),
+        "the fails ladder still says what it saw: {}",
+        got.fails_joined()
+    );
+}
+
+/// The same connect errors BESIDE a judged failure are noise around a
+/// red, not a refusal: a test that failed is a verdict on the branch.
+#[test]
+fn connect_errors_beside_a_judged_failure_stay_a_red() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let log = format!(
+        "::group::gate: test\nerror: Unable to connect. Is the computer able to access the url?\n\
+         error: Unable to connect. Is the computer able to access the url?\n{}",
+        LOG.split("::group::gate: test\n").nth(1).unwrap_or("")
+    );
+    let receipt = red_receipt("{\"name\":\"test\",\"result\":\"fail\"}");
+    let got = run_extractor(&receipt, &log);
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    assert_eq!(v["verdict"], "failed", "{}", got.receipt);
+    assert!(v.get("refused_because").is_none(), "{}", got.receipt);
+}
+
 #[test]
 fn it_keeps_what_a_killed_check_managed_to_say() {
     if python3_missing() {
@@ -405,7 +493,7 @@ fn it_leaves_every_other_receipt_field_alone() {
     }
     assert!(
         after.get("fails").is_some(),
-        "…and `fails` is the only addition:\n{}",
+        "…and `fails` (with `fails_excerpt`) is the only addition:\n{}",
         got.receipt
     );
 }
@@ -483,5 +571,331 @@ Error: src/it/yard/yard.svelte:12:3 Type 'string' is not assignable to 'number'
     assert!(
         !fails.contains("panicked"),
         "and nothing may be claimed about a shape that was never there:\n{fails}"
+    );
+}
+
+/// THE THIRD FAILURE, one level deeper again (backlog 5708cbd5). Train
+/// #361's red gate (2026-09-14) recorded `test: the_real_run_refuses…
+/// - FAILED, with no panic line for it in this check's output` — the
+/// test named, the reason absent, because the assertion text lived only
+/// in the pod log's replay and the pod log is reaped. So the SAME lines
+/// the replay prints for a failed check ride the receipt as
+/// `fails_excerpt: {check: text}`, beside `fails`: the record then says
+/// WHY, and the red-train alert can carry it without kubectl.
+#[test]
+fn a_red_receipt_carries_each_failed_checks_excerpt_and_only_theirs() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let receipt = red_receipt(
+        "{\"name\":\"fmt\",\"result\":\"pass\"},\
+         {\"name\":\"clippy\",\"result\":\"fail\"},\
+         {\"name\":\"test\",\"result\":\"fail\"}",
+    );
+    let got = run_extractor(&receipt, LOG);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+
+    let excerpt = got
+        .fails_excerpt()
+        .expect("fails_excerpt is present on a red receipt");
+    let mut keys: Vec<&String> = excerpt.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["clippy", "test"],
+        "one excerpt per FAILED check — the passing one has nothing to explain:\n{}",
+        got.receipt
+    );
+    assert!(
+        got.excerpt_of("clippy")
+            .contains("error: aborting due to 1 previous error"),
+        "the failing check's own words are the excerpt:\n{}",
+        got.receipt
+    );
+    assert!(
+        got.excerpt_of("test")
+            .contains("test boss::thing ... FAILED"),
+        "every failed check gets its excerpt, not just the first:\n{}",
+        got.receipt
+    );
+    assert!(
+        !got.receipt.contains("formatting is fine"),
+        "a passing check's output never reaches the receipt:\n{}",
+        got.receipt
+    );
+}
+
+/// The excerpt is the replay's selection, not a new one: the panic
+/// block with its `file:line` and message is in it verbatim, so the
+/// alert that attaches it says what the operator otherwise reads by
+/// `kubectl logs` — which the forge, the yard and orient cannot run.
+#[test]
+fn the_excerpt_carries_the_panic_block_the_replay_prints() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"test\",\"result\":\"fail\"}"),
+        CARGO_LOG,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let excerpt = got.excerpt_of("test");
+    for needle in [
+        "---- every_sweep_spawner_guards_on_its_own_subject stdout ----",
+        "panicked at crates/core/boss-dispatcher/tests/sweep_spawn_guards.rs:79:5:",
+        "expected the seven daily sweep spawners, found 6",
+    ] {
+        assert!(
+            excerpt.contains(needle),
+            "the excerpt must carry `{needle}` — the same lines the replay prints:\n{excerpt}"
+        );
+        assert!(
+            got.replay.contains(needle),
+            "…and the replay still prints it (one selection, two outputs):\n{}",
+            got.replay
+        );
+    }
+}
+
+/// A green receipt carries `fails_excerpt: {}` — present and empty, for
+/// the reason `fails` is `[]` and never `null`: "nothing failed" and
+/// "nobody wrote the field" must not look the same to a reader.
+#[test]
+fn a_green_receipt_carries_an_empty_excerpt_not_a_missing_one() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let green = "{\"verdict\":\"green\",\"head\":\"abc\",\"mode\":\"full\",\
+                 \"checks\":[{\"name\":\"fmt\",\"result\":\"pass\"}]}";
+    let got = run_extractor(green, "::group::gate: fmt\nfine\n::endgroup::\n");
+    assert!(got.ok, "green must not be an error path: {}", got.stdout);
+    assert_eq!(
+        got.fails_excerpt().map(|m| m.len()),
+        Some(0),
+        "a green receipt must carry `fails_excerpt: {{}}`:\n{}",
+        got.receipt
+    );
+}
+
+/// THE BOUND. The receipt rides the record-verdict step's metadata and
+/// the runner passes it as ONE argv string to the report-back (a 128 KB
+/// ceiling per argument on Linux), so an excerpt is capped per check
+/// (~6 KB) and in all (~24 KB) — and each cap says what it left out,
+/// because a silent reduction is the 778 KB-log-tailed-to-16 KB defect
+/// wearing a different hat (CLAUDE.md §Diagnosis).
+#[test]
+fn the_excerpt_is_bounded_per_check_and_in_all_and_says_so() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    // Eight failed checks, each 300 lines of 100 characters: 30 KB per
+    // check, 240 KB in all — a receipt nobody could pass along.
+    let names: Vec<String> = (0..8).map(|i| format!("check-{i}")).collect();
+    let mut log = String::new();
+    for n in &names {
+        log.push_str(&format!("::group::gate: {n}\n"));
+        for i in 0..300 {
+            log.push_str(&format!(
+                "{n} line {i:03} {}\n",
+                "x".repeat(100 - 16 - n.len())
+            ));
+        }
+        log.push_str(&format!("error: {n} failed at the end\n::endgroup::\n"));
+    }
+    let checks = names
+        .iter()
+        .map(|n| format!("{{\"name\":\"{n}\",\"result\":\"fail\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let got = run_extractor(&red_receipt(&checks), &log);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+
+    let excerpt = got.fails_excerpt().expect("fails_excerpt is present");
+    assert_eq!(
+        excerpt.len(),
+        8,
+        "every failed check has an entry, even one that only says it was omitted:\n{}",
+        got.receipt
+    );
+    let total: usize = excerpt
+        .values()
+        .map(|v| v.as_str().map_or(0, str::len))
+        .sum();
+    assert!(
+        total <= 26_000,
+        "the whole excerpt must stay far under the transport's ceiling — {total} chars is not \
+         a receipt:\n{}",
+        got.receipt
+    );
+    for (name, text) in &excerpt {
+        let text = text.as_str().expect("excerpt is a string");
+        assert!(
+            text.len() <= 6_600,
+            "no single check's excerpt may be unbounded — {name} is {} chars",
+            text.len()
+        );
+        assert!(
+            text.contains("omitted"),
+            "every reduction states itself — {name}'s excerpt was cut and does not say so:\n{text}"
+        );
+    }
+    let first = got.excerpt_of("check-0");
+    assert!(
+        first.contains("error: check-0 failed at the end"),
+        "a bounded excerpt still spends its budget on the failure line, not the chatter \
+         above it:\n{first}"
+    );
+}
+
+/// THE NOISE NAMED INSTEAD OF THE VERDICT (backlog 3a6f61d6). Measured
+/// 2026-09-18 on red-train alert 64a17c4b (train ccaf018e, gate
+/// c924dbe0): for the web-suite check the alert said "no cargo test
+/// failure in this check's output; 264 error line(s), first 5:" and
+/// quoted five `error: Unable to connect. Is the computer able to
+/// access the url?` lines — bun's proxy noise for the backend the mocked
+/// runner never starts, printed in every PASSING run too — while the
+/// same excerpt held Playwright's own verdict: the `✘ 15 …
+/// interaction-crawl … shard 2/4` line, `- Expected - 1 / + Received +
+/// 5`, `[/ux/views] id: not clickable: locator.click: Timeout 3000ms
+/// exceeded`, and `2 failed / 102 passed`. The operator had to pull the
+/// Job log to learn it was a 3 s click timeout. So for a check whose
+/// output carries Playwright's markers, `fails` ranks THEM: the ✘ lines,
+/// the `N failed` roll-up, the `Error:` line, the Expected/Received diff
+/// as one entry. The fixture is that excerpt, written by hand from those
+/// lines. (The connect noise itself was deleted at its source on
+/// 2026-09-19, 82b87a09 — the mocked dev-server answers a miss locally —
+/// so the filter this test once pinned went with it; what remains
+/// pinned is the ranking.)
+const WEB_SUITE_RED: &str = "\
+::group::gate: web-suite
+  ✓  14 [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 1/4 (28.1s)
+  ✘  15 [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 2/4 (31.4s)
+  ✓  16 [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 3/4 (27.9s)
+  ✘  17 [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 4/4 (30.2s)
+
+
+  1) [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 2/4
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 5
+
+      Array [
+    -   Array [],
+    +   \"[/ux/views] id: not clickable: locator.click: Timeout 3000ms exceeded.\",
+    +   \"[/ux/views] id: not clickable: locator.click: Timeout 3000ms exceeded.\",
+    +   \"[/ux/views] id: not clickable: locator.click: Timeout 3000ms exceeded.\",
+    +   \"[/ux/views] id: not clickable: locator.click: Timeout 3000ms exceeded.\",
+    +   \"[/ux/views] id: not clickable: locator.click: Timeout 3000ms exceeded.\",
+      ]
+
+      64 |
+    > 65 |   expect(problems).toEqual([]);
+         |                    ^
+
+  2 failed
+    [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 2/4
+    [chromium] › tests/mocked/interaction-crawl.spec.ts:40:5 › interaction crawl › shard 4/4
+  102 passed (2.1m)
+::endgroup::
+";
+
+#[test]
+fn a_web_suite_red_names_the_failing_spec_and_its_diff() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite\",\"result\":\"fail\"}"),
+        WEB_SUITE_RED,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails().expect("fails is on the receipt");
+    let joined = fails.join("\n");
+
+    let quoted: Vec<&String> = fails.iter().filter(|e| e.contains("| ")).collect();
+    assert!(
+        quoted.first().is_some_and(|e| e.contains("✘")
+            && e.contains("interaction-crawl")
+            && e.contains("shard 2/4")),
+        "the first quoted line is the failing spec:\n{joined}"
+    );
+    assert!(
+        joined.contains("2 failed"),
+        "the run's own roll-up is on the receipt:\n{joined}"
+    );
+    assert!(
+        joined.contains("Timeout 3000ms exceeded"),
+        "the Received value — the 3 s click timeout the operator had to pull the Job log \
+         for — rides the receipt:\n{joined}"
+    );
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    assert_eq!(
+        v["verdict"], "failed",
+        "two failed specs is a verdict on the branch:\n{}",
+        got.receipt
+    );
+}
+
+/// THE BUDGET GOES TO THE MARKER AND THE LAST WORDS (backlog 4077889a).
+/// For a web-suite red the first failure marker is the per-spec `✘`
+/// near the top of Playwright's list, and the `Error:`, the
+/// Expected/Received diff and the `N failed` roll-up are at the END;
+/// a head-only cut from the marker held the passing-spec chatter
+/// between and lost the verdict. The fixture puts 100 passing-spec
+/// lines between the `✘` line and the failure detail - more than the
+/// excerpt's character budget - so the budget must be spent on the
+/// marker and the check's last words, and the middle cut must state
+/// itself. (Until 2026-09-19 the bulk in this fixture was the mocked
+/// runner's connect noise, filtered before the window; 82b87a09 deleted
+/// the noise at its source and the filter with it, and the window is
+/// the raw tail again.)
+#[test]
+fn the_web_suite_excerpt_holds_the_failing_spec_line_and_the_verdict_below_it() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let (head, tail) = WEB_SUITE_RED
+        .split_once("\n\n  1) ")
+        .expect("the fixture has a failure detail");
+    let between: String = (0..100)
+        .map(|i| {
+            format!(
+                "  ✓  {} [chromium] › tests/mocked/pages.spec.ts:9:3 › page {i} renders \
+                 (1.2s)\n",
+                i + 18
+            )
+        })
+        .collect();
+    let log = format!("{head}\n{between}\n  1) {tail}");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite\",\"result\":\"fail\"}"),
+        &log,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let excerpt = got.excerpt_of("web-suite");
+    assert!(
+        excerpt.contains("✘  15 [chromium]") && excerpt.contains("shard 2/4 (31.4s)"),
+        "the excerpt holds the per-spec ✘ line:\n{excerpt}"
+    );
+    assert!(
+        excerpt.contains("Timeout 3000ms exceeded") && excerpt.contains("2 failed"),
+        "…and still the verdict below it:\n{excerpt}"
+    );
+    assert!(
+        excerpt.contains("omitted between the first failure marker and the check's last words"),
+        "the cut between them states itself:\n{excerpt}"
+    );
+    assert!(
+        got.replay.contains("shard 2/4 (31.4s)") && got.replay.contains("2 failed"),
+        "the replay holds the ✘ line and the verdict:\n{}",
+        got.replay
     );
 }

@@ -69,6 +69,8 @@
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 # --- the layer map ---------------------------------------------------------
 # Rank order. A crate may depend downward and sideways, never upward.
@@ -170,7 +172,7 @@ check_shape() {
             # this file decides how work RUNS, which is Actors.
             if grep -qE 'impl[[:space:]].*AgentDispatcher[[:space:]]+for' "$f"; then
                 hit="$rel memory-no-executor"
-                if printf '%s\n' "$SHAPE_ALLOW" | grep -q "^$rel memory-no-executor "; then
+                if grep -q "^$rel memory-no-executor " <<< "$SHAPE_ALLOW"; then
                     :
                 else
                     echo "VIOLATION [memory-no-executor]: $rel implements AgentDispatcher — the memory layer must not run work"
@@ -182,7 +184,7 @@ check_shape() {
             # which is Apps. Reading the log over HTTP is fine — it just
             # belongs on the other side of the boundary.
             if grep -qE '^use axum::|axum::Router|Router::new\(\)' "$f"; then
-                if printf '%s\n' "$SHAPE_ALLOW" | grep -q "^$rel memory-no-http-server "; then
+                if grep -q "^$rel memory-no-http-server " <<< "$SHAPE_ALLOW"; then
                     :
                 else
                     echo "VIOLATION [memory-no-http-server]: $rel serves HTTP — the door belongs in the apps layer"
@@ -218,7 +220,7 @@ EOF
     if [ "$rc" -eq 0 ]; then
         echo "SELF-TEST FAIL: planted backward edge (memory -> apps) was not caught"
         fails=$((fails+1))
-    elif ! printf '%s' "$out" | grep -q 'VIOLATION \[order\]'; then
+    elif ! grep -q 'VIOLATION \[order\]' <<<"$out"; then
         echo "SELF-TEST FAIL: backward edge caught but not reported as an order violation"
         fails=$((fails+1))
     fi
@@ -279,6 +281,7 @@ check_order crates || total=$((total+$?))
 check_shape crates || total=$((total+$?))
 
 if [ "$total" -eq 0 ]; then
+    lint_scanned layer-order-audit "$(find crates -name Cargo.toml -type f | wc -l | tr -d ' ')" "Cargo.toml(s) under crates/"
     echo "layer-order-audit: clean (order + shape); $allow_count known shape exception(s) allow-listed"
     exit 0
 fi

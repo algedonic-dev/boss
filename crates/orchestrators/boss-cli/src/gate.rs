@@ -332,12 +332,46 @@ async fn policy_max_concurrent(http: &reqwest::Client) -> usize {
 
 /// The concurrency bound in force: env override > delivery policy >
 /// compiled fallback.
-async fn max_concurrent(http: &reqwest::Client) -> Result<usize> {
+pub(crate) async fn max_concurrent(http: &reqwest::Client) -> Result<usize> {
     let fallback = policy_max_concurrent(http).await;
     max_concurrent_from(
         std::env::var("BOSS_GATE_MAX_CONCURRENT").ok().as_deref(),
         fallback,
     )
+}
+
+/// Who is asking the bound for a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Requester {
+    /// A PR car's gate, filed by `boss gate` — as many as builders send.
+    Car,
+    /// A train's gate, filed by the conductor — REQUIRED for the CI
+    /// verdict since design 128b5496, one per train, 2–10 min on a
+    /// warm target.
+    Train,
+}
+
+/// THE ONE DEFINITION OF ADMISSION AT THE GATE BOUND. `live` is the
+/// count of running gate Jobs, whoever filed them; `max` is the
+/// delivery policy's `gate_max_concurrent` (or the env override).
+///
+/// A car is admitted BELOW the bound. A train is admitted AT it — it
+/// may be the bound+1th running Job. Measured 2026-09-18 on train
+/// ccd8b08e (backlog 48f7aba1): with the train held to the same line
+/// as the cars, the conductor logged "the cluster is at its gate bound
+/// (3 running of 3)" five passes running while operator and builder
+/// car gates refilled the three slots between passes, and the train sat
+/// two hours at CI. A busy dock starved the train — the more cars were
+/// gated, the less could land, the inverse of what a bound is for.
+/// Admitting the train at the bound is one branch here and never
+/// delays a car; the alternative (reserving a slot for trains) would
+/// hold a car slot empty on every quiet hour. One slot of overage,
+/// never two: a train asking with the bound+1th already running waits.
+pub(crate) const fn admits(live: usize, max: usize, who: Requester) -> bool {
+    match who {
+        Requester::Car => live < max,
+        Requester::Train => live <= max,
+    }
 }
 
 /// The polite refusal at the concurrency bound, or None below it.
@@ -346,7 +380,7 @@ async fn max_concurrent(http: &reqwest::Client) -> Result<usize> {
 /// to wait for or watch one of them, and a bound that says only "3
 /// running" sends them off to run the kubectl this verb already ran.
 pub(crate) fn crowd_refusal(live: &[String], max: usize) -> Option<String> {
-    if live.len() < max {
+    if admits(live.len(), max, Requester::Car) {
         return None;
     }
     Some(format!(
@@ -554,7 +588,7 @@ pub(crate) fn places_ahead(order: &[String], reuse: Option<&str>) -> usize {
 /// line waits for the second slot, so two waiters released by one
 /// finishing gate do not both launch onto a node with room for one.
 pub(crate) const fn may_launch(live: usize, max: usize, position: usize) -> bool {
-    live + position < max
+    admits(live + position, max, Requester::Car)
 }
 
 /// Roughly what a place costs, a gate at a time. Arithmetic on the
@@ -788,6 +822,7 @@ pub(crate) fn gate_run_body(
     sha: &str,
     manifest: &str,
     delivery_channel: Option<&str>,
+    owner: &str,
 ) -> Value {
     let mut metadata = json!({
         "branch": branch,
@@ -805,7 +840,11 @@ pub(crate) fn gate_run_body(
         "kind": "gate-run",
         "title": format!("Gate: {branch}"),
         "subject": {"subject_kind": "custom", "id": "bosspipeline"},
-        "owner_id": "emp-david",
+        // Who answers for the gate-run: the platform owner as the
+        // registry answers it (backlog 3c23662d), or nobody, which the
+        // jobs API resolves from the kind's owner_role — never a
+        // literal person.
+        "owner_id": owner,
         "priority": "standard",
         "status": "open",
         "tags": [],
@@ -853,9 +892,13 @@ pub struct ParkIntent {
 /// 23b2dffa filed: the gate refused both shapes, the hand verb refused
 /// neither, and the rule's only trace at the second door was a comment
 /// describing this one. Re-exported under their local names so this
-/// module's callers and tests read unchanged.
+/// module's callers and tests read unchanged. The git-date rule
+/// (c0ac92b8) joined them the same way: predicate and evidence in
+/// `boss_jobs::probe`, the refusal's wording at each door.
 pub use boss_jobs::probe::{
-    SOR_READER, SOR_USER_VAR, needs_absent_tool as probe_needs_absent_tool,
+    SOR_READER, SOR_USER_VAR, names_an_actor as probe_names_an_actor,
+    needs_absent_tool as probe_needs_absent_tool,
+    reads_git_time_with_an_offset as probe_reads_git_time_with_an_offset,
     reads_the_sor_unidentified as probe_reads_the_sor_unidentified,
 };
 
@@ -917,17 +960,18 @@ impl ParkIntent {
     /// `boss prove` refuses that shape too), and a car is EITHER probed
     /// or event-bound — a probe next to a `--park-proof-event` says the
     /// builder did not decide which.
-    /// THE TWO SHAPE WARNINGS ON A `--park-probe` (backlog 4fccc595).
+    /// THE SHAPE WARNINGS ON A `--park-probe` (backlog 4fccc595, and
+    /// 0df3af1c for the third).
     ///
     /// This door is where the probe that cost 18 hours was ADMITTED, and
     /// the moment a builder is still typing it is the only moment the
     /// shape is cheap to fix — by the time the arrival rule runs the
     /// text, unattended on the forge, nothing there reads a warning. So
-    /// the same two findings `boss prove`'s `admit` says are said here,
+    /// the same findings `boss prove`'s `admit` says are said here,
     /// from the one definition in `boss_jobs::probe`. They WARN rather
-    /// than refuse, for the reason argued at that door: both shapes fail
-    /// closed, so the worst they do is strand a car, and both detectors
-    /// are coarse text scans a false refusal would be too expensive for.
+    /// than refuse, for the reason argued at that door: every shape fails
+    /// closed, so the worst it does is strand a car, and every detector
+    /// is a coarse text scan a false refusal would be too expensive for.
     pub fn probe_warnings(&self) -> Vec<String> {
         match &self.probe {
             None => Vec::new(),
@@ -967,7 +1011,8 @@ impl ParkIntent {
                 "--park-probe invokes `{tool}`, which the FORGE HOST does not have.\n\n\
                  A recorded probe does not run here. It runs on the forge host, as david, \
                  in /home/david/boss, when this car's train arrives \
-                 (infra/forge/run-car-probe.sh) — a machine outside the cluster with no \
+                 (boss prove --from-car --unattended, run by the ops-runner) — a machine \
+                 outside the cluster with no \
                  kubeconfig. Measured 2026-09-09 (f9304366): the first two cars ever to \
                  record a probe both used `kubectl`, both were right from this pod, and \
                  both came back as an exit code with empty streams.\n\n\
@@ -979,6 +1024,23 @@ impl ParkIntent {
             );
         }
         if let Some(probe) = &self.probe
+            && let Some(var) = probe_names_an_actor(probe)
+        {
+            anyhow::bail!(
+                "--park-probe assigns `{var}`, which would name an actor for the `boss` \
+                 verbs it runs — and a probe proves, it does not act.\n\n\
+                 The forge runs a recorded probe with NO actor in its env, on purpose: the \
+                 CLI there refuses an unnamed write by its own rule, and that refusal is \
+                 what keeps a probe a read. A `boss` READ needs no actor — it goes out \
+                 signed operator:unidentified under the CLI's own platform-admin header, \
+                 which reads the whole world (one stderr line says so). Drop the \
+                 assignment; if the claim needs a write to be observed, it is not a probe \
+                 but an event — record the car as --park-proof-event.\n\n\
+                 The rule is stated with the forge's tool list, \
+                 infra/forge/host-absent-tools.txt (the `boss` block)."
+            );
+        }
+        if let Some(probe) = &self.probe
             && let Some(client) = probe_reads_the_sor_unidentified(probe)
         {
             anyhow::bail!(
@@ -986,14 +1048,42 @@ impl ParkIntent {
                  it reads as operator:unidentified — and an unidentified reader is answered \
                  with a NARROWER WORLD, silently.\n\n\
                  {}\n\n\
-                 Read it as a named reader instead. Either is fine:\n  \
+                 Read it as a named reader instead. Any of these is fine:\n  \
                  {SOR_READER} /api/yard/status | grep -q '\"dock_depth\":1'\n  \
-                 curl -fsS -H \"x-boss-user: ${SOR_USER_VAR}\" $BOSS_JOBS_URL/api/...\n\n\
+                 curl -fsS -H \"x-boss-user: ${SOR_USER_VAR}\" $BOSS_JOBS_URL/api/...\n  \
+                 {SOR_READER} /api/yard/status | jq -e '.boarding.dock_depth == 1' \
+                 >/dev/null && echo claim:ok\n\n\
+                 THE READER DOES THE READ; ANYTHING MAY PARSE ITS STDOUT. `jq` and \
+                 `python3` on the right of that pipe are parsers, not readers, and this \
+                 check no longer refuses them (5dc5159d) — so reach for the shape that \
+                 reads the claim precisely rather than bending it into a `grep -q`, which \
+                 is line-based and cannot match a phrase that wraps. Use {SOR_READER} and \
+                 not `boss-api` in a PARKED probe: this text runs on the forge, where \
+                 {SOR_READER} is in the converged tree and boss-api has never been \
+                 measured present (infra/forge/host-absent-tools.txt).\n\n\
                  {SOR_READER} is infra/forge/probe-bin/{SOR_READER}, first on the probe's \
                  PATH in the converged checkout; it is GET-only and signs as a read-scoped \
                  actor the runner supplies (audit-readonly — Read everywhere, write \
                  nowhere).",
                 boss_jobs::probe::UNIDENTIFIED_READ_EVIDENCE,
+            );
+        }
+        if let Some(probe) = &self.probe
+            && let Some(token) = probe_reads_git_time_with_an_offset(probe)
+        {
+            anyhow::bail!(
+                "--park-probe reads a git date with `{token}`, which carries the committer's \
+                 UTC offset — and a probe that compares that string against the system of \
+                 record's UTC timestamps lies in BOTH directions.\n\n\
+                 {}\n\n\
+                 This check refuses the TOKEN, not the compare: whether the string reaches a \
+                 `[ ... \\> ... ]` would take a shell parser to know honestly, and the fix is \
+                 the same either way. Read the commit time as an epoch (`git log -1 \
+                 --format=%ct`), turn the other side into one (`date -u -d \"$ts\" +%s`) \
+                 after guarding the empty case, and compare the two integers with `-gt`.\n\n\
+                 The rule is boss_jobs::probe::reads_git_time_with_an_offset, and `boss prove` \
+                 refuses the same text.",
+                boss_jobs::probe::GIT_TIME_STRING_EVIDENCE,
             );
         }
         let missing: Vec<&str> = [
@@ -1137,6 +1227,48 @@ impl ParkIntent {
         Ok(())
     }
 
+    /// Every packet id a park intent names, with the flag that named it:
+    /// the item this car closes or is a piece of, and the car it boards
+    /// behind. Each is a reference the auto-park handler will write as a
+    /// job edge ON GREEN — an hour after this terminal, where a bad id is
+    /// a refused edge on a dispatcher run and not a word to the builder.
+    /// So the launcher resolves them now: `unresolvable` returns the ones
+    /// `exists` cannot find, and the caller refuses before a slot is
+    /// spent. Measured 2026-09-12: a builder passed a `--park-backlog-item`
+    /// id they had typed rather than read; the gate launched, and only a
+    /// read of the packet afterwards caught it (CLAUDE.md memory: never
+    /// write a sha you did not read — an id is a sha).
+    /// Replace a named ref with the id the system of record resolved it
+    /// to — the full id the auto-park handler's routing requires.
+    pub fn set_named_ref(&mut self, flag: &str, full: String) {
+        match flag {
+            "--park-backlog-item" => self.backlog_item = Some(full),
+            "--park-partial-item" => self.partial_item = Some(full),
+            "--park-after" => self.boards_after = Some(full),
+            _ => {}
+        }
+    }
+
+    pub fn named_refs(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("--park-backlog-item", self.backlog_item.as_deref()),
+            ("--park-partial-item", self.partial_item.as_deref()),
+            ("--park-after", self.boards_after.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(f, v)| v.map(|v| (f, v)))
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect()
+    }
+
+    pub fn unresolvable(&self, exists: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
+        self.named_refs()
+            .into_iter()
+            .filter(|(_, id)| !exists(id))
+            .map(|(f, id)| (f, id.to_string()))
+            .collect()
+    }
+
     /// The metadata patch to MERGE onto the gate-run — only the fields
     /// set, keyed `park_*` so the auto-park handler reads them on green.
     pub fn metadata_patch(&self) -> Value {
@@ -1179,6 +1311,42 @@ impl ParkIntent {
             PARK_PROOF_EVENT: Value::Null,
         })
     }
+}
+
+/// The env var a dispatched builder exports so the gate it launches
+/// names the run that launched it (`boss dispatch` prints the id).
+pub(crate) const AGENT_RUN_ENV: &str = "BOSS_AGENT_RUN";
+
+/// The key the run's id rides under on the gate-run — the `link` the
+/// landing rule's `jobs.complete_linked_step` follows.
+pub(crate) const AGENT_RUN_KEY: &str = "agent_run";
+
+/// The merging PATCH that records the run, or `None` when nothing
+/// names one. A blank value is nothing: an `export BOSS_AGENT_RUN=`
+/// must not stamp an empty edge the handler would refuse as unusable.
+///
+/// A NON-UUID IS A REFUSAL, not a stamp (car 3, backlog cb78818d —
+/// car 2's loose end). The landing handler skips a link that is not a
+/// full Job id with a warn in the dispatcher's journal, which the
+/// builder never reads: the gate would go green, the run would sit at
+/// `building` until the silence rule aged it out as died, and nothing
+/// would say the export was the 8-character prefix the prompt's
+/// `boss dispatch:` line prints. The shape here is the handler's own
+/// (`jobs_complete_linked_step::unusable_link`), and the refusal is
+/// raised before any packet is filed.
+pub(crate) fn agent_run_patch(env: Option<String>) -> Result<Option<Value>> {
+    let Some(id) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if uuid::Uuid::try_parse(&id).is_err() || id.len() != 36 {
+        anyhow::bail!(
+            "{AGENT_RUN_ENV}={id:?} is not a full agent-run id ({} chars): the landing \
+             rule follows `{AGENT_RUN_KEY}` only when it is the 36-character id `boss \
+             dispatch` printed under THE RUN — export that, or unset it for a hand gate",
+            id.len()
+        );
+    }
+    Ok(Some(json!({ AGENT_RUN_KEY: id })))
 }
 
 /// The HOLD a gate carries: `--hold <reason>` stamps `hold: <reason>`
@@ -1491,6 +1659,63 @@ async fn observe_landing(http: &reqwest::Client, branch: &str, sha: &str) -> Opt
 /// Best-effort by design: the refusal is the primary fact and must
 /// surface either way; a failed close is reported beside it rather than
 /// replacing it.
+/// The read behind a re-gate's stamp: closed gate-runs at exactly this
+/// branch and head, narrowed at the server by the containment door
+/// (`metadata=`, url-encoded the way `boss job list --where` sends it —
+/// one encoder, `job::QUERY_VALUE`). Closed only: an open run at the
+/// head is still running, and `reusable_packet` attaches to it instead.
+/// A head is gated a handful of times at most, so the page is small.
+pub(crate) fn prior_runs_query(branch: &str, sha: &str) -> String {
+    let doc = json!({ "branch": branch, "sha": sha }).to_string();
+    format!(
+        "/api/jobs?kind=gate-run&status=closed&metadata={}&limit=20",
+        percent_encoding::utf8_percent_encode(&doc, crate::job::QUERY_VALUE)
+    )
+}
+
+/// THE RED THIS LAUNCH RE-GATES, if any: the newest closed gate-run at
+/// the same branch and sha, judged `failed` or `lost` —
+/// `boss_jobs::flake::prior_red`, the one definition. Backlog
+/// 36cc4913: 4 of 11 red gates in two days were not the branch's
+/// fault, and each was recorded exactly like an author's red, so the
+/// flakiest check was a memory. A re-gate at an UNCHANGED head is the
+/// operator saying "the branch did not move; judge it again", and the
+/// relationship between the two runs is what turns a flake into a
+/// count — stamped here at launch as `regate_of`, and settled by the
+/// verdict: a green stamps `flake_of` (the auto-park handler, which
+/// reads every green), a red stamps nothing.
+///
+/// Never an automatic retry: a retry hides the flake; a named re-gate
+/// records it. BEST EFFORT: an unreadable record is `None` with a note,
+/// never a refusal — this is a stamp, not a gate condition, and a dark
+/// SoR must not stop a launch that `wait_for_verdict` is built to
+/// survive.
+async fn observe_prior_red(
+    http: &reqwest::Client,
+    base: &str,
+    branch: &str,
+    sha: &str,
+) -> Option<boss_jobs::flake::PriorRed> {
+    match api_at(
+        http,
+        base,
+        reqwest::Method::GET,
+        &prior_runs_query(branch, sha),
+        None,
+    )
+    .await
+    {
+        Ok(body) => boss_jobs::flake::prior_red(&rows(body), branch, sha),
+        Err(e) => {
+            eprintln!(
+                "boss gate: could not read earlier gate-runs at this head ({e:#}) — the gate \
+                 runs anyway; a green here will not be recorded as a flake of anything"
+            );
+            None
+        }
+    }
+}
+
 async fn close_refused(http: &reqwest::Client, packet: &str, reason: &str) {
     let result = async {
         let job = api(
@@ -1865,7 +2090,7 @@ pub(crate) fn resolve_sha(branch: &str) -> String {
     format!("origin/{branch}")
 }
 
-fn kubectl(namespace: &str) -> std::process::Command {
+pub(crate) fn kubectl(namespace: &str) -> std::process::Command {
     let mut c = std::process::Command::new("kubectl");
     c.args(["-n", namespace]);
     c
@@ -1912,7 +2137,7 @@ fn gate_jobs_table(namespace: &str, selector: &str) -> Result<String> {
 /// see it — two quick `boss gate` calls would each count zero and
 /// together over-fill the node. A Job with neither `succeeded` nor
 /// `failed` set is live from the moment `kubectl create` returns.
-fn running_gates(namespace: &str) -> Result<Vec<String>> {
+pub(crate) fn running_gates(namespace: &str) -> Result<Vec<String>> {
     Ok(live_gates(&gate_jobs_table(namespace, "app=gate-runner")?))
 }
 
@@ -1924,9 +2149,10 @@ pub async fn run(
     namespace: &str,
     wait: bool,
     dry: bool,
-    park: ParkIntent,
+    mut park: ParkIntent,
     force_regate: Option<String>,
     stale_base_anyway: Option<String>,
+    rebase: bool,
     hold: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
@@ -1956,19 +2182,94 @@ pub async fn run(
     {
         eprintln!("{w}");
     }
-    // And the two SHAPE warnings on the probe itself, said here for the
+    // And the SHAPE warnings on the probe itself, said here for the
     // same reason: this text is judged by a machine at arrival, hours
-    // later, where no warning has a reader (4fccc595).
+    // later, where no warning has a reader (4fccc595, 0df3af1c).
     for w in park.probe_warnings() {
         eprintln!("{w}");
     }
     let hold = hold_guard(hold.as_deref(), &park)?;
+    // The run this gate belongs to, judged BEFORE any packet exists: a
+    // malformed export is refused here rather than stamped and skipped
+    // an hour later in a journal nobody reads.
+    let agent_run = agent_run_patch(std::env::var(AGENT_RUN_ENV).ok())?;
     let http = reqwest::Client::new();
+    // EVERY PACKET THE PARK INTENT NAMES MUST EXIST, checked here at the
+    // terminal. The auto-park handler writes these as job edges on
+    // green, and the edge guard refuses an unresolvable id — an hour
+    // from now, on a dispatcher run, as a dead letter the builder never
+    // sees. An id typed rather than read is the whole failure mode
+    // (2026-09-12, be793304's car launched with an invented suffix).
+    if !dry {
+        // What the SoR could find, by the id typed; `unresolvable` then
+        // names the rest with their flags — the pure half the test
+        // pins, the loop here only gathering the answers.
+        let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved: Vec<(&'static str, String)> = Vec::new();
+        for (flag, id) in park.named_refs() {
+            // `api` raises on every non-2xx; a 404 here is the answer,
+            // not an error — the rest (unreachable, 5xx) still raise.
+            match api(
+                &http,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await
+            {
+                Ok(Some(packet)) => {
+                    found.insert(id.to_string());
+                    // STAMP WHAT WAS RESOLVED, not what was typed. The
+                    // jobs API answers a unique prefix, so an 8-char id
+                    // passes this check — and rode the gate-run as
+                    // `park_backlog_item: "436a2e91"`, which the auto-park
+                    // handler's routing refused ("not a full Job id") and
+                    // left the item un-routed (2026-09-14). The car got
+                    // its full link because the handler resolves the car
+                    // side; the routing reads the stamp raw. Read the id
+                    // off the packet the API returned.
+                    if let Some(full) = packet
+                        .get("data")
+                        .unwrap_or(&packet)
+                        .get("id")
+                        .and_then(Value::as_str)
+                        && full != id
+                    {
+                        resolved.push((flag, full.to_string()));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) if format!("{e:#}").contains("404") => {}
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "resolving {flag} {id} against the system of record"
+                    )));
+                }
+            }
+        }
+        let missing = park.unresolvable(|id| found.contains(id));
+        for (flag, full) in &resolved {
+            println!("boss gate: {flag} resolved to {full}");
+            park.set_named_ref(flag, full.clone());
+        }
+        if !missing.is_empty() {
+            let lines: Vec<String> = missing
+                .iter()
+                .map(|(f, id)| format!("  {f} {id} — no such packet"))
+                .collect();
+            bail!(
+                "boss gate: REFUSED — the park intent names a packet the system of record \
+                 does not have:\n{}\n  Read the id off the packet (boss-api GET /api/jobs?…) \
+                 rather than typing it; an id is a sha.",
+                lines.join("\n")
+            );
+        }
+    }
     // The concurrency bound: env override > delivery policy > compiled.
     // Fetched here, before the packet, so a bad env override refuses
     // without side effects — the policy read never fails, it falls back.
     let max = max_concurrent(&http).await?;
-    let sha = resolve_sha(branch);
+    let mut sha = resolve_sha(branch);
 
     // A LANDED BRANCH IS NOT GATED. Before any packet is filed or
     // reused — a refusal here costs nothing to close. See `landed_guard`.
@@ -2024,7 +2325,7 @@ pub async fn run(
         println!("boss gate: packet {id} is already being gated by {name}");
         if wait {
             println!("boss gate: attaching to it — a second Job would race it");
-            return wait_for_verdict(&http, id, namespace, &name).await;
+            return wait_for_verdict(&http, id, namespace, &name, now).await;
         }
         println!(
             "boss gate: not starting a second Job. Follow this one with \
@@ -2052,10 +2353,61 @@ pub async fn run(
     // "stale", and this is the single door every car passes through, so a
     // guard that failed closed on a forge blip would stop all delivery,
     // which is worse than the defect it guards.
-    let base_obs = crate::freshness::observe(std::path::Path::new("."), branch);
+    let mut base_obs = crate::freshness::observe(std::path::Path::new("."), branch);
+    // `--rebase`: the refusal below was always followed by the same three
+    // hand steps (worktree, cherry-pick, force-with-lease — seven times on
+    // 2026-09-12), so the verb does them, in a temporary worktree, and
+    // gates the replayed head. A conflict refuses with the files named
+    // and pushes nothing. The sha recorded on the gate-run is the NEW
+    // head: it is resolved below, after this.
+    if rebase && dry && base_obs.standing == crate::freshness::Base::Behind {
+        println!(
+            "boss gate: DRY RUN — --rebase would replay {branch} onto origin/main@{} (base {} is \
+             {} commit(s) behind) and push with a lease; nothing is pushed in a dry run",
+            &base_obs.main_head[..7.min(base_obs.main_head.len())],
+            &base_obs.base[..7.min(base_obs.base.len())],
+            base_obs.behind_by
+        );
+    } else if rebase && base_obs.standing == crate::freshness::Base::Behind {
+        let done = crate::freshness::rebase_onto_main(std::path::Path::new("."), branch)?;
+        // A commit main already holds (the predecessor car landed by
+        // squash) replayed empty and was dropped: say which, and why,
+        // one line each — the operator reads the count below against
+        // the commits they know the branch carries (1cfab20e).
+        for d in &done.dropped {
+            println!("boss gate: {}", d.line());
+        }
+        println!(
+            "boss gate: --rebase replayed {} commit(s) of {branch} onto origin/main — {} → {} \
+             (pushed with a lease on the old head; your own worktree still has the old head: \
+             `git fetch origin && git reset --hard origin/{branch}` there when you are done)",
+            done.replayed,
+            &done.old_head[..8.min(done.old_head.len())],
+            &done.new_head[..8.min(done.new_head.len())]
+        );
+        base_obs = crate::freshness::observe(std::path::Path::new("."), branch);
+        // The packet records the head that is GATED — the replayed one.
+        // First live use (2026-09-12, dfc747c5) recorded the pre-rebase
+        // sha, because it was resolved before the guard ran.
+        sha = done.new_head.clone();
+    }
     match crate::freshness::stale_base_guard(branch, &base_obs, stale_base_anyway.as_deref()) {
         crate::freshness::BaseGuard::Note(note) => println!("{note}"),
         crate::freshness::BaseGuard::Refuse(why) => bail!("{why}"),
+    }
+
+    // A RE-GATE AT AN UNCHANGED HEAD RECORDS WHAT IT RE-GATES. Read
+    // here, AFTER the sha is final (a `--rebase` moves it, and a moved
+    // head is the author's fix, not a re-gate), and before the packet,
+    // so the operator reads the line beside the launch. See
+    // `observe_prior_red`.
+    let prior_red = if dry {
+        None
+    } else {
+        observe_prior_red(&http, &jobs_base()?, branch, &sha).await
+    };
+    if let Some(p) = &prior_red {
+        println!("{}", boss_jobs::flake::launch_line(&sha, p));
     }
 
     // EVERY REFUSAL IS DECIDED HERE, BEFORE A PACKET EXISTS (fd217c65).
@@ -2119,18 +2471,22 @@ pub async fn run(
                 println!("boss gate: DRY would file a gate-run packet for {branch}@{sha}");
                 "dry-run-packet".to_string()
             } else {
-                let created = api(
-                    &http,
-                    reqwest::Method::POST,
-                    "/api/jobs",
-                    Some(gate_run_body(
-                        branch,
-                        &sha,
-                        &manifest_path.display().to_string(),
-                        crate::channels::delivery_channel_for(branch).as_deref(),
-                    )),
-                )
-                .await?;
+                let owner = crate::owner::for_filing_at(&jobs_base()?).await;
+                let mut body = gate_run_body(
+                    branch,
+                    &sha,
+                    &manifest_path.display().to_string(),
+                    crate::channels::delivery_channel_for(branch).as_deref(),
+                    &owner,
+                );
+                // The tiers the same diff touched (ba429e7f), beside the
+                // channel: `software_tiers` + `software_tier`, which the
+                // auto-park handler copies onto the car verbatim. Empty
+                // when the diff would not resolve — nothing stamped.
+                if let Some(md) = body.get_mut("metadata").and_then(Value::as_object_mut) {
+                    md.extend(crate::channels::tier_stamps_for(branch));
+                }
+                let created = api(&http, reqwest::Method::POST, "/api/jobs", Some(body)).await?;
                 created
                     .as_ref()
                     .and_then(|c| c.get("data").unwrap_or(c).get("id"))
@@ -2171,7 +2527,53 @@ pub async fn run(
              runs anyway, but this receipt will not say which main it was taken against."
         );
     }
+    // THE RE-GATE'S RELATIONSHIP, the same way as the base: a merging
+    // PATCH, best effort, a record and not an instruction. What acts on
+    // it is the green verdict — `jobs.auto-park` reads `regate_of` off
+    // the gate-run and stamps `flake_of` (backlog 36cc4913).
+    if let Some(p) = prior_red.as_ref().filter(|_| !dry)
+        && let Err(e) = api(
+            &http,
+            reqwest::Method::PATCH,
+            &format!("/api/jobs/{packet}/metadata"),
+            Some(boss_jobs::flake::regate_patch(p)),
+        )
+        .await
+    {
+        eprintln!(
+            "boss gate: could not stamp regate_of onto the gate-run ({e:#}) — the gate runs \
+             anyway, but a green here will not be recorded as a flake of {}",
+            &p.id[..8.min(p.id.len())]
+        );
+    }
 
+    // THE RUN THAT LAUNCHED THIS GATE (design c87fb59b car 2, backlog
+    // 39d0b528). A builder dispatched by `boss dispatch` exports its
+    // run's id as BOSS_AGENT_RUN; stamped here as `agent_run`, it is the
+    // declared edge `agent-run-lands-on-gate-green` follows on green
+    // (jobs.complete_linked_step, the same handler a car's
+    // `backlog_item` rides). A merging PATCH like the base and the
+    // re-gate relationship, and BEST EFFORT for the same reason: this
+    // is a record — the run is completed by hand if it is lost — and
+    // losing it to a rolling SoR must not cost the gate.
+    if let Some(patch) = agent_run.clone().filter(|_| !dry) {
+        match api(
+            &http,
+            reqwest::Method::PATCH,
+            &format!("/api/jobs/{packet}/metadata"),
+            Some(patch),
+        )
+        .await
+        {
+            Ok(_) => {
+                println!("boss gate: agent run stamped — a green here lands the run by itself")
+            }
+            Err(e) => eprintln!(
+                "boss gate: could not stamp the agent run onto the gate-run ({e:#}) — the \
+                 gate runs anyway, but the run will not land on this green by itself."
+            ),
+        }
+    }
     // Stamp the park intent onto the gate-run so the auto-park handler
     // can file the car verbatim on green. A PATCH so it works whether the
     // packet was just created or reused, and merges rather than replaces.
@@ -2269,7 +2671,7 @@ pub async fn run(
             wait_for_slot(&http, &packet, branch, namespace, max, now).await?
         {
             println!("boss gate: packet {packet} was launched as {name} while it waited");
-            return wait_for_verdict(&http, &packet, namespace, &name).await;
+            return wait_for_verdict(&http, &packet, namespace, &name, now).await;
         }
         // The place is spent the moment a Job exists, and a run still
         // marked queued would be missing from the yard's gate bays.
@@ -2329,7 +2731,7 @@ pub async fn run(
             .next()
             .unwrap_or_default()
             .to_string();
-        wait_for_verdict(&http, &packet, namespace, &job_name).await?;
+        wait_for_verdict(&http, &packet, namespace, &job_name, now).await?;
     } else {
         println!(
             "boss gate: not waiting — `boss gate {branch} --wait` ATTACHES to this Job, \
@@ -2358,6 +2760,125 @@ pub async fn run(
 /// The Job status is a signal about the RUN and never about the CODE, so
 /// it is not treated as a verdict here — it is only used to decide that
 /// no verdict is coming, and to say where the answer actually lives.
+/// How long a scheduled gate pod may sit without its containers
+/// starting before the wait calls it an infrastructure refusal. A
+/// warm image pull and a volume mount are seconds; a local PV whose
+/// path the kubelet cannot see retries every two minutes forever.
+pub(crate) const START_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What the kubelet has to say about a gate pod that has a node but no
+/// running containers — read off the pod, not the events (the session
+/// could not read events until 27eacc14; conditions it always could).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PodStart {
+    /// `PodScheduled=True` since this instant (RFC 3339), if at all.
+    pub scheduled_at: Option<String>,
+    /// `PodReadyToStartContainers=True`, i.e. the sandbox and every
+    /// volume are up and the containers can start.
+    pub ready_to_start: bool,
+    /// Each container's `state.waiting.reason` (ContainerCreating,
+    /// ErrImagePull, …) and message, for the record.
+    pub waiting: Vec<String>,
+}
+
+/// Has this pod been scheduled for longer than the tolerance without
+/// getting to start? Pure: the caller supplies "now".
+pub(crate) fn unstarted_too_long(
+    start: &PodStart,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<i64> {
+    if start.ready_to_start {
+        return None;
+    }
+    let since = start
+        .scheduled_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())?;
+    let waited = now.signed_duration_since(since.with_timezone(&chrono::Utc));
+    (waited.num_seconds() >= START_TOLERANCE.as_secs() as i64).then(|| waited.num_minutes())
+}
+
+/// The receipt an unstarted gate records: a REFUSAL, the runner's own
+/// shape for "declined before any check ran" (`verdict: refused`,
+/// `refused_because`), so every reader that already spares the cars on a
+/// refusal — train.rs `verdict_strikes_cars`, `red_verdict_detail` —
+/// reads this one the same way. Before this, a pod that never started
+/// sat silent until `activeDeadlineSeconds` (three hours) failed the
+/// Job, and the wait then read that as a red (1661dd1e: the 9-hour
+/// gate-seed mount, d42d4967, was found by a human looking at a pod).
+pub(crate) fn unstarted_receipt(minutes: i64, start: &PodStart) -> Value {
+    let waiting = if start.waiting.is_empty() {
+        "no container state reported".to_string()
+    } else {
+        start.waiting.join("; ")
+    };
+    json!({
+        "verdict": "refused",
+        "head": "",
+        "mode": "",
+        "fails": [],
+        "refused_because": format!(
+            "the gate pod was scheduled {minutes} min ago and its containers never started \
+             (PodReadyToStartContainers=False) — a mount, image or sandbox the node could not \
+             provide, not a verdict on the branch. Container state: {waiting}. \
+             `kubectl -n boss-dev describe pod -l job-name=<job>` carries the kubelet's reason."
+        ),
+    })
+}
+
+/// Parse `kubectl get pods -l job-name=<job> -o json` into the pod's
+/// start state. Absent pods (none created yet) read as default:
+/// unscheduled, so never "too long" — a pod that is not even scheduled
+/// is the queue's business, not this guard's.
+pub(crate) fn pod_start_from_json(pods: &Value) -> PodStart {
+    let Some(pod) = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+    else {
+        return PodStart::default();
+    };
+    let conds = pod
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let cond = |ty: &str| {
+        conds
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some(ty))
+    };
+    let scheduled_at = cond("PodScheduled")
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("True"))
+        .and_then(|c| c.get("lastTransitionTime"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let ready_to_start = cond("PodReadyToStartContainers")
+        .is_some_and(|c| c.get("status").and_then(Value::as_str) == Some("True"));
+    let waiting = pod
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+            let w = c.pointer("/state/waiting")?;
+            let reason = w.get("reason").and_then(Value::as_str).unwrap_or("waiting");
+            let msg = w.get("message").and_then(Value::as_str).unwrap_or("");
+            Some(if msg.is_empty() {
+                format!("{name}: {reason}")
+            } else {
+                format!("{name}: {reason} — {msg}")
+            })
+        })
+        .collect();
+    PodStart {
+        scheduled_at,
+        ready_to_start,
+        waiting,
+    }
+}
+
 pub(crate) fn silent_packet_verdict(job_finished: bool, job_failed: bool) -> Option<String> {
     if !job_finished {
         return None;
@@ -2450,9 +2971,14 @@ pub(crate) fn verdict_line(verdict: &str, packet: &str, body: &Value) -> String 
 /// scoped runs where a check failed without naming a test.
 /// `refused_because` covers a REFUSAL, which fails no check at all and
 /// is not a statement about the branch (§Diagnosis: "an infrastructure
-/// refusal is not a consist failure"). `None` when there is no readable
-/// receipt — a runner that died before writing one leaves the bare
-/// verdict line, and inventing a cause would be worse than silence.
+/// refusal is not a consist failure"). A refusal LEADS with it: since
+/// 2026-09-18 a lint that cannot read the registry refuses the gate and
+/// its receipt records that check as `refused`, which the checks rung
+/// dressed as `<lint>: failed (this receipt names no test)` — a red's
+/// shape on a verdict that judged nothing (backlog c7bea0e2). `None`
+/// when there is no readable receipt — a runner that died before
+/// writing one leaves the bare verdict line, and inventing a cause
+/// would be worse than silence.
 ///
 /// BOUNDED, WITH THE REMAINDER COUNTED. A console line is not a receipt,
 /// so at most [`DETAIL_LINES`] entries are printed and what is left is
@@ -2469,6 +2995,16 @@ fn red_verdict_detail(body: &Value) -> Option<String> {
         .pointer("/metadata/receipt")?
         .as_str()?;
     let receipt: Value = serde_json::from_str(raw).ok()?;
+
+    let refused_because = receipt
+        .get("refused_because")
+        .and_then(Value::as_str)
+        .map(|why| format!("the gate refused before any check ran: {why}"));
+    if receipt.get("verdict").and_then(Value::as_str) == Some("refused")
+        && let Some(why) = refused_because
+    {
+        return Some(format!("  {why}"));
+    }
 
     let fails: Vec<String> = receipt
         .get("fails")
@@ -2496,11 +3032,7 @@ fn red_verdict_detail(body: &Value) -> Option<String> {
         fails
     };
     if lines.is_empty() {
-        lines = receipt
-            .get("refused_because")
-            .and_then(Value::as_str)
-            .map(|why| vec![format!("the gate refused before any check ran: {why}")])
-            .unwrap_or_default();
+        lines = refused_because.into_iter().collect();
     }
     if lines.is_empty() {
         return None;
@@ -2557,7 +3089,16 @@ async fn wait_for_verdict(
     packet: &str,
     namespace: &str,
     job_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    // Wall time for the pod-start guard: the clock-routed `now` this
+    // verb was handed, advanced by the monotonic time since — never a
+    // fresh wallclock read (infra/lint/no-wallclock.sh says why).
+    let started = std::time::Instant::now();
+    let wall_now = || {
+        now + chrono::Duration::from_std(started.elapsed())
+            .unwrap_or_else(|_| chrono::Duration::zero())
+    };
     // A MOMENTARY ABSENCE IS NOT A FAILURE.
     //
     // Every train deploy rolls the boss Deployment, and the jobs API
@@ -2629,6 +3170,11 @@ async fn wait_for_verdict(
                         .unwrap_or("<branch unrecorded>")
                 );
             }
+            // A green that re-gated a red at the same head: say what the
+            // record now holds, where the operator is looking (36cc4913).
+            if let Some(note) = job.get("metadata").and_then(boss_jobs::flake::green_note) {
+                println!("{note}");
+            }
             return Ok(());
         }
         // The packet is silent. Before sleeping again, find out whether
@@ -2638,6 +3184,111 @@ async fn wait_for_verdict(
         if let Some(why) = silent_packet_verdict(finished, failed) {
             bail!("{why}\n  Job: {job_name} (namespace {namespace}), packet: {packet}");
         }
+        // A POD THAT NEVER STARTS IS A REFUSAL, WITHIN MINUTES. The Job
+        // is live and the packet silent for one more reason than "still
+        // running": the pod has a node and its containers never came up
+        // — a volume the kubelet cannot mount, an image it cannot pull.
+        // Left alone that sits until activeDeadlineSeconds (three
+        // hours) fails the Job, which the branch then wears as a red.
+        // On 2026-09-12 the gate seed's local PV was invisible to the
+        // kubelet for nine hours and the only thing that noticed was a
+        // human reading a pod (1661dd1e, d42d4967). Past the tolerance
+        // the wait records the runner's own refusal shape on the packet,
+        // frees the slot, and says what it is.
+        let start = pod_start(namespace, job_name);
+        if let Some(minutes) = unstarted_too_long(&start, wall_now()) {
+            let receipt = unstarted_receipt(minutes, &start);
+            let why = receipt["refused_because"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            record_refusal(http, packet, &receipt).await;
+            let _ = kubectl(namespace)
+                .args(["delete", job_name, "--ignore-not-found", "--wait=false"])
+                .output();
+            println!(
+                "boss gate: REFUSED  (packet {}, infrastructure — not the branch)",
+                &packet[..8.min(packet.len())]
+            );
+            bail!(
+                "gate refused: {why}\n  Job {job_name} deleted so the slot is free; the packet {packet} \
+                 carries the refusal. Fix the node or the manifest and gate again — there is nothing \
+                 here for the author of the change to edit."
+            );
+        }
+    }
+}
+
+/// The start state of the gate Job's pod, read off the cluster. A read
+/// that fails (kubectl absent, RBAC) is the default state — unscheduled
+/// — which never trips the guard: this verb must not refuse a gate
+/// because it could not see the pod.
+fn pod_start(namespace: &str, job_name: &str) -> PodStart {
+    let selector = format!("job-name={}", job_name.trim_start_matches("job.batch/"));
+    let out = kubectl(namespace)
+        .args(["get", "pods", "-l", &selector, "-o", "json"])
+        .output();
+    let Ok(o) = out else {
+        return PodStart::default();
+    };
+    if !o.status.success() {
+        return PodStart::default();
+    }
+    serde_json::from_slice::<Value>(&o.stdout)
+        .map(|v| pod_start_from_json(&v))
+        .unwrap_or_default()
+}
+
+/// Record an infrastructure refusal on the gate-run's receipt step —
+/// the same step and the same shape the runner writes, so the record
+/// reads one way whichever side declined. Best-effort, like
+/// `close_refused`: a failure to write is said, not raised, because the
+/// wait is about to end with the reason either way.
+async fn record_refusal(http: &reqwest::Client, packet: &str, receipt: &Value) {
+    let result = async {
+        let job = api(
+            http,
+            reqwest::Method::GET,
+            &format!("/api/jobs/{packet}"),
+            None,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("gate-run {packet} vanished"))?;
+        let step_id = job
+            .get("steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|s| s.get("title").and_then(Value::as_str) == Some("Record the receipt"))
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("gate-run {packet} has no verdict step"))?
+            .to_string();
+        // The step's `verdict` is the closed enum green|failed|lost
+        // (gate-run.toml); `lost` is "the environment died", the same
+        // word `close_refused` uses for a launch that never made a Job.
+        // The refusal itself rides the receipt — `verdict: refused`,
+        // `refused_because` — exactly as gate.sh writes a headroom
+        // refusal, so `red_verdict_detail` and the train's strike rule
+        // read both the same way.
+        api(
+            http,
+            reqwest::Method::PUT,
+            &format!("/api/jobs/{packet}/steps/{step_id}"),
+            Some(json!({
+                "status": "completed",
+                "metadata": { "verdict": "lost", "receipt": serde_json::to_string(receipt)? },
+            })),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        eprintln!(
+            "boss gate: could not record the refusal on packet {packet}: {e:#}\n  \
+             the packet stays open; the overdue alarm will find it."
+        );
     }
 }
 
@@ -2902,6 +3553,113 @@ fn live_gate_for_packet(namespace: &str, packet: &str) -> Result<Option<String>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pod scheduled but never started is an infrastructure refusal
+    /// after the tolerance, never before it, and never once it started
+    /// (1661dd1e; the 9-hour gate-seed mount d42d4967 sat exactly like
+    /// this, found by a human reading a pod).
+    #[test]
+    fn an_unstarted_pod_is_refused_only_past_the_tolerance() {
+        let now = chrono::Utc::now();
+        let at = |secs_ago: i64| {
+            Some(
+                (now - chrono::Duration::seconds(secs_ago))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+        };
+        let stuck = PodStart {
+            scheduled_at: at(600),
+            ready_to_start: false,
+            waiting: vec!["gate: ContainerCreating".into()],
+        };
+        assert_eq!(
+            unstarted_too_long(&stuck, now),
+            Some(10),
+            "ten minutes, not started"
+        );
+        let fresh = PodStart {
+            scheduled_at: at(90),
+            ..stuck.clone()
+        };
+        assert_eq!(
+            unstarted_too_long(&fresh, now),
+            None,
+            "90 s is a normal mount"
+        );
+        let started = PodStart {
+            ready_to_start: true,
+            ..stuck.clone()
+        };
+        assert_eq!(
+            unstarted_too_long(&started, now),
+            None,
+            "started: the run decides"
+        );
+        let unscheduled = PodStart::default();
+        assert_eq!(
+            unstarted_too_long(&unscheduled, now),
+            None,
+            "no pod yet is the queue's business"
+        );
+    }
+
+    /// The receipt is the runner's own refusal shape, so every reader
+    /// that spares the cars on `refused` spares these too.
+    #[test]
+    fn an_unstarted_gate_records_a_refusal_not_a_red() {
+        let start = PodStart {
+            scheduled_at: None,
+            ready_to_start: false,
+            waiting: vec!["gate: ContainerCreating".into()],
+        };
+        let r = unstarted_receipt(12, &start);
+        assert_eq!(r["verdict"], "refused");
+        assert_eq!(r["fails"], json!([]), "a refusal fails no check");
+        let why = r["refused_because"].as_str().unwrap();
+        assert!(
+            why.contains("12 min") && why.contains("never started"),
+            "{why}"
+        );
+        assert!(
+            why.contains("gate: ContainerCreating"),
+            "the container state rides the record: {why}"
+        );
+        assert!(why.contains("not a verdict on the branch"), "{why}");
+    }
+
+    /// The kubelet's account is read off the pod's conditions and
+    /// container states — the fields this session could always read.
+    #[test]
+    fn pod_start_is_read_off_conditions_and_container_states() {
+        let pods = json!({"items": [{
+            "status": {
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "False", "lastTransitionTime": "2026-09-12T04:21:30Z"},
+                    {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
+                ],
+                "containerStatuses": [
+                    {"name": "gate", "state": {"waiting": {"reason": "ContainerCreating"}}},
+                    {"name": "pg", "state": {"waiting": {"reason": "ContainerCreating"}}}
+                ]
+            }
+        }]});
+        let s = pod_start_from_json(&pods);
+        assert_eq!(s.scheduled_at.as_deref(), Some("2026-09-12T04:21:30Z"));
+        assert!(!s.ready_to_start);
+        assert_eq!(
+            s.waiting,
+            vec!["gate: ContainerCreating", "pg: ContainerCreating"]
+        );
+        assert_eq!(
+            pod_start_from_json(&json!({"items": []})),
+            PodStart::default()
+        );
+        let running = json!({"items": [{"status": {"conditions": [
+            {"type": "PodReadyToStartContainers", "status": "True"},
+            {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
+        ]}}]});
+        assert!(pod_start_from_json(&running).ready_to_start);
+    }
 
     fn park_full() -> ParkIntent {
         ParkIntent {
@@ -3281,23 +4039,55 @@ mod tests {
         }
     }
 
-    /// And the invocation it was added for is still caught. Measured
-    /// on the forge the same day: `boss rerail --help` exited 127 with
-    /// `bash: line 1: boss: command not found`, on a car the arrival
-    /// rule had probed unattended.
+    /// And an invocation of a listed tool is still caught in every
+    /// position the shell would run it from — pinned on `kubectl`, the
+    /// tool still measured absent (f9304366). Until 2026-09-18 this ran
+    /// on `boss`, which left the list that day.
     #[test]
-    fn invoking_the_boss_binary_on_the_forge_is_refused() {
+    fn invoking_an_absent_tool_on_the_forge_is_refused() {
         for probe in [
-            "boss rerail --help",
-            "cd /home/david/boss && boss receipt main",
-            "echo x $(boss orient)",
+            "kubectl -n boss get deploy boss-jobs",
+            "cd /home/david/boss && kubectl get pods -A",
+            "echo x $(kubectl get nodes)",
         ] {
             assert_eq!(
                 probe_needs_absent_tool(probe),
-                Some("boss"),
-                "the forge has no boss binary: {probe}"
+                Some("kubectl"),
+                "the forge has no kubectl: {probe}"
             );
         }
+    }
+
+    /// THE CLI IS ON THE FORGE (H8 car 1, 9f00a805; proven by car
+    /// 9ec955c3's probe; `boss` retired from the list under 8a1fcd22).
+    /// A park intent whose probe shells to a `boss` verb is complete —
+    /// which is what every later H8 car, a shell twin retiring one verb
+    /// at a time, needs to be able to record.
+    #[test]
+    fn a_probe_that_shells_to_the_cli_is_accepted_at_gate_time() {
+        let mut p = park_full();
+        p.probe = Some(
+            "cli=/usr/local/bin/boss; test -x \"$cli\" || exit 75; \"$cli\" --version \
+             >/dev/null 2>&1 && echo cli:ok"
+                .into(),
+        );
+        p.expect = Some("cli:ok".into());
+        assert!(p.require_complete().is_ok(), "{:?}", p.require_complete());
+    }
+
+    /// A PROBE PROVES, IT DOES NOT ACT. With the CLI reachable, the one
+    /// thing that would let a probe WRITE is an actor, and the probe's
+    /// env carries none — so a probe text that assigns one is refused
+    /// here, naming the variable and the rule.
+    #[test]
+    fn a_probe_that_names_an_actor_is_refused_at_gate_time() {
+        let mut p = park_full();
+        p.probe = Some("BOSS_ACTOR=emp-david boss job close 1234 && echo closed".into());
+        p.expect = Some("closed".into());
+        let e = p.require_complete().unwrap_err().to_string();
+        assert!(e.contains("BOSS_ACTOR"), "{e}");
+        assert!(e.contains("does not act"), "{e}");
+        assert!(e.contains("host-absent-tools.txt"), "{e}");
     }
 
     /// A PROBE READS THE SYSTEM OF RECORD AS A NAMED READER (61085a9e).
@@ -3337,6 +4127,45 @@ mod tests {
             assert!(e.contains("unidentified"), "{e}");
             assert!(e.contains("BOSS_SOR_USER"), "{e}");
         }
+    }
+
+    /// A PROBE COMPARES EPOCHS, NEVER ISO STRINGS WITH MIXED OFFSETS
+    /// (c0ac92b8). Car 746a1fac's probe compared `git log --format=%cI`
+    /// — a -07:00 committer date — against UTC audit timestamps as
+    /// strings and answered FAILED for a not-yet; with the offsets the
+    /// other way it answers PASS for nothing. Refused here, naming the
+    /// token, the evidence, and the epoch rewrite with its empty guard
+    /// — the same text `boss prove` says, from the one definition.
+    #[test]
+    fn a_probe_that_reads_a_git_date_with_an_offset_is_refused_at_gate_time() {
+        let mut p = park_full();
+        p.probe = Some(
+            "since=$(git log -1 --format=%cI HEAD); last=$(boss-sor-read /api/audit | jq -r '.data[0].at'); \
+             [ \"$last\" \\> \"$since\" ] && echo retire:after-landing"
+                .into(),
+        );
+        p.expect = Some("retire:after-landing".into());
+        let e = p.require_complete().unwrap_err().to_string();
+        assert!(e.contains("`%cI`"), "names the token: {e}");
+        assert!(e.contains("--format=%ct"), "names the epoch format: {e}");
+        assert!(
+            e.contains("date -u -d"),
+            "names the other side's epoch: {e}"
+        );
+        assert!(e.contains("midnight"), "names the empty-case hazard: {e}");
+        assert!(e.contains("not the compare"), "says what it refuses: {e}");
+        assert!(
+            e.contains(boss_jobs::probe::GIT_TIME_STRING_EVIDENCE),
+            "quotes the one evidence text: {e}"
+        );
+        // The rewrite it names is admitted.
+        p.probe = Some(
+            "commit=$(git log -1 --format=%ct HEAD); last=$(boss-sor-read /api/audit | jq -r '.data[0].at // empty'); \
+             [ -n \"$last\" ] || { echo 'not yet: no retire'; exit 75; }; \
+             [ \"$(date -u -d \"$last\" +%s)\" -gt \"$commit\" ] && echo retire:after-landing"
+                .into(),
+        );
+        p.require_complete().expect("epochs compare");
     }
 
     /// THE SHAPE THAT COULD NOT PASS, NAMED AT THE DOOR THAT ADMITTED IT
@@ -3382,6 +4211,58 @@ mod tests {
         );
     }
 
+    /// THE NUMBER THAT WAS `null`, named at the door that admitted it
+    /// (backlog 0df3af1c). Three probes parked through this flag compared
+    /// a `jq -r` number with `-lt` and nothing between the JSON and `[`;
+    /// each read `null`, each wrote `integer expression expected` to a
+    /// stderr nobody reads, and each car sat unproven until an operator
+    /// rewrote it. Warned, not refused, like the two shapes before it:
+    /// `[` exits 2 on the string, so the shape fails closed.
+    #[test]
+    fn a_park_probe_that_compares_an_unguarded_number_is_warned_about_not_refused() {
+        let mut p = park_full();
+        p.probe = Some(
+            "b=$(boss-sor-read /api/jobs?kind=x | jq -r '[.data[] | .m] | first | .build_s'); \
+             if [ \"${b:-9999}\" -lt 200 ]; then echo warm:ok; else exit 75; fi"
+                .into(),
+        );
+        p.expect = Some("warm:ok".into());
+        assert!(
+            p.require_complete().is_ok(),
+            "a warning must not become a refusal: {:?}",
+            p.require_complete()
+        );
+        let said = p.probe_warnings().join("\n");
+        assert!(said.contains("$b"), "names the variable to guard: {said}");
+        assert!(
+            said.contains("integer expression expected"),
+            "says what happens: {said}"
+        );
+        assert!(said.contains("// empty"), "shows the jq-side guard: {said}");
+        assert!(
+            said.contains("*[!0-9]*"),
+            "shows the shell-side guard: {said}"
+        );
+        assert!(
+            said.contains("${b:-"),
+            "says why the default is not a guard: {said}"
+        );
+        // The same probe with either idiomatic guard says nothing.
+        let mut guarded = park_full();
+        guarded.probe = Some(
+            "b=$(boss-sor-read /api/jobs?kind=x | jq -r '[.data[] | .m] | first | .build_s // empty'); \
+             case \"$b\" in ''|*[!0-9]*) echo 'not yet: no build recorded'; exit 75;; esac; \
+             if [ \"$b\" -lt 200 ]; then echo warm:ok; else exit 75; fi"
+                .into(),
+        );
+        guarded.expect = Some("warm:ok".into());
+        assert!(
+            guarded.probe_warnings().is_empty(),
+            "{:?}",
+            guarded.probe_warnings()
+        );
+    }
+
     /// THE MENTION-ONLY GUARD, the same one the absent-tool scan needs.
     /// Naming the URL is not reading it: a probe that greps the checkout
     /// for `BOSS_JOBS_URL`, or tests that it is set, runs fine and is
@@ -3390,7 +4271,7 @@ mod tests {
     #[test]
     fn a_probe_that_only_mentions_the_sor_is_not_refused() {
         for probe in [
-            "grep -c BOSS_JOBS_URL /home/david/boss/infra/forge/run-car-probe.sh",
+            "grep -c BOSS_JOBS_URL /home/david/boss/infra/ops/ops-runner.sh",
             "test -n \"$BOSS_JOBS_URL\" && echo claim-ok",
             "grep -q 'boss-jobs-internal' /home/david/boss/infra/cluster/manifests/boss.yaml && echo claim-ok",
             "git -C /home/david/boss log -1 --format=%s | grep -q /api/yard",
@@ -3554,6 +4435,35 @@ mod tests {
         );
     }
 
+    /// An id the system of record cannot resolve is refused at the
+    /// terminal, naming the flag — not an hour later as a refused edge
+    /// on the auto-park handler's dispatcher run.
+    #[test]
+    fn a_park_intent_naming_a_packet_that_does_not_exist_is_refused_by_flag() {
+        let mut p = park_full();
+        p.backlog_item = Some("be793304-9f1e-4c76-a9e6-2a6b47bcf4c0".into());
+        p.boards_after = Some("a1b2c3d4".into());
+        let known = |id: &str| id == "a1b2c3d4";
+        assert_eq!(
+            p.unresolvable(known),
+            vec![(
+                "--park-backlog-item",
+                "be793304-9f1e-4c76-a9e6-2a6b47bcf4c0".to_string()
+            )],
+            "the one the SoR cannot find is named with its flag; the one it can is not"
+        );
+        assert!(
+            p.unresolvable(|_| true).is_empty(),
+            "every ref resolves: nothing to refuse"
+        );
+        let mut none = park_full();
+        none.no_item = Some("asked for in conversation".into());
+        assert!(
+            none.named_refs().is_empty(),
+            "--park-no-item names no packet"
+        );
+    }
+
     /// A BLANK `--park-after` IS REFUSED, and the refusal says why it is
     /// worse than no flag at all: `''` passes the ref check as "no claim
     /// to check" (migration 104), so the car would be filed with a
@@ -3671,6 +4581,31 @@ mod tests {
     }
 
     /// ANSWER (1) — this car IS the item's build. Unchanged: the edge
+    /// A short id typed at the terminal is replaced by the id the system
+    /// of record answered with, so the stamp the auto-park routing reads
+    /// is the full one (2026-09-14: an 8-char stamp left 436a2e91
+    /// un-routed while its car carried the full link).
+    #[test]
+    fn a_named_ref_is_stamped_as_the_id_the_record_resolved() {
+        let mut p = ParkIntent {
+            backlog_item: Some("436a2e91".into()),
+            ..ParkIntent::default()
+        };
+        p.set_named_ref(
+            "--park-backlog-item",
+            "436a2e91-06e3-4d98-953d-d813745dbf9f".into(),
+        );
+        assert_eq!(
+            p.metadata_patch()["park_backlog_item"],
+            "436a2e91-06e3-4d98-953d-d813745dbf9f"
+        );
+        p.set_named_ref("--park-after", "0123456789abcdef0123456789abcdef".into());
+        assert_eq!(
+            p.boards_after.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
     /// rides the gate-run as `park_backlog_item`, becomes
     /// `metadata.backlog_item` on the car, and the arrival rule closes
     /// the item when the car lands.
@@ -4351,6 +5286,40 @@ mod tests {
         assert_eq!(crowd_refusal(&[], 1), None);
     }
 
+    /// 48f7aba1: THE ONE DEFINITION OF ADMISSION, both callers. Three
+    /// PR-car gates running of a bound of three, and a train asks: the
+    /// train is admitted (the bound+1th Job); a car asking the same
+    /// question is refused exactly as before; and a train asking with
+    /// the bound+1th already running is refused — the overage is one
+    /// slot, never a second.
+    #[test]
+    fn a_train_gate_is_admitted_at_the_bound_and_a_car_is_not() {
+        assert!(
+            admits(3, 3, Requester::Train),
+            "a train at the bound is admitted"
+        );
+        assert!(
+            !admits(3, 3, Requester::Car),
+            "a car at the bound waits, as today"
+        );
+        assert!(
+            !admits(4, 3, Requester::Train),
+            "one slot of overage, not two"
+        );
+        assert!(
+            admits(2, 3, Requester::Car),
+            "below the bound a car is admitted"
+        );
+        assert!(admits(2, 3, Requester::Train));
+        // And the two car-side readers of the bound are that predicate:
+        // `crowd_refusal` at the bound refuses, `may_launch` counts a
+        // waiter's place against the same line.
+        let live: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        assert!(crowd_refusal(&live, 3).is_some());
+        assert!(!may_launch(3, 3, 0));
+        assert!(may_launch(2, 3, 0) && !may_launch(2, 3, 1));
+    }
+
     /// The env override: absent means the FALLBACK (the delivery
     /// policy's bound, resolved by the caller), a count means that count,
     /// and GARBAGE REFUSES rather than silently meaning the fallback — a
@@ -4518,6 +5487,7 @@ mod tests {
             "abc123",
             "infra/gate-runner/gate-runner.yaml",
             None,
+            "emp-owner",
         );
         // Exactly the `Job` fields with no serde default and no Option.
         for field in [
@@ -4547,6 +5517,7 @@ mod tests {
             "abc123",
             "infra/gate-runner/gate-runner.yaml",
             None,
+            "emp-owner",
         );
         assert!(
             b.get("opened_on").is_none(),
@@ -4573,6 +5544,7 @@ mod tests {
             "abc123",
             "infra/gate-runner/gate-runner.yaml",
             None,
+            "emp-owner",
         );
         b.as_object_mut()
             .expect("body is an object")
@@ -4590,14 +5562,26 @@ mod tests {
     /// rig produced a verdict without guessing from the branch name.
     #[test]
     fn the_packet_records_which_runner_manifest_rendered_it() {
-        let b = gate_run_body("feat/x", "abc123", "infra/gate-runner/local.yaml", None);
+        let b = gate_run_body(
+            "feat/x",
+            "abc123",
+            "infra/gate-runner/local.yaml",
+            None,
+            "emp-owner",
+        );
         assert_eq!(b["metadata"]["runner"], "infra/gate-runner/local.yaml");
     }
 
     #[test]
     fn the_gate_run_stamps_the_delivery_channel_when_known() {
         // None (branch had no forge diff to classify) leaves it unstamped.
-        let b = gate_run_body("feat/x", "abc123", "infra/gate-runner/local.yaml", None);
+        let b = gate_run_body(
+            "feat/x",
+            "abc123",
+            "infra/gate-runner/local.yaml",
+            None,
+            "emp-owner",
+        );
         assert!(b["metadata"].get("delivery_channel").is_none());
         // A known channel rides on the gate-run so the car and the
         // channel-gated delivery can read it without re-deriving.
@@ -4606,6 +5590,7 @@ mod tests {
             "abc123",
             "infra/gate-runner/local.yaml",
             Some("data"),
+            "emp-owner",
         );
         assert_eq!(d["metadata"]["delivery_channel"], "data");
     }
@@ -5140,6 +6125,40 @@ kind: Job\n\
         );
     }
 
+    /// A REFUSAL LEADS WITH ITS REASON. Since 2026-09-18 a pre-flight
+    /// lint that cannot read the registry refuses the gate (backlog
+    /// a26f92c4) and its receipt carries that check as `refused` beside
+    /// the passes. Read through the ladder bottom-up that showed as
+    /// `<lint>: failed (this receipt names no test)` — a red's shape on
+    /// a verdict that judged nothing (backlog c7bea0e2). When the
+    /// verdict is `refused`, `refused_because` is the first line and no
+    /// refused check is dressed as a failure.
+    #[test]
+    fn a_refused_verdict_leads_with_why_it_refused() {
+        let body = json!({
+            "steps": [{
+                "spec_slug": "record-verdict",
+                "metadata": {"verdict": "refused", "receipt":
+                    "{\"verdict\":\"refused\",\
+                      \"refused_because\":\"pre-flight lint the-live-protocols-are-the-authored-protocols \
+                      could not answer (exit 3): http://[::1]:9/api/workflows answered HTTP 000\",\
+                      \"checks\":[{\"name\":\"fmt\",\"result\":\"pass\"},\
+                      {\"name\":\"the-live-protocols-are-the-authored-protocols\",\"result\":\"refused\"}],\
+                      \"fails\":[]}"}
+            }]
+        });
+        let detail = red_verdict_detail(&body).expect("a refusal says why");
+        let first = detail.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("refused") && first.contains("answered HTTP 000"),
+            "the first line is refused_because, the one fact a reader acts on: {detail}"
+        );
+        assert!(
+            !detail.contains("failed (this receipt names no test)"),
+            "a refused check is not a failure that forgot its test name: {detail}"
+        );
+    }
+
     /// The reduction is bounded and says so. A suite failing forty tests
     /// writes forty `fails` entries; a console line is not where forty
     /// belong, and dropping the rest without a count is the defect this
@@ -5223,14 +6242,47 @@ kind: Job\n\
 }
 
 #[cfg(test)]
-mod signing_tests {
+mod agent_run_tests {
     use super::*;
-    use crate::identity::Signature;
 
-    /// A one-shot HTTP stub that hands back the request head it read.
-    /// The head is where the answer lives: `x-boss-user` is what the
-    /// system of record stamps into `completed_by`.
-    async fn one_request(body: &'static str) -> (String, tokio::task::JoinHandle<Option<String>>) {
+    /// A dispatched builder's gate names its run; a hand-launched gate
+    /// — or a blank export — names nothing and stamps nothing.
+    #[test]
+    fn the_run_is_stamped_only_when_something_names_it() {
+        assert_eq!(
+            agent_run_patch(Some("5b1d2c3e-0000-4000-8000-000000000001".into())).unwrap(),
+            Some(json!({ "agent_run": "5b1d2c3e-0000-4000-8000-000000000001" }))
+        );
+        assert_eq!(agent_run_patch(Some("  ".into())).unwrap(), None);
+        assert_eq!(agent_run_patch(None).unwrap(), None);
+        assert_eq!(AGENT_RUN_ENV, "BOSS_AGENT_RUN");
+    }
+
+    /// A prefix, a branch, or anything the landing handler would skip
+    /// as an unusable link is refused at the terminal, naming the fix
+    /// — pinned to the handler's shape (36 chars, hex and dashes).
+    #[test]
+    fn a_run_id_the_landing_rule_could_not_follow_is_refused_before_launch() {
+        for bad in ["5b1d2c3e", "feat/x", "5b1d2c3e-0000-4000-8000-00000000000g"] {
+            let why = agent_run_patch(Some(bad.into()))
+                .expect_err("refused")
+                .to_string();
+            assert!(why.contains("BOSS_AGENT_RUN"), "{why}");
+            assert!(why.contains("36-character"), "{why}");
+            assert!(why.contains("unset it"), "{why}");
+        }
+    }
+}
+
+/// A one-shot HTTP stub that hands back the request head it read —
+/// the seam the wire tests go through, shared by the signing tests
+/// (the head is where `x-boss-user` lives) and the re-gate read (the
+/// head is where the query lives).
+#[cfg(test)]
+mod stub {
+    pub(super) async fn one_request(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5258,6 +6310,13 @@ mod signing_tests {
         });
         (format!("http://{addr}"), handle)
     }
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::stub::one_request;
+    use super::*;
+    use crate::identity::Signature;
 
     /// Backlog 5083d6f5, at the wire: the step PUT a `boss prove`
     /// makes must arrive carrying the operator who ran it.
@@ -5340,5 +6399,94 @@ mod signing_tests {
             "an unnamed read must say so; head was:\n{head}"
         );
         assert!(!head.contains(crate::identity::CONDUCTOR), "{head}");
+    }
+}
+
+#[cfg(test)]
+mod regate_tests {
+    use super::stub::one_request;
+    use super::*;
+
+    fn red_run(id: &str, branch: &str, sha: &str) -> String {
+        json!({
+            "id": id, "kind": "gate-run", "status": "closed", "opened_on": "2026-09-18",
+            "metadata": { "branch": branch, "sha": sha, "opened_at": "2026-09-18T10:00:00Z" },
+            "steps": [{ "spec_slug": "record-verdict", "metadata": {
+                "verdict": "failed",
+                "receipt": "{\"verdict\":\"failed\",\"checks\":[{\"name\":\"test\",\"result\":\"FAIL\",\"seconds\":9}]}"
+            }}]
+        })
+        .to_string()
+    }
+
+    fn page(run: String) -> &'static str {
+        Box::leak(format!(r#"{{"data":[{run}],"total":1}}"#).into_boxed_str())
+    }
+
+    /// The read is narrowed AT THE SERVER to the branch and head — the
+    /// containment door, url-encoded the way `boss job list --where`
+    /// sends it — and to closed runs, since an open one is still
+    /// running. Pinned as the string the wire carries.
+    #[test]
+    fn the_prior_read_narrows_on_branch_head_and_closed() {
+        let q = prior_runs_query("fix/x", "abc123");
+        assert!(
+            q.starts_with("/api/jobs?kind=gate-run&status=closed&"),
+            "{q}"
+        );
+        assert!(
+            q.contains("metadata=%7B%22branch%22%3A%22fix%2Fx%22%2C%22sha%22%3A%22abc123%22%7D"),
+            "{q}"
+        );
+    }
+
+    /// Backlog 36cc4913: a red at this head, re-gated at the SAME head.
+    /// The prior is read off the system of record and the stamp names
+    /// it and its failing check.
+    #[tokio::test]
+    async fn a_prior_red_at_the_same_head_is_read_off_the_record() {
+        let (base, stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "abc123"))).await;
+        let http = reqwest::Client::new();
+        let prior = observe_prior_red(&http, &base, "fix/x", "abc123")
+            .await
+            .expect("a closed red at the same head is the prior");
+        assert_eq!(prior.id, "aaaa1111-0000");
+        assert_eq!(prior.failed, vec!["test".to_string()]);
+        let head = stub.await.unwrap().expect("the stub read a request");
+        assert!(head.contains("kind=gate-run"), "{head}");
+        assert!(
+            head.contains("metadata=%7B%22branch%22"),
+            "the read narrows: {head}"
+        );
+        assert_eq!(
+            boss_jobs::flake::regate_patch(&prior),
+            json!({ "regate_of": "aaaa1111-0000", "prior_failed": ["test"] })
+        );
+    }
+
+    /// A moved head is the author's fix, not a re-gate. The stub hands
+    /// back a red at ANOTHER sha — what a server that ignored the
+    /// `metadata=` parameter would do — and nothing is stamped.
+    #[tokio::test]
+    async fn a_red_at_another_head_is_not_a_regate_even_when_the_server_sends_it() {
+        let (base, _stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "def456"))).await;
+        let http = reqwest::Client::new();
+        assert!(
+            observe_prior_red(&http, &base, "fix/x", "abc123")
+                .await
+                .is_none()
+        );
+    }
+
+    /// An unreadable record is not a prior: the gate runs, the stamp is
+    /// simply absent — a dark SoR must not refuse a launch.
+    #[tokio::test]
+    async fn an_unreachable_record_stamps_nothing_and_refuses_nothing() {
+        let http = reqwest::Client::new();
+        assert!(
+            observe_prior_red(&http, "http://127.0.0.1:9", "fix/x", "abc123")
+                .await
+                .is_none()
+        );
     }
 }

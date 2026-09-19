@@ -3,33 +3,55 @@
 //! `post_fact_in_tx` is the single entry point domain crates call from
 //! inside their write transaction. It:
 //!
-//! 1. Evaluates the active rule for the fact (RuleSet v1 today; a hardcoded
-//!    dispatch for now — v2 will look up the active row in
-//!    `gl_rule_versions` at startup).
+//! 1. Evaluates the active rule for the fact: the newest `gl_posting_rules`
+//!    row for its kind when a tenant published one, the code rules
+//!    (`BossRuleSet`) otherwise — `DataRuleSet` is that one decision
+//!    (backlog a40541cb).
 //! 2. Auto-creates the monthly `gl_periods` row if one doesn't yet exist.
 //! 3. Resolves draft account codes to chart UUIDs.
 //! 4. Inserts `gl_journal_entries` + `gl_journal_lines` rows.
 //! 5. The deferred trigger checks the double-entry invariant at commit.
 //!
 //! Idempotency: `gl_journal_entries` has a `UNIQUE (fact_id, rule_version_id)`
-//! constraint. A re-post of the same fact is a no-op.
+//! constraint. A re-post of the same fact is a no-op — and so is a post
+//! of a SUPERSEDED fact, whose entry the supersede dropped on purpose
+//! (backlog 94f20e76; the guard is in `post_fact_in_tx`).
 
 use chrono::{Datelike, NaiveDate};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::LedgerError;
-use crate::rules::{BossRuleSet, evaluate, is_gl_inert};
+use crate::posting_rules::{DataRuleSet, load_newest_rule_in_tx};
+use crate::rules::{evaluate, is_gl_inert};
 use crate::types::{FactRef, JournalEntryDraft};
 
 /// Fixed UUID of the active BOSS RuleSet — matches the seed in
 /// `schema/40-ledger.sql`. A future shape change introduces a sibling
 /// `RULE_SET_V2_ID` + RuleSet impl alongside this one and historical
 /// rows stay pinned to their original `rule_version_id`.
+///
+/// A DATA rule does not move this. `gl_rule_versions` names the
+/// interpreter that ran (`DataRuleSet` over `BossRuleSet` reports the
+/// same version); a tenant's `gl_posting_rules` version is its edition
+/// of one fact kind's lines, recorded in the entry's memo, and a newer
+/// edition re-projects open periods on rebuild exactly as the code
+/// rules do (`OPEN_PERIOD_FACTS_SQL`) — never a locked one.
 pub const RULE_SET_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
 
-fn evaluate_active(fact: &FactRef<'_>) -> Result<(JournalEntryDraft, Uuid), LedgerError> {
-    let draft = evaluate(&BossRuleSet, fact)?;
+/// The one construction site of the active RuleSet: one primary-key
+/// read for the fact's kind, then the pure evaluation.
+async fn evaluate_active(
+    tx: &mut Transaction<'_, Postgres>,
+    fact: &FactRef<'_>,
+) -> Result<(JournalEntryDraft, Uuid), LedgerError> {
+    let rules = DataRuleSet::new(
+        load_newest_rule_in_tx(tx, fact.kind)
+            .await?
+            .into_iter()
+            .collect(),
+    );
+    let draft = evaluate(&rules, fact)?;
     Ok((draft, RULE_SET_ID))
 }
 
@@ -55,7 +77,29 @@ pub async fn post_fact_in_tx(
     if is_gl_inert(fact.kind) {
         return Ok(());
     }
-    let (draft, rule_version_id) = evaluate_active(fact)?;
+    // A superseded fact posts nothing. `apply_supersede_in_tx` marks the
+    // row and DROPS its entry, and until 2026-09-17 (backlog 94f20e76)
+    // this function never read the mark: any caller that re-posted an
+    // existing fact — a domain writer's retry, whose `record_fact_in_tx`
+    // resolves the kept row's id; a NAK redelivery — found no entry
+    // under the UNIQUE key below and resurrected the retraction. The
+    // rebuild and replay paths filter superseded rows in SQL
+    // (`OPEN_PERIOD_FACTS_SQL`); the live projector posts only the fact
+    // it inserted; THIS is the guard every caller shares. A no-op, not
+    // an error: the operator retired the fact deliberately, and the
+    // domain write that re-posts it is otherwise idempotent and must
+    // stay so. Logged, because a silent no-op is the one forbidden
+    // failure mode (superseded-fact-posts-nothing).
+    if let Some(reason) = supersede_reason_of(tx, fact.id).await? {
+        tracing::warn!(
+            fact_id = %fact.id,
+            kind = fact.kind,
+            supersede_reason = %reason,
+            "superseded-fact-posts-nothing: re-post of a retired fact left no journal entry"
+        );
+        return Ok(());
+    }
+    let (draft, rule_version_id) = evaluate_active(tx, fact).await?;
 
     // Early-return if a row already exists for this (fact, ruleset). Saves
     // a period-lookup and chart-lookup on replay.
@@ -142,6 +186,23 @@ pub async fn post_fact_in_tx(
     )
     .await?;
     Ok(())
+}
+
+/// The fact's `supersede_reason`, `Some` iff the row is retired
+/// (supersede.rs's convention). A fact with no row yet reads as live:
+/// the entry insert's FK on `financial_facts(id)` is the one that
+/// speaks to a missing row, and this read must not pre-empt it.
+async fn supersede_reason_of(
+    tx: &mut Transaction<'_, Postgres>,
+    fact_id: Uuid,
+) -> Result<Option<String>, LedgerError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT supersede_reason FROM financial_facts WHERE id = $1")
+            .bind(fact_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    Ok(row.and_then(|(reason,)| reason))
 }
 
 /// The fact kind emitted when an accounting period is closed.

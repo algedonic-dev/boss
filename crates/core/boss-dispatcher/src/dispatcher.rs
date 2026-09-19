@@ -3,6 +3,7 @@
 
 use crate::config::AssignmentStrategy;
 use anyhow::{Context, Result};
+use boss_core::partition::Partition;
 use boss_jobs::step_registry::{Completion, StepRegistry};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -27,6 +28,10 @@ pub struct DispatcherCtx {
     /// round-trip per assign — ~6 assigns/sec, so each newly-ready step
     /// waited seconds in the queue and every pipeline tier inherited that
     /// lag. The cache turns the steady-state assign into a local pick.
+    /// Since backlog ab192a9f the roster is the UNION of the people
+    /// roster and the registered agents that hold a role
+    /// (`roster_union`): a role audience resolves to its holders, and an
+    /// agent holding the role is one.
     roster: Arc<tokio::sync::Mutex<RosterCache>>,
     /// Step-assignment distribution strategy, selected by config/data
     /// (`BOSS_DISPATCH_STRATEGY`, default `Spread`). Read by
@@ -41,6 +46,14 @@ pub struct DispatcherCtx {
 struct RosterCache {
     fetched_at: Option<std::time::Instant>,
     employees: Vec<Employee>,
+    /// login → registered agent id, folded by `alias_map` from the
+    /// same `/api/agents` listing the roster reads (backlog d7fef617).
+    /// Not a roster row: an agent with no role is not on the roster,
+    /// but its login still resolves — so the map has its own stamp
+    /// and its own refresh (`canonical_executor_for`) rather than
+    /// riding on the roster rows.
+    aliases: std::collections::HashMap<String, String>,
+    aliases_fetched_at: Option<std::time::Instant>,
 }
 
 impl DispatcherCtx {
@@ -175,18 +188,21 @@ pub async fn run_loop(
                 // silently yields all-None fields, so unwrap `payload` first.
                 let inner = envelope.get("payload").cloned().unwrap_or(envelope);
                 let subject = msg.subject.to_string();
-                // Inherit the triggering event's sim-ness, same as the
+                // Inherit the triggering event's partition, same as the
                 // rules dispatcher. The assignment path is a SEPARATE
                 // consumer, and it was the last hop losing the marker:
                 // its writes landed `_simulated: false` on simulated
                 // Jobs because nothing here ever set the task-local.
-                // The SAME bit also gates who may be assigned (see
+                // The SAME fact also gates who may be assigned (see
                 // `partition_permits`), so it is threaded into
                 // handle_event explicitly rather than re-read there.
-                let simulated = event_is_simulated(&inner);
+                // The chain is "not real" (packet 508cc38c): a shadow
+                // packet's writes fail closed exactly as a simulated
+                // one's do.
+                let partition = event_partition(&inner);
                 let outcome = boss_core::sim_origin::with_sim_chain(
-                    simulated,
-                    handle_event(&ctx, &subject, &inner, simulated),
+                    partition.fails_closed(),
+                    handle_event(&ctx, &subject, &inner, partition),
                 )
                 .await;
                 // ACK on success; NAK (→ redeliver) on failure; dead-letter
@@ -205,10 +221,12 @@ pub async fn run_loop(
     Ok(())
 }
 
-/// The assignment-side sim boundary, one checkable question — the exact
-/// mirror of the workforce's `row_is_simulated` (boss-sim/workforce.rs):
-/// `true` only when the event SAYS `_simulated: true`; absent, null,
-/// false, or a mis-typed value all read as REAL.
+/// The assignment-side partition boundary, one checkable question — the
+/// exact mirror of the workforce's `row_partition` (boss-sim/workforce.rs)
+/// and the one reader every marker consumer shares
+/// (`Partition::from_event_payload`): `_partition` when the stamp wrote
+/// one, else the older `_simulated` bool; absent, null, or a mis-typed
+/// value all read as REAL.
 ///
 /// The mirror direction is load-bearing. "Absent means real" is the
 /// partition's one documented posture, and both halves must agree on
@@ -221,8 +239,8 @@ pub async fn run_loop(
 /// is the filing exercise's defect (9c23395c's prevention finding:
 /// exercises must set simulated=true or tear down what they file), and
 /// costs the human a glance, not lost work.
-fn event_is_simulated(payload: &Value) -> bool {
-    payload.get("_simulated").and_then(Value::as_bool) == Some(true)
+fn event_partition(payload: &Value) -> Partition {
+    Partition::from_event_payload(payload)
 }
 
 /// The role that marks an operator identity — a real login/agent, not a
@@ -235,20 +253,23 @@ fn event_is_simulated(payload: &Value) -> bool {
 const OPERATOR_ROLE: &str = "platform-admin";
 
 /// May a packet from this partition be assigned to an employee with this
-/// role? The one rule of the 9c23395c fix: a SIMULATED packet must never
-/// be assigned to an operator identity — the five `[sim]
+/// role? The one rule of the 9c23395c fix: a packet that is NOT REAL
+/// must never be assigned to an operator identity — the five `[sim]
 /// decision-routing probe` packets landed in David's real queue through
 /// the owner-preference path because no assignment route checked the
-/// partition. Real packets are untouched in every direction.
-fn partition_permits(simulated: bool, employee_role: &str) -> bool {
-    !simulated || employee_role != OPERATOR_ROLE
+/// partition. Generalised from "simulated" to `fails_closed()` for the
+/// shadow lane (packet 508cc38c): a shadow packet is refused an
+/// operator exactly as a simulated one is. Real packets are untouched
+/// in every direction.
+fn partition_permits(partition: Partition, employee_role: &str) -> bool {
+    partition.is_real() || employee_role != OPERATOR_ROLE
 }
 
 async fn handle_event(
     ctx: &DispatcherCtx,
     subject: &str,
     payload: &Value,
-    simulated: bool,
+    partition: Partition,
 ) -> Result<()> {
     let step: StepEventPayload =
         serde_json::from_value(payload.clone()).context("parsing step payload")?;
@@ -272,12 +293,7 @@ async fn handle_event(
     if status != "ready" && status != "active" {
         return Ok(());
     }
-    if step
-        .assignee_id
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-    {
+    if born_placed(&step) {
         return Ok(());
     }
     let Some(job_id) = step.job_id.as_deref() else {
@@ -403,8 +419,47 @@ async fn handle_event(
         .and_then(|k| ctx.registry.get(k))
         .map(|t| t.decision_shaped)
         .unwrap_or(true);
+    // THE CAPABILITY PICK FIRST (c87fb59b car 3): a step whose block
+    // names a model goes to the registered agent whose row holds the
+    // role and runs the model. The roster is read only when a block is
+    // declared, so a step without one costs nothing here; a roster
+    // read that fails falls through to the env executor rather than
+    // NAKing — the pick below is the prior behaviour, never worse.
+    let step_model = step
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(boss_jobs::agent_spec::MODEL_KEY))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    if step_model.is_some() {
+        match capability_executor_for(
+            ctx,
+            partition,
+            decision_shaped,
+            &role_candidates,
+            step_model,
+        )
+        .await
+        {
+            Ok(Some(agent)) => {
+                assign(ctx, job_id, step_id, &agent).await?;
+                debug!(
+                    job_id,
+                    step_id,
+                    agent,
+                    model = step_model.unwrap_or_default(),
+                    "dispatcher assigned the step to the agent serving its (role, model)"
+                );
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!(job_id, step_id, error = %e, "roster read failed for the capability pick; using the env executor");
+            }
+        }
+    }
     if let Some(executor) = executor_for(
-        simulated,
+        partition,
         decision_shaped,
         std::env::var("BOSS_DISPATCH_EXECUTOR_ID").ok().as_deref(),
         std::env::var("BOSS_DISPATCH_EXECUTOR_ROLES")
@@ -412,6 +467,10 @@ async fn handle_event(
             .as_deref(),
         &role_candidates,
     ) {
+        // Nominate the REGISTERED id, not the env spelling: the claim
+        // door signs this actor by its registered id and the CAS
+        // compares the two (d7fef617, `canonical_executor`).
+        let executor = canonical_executor_for(ctx, &executor).await;
         assign(ctx, job_id, step_id, &executor).await?;
         debug!(
             job_id,
@@ -435,7 +494,7 @@ async fn handle_event(
             }
         };
         let owner_holds = match owner.as_deref() {
-            Some(o) => owner_is_active_holder(ctx, o, &role_candidates, simulated)
+            Some(o) => owner_is_active_holder(ctx, o, &role_candidates, partition)
                 .await
                 .unwrap_or(false),
             None => false,
@@ -449,8 +508,14 @@ async fn handle_event(
             return Ok(());
         }
     }
-    let chosen =
-        pick_employee_with_role_fallback(ctx, &role_candidates, step_id, simulated).await?;
+    let chosen = pick_employee_with_role_fallback(
+        ctx,
+        &role_candidates,
+        step_id,
+        partition,
+        decision_shaped,
+    )
+    .await?;
     let Some((emp_id, role_used)) = chosen else {
         // A role IS required (role_candidates is non-empty) but no active
         // holder was found. This is virtually always transient: at sim start
@@ -461,7 +526,7 @@ async fn handle_event(
         // roster warms the reassignment succeeds, and the assignee-already-set
         // guard above keeps redelivery idempotent. A genuinely unfillable role
         // exhausts the budget and dead-letters loudly — the correct outcome.
-        // A SIMULATED step whose only role holders are operator identities
+        // A NON-REAL step whose only role holders are operator identities
         // is unfillable BY DESIGN (`partition_permits`): it dead-letters
         // loudly instead of polluting a real queue, and the exercise that
         // filed it learns immediately.
@@ -471,7 +536,7 @@ async fn handle_event(
         // hang — the first AP run opened before the roster was queryable.
         anyhow::bail!(
             "no eligible employee for step {step_id} (job {job_id}); \
-             candidates={role_candidates:?} simulated={simulated} — \
+             candidates={role_candidates:?} partition={partition} — \
              NAK for redelivery once the roster warms"
         );
     };
@@ -497,14 +562,33 @@ async fn handle_event(
 /// is testable without a roster or an env-mutating test. `Some(id)` =
 /// assign the executor; `None` = fall through to the human pick.
 ///
-/// Never fires for a simulated step (the executor is a REAL registered
-/// agent — a deployment fact, not a sim identity — and the 9c23395c rule
-/// is that sim packets never enter a real actor's queue), never fires
+/// Never fires for a step that is not real (the executor is a REAL
+/// registered agent — a deployment fact, not a sim identity — and the
+/// 9c23395c rule is that sim packets never enter a real actor's queue;
+/// a shadow packet is refused the same way, 508cc38c), never fires
 /// for a decision-shaped step, never fires without a configured
 /// executor, and only fires when one of the step's candidate roles is a
 /// role the executor is declared to execute for — a brewery `brewer`
 /// step must not land on the platform agent just because the agent
 /// exists.
+/// Is this step already somebody's? An assigned step never re-routes
+/// through the dispatcher — that is the idempotency guard on every
+/// status flip (the assignment PUT itself emits a `jobs.step.updated`)
+/// — and it is also how a step that is born placed stays out of every
+/// pick below. A Workflow step with an `individual` audience
+/// materialises with its `assignee_id` set (f5ebd2e1), and since
+/// backlog af796788 the pr-train's task steps name the conductor that
+/// way: they were arriving with a role and no assignee, so the
+/// executes-lane nominated all seven of every train to the agent alias
+/// and the conductor completed them over its head. Pure, so the rule
+/// is testable over a materialised packet without an event loop.
+fn born_placed(step: &StepEventPayload) -> bool {
+    step.assignee_id
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Why a ready step is left in its role queue instead of being
 /// nominated to one actor, or `None` to nominate as usual. Two
 /// declarations on the materialized step say so: `claimable` (the
@@ -525,13 +609,13 @@ fn left_for_role_queue(metadata: Option<&Value>) -> Option<&'static str> {
 }
 
 fn executor_for(
-    simulated: bool,
+    partition: Partition,
     decision_shaped: bool,
     executor_id: Option<&str>,
     executor_roles: Option<&str>,
     role_candidates: &[&str],
 ) -> Option<String> {
-    if simulated || decision_shaped {
+    if partition.fails_closed() || decision_shaped {
         return None;
     }
     let id = executor_id?.trim();
@@ -543,6 +627,72 @@ fn executor_for(
         .map(str::trim)
         .any(|r| !r.is_empty() && role_candidates.contains(&r));
     if eligible { Some(id.to_string()) } else { None }
+}
+
+/// THE CAPABILITY PICK (design c87fb59b car 3, backlog cb78818d): the
+/// registered agent that serves the `(role, model)` a step's agent
+/// block declares — the same pair `station_projection::agent_stations`
+/// gates a station on — nominated ahead of the env executor.
+///
+/// Fires only for a REAL, executable step that carries `agent_model`
+/// (car 1's projection of the block onto the packet) and a role among
+/// its candidates; the agent must be active, hold that role and run
+/// that model. Lowest id wins, so the pick is deterministic. `None` is
+/// "this pick says nothing", and the caller falls through to
+/// `executor_for` — the env's single executor, which is the FALLBACK
+/// now and retires when every deployment's agents row holds the roles
+/// its blocks are declared under. Measured 2026-09-18 on the live
+/// registry: agent-claude holds `engineering-agent`, every block sits
+/// under `platform-admin`, so this pick names nobody and prod keeps
+/// nominating claude@algedonic.dev through BOSS_DISPATCH_EXECUTOR_ID.
+/// The retirement is one registry edit (the row's `role`) and one
+/// manifest edit (drop the two env lines), in that order.
+fn capability_executor(
+    partition: Partition,
+    decision_shaped: bool,
+    role_candidates: &[&str],
+    step_model: Option<&str>,
+    roster: &[Employee],
+) -> Option<String> {
+    if partition.fails_closed() || decision_shaped {
+        return None;
+    }
+    let model = step_model?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    roster
+        .iter()
+        .filter(|e| e.is_agent && e.status == "active")
+        .filter(|e| role_candidates.contains(&e.role.as_str()))
+        .filter(|e| e.models.iter().any(|m| m == model))
+        .map(|e| e.id.as_str())
+        .min()
+        .map(str::to_string)
+}
+
+/// `capability_executor` over the SAME TTL-cached roster the role pick
+/// and the owner check read, so the three picks never see different
+/// rosters.
+async fn capability_executor_for(
+    ctx: &DispatcherCtx,
+    partition: Partition,
+    decision_shaped: bool,
+    role_candidates: &[&str],
+    step_model: Option<&str>,
+) -> Result<Option<String>> {
+    let mut cache = ctx.roster.lock().await;
+    if roster_is_stale(&cache) {
+        cache.employees = fetch_active_roster(ctx).await?;
+        cache.fetched_at = Some(std::time::Instant::now());
+    }
+    Ok(capability_executor(
+        partition,
+        decision_shaped,
+        role_candidates,
+        step_model,
+        &cache.employees,
+    ))
 }
 
 /// A decision-shaped step routes to the packet OWNER when the owner is
@@ -585,25 +735,63 @@ async fn pick_employee_with_role_fallback(
     ctx: &DispatcherCtx,
     role_candidates: &[&str],
     step_id: &str,
-    simulated: bool,
+    partition: Partition,
+    decision_shaped: bool,
 ) -> Result<Option<(String, String)>> {
     if role_candidates.is_empty() {
-        let chosen = pick_employee(ctx, None, step_id, simulated).await?;
+        let chosen = pick_employee(ctx, None, step_id, partition, decision_shaped).await?;
         return Ok(chosen.map(|id| (id, String::new())));
     }
     for r in role_candidates {
-        if let Some(id) = pick_employee(ctx, Some(r), step_id, simulated).await? {
+        if let Some(id) = pick_employee(ctx, Some(r), step_id, partition, decision_shaped).await? {
             return Ok(Some((id, (*r).to_string())));
         }
     }
     Ok(None)
 }
 
-#[derive(Debug, Deserialize)]
+/// One roster row: a person as `/api/people` answers it, or a
+/// registered agent that holds a role, folded in by `roster_union`.
+#[derive(Debug, Clone, Deserialize)]
 struct Employee {
     id: String,
     role: String,
     status: String,
+    /// A registered agent (from `/api/agents`, backlog ab192a9f), not a
+    /// person. Never on the wire from `/api/people`, hence the default;
+    /// read by `eligible_candidates`, which admits an agent under the
+    /// executor's three guards and nowhere else.
+    #[serde(default)]
+    is_agent: bool,
+    /// The models a registered agent runs — its row's `default_model`,
+    /// folded in by `roster_union` (design c87fb59b car 3). Empty for a
+    /// person, who runs none. Read by `capability_executor`, which
+    /// nominates an agent for a step whose block names one of these.
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// The one roster every reader shares: the people roster plus each
+/// registered agent that HOLDS a role, as a row of that role (backlog
+/// ab192a9f). An agent with no role is not on the roster — it is
+/// reachable by id only, which is what a null role means. Pure, so the
+/// union is testable without the two HTTP reads.
+fn roster_union(
+    employees: Vec<Employee>,
+    agents: Vec<boss_jobs::agents::AgentRow>,
+) -> Vec<Employee> {
+    employees
+        .into_iter()
+        .chain(agents.into_iter().filter_map(|a| {
+            a.role.map(|role| Employee {
+                id: a.id,
+                role,
+                status: "active".to_string(),
+                is_agent: true,
+                models: vec![a.default_model],
+            })
+        }))
+        .collect()
 }
 
 /// Roster cache TTL: short enough that a new hire becomes assignable
@@ -618,21 +806,111 @@ fn roster_is_stale(cache: &RosterCache) -> bool {
         .unwrap_or(true)
 }
 
-/// The active roster, fetched from the people API. The one HTTP call
-/// every roster reader shares; the TTL cache in `ctx.roster` is what
-/// keeps it off the hot path.
+/// The active roster: the people API's employees and the jobs API's
+/// registered agents, unioned by `roster_union`. The one read every
+/// roster reader shares; the TTL cache in `ctx.roster` is what keeps
+/// it off the hot path. Either read failing fails the roster — the
+/// caller NAKs for redelivery exactly as for a cold people projection,
+/// and a roster missing its agents would nominate nobody for a role
+/// only an agent holds, silently, which is the defect ab192a9f names.
 async fn fetch_active_roster(ctx: &DispatcherCtx) -> Result<Vec<Employee>> {
-    let url = format!("{}/api/people", ctx.people_api_url.trim_end_matches('/'));
+    let people = format!("{}/api/people", ctx.people_api_url.trim_end_matches('/'));
+    let employees: Vec<Employee> = fetch_json(ctx, &people).await?;
+    let agents = fetch_agents(ctx).await?;
+    Ok(roster_union(employees, agents))
+}
+
+/// The registered agents, as `GET /api/agents` lists them — the one
+/// read behind both folds of that listing (`roster_union`, `alias_map`).
+async fn fetch_agents(ctx: &DispatcherCtx) -> Result<Vec<boss_jobs::agents::AgentRow>> {
+    let url = format!("{}/api/agents", ctx.jobs_api_url.trim_end_matches('/'));
+    let listing: AgentsListing = fetch_json(ctx, &url).await?;
+    Ok(listing.data)
+}
+
+/// `GET /api/agents` answers `{data, total}`; the rows are the
+/// registry's own shape.
+#[derive(Debug, Deserialize)]
+struct AgentsListing {
+    data: Vec<boss_jobs::agents::AgentRow>,
+}
+
+/// THE EXECUTOR LANE NOMINATES THE REGISTERED ID (backlog d7fef617).
+/// The id `executor_for` returns is the raw env value
+/// (`BOSS_DISPATCH_EXECUTOR_ID`), and the deployment spells it as the
+/// agent's LOGIN — `claude@algedonic.dev`. The jobs API's login door
+/// (design 6fda05ae) rewrites that login to the registered id
+/// `agent-claude` before any write is read, so the actor's own claim
+/// arrives as `agent-claude` and the claim CAS (`assignee_id = $2`)
+/// refused the holder to itself: 409 {holder: claude@algedonic.dev,
+/// status: ready}, measured 2026-09-19 00:50Z on `boss dispatch`
+/// da925366. One definition: every writer of assignee_id spells the
+/// actor the way the door does, so the nomination resolves through the
+/// same alias relation the door reads, folded here from the registry's
+/// rows. Pure: an alias resolves to the agent that lists it; anything
+/// else — a registered id, a person, an id the registry does not know
+/// — passes through unchanged, because this lane never invents an
+/// identity.
+fn canonical_executor(env_id: &str, aliases: &std::collections::HashMap<String, String>) -> String {
+    aliases
+        .get(env_id)
+        .cloned()
+        .unwrap_or_else(|| env_id.to_string())
+}
+
+/// login → registered id, over every agent row — with or without a
+/// role, which is why this is not a roster row's field: the roster
+/// holds only agents that hold a role, and a login resolves either way.
+fn alias_map(agents: &[boss_jobs::agents::AgentRow]) -> std::collections::HashMap<String, String> {
+    agents
+        .iter()
+        .flat_map(|a| {
+            a.aliases
+                .iter()
+                .map(move |alias| (alias.clone(), a.id.clone()))
+        })
+        .collect()
+}
+
+/// `canonical_executor` over the alias map cached beside the roster,
+/// refreshed on the roster's TTL from the same `/api/agents` listing.
+/// A registry that cannot be read leaves the env spelling as it was —
+/// the prior behaviour, and one the claim CAS now admits (the other
+/// half of d7fef617) — rather than NAKing a lane that never depended
+/// on a registry read before; the miss is logged.
+async fn canonical_executor_for(ctx: &DispatcherCtx, env_id: &str) -> String {
+    let mut cache = ctx.roster.lock().await;
+    let stale = cache
+        .aliases_fetched_at
+        .map(|t| t.elapsed() >= ROSTER_TTL)
+        .unwrap_or(true);
+    if stale {
+        match fetch_agents(ctx).await {
+            Ok(agents) => {
+                cache.aliases = alias_map(&agents);
+                cache.aliases_fetched_at = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                debug!(env_id, error = %e, "agents read failed; nominating the executor as the env spells it");
+            }
+        }
+    }
+    canonical_executor(env_id, &cache.aliases)
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(ctx: &DispatcherCtx, url: &str) -> Result<T> {
     let resp = ctx
         .client
-        .get(&url)
+        .get(url)
         .header("x-sim-origin", sim_origin_value())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
-    resp.json().await.context("decode /api/people response")
+    resp.json()
+        .await
+        .with_context(|| format!("decode {url} response"))
 }
 
 /// Is `owner_id` an active holder of any of `roles`? Reads the SAME
@@ -643,7 +921,7 @@ async fn owner_is_active_holder(
     ctx: &DispatcherCtx,
     owner_id: &str,
     roles: &[&str],
-    simulated: bool,
+    partition: Partition,
 ) -> Result<bool> {
     let mut cache = ctx.roster.lock().await;
     if roster_is_stale(&cache) {
@@ -654,14 +932,14 @@ async fn owner_is_active_holder(
         &cache.employees,
         owner_id,
         roles,
-        simulated,
+        partition,
     ))
 }
 
 /// The membership question, pure: is `owner_id` an ACTIVE employee whose
 /// role is one of `roles`, reachable from this partition? An inactive
 /// holder, a wrong role, a different id, or an operator identity on a
-/// SIMULATED packet all read false — the same eligibility
+/// NON-REAL packet all read false — the same eligibility
 /// `pick_employee`'s candidate filter uses, so the owner is preferred
 /// only when they could have been picked anyway. (The partition leg is
 /// the 9c23395c fix: the five `[sim]` probes reached emp-david through
@@ -670,13 +948,14 @@ fn is_active_holder(
     employees: &[Employee],
     owner_id: &str,
     roles: &[&str],
-    simulated: bool,
+    partition: Partition,
 ) -> bool {
     employees.iter().any(|e| {
-        e.status == "active"
+        !e.is_agent
+            && e.status == "active"
             && e.id == owner_id
             && roles.contains(&e.role.as_str())
-            && partition_permits(simulated, &e.role)
+            && partition_permits(partition, &e.role)
     })
 }
 
@@ -793,14 +1072,15 @@ async fn pick_employee(
     ctx: &DispatcherCtx,
     role: Option<&str>,
     step_id: &str,
-    simulated: bool,
+    partition: Partition,
+    decision_shaped: bool,
 ) -> Result<Option<String>> {
     let mut cache = ctx.roster.lock().await;
     if roster_is_stale(&cache) {
         cache.employees = fetch_active_roster(ctx).await?;
         cache.fetched_at = Some(std::time::Instant::now());
     }
-    let candidates = eligible_candidates(&cache.employees, role, simulated);
+    let candidates = eligible_candidates(&cache.employees, role, partition, decision_shaped);
     if candidates.is_empty() {
         // No eligible holder — preserve the None contract; never `% 0`.
         return Ok(None);
@@ -811,21 +1091,32 @@ async fn pick_employee(
 
 /// The candidate pool, pure: active, role-matched (when a role
 /// constrains the step), reachable from the packet's partition
-/// (`partition_permits` — a SIMULATED packet's pool never contains an
+/// (`partition_permits` — a NON-REAL packet's pool never contains an
 /// operator identity), in stable id order so the strategy index above is
 /// reproducible. Factored out of `pick_employee` so the eligibility
 /// rule — the surface the 9c23395c defect lived on — is testable
 /// without the roster cache / HTTP.
+///
+/// A registered agent on the roster (backlog ab192a9f) is admitted
+/// under the executor's own three guards (`executor_for`, 291a73a7
+/// option c): the packet is REAL, the step is EXECUTABLE (a verdict
+/// goes to a person), and a role constrains the step — the
+/// unconstrained pool stays people. So a role only an agent holds
+/// nominates the agent, and everything that reached a person before
+/// still does.
 fn eligible_candidates<'a>(
     employees: &'a [Employee],
     role: Option<&str>,
-    simulated: bool,
+    partition: Partition,
+    decision_shaped: bool,
 ) -> Vec<&'a Employee> {
+    let agent_permitted = role.is_some() && partition.is_real() && !decision_shaped;
     let mut candidates: Vec<&Employee> = employees
         .iter()
         .filter(|e| e.status == "active")
         .filter(|e| role.map(|r| e.role == r).unwrap_or(true))
-        .filter(|e| partition_permits(simulated, &e.role))
+        .filter(|e| partition_permits(partition, &e.role))
+        .filter(|e| !e.is_agent || agent_permitted)
         .collect();
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
     candidates
@@ -889,9 +1180,10 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_candidates, event_is_simulated, executor_for, is_active_holder,
-        left_for_role_queue, owner_assignee, owner_id_from_job_body, partition_permits, pick_index,
-        pick_index_for, stable_hash,
+        Partition, StepEventPayload, born_placed, capability_executor, eligible_candidates,
+        event_partition, executor_for, is_active_holder, left_for_role_queue, owner_assignee,
+        owner_id_from_job_body, partition_permits, pick_index, pick_index_for, roster_union,
+        stable_hash,
     };
     use crate::config::AssignmentStrategy;
     use boss_jobs::step_registry::StepRegistry;
@@ -965,7 +1257,7 @@ mod tests {
         // role eligible.
         assert_eq!(
             executor_for(
-                false,
+                Partition::Real,
                 false,
                 Some("claude@algedonic.dev"),
                 Some("platform-admin"),
@@ -976,7 +1268,7 @@ mod tests {
         // A DECISION never goes to the executor, whatever the config.
         assert_eq!(
             executor_for(
-                false,
+                Partition::Real,
                 true,
                 Some("claude@algedonic.dev"),
                 Some("platform-admin"),
@@ -989,7 +1281,7 @@ mod tests {
         // agent just because the agent exists.
         assert_eq!(
             executor_for(
-                false,
+                Partition::Real,
                 false,
                 Some("claude@algedonic.dev"),
                 Some("platform-admin"),
@@ -999,14 +1291,123 @@ mod tests {
         );
         // Unconfigured deployments behave exactly as before.
         assert_eq!(
-            executor_for(false, false, None, Some("platform-admin"), &platform),
+            executor_for(
+                Partition::Real,
+                false,
+                None,
+                Some("platform-admin"),
+                &platform
+            ),
             None
         );
         assert_eq!(
-            executor_for(false, false, Some(""), Some("platform-admin"), &platform),
+            executor_for(
+                Partition::Real,
+                false,
+                Some(""),
+                Some("platform-admin"),
+                &platform
+            ),
             None
         );
-        assert_eq!(executor_for(false, false, Some("x"), None, &platform), None);
+        assert_eq!(
+            executor_for(Partition::Real, false, Some("x"), None, &platform),
+            None
+        );
+    }
+
+    /// THE CAPABILITY PICK (design c87fb59b car 3, backlog cb78818d):
+    /// a step whose materialised metadata carries the agent block's
+    /// `agent_model` beside its `authority_role` is nominated to the
+    /// registered agent whose row holds that role and runs that model —
+    /// the same `(role, model)` the station projection gates on — and
+    /// to nobody else. In every direction it must NOT fire: a decision,
+    /// a non-real packet, a step with no block, a role the agent does not
+    /// hold, a model the agent does not run, a person of the right role
+    /// (people run no model). The env executor stays the FALLBACK, read
+    /// only when this pick names nobody — which on the live registry it
+    /// does today: agent-claude's row holds `engineering-agent` while
+    /// every agent block sits under `platform-admin`, so prod keeps
+    /// nominating claude@algedonic.dev through BOSS_DISPATCH_EXECUTOR_*
+    /// until the row holds the role (measured 2026-09-18).
+    #[test]
+    fn a_step_with_an_agent_block_is_nominated_by_capability_match() {
+        let agent = |id: &str, role: &str, model: &str| super::Employee {
+            id: id.into(),
+            role: role.into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![model.into()],
+        };
+        let mut roster = partition_roster();
+        roster.push(agent("agent-zed", "platform-admin", "opus-5[1m]"));
+        roster.push(agent("agent-claude", "platform-admin", "opus-5[1m]"));
+        roster.push(agent("agent-haiku", "platform-admin", "haiku-4-5"));
+        roster.push(agent("agent-eng", "engineering-agent", "opus-5[1m]"));
+        let platform = ["platform-admin"];
+        let pick = |partition, decision, roles: &[&str], model: Option<&str>| {
+            capability_executor(partition, decision, roles, model, &roster)
+        };
+        // The case the rule exists for — and the lowest id wins, so the
+        // pick is deterministic across a roster of equals.
+        assert_eq!(
+            pick(Partition::Real, false, &platform, Some("opus-5[1m]")),
+            Some("agent-claude".to_string())
+        );
+        assert_eq!(
+            pick(Partition::Real, false, &platform, Some("haiku-4-5")),
+            Some("agent-haiku".to_string())
+        );
+        // A model no platform-admin agent runs: nobody, so the env
+        // fallback decides.
+        assert_eq!(
+            pick(Partition::Real, false, &platform, Some("sonnet-4-5")),
+            None
+        );
+        // A role the agents do not hold: nobody, even on the right model.
+        assert_eq!(
+            pick(Partition::Real, false, &["bookkeeper"], Some("opus-5[1m]")),
+            None
+        );
+        // No block on the step: this pick says nothing.
+        assert_eq!(pick(Partition::Real, false, &platform, None), None);
+        // A decision, or a packet that is not real: never.
+        assert_eq!(
+            pick(Partition::Real, true, &platform, Some("opus-5[1m]")),
+            None
+        );
+        assert_eq!(
+            pick(Partition::Simulated, false, &platform, Some("opus-5[1m]")),
+            None
+        );
+        // The people of the role are not candidates here: emp-agent and
+        // emp-david hold platform-admin and run no model.
+        let people_only = partition_roster();
+        assert_eq!(
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5[1m]"),
+                &people_only
+            ),
+            None
+        );
+        // An inactive agent is not nominated.
+        let mut retired = roster.clone();
+        for e in retired.iter_mut().filter(|e| e.is_agent) {
+            e.status = "inactive".into();
+        }
+        assert_eq!(
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5[1m]"),
+                &retired
+            ),
+            None
+        );
     }
 
     /// The owner-routing pick (be264fa2), in every direction it must and
@@ -1061,6 +1462,8 @@ mod tests {
             id: id.into(),
             role: role.into(),
             status: status.into(),
+            is_agent: false,
+            models: vec![],
         };
         let roster = vec![
             emp("emp-david", "platform-admin", "active"),
@@ -1068,41 +1471,88 @@ mod tests {
             emp("emp-brewer", "brewer", "active"),
         ];
         let admin = ["platform-admin"];
-        assert!(is_active_holder(&roster, "emp-david", &admin, false));
-        assert!(!is_active_holder(&roster, "emp-gone", &admin, false)); // inactive
-        assert!(!is_active_holder(&roster, "emp-brewer", &admin, false)); // wrong role
-        assert!(!is_active_holder(&roster, "emp-ghost", &admin, false)); // not on roster
-        assert!(!is_active_holder(&roster, "emp-david", &[], false)); // no candidate roles
+        assert!(is_active_holder(
+            &roster,
+            "emp-david",
+            &admin,
+            Partition::Real
+        ));
+        assert!(!is_active_holder(
+            &roster,
+            "emp-gone",
+            &admin,
+            Partition::Real
+        )); // inactive
+        assert!(!is_active_holder(
+            &roster,
+            "emp-brewer",
+            &admin,
+            Partition::Real
+        )); // wrong role
+        assert!(!is_active_holder(
+            &roster,
+            "emp-ghost",
+            &admin,
+            Partition::Real
+        )); // not on roster
+        assert!(!is_active_holder(
+            &roster,
+            "emp-david",
+            &[],
+            Partition::Real
+        )); // no candidate roles
     }
 
-    /// The assignment-side sim boundary predicate mirrors the workforce's
-    /// `row_is_simulated` EXACTLY: only a literal `_simulated: true` reads
-    /// as simulated; absent, null, false, or a mis-typed value all read
-    /// as REAL. See `event_is_simulated` for why the mirror direction is
-    /// load-bearing (the two halves must agree on which side an ambiguous
-    /// packet falls, or it becomes workable by nobody).
+    /// The assignment-side partition predicate mirrors the workforce's
+    /// `row_partition` EXACTLY: `_partition` when present, else only a
+    /// literal `_simulated: true` reads as simulated; absent, null,
+    /// false, or a mis-typed value all read as REAL. See
+    /// `event_partition` for why the mirror direction is load-bearing
+    /// (the two halves must agree on which side an ambiguous packet
+    /// falls, or it becomes workable by nobody).
     #[test]
     fn the_assignment_boundary_fails_closed_on_shape() {
         use serde_json::json;
-        assert!(event_is_simulated(&json!({"_simulated": true})));
-        assert!(!event_is_simulated(&json!({"_simulated": false})));
-        assert!(!event_is_simulated(&json!({})), "absent means real");
-        assert!(!event_is_simulated(&json!({"_simulated": null})));
-        assert!(
-            !event_is_simulated(&json!({"_simulated": "true"})),
+        assert_eq!(
+            event_partition(&json!({"_simulated": true})),
+            Partition::Simulated
+        );
+        assert_eq!(
+            event_partition(&json!({"_partition": "shadow", "_simulated": true})),
+            Partition::Shadow
+        );
+        assert_eq!(
+            event_partition(&json!({"_simulated": false})),
+            Partition::Real
+        );
+        assert_eq!(
+            event_partition(&json!({})),
+            Partition::Real,
+            "absent means real"
+        );
+        assert_eq!(
+            event_partition(&json!({"_simulated": null})),
+            Partition::Real
+        );
+        assert_eq!(
+            event_partition(&json!({"_simulated": "true"})),
+            Partition::Real,
             "a string is not a claim - fail closed on shape too"
         );
     }
 
-    /// The partition rule itself: only the (simulated, operator-role)
-    /// pair is refused. Real packets reach operators; sim packets reach
-    /// every non-operator role.
+    /// The partition rule itself: only the (not-real, operator-role)
+    /// pair is refused. Real packets reach operators; sim AND shadow
+    /// packets reach every non-operator role and never an operator —
+    /// shadow fails closed exactly as simulated does (508cc38c).
     #[test]
-    fn the_partition_refuses_exactly_sim_cross_operator() {
-        assert!(!partition_permits(true, "platform-admin"));
-        assert!(partition_permits(false, "platform-admin"));
-        assert!(partition_permits(true, "brewer"));
-        assert!(partition_permits(false, "brewer"));
+    fn the_partition_refuses_exactly_not_real_cross_operator() {
+        assert!(!partition_permits(Partition::Simulated, "platform-admin"));
+        assert!(!partition_permits(Partition::Shadow, "platform-admin"));
+        assert!(partition_permits(Partition::Real, "platform-admin"));
+        assert!(partition_permits(Partition::Simulated, "brewer"));
+        assert!(partition_permits(Partition::Shadow, "brewer"));
+        assert!(partition_permits(Partition::Real, "brewer"));
     }
 
     fn partition_roster() -> Vec<super::Employee> {
@@ -1110,6 +1560,8 @@ mod tests {
             id: id.into(),
             role: role.into(),
             status: status.into(),
+            is_agent: false,
+            models: vec![],
         };
         vec![
             emp("emp-aa-100", "brewer", "active"),
@@ -1129,17 +1581,28 @@ mod tests {
         let ids = |v: Vec<&super::Employee>| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
         // The exact probe shape: authority_role=platform-admin, sim event.
         assert!(
-            eligible_candidates(&roster, Some("platform-admin"), true).is_empty(),
+            eligible_candidates(&roster, Some("platform-admin"), Partition::Simulated, false)
+                .is_empty(),
             "sim packets must never route to operator identities"
         );
         // Unconstrained sim steps still reach the sim-workable roster.
         assert_eq!(
-            ids(eligible_candidates(&roster, None, true)),
+            ids(eligible_candidates(
+                &roster,
+                None,
+                Partition::Simulated,
+                false
+            )),
             vec!["emp-aa-100"]
         );
         // Non-operator roles are untouched by the partition.
         assert_eq!(
-            ids(eligible_candidates(&roster, Some("brewer"), true)),
+            ids(eligible_candidates(
+                &roster,
+                Some("brewer"),
+                Partition::Simulated,
+                false
+            )),
             vec!["emp-aa-100"]
         );
         // And a sim OWNER who is an operator is no longer an active
@@ -1149,8 +1612,202 @@ mod tests {
             &roster,
             "emp-david",
             &["platform-admin"],
-            true
+            Partition::Simulated
         ));
+        // The shadow lane closes the same doors (508cc38c).
+        assert!(
+            eligible_candidates(&roster, Some("platform-admin"), Partition::Shadow, false)
+                .is_empty(),
+            "shadow packets must never route to operator identities"
+        );
+        assert_eq!(
+            ids(eligible_candidates(&roster, None, Partition::Shadow, false)),
+            vec!["emp-aa-100"]
+        );
+        assert!(!is_active_holder(
+            &roster,
+            "emp-david",
+            &["platform-admin"],
+            Partition::Shadow
+        ));
+    }
+
+    /// Backlog ab192a9f: a step whose audience is a role resolves to
+    /// the HOLDERS of the role, and a registered agent that holds it is
+    /// one. Until this the roster was the employees table alone, so a
+    /// role only an agent held nominated nobody (NAK, then dead-letter)
+    /// and an agent was reachable by id only. The agent joins the pool
+    /// under the executor's own three guards (`executor_for`): a REAL
+    /// packet, an EXECUTABLE (not decision-shaped) step, and a role it
+    /// holds — never the unconstrained pool, never a verdict, never a
+    /// sim or shadow packet.
+    #[test]
+    fn a_role_audience_nominates_an_agent_that_holds_the_role_when_no_employee_does() {
+        let agent = |id: &str, role: &str| super::Employee {
+            id: id.into(),
+            role: role.into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![],
+        };
+        let mut roster = partition_roster();
+        roster.push(agent("agent-claude", "engineering-agent"));
+        let ids = |v: Vec<&super::Employee>| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        // No employee holds engineering-agent: the agent is the holder.
+        assert_eq!(
+            ids(eligible_candidates(
+                &roster,
+                Some("engineering-agent"),
+                Partition::Real,
+                false
+            )),
+            vec!["agent-claude"]
+        );
+        // A verdict still goes to a person — and here there is none.
+        assert!(
+            eligible_candidates(&roster, Some("engineering-agent"), Partition::Real, true)
+                .is_empty(),
+            "a decision-shaped step is never nominated to an agent"
+        );
+        // A packet that is not real never enters a real actor's queue.
+        for not_real in [Partition::Simulated, Partition::Shadow] {
+            assert!(
+                eligible_candidates(&roster, Some("engineering-agent"), not_real, false).is_empty(),
+                "{not_real} must not reach a registered agent"
+            );
+        }
+        // The unconstrained pool is people, as before.
+        assert_eq!(
+            ids(eligible_candidates(&roster, None, Partition::Real, false)),
+            vec!["emp-aa-100", "emp-agent", "emp-david"]
+        );
+        // A role both hold: both, in stable id order, so the spread
+        // pick stays deterministic over the union.
+        roster.push(agent("agent-scout", "platform-admin"));
+        assert_eq!(
+            ids(eligible_candidates(
+                &roster,
+                Some("platform-admin"),
+                Partition::Real,
+                false
+            )),
+            vec!["agent-scout", "emp-agent", "emp-david"]
+        );
+        // The owner check reads people only: an agent never owns a
+        // packet (owner_resolution refuses automation-shaped owners).
+        assert!(!is_active_holder(
+            &roster,
+            "agent-claude",
+            &["engineering-agent"],
+            Partition::Real
+        ));
+    }
+
+    /// THE EXECUTOR LANE NOMINATES THE REGISTERED ID (backlog d7fef617).
+    /// Measured 2026-09-19 00:50Z: the lane wrote the raw env value
+    /// `claude@algedonic.dev` as assignee_id while the jobs API's login
+    /// door signs that same actor's claim as `agent-claude`, so the
+    /// claim CAS refused the holder to itself (409, holder = the alias).
+    /// The rule, pure over the alias map folded from the registry's
+    /// rows: an alias resolves to the agent that lists it — whether or
+    /// not that agent holds a role, since a login is not a roster fact
+    /// — and a registered id or an id the registry does not know passes
+    /// through unchanged.
+    #[test]
+    fn the_env_executor_resolves_through_the_registry_aliases() {
+        let agent = |id: &str, role: Option<&str>, aliases: &[&str]| boss_jobs::agents::AgentRow {
+            id: id.into(),
+            display_name: id.into(),
+            default_model: "opus-5[1m]".into(),
+            role: role.map(str::to_string),
+            department: None,
+            hourly_budget_usd_micros: None,
+            max_concurrent_runs: None,
+            aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        };
+        let aliases = super::alias_map(&[
+            agent(
+                "agent-claude",
+                Some("engineering-agent"),
+                &["claude@algedonic.dev"],
+            ),
+            agent("agent-mute", None, &["mute@algedonic.dev"]),
+        ]);
+        // An alias resolves — the packet's exact pair.
+        assert_eq!(
+            super::canonical_executor("claude@algedonic.dev", &aliases),
+            "agent-claude"
+        );
+        // A role-less agent's login resolves too: the roster would not
+        // list it, the alias relation does.
+        assert_eq!(
+            super::canonical_executor("mute@algedonic.dev", &aliases),
+            "agent-mute"
+        );
+        // A registered id passes through.
+        assert_eq!(
+            super::canonical_executor("agent-claude", &aliases),
+            "agent-claude"
+        );
+        // An id the registry does not know passes through unchanged —
+        // this lane never invents an identity.
+        assert_eq!(
+            super::canonical_executor("nobody@example.test", &aliases),
+            "nobody@example.test"
+        );
+        assert_eq!(
+            super::canonical_executor("emp-david", &aliases),
+            "emp-david"
+        );
+        // No registry rows at all: every spelling passes through.
+        let none = super::alias_map(&[]);
+        assert_eq!(
+            super::canonical_executor("claude@algedonic.dev", &none),
+            "claude@algedonic.dev"
+        );
+    }
+
+    /// The roster union, pure: an agent row with a role becomes a
+    /// holder of that role; one without a role is not on the roster at
+    /// all (reachable by id only), and every employee rides through
+    /// untouched.
+    #[test]
+    fn the_roster_is_employees_and_the_agents_that_hold_a_role() {
+        let agent = |id: &str, role: Option<&str>| boss_jobs::agents::AgentRow {
+            id: id.into(),
+            display_name: id.into(),
+            default_model: "opus-5[1m]".into(),
+            role: role.map(str::to_string),
+            department: None,
+            hourly_budget_usd_micros: None,
+            max_concurrent_runs: None,
+            aliases: vec![],
+        };
+        let roster = roster_union(
+            partition_roster(),
+            vec![
+                agent("agent-claude", Some("engineering-agent")),
+                agent("agent-mute", None),
+            ],
+        );
+        let rows: Vec<(&str, bool)> = roster.iter().map(|e| (e.id.as_str(), e.is_agent)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("emp-aa-100", false),
+                ("emp-agent", false),
+                ("emp-david", false),
+                ("agent-claude", true),
+            ]
+        );
+        assert_eq!(roster[3].role, "engineering-agent");
+        assert_eq!(roster[3].status, "active");
+        assert_eq!(
+            roster[3].models,
+            vec!["opus-5[1m]".to_string()],
+            "the agent's default_model is the capability the executor pick matches"
+        );
+        assert!(roster[0].models.is_empty(), "a person runs no model");
     }
 
     /// REAL packets are byte-for-byte unaffected: same candidates, same
@@ -1160,47 +1817,137 @@ mod tests {
         let roster = partition_roster();
         let ids = |v: Vec<&super::Employee>| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
         assert_eq!(
-            ids(eligible_candidates(&roster, Some("platform-admin"), false)),
+            ids(eligible_candidates(
+                &roster,
+                Some("platform-admin"),
+                Partition::Real,
+                false
+            )),
             vec!["emp-agent", "emp-david"]
         );
         assert_eq!(
-            ids(eligible_candidates(&roster, None, false)),
+            ids(eligible_candidates(&roster, None, Partition::Real, false)),
             vec!["emp-aa-100", "emp-agent", "emp-david"]
         );
         assert!(is_active_holder(
             &roster,
             "emp-david",
             &["platform-admin"],
-            false
+            Partition::Real
         ));
     }
 
     /// The executor is a REAL registered agent (a deployment fact, not a
     /// sim identity): a simulated packet never routes to it, even when
-    /// the step is executable and the role matches.
+    /// the step is executable and the role matches — and neither does a
+    /// shadow one (508cc38c: every door simulated closes, shadow closes).
     #[test]
     fn a_sim_packet_never_reaches_the_executor() {
         let platform = ["platform-admin"];
-        assert_eq!(
-            executor_for(
-                true,
-                false,
-                Some("claude@algedonic.dev"),
-                Some("platform-admin"),
-                &platform
-            ),
-            None
-        );
+        for not_real in [Partition::Simulated, Partition::Shadow] {
+            assert_eq!(
+                executor_for(
+                    not_real,
+                    false,
+                    Some("claude@algedonic.dev"),
+                    Some("platform-admin"),
+                    &platform
+                ),
+                None,
+                "{not_real} must not reach the executor"
+            );
+        }
         // Real packets keep the executor path exactly as before.
         assert_eq!(
             executor_for(
-                false,
+                Partition::Real,
                 false,
                 Some("claude@algedonic.dev"),
                 Some("platform-admin"),
                 &platform
             ),
             Some("claude@algedonic.dev".to_string())
+        );
+    }
+
+    /// The `run` step of a maintenance chore, materialised from the
+    /// platform bundle exactly as `POST /api/jobs` does and serialised
+    /// the way `STEP_CREATED` carries it — so what this reads is what
+    /// `handle_event` reads. Named for the chore family on purpose: the
+    /// pr-train car (af796788) carries its own helper for the train.
+    fn bundled_chore_run_step(kind: &str) -> super::StepEventPayload {
+        use boss_core::job::{JobId, StepId, Subject};
+        let spec =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .find(|w| w.kind == kind)
+                .unwrap_or_else(|| panic!("{kind} ships in the platform bundle"));
+        let subject = Subject::new("custom", "maintenance/2026-09-18");
+        let run = boss_jobs::registry::materialize_steps(
+            &spec,
+            &subject,
+            JobId::new(),
+            &serde_json::Value::Object(Default::default()),
+            StepId::new,
+        )
+        .into_iter()
+        .find(|s| s.spec_slug.as_deref() == Some("run"))
+        .unwrap_or_else(|| panic!("{kind} has a `run` step"));
+        serde_json::from_value(boss_jobs::events::step_state_payload(&run))
+            .expect("a serialised Step is a StepEventPayload")
+    }
+
+    /// A chore's `run` step nominates nobody — it is born its
+    /// automation's (backlog 4f909642, the pr-train's af796788 applied
+    /// to the chores). Measured 2026-09-18 on every closed
+    /// `maintenance-*` packet the system of record listed: each `run`
+    /// arrived with `authority_role = platform-admin` and no assignee,
+    /// so the executes-lane handed it to the agent alias and
+    /// `automation:boss-step` completed it over the agent's head —
+    /// every five minutes for the estate observer. The bundle now
+    /// declares the completing actor as the step's audience, so the
+    /// step is born placed and the guard at the top of `handle_event`
+    /// (assignee already set) passes it over before any pick. The
+    /// executes-lane itself is unchanged: handed the role the step used
+    /// to carry, it still names the executor.
+    #[test]
+    fn a_chores_run_step_nominates_nobody() {
+        for (kind, actor) in [
+            ("maintenance-backup", "automation:boss-step"),
+            ("maintenance-estate-observe-units", "automation:boss-step"),
+            (
+                "maintenance-dev-scratch-reclaim",
+                "automation:dev-scratch-reclaim",
+            ),
+        ] {
+            let run = bundled_chore_run_step(kind);
+            assert_eq!(
+                run.assignee_id.as_deref(),
+                Some(actor),
+                "{kind}: `run` is born placed with the actor that completes it, so the \
+                 dispatcher never reaches a pick for it"
+            );
+            assert!(
+                run.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("authority_role"))
+                    .is_none(),
+                "{kind}: `run` carries no role for the role arm to list"
+            );
+        }
+        // The control: the shape the chores USED to arrive in — the
+        // role and no assignee — is exactly what the lane nominates.
+        assert_eq!(
+            executor_for(
+                Partition::Real,
+                false,
+                Some("claude@algedonic.dev"),
+                Some("platform-admin"),
+                &["platform-admin"]
+            )
+            .as_deref(),
+            Some("claude@algedonic.dev")
         );
     }
 
@@ -1315,5 +2062,107 @@ mod tests {
                 "a single-holder role must pick index 0 under {strategy:?}"
             );
         }
+    }
+
+    /// The step payloads the jobs API publishes for a freshly opened
+    /// packet of `kind`, materialised from the platform bundle exactly
+    /// as `POST /api/jobs` does and serialised the way `STEP_CREATED`
+    /// carries them — so what this test reads is what `handle_event`
+    /// reads.
+    fn bundled_packet_steps(kind: &str) -> Vec<(String, StepEventPayload)> {
+        use boss_core::job::{JobId, StepId, Subject};
+        let spec =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .find(|w| w.kind == kind)
+                .unwrap_or_else(|| panic!("{kind} ships in the platform bundle"));
+        let subject = Subject::new("custom", "train/20260918-1141");
+        boss_jobs::registry::materialize_steps(
+            &spec,
+            &subject,
+            JobId::new(),
+            &serde_json::Value::Object(Default::default()),
+            StepId::new,
+        )
+        .into_iter()
+        .map(|step| {
+            let slug = step.spec_slug.clone().expect("a bundled step has a slug");
+            let payload = serde_json::from_value(boss_jobs::events::step_state_payload(&step))
+                .expect("a serialised Step is a StepEventPayload");
+            (slug, payload)
+        })
+        .collect()
+    }
+
+    /// The deployment's executes-lane (`infra/cluster/manifests/boss.yaml`):
+    /// the agent alias, executing for `platform-admin`.
+    const EXECUTOR: &str = "claude@algedonic.dev";
+    const EXECUTOR_ROLES: &str = "platform-admin";
+
+    /// A train's steps nominate nobody — they are born the conductor's
+    /// (backlog af796788). Measured 2026-09-18 on three consecutive
+    /// pr-trains: every task step arrived with `authority_role =
+    /// platform-admin` and no assignee, so the executes-lane below
+    /// handed all seven to the agent alias and the conductor completed
+    /// them over its head. The bundle now declares the conductor as
+    /// each step's audience, so the step is born placed and the
+    /// dispatcher's first guard passes it over — while a genuine
+    /// agent-executable step (a backlog item's `build`) still reaches
+    /// the executor through the same lane.
+    #[test]
+    fn the_conductors_train_steps_nominate_nobody() {
+        let train = bundled_packet_steps("pr-train");
+        let conductors = [
+            "collect",
+            "assemble",
+            "pr",
+            "ci",
+            "merged",
+            "deployed",
+            "converged",
+        ];
+        for slug in conductors {
+            let (_, step) = train
+                .iter()
+                .find(|(s, _)| s == slug)
+                .unwrap_or_else(|| panic!("the train has a `{slug}` step"));
+            assert!(
+                born_placed(step),
+                "`{slug}` is born placed, so the dispatcher never reaches a pick for it"
+            );
+            assert_eq!(
+                step.assignee_id.as_deref(),
+                Some("automation:train-conductor"),
+                "`{slug}` is the conductor's, not the executor's"
+            );
+        }
+
+        // The control: a step the agent genuinely executes is still
+        // unplaced at birth, carries its role, and the lane names the
+        // executor for it — the fix narrowed nothing but the train.
+        let backlog = bundled_packet_steps("backlog-item");
+        let (_, build) = backlog
+            .iter()
+            .find(|(s, _)| s == "build")
+            .expect("a backlog item has a `build` step");
+        assert!(!born_placed(build), "a build step waits for a nomination");
+        let role = build
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("authority_role"))
+            .and_then(|v| v.as_str())
+            .expect("a build step carries its role");
+        assert_eq!(
+            executor_for(
+                Partition::Real,
+                false,
+                Some(EXECUTOR),
+                Some(EXECUTOR_ROLES),
+                &[role]
+            )
+            .as_deref(),
+            Some(EXECUTOR)
+        );
     }
 }

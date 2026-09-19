@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# boss-api METHOD /api/path [body.json] — the door to the system of record.
+#
+# The curl wrapper every session, probe and builder uses to read and
+# write the jobs API (CLAUDE.md §Doors): pinned base URL, the session's
+# actor in X-Boss-User, the machine token when one is mounted, invoked
+# BARE so it stays inside a permission allowlist. Body -> stdout, HTTP
+# code -> stderr as one `HTTP:<code>` line, non-2xx exits 1 so drivers
+# fail loudly (boss-driving-the-jobs-api item 1).
+#
+# Why it lives HERE and not only on the pod (backlog 0d8d7a90,
+# 2026-09-14): until then it was pod-local text under /work/tools/bin
+# that no gate read and no car shipped — a fresh pod, a second builder
+# host, or a builder pod (design 90a14acc) would not have had it, and
+# CLAUDE.md documented a door the tree could not reproduce. Same shape
+# as wt-cargo (34b29b52, #364): the pod file was the spec, and the
+# pod's /work/tools/bin/boss-api becomes a symlink to this file in the
+# operator's checkout. Pinned by
+# crates/core/boss-testing/tests/boss_api_sh.rs against a stub curl.
+#
+# Who a call signs as follows the boss CLI's rule
+# (crates/orchestrators/boss-cli/src/identity.rs, backlog 5083d6f5):
+# BOSS_ACTOR, else the actor file, else NOBODY — and nobody is loud. A
+# WRITE with no actor is refused, naming both fixes; a READ, which
+# attributes nothing, goes out marked operator:unidentified and says so
+# once on stderr. Until 2026-09-14 (backlog 416d503c) the pod copy fell
+# back to a fixed id instead, so a builder pod or a fresh session with
+# no actor file wrote history as the operator's agent identity — two
+# doors to one system of record with two provenance rules.
+#
+# The base URL, when BOSS_JOBS_URL does not name one, is the one line
+# in `sor-url` beside this script — the ONE spelling of the
+# system-of-record address in infra/dev (CLAUDE.md §9a). The boss shim
+# (feat/the-boss-shim-lives-in-the-tree, parked as of 2026-09-14) is
+# to read the same file when it lands; until then the pod's
+# /work/tools/bin/boss still carries its own spelling.
+#
+# WHICH PORT — the path decides (backlog de0989d2, measured 2026-09-17
+# 14:50Z). The system of record is several services on one LAN IP
+# (design 28d2bed9, boss-jobs-internal.yaml), and this door sent every
+# path to the jobs port — so `POST /api/people/accounts`, the account
+# the first real sponsorship's reconcile step needs, which
+# boss-accounts serves on 7550, could not be made through any door: the
+# forge's reader is GET-only by design and this one could not route.
+# Now the SERVICE comes from the ONE route table both doors source
+# (../forge/probe-bin/sor-routes.sh, `sor_service_for_path`) and the
+# PORT from a `name=port` table: BOSS_SOR_PORTS when set, else
+# ../forge/sor-ports.env read as data from beside this file — the same
+# file the forge's unattended prove door hands its reader, pinned to
+# boss-ports by the_machine_door_carries_every_read_surface.rs. The host
+# is kept; only the port moves. Absent both tables nothing is routed
+# (the door as it was); a table that lacks the routed service is
+# refused before curl, because a 404 from the wrong port is the defect
+# this removes, not a fallback.
+#
+# The pod-specific constants are env-overridable:
+#   BOSS_JOBS_URL            the base URL; else the line in ./sor-url
+#   BOSS_SOR_PORTS           `name=port …`; else ../forge/sor-ports.env
+#   BOSS_ACTOR               who the call signs as — the id; else the one
+#   BOSS_ACTOR_FILE            line in this file ($HOME/.config/boss/actor,
+#                              as the boss CLI reads it)
+#   BOSS_MACHINE_TOKEN_FILE  the machine token, sent only when it exists
+set -euo pipefail
+
+METHOD=${1:-}; API_PATH=${2:-}; BODY=${3:-}
+case "$METHOD" in
+  GET|POST|PUT|PATCH|DELETE) ;;
+  *) echo "usage: boss-api GET|POST|PUT|PATCH|DELETE /api/path [body.json]" >&2; exit 2 ;;
+esac
+[ -n "$API_PATH" ] || { echo "usage: boss-api GET|POST|PUT|PATCH|DELETE /api/path [body.json]" >&2; exit 2; }
+
+# readlink -f: the pod invokes this through a symlink, and sor-url sits
+# beside the FILE, not the link.
+HERE="$(dirname "$(readlink -f "$0")")"
+SOR_URL_FILE="$HERE/sor-url"
+BASE=${BOSS_JOBS_URL:-$(head -n1 "$SOR_URL_FILE" 2>/dev/null || true)}
+[ -n "$BASE" ] || {
+  echo "boss-api: BOSS_JOBS_URL is unset and $SOR_URL_FILE names no system of record — a copy of this script without its sor-url has no default" >&2
+  exit 2
+}
+
+# The port table: BOSS_SOR_PORTS, else the forge's env file read as
+# data (`#` and blank lines dropped, one space-separated line) the way
+# boss prove --unattended reads it. Absent both, nothing below routes.
+SOR_PORTS_FILE="$HERE/../forge/sor-ports.env"
+SOR_PORTS=${BOSS_SOR_PORTS:-}; SOR_PORTS_FROM=BOSS_SOR_PORTS
+if [ -z "$SOR_PORTS" ] && [ -r "$SOR_PORTS_FILE" ]; then
+  SOR_PORTS=$(grep -Ev '^[[:space:]]*(#|$)' "$SOR_PORTS_FILE" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//' || true)
+  SOR_PORTS_FROM=$SOR_PORTS_FILE
+fi
+if [ -n "$SOR_PORTS" ]; then
+  SOR_ROUTES="$HERE/../forge/probe-bin/sor-routes.sh"
+  [ -r "$SOR_ROUTES" ] || {
+    echo "boss-api: a port table is set ($SOR_PORTS_FROM) but $SOR_ROUTES is missing — a copy of this script without the route table cannot say which port $API_PATH belongs to" >&2
+    exit 2
+  }
+  # shellcheck source=../forge/probe-bin/sor-routes.sh
+  . "$SOR_ROUTES"
+  SERVICE=$(sor_service_for_path "$API_PATH")
+  if [ "$SERVICE" != jobs ]; then
+    PORT=$(sor_port_for_service "$SERVICE" "$SOR_PORTS") || {
+      echo "boss-api: refusing $METHOD $API_PATH: it is served by $SERVICE, and the port table names no port for it (table: '$SOR_PORTS', from $SOR_PORTS_FROM). Sending it to the jobs port would answer 404 about a surface that exists — refusing rather than guessing." >&2
+      exit 2
+    }
+    BASE=$(sor_base_on_port "$BASE" "$PORT")
+  fi
+fi
+
+# Blank and whitespace-only values are NOT answers (identity.rs): an
+# `export BOSS_ACTOR=` or an empty file falls through, never signs as "".
+ACTOR_FILE=${BOSS_ACTOR_FILE:-$HOME/.config/boss/actor}
+ACTOR_ID=$(printf '%s' "${BOSS_ACTOR:-}" | tr -d '[:space:]')
+[ -n "$ACTOR_ID" ] || ACTOR_ID=$(head -n1 "$ACTOR_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+if [ -z "$ACTOR_ID" ]; then
+  case "$METHOD" in
+    GET)
+      ACTOR_ID=operator:unidentified
+      echo "boss-api: nothing names the actor running this command — reading as \`$ACTOR_ID\`. Writes will be refused until \`BOSS_ACTOR\` (or the actor file) names you." >&2
+      ;;
+    *)
+      # The CLI's refusal, with the identity THIS door used to fall back
+      # to in place of the conductor, so a reader tells it apart from a
+      # policy denial.
+      echo "boss-api: refusing to sign $METHOD $API_PATH: nothing names the actor running this command, and signing it as \`claude@algedonic.dev\` would credit the operator's agent identity with your act (backlog 416d503c). Name yourself with \`export BOSS_ACTOR=<your id>\` or by writing that id into $ACTOR_FILE." >&2
+      exit 2
+      ;;
+  esac
+fi
+ACTOR='{"id":"'"$ACTOR_ID"'","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":null}'
+
+args=( -sS -X "$METHOD" -H 'Content-Type: application/json' -H "X-Boss-User: $ACTOR" -w '\n%{http_code}' )
+TOK=$(cat "${BOSS_MACHINE_TOKEN_FILE:-/etc/boss/machine-token}" 2>/dev/null || true)
+[ -n "$TOK" ] && args+=( -H "X-Boss-Machine-Token: $TOK" )
+[ -n "$BODY" ] && args+=( --data-binary "@$BODY" )
+
+out=$(curl "${args[@]}" "$BASE$API_PATH")
+code=${out##*$'\n'}
+body=${out%"$code"}
+printf '%s' "$body"
+printf 'HTTP:%s\n' "$code" >&2
+case "$code" in 2*) exit 0 ;; *) exit 1 ;; esac

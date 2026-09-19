@@ -113,6 +113,7 @@ fn build_app() -> (Router, Arc<InMemoryJobs>) {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -161,7 +162,7 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
         closed_on: None,
         metadata: serde_json::json!({}),
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     };
     jobs.create_job(&job).await.unwrap();
     jobs.add_step(&step(

@@ -3,13 +3,14 @@
 # `infra/oss-quickstart/docker-compose.yml`.
 #
 # Multi-stage:
-#   1. rust-base   — toolchain + build deps + cargo-chef.
-#   2. planner     — cargo-chef recipe (the dependency build plan).
-#   3. rust-build  — cook the dep tree (a cacheable layer), then
-#                    compile the workspace in release mode.
-#   4. spa-build   — bun install + bun run build for BOTH SPAs
+#   1. rust-base   — toolchain + build deps.
+#   2. rust-build  — compile the workspace in release mode, cargo's
+#                    target and registry kept in BuildKit cache mounts
+#                    between builds.
+#   3. spa-build   — bun install + bun run build for BOTH SPAs
 #                    (apps/web and apps/simulator).
-#   5. runtime     — debian:slim with the binaries + SPAs copied in.
+#   4. runtime     — debian:slim with the binaries + SPAs copied in,
+#                    and BOSS_BUILD_COMMIT set last.
 #
 # Image size: ~250 MB (binaries are stripped via `-C strip=symbols`
 # in the workspace Cargo.toml; SPA dist is gzipped by Caddy).
@@ -18,19 +19,36 @@
 # `build.context: ../..` so the entire workspace is available.
 
 # ---------------------------------------------------------------------------
-# Stages 1–3 — Rust build, split so the dependency tree is a real,
-# cacheable image LAYER.
+# Stages 1–2 — Rust build, with the compiler's own cache kept between
+# builds.
 #
-# cargo-chef separates "compile the ~400-crate dependency tree"
-# (changes only when Cargo.lock / crate manifests change) from
-# "compile our own crates" (changes every commit). CI's remote layer
-# cache (--cache-to type=gha) can persist and restore LAYERS across
-# runs — but never RUN cache mounts, which live in local BuildKit
-# state and die with the runner. The previous cache-mount pattern was
-# therefore warm for local rebuilds and permanently cold in CI (~20
-# min of dep compilation every run). Baking the cook step into a
-# layer serves both: local rebuilds hit the local layer cache, CI
-# restores the same layer from the Actions cache.
+# THE BUILDER IS THE FORGE'S ROOTLESS BUILDKIT DAEMON, every train, and
+# `docker compose` on an operator's machine; nothing else builds this
+# file (CI's kaniko builds boss-ci, a different Dockerfile). Both keep
+# local BuildKit state between builds, so `RUN --mount=type=cache` is
+# warm where it runs — the reason it was once dropped for cargo-chef
+# (a GitHub Actions layer cache that could not carry mounts) no longer
+# applies, and the forge's converge stamps said what chef's layer was
+# costing: 2026-09-12, `build_s=522` for a train that changed no Rust.
+# Two causes, both fixed here:
+#
+#   - `ENV BOSS_BUILD_COMMIT` stood before `cargo build`, and
+#     `option_env!` baked it into boss-core — so a value that changes
+#     on every train recompiled every workspace crate on every train.
+#     It now lives in the runtime stage (the last lines of this file),
+#     read by the binaries from their environment: the image still
+#     names the tree it was built from, and the compiled layer is
+#     invalidated only by what it compiles.
+#   - nothing of one build's `target/` survived into the next, so even
+#     a one-crate change paid the whole workspace. The cache mounts
+#     below keep cargo's incremental state and the registry between
+#     builds; a cold or pruned cache costs one full build and nothing
+#     else (`docker builder prune` is the reset).
+#
+# WHAT THE CACHE DOES NOT CHANGE: the binaries copied to /out are what
+# `cargo build --release` produced for this tree, and the runtime stage
+# is rebuilt for every commit. A train without a Rust change ships the
+# identical binaries under a new commit, which is exactly what it is.
 # ---------------------------------------------------------------------------
 FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS rust-base
 
@@ -42,40 +60,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Version-pinned + --locked, same discipline as the digest-pinned
-# base images. Compiling chef costs ~1 min once; the layer keys only
-# on the base image + apt layer above, so every rebuild — local or
-# CI — reuses it until the toolchain image bumps.
-RUN cargo install cargo-chef --version 0.1.77 --locked
-
 WORKDIR /build
 
-# ---------------------------------------------------------------------------
-# Planner — compute recipe.json, the dependency build plan. Re-runs on
-# ANY source change (cheap: manifest analysis only), but its output is
-# byte-identical unless Cargo.toml / Cargo.lock content actually
-# changed — and the expensive cook layer below keys on recipe.json
-# CONTENT, so source-only commits leave the cooked deps cached.
-# ---------------------------------------------------------------------------
-FROM rust-base AS planner
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-RUN cargo chef prepare --recipe-path recipe.json
-
-# ---------------------------------------------------------------------------
-# Rust build — cook the dependency tree, then compile the workspace.
-# ---------------------------------------------------------------------------
 FROM rust-base AS rust-build
-
-COPY --from=planner /build/recipe.json recipe.json
-
-# Compile ONLY dependencies, against chef's stub skeleton of the
-# workspace. Flags must mirror the real build below — a mismatch
-# changes cargo's fingerprints and the deps silently recompile. The
-# two umbrella-feature bins built explicitly below (accounts-api /
-# events-api) may pull a few deps this pass misses; those compile in
-# the final step at seconds of cost, not the ~20-min tree.
-RUN cargo chef cook --release --workspace --features postgres --recipe-path recipe.json
 
 # The real source. .dockerignore excludes target/ and node_modules/
 # so only source goes into the build context.
@@ -107,25 +94,30 @@ COPY infra/postgres ./infra/postgres
 # Rust build layer every time a shell script moved.
 COPY infra/estate/observe-lib.sh ./infra/estate/observe-lib.sh
 COPY infra/forge/host-absent-tools.txt ./infra/forge/host-absent-tools.txt
-COPY infra/deploy-services.sh ./infra/deploy-services.sh
-COPY infra/forge/run-car-probe.sh ./infra/forge/run-car-probe.sh
+# boss-core `include_str!`s the tiers registry (ba429e7f). The runtime
+# stage copies all of infra/platform for the services to READ at run
+# time; that copy is a different stage and does not feed rustc here —
+# train #473 could not build its image for want of this one line while
+# the lint counted the runtime COPY as coverage (2026-09-19).
+COPY infra/platform/tiers.toml ./infra/platform/tiers.toml
+# `boss ops` compiles the ops allowlist in — the DIRECTORY of verb files
+# the host runner enforces (one per verb, 5086842d), listed by boss-cli's
+# build.rs; the terminal applies the same rules first.
+COPY infra/ops/verbs ./infra/ops/verbs
 
-# The commit this image is built from, exported to the cargo build so
-# `Capabilities` self-reports it from every service's health endpoint
-# (option_env! in boss-core). Declared AFTER the chef cook layer on
-# purpose: the arg changes every build, and placing it above would
-# invalidate the cached dependency tree each time. The train's
-# `converged` step reads this back from the RUNNING pod — the proof of
-# installation the arrival report now requires (fdff316c / 7e5ee013).
-ARG BOSS_BUILD_COMMIT=
-ENV BOSS_BUILD_COMMIT=$BOSS_BUILD_COMMIT
+# NO `ENV BOSS_BUILD_COMMIT` HERE — see the stage header; it is set in
+# the runtime stage so this layer keys on the sources alone.
 
 # Build every binary the runtime needs. --features postgres pulls in
 # the sqlx-backed adapters; the workspace builds in one cargo
-# invocation so dep compilation is shared across crates. The cooked
-# target/ from the layer above carries the finished dep artifacts, so
-# this step compiles workspace crates only.
-RUN set -eu && \
+# invocation so dep compilation is shared across crates. The three
+# mounts are cargo's state between builds: the target dir (incremental
+# compilation of deps and workspace alike), the registry (downloaded
+# crates) and git checkouts. They are not part of the image; /out is.
+RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
+    --mount=type=cache,id=boss-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=boss-cargo-git,target=/usr/local/cargo/git \
+    set -eu && \
     # Single cargo invocation across the whole workspace —
     # boss-brewery-sim builds by default (no feature gate), so it
     # rides the same --workspace --bins pass, sharing dep compilation.
@@ -152,10 +144,14 @@ RUN set -eu && \
         \( -name 'boss' -o -name 'boss-*' \) ! -name '*.d' \
         -exec cp {} /out/ \; && \
     test -x /out/boss-gateway || (echo "FATAL: boss-gateway missing in /out" >&2; ls /out >&2; exit 1) && \
-    test -x /out/boss-brewery-sim || (echo "FATAL: boss-brewery-sim missing in /out" >&2; ls /out >&2; exit 1)
+    # The brewery's engine is one tenant's binary, not the platform's
+    # (backlog 18d6a6c9, 2026-09-17): the launcher SKIPs it when absent
+    # and starts it only for a tenant that declares the sim. Said out
+    # loud, never fatal.
+    (test -x /out/boss-brewery-sim || echo "WARN: boss-brewery-sim missing in /out — the image ships without the brewery's engine" >&2)
 
 # ---------------------------------------------------------------------------
-# Stage 4 — SPA build.
+# Stage 3 — SPA build.
 # ---------------------------------------------------------------------------
 FROM oven/bun:1.3-debian@sha256:9dba1a1b43ce28c9d7931bfc4eb00feb63b0114720a0277a8f939ae4dfc9db6f AS spa-build
 
@@ -208,7 +204,7 @@ RUN cd apps/simulator && bun run build && \
     (echo "FATAL: apps/simulator built no dist/index.html" >&2; exit 1)
 
 # ---------------------------------------------------------------------------
-# Stage 5 — runtime.
+# Stage 4 — runtime.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
 
@@ -296,6 +292,14 @@ COPY infra/postgres /opt/boss/infra/postgres
 # MUST be available — seed-operator-baseline.sh reads this dir to POST
 # them to /api/people once the stack is up.
 COPY infra/operator-baseline /opt/boss/infra/operator-baseline
+# THE CONDUCTOR LAUNCHES GATES (design 128b5496): `boss gate` renders
+# infra/gate-runner/gate-runner.yaml and runs `kubectl create`, so the
+# image carries both. kubectl is copied from the alpine/k8s image the
+# converge runner already drives kubectl from — the mirrored tag
+# (infra/forge/mirror-base-images.sh), no public download, no sha to
+# hunt — and it is the version the cluster's own tooling runs.
+COPY --from=10.20.0.15:3000/david/alpine-k8s:1.33.3 /usr/bin/kubectl /usr/local/bin/kubectl
+COPY infra/gate-runner /opt/boss/infra/gate-runner
 # The platform Workflow bundle — protocols shipped as DATA
 # (protocols-as-data step 1). bootstrap-db.sh seeds it insert-if-
 # missing at ../platform/workflows/ relative to itself, and until
@@ -312,6 +316,11 @@ COPY infra/platform /opt/boss/infra/platform
 # /opt/boss/infra/dispatcher/rules/. Without this dir the rules runner
 # can't start and Jobs get assigned + worked but never close.
 COPY infra/dispatcher /opt/boss/infra/dispatcher
+# DNS zone declarations + their comparator (5e58922c). The dns.observe
+# handler runs `check-declared.sh --json` over the zone it fetched, so
+# the comparison has ONE definition — the script an operator runs by
+# hand — and the image must carry it; BOSS_DNS_DECLARATIONS names it.
+COPY infra/cluster/dns /opt/boss/infra/cluster/dns
 COPY examples /opt/boss/examples
 # `COPY docs /opt/boss/docs` stood here until 2026-09-10, and it was
 # load-bearing for one reader only: boss-docs-api ran with
@@ -330,9 +339,25 @@ COPY examples /opt/boss/examples
 # (/opt/boss/infra/...), so they need the execute bit.
 COPY infra/seed-operator-baseline.sh /opt/boss/infra/seed-operator-baseline.sh
 COPY infra/seed-brewery-tenant.sh /opt/boss/infra/seed-brewery-tenant.sh
+# The generic tenant seed (`boss tenant publish`, ee7b62bb): what
+# tenant-launch.sh runs for any tenant whose manifest is not the
+# brewery's. Pinned by crates/core/boss-testing/tests/
+# the_launcher_publishes_a_tenant_by_its_id.rs.
+COPY infra/seed-tenant.sh /opt/boss/infra/seed-tenant.sh
+# The estate declaration (`boss estate declare`, backlog ee368d0c): the
+# tree's machines, published on every start BEFORE the baseline and
+# the tenant — until 2026-09-18 they reached a database only as a
+# migration, so every fresh database booted declaring this LAN's
+# seven. The source is the one file the estate lives in.
+COPY infra/seed-estate.sh /opt/boss/infra/seed-estate.sh
+COPY infra/estate/estate.toml /opt/boss/infra/estate/estate.toml
 
 # Quickstart launcher + init scripts.
 COPY infra/oss-quickstart/init.sh /usr/local/bin/boss-init
+# boss-init's database name comes off DATABASE_URL through this helper
+# (2026-09-16, 063dba4e): the tree copy at /opt/boss is what init.sh
+# calls, by $REPO.
+COPY infra/oss-quickstart/database-from-url.sh /opt/boss/infra/oss-quickstart/database-from-url.sh
 COPY infra/oss-quickstart/services-launcher.sh /usr/local/bin/boss-launch
 # What the launcher SOURCES must land beside it: services-launcher.sh
 # reads tenant-launch.sh from its own directory, which in this image is
@@ -343,22 +368,47 @@ COPY infra/oss-quickstart/services-launcher.sh /usr/local/bin/boss-launch
 # (it never builds the image), so infra/lint/the-image-carries-what-
 # the-launcher-sources.sh pins this pairing instead.
 COPY infra/oss-quickstart/tenant-launch.sh /usr/local/bin/tenant-launch.sh
+COPY infra/oss-quickstart/tenant-modules.sh /usr/local/bin/tenant-modules.sh
 # The maintenance-packet wrap scripts, so in-cluster CronJob chores
 # (boss-search-reindex first) open and complete their packets the same
 # way the boss-gcp timers do — one script pair, both hosts (jq above
-# is theirs).
-COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh infra/boss-api-curl.sh /usr/local/bin/
+# is theirs) — and boss-chore.sh, the CronJob's ExecStopPost: it runs
+# the pair around a check and records ok AND failed (480e183c), and
+# finds the pair next to itself, which is why all four share this line.
+# crates/core/boss-testing/tests/a_chore_records_ok_and_failed.rs pins
+# the pairing; the gate never builds the image.
+COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh infra/boss-api-curl.sh infra/boss-chore.sh /usr/local/bin/
+# The platform's conservation-invariant sweep and the helper it sources,
+# for the hourly boss-conservation-invariants CronJob (H12, backlog
+# 236529aa) — the brewery's own sweep rides in with `COPY examples`
+# above. The gate never builds the image, so
+# crates/core/boss-testing/tests/conservation_invariants_sweep_the_sor.rs
+# pins this pairing to the path the manifest runs.
+COPY infra/lint/conservation-invariants.sh /opt/boss/infra/lint/conservation-invariants.sh
+COPY infra/lint/lib/conservation.sh /opt/boss/infra/lint/lib/conservation.sh
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
-RUN chmod +x /usr/local/bin/boss-init /usr/local/bin/boss-launch \
+RUN chmod +x /opt/boss/infra/oss-quickstart/database-from-url.sh /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \
     /opt/boss/infra/seed-operator-baseline.sh \
-    /opt/boss/infra/seed-brewery-tenant.sh
+    /opt/boss/infra/seed-brewery-tenant.sh \
+    /opt/boss/infra/seed-tenant.sh \
+    /opt/boss/infra/seed-estate.sh
 
 # /etc must be writable by the boss user so generate-configs can
 # write the per-service TOML files at container start. Default
 # debian permissions on /etc are root:root 0755, which the boss
 # user can't write to. Open it up; the container is ephemeral.
 RUN chmod 0777 /etc
+
+# The commit this image is built from, for every binary to read from
+# its environment: `Capabilities.commit` on each service's /health (the
+# train's `converged` step reads it back from the RUNNING pod — the
+# proof of installation the arrival report requires, fdff316c /
+# 7e5ee013) and `boss --version` / `boss orient` in the conductor.
+# LAST, on purpose: it changes every build, and everything above it is
+# cached by content.
+ARG BOSS_BUILD_COMMIT=
+ENV BOSS_BUILD_COMMIT=$BOSS_BUILD_COMMIT
 
 USER boss
 WORKDIR /home/boss

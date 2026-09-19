@@ -1,11 +1,15 @@
 //! Rebuild `financial_facts` from `audit_log` via the
 //! `gl_fact_projection_rules` registry.
 //!
-//! Each rule maps one real-world `audit_log.kind` 1:1 to one
-//! `financial_facts.kind`. The projection extracts `source_id`,
-//! `happened_on`, and `created_by` from `event.payload` via JSON
-//! pointers (RFC 6901), passes the payload through verbatim, and
-//! upserts via `record_fact_in_tx` — idempotent on the natural key
+//! Each rule maps one real-world `audit_log.kind` to one
+//! `financial_facts.kind`, optionally only for the events whose
+//! payload matches the rule's `when` (`{"/pointer": value}`, every
+//! pointer equal) — which is how ONE workflow's completed step becomes
+//! a fact out of a `step.done.task` every workflow emits (backlog
+//! a40541cb). The projection extracts `source_id`, `happened_on`, and
+//! `created_by` from `event.payload` via JSON pointers (RFC 6901),
+//! passes the payload through verbatim, and upserts via
+//! `record_fact_in_tx` — idempotent on the natural key
 //! `(kind, source_table, source_id)`.
 //!
 //! Determinism: `fact_id` derivation lives in `record_fact_in_tx`
@@ -35,15 +39,9 @@ use crate::supersede::replay_supersede_events_in_tx;
 /// serializes concurrent ledger-rebuilds.
 const REBUILD_FACTS_LOCK_KEY: i64 = boss_core::rebuild::lock_key("ledger-facts");
 
-#[derive(Debug, Clone)]
-pub struct ProjectionRule {
-    pub event_kind: String,
-    pub fact_kind: String,
-    pub source_table: String,
-    pub source_id_path: String,
-    pub happened_on_path: Option<String>,
-    pub created_by_path: Option<String>,
-}
+/// The registry row, shared with the tenant loader and the batch door
+/// (one definition, CLAUDE.md §9a). Carries `when`.
+pub use crate::posting_rules::ProjectionRule;
 
 #[derive(Debug, Clone)]
 pub struct RebuildFactsReport {
@@ -217,8 +215,8 @@ pub async fn rebuild_facts(pool: &PgPool) -> Result<RebuildFactsReport, LedgerEr
 pub async fn rebuild_facts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<RebuildFactsReport, LedgerError> {
-    let rules = load_rules_in_tx(tx).await?;
-    let event_kinds: Vec<String> = rules.keys().cloned().collect();
+    let rules = ProjectionRules::load_in_tx(tx).await?;
+    let event_kinds = rules.event_kinds();
 
     // TRUNCATE-then-replay model. financial_facts is a pure
     // projection of audit_log; no row may live here that doesn't
@@ -276,21 +274,21 @@ pub async fn rebuild_facts_in_tx(
         let kind: String = row.get("kind");
         let payload: Value = row.get("payload");
 
-        let Some(rule) = rules.get(&kind) else {
-            continue;
-        };
+        // Every rule whose (kind, `when`) matches fires — the same
+        // `matching` the live subscriber applies to a delivery.
+        for rule in rules.matching(&kind, &payload) {
+            let projected = match project_event(rule, timestamp, &source, &payload) {
+                Ok(p) => p,
+                Err(ProjectionError::MissingField { .. }) => {
+                    events_skipped_missing_field += 1;
+                    continue;
+                }
+                Err(e) => return Err(LedgerError::Storage(e.to_string())),
+            };
 
-        let projected = match project_event(rule, timestamp, &source, &payload) {
-            Ok(p) => p,
-            Err(ProjectionError::MissingField { .. }) => {
-                events_skipped_missing_field += 1;
-                continue;
-            }
-            Err(e) => return Err(LedgerError::Storage(e.to_string())),
-        };
-
-        record_fact_in_tx(tx, projected.as_write()).await?;
-        facts_written += 1;
+            record_fact_in_tx(tx, projected.as_write()).await?;
+            facts_written += 1;
+        }
     }
 
     // GL-inert reprojection pass — kept OFF the `gl_fact_projection_rules`
@@ -402,31 +400,74 @@ async fn rebuild_inert_received_facts_in_tx(
     Ok(written)
 }
 
-async fn load_rules_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<HashMap<String, ProjectionRule>, LedgerError> {
-    let rows = sqlx::query(
-        "SELECT event_kind, fact_kind, source_table, source_id_path, \
-                happened_on_path, created_by_path \
-         FROM gl_fact_projection_rules",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| LedgerError::Storage(e.to_string()))?;
+/// The registry grouped by event kind, each group in registry order —
+/// the ONE reading of `gl_fact_projection_rules` both the rebuild's
+/// per-row loop and the live subscriber (`live_facts`, backlog
+/// 5621d166) match against, so "which rules fire on this event" has a
+/// single definition: kind equality, then the rule's `when`.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionRules {
+    by_kind: HashMap<String, Vec<ProjectionRule>>,
+}
 
-    let mut out = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let rule = ProjectionRule {
-            event_kind: row.get("event_kind"),
-            fact_kind: row.get("fact_kind"),
-            source_table: row.get("source_table"),
-            source_id_path: row.get("source_id_path"),
-            happened_on_path: row.get("happened_on_path"),
-            created_by_path: row.get("created_by_path"),
-        };
-        out.insert(rule.event_kind.clone(), rule);
+impl ProjectionRules {
+    pub fn new(rules: Vec<ProjectionRule>) -> Self {
+        let mut by_kind: HashMap<String, Vec<ProjectionRule>> = HashMap::new();
+        for rule in rules {
+            by_kind
+                .entry(rule.event_kind.clone())
+                .or_default()
+                .push(rule);
+        }
+        Self { by_kind }
     }
-    Ok(out)
+
+    pub async fn load_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<Self, LedgerError> {
+        Ok(Self::new(
+            crate::posting_rules::load_projection_rules_in_tx(tx).await?,
+        ))
+    }
+
+    /// Every rule that fires on an event of `kind` with `payload`. One
+    /// event kind may carry several rules (one per `when`); every rule
+    /// whose filter matches fires.
+    pub fn matching<'a>(
+        &'a self,
+        kind: &str,
+        payload: &'a Value,
+    ) -> impl Iterator<Item = &'a ProjectionRule> + 'a {
+        self.by_kind
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter(move |r| r.when_matches(payload))
+    }
+
+    /// The distinct event kinds the registry names, sorted.
+    pub fn event_kinds(&self) -> Vec<String> {
+        let mut kinds: Vec<String> = self.by_kind.keys().cloned().collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// The subject families a durable consumer filters on to see every
+    /// event kind here: the dispatcher's coarse collapse (one
+    /// non-overlapping `<token>.>` per first token), matched precisely
+    /// again by [`Self::matching`] on delivery.
+    pub fn filter_subjects(&self) -> Vec<String> {
+        boss_nats::durable::coarse_filter_subjects(&self.event_kinds())
+    }
+
+    /// Number of rules loaded.
+    pub fn len(&self) -> usize {
+        self.by_kind.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Strip the publisher-injected event-envelope keys (`_actor`,
@@ -472,6 +513,7 @@ mod tests {
             source_id_path: "/id".into(),
             happened_on_path: Some("/issued_on".into()),
             created_by_path: None,
+            when: None,
         }
     }
 

@@ -51,12 +51,22 @@
 #   DECLARED — the basenames of `infra/dispatcher/rules/*.toml`. A rule
 #     the tree declares. Adding a rule is dropping a file in; retiring
 #     one is deleting the file.
+#   TENANT-DECLARED — every `name = "…"` in an example tenant's
+#     `examples/*/seeds/rules.toml`. Since the tenant contract took
+#     `seeds/rules.toml` (#430) a tenant's reactors are declared THERE,
+#     and on 2026-09-17 thirty-one rules moved from the product
+#     directory to the brewery's file (design e2580840 car 4). A name
+#     that moved is still declared by the tree — the file that declares
+#     it, the test that reads it and the fixture that borrows it are
+#     all correct — so it is not RETIRED. The pins below
+#     (`rule-registry-pin`) still count the product directory alone: a
+#     pin is over the registry the product's seed derives.
 #   EVER — DECLARED plus every rule name a `dispatcher_rules` statement
 #     under `infra/postgres/schema/` has ever mentioned. Migrations are
 #     applied history: they stay in the tree forever, which is exactly
 #     why they are the memory of what a rule name USED to mean.
-#   RETIRED — EVER minus DECLARED. A name the tree once declared and
-#     declares no longer.
+#   RETIRED — EVER minus DECLARED minus TENANT-DECLARED. A name the tree
+#     once declared and declares no longer, anywhere.
 #
 # A reference to a RETIRED name, in code, anywhere outside the two
 # directories that legitimately remember it, is the defect. It is named
@@ -153,11 +163,15 @@ set -uo pipefail
 
 NAME="an-expectation-names-a-rule-the-tree-declares"
 SELF_REL="infra/lint/$NAME.sh"
+DECISIONS_REL="crates/core/boss-dispatcher/tests/seed_residue_migration.rs"
 RULES_REL="infra/dispatcher/rules"
 SCHEMA_REL="infra/postgres/schema"
+TENANT_RULES_GLOB="examples/*/seeds/rules.toml"
 PIN_TOKEN="rule-registry-pin:"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$REPO_ROOT/infra/lint/lib/scanned.sh" || exit 3
 
 # ---------------------------------------------------------------------------
 # The sets
@@ -172,6 +186,22 @@ declared_names() {
     for f in "${files[@]}"; do basename "$f" .toml; done | LC_ALL=C sort -u
 }
 
+# Rule names an example tenant DECLARES in its own seeds/rules.toml —
+# the `name = "…"` key of each `[[rule]]`, read the way the ratchet
+# lint reads the product's files. A tenant file that does not exist is
+# an empty set, not an error: the used-device-shop had none until
+# 2026-09-17, and a tree with no example tenants is still a tree.
+tenant_declared_names() {
+    local tree="$1" f
+    shopt -s nullglob
+    # shellcheck disable=SC2206
+    local files=("$tree"/$TENANT_RULES_GLOB)
+    shopt -u nullglob
+    for f in "${files[@]}"; do
+        LC_ALL=C sed -n 's/^name[ \t]*=[ \t]*"\([^"]*\)".*/\1/p' "$f"
+    done | LC_ALL=C sort -u
+}
+
 # Every rule name a `dispatcher_rules` statement has ever mentioned.
 #
 # Two shapes, both precise on purpose — a loose scrape would pick up
@@ -183,8 +213,10 @@ declared_names() {
 #   UPDATE|DELETE ... dispatcher_rules ... name = '<x>' / name IN ('<x>', '<y>')
 #
 # Measured against the real tree on 2026-09-10: 64 names from 60 files,
-# and all 60 declared rules found — which is what `no_unscraped_declared`
-# below turns into this script's own non-vacuity guard.
+# and all 60 declared rules found. Since the 2026-09-11 collapse a new
+# rule has NO migration, so the set below is applied history: it still
+# decides RETIRED (scraped, no longer declared), and the non-vacuity
+# guard asks only that it overlap the declared set at all.
 scraped_names() {
     local tree="$1"
     shopt -s nullglob
@@ -264,6 +296,14 @@ EOF
 #   $SELF_REL     this script. Its self-test fixtures spell real retired
 #                 names on purpose (the brief's "use today's incidents"),
 #                 and a fixture heredoc is not a comment.
+#   $DECISIONS_REL the seed-residue pin. Its RETIRED_BY_DECISION_SINCE
+#                 list is, by construction, the names a migration
+#                 inserted that a DECISION later retired from the tree —
+#                 each with the packet that retired it. A retired name
+#                 is what that list is FOR (the first, 2026-09-18,
+#                 backlog 18df96c4: maintenance-sweep-build-caches-
+#                 daily), so it is the same shape as a retirement
+#                 migration: a record, not an expectation.
 candidate_files() {
     local tree="$1" top="" listing
     top="$(git -C "$tree" rev-parse --show-toplevel 2>/dev/null)"
@@ -274,9 +314,10 @@ candidate_files() {
             \( -name .git -o -name target -o -name node_modules -o -name .claude -o -name dist \) -prune -o \
             -type f -print 2>/dev/null | sed 's#^\./##')"
     fi
-    printf '%s\n' "$listing" | LC_ALL=C awk -v schema="$SCHEMA_REL/" -v rules="$RULES_REL/" -v self="$SELF_REL" '
+    printf '%s\n' "$listing" | LC_ALL=C awk -v schema="$SCHEMA_REL/" -v rules="$RULES_REL/" -v self="$SELF_REL" -v decisions="$DECISIONS_REL" '
         $0 == "" { next }
         $0 == self { next }
+        $0 == decisions { next }
         index($0, schema) == 1 { next }
         index($0, rules) == 1 { next }
         index($0, "docs/") == 1 { next }
@@ -368,31 +409,47 @@ scan_tree() {
     }
     scraped_names "$tree" > "$tmp/scraped"
 
-    # NON-VACUITY. Every declared rule is seeded by a migration (the
-    # rules README requires it and the authored registry's loader
-    # pins it), so the scrape must find all of them. If it does not,
-    # either the scrape stopped recognising a statement shape — and then
-    # RETIRED is wrong in the silent direction — or a rule arrived with
-    # no seed migration and a fresh database will not have it. Both are
-    # findings; neither may pass as "nothing to report".
+    # NON-VACUITY. Until 2026-09-11 every declared rule was also seeded
+    # by a migration, and this guard demanded the scrape find ALL of
+    # them. The collapse (41ba00cd) made the directory the definition
+    # and `no-migration-writes-a-dispatcher-rule.sh` REFUSES that INSERT
+    # for any new rule — so a declared rule no migration mentions is now
+    # the normal shape of every rule added since, not a finding. The
+    # first one arrived on 2026-09-12 (measure-*-sweep-on-inspect-ready)
+    # and met the old guard, which pushed its author to write exactly
+    # the migration the sibling lint forbids. What the guard is FOR
+    # survives: RETIRED is "scraped and not declared", and if the scrape
+    # stopped recognising a statement shape it would be wrong in the
+    # quiet direction. So the check is that the scrape still reads the
+    # applied history — it must find at least one rule the tree still
+    # declares (the thirty-one pre-collapse seeds cannot all have been
+    # retired) — and the count it did not find is REPORTED on the OK
+    # line, where a reader who expected zero will see it.
     if ! LC_ALL=C comm -23 "$tmp/declared" "$tmp/scraped" > "$tmp/unscraped"; then
         echo "$NAME: could not compare the declared and scraped name sets" >&2
         return 1
     fi
-    if [ -s "$tmp/unscraped" ]; then
-        echo "$NAME: $(wc -l < "$tmp/unscraped" | tr -d ' ') declared rule(s) are not mentioned by any migration in $SCHEMA_REL:" >&2
-        sed 's/^/    /' "$tmp/unscraped" >&2
+    # Written to a file and tested for size, not piped into `grep -q`:
+    # the reader would exit at the first line and comm's next write is
+    # SIGPIPE, which pipefail reports as "found none" (backlog 0f2ecbda).
+    if ! LC_ALL=C comm -12 "$tmp/declared" "$tmp/scraped" > "$tmp/recognised"; then
+        echo "$NAME: could not compare the declared and scraped name sets" >&2
+        return 1
+    fi
+    if ! [ -s "$tmp/recognised" ]; then
+        echo "$NAME: the migration scrape found NONE of the $(LC_ALL=C grep -c . < "$tmp/declared") declared rules in $SCHEMA_REL" >&2
         echo "" >&2
-        echo "  Either the rule arrived without the ON CONFLICT-safe INSERT a fresh" >&2
-        echo "  database needs (see $RULES_REL/README.md; the DB test" >&2
-        echo "  parse_raw_dir refuses the file the same way, later), or this" >&2
-        echo "  script's scrape no longer recognises the statement's shape — in which" >&2
-        echo "  case the retired set below is wrong in the quiet direction and must" >&2
-        echo "  not be trusted. Refusing rather than reporting a clean tree." >&2
+        echo "  The pre-collapse seeds are applied history that names rules the tree" >&2
+        echo "  still declares, so a scrape that recognises no statement shape has" >&2
+        echo "  broken — and the retired set would then be wrong in the quiet" >&2
+        echo "  direction. Refusing rather than reporting a clean tree." >&2
         problems=$((problems + 1))
     fi
+    nunseeded=$(LC_ALL=C grep -c . < "$tmp/unscraped" || true)
 
-    LC_ALL=C comm -13 "$tmp/declared" "$tmp/scraped" > "$tmp/retired"
+    tenant_declared_names "$tree" > "$tmp/tenant"
+    LC_ALL=C comm -13 "$tmp/declared" "$tmp/scraped" \
+        | LC_ALL=C comm -23 - "$tmp/tenant" > "$tmp/retired"
 
     candidate_files "$tree" > "$tmp/files"
 
@@ -490,10 +547,12 @@ EOF
 
     [ "$problems" -eq 0 ] || return 1
 
-    local nretired npins
+    local nretired npins ntenant
     nretired="$(LC_ALL=C grep -c . < "$tmp/retired" || true)"
+    ntenant="$(LC_ALL=C grep -c . < "$tmp/tenant" || true)"
     npins="$(cd "$tree" && LC_ALL=C grep -lF -- "$PIN_TOKEN" /dev/null $(tr '\n' ' ' < "$tmp/files") 2>/dev/null | LC_ALL=C grep -c . || true)"
-    echo "$NAME: OK — $(LC_ALL=C grep -c . < "$tmp/declared") declared rules, $nretired retired and referenced nowhere in code, $npins file(s) carrying a $PIN_TOKEN pin"
+    lint_scanned "$NAME" "$(LC_ALL=C grep -c . < "$tmp/declared")" "declared rule(s), each checked against every code file in the tree"
+    echo "$NAME: OK — $(LC_ALL=C grep -c . < "$tmp/declared") declared rules ($nunseeded declared since the collapse, by file alone), $nretired retired and referenced nowhere in code, $npins file(s) carrying a $PIN_TOKEN pin, $ntenant declared by an example tenant's seeds/rules.toml"
     return 0
 }
 
@@ -583,7 +642,7 @@ fn why() {
 RS
     out="$(scan_tree "$tmp/clean" 2>&1)"; rc=$?
     [ "$rc" -eq 0 ] || st_fail "the clean tree was refused: $out"
-    printf '%s' "$out" | grep -q "OK — 7 declared rules, 2 retired" \
+    grep -q "OK — 7 declared rules (0 declared since the collapse, by file alone), 2 retired" <<<"$out" \
         || st_fail "the clean tree's OK line does not state what it compared: $out"
 
     # 2. INCIDENT 31e1d207 — a test names `design-review-level-sweep`
@@ -598,11 +657,11 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
 RS
     out="$(scan_tree "$tmp/stale-name" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || st_fail "a test naming a retired rule was not refused (rc=$rc): $out"
-    printf '%s' "$out" | grep -q 'design-review-level-sweep' \
+    grep -q 'design-review-level-sweep' <<<"$out" \
         || st_fail "the refusal does not name the rule: $out"
-    printf '%s' "$out" | grep -q 'crates/t/tests/pin.rs:3' \
+    grep -q 'crates/t/tests/pin.rs:3' <<<"$out" \
         || st_fail "the refusal does not name the referencing file and line: $out"
-    printf '%s' "$out" | grep -q "retired in $SCHEMA_REL/200-retire.sql" \
+    grep -q "retired in $SCHEMA_REL/200-retire.sql" <<<"$out" \
         || st_fail "the refusal does not say where the rule went: $out"
 
     # 3. INCIDENT aecdaa07 / the gate's catch — a count pin expecting
@@ -614,9 +673,9 @@ RS
 RS
     out="$(scan_tree "$tmp/stale-count" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || st_fail "a stale count pin was not refused (rc=$rc): $out"
-    printf '%s' "$out" | grep -q 'pins `maintenance-sweep-\*-daily` = 8, but the tree declares 6' \
+    grep -q 'pins `maintenance-sweep-\*-daily` = 8, but the tree declares 6' <<<"$out" \
         || st_fail "the refusal does not state expected vs actual: $out"
-    printf '%s' "$out" | grep -q 'maintenance-sweep-disk-daily' \
+    grep -q 'maintenance-sweep-disk-daily' <<<"$out" \
         || st_fail "the refusal does not list what the glob matched: $out"
 
     # 4. A pin whose glob matches nothing passes forever — refused, for
@@ -625,24 +684,57 @@ RS
     printf '// rule-registry-pin: design-review-* = 2\n' > "$tmp/empty-pin/crates/t/tests/pin.rs"
     out="$(scan_tree "$tmp/empty-pin" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || st_fail "a pin matching no rule was not refused (rc=$rc): $out"
-    printf '%s' "$out" | grep -q 'no rule in .* matches that glob' \
+    grep -q 'no rule in .* matches that glob' <<<"$out" \
         || st_fail "the empty-pin refusal does not say the glob matched nothing: $out"
 
-    # 5. NON-VACUITY: a rule the migrations never mention means either a
-    #    missing seed or a broken scrape, and the retired set cannot be
-    #    trusted either way.
+    # 5. THE POST-COLLAPSE SHAPE: a rule declared by its file alone, no
+    #    migration mentioning it, is the normal case since 2026-09-11 and
+    #    passes — counted on the OK line, not refused.
     mk_tree "$tmp/unseeded"
     printf '[[rule]]\nname = "spawn-nothing-daily"\n' > "$tmp/unseeded/$RULES_REL/spawn-nothing-daily.toml"
     out="$(scan_tree "$tmp/unseeded" 2>&1)"; rc=$?
-    [ "$rc" -eq 1 ] || st_fail "a rule with no seed migration was not refused (rc=$rc): $out"
-    printf '%s' "$out" | grep -q 'spawn-nothing-daily' \
-        || st_fail "the non-vacuity refusal does not name the rule: $out"
+    [ "$rc" -eq 0 ] || st_fail "a rule declared by file alone (the post-collapse shape) was refused (rc=$rc): $out"
+    grep -q "OK — 8 declared rules (1 declared since the collapse, by file alone)" <<<"$out" \
+        || st_fail "the OK line does not count the file-only rule: $out"
+
+    # 5b. NON-VACUITY, what remains of it: a scrape that finds NONE of the
+    #     declared rules in the applied history has broken, and the
+    #     retired set it would print is not to be trusted.
+    mk_tree "$tmp/blind"
+    printf 'select 1;\n' > "$tmp/blind/$SCHEMA_REL/100-seed.sql"
+    rm -f "$tmp/blind/$SCHEMA_REL/200-retire.sql"
+    out="$(scan_tree "$tmp/blind" 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || st_fail "a scrape that found no declared rule was read as clean (rc=$rc): $out"
+    grep -q 'found NONE' <<<"$out" \
+        || st_fail "the broken-scrape refusal does not say so: $out"
 
     # 6. An empty or wrong rule directory is a wrong path, never a clean
     #    tree — the sibling lint's refusal, for the same reason.
     mkdir -p "$tmp/hollow/$RULES_REL"
     out="$(scan_tree "$tmp/hollow" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || st_fail "an empty rule directory was read as a clean tree (rc=$rc): $out"
+
+    # 8. A RULE THAT MOVED TO A TENANT (2026-09-17): its migration still
+    #    names it, the product directory no longer does, and an example
+    #    tenant's seeds/rules.toml declares it. A test that reads that
+    #    file by name is right, not stale — passes, and the OK line says
+    #    how many names a tenant declares. The control: with the tenant
+    #    file gone, the same reference IS stale and is refused.
+    mk_tree "$tmp/moved"
+    rm -f "$tmp/moved/$RULES_REL/publish-to-github-daily.toml"
+    mkdir -p "$tmp/moved/examples/acme/seeds"
+    printf '[[rule]]\nname = "publish-to-github-daily"\nversion = 1\n' \
+        > "$tmp/moved/examples/acme/seeds/rules.toml"
+    printf 'const MOVED: &str = "publish-to-github-daily";\n' > "$tmp/moved/crates/t/tests/pin.rs"
+    out="$(scan_tree "$tmp/moved" 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] || st_fail "a name an example tenant's seeds/rules.toml declares was read as retired (rc=$rc): $out"
+    grep -q "1 declared by an example tenant's seeds/rules.toml" <<<"$out" \
+        || st_fail "the OK line does not count the tenant-declared name: $out"
+    rm -f "$tmp/moved/examples/acme/seeds/rules.toml"
+    out="$(scan_tree "$tmp/moved" 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || st_fail "without the tenant file the moved name must read as retired (rc=$rc): $out"
+    grep -q 'publish-to-github-daily' <<<"$out" \
+        || st_fail "the control refusal does not name the rule: $out"
 
     # 7. THIS SCRIPT MUST NOT READ STDIN, and the cost of getting that
     #    wrong is not its own result. gate.sh runs the roster as
@@ -663,8 +755,8 @@ roster loop that silently truncates the roster and still reports clean"
     [ "$bad" -eq 0 ] || return 1
     echo "$NAME: self-test ok — a retired rule QUOTED in code fails with its file, line and \
 retiring migration; a stale count pin fails with expected vs actual; a pin matching nothing \
-fails; a rule with no seed migration fails; the same names in line comments, block comments, \
-backticked prose inside a string literal, and docs all pass; and the scan leaves stdin alone, \
+fails; a rule declared by file alone passes and is counted; a scrape finding no declared rule fails; the same names in line comments, block comments, \
+backticked prose inside a string literal, and docs all pass; a name an example tenant's seeds/rules.toml declares is not retired; and the scan leaves stdin alone, \
 so it cannot truncate gate.sh's roster loop"
     return 0
 }

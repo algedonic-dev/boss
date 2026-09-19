@@ -50,8 +50,8 @@ START="${BOSS_REGEN_START:-2025-04-01}"
 # sustains only ~10 writes/wall-second. At 8640 that's ~105 completions per
 # sim-day — far below the ~400+ steps generated/day — so work-in-flight
 # grows unboundedly. The compressed burst load also stresses Postgres: the
-# ~24 API pools now run against max_connections=400 (raised from 100 — see
-# deploy-services.sh), which keeps connection contention in the transient
+# ~24 API pools now run against max_connections=400 (raised from 100 on
+# the bare-metal box this ran on), which keeps connection contention in the transient
 # regime the JetStream redelivery layer can self-heal rather than the
 # sustained saturation that dead-letters assignments. 2000 still gives the
 # serial path ~43 wall-s per sim-day to keep pace. Raising serial write
@@ -80,10 +80,9 @@ echo
 # -- Step 0: clock-api must be up in sim mode ------------------
 # Every write in the run is stamped through clock-api, so the whole
 # script depends on a sim-mode clock (`POST /configure` is sim-only —
-# a wall-mode clock 405s it). deploy-services.sh installs the clock
-# with BOSS_CLOCK_MODE=wall (the prod default), so a fresh
-# bootstrap-vm.sh box fails here until the mode is flipped; the
-# playground carries the sim-mode drop-in already. Probe /configure
+# a wall-mode clock 405s it). A unit installed with BOSS_CLOCK_MODE=wall
+# (the prod default) fails here until the mode is flipped; the
+# playground carried the sim-mode drop-in. Probe /configure
 # up front — before the DB drop — so a wall-mode box fails in
 # seconds with the remediation, not minutes in with a half-reset DB.
 # In sim mode the probe doubles as an early epoch prime; step 2.4
@@ -104,8 +103,8 @@ deployed unit to sim mode and re-run:
       sudo tee /etc/systemd/system/boss-clock-api.service.d/override.conf
   sudo systemctl daemon-reload && sudo systemctl restart boss-clock-api
 
-(The drop-in survives deploy-services.sh re-runs; see the clock section
-there for why wall is the install default.)
+(A drop-in survives unit reinstalls; wall is the install default because
+production must never run on a sim clock.)
 EOF
     exit 1
 fi
@@ -162,9 +161,7 @@ done
 MAINT_TIMERS=(
     boss-ledger-replay-check.timer
     boss-audit-integrity-check.timer
-    boss-conservation-invariants.timer
     boss-ledger-recognize.timer
-    boss-backup.timer
     boss-files-gc.timer
     boss-messages-events-purge.timer
     boss-ml-inference-batch.timer
@@ -483,7 +480,7 @@ DEAD_LETTERS=$(journalctl -u boss-dispatcher --since "$RUN_STARTED" --no-pager 2
 if [[ "${DEAD_LETTERS:-0}" -gt 0 ]]; then
     echo "ERROR: $DEAD_LETTERS dispatcher dead-letter(s) this run — a side effect exhausted redelivery and is permanently stuck:" >&2
     journalctl -u boss-dispatcher --since "$RUN_STARTED" --no-pager 2>/dev/null \
-        | grep -E "DEAD-LETTER" | grep -oE "subject=[a-z._*-]+ .*error=[^\"]*" | sort | uniq -c | sort -rn | head -10 >&2
+        | grep -E "DEAD-LETTER" | grep -oE "subject=[a-z._*-]+ .*error=[^\"]*" | sort | uniq -c | sort -rn | sed -n '1,10p' >&2
     exit 1
 fi
 # For visibility: how many transient failures self-healed via redelivery.
@@ -607,19 +604,26 @@ PGPASSWORD=boss psql -h 127.0.0.1 -U boss -d boss -q -c "DROP TABLE IF EXISTS _d
 echo "    determinism OK — rebuilt ledger matches live across all accounts"
 
 # -- Step 8.5: conservation invariants (incl. exact GL ≡ value) --
-echo "==> [8.5/10] running conservation-invariant sweep"
-# The full lettered sweep the nightly timer runs, promoted to a
-# regen gate. Invariants N + P are EXACT under value-primary rows
-# (PR 6a): balance(1300) == Σ inventory_items.value_cents and
-# balance(1320) == Σ finished_product_inventory.value_cents, to the
-# cent, after a full year — the class of leak the old ±$50k / $100
-# tolerances papered over no longer exists, so any hit here is a
-# write path that moved stock without its JE (or vice versa).
-if ! PGHOST=127.0.0.1 PGUSER=boss PGDATABASE=boss PGPASSWORD=boss     "$REPO_ROOT/infra/lint/conservation-invariants.sh"; then
-    echo "ERROR: conservation invariants failed — see the lettered failures above" >&2
-    exit 1
-fi
-echo "    conservation invariants green (N + P exact)"
+echo "==> [8.5/10] running conservation-invariant sweeps"
+# The full lettered sweep, promoted to a regen gate — in TWO scripts
+# since 2026-09-18 (H12, backlog 236529aa): the platform's eight
+# (infra/lint/conservation-invariants.sh, what the hourly in-cluster
+# chore runs on every instance) and the brewery's fourteen
+# (examples/brewery/conservation-invariants.sh — the chart-of-accounts
+# and batch invariants only this tenant means). Invariants N + P are
+# EXACT under value-primary rows (PR 6a): balance(1300) == Σ
+# inventory_items.value_cents and balance(1320) == Σ
+# finished_product_inventory.value_cents, to the cent, after a full
+# year — the class of leak the old ±$50k / $100 tolerances papered
+# over no longer exists, so any hit here is a write path that moved
+# stock without its JE (or vice versa).
+for sweep in infra/lint/conservation-invariants.sh examples/brewery/conservation-invariants.sh; do
+    if ! PGHOST=127.0.0.1 PGUSER=boss PGDATABASE=boss PGPASSWORD=boss "$REPO_ROOT/$sweep"; then
+        echo "ERROR: conservation invariants failed ($sweep) — see the lettered failures above" >&2
+        exit 1
+    fi
+done
+echo "    conservation invariants green (platform 8 + brewery 14; N + P exact)"
 
 # -- Step 9: dangling-FK lint ----------------------------------
 echo "==> [9/10] running audit_log integrity check"

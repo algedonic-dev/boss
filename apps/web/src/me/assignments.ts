@@ -7,7 +7,7 @@
 // unassigned). Rows where someone else is mid-flight on a
 // role-matched step are visible context, not claimable work.
 
-import { isSim, type PacketCardData } from '@boss/web-kit/ui/packet-card';
+import { carRow, partitionOf, type CarRow, type Partition } from '../it/yard/yard';
 
 export type AssignmentStep = Readonly<{
   id: string;
@@ -37,13 +37,20 @@ export type AssignmentRow = Readonly<{
   subject_kind: string;
   subject_id: string;
   priority: string;
-  /** The Job's admission-fixed sim-vs-real flag, and its tags — the
-   *  packet facts the card needs, carried on the row so this lens
-   *  needs no second fetch. Optional so a response from a server that
-   *  predates them still parses (they then read as a real packet, the
-   *  same default the Job's own `serde(default)` takes). */
+  /** The Job's admission-fixed partition (the word, 508cc38c) and its
+   *  derived `simulated` bool, and its tags — the packet facts the card
+   *  needs, carried on the row so this lens needs no second fetch.
+   *  Optional so a response from a server that predates them still
+   *  parses (they then read as a real packet, the same default the
+   *  Job's own `serde(default)` takes). */
+  partition?: Partition;
   simulated?: boolean;
   tags?: readonly string[];
+  /** How many red trains have released this car — the conductor's
+   *  `red_trains` stamp, read off the job's metadata by the server
+   *  (boss-jobs port.rs AssignmentRow, d6e53a35). Optional so a row from
+   *  a server that predates it still parses, and reads as a clean car. */
+  red_trains?: number;
   step: AssignmentStep;
 }>;
 
@@ -189,29 +196,40 @@ export async function fetchMyDay(
 }
 
 // My Day rows render as packet cards — the same card the train yard
-// uses (feedback d69033dd: one card grammar across the network). The
-// lens maps its rows into the card's shape: the workflow is the
-// protocol, the job title leads, and the actionable step rides the
-// mono provenance line. Priority, due date, and a blocked marker
-// travel as tag chips. Sim comes off the row's own packet facts
-// through the shared predicate, so a simulated packet is as visibly
-// simulated in a personal queue as it is in the yard. The job's tags
-// feed that predicate but stay off the chips: in this lens the chips
-// are queue state (blocked / priority / due), not packet labels.
-export function assignmentPacket(row: AssignmentRow): PacketCardData {
+// uses (feedback d69033dd: one card grammar across the network), built
+// by the yard's one constructor (fb3b5ce1, 2026-09-14: this lens had
+// its own literal and missed `redTrains` the day the yard read it).
+// The row is a projection, not the Job — it names the packet and
+// carries its sim flag, tags and strike count but no metadata and no
+// steps — so the constructor gets exactly what the row holds and the
+// packet-record facts it lacks (head, proof) read as absent, the way a
+// car outside the yard's window does. The strike count is the first
+// fact the server put on the row for this lens (d6e53a35, 2026-09-14:
+// a builder's own struck car read clean here while the yard drew it
+// struck, and the builder is who can act before the next red holds it);
+// when the server puts more of the packet on the row, this call passes
+// it and nothing else changes. Two fields are
+// the lens's own and override: the actionable step rides the mono
+// provenance line, and the chips are queue state (blocked / priority /
+// due), not packet labels — the job's tags feed the sim predicate and
+// stay off them.
+export function assignmentPacket(row: AssignmentRow): CarRow {
   const actionable = row.step.status === 'ready' || row.step.status === 'active';
   return {
-    id: row.job_id,
-    kind: row.workflow,
+    ...carRow({
+      id: row.job_id,
+      kind: row.workflow,
+      title: row.job_title,
+      tags: row.tags,
+      partition: partitionOf(row),
+      red_trains: row.red_trains,
+    }),
     branch: row.step.title,
-    title: row.job_title,
     tags: [
       ...(actionable ? [] : ['blocked']),
       ...(row.priority !== 'standard' ? [row.priority] : []),
       ...(row.due_on ? [`due ${row.due_on}`] : []),
     ],
-    sim: isSim({ simulated: row.simulated, tags: row.tags }),
-    skipReason: null,
   };
 }
 

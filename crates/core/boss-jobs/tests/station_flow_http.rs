@@ -142,7 +142,7 @@ fn packet() -> Job {
         closed_on: None,
         metadata: serde_json::json!({}),
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 
@@ -252,6 +252,7 @@ async fn app() -> axum::Router {
         )),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     router(state)
 }
