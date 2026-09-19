@@ -75,6 +75,8 @@ export type ProbeRun =
       stderr: string | null;
       why: string | null;
       missingTools: readonly string[];
+      /** Exit 75: ran, said "not yet" — see `ProofAttempt.notYet`. */
+      notYet: boolean;
     }>
   | Readonly<{ kind: 'waiting' }>;
 
@@ -120,6 +122,7 @@ export function probeRun(
       stderr: a.stderr,
       why: a.why,
       missingTools: a.missingTools,
+      notYet: a.notYet,
     };
   }
   return { kind: 'waiting' };
@@ -160,13 +163,20 @@ export function inspectionShed(
   });
 }
 
-/** A probe that ran and did not print what was claimed. */
-const ranRed = (s: ShedCar): boolean => s.run.kind === 'ran' && s.run.exit !== 0;
+/** A probe that ran and said NOT YET (exit 75): the world is not ready
+ *  to judge the claim, and the probe said why. Early, not wrong. */
+const ranNotYet = (s: ShedCar): boolean => s.run.kind === 'ran' && s.run.notYet;
+
+/** A probe that ran and did not print what was claimed — and did not
+ *  say "not yet". This is the one red thing in the shed. */
+const ranRed = (s: ShedCar): boolean => s.run.kind === 'ran' && s.run.exit !== 0 && !s.run.notYet;
 
 export type ShedCounts = Readonly<{
   inspecting: number;
   /** Of those inspecting, how many have a failed run on record. */
   failed: number;
+  /** Of those inspecting, how many said "not yet" on their last run. */
+  notYet: number;
   onEvent: number;
   noProbe: number;
 }>;
@@ -175,6 +185,7 @@ export function shedCounts(cars: readonly ShedCar[]): ShedCounts {
   return {
     inspecting: cars.filter(s => s.place === 'inspection-shed').length,
     failed: cars.filter(s => s.place === 'inspection-shed' && ranRed(s)).length,
+    notYet: cars.filter(s => s.place === 'inspection-shed' && ranNotYet(s)).length,
     onEvent: cars.filter(s => s.place === 'siding-event').length,
     noProbe: cars.filter(s => s.place === 'siding-no-probe').length,
   };
@@ -185,6 +196,7 @@ export function shedLabel(c: ShedCounts): string {
   const parts = [
     ...(c.inspecting > 0 ? [`${c.inspecting} inspecting`] : []),
     ...(c.failed > 0 ? [`${c.failed} probe failed`] : []),
+    ...(c.notYet > 0 ? [`${c.notYet} not yet`] : []),
     ...(c.onEvent > 0 ? [`${c.onEvent} on an event`] : []),
     ...(c.noProbe > 0 ? [`${c.noProbe} with no probe`] : []),
   ];
@@ -207,7 +219,9 @@ export function shedStatus(s: ShedCar): string {
             ? 'inspection shed · probe ran, no exit recorded'
             : s.run.exit === 0
               ? 'inspection shed · probe exit 0, not stamped'
-              : `inspection shed · probe failed, exit ${s.run.exit}`;
+              : s.run.notYet
+                ? 'inspection shed · probe says not yet — rechecked daily'
+                : `inspection shed · probe failed, exit ${s.run.exit}`;
         case 'waiting':
           // Deliberately the weaker claim: the page read a window of
           // ops-requests, and an absence there is not an absence.
@@ -234,4 +248,53 @@ export function shedLamp(s: ShedCar): 'ok' | 'working' | 'warn' | 'err' | 'off' 
 /** When the run happened, for a wagon with no better entry stamp. */
 export function runAt(r: ProbeRun): string | null {
   return r.kind === 'waiting' ? null : r.at;
+}
+
+// THE FLAKE TALLY — reds that were not the branch's, by check.
+//
+// Retro 27fad542 counted 4 of 11 red car gates in two days that were not
+// the branch's fault, each recorded exactly like an author's red, so the
+// flakiest check was a memory (backlog 36cc4913). The rule lives in
+// `boss_jobs::flake` and is decided by the record, never by a check's
+// name: `boss gate` re-run at an UNCHANGED head stamps `regate_of` (the
+// prior red) on the fresh gate-run, and a GREEN verdict there stamps
+// `flake_of` + `flaky_checks` (the prior's failing checks). This tally
+// reads those stamps off the gate-run packets the page already holds —
+// the same window the signals read — so the shed lists the same number
+// `boss orient`'s FLAKES line prints. A stamped run whose prior named no
+// check (a lost run, a refusal) counts under NO_CHECK_NAMED rather than
+// vanishing.
+
+/** The tally key for a flake whose prior run named no check —
+ *  `boss_jobs::flake::NO_CHECK_NAMED`, spelled once there and once here. */
+export const NO_CHECK_NAMED = '(no check named)';
+
+export type FlakeCount = Readonly<{ check: string; count: number }>;
+
+const strings = (v: unknown): readonly string[] =>
+  Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
+
+/** How many times each check went red then green at one head, over the
+ *  gate-runs given — most flaky first, ties by name. Runs without a
+ *  `flake_of` stamp (a plain green, a re-gate that stayed red) do not
+ *  count: a persistent red is the branch's. */
+export function flakeTally(gateRuns: readonly JobLite[]): readonly FlakeCount[] {
+  const counts = new Map<string, number>();
+  gateRuns.forEach(r => {
+    const m = md(r);
+    if (text(m.flake_of) === null) return;
+    const checks = strings(m.flaky_checks);
+    (checks.length > 0 ? checks : [NO_CHECK_NAMED]).forEach(c => counts.set(c, (counts.get(c) ?? 0) + 1));
+  });
+  return [...counts.entries()]
+    .map(([check, count]) => ({ check, count }))
+    .sort((a, b) => b.count - a.count || (a.check < b.check ? -1 : a.check > b.check ? 1 : 0));
+}
+
+/** The tally's one line: the checks by count, or a stated none. The
+ *  page reads a WINDOW of gate-runs, so a none is "in the runs read". */
+export function flakeLabel(tally: readonly FlakeCount[]): string {
+  return tally.length === 0
+    ? 'no flakes in the runs read'
+    : ['flakes', ...tally.map(f => `${f.check}: ${f.count}`)].join(' · ');
 }

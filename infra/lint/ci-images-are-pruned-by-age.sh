@@ -191,7 +191,7 @@ grep -q 'landed-train-shas.lib.sh' "$sweep" \
 
 # Code lines only: both phrases also appear in the prose above them, and
 # a check that reads a comment as the mechanism is no check at all.
-code_line() { grep -n "$1" "$sweep" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1; }
+code_line() { grep -n "$1" "$sweep" | grep -vE '^[0-9]+:[[:space:]]*#' | sed -n 1p | cut -d: -f1; }
 prune_line=$(code_line 'prune_ci_images "')
 floor_line=$(code_line 'nothing to do')
 if [ -z "$prune_line" ] || [ -z "$floor_line" ]; then
@@ -212,7 +212,7 @@ fi
 # floor early-return owes the record nothing.
 floor_half="$(sed -n '/reclaiming regenerable docker caches/,$p' "$sweep")"
 for token in LANDED landed_train_shas BOSS_JOBS_URL; do
-    printf '%s' "$floor_half" | grep -q "$token" \
+    grep -q "$token" <<<"$floor_half" \
         && fail "the below-floor remediations in $sweep reference \`$token\` — an arm that needs the system of record is not an arm when the record is what is down"
 done
 

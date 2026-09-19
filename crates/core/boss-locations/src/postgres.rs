@@ -3,11 +3,12 @@
 
 use async_trait::async_trait;
 use boss_core::primitives::Location;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::port::{LocationError, LocationRepository};
+use crate::port::{LocationError, LocationRepository, declared_event};
 
 pub struct PgLocations {
     pool: PgPool,
@@ -116,5 +117,60 @@ impl LocationRepository for PgLocations {
         }
         .map_err(|e| LocationError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn batch_upsert(
+        &self,
+        rows: &[Location],
+        stamp: &EventStamp,
+    ) -> Result<u64, LocationError> {
+        // One `ON CONFLICT (id) DO NOTHING` per row inside a single
+        // transaction — the classes batch's shape (backlog 1ec8312a,
+        // 2026-09-17). The transaction is what lets a `parent_id`
+        // name a row later in the same file: `locations.parent_id`
+        // is DEFERRABLE INITIALLY DEFERRED, checked at commit.
+        // `created_at` / `updated_at` default in the table;
+        // `retired_at` is not seeded (rows arrive active). Row-at-a-
+        // time is also what lets `rows_affected` say, per row, whether
+        // THIS one was inserted: only those stage a `location.declared`
+        // on the outbox, in the same transaction, so the fact and the
+        // row commit or roll back together (backlog d9409039).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LocationError::Storage(e.to_string()))?;
+        let mut inserted: u64 = 0;
+        for r in rows {
+            let result = sqlx::query(
+                "INSERT INTO locations \
+                 (id, name, kind, parent_id, timezone, latitude, longitude, address, account_id, metadata) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&r.id)
+            .bind(&r.name)
+            .bind(&r.kind)
+            .bind(&r.parent_id)
+            .bind(&r.timezone)
+            .bind(r.latitude)
+            .bind(r.longitude)
+            .bind(&r.address)
+            .bind(&r.account_id)
+            .bind(&r.metadata)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| LocationError::Storage(e.to_string()))?;
+            if result.rows_affected() == 1 {
+                boss_events::outbox::record_event_in_tx(&mut tx, &declared_event(stamp, r)?)
+                    .await
+                    .map_err(LocationError::Storage)?;
+                inserted += 1;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| LocationError::Storage(e.to_string()))?;
+        Ok(inserted)
     }
 }

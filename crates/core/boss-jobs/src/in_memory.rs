@@ -38,6 +38,9 @@ struct State {
     /// tiebreak every windowed read of a busy day returned an
     /// arbitrary subset.
     job_created_at: HashMap<String, DateTime<Utc>>,
+    /// The estate as declared through `declare_estate_nodes` — empty
+    /// until a test declares one, exactly as a fresh database is.
+    estate: Vec<crate::port::EstateNode>,
 }
 
 impl InMemoryJobs {
@@ -77,6 +80,13 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
+    // A set of kinds, empty set included: `Some(vec![])` matches no
+    // packet, the same as the SQL adapter's `kind = ANY('{}')`.
+    if let Some(ref kinds) = filter.kinds
+        && !kinds.contains(&job.kind)
+    {
+        return false;
+    }
     // The retention window replaces the status equality when set:
     // "live OR closed on/after this date". Same contract as the SQL
     // adapter, which expresses it as a CASE over the same two columns
@@ -102,8 +112,8 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
-    if let Some(simulated) = filter.simulated
-        && job.simulated != simulated
+    if let Some(partition) = filter.partition
+        && job.partition != partition
     {
         return false;
     }
@@ -139,6 +149,15 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
             }
         }
     }
+    if let Some(key) = &filter.metadata_has
+        && job.metadata.get(key).is_none()
+    {
+        // The stand-in for Postgres `metadata ? $n`: a top-level key,
+        // whatever its value. `Value::get` on null metadata is None, so
+        // the seeded default carries nothing — same as `?` on a JSONB
+        // null.
+        return false;
+    }
     match &filter.scope {
         JobScope::All => {}
         JobScope::None => return false,
@@ -167,17 +186,59 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     true
 }
 
+/// The ONE in-memory step insert, under a lock the caller holds:
+/// `add_step_at` and `create_job_with_steps_at` write a step through
+/// this, as the Pg adapter's two paths share one INSERT. Mirrors the
+/// Pg replay guard — an existing id is a no-op that records nothing —
+/// and reports whether the row was inserted.
+fn insert_step_locked(state: &mut State, step: &Step, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let key = step_key(&step.id);
+    let inserted = match state.steps.entry(key.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(step.clone());
+            true
+        }
+    };
+    if inserted {
+        // Born ready IS the ready flip — same rule as the
+        // INSERT's CASE in the Pg adapter.
+        if step.status == StepStatus::Ready {
+            state.step_ready_at.insert(key.clone(), now);
+        }
+        state.step_touched_at.insert(key, now);
+    }
+    inserted
+}
+
 #[async_trait]
 impl JobsRepository for InMemoryJobs {
-    async fn create_job_at(
+    async fn create_job_with_steps_at(
         &self,
         job: &Job,
+        steps: &[Step],
         now: chrono::DateTime<chrono::Utc>,
-        events: &[boss_core::event::Event],
+        job_events: &[boss_core::event::Event],
+        step_events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        // Mirror the Pg replay guard: an existing id is a no-op that
-        // records nothing — and keeps its original admission instant.
-        let inserted = {
+        // Same refusal as the Pg adapter, before the lock: nothing is
+        // written for a graph whose events do not pair with its rows.
+        if steps.len() != step_events.len() {
+            return Err(JobsError::Storage(format!(
+                "create_job_with_steps_at: {} step(s) but {} step event(s) — one \
+                 STEP_CREATED per step, index-aligned",
+                steps.len(),
+                step_events.len()
+            )));
+        }
+        // One lock held across the job AND every step is this
+        // adapter's one transaction: a reader sees the whole graph or
+        // none of it, as the Pg commit guarantees (backlog f2ba226e).
+        // Mirror the Pg replay guard per row: an existing id is a
+        // no-op that records nothing — and keeps its original
+        // admission instant.
+        let mut recorded = Vec::with_capacity(job_events.len() + step_events.len());
+        {
             let mut state = self.inner.lock().expect("poisoned");
             let key = job_key(&job.id);
             let inserted = match state.jobs.entry(key.clone()) {
@@ -189,12 +250,15 @@ impl JobsRepository for InMemoryJobs {
             };
             if inserted {
                 state.job_created_at.insert(key, now);
+                recorded.extend_from_slice(job_events);
             }
-            inserted
-        };
-        if inserted {
-            self.record_all(events);
+            for (step, event) in steps.iter().zip(step_events) {
+                if insert_step_locked(&mut state, step, now) {
+                    recorded.push(event.clone());
+                }
+            }
         }
+        self.record_all(&recorded);
         Ok(())
     }
 
@@ -229,12 +293,12 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
-            // Mirror the Pg adapter: `simulated` is decided at
+            // Mirror the Pg adapter: the partition is decided at
             // admission and immutable — an update carries no
             // authority over it. The storage enforces this rather
             // than trusting every caller to.
             let mut next = job.clone();
-            next.simulated = existing.simulated;
+            next.partition = existing.partition;
             state.jobs.insert(key, next);
         }
         self.record_all(events);
@@ -278,10 +342,74 @@ impl JobsRepository for InMemoryJobs {
     }
 
     async fn list_estate_nodes(&self) -> Result<Vec<crate::port::EstateNode>, JobsError> {
-        // The estate is seeded by schema migration, so an in-memory
-        // registry genuinely has none — and saying so is better than
-        // inventing fixtures a test would then assert against.
-        Ok(Vec::new())
+        // Empty until a declaration lands, exactly as a fresh database
+        // is (backlog ee368d0c) — no invented fixtures a test would
+        // then assert against. The Pg read orders by (role, id).
+        let st = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("lock".into()))?;
+        let mut nodes = st.estate.clone();
+        nodes.sort_by(|a, b| (&a.role, &a.id).cmp(&(&b.role, &b.id)));
+        Ok(nodes)
+    }
+
+    async fn declare_estate_nodes(
+        &self,
+        declared: &[crate::port::EstateNodeInput],
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::port::EstateBatchOutcome, JobsError> {
+        let mut st = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("lock".into()))?;
+        let mut inserted = 0;
+        let mut roles_inserted = 0;
+        let mut events = Vec::new();
+        for n in declared {
+            let node_new = !st.estate.iter().any(|e| e.id == n.id);
+            if node_new {
+                st.estate.push(crate::port::EstateNode {
+                    id: n.id.clone(),
+                    label: n.label.clone(),
+                    address: n.address.clone(),
+                    role: n.role.clone(),
+                    roles: Vec::new(),
+                    cpu: n.cpu,
+                    memory_gb: n.memory_gb,
+                    disk_gb: n.disk_gb,
+                    notes: n.notes.clone(),
+                    retired: false,
+                });
+                inserted += 1;
+            }
+            let row = st
+                .estate
+                .iter_mut()
+                .find(|e| e.id == n.id)
+                .ok_or_else(|| JobsError::Storage("the node just landed".into()))?;
+            let landed: Vec<String> = n
+                .roles
+                .iter()
+                .filter(|r| !row.roles.contains(r))
+                .cloned()
+                .collect();
+            row.roles.extend(landed.iter().cloned());
+            row.roles.sort();
+            roles_inserted += landed.len();
+            if node_new || !landed.is_empty() {
+                events.push(crate::port::node_declared_event(
+                    stamp, n, node_new, &landed,
+                )?);
+            }
+        }
+        drop(st);
+        self.record_all(&events);
+        Ok(crate::port::EstateBatchOutcome {
+            received: declared.len(),
+            inserted,
+            roles_inserted,
+        })
     }
 
     async fn recent_events_by_kind(
@@ -484,27 +612,9 @@ impl JobsRepository for InMemoryJobs {
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        // Mirror the Pg replay guard: an existing id is a no-op that
-        // records nothing.
         let inserted = {
             let mut state = self.inner.lock().expect("poisoned");
-            let key = step_key(&step.id);
-            let inserted = match state.steps.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(_) => false,
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(step.clone());
-                    true
-                }
-            };
-            if inserted {
-                // Born ready IS the ready flip — same rule as the
-                // INSERT's CASE in the Pg adapter.
-                if step.status == StepStatus::Ready {
-                    state.step_ready_at.insert(key.clone(), now);
-                }
-                state.step_touched_at.insert(key, now);
-            }
-            inserted
+            insert_step_locked(&mut state, step, now)
         };
         if inserted {
             self.record_all(events);
@@ -723,7 +833,7 @@ impl JobsRepository for InMemoryJobs {
                     step_title: s.title.clone(),
                     status: s.status,
                     assignee_id: s.assignee_id.clone(),
-                    simulated: job.simulated,
+                    partition: job.partition,
                     since,
                     exact,
                 })
@@ -995,6 +1105,7 @@ pub fn compute_job_status(steps: &[Step]) -> JobStatus {
 #[cfg(test)]
 mod tests {
     use boss_core::job::{Priority, Subject};
+    use boss_core::partition::Partition;
     use chrono::{NaiveDate, TimeZone};
 
     use super::*;
@@ -1012,20 +1123,28 @@ mod tests {
     /// window exists to prevent, an order of magnitude worse. So the
     /// filter is asserted through `list_jobs`, including its total.
     #[tokio::test]
-    async fn simulated_partitions_both_the_rows_and_the_total() {
+    async fn partition_filters_both_the_rows_and_the_total() {
         let repo = InMemoryJobs::default();
         for i in 0..3 {
             let mut j = make_job("wholesale-keg-order");
-            j.simulated = true;
+            j.partition = Partition::Simulated;
             j.title = format!("sim {i}");
             repo.create_job(&j).await.expect("create sim");
         }
         let mut real = make_job("ship-a-change");
         real.title = "real one".into();
         repo.create_job(&real).await.expect("create real");
+        // A shadow packet (packet 508cc38c): excluded from the real
+        // lane exactly as a simulated one is, AND from the simulated
+        // lane — the sim never sees it (Q5). Only its own filter
+        // returns it.
+        let mut shadow = make_job("wholesale-keg-order");
+        shadow.partition = Partition::Shadow;
+        shadow.title = "shadow one".into();
+        repo.create_job(&shadow).await.expect("create shadow");
 
         let only_real = JobFilter {
-            simulated: Some(false),
+            partition: Some(Partition::Real),
             ..Default::default()
         };
         let (rows, total) = repo.list_jobs(&only_real, 50, 0).await.expect("list");
@@ -1037,12 +1156,21 @@ mod tests {
         assert_eq!(rows[0].title, "real one");
 
         let only_sim = JobFilter {
-            simulated: Some(true),
+            partition: Some(Partition::Simulated),
             ..Default::default()
         };
         let (rows, total) = repo.list_jobs(&only_sim, 50, 0).await.expect("list");
         assert_eq!(rows.len(), 3);
         assert_eq!(total, 3);
+
+        let only_shadow = JobFilter {
+            partition: Some(Partition::Shadow),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&only_shadow, 50, 0).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].title, "shadow one");
 
         // Absent means everything — every existing caller keeps its
         // answer, which is what makes this safe to land before any
@@ -1051,8 +1179,8 @@ mod tests {
             .list_jobs(&JobFilter::default(), 50, 0)
             .await
             .expect("list");
-        assert_eq!(rows.len(), 4);
-        assert_eq!(total, 4);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(total, 5);
     }
 
     fn make_job(kind: &str) -> Job {
@@ -1064,6 +1192,93 @@ mod tests {
             Priority::Standard,
             test_date(),
         )
+    }
+
+    /// A packet's metadata is the only place most of what a reader
+    /// wants to know lives — the car's branch, the alert's finding,
+    /// the train's outcome — and until 2026-09-14 (4d9aa761) the list
+    /// could not narrow on any of it, so every probe paged and
+    /// filtered afterwards, exact only while the page was bigger than
+    /// the world. These two filters are the in-memory half of the
+    /// `metadata @> $n` / `metadata ? $n` clauses; the Pg half is
+    /// tests/postgres_filter.rs. Both assert the total, because a
+    /// total that disagrees with the rows is the failure this exists
+    /// to remove.
+    fn make_job_with(kind: &str, metadata: serde_json::Value) -> Job {
+        let mut j = make_job(kind);
+        j.metadata = metadata;
+        j
+    }
+
+    #[tokio::test]
+    async fn metadata_has_keeps_only_packets_carrying_the_key() {
+        let repo = InMemoryJobs::new();
+        let mut with_key = make_job_with(
+            "estate-alert",
+            serde_json::json!({ "estate_finding": "disk-floor" }),
+        );
+        with_key.title = "carries it".into();
+        let mut other_key = make_job_with("estate-alert", serde_json::json!({ "branch": "x" }));
+        other_key.title = "other key".into();
+        // Null metadata is the seeded default and must not match —
+        // `Value::get` on a non-object is None, but say so in a test.
+        let mut bare = make_job("estate-alert");
+        bare.title = "no metadata".into();
+        for j in [&with_key, &other_key, &bare] {
+            repo.create_job(j).await.unwrap();
+        }
+
+        let filter = JobFilter {
+            metadata_has: Some("estate_finding".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(total, 1, "the total must reflect the key filter");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "carries it");
+
+        // A key nothing carries is an empty answer, not everything.
+        let filter = JobFilter {
+            metadata_has: Some("outcome".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn metadata_contains_narrows_to_the_matching_document() {
+        let repo = InMemoryJobs::new();
+        let mut car = make_job_with(
+            "ship-a-change",
+            serde_json::json!({ "branch": "feat/x", "outcome": "arrived" }),
+        );
+        car.title = "the car".into();
+        let mut twin = make_job_with(
+            "ship-a-change",
+            serde_json::json!({ "branch": "feat/y", "outcome": "arrived" }),
+        );
+        twin.title = "another car".into();
+        for j in [&car, &twin] {
+            repo.create_job(j).await.unwrap();
+        }
+
+        let filter = JobFilter {
+            metadata_contains: Some(serde_json::json!({ "branch": "feat/x" })),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "the car");
+
+        // Containment is AND across keys: both must hold on one packet.
+        let filter = JobFilter {
+            metadata_contains: Some(serde_json::json!({ "branch": "feat/y", "outcome": "lost" })),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
     }
 
     #[tokio::test]
@@ -1110,6 +1325,52 @@ mod tests {
         let (jobs, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(jobs[0].kind, "refurb");
+    }
+
+    /// `kinds` is a SET of kinds, and an empty set is an empty answer.
+    /// The department listing (cc76f755, 2026-09-18) resolves a
+    /// department to the kinds whose workflow declares it and asks for
+    /// exactly those; a department nobody declares resolves to no
+    /// kinds, and that must answer zero packets rather than fall
+    /// through to every packet — the trap the packet was filed on
+    /// (`?department=sales` answered the unfiltered 1944).
+    #[tokio::test]
+    async fn kinds_keeps_only_packets_of_the_named_kinds_and_none_for_no_kinds() {
+        let repo = InMemoryJobs::new();
+        for kind in ["receive-an-inquiry", "receive-a-sponsorship", "pr-train"] {
+            repo.create_job(&make_job(kind)).await.unwrap();
+        }
+
+        let sales = JobFilter {
+            kinds: Some(vec![
+                "receive-an-inquiry".into(),
+                "receive-a-sponsorship".into(),
+            ]),
+            ..Default::default()
+        };
+        let (jobs, total) = repo.list_jobs(&sales, 100, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert!(jobs.iter().all(|j| j.kind.starts_with("receive-")));
+
+        let nobody = JobFilter {
+            kinds: Some(vec![]),
+            ..Default::default()
+        };
+        let (jobs, total) = repo.list_jobs(&nobody, 100, 0).await.unwrap();
+        assert_eq!(
+            (jobs.len(), total),
+            (0, 0),
+            "no kinds is no packets, not every packet"
+        );
+
+        // Composes with `kind` as an intersection, not a union.
+        let both = JobFilter {
+            kind: Some("pr-train".into()),
+            kinds: Some(vec!["receive-an-inquiry".into()]),
+            ..Default::default()
+        };
+        let (_, total) = repo.list_jobs(&both, 100, 0).await.unwrap();
+        assert_eq!(total, 0);
     }
 
     // `opened_on` is a DATE. On 2026-09-07 one day held 398 closed
@@ -1348,6 +1609,10 @@ mod tests {
         assert!(!titles.contains(&"Stale bill"), "closed-job step excluded");
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|r| r.workflow == "ingredient-restock"));
+        // The row carries the packet's admission date: a personal queue
+        // reads "how long has this waited" off the row alone (65a89769,
+        // `boss orient` MY WORK), as it reads the title and priority.
+        assert!(rows.iter().all(|r| r.opened_on == job.opened_on));
     }
 
     #[tokio::test]
@@ -1357,7 +1622,7 @@ mod tests {
         let repo = InMemoryJobs::new();
         let mut sim = make_job("ingredient-restock");
         sim.status = JobStatus::Open;
-        sim.simulated = true;
+        sim.partition = Partition::Simulated;
         sim.tags = vec!["nightly".to_string()];
         repo.create_job(&sim).await.unwrap();
         let mut s = Step::new(sim.id, "procurement", "Place PO", 0).with_assignee("emp-1");
@@ -1376,20 +1641,78 @@ mod tests {
             .await
             .unwrap();
         let sim_row = rows.iter().find(|row| row.job_id == sim.id).unwrap();
-        assert!(sim_row.simulated, "simulated job's row reports it");
+        assert_eq!(
+            sim_row.partition,
+            Partition::Simulated,
+            "simulated job's row reports it"
+        );
         assert_eq!(sim_row.tags, vec!["nightly".to_string()]);
         let real_row = rows.iter().find(|row| row.job_id == real.id).unwrap();
-        assert!(!real_row.simulated, "a real job's row stays real");
+        assert_eq!(
+            real_row.partition,
+            Partition::Real,
+            "a real job's row stays real"
+        );
         assert!(real_row.tags.is_empty());
+        // The row's wire shape carries both keys: the sim workforce
+        // reads `partition` (Q5: it works the simulated company and
+        // nothing else), and an N-1 reader of the bool fails closed.
+        let wire = serde_json::to_value(sim_row).unwrap();
+        assert_eq!(wire["partition"], "simulated");
+        assert_eq!(wire["simulated"], true);
 
         // The sim workforce's bulk pull reads the same row shape.
         let bulk = repo.list_assigned_workable(100).await.unwrap();
-        assert!(
+        assert_eq!(
             bulk.iter()
                 .find(|row| row.job_id == sim.id)
                 .unwrap()
-                .simulated,
-            "bulk backlog rows carry the flag too"
+                .partition,
+            Partition::Simulated,
+            "bulk backlog rows carry the partition too"
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_rows_carry_the_cars_red_train_count() {
+        // A builder's own struck car was invisible on their My Day
+        // (d6e53a35, 2026-09-14): the assignments lens builds its card
+        // through the yard's one constructor, but the row it feeds in
+        // carried no job metadata, so `red_trains` read 0 there while
+        // the yard drew the same car struck. The count rides the row.
+        let repo = InMemoryJobs::new();
+        let mut struck = make_job_with("ship-a-change", serde_json::json!({ "red_trains": 2 }));
+        struck.status = JobStatus::Open;
+        repo.create_job(&struck).await.unwrap();
+        let mut s = Step::new(struck.id, "review", "Review", 0).with_assignee("emp-1");
+        s.status = StepStatus::Ready;
+        repo.add_step(&s).await.unwrap();
+
+        let mut clean = make_job("ship-a-change");
+        clean.status = JobStatus::Open;
+        repo.create_job(&clean).await.unwrap();
+        let mut c = Step::new(clean.id, "review", "Review", 0).with_assignee("emp-1");
+        c.status = StepStatus::Ready;
+        repo.add_step(&c).await.unwrap();
+
+        let rows = repo
+            .list_assignments(Some("emp-1"), &[], 100)
+            .await
+            .unwrap();
+        let struck_row = rows.iter().find(|row| row.job_id == struck.id).unwrap();
+        assert_eq!(struck_row.red_trains, 2, "a twice-struck car's row says so");
+        let clean_row = rows.iter().find(|row| row.job_id == clean.id).unwrap();
+        assert_eq!(clean_row.red_trains, 0, "no stamp reads as no strikes");
+
+        // The sim workforce's bulk pull reads the same row shape.
+        let bulk = repo.list_assigned_workable(100).await.unwrap();
+        assert_eq!(
+            bulk.iter()
+                .find(|row| row.job_id == struck.id)
+                .unwrap()
+                .red_trains,
+            2,
+            "bulk backlog rows carry the count too"
         );
     }
 

@@ -28,6 +28,7 @@
 // it is absent. `crew.test.ts` pins its absence.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { partitionOf, type Partition } from '@boss/web-kit/ui/packet-card';
 import { isHumanActor } from '../../data/actor';
 
 // ---------------------------------------------------------------------
@@ -108,6 +109,10 @@ export type Car = Readonly<{
   /// see `isBuilding`.
   branch: string | null;
   open: boolean;
+  /// The packet's partition (508cc38c), parsed at this boundary;
+  /// `simulated` is derived from it — not-real — so a shadow car sits
+  /// in the sim lane until car 4 draws it as its own.
+  partition: Partition;
   simulated: boolean;
   abandoned: boolean;
   /// The train this car boarded, when it has boarded one.
@@ -125,12 +130,14 @@ function parseJobLike(r: Record<string, unknown>): Car {
   const steps = Array.isArray(r.steps)
     ? (r.steps as ReadonlyArray<Record<string, unknown>>)
     : [];
-  const simulated = r.simulated === true;
+  const partition = partitionOf(r);
+  const simulated = partition !== 'real';
   return {
     id: str(r.id) ?? '',
     title: str(r.title) ?? '',
     branch: str(m.branch),
     open: str(r.status) === 'open',
+    partition,
     simulated,
     abandoned: m.abandoned === true,
     train: str(m.train),
@@ -286,6 +293,153 @@ export function parseYard(raw: unknown): YardLanes {
 }
 
 // ---------------------------------------------------------------------
+// Agent runs — `GET /api/jobs?kind=agent-run&status=open`
+// ---------------------------------------------------------------------
+
+/// One agent's run of one protocol step, as `boss dispatch` files it
+/// (design c87fb59b car 2, backlog 39d0b528): the packet it executes,
+/// the settings it launched under, where it runs, and the step the run
+/// itself is at. The FIRST first-party record of a build while it
+/// happens — until this kind existed the BUILDING lane above could only
+/// infer one from a branch with no gate-run behind it.
+export type AgentRun = Readonly<{
+  id: string;
+  title: string;
+  /// The job whose step this run executes, and that step's slug.
+  packet: string | null;
+  step: string | null;
+  /// The actor the run signs as.
+  agent: string | null;
+  model: string | null;
+  budgetUsd: number | null;
+  effort: string | null;
+  host: string | null;
+  /// The run's own open step (`briefed` / `building` / `reported`), or
+  /// `null` between states.
+  at: string | null;
+  openedAt: string | null;
+  /// The work-session the run was dispatched from (design 511fa7d4 car
+  /// 2b: written by `boss dispatch --from-hook`), or `null` for a run
+  /// dispatched by hand.
+  session: string | null;
+}>;
+
+export function parseAgentRuns(raw: unknown): ReadonlyArray<AgentRun> {
+  return rows(raw)
+    .map((r) => {
+      const m = meta(r);
+      const steps = Array.isArray(r.steps)
+        ? (r.steps as ReadonlyArray<Record<string, unknown>>)
+        : [];
+      const open = steps.find((s) => str(s.status) === 'ready' || str(s.status) === 'active');
+      return {
+        id: str(r.id) ?? '',
+        title: str(r.title) ?? '',
+        packet: str(m.packet),
+        step: str(m.step),
+        agent: str(m.agent),
+        model: str(m.model),
+        budgetUsd: num(m.budget_usd),
+        effort: str(m.effort),
+        host: str(m.host),
+        at: open ? str(open.spec_slug) : null,
+        openedAt: str(m.opened_at) ?? str(r.opened_on),
+        session: str(m.session),
+      };
+    })
+    .filter((a) => a.id !== '');
+}
+
+// ---------------------------------------------------------------------
+// Sessions — `GET /api/jobs?kind=work-session&status=open`
+// ---------------------------------------------------------------------
+
+/// One operator's session, as the SessionStart hook files it and the
+/// prompt hook heartbeats it (design 511fa7d4 car 2b, backlog
+/// da925366). The shop floor: sessions are the crews, and the runs
+/// linked to a session are the cars that crew is building.
+export type Session = Readonly<{
+  id: string;
+  title: string;
+  actor: string | null;
+  host: string | null;
+  cwd: string | null;
+  startedAt: string | null;
+  /// The heartbeat — the last prompt's instant. `null` until the first
+  /// prompt after SessionStart.
+  lastActiveAt: string | null;
+  promptCount: number | null;
+  /// Agent-tool calls the dispatch hook could parse no packet from.
+  untrackedRuns: number | null;
+}>;
+
+export function parseSessions(raw: unknown): ReadonlyArray<Session> {
+  return rows(raw)
+    .map((r) => {
+      const m = meta(r);
+      return {
+        id: str(r.id) ?? '',
+        title: str(r.title) ?? '',
+        actor: str(m.actor),
+        host: str(m.host),
+        cwd: str(m.cwd),
+        startedAt: str(m.started_at) ?? str(m.opened_at),
+        lastActiveAt: str(m.last_active_at),
+        promptCount: num(m.prompt_count),
+        untrackedRuns: num(m.untracked_runs),
+      };
+    })
+    .filter((s) => s.id !== '');
+}
+
+/// A session with the runs it dispatched. `idle` is the design's own
+/// threshold — silent past an hour, measured from the heartbeat (or the
+/// start, before the first prompt) — and `null` when there is no clock
+/// to measure against: an unknown is never drawn as "at work".
+export type Crew = Readonly<{
+  session: Session;
+  runs: ReadonlyArray<AgentRun>;
+  idle: boolean | null;
+}>;
+
+/// Silent past this many milliseconds, a crew is drawn idle. The clock
+/// rule ends a session at six hours; an hour is where the board stops
+/// calling it "working".
+export const IDLE_AFTER_MS = 60 * 60 * 1000;
+
+const epoch = (iso: string | null): number | null => {
+  if (iso === null) return null;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : null;
+};
+
+/// Sessions folded with their runs, oldest session first, plus the runs
+/// no listed session claims — a hand dispatch, or a session outside the
+/// read window — which the runs table still shows.
+export function crews(
+  sessions: ReadonlyArray<Session>,
+  runs: ReadonlyArray<AgentRun>,
+  now: string | null,
+): Readonly<{ crews: ReadonlyArray<Crew>; unlinked: ReadonlyArray<AgentRun> }> {
+  const nowMs = epoch(now);
+  const ids = new Set(sessions.map((s) => s.id));
+  const folded = [...sessions]
+    .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''))
+    .map((session) => {
+      const since = epoch(session.lastActiveAt) ?? epoch(session.startedAt);
+      return {
+        session,
+        runs: runs.filter((r) => r.session === session.id),
+        idle: nowMs === null || since === null ? null : nowMs - since > IDLE_AFTER_MS,
+      };
+    });
+  return {
+    crews: folded,
+    unlinked: runs.filter((r) => r.session === null || !ids.has(r.session)),
+  };
+}
+
+// ---------------------------------------------------------------------
 // Waits — `GET /api/jobs/queue-age`
 // ---------------------------------------------------------------------
 
@@ -302,6 +456,7 @@ export type Wait = Readonly<{
   assigneeId: string | null;
   waitingDays: number;
   exact: boolean;
+  partition: Partition;
   simulated: boolean;
   since: string | null;
 }>;
@@ -318,7 +473,8 @@ export function parseWaits(raw: unknown): ReadonlyArray<Wait> {
       assigneeId: str(r.assignee_id),
       waitingDays: num(r.waiting_days) ?? 0,
       exact: r.exact === true,
-      simulated: r.simulated === true,
+      partition: partitionOf(r),
+      simulated: partitionOf(r) !== 'real',
       since: str(r.since),
     }))
     .filter((w) => w.jobId !== '');
@@ -683,14 +839,21 @@ export type CrewState = Readonly<{
   gateRuns: Exclude<Remote<ReadonlyArray<GateRun>>, { kind: 'loading' }>;
   yard: Exclude<Remote<YardLanes>, { kind: 'loading' }>;
   waits: Exclude<Remote<ReadonlyArray<Wait>>, { kind: 'loading' }>;
+  /// OPEN runs only: a run that landed, was refused or died is history
+  /// the packet's own page tells; this board is about now.
+  agentRuns: Exclude<Remote<ReadonlyArray<AgentRun>>, { kind: 'loading' }>;
+  /// OPEN sessions: the crews on the floor right now.
+  sessions: Exclude<Remote<ReadonlyArray<Session>>, { kind: 'loading' }>;
 }>;
 
 export async function fetchCrew(): Promise<CrewState> {
-  const [cars, gateRuns, yard, waits] = await Promise.all([
+  const [cars, gateRuns, yard, waits, agentRuns, sessions] = await Promise.all([
     fetchRemote(`/api/jobs?kind=ship-a-change&limit=${CAR_WINDOW}`, parseCars),
     fetchRemote(`/api/jobs?kind=gate-run&limit=${CAR_WINDOW}`, parseGateRuns),
     fetchRemote('/api/yard/status', parseYard),
     fetchRemote('/api/jobs/queue-age', parseWaits),
+    fetchRemote(`/api/jobs?kind=agent-run&status=open&limit=${CAR_WINDOW}`, parseAgentRuns),
+    fetchRemote(`/api/jobs?kind=work-session&status=open&limit=${CAR_WINDOW}`, parseSessions),
   ]);
-  return { cars, gateRuns, yard, waits };
+  return { cars, gateRuns, yard, waits, agentRuns, sessions };
 }

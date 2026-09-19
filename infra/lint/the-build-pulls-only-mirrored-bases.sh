@@ -36,8 +36,13 @@
 # NOT covered: they are the operator's deployment, not the pipeline.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
-REGISTRY="10.20.0.15:3000"
+# The registry, from the one tree source (infra/estate/estate.toml,
+# backlog 5222163e) — never typed here.
+REGISTRY=$(sed -n 's/^forge_registry = "\(.*\)"[[:space:]]*$/\1/p' infra/estate/estate.toml | sed -n 1p)
+[ -n "$REGISTRY" ] || { echo "the-build-pulls-only-mirrored-bases: infra/estate/estate.toml names no forge_registry" >&2; exit 1; }
 FORGE_BASE="$REGISTRY/david"
 # Repos this pipeline pushes: built by build-image, never mirrored.
 BUILT_REPOS="boss-ci boss"
@@ -160,7 +165,7 @@ check_tree() {
                 rest="${ref#"$FORGE_BASE"/}"
                 repo="${rest%%:*}"; repo="${repo%%@*}"; repo="${repo%%/*}"
                 for b in $BUILT_REPOS; do [ "$repo" = "$b" ] && continue 2; done
-                if ! printf '%s\n' "$mirrored" | grep -qxF -- "$rest"; then
+                if ! grep -qxF -- "$rest" <<< "$mirrored"; then
                     echo "$file:$line: $ref is a forge tag nothing mirrors — add '<external ref>|$rest' to $MIRROR's IMAGES list and run the mirror-base-images verb before referencing it"
                     found=$((found + 1))
                 fi ;;
@@ -285,5 +290,6 @@ if [ "$rc" -ne 0 ]; then
 fi
 n=$(( $(ci_images "$WORKFLOW" | wc -l) + $(dockerfile_refs "$DOCKERFILE" | wc -l) ))
 for m in "${MANIFESTS[@]}"; do n=$(( n + $(manifest_images "$m" | wc -l) )); done
+lint_scanned the-build-pulls-only-mirrored-bases "$n" "image ref(s) across $WORKFLOW, $DOCKERFILE and ${#MANIFESTS[@]} gate-runner manifest(s)"
 echo "the-build-pulls-only-mirrored-bases: self-test ok — a public ref, an inline container ref, a public services image, a public manifest image and an unmirrored forge tag are refused by name and line; $n ref(s) across $WORKFLOW, $DOCKERFILE and ${#MANIFESTS[@]} gate-runner manifest(s) are forge tags the mirror list carries or this pipeline builds"
 exit 0

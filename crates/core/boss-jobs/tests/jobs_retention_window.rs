@@ -92,6 +92,7 @@ fn app_at(today: NaiveDate) -> (Router, Arc<InMemoryJobs>) {
         clock,
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -124,7 +125,7 @@ fn feedback(n: u8, status: JobStatus, closed_on: Option<NaiveDate>) -> Job {
         closed_on,
         metadata: serde_json::Value::Null,
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 

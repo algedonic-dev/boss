@@ -25,12 +25,16 @@
 #
 # WHAT IT CHECKS
 #   1. the converge script + unit pair exist, and the script is runnable
-#   2. `boss-gcp-converge` is a TIMERS row — the loop that does the
+#   2. `boss-gcp-converge` is a roles.toml row — the loop that does the
 #      installing is installed BY the thing it runs, so after the one
 #      bootstrap no unit on this host ever needs a hand again
-#   3. `deploy-services.sh units` installs every TIMERS unit pair into a
-#      scratch root with a stub systemctl, enables every timer, reloads
-#      — and stages no binary, converges no schema, restarts nothing
+#   3. `install-units.sh units` installs every roles.toml unit pair into
+#      a scratch root with a stub systemctl, enables every timer, reloads
+#      — and stages no binary, converges no schema, restarts nothing.
+#      (The installer was the `units` mode of the bare-metal
+#      deploy-services.sh until 2026-09-18, when that path was deleted,
+#      e109bd71; its rows were a TIMERS array pinned equal to roles.toml
+#      by this lint, and roles.toml is now the one roster.)
 #   4. the loop converges from the FORGE, never from the GitHub mirror
 #   5. a dirty checkout is refused with the tree untouched
 #   6. a clean checkout fast-forwards to forge main and drives the
@@ -62,7 +66,7 @@ set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 converge="$repo/infra/gcp/boss-gcp-converge.sh"
-deploy="$repo/infra/deploy-services.sh"
+installer="$repo/infra/gcp/install-units.sh"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -74,9 +78,13 @@ for ext in service timer; do
 done
 
 # 2. The loop installs itself.
-rows=$(sed -n '/^TIMERS=(/,/^)/p' "$deploy" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"')
-printf '%s\n' "$rows" | grep -qx 'boss-gcp-converge:gcp' \
-    || fail "boss-gcp-converge is not a TIMERS row in deploy-services.sh — the converge
+[ -x "$installer" ] || fail "$installer is missing or not executable"
+rows=$(BOSS_REPO_ROOT="$repo" bash "$installer" rows 2>/dev/null | grep -E '^[a-z0-9-]+:[^:]+$')
+[ -n "$rows" ] || fail "install-units.sh rows printed nothing — roles.toml names no unit,
+    or the mode broke, and a green result here would mean nothing"
+command -v jq >/dev/null || fail "jq is required to check the run summary and the roles read"
+grep -qx 'boss-gcp-converge:gcp' <<< "$rows" \
+    || fail "boss-gcp-converge is not a roles.toml row carried under infra/gcp — the converge
     would install every OTHER unit and never itself, so the one hand-install would have
     to be repeated after every rebuild. That is the bootstrap treadmill this ends."
 
@@ -99,7 +107,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # ---------------------------------------------------------------------
-# 3. THE INSTALLER PATH: `deploy-services.sh units`.
+# 3. THE INSTALLER PATH: `install-units.sh units`.
 # ---------------------------------------------------------------------
 mkdir -p "$tmp/etc" "$tmp/bin"
 cat >"$tmp/bin/systemctl" <<'STUB'
@@ -124,16 +132,37 @@ mkdir -p "$tmp/unitlib" "$tmp/empty-unitlib" "$tmp/etc-absent"
 # UNITS_REPO_ROOT and UNITS_SUMMARY are read from the environment rather
 # than taken as arguments so the three original call sites read as they
 # did; check 10 sets them.
+# THE ADDRESS FILE the installers read (infra/lib/sor.sh): on the host
+# the converge renders /etc/boss/sor.env from infra/estate/estate.toml
+# before the installer runs; here it is rendered once into the scratch
+# root, from the same source, and every run below is pointed at it. The
+# ops-runner installer refuses without it — by design, so a host with
+# no address gets no runner (backlog 5222163e). NAMED, not merely
+# present: a file named with BOSS_SOR_ENV replaces whatever address the
+# process environment carries (infra/lib/sor.sh), which is what makes
+# this check the same in every environment — the conductor pod runs the
+# consist check with BOSS_JOBS_URL set to the cluster-internal service
+# and no /etc/boss/sor.env, and on 2026-09-18 that refused a car here
+# because the installer reported the pod's address instead of the
+# file's. The expected answer below is read off the file, never the
+# environment, for the same reason.
+sor_env="$tmp/sor.env"
+bash "$repo/infra/estate/render-sor-env.sh" --to "$sor_env" >/dev/null \
+    || fail "infra/estate/render-sor-env.sh could not render the address file from infra/estate/estate.toml"
+export BOSS_SOR_ENV="$sor_env"
+sor_url=$(sed -n 's/^BOSS_JOBS_URL=//p' "$sor_env")
+[ -n "$sor_url" ] || fail "the rendered address file names no BOSS_JOBS_URL"
+
 units_run() { # <systemctl-log> <etc> <unit-lib> <outfile>
     STUB_LOG="$1" INSTALL_ETC="$2" INSTALL_SYSTEMCTL="$tmp/bin/systemctl" \
         INSTALL_APT_GET="$tmp/bin/apt-get" INSTALL_UNIT_LIB="$3" \
-        BOSS_REPO_ROOT="${UNITS_REPO_ROOT:-$repo}" BOSS_DEPLOY_ENV=/dev/null \
+        BOSS_REPO_ROOT="${UNITS_REPO_ROOT:-$repo}" \
         BOSS_RUN_SUMMARY_FILE="${UNITS_SUMMARY:-}" \
-        bash "$deploy" units >"$4" 2>&1
+        bash "$installer" units >"$4" 2>&1
 }
 
 if ! units_run "$tmp/systemctl.log" "$tmp/etc" "$tmp/unitlib" "$tmp/units.out"; then
-    echo "FAIL: deploy-services.sh units exited non-zero in the scratch run:" >&2
+    echo "FAIL: install-units.sh units exited non-zero in the scratch run:" >&2
     cat "$tmp/units.out" >&2
     exit 1
 fi
@@ -144,9 +173,10 @@ units_fail() { echo "FAIL: $*" >&2; echo "--- units-mode output:" >&2; cat "$tmp
 installed=0
 for row in $rows; do
     stem="${row%%:*}"; sub="${row##*:}"
-    [ "$sub" = "." ] && src="$repo/infra" || src="$repo/infra/$sub"
     # A row whose source files do not exist is check 1 of
     # timers-leave-a-packet's business, not this one's.
+    [ "$sub" = "missing" ] && continue
+    [ "$sub" = "." ] && src="$repo/infra" || src="$repo/infra/$sub"
     [ -f "$src/$stem.service" ] && [ -f "$src/$stem.timer" ] || continue
     for ext in service timer; do
         [ -f "$tmp/etc/$stem.$ext" ] \
@@ -154,9 +184,15 @@ for row in $rows; do
     done
     grep -q "enable --now $stem.timer" "$tmp/systemctl.log" \
         || units_fail "$stem.timer was not enabled by the units mode"
-    [ -f "$tmp/etc/$stem.service.d/jobs-url.conf" ] \
-        || units_fail "$stem got no jobs-url drop-in — boss-maintenance-wrap.sh refuses
-    without BOSS_JOBS_URL and every packet fails to open (timers-leave-a-packet check 5)"
+    # NO jobs-url DROP-IN. Until 2026-09-18 every row got an
+    # `Environment=BOSS_JOBS_URL=http://127.0.0.1:7900` drop-in — the
+    # second stack, retired 2026-09-15. Every unit still in a role pins
+    # the system of record inline (timers-leave-a-packet check 7); a
+    # drop-in naming a port nothing listens on is a wrong target one
+    # layer down, and this asserts the installer writes none.
+    [ ! -e "$tmp/etc/$stem.service.d/jobs-url.conf" ] \
+        || units_fail "$stem got a jobs-url drop-in — the localhost stack it named was retired
+    on 2026-09-15; the unit pins the system of record inline and the drop-in is dead"
     installed=$((installed + 1))
 done
 [ "$installed" -ge 10 ] \
@@ -180,6 +216,85 @@ for word in "stage" "converge schema" "health probes" "activate generation"; do
     grep -qi -- "$word" "$tmp/units.out" \
         && units_fail "the units mode ran '$word' — it must install unit files only"
 done
+
+# ---------------------------------------------------------------------
+# 3b. A HOST INSTALLS THE ROWS ITS ROLES NAME, AND REPORTS THE REST.
+#
+# Design 9e3e093f: a node declares its roles as registry data and
+# infra/estate/roles.toml maps each role to its stems — and since
+# 2026-09-18 roles.toml IS the roster (the equality pin that held it to
+# a TIMERS array is collapsed, CLAUDE.md §9a). With BOSS_NODE_ROLES set,
+# the units mode installs ONLY the named rows plus `always`, prints NOT
+# IN ROLE for each of the others by name, enables none of those, and
+# counts them on the packet — while with no roles at all it installs
+# every row (check 3 above ran exactly that). A stem named under two
+# roles is the installer's own refusal (exit 78), exercised below.
+# ---------------------------------------------------------------------
+roles_toml="$repo/infra/estate/roles.toml"
+[ -f "$roles_toml" ] || fail "infra/estate/roles.toml is missing — the role -> units map"
+timer_stems=$(printf '%s\n' $rows | cut -d: -f1 | sort)
+dup_toml="$tmp/roles-dup.toml"
+{ cat "$roles_toml"; printf '\n[roles.lint-dup]\nunits = ["boss-gcp-converge"]\n'; } >"$dup_toml"
+if out=$(BOSS_REPO_ROOT="$repo" BOSS_ROLES_TOML="$dup_toml" bash "$installer" rows 2>&1); then
+    fail "the installer answered a roles.toml naming boss-gcp-converge under two roles:
+$out
+    One role owns each row, or 'not in role' has two answers."
+fi
+grep -q "boss-gcp-converge" <<<"$out" \
+    || fail "the refusal of a twice-named stem does not name the stem: $out"
+
+# The installer under roles: legacy-stack only, so the observer and the
+# ML batch (other roles) must be reported, not installed.
+mkdir -p "$tmp/etc-roles"
+: >"$tmp/systemctl-roles.log"
+# THE FOUR ROLES THE HOST DECLARED ON 2026-09-12 FIRST — including one
+# that maps to NO units (wireguard-bastion: `units = []`). A fixture, not
+# the live set: legacy-stack left boss-gcp's node_roles on 2026-09-14
+# (d5941ef3 car 3) and stays in roles.toml as vocabulary, so this still
+# exercises a role with units beside an empty one. Measured 2026-09-12 18:55Z on
+# boss-gcp, three converges in a row: the roles read worked, the
+# installer printed its header and died with exit 1 and not one more
+# line, because `role_units` piped awk into `grep -oE '"[^"]+"'`, an
+# empty units list gave grep nothing to match, and `set -euo pipefail`
+# ended the script on that exit 1. The lint below had only ever run
+# with BOSS_NODE_ROLES=legacy-stack, a role with units.
+mkdir -p "$tmp/etc-all"
+: >"$tmp/systemctl-all.log"
+sum_all="$tmp/summary-all-roles.json"
+BOSS_NODE_ROLES=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion UNITS_SUMMARY="$sum_all" \
+    units_run "$tmp/systemctl-all.log" "$tmp/etc-all" "$tmp/unitlib" "$tmp/units-all.out" \
+    || { cat "$tmp/units-all.out" >&2; fail "units mode with the host's four roles (one with units = []) exited non-zero — an empty role must install nothing, not kill the converge"; }
+# Those four roles plus [always] name the whole roles.toml roster, so
+# every stem must land — the empty role adds nothing and removes nothing.
+for stem in $timer_stems; do
+    [ -f "$tmp/etc-all/$stem.service" ] || fail "$stem was not installed under boss-gcp's own four roles (one of them empty)"
+done
+
+sum_roles="$tmp/summary-roles.json"
+BOSS_NODE_ROLES=legacy-stack UNITS_SUMMARY="$sum_roles" \
+    units_run "$tmp/systemctl-roles.log" "$tmp/etc-roles" "$tmp/unitlib" "$tmp/units-roles.out" \
+    || { cat "$tmp/units-roles.out" >&2; fail "units mode with BOSS_NODE_ROLES=legacy-stack exited non-zero"; }
+touch "$tmp/systemctl-roles.log"
+in_role=$(awk '$0=="[always]"||$0=="[roles.legacy-stack]"{on=1;next} /^\[/{on=0} on&&/^units/' "$roles_toml" | grep -oE '"[^"]+"' | tr -d '"')
+for stem in $timer_stems; do
+    if grep -qxF "$stem" <<<"$in_role"; then
+        [ -f "$tmp/etc-roles/$stem.service" ] || fail "$stem is in the legacy-stack/always roster and was NOT installed under BOSS_NODE_ROLES=legacy-stack"
+    else
+        [ -f "$tmp/etc-roles/$stem.service" ] && fail "$stem is outside the legacy-stack roster and was installed anyway under BOSS_NODE_ROLES=legacy-stack"
+        grep -q "NOT IN ROLE $stem" "$tmp/units-roles.out" \
+            || fail "$stem is outside the roster and the units mode did not REPORT it by name (NOT IN ROLE $stem)"
+        grep -q "enable --now $stem.timer" "$tmp/systemctl-roles.log" \
+            && fail "$stem is outside the roster and was still ENABLED"
+    fi
+done
+not_in_role=$(grep -c 'NOT IN ROLE ' "$tmp/units-roles.out" || true)
+[ "$not_in_role" -ge 1 ] || fail "BOSS_NODE_ROLES=legacy-stack reported nothing as NOT IN ROLE — the observer and the ML batch are outside it"
+[ "$(jq -r '.units_not_in_role // ""' "$sum_roles")" = "$not_in_role" ] \
+    || fail "the summary says units_not_in_role='$(jq -r '.units_not_in_role // ""' "$sum_roles")'; the run reported $not_in_role — the packet must carry the count a reader with no host access needs"
+[ "$(jq -r '.node_roles // ""' "$sum_roles")" = "legacy-stack" ] \
+    || fail "the summary does not record which roles the roster was derived from"
+grep -q 'NOT IN ROLE boss-estate-observe-host' "$sum_roles" \
+    || fail "the summary's anomalies do not name the observer as NOT IN ROLE — a report that reaches only the journal is a report a reader without host access never sees"
 
 # ---------------------------------------------------------------------
 # 8. THE JOURNAL READ DOOR (:19531), CONVERGED.
@@ -245,9 +360,8 @@ grep -q 'journal read door' "$tmp/units-absent.out" \
 # human. It rides this mode, from the same ONE definition the forge
 # installer uses (infra/ops/install-ops-runner.sh).
 #
-# THE FAILURE THIS SECTION EXISTS FOR is the invisible one. This mode
-# writes every TIMERS row a `jobs-url.conf` drop-in naming
-# `127.0.0.1:<jobs port>` — on THIS host the legacy second stack, not
+# THE FAILURE THIS SECTION EXISTS FOR is the invisible one. boss-gcp's
+# `127.0.0.1:7900` was the legacy second stack (retired 2026-09-15), not
 # the system of record. A runner pointed there finds no ops-request
 # packets, exits 0 every minute and looks healthy forever: a wrong
 # target answers instead of erroring (CLAUDE.md §Doors). So the
@@ -272,9 +386,18 @@ grep -qx 'Environment=HOST_ID=boss-gcp' "$dropin" \
     || units_fail "the drop-in does not name this host: $(cat "$dropin")"
 grep -qx 'ExecStart=' "$dropin" \
     || units_fail "the drop-in does not clear the unit's ExecStart before overriding it"
-grep -qx "ExecStart=/usr/bin/env BOSS_JOBS_URL=http://10.20.0.34:7900 $repo/infra/ops/ops-runner.sh" "$dropin" \
-    || units_fail "the drop-in does not run the runner from THIS checkout with the cluster
-    pinned inline by env(1): $(cat "$dropin")"
+grep -qx "ExecStart=$repo/infra/ops/ops-runner.sh" "$dropin" \
+    || units_fail "the drop-in does not run the runner from THIS checkout: $(cat "$dropin")"
+# The address the unit reads is the FILE's, not a drop-in's: the unit
+# carries EnvironmentFile=/etc/boss/sor.env (which outranks any
+# Environment= drop-in) and the installer checked that file before it
+# wrote anything.
+grep -qx 'EnvironmentFile=/etc/boss/sor.env' "$tmp/etc/boss-ops-runner.service" \
+    || units_fail "boss-ops-runner.service does not read /etc/boss/sor.env — the unit would start
+    with no system of record, or with whatever a stale drop-in still says"
+grep -q "reporting to $sor_url" "$tmp/units.out" \
+    || units_fail "the ops-runner installer did not report the address it checked ($sor_url):
+$(grep -n 'install-ops-runner' "$tmp/units.out")"
 # THE NEGATIVE. `127.0.0.1` anywhere in what configures this runner is
 # the legacy stack, and the failure it causes is silent.
 # Directive lines only: the unit's own comments explain this very trap
@@ -286,15 +409,14 @@ if printf '%s\n' "$ops_conf" | grep -n '127\.0\.0\.1'; then
     is the LEGACY second stack (91ddebfb), not the system of record. The runner would poll it,
     find no ops-request packets, exit 0 every minute and look healthy forever."
 fi
-# AND IT IS NOT A TIMERS ROW, deliberately. A row would earn it that
-# 127.0.0.1 drop-in and would owe timers-leave-a-packet.sh a
-# maintenance-wrap packet pair — which this unit must not have: it
-# fires every minute, its product IS packets, and a packet per firing
-# would drown the board (infra/ops/ops-runner.sh's header).
-printf '%s\n' "$rows" | grep -q 'boss-ops-runner' \
-    && units_fail "boss-ops-runner is a TIMERS row. It must be installed from its own block:
-    as a row it would get the legacy 127.0.0.1 jobs-url drop-in and would owe a
-    maintenance-wrap packet pair it deliberately does not have."
+# AND IT IS NOT A roles.toml ROW, deliberately. A row would owe
+# timers-leave-a-packet.sh a maintenance-wrap packet pair — which this
+# unit must not have: it fires every minute, its product IS packets, and
+# a packet per firing would drown the board (infra/ops/ops-runner.sh's
+# header).
+grep -q 'boss-ops-runner' <<< "$rows" \
+    && units_fail "boss-ops-runner is a roles.toml row. It must be installed from its own block:
+    as a row it would owe a maintenance-wrap packet pair it deliberately does not have."
 
 # ---------------------------------------------------------------------
 # 10. THE PACKET SAYS WHAT IT INSTALLED.
@@ -305,7 +427,7 @@ printf '%s\n' "$rows" | grep -q 'boss-ops-runner' \
 # question that mattered next — did it actually install? — took filing
 # an ops-request, reading 200 journal lines off the host and parsing
 # them by hand, and in the meantime the estate unit observer (whose
-# roster is the TIMERS array, which this unit deliberately is not in)
+# roster is roles.toml, which this unit deliberately is not in)
 # was read as saying the unit was absent. It was not absent. A reader
 # with no host access could not tell "installed 14 pairs" from
 # "installed 12 and skipped 2", so the wrong conclusion was available
@@ -318,13 +440,12 @@ printf '%s\n' "$rows" | grep -q 'boss-ops-runner' \
 # boss-step.sh merges onto the `run` step. The full log stays in the
 # journal; the packet carries the counted shape and the anomalies.
 #
-# A SKIP IS LOUD, NOT FATAL: a TIMERS row whose unit files this commit
+# A SKIP IS LOUD, NOT FATAL: a roles.toml row whose unit files this commit
 # does not carry is a legitimate state (observe-units.sh derives its
 # roster by skipping exactly those), and failing the converge over one
 # would stop the other thirteen pairs converging. It must be IN THE
 # RECORD, with the name, which is what this asserts.
 # ---------------------------------------------------------------------
-command -v jq >/dev/null || fail "jq is required to check the run summary"
 sum="$tmp/summary.json"
 mkdir -p "$tmp/etc-sum"
 UNITS_SUMMARY="$sum" units_run "$tmp/systemctl-sum.log" "$tmp/etc-sum" "$tmp/unitlib" "$tmp/units-sum.out" \
@@ -368,7 +489,7 @@ sum_skip="$tmp/summary-skip.json"
 mkdir -p "$tmp/etc-skip"
 if ! UNITS_SUMMARY="$sum_skip" UNITS_REPO_ROOT="$partial" \
     units_run "$tmp/systemctl-skip.log" "$tmp/etc-skip" "$tmp/unitlib" "$tmp/units-skip.out"; then
-    echo "FAIL: the units mode FAILED because one TIMERS row's files were absent:" >&2
+    echo "FAIL: the units mode FAILED because one roles.toml row's files were absent:" >&2
     cat "$tmp/units-skip.out" >&2
     echo "    A skip must be loud in the record, not fatal — failing here would stop the" >&2
     echo "    other $((installed - 1)) pairs converging over a row this commit does not carry." >&2
@@ -379,7 +500,7 @@ sum="$sum_skip"; sum_out="$tmp/units-skip.out"
     || sum_fail "one pair was missing and the summary does not say units_skipped=1"
 [ "$(jq -r '.units_installed // ""' "$sum_skip")" = "$((installed - 1))" ] \
     || sum_fail "units_installed did not drop by one when a pair was skipped"
-jq -r '.anomalies // ""' "$sum_skip" | grep -q "$skip_stem" \
+grep -q "$skip_stem" <<<"$(jq -r '.anomalies // ""' "$sum_skip")" \
     || sum_fail "the skipped unit ($skip_stem) is not NAMED in the summary's anomalies.
     'something was skipped' sends the reader back to the host, which is the cost this
     whole check removes."
@@ -440,7 +561,7 @@ if out=$(resolve "$mirror"); then
     mirror. The mirror lags the forge by a publish and is never the source of truth; a
     converge that reads it installs yesterday's units and says it converged."
 fi
-printf '%s' "$out" | grep -qi "github" \
+grep -qi "github" <<<"$out" \
     || fail "the refusal does not name the mirror it refused: $out"
 
 # 4c. an explicit override is honoured; a bogus one is refused.
@@ -457,7 +578,7 @@ fi
 # ---------------------------------------------------------------------
 cat >"$tmp/bin/installer-ok" <<'STUB'
 #!/usr/bin/env bash
-echo "stub installer: args=$*" >>"$STUB_CALLS"
+echo "stub installer: args=$* roles=${BOSS_NODE_ROLES-unset}" >>"$STUB_CALLS"
 echo "units: 14 timer unit pair(s) installed and enabled"
 exit 0
 STUB
@@ -469,9 +590,33 @@ echo "DISTINCTIVE-FAILURE-DETAIL: migration 202609 refused"
 exit 3
 STUB
 chmod +x "$tmp/bin/installer-ok" "$tmp/bin/installer-bad"
+# The CLI step (infra/estate/install-cli-from-image.sh, 6f58e9a1) runs
+# after the units with the converged sha; here it is a stub that records
+# the sha it was handed, so this lint stays about the loop. The step's
+# own behaviour — the registry pull, generations, confirmation, the packet fields —
+# is crates/core/boss-testing/tests/install_cli_from_image_sh.rs.
+cat >"$tmp/bin/cli-installer-ok" <<'STUB'
+#!/usr/bin/env bash
+echo "stub cli installer: sha=$*" >>"$STUB_CALLS"
+echo "install-cli-from-image: CONFIRMED (stub)"
+exit 0
+STUB
+chmod +x "$tmp/bin/cli-installer-ok"
 
+# The registry the converge reads its roles from is a FILE here — the
+# harness never touches the network — shaped like /api/estate/nodes.
+nodes_json="$tmp/nodes.json"
+cat >"$nodes_json" <<'JSON'
+{"data":[{"id":"boss-gcp","role":"bastion","roles":["legacy-stack","ml-batch-host","off-cluster-observer","wireguard-bastion"]},
+         {"id":"w-1","role":"talos-worker","roles":[]}]}
+JSON
 run_converge() { # <dir> <installer> -> output; returns the script's status
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
+        BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
+        BOSS_GCP_CONVERGE_CLI_INSTALLER="$tmp/bin/cli-installer-ok" \
+        BOSS_NODE_ID="${CONVERGE_NODE_ID:-boss-gcp}" \
+        BOSS_ESTATE_NODES_URL="${CONVERGE_NODES_URL:-file://$nodes_json}" \
+        BOSS_NODE_ROLES_CACHE="${CONVERGE_ROLES_CACHE:-$tmp/roles.cache}" \
         STUB_CALLS="$tmp/calls.log" bash "$converge" 2>&1
 }
 
@@ -488,7 +633,7 @@ grep -q "local edit nobody committed" "$dirty/file" \
     || fail "the converge DISCARDED an uncommitted local change — it must refuse, never clobber"
 [ ! -s "$tmp/calls.log" ] \
     || fail "the converge installed units from a dirty tree: $(cat "$tmp/calls.log")"
-printf '%s' "$out" | grep -q "$dirty" \
+grep -q "$dirty" <<<"$out" \
     || fail "the refusal does not name the checkout an operator has to look at:
 $out"
 
@@ -520,10 +665,15 @@ $out"
     detached HEAD on a hand-operated host is a surprise nobody asked for."
 grep -q "args=units" "$tmp/calls.log" \
     || fail "the converge did not drive the installer's units mode (calls: $(cat "$tmp/calls.log"))"
-printf '%s' "$out" | grep -q "${want:0:8}" \
+# The CLI step runs AFTER the units, with the sha the tree now sits at.
+grep -q "sha=$want" "$tmp/calls.log" \
+    || fail "the converge did not hand the CLI step the converged sha $want (calls: $(cat "$tmp/calls.log"))"
+[ "$(head -n 1 "$tmp/calls.log")" = "stub installer: args=units roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" ] \
+    || fail "the CLI step must run after the units, never instead of them (calls: $(cat "$tmp/calls.log"))"
+grep -q "${want:0:8}" <<<"$out" \
     || fail "the converge does not say which commit it converged on:
 $out"
-printf '%s' "$out" | grep -q "14 timer unit pair" \
+grep -q "14 timer unit pair" <<<"$out" \
     || fail "the installer's own summary is not in the converge's output — print what it did:
 $out"
 
@@ -536,17 +686,70 @@ grep -q "args=units" "$tmp/calls.log" \
     || fail "the second pass skipped the installer. A unit removed by hand must come back
     on the next tick even when main has not moved: that is what converge means."
 
+# 6b. THE HOST'S ROLES REACH THE INSTALLER, read off the registry — and
+#     a registry that does not answer leaves them empty, installs every
+#     row, and says so, instead of stopping the converge.
+grep -q "roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
+    || fail "the converge did not hand boss-gcp's declared roles to the installer as BOSS_NODE_ROLES (calls: $(cat "$tmp/calls.log"))"
+grep -q "declares roles: legacy-stack" <<<"$out" \
+    || fail "the converge does not say which roles it read:
+$out"
+: >"$tmp/calls.log"
+out=$(CONVERGE_NODE_ID=w-1 run_converge "$clean" "$tmp/bin/installer-ok") \
+    || fail "the converge failed for a node that declares no roles:
+$out"
+grep -q "roles=$" "$tmp/calls.log" \
+    || fail "a node with no declared roles must reach the installer with BOSS_NODE_ROLES empty, so every row installs (calls: $(cat "$tmp/calls.log"))"
+# A DARK REGISTRY NEVER WIDENS WHAT THE HOST RUNS (6cd124c4). The read
+# above was remembered in the scratch cache; with the registry dark the
+# converge installs THAT declaration and says it is cached. With no cache
+# at all it installs [always] only — the sentinel `registry-unread`
+# matches no roles.toml section — never every row, which until
+# 2026-09-14 is what a dark tick did.
+: >"$tmp/calls.log"
+out=$(CONVERGE_NODES_URL="file://$tmp/no-such-registry.json" run_converge "$clean" "$tmp/bin/installer-ok") \
+    || fail "an unreachable registry STOPPED the converge — an arm that needs the patient is not an arm:
+$out"
+grep -q "roles=$" "$tmp/calls.log" \
+    || fail "w-1's cached declaration is EMPTY (it declares no roles), so a dark tick installs every row as its last read did (calls: $(cat "$tmp/calls.log"))"
+grep -q "cached declaration" <<<"$out" \
+    || fail "the converge does not say w-1's empty roles came from the cache:
+$out"
+: >"$tmp/calls.log"
+out=$(CONVERGE_NODE_ID=boss-gcp CONVERGE_ROLES_CACHE="$tmp/roles.cache.gcp" run_converge "$clean" "$tmp/bin/installer-ok") \
+    || fail "the boss-gcp read that seeds the cache failed:
+$out"
+[ -s "$tmp/roles.cache.gcp" ] || fail "a successful roles read was not remembered in the cache"
+: >"$tmp/calls.log"
+out=$(CONVERGE_NODE_ID=boss-gcp CONVERGE_ROLES_CACHE="$tmp/roles.cache.gcp" CONVERGE_NODES_URL="file://$tmp/no-such-registry.json" run_converge "$clean" "$tmp/bin/installer-ok") \
+    || fail "an unreachable registry STOPPED the converge that had a cache:
+$out"
+grep -q "roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
+    || fail "a dark registry must drive the installer with the CACHED declaration (calls: $(cat "$tmp/calls.log"))"
+grep -q "cached declaration" <<<"$out" \
+    || fail "the converge does not say the roles came from the cache:
+$out"
+: >"$tmp/calls.log"
+out=$(CONVERGE_NODE_ID=boss-gcp CONVERGE_ROLES_CACHE="$tmp/roles.cache.none" CONVERGE_NODES_URL="file://$tmp/no-such-registry.json" run_converge "$clean" "$tmp/bin/installer-ok") \
+    || fail "an unreachable registry with no cache STOPPED the converge:
+$out"
+grep -q "roles=registry-unread" "$tmp/calls.log" \
+    || fail "a dark registry with no cache must install [always] only (roles=registry-unread), never every row (calls: $(cat "$tmp/calls.log"))"
+grep -q "did not answer" <<<"$out" \
+    || fail "the converge does not say the registry did not answer:
+$out"
+
 # 7. A failed install prints EVERY line the installer wrote.
 : >"$tmp/calls.log"
 if out=$(run_converge "$clean" "$tmp/bin/installer-bad"); then
     fail "the converge reported success over an installer that exited 3:
 $out"
 fi
-printf '%s' "$out" | grep -q "DISTINCTIVE-FAILURE-DETAIL" \
+grep -q "DISTINCTIVE-FAILURE-DETAIL" <<<"$out" \
     || fail "the failure output does not carry what the installer said. A tail, a -q or a
     digest suppresses OUTPUT, not work: capture to a file and print it ALL on failure.
 $out"
-printf '%s' "$out" | grep -q "LINE-ONE-OF-MANY" \
+grep -q "LINE-ONE-OF-MANY" <<<"$out" \
     || fail "only part of the installer's output survived — no tails (CLAUDE.md §Diagnosis)
 $out"
 
@@ -564,7 +767,11 @@ $out"
 sum_conv="$tmp/summary-converge.json"
 run_converge_sum() { # <dir> <installer>
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
+        BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
+        BOSS_GCP_CONVERGE_CLI_INSTALLER="$tmp/bin/cli-installer-ok" \
         BOSS_RUN_SUMMARY_FILE="$sum_conv" \
+        BOSS_NODE_ID=boss-gcp BOSS_ESTATE_NODES_URL="file://$nodes_json" \
+        BOSS_NODE_ROLES_CACHE="$tmp/roles.cache.sum" \
         STUB_CALLS="$tmp/calls.log" bash "$converge" 2>&1
 }
 conv_fail() { echo "FAIL: $*" >&2; echo "--- summary ($sum_conv):" >&2
@@ -608,5 +815,5 @@ fi
     || conv_fail "a failed converge lost the sha it was installing from — record each fact
     as soon as it is known, not at the end of a run that may not get there"
 
-echo "boss-gcp-converges-itself: ok — $installed timer pairs install from \`deploy-services.sh units\` (the converge's own among them, nothing restarted), the journal read door on :19531 comes up with it and cannot abort it, the ops-request runner lands with HOST_ID=boss-gcp, this checkout and the CLUSTER as its system of record (never the legacy 127.0.0.1 stack) without being a TIMERS row, the loop converges from the forge and refuses the mirror, refuses a dirty tree, fast-forwards and drives the installer idempotently, prints every line of a failed install, and leaves its packet a counted summary — units installed/skipped with every skip named, the ops runner's and the read door's own verdicts, the sha and remote it converged from, the installer's exit on failure, and nothing at all from a previous run"
+echo "boss-gcp-converges-itself: ok — $installed timer pairs install from \`install-units.sh units\` (roles.toml is the one roster, the converge's own row among them, nothing restarted, no localhost drop-in), the journal read door on :19531 comes up with it and cannot abort it, the ops-request runner lands with HOST_ID=boss-gcp, this checkout and the CLUSTER as its system of record (never the legacy 127.0.0.1 stack) without being a roles.toml row, the loop converges from the forge and refuses the mirror, refuses a dirty tree, fast-forwards and drives the installer idempotently, prints every line of a failed install, and leaves its packet a counted summary — units installed/skipped with every skip named, the ops runner's and the read door's own verdicts, the sha and remote it converged from, the installer's exit on failure, and nothing at all from a previous run"
 exit 0

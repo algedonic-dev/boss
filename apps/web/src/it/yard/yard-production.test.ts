@@ -25,11 +25,13 @@ const yardOf = (over: Partial<YardState> = {}): YardState => ({
   },
   arrivals: [],
   cancelled: [],
+  withdrawn: [],
   delivery: [],
   awaitingProof: [],
   publishing: [],
   cars: [],
   packets: { trains: [], gateRuns: [] },
+  day: null,
   ...over,
 });
 
@@ -46,11 +48,13 @@ const statusOf = (over: Partial<YardStatus> = {}): YardStatus => ({
   limbo: [],
   policy: { stall_hours: 2, max_red_trains: 2 },
   conductor: null,
+  gate_runs: null,
+  sidings: [],
   now: '2026-09-08T02:35:20Z',
   ...over,
 });
 
-const car = (id: string): CarRow => ({ id, kind: 'ship-a-change', branch: `fix/${id}`, title: id, tags: [], sim: false, skipReason: null, head: null });
+const car = (id: string): CarRow => ({ id, kind: 'ship-a-change', branch: `fix/${id}`, title: id, tags: [], sim: false, skipReason: null, head: null, deliveryChannel: 'software' });
 
 const landed = (id: string, at: string, nCars: number, outcome: TrainRow['outcome'] = 'arrived'): TrainRow => ({
   id,
@@ -87,6 +91,54 @@ describe('production — today, from the arrivals the page already holds', () =>
       NOW,
     );
     expect(p).toMatchObject({ day: '2026-09-08', carsLanded: 3, carsWindowed: false, trainsArrived: 2, trainsCancelled: 1, trainsWindowed: false });
+  });
+
+  // THE DAY FROM THE RECORD (2026-09-11). The tile counted over the
+  // five-train arrivals window and rendered '≥ 5' on a day the system of
+  // record closed 29 arrived trains with 66 cars — a floor read as the
+  // day's total. When the yard carries the record's own day page
+  // (`/api/jobs?kind=pr-train&closed_within=0`, today on the
+  // authoritative clock), the tile counts THAT, and '≥' means the page
+  // itself was cut off, not that the window was.
+  test('counts the day from the record when the yard carries it, not from the five-train window', () => {
+    const d = '2026-09-08';
+    const trains = Array.from({ length: 29 }, (_, i) =>
+      landed(`t${i}`, `${d}T${String(i % 24).padStart(2, '0')}:10:00Z`, i % 3 === 0 ? 3 : 2),
+    );
+    const cancelled = [landed('x1', `${d}T01:00:00Z`, 1, 'cancelled')];
+    const yard = yardOf({
+      arrivals: trains.slice(0, ARRIVALS_SHOWN),
+      cancelled: [],
+      day: { arrived: trains, cancelled, complete: true },
+    });
+    const p = production(yard, statusOf(), NOW);
+    expect(p.trainsArrived).toBe(29);
+    expect(p.trainsCancelled).toBe(1);
+    expect(p.carsLanded).toBe(trains.reduce((n, t) => n + t.cars.length, 0));
+    expect(p.carsWindowed).toBe(false);
+    expect(p.trainsWindowed).toBe(false);
+    expect(p.source).toBe('record');
+    // the chart follows the day too, not the window
+    expect(p.perHour.reduce((a, b) => a + b, 0)).toBe(p.carsLanded);
+  });
+
+  test('a day page the server cut off is a floor, and says so', () => {
+    const d = '2026-09-08';
+    const trains = Array.from({ length: 7 }, (_, i) => landed(`t${i}`, `${d}T0${i}:00:00Z`, 2));
+    const yard = yardOf({ arrivals: trains.slice(0, ARRIVALS_SHOWN), day: { arrived: trains, cancelled: [], complete: false } });
+    const p = production(yard, statusOf(), NOW);
+    expect(p.trainsArrived).toBe(7);
+    expect(p.trainsWindowed).toBe(true);
+    expect(p.carsWindowed).toBe(true);
+  });
+
+  test('without a day page (an older server, a failed read) the window still answers, as a floor', () => {
+    const d = '2026-09-08';
+    const trains = Array.from({ length: ARRIVALS_SHOWN }, (_, i) => landed(`t${i}`, `${d}T0${i}:00:00Z`, 2));
+    const p = production(yardOf({ arrivals: trains, day: null }), statusOf(), NOW);
+    expect(p.trainsArrived).toBe(ARRIVALS_SHOWN);
+    expect(p.trainsWindowed).toBe(true);
+    expect(p.source).toBe('window');
   });
 
   test('a full window whose oldest train is still today may be cut off, and says so', () => {

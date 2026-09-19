@@ -10,7 +10,7 @@
 # reachable host has kubectl, therefore nobody has one", which was
 # sound and wrong.
 #
-# `deploy-services.sh` owns systemd units on boss-gcp. Nothing owned
+# `install-units.sh` owns systemd units on boss-gcp. Nothing owned
 # `infra/cluster/manifests/`, so "merged" and "running" were different
 # states with no observer. This is the observer.
 #
@@ -48,8 +48,26 @@
 # Other kinds stay existence-only — a full drift diff is `kubectl diff`
 # and needs write-shaped permission this credential does not have.
 #
+# AN INSTANCE THE CONVERGE SKIPPED IS NOT MISSING (backlog 07d7549c;
+# measured on the forge journal 2026-09-16 06:06Z, main b4d7a0fd). The
+# converge skips an instance whose Secrets are not minted yet, whole and
+# by name (cluster-deploy-runner.sh, `instances_skipped`); as first
+# landed this check was not told, walked the rendered set, and reported
+# the skipped playground's 21 objects MISSING — `60 present, 21 missing`,
+# exit 1, `result: exit-code` on the converge packet (b7026689), on
+# every train until the ceremony. The skip was right; the check had not
+# learned it. So the runner hands this check its `instances_skipped`
+# field, verbatim — BOSS_INSTANCES_SKIPPED="<ns> (<reason>: …)[; <ns>
+# (…)]", the ONE string the packet carries — and an object ABSENT from a
+# namespace named there is counted `skipped` (with the instance and the
+# reason), not `missing`. A skipped instance's object that IS present
+# counts present: the skip explains an absence, it does not excuse a
+# read. A skip the converge did not declare is still a miss, and a miss
+# in an applied instance still fails beside the skip.
+#
 # EXIT CODES
-#   0  every object present, and every RBAC object matches the tree
+#   0  every object present — or absent only in an instance the converge
+#      declared skipped — and every RBAC object matches the tree
 #   1  something in the tree is not in the cluster, or differs from it
 #   2  cannot reach the cluster (no credential, no kubectl) — NOT
 #      confused with "nothing is applied", because reporting a missing
@@ -59,12 +77,28 @@
 # RUN IT with a credential that can read the namespaces in question.
 # The boss-dev session credential is namespace-scoped and cannot read
 # cluster-scoped objects (Namespace, StorageClass) — those are
-# reported as skipped rather than passed, so a narrow credential
+# reported as unreadable rather than passed, so a narrow credential
 # cannot produce a falsely green run.
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
 DIR="infra/cluster/manifests"
+
+# WHAT THE TREE DECLARES is the RENDERED set, not the directory (backlog
+# 07d7549c): the directory is written for prod, and every instance in
+# infra/cluster/instances.toml is that directory rendered with its own
+# namespace, tenant, sim flag and hostname — which is exactly what the
+# converge applies. So this walks the same render the converge applied,
+# one directory per namespace, and a playground object that is missing
+# is reported by name like a prod one. The render refuses (exit 2) a
+# manifest the roster does not classify; a refusal here is 'unknown',
+# not 'clean', for the same reason a missing credential is.
+RENDERED=$(mktemp -d) || exit 2
+trap 'rm -rf "$RENDERED"' EXIT
+if ! "$DIR/../render-instance.sh" --all "$RENDERED"; then
+    echo "check-manifests-applied: the instance render refused — cannot say what the tree declares." >&2
+    exit 2
+fi
 
 command -v kubectl >/dev/null 2>&1 || {
     echo "check-manifests-applied: kubectl not found — cannot verify." >&2
@@ -80,7 +114,7 @@ fi
 # kind/name/namespace for every document, via kubectl's own parser so
 # this does not grow a YAML implementation.
 inventory=$(
-    for f in "$DIR"/*.yaml; do
+    for f in "$RENDERED"/*/*.yaml; do
         [ -f "$f" ] || continue
         # No {range .items[*]}: kubectl emits one JSON document per
         # object, not a List, so the template applies per document.
@@ -152,6 +186,13 @@ for f in FIELDS:
 PY
 }
 
+# skip_reason NS — the reason the converge gave for skipping NS, or
+# nothing when NS was not skipped. The parse of BOSS_INSTANCES_SKIPPED
+# is shared with render-tunnel-config.sh, which reads the same string
+# for the same reason (40d46042): one parser, sourced.
+# shellcheck source=infra/cluster/instances-skipped.lib.sh
+. infra/cluster/instances-skipped.lib.sh
+
 total=$(printf '%s\n' "$inventory" | grep -c . || true)
 if [ "$total" -lt 5 ]; then
     echo "check-manifests-applied: only parsed $total object(s) from $DIR —" >&2
@@ -159,9 +200,14 @@ if [ "$total" -lt 5 ]; then
     exit 2
 fi
 
-missing=0; skipped=0; present=0; drifted=0
+missing=0; skipped=0; unreadable=0; present=0; drifted=0
+skipped_in=""   # "<ns>: <reason>" per skipped instance with an absence, for the summary
 while IFS=$'\t' read -r file kind name ns; do
     [ -n "$kind" ] || continue
+    # The instance this object was rendered FOR: the render writes each
+    # namespace's copy into its own directory, and a Namespace object
+    # carries no namespace of its own.
+    instance="${file%/*}"; instance="${instance##*/}"
     if [ -n "$ns" ]; then
         args=(-n "$ns")
     else
@@ -175,22 +221,31 @@ while IFS=$'\t' read -r file kind name ns; do
             Role|ClusterRole|RoleBinding|ClusterRoleBinding)
                 why=$(rbac_drift "$kind" "$name" "$ns" "$file")
                 if [ -n "$why" ]; then
-                    echo "  DRIFT   $kind/$name${ns:+ (ns $ns)} — $why from $file" >&2
+                    echo "  DRIFT   $kind/$name${ns:+ (ns $ns)} — $why from $DIR/${file##*/} (rendered for ${file%/*})" >&2
                     drifted=$((drifted + 1))
                 fi
                 ;;
         esac
-    elif printf '%s' "$out" | grep -qiE 'forbidden|cannot list|cannot get'; then
+    elif grep -qiE 'forbidden|cannot list|cannot get' <<<"$out"; then
         # Not visible to THIS credential. Say so; never count it green.
         echo "  skip    $kind/$name${ns:+ (ns $ns)} — not readable by this credential"
+        unreadable=$((unreadable + 1))
+    elif why=$(skip_reason "$instance") && [ -n "$why" ]; then
+        # Absent from an instance the converge did not apply — expected,
+        # named, and counted apart from a miss.
+        echo "  skip    $kind/$name${ns:+ (ns $ns)} — instance $instance skipped by the converge ($why)"
         skipped=$((skipped + 1))
+        case "$skipped_in" in
+            *"$instance: "*) ;;
+            *) skipped_in="${skipped_in:+$skipped_in, }$instance: $why" ;;
+        esac
     else
         echo "  MISSING $kind/$name${ns:+ (ns $ns)}" >&2
         missing=$((missing + 1))
     fi
 done <<< "$inventory"
 
-echo "check-manifests-applied: $present present, $missing missing, $drifted drifted, $skipped unreadable (of $total)"
+echo "check-manifests-applied: $present present, $missing missing, $skipped skipped${skipped_in:+ ($skipped_in)}, $drifted drifted, $unreadable unreadable (of $total)"
 if [ "$missing" -gt 0 ]; then
     echo "  A manifest in the tree is not in the cluster. Apply it, or delete it —" >&2
     echo "  a file that describes nothing running is worse than no file, because" >&2
@@ -210,8 +265,8 @@ fi
 # same false comfort this whole script was written against — a green
 # result must mean verified, so a partial view exits 2 (unknown) and
 # names the number.
-if [ "$skipped" -gt 0 ]; then
-    echo "  $skipped of $total objects were not readable by this credential, so this" >&2
+if [ "$unreadable" -gt 0 ]; then
+    echo "  $unreadable of $total objects were not readable by this credential, so this" >&2
     echo "  run verified $present. That is 'unknown', not 'clean' — rerun with a" >&2
     echo "  credential that can read them before believing the cluster matches." >&2
     exit 2

@@ -11,6 +11,7 @@
   // There is deliberately no kind match here — the
   // no-step-kind-match lint fails the build if one returns.
 
+  import type { Component } from 'svelte';
   import GenericSurface from './GenericSurface.svelte';
   import DecisionContext from './DecisionContext.svelte';
   import StepProcedure from './StepProcedure.svelte';
@@ -35,7 +36,9 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
-  import type { StepStatus } from '../jobs/types';
+  import { isTerminal, type StepStatus } from '../jobs/types';
+  import { failedVerb, failedVerbPhrase } from './failedVerb';
+  import { href, navigate } from '../router';
 
   type StepData = {
     id: string;
@@ -111,6 +114,38 @@
       ? { id: session.value.user.id, role: session.value.user.role }
       : undefined,
   );
+
+  // The surface-id → component table the file header promises. Keyed
+  // by the SURFACE id the registry names for a kind (never the kind),
+  // and absent for 'generic' — the fallback is not a row, it is what
+  // renders when there is none. This was an eleven-arm if/else chain;
+  // it became a table when the generic fallback started taking the
+  // decision-context panel as children (feedback 26ae4d44), which
+  // needed one place that says "platform surface or not".
+  type SurfaceProps = { step: StepData; jobId: string; onUpdate: () => void };
+  const PLATFORM_SURFACES: Readonly<Record<string, Component<SurfaceProps>>> = {
+    approval: ApprovalSurface,
+    repair: RepairSurface,
+    inspection: InspectionSurface,
+    billing: BillingSurface,
+    intake: IntakeSurface,
+    shipment: ShipmentSurface,
+    scheduling: SchedulingSurface,
+    'production-consume': ProductionConsumeSurface,
+    handoff: HandoffSurface,
+    receiving: ReceivingSurface,
+    procurement: ProcurementSurface,
+  };
+  let Platform = $derived(PLATFORM_SURFACES[surfaceOf(step.kind)] ?? null);
+
+  // The verb this step waited on FAILED and the step is still open
+  // (backlog 074e1287): the dispatcher's note is on the metadata, the
+  // alert it filed is a packet, and until now neither reached the
+  // surface — publish 254177e2's open-pr read as any ready step for
+  // hours. A terminal step's note is history and stays in its
+  // metadata; an OPEN one is trouble and is drawn as such.
+  let failure = $derived(isTerminal(step.status) ? null : failedVerb(step.metadata));
+  const packetLink = (id: string) => href(`/jobs/${id}`);
 </script>
 
 <!-- Every step surface — platform, generic fallback, and mounted
@@ -119,6 +154,37 @@
      StepFocusPage, DecideModal all mount it), so gating HERE is the
      one edit instead of one per surface. -->
 <WriteGate>
+{#if failure}
+  <!-- Same voice as a failed registry read: the record's own words,
+       in the error colour, with the packets to open. The line is the
+       verb's, verbatim — a troubled packet must look troubled
+       (CLAUDE.md §Diagnosis), and no paraphrase beats the receipt. -->
+  <p class="load-failed" role="alert" data-testid="step-failed-verb">
+    {failedVerbPhrase(failure)}
+    {#if failure.alert}
+      {@const alert = failure.alert}
+      · alert
+      <a
+        href={packetLink(alert)}
+        onclick={(e) => {
+          e.preventDefault();
+          navigate(packetLink(alert));
+        }}>{alert.slice(0, 8)}</a
+      >
+    {/if}
+    {#if failure.source}
+      {@const request = failure.source}
+      · request
+      <a
+        href={packetLink(request)}
+        onclick={(e) => {
+          e.preventDefault();
+          navigate(packetLink(request));
+        }}>{request.slice(0, 8)}</a
+      >
+    {/if}
+  </p>
+{/if}
 <!-- The step's authored instructions, above BOTH sides of the plugin
      fork (backlog 3c640ac3). The decision panel below is exempt for
      plugin-backed steps because a mounted plugin is its own
@@ -159,32 +225,17 @@
        which doesn't seem like much of a choice"). A mounted plugin is
        its own presentation, so the panel lives on this side of the
        fork — once, for every platform surface and the generic
-       fallback alike. -->
-  <DecisionContext {step} {jobId} />
-  {#if surfaceOf(step.kind) === 'approval'}
-    <ApprovalSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'repair'}
-    <RepairSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'inspection'}
-    <InspectionSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'billing'}
-    <BillingSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'intake'}
-    <IntakeSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'shipment'}
-    <ShipmentSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'scheduling'}
-    <SchedulingSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'production-consume'}
-    <ProductionConsumeSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'handoff'}
-    <HandoffSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'receiving'}
-    <ReceivingSurface {step} {jobId} {onUpdate} />
-  {:else if surfaceOf(step.kind) === 'procurement'}
-    <ProcurementSurface {step} {jobId} {onUpdate} />
+       fallback alike. The generic surface takes it as children so it
+       lands INSIDE the card, under the step's title and above its
+       form: title, case, answer, in that order (feedback 26ae4d44). -->
+  {#snippet theCase()}
+    <DecisionContext {step} {jobId} />
+  {/snippet}
+  {#if Platform}
+    {@render theCase()}
+    <Platform {step} {jobId} {onUpdate} />
   {:else}
-    <GenericSurface {step} {jobId} {onUpdate} />
+    <GenericSurface {step} {jobId} {onUpdate}>{@render theCase()}</GenericSurface>
   {/if}
 {/if}
 

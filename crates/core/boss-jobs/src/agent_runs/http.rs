@@ -6,7 +6,8 @@
 //! deploys is a record nobody can file.
 //!
 //! **Every route, the POST included, admits the same two categories as
-//! the cadence surface: operator tier, or a trusted internal caller.**
+//! the cadence surface: operator tier, or a trusted internal caller** —
+//! and the three reads admit the auditor tier besides ([`can_read`]).
 //! An internal caller is one that arrived with no `x-boss-user` header
 //! at all, which the extractor reports as `role=guest` — a loopback
 //! sibling or a test harness, never a browser, because the gateway
@@ -33,7 +34,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use boss_policy_client::{AccessTier, CurrentUser, User};
+use boss_policy_client::CurrentUser;
+
+use crate::trust::{can_read, is_trusted};
 
 use super::port::{AgentRunError, AgentRunLog};
 use super::types::{AgentRun, NewAgentRun, RunFilter, RunSummary, summarize};
@@ -42,14 +45,10 @@ pub struct AgentRunsApiState {
     pub log: Arc<dyn AgentRunLog>,
 }
 
-/// Same two categories the cadence door admits: an operator-tier
-/// caller, or a trusted internal one (the extractor defaults to
-/// `role=guest` when no `x-boss-user` header arrived, i.e. a loopback
-/// sibling or a test harness; the gateway always injects the header for
-/// external requests).
-fn is_trusted(user: &User) -> bool {
-    user.role == "guest" || user.access_tier == AccessTier::Operator
-}
+// Who this door admits lives in `crate::trust` (839335b7): this door
+// was the first to learn (2026-09-15) that its reads must admit the
+// auditor tier the recorded-probe reader carries, and the other four
+// operator doors had not — so the predicate pair moved out.
 
 pub fn router(state: AgentRunsApiState) -> Router {
     let shared = Arc::new(state);
@@ -63,6 +62,21 @@ pub fn router(state: AgentRunsApiState) -> Router {
 fn err_response(e: AgentRunError) -> Response {
     match e {
         AgentRunError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+        // 409, the status every other refused-by-state write on this
+        // service answers with (a terminal step, incomplete sign-offs):
+        // the report was well-formed, and the record's state — the
+        // actor's spend against its cap — is what refused it. The body
+        // is the decision, not a bare string, so a caller can show it.
+        AgentRunError::Denied { reason } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "run refused against the actor's budget",
+                "budget": { "kind": "deny", "reason": reason },
+                "hint": "the refusal is on the log as agents.run.denied; \
+                         the window rolls an hour after the spend it counted",
+            })),
+        )
+            .into_response(),
         AgentRunError::Storage(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
@@ -120,7 +134,7 @@ async fn list_runs(
     CurrentUser(user): CurrentUser,
     Query(q): Query<RunQuery>,
 ) -> Response {
-    if !is_trusted(&user) {
+    if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.log.list_runs(&q.into()).await {
@@ -162,7 +176,7 @@ async fn cost(
     CurrentUser(user): CurrentUser,
     Query(q): Query<RunQuery>,
 ) -> Response {
-    if !is_trusted(&user) {
+    if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let job_id = q.job_id;
@@ -185,7 +199,7 @@ async fn rate_card(
     State(state): State<Arc<AgentRunsApiState>>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    if !is_trusted(&user) {
+    if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.log.rate_card().await {
@@ -218,6 +232,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use boss_core::actor::ActorId;
+    use boss_policy_client::{AccessTier, User};
     use chrono::Duration;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -258,6 +273,7 @@ mod tests {
             finished_at: finished,
             outcome: RunOutcome::Success,
             error: None,
+            model: None,
             tokens: TokenUsage::TotalOnly { total: 134_392 },
             tool_calls: 70,
             job_id: None,
@@ -267,11 +283,39 @@ mod tests {
     }
 
     async fn app() -> Router {
-        let log = InMemoryAgentRuns::new(card());
+        // The registry's one live row, as 20260915212644 seeds it.
+        let log =
+            InMemoryAgentRuns::new(card()).with_registered_agent("agent-claude", "opus-5[1m]");
         log.record_run(&a_run(), &ActorId::Automation("platform".into()))
             .await
             .expect("the fixture run records");
         router(AgentRunsApiState { log: Arc::new(log) })
+    }
+
+    async fn post(
+        path: &str,
+        body: serde_json::Value,
+        user: Option<String>,
+    ) -> (StatusCode, String) {
+        let mut req = Request::post(path).header("content-type", "application/json");
+        if let Some(u) = user {
+            req = req.header("x-boss-user", u);
+        }
+        let resp = (app().await)
+            .oneshot(
+                req.body(Body::from(body.to_string()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("the router answers");
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body collects")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn header(role: &str, tier: AccessTier) -> String {
@@ -338,6 +382,40 @@ mod tests {
         }
     }
 
+    /// The recorded-probe reader (boss-cli prove.rs, the unattended door:
+    /// role `audit-readonly`, tier `auditor`) reads every surface and
+    /// writes none — the same door `/api/events/*` already opens to
+    /// that tier. Found 2026-09-15 by rehearsing this car's probe:
+    /// `boss-sor-read /api/agent-runs` answered 403, so no car could
+    /// ever prove a claim about a run through the one reader a probe
+    /// is allowed to use.
+    #[tokio::test]
+    async fn the_probe_reader_reads_every_surface_and_cannot_write() {
+        let auditor = header("audit-readonly", AccessTier::Auditor);
+        for path in READS {
+            let (status, body) = get(path, Some(auditor.clone())).await;
+            assert_eq!(status, StatusCode::OK, "`{path}`: {body}");
+        }
+        let (status, body) = post(
+            "/api/agent-runs",
+            serde_json::json!({
+                "run_id": "run-auditor",
+                "actor_id": "agent-claude",
+                "started_at": "2026-09-15T22:00:00Z",
+                "finished_at": "2026-09-15T22:10:00Z",
+                "outcome": "success",
+                "total_tokens": 1
+            }),
+            Some(auditor),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an auditor is a reader; the record is written by operators: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn a_user_tier_employee_is_refused() {
         for path in READS {
@@ -377,17 +455,86 @@ mod tests {
             "fix/the-branch-sweep-inspects-every-landed-car"
         );
         assert_eq!(row["total_tokens"], 134_392);
+        // The model is its own key on every row the list serves — this
+        // one resolved out of the legacy colon form at record time.
+        assert_eq!(row["model"], "opus-5[1m]", "body: {body}");
         // A bare total cannot be priced, and the row says so rather
         // than reporting a dollar figure it does not have.
         assert!(row["usd_micros"].is_null(), "body: {body}");
     }
 
+    /// The shape the design decided (6fda05ae): a registered agent's
+    /// id, model-free, with the model a fact about the run — from the
+    /// body when it says, from the agent row's default when it does
+    /// not. Posted through the door, read back off the answer.
+    #[tokio::test]
+    async fn a_registered_agents_report_carries_its_model_or_takes_the_default() {
+        let user = Some(header("platform-admin", AccessTier::Operator));
+        let report = |run_id: &str, model: Option<&str>| {
+            serde_json::json!({
+                "run_id": run_id,
+                "actor_id": "agent-claude",
+                "model": model,
+                "started_at": "2026-09-15T22:00:00Z",
+                "finished_at": "2026-09-15T22:10:00Z",
+                "outcome": "success",
+                "total_tokens": 1000,
+                "tool_calls": 1
+            })
+        };
+
+        let (status, body) = post(
+            "/api/agent-runs",
+            report("run-says", Some("haiku-4-5")),
+            user.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let out: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(out["run"]["actor_id"], "agent-claude");
+        assert_eq!(
+            out["run"]["model"], "haiku-4-5",
+            "the report's own word: {body}"
+        );
+
+        let (status, body) = post("/api/agent-runs", report("run-silent", None), user).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let out: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            out["run"]["model"], "opus-5[1m]",
+            "the agent row's default: {body}"
+        );
+    }
+
+    /// A registered id no `agents` row backs, reporting no model, is a
+    /// 400 that names both fixes — not a row with a NULL model.
+    #[tokio::test]
+    async fn an_unregistered_agents_silent_report_is_refused_naming_the_fixes() {
+        let (status, body) = post(
+            "/api/agent-runs",
+            serde_json::json!({
+                "run_id": "run-nobody",
+                "actor_id": "agent-nobody",
+                "started_at": "2026-09-15T22:00:00Z",
+                "finished_at": "2026-09-15T22:10:00Z",
+                "outcome": "success",
+                "total_tokens": 1000
+            }),
+            Some(header("platform-admin", AccessTier::Operator)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("agent-nobody"), "{body}");
+        assert!(body.contains("register the agent"), "{body}");
+    }
+
     /// The roll-up a cost surface would read. It already groups by
-    /// model and by branch; `by_actor` is absent on purpose — the model
-    /// key IS parsed out of `actor_id`, so under today's
-    /// `<mode>:<model>` vocabulary the two groupings have the same
-    /// buckets, and `actor_id` is a filter parameter on the list for
-    /// the narrower question.
+    /// model and by branch; `by_actor` is absent on purpose — every
+    /// live row is one actor (`agent-claude`, or its colon-form
+    /// spelling on older rows), so an actor grouping would be one
+    /// bucket, and `actor_id` is a filter parameter on the list for
+    /// the narrower question. The model bucket reads the run's own
+    /// `model` column since design 6fda05ae.
     #[tokio::test]
     async fn the_cost_read_names_the_filter_it_summed() {
         let (status, body) = get(
@@ -404,6 +551,91 @@ mod tests {
         assert_eq!(out["summary"]["runs"], 1);
         assert_eq!(out["summary"]["by_model"][0]["key"], "opus-5[1m]");
         assert!(out["summary"].get("by_actor").is_none(), "body: {body}");
+    }
+
+    /// A refused run answers 409 with the decision in the body — the
+    /// status every other refused-by-state write on this service uses
+    /// — and an admitted one carries its decision on the run. Through
+    /// the door, so the wire shape is what is pinned: a caller reads
+    /// `budget.kind` off either answer.
+    #[tokio::test]
+    async fn a_refused_run_is_a_409_carrying_the_decision() {
+        // A cap of zero is a declared cap: the agent is switched off.
+        let log = InMemoryAgentRuns::new(card()).with_budgeted_agent(
+            "agent-claude",
+            "opus-5[1m]",
+            boss_core::agent::AgentCaps {
+                hourly_budget_usd_micros: Some(0),
+                max_concurrent_runs: None,
+            },
+        );
+        let app = router(AgentRunsApiState { log: Arc::new(log) });
+        let req = Request::post("/api/agent-runs")
+            .header("content-type", "application/json")
+            .header(
+                "x-boss-user",
+                header("platform-admin", AccessTier::Operator),
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "run_id": "run-refused",
+                    "actor_id": "agent-claude",
+                    "started_at": "2026-09-15T22:00:00Z",
+                    "finished_at": "2026-09-15T22:10:00Z",
+                    "outcome": "success",
+                    "input_tokens": 900,
+                    "output_tokens": 100
+                })
+                .to_string(),
+            ))
+            .expect("request builds");
+        let resp = app.oneshot(req).await.expect("the router answers");
+        let status = resp.status();
+        let body = String::from_utf8_lossy(
+            &resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body collects")
+                .to_bytes(),
+        )
+        .into_owned();
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        let out: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(out["budget"]["kind"], "deny", "body: {body}");
+        assert!(
+            out["budget"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("0 of 0")),
+            "body: {body}"
+        );
+    }
+
+    /// The unbudgeted case is the live one (agent-claude, both caps
+    /// NULL): the run is admitted and the answer says so, with nothing
+    /// to count down.
+    #[tokio::test]
+    async fn an_admitted_run_answers_with_its_decision() {
+        let (status, body) = post(
+            "/api/agent-runs",
+            serde_json::json!({
+                "run_id": "run-admitted",
+                "actor_id": "agent-claude",
+                "started_at": "2026-09-15T22:00:00Z",
+                "finished_at": "2026-09-15T22:10:00Z",
+                "outcome": "success",
+                "total_tokens": 1000
+            }),
+            Some(header("platform-admin", AccessTier::Operator)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let out: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(out["run"]["budget"]["kind"], "allow", "body: {body}");
+        assert!(
+            out["run"]["budget"]["remaining_usd_micros"].is_null(),
+            "no cap declared: {body}"
+        );
     }
 
     /// `actor_id` is the filter the `(actor_id, finished_at)` index was

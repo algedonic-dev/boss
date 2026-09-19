@@ -17,34 +17,45 @@
 #
 # That is CLAUDE.md §Doors' rule in its purest form — "a wrong target
 # answers instead of erroring" — and the repair is §9a's: the roster is
-# DERIVED from infra/deploy-services.sh's TIMERS list, the one place
-# that knows what is installed, so the watch list cannot drift from the
-# install list. A hand-written watch list holds no information its
-# source does not.
+# DERIVED from the installer's rows (infra/gcp/install-units.sh, whose
+# rows are infra/estate/roles.toml), the one place that knows what is
+# installed, so the watch list cannot drift from the install list. A
+# hand-written watch list holds no information its source does not.
+# (Until 2026-09-18 the rows were the TIMERS array of the bare-metal
+# deploy script, scraped as shell; that script is deleted, e109bd71.)
 #
 # WHAT IT CHECKS
 #   1. the observer answers `--roster` without touching systemd or the API
-#   2. every installable TIMERS row contributes BOTH halves of its pair —
+#   2. every installable roles.toml row contributes BOTH halves of its pair —
 #      the .timer (is it installed and armed) and the .service (did it
 #      run, and what did it exit with) — minus a named exclusion set
 #   3. boss-ml-inference-batch.timer, the unit the measured failure was
 #      about, is in the roster
 #   4. the exclusion set is small and every entry is justified in the file
 #   5. the unit file carries NO second copy of the list (the collapse)
-#   6. an unreadable TIMERS source REFUSES (EX_CONFIG) rather than
+#   6. an unreadable installer REFUSES (EX_CONFIG) rather than
 #      falling back to a shorter list — a smaller roster would answer a
 #      smaller question, confidently
+#   7. under a host's ROLES the roster is exactly the installer's
+#      `in-role` rows, both halves — a row the host's roles do not name
+#      is not watched. The measured cost of the roster ignoring roles
+#      (2026-09-15): the legacy-stack role left boss-gcp, its ten chores
+#      were uninstalled, and the observer filed twelve urgent
+#      `unit_unhealthy` alarms for units read `not-found` every five
+#      minutes — a broken watch list reported as a broken host
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
+# shellcheck source=infra/lint/lib/scanned.sh
+. "$here/lib/scanned.sh" || exit 3
 observer="$repo/infra/estate/observe-units.sh"
-deploy="$repo/infra/deploy-services.sh"
+installer="$repo/infra/gcp/install-units.sh"
 unit="$repo/infra/estate/boss-estate-observe-units.service"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -x "$observer" ] || fail "$observer is missing or not executable"
-[ -f "$deploy" ] || fail "$deploy is missing — it is where the roster comes from"
+[ -f "$installer" ] || fail "$installer is missing — it is where the roster comes from"
 
 # 1. --roster answers, with no HOST_ID, no JOBS_API, and no systemd.
 roster="$(env -u UNITS -u HOST_ID -u JOBS_API bash "$observer" --roster 2>&1)" \
@@ -53,11 +64,11 @@ roster="$(env -u UNITS -u HOST_ID -u JOBS_API bash "$observer" --roster 2>&1)" \
 $roster"
 [ -n "$roster" ] || fail "observe-units.sh --roster printed nothing"
 
-# 2. The roster IS the installable TIMERS rows, both halves, minus the
-#    exclusions. Scraped independently here, the same way
-#    infra/lint/boss-gcp-converges-itself.sh scrapes it.
-rows=$(sed -n '/^TIMERS=(/,/^)/p' "$deploy" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"')
-[ -n "$rows" ] || fail "no TIMERS rows scraped from $deploy — the scrape broke, so a green
+# 2. The roster IS the installable roles.toml rows, both halves, minus
+#    the exclusions. Read independently here off the installer's `rows`
+#    mode, the same way infra/lint/boss-gcp-converges-itself.sh reads it.
+rows=$(BOSS_REPO_ROOT="$repo" bash "$installer" rows 2>/dev/null | grep -E '^[a-z0-9-]+:[^:]+$')
+[ -n "$rows" ] || fail "no rows came out of $installer rows — the mode broke, so a green
     result here would mean nothing"
 
 excludes=$(sed -n 's/^ROSTER_EXCLUDE="\(.*\)"$/\1/p' "$observer")
@@ -67,15 +78,16 @@ excludes=$(sed -n 's/^ROSTER_EXCLUDE="\(.*\)"$/\1/p' "$observer")
 want=0
 for row in $rows; do
     stem="${row%%:*}"; sub="${row##*:}"
-    [ "$sub" = "." ] && src="$repo/infra" || src="$repo/infra/$sub"
     # A row whose source files are absent is SKIPped by the installer, so
     # it is not installed and watching it would report not-found forever.
+    [ "$sub" = "missing" ] && continue
+    [ "$sub" = "." ] && src="$repo/infra" || src="$repo/infra/$sub"
     [ -f "$src/$stem.service" ] && [ -f "$src/$stem.timer" ] || continue
     for ext in timer service; do
         case " $excludes " in *" $stem.$ext "*) continue ;; esac
-        printf '%s\n' "$roster" | grep -qx "$stem.$ext" \
+        grep -qx "$stem.$ext" <<< "$roster" \
             || fail "$stem.$ext installs on this host and the observer does not watch it.
-    The roster must be DERIVED from deploy-services.sh's TIMERS (CLAUDE.md §9a), so a
+    The roster must be DERIVED from the installer's rows (CLAUDE.md §9a), so a
     timer that lands cannot be outside what the observer watches. Roster was:
 $roster"
         want=$((want + 1))
@@ -87,20 +99,20 @@ done
 
 got=$(printf '%s\n' "$roster" | sed '/^$/d' | wc -l | tr -d ' ')
 [ "$got" -eq "$want" ] \
-    || fail "the roster carries $got units but $want install from TIMERS. An EXTRA unit is a
+    || fail "the roster carries $got units but $want install from roles.toml. An EXTRA unit is a
     hand-written entry that has outlived its source; a missing one is the drift this check
     exists to stop. Roster was:
 $roster"
 
 # 3. The unit the measured failure was about.
-printf '%s\n' "$roster" | grep -qx 'boss-ml-inference-batch.timer' \
+grep -qx 'boss-ml-inference-batch.timer' <<< "$roster" \
     || fail "boss-ml-inference-batch.timer is not in the roster. That is the exact unit whose
     installed-ness could not be established on 2026-09-10, and the wrong answer reasoned
     from the tree instead cost a correction on a live alarm (backlog 68757702)."
 
 # 4. EVERY EXCLUSION IS JUSTIFIED IN THE FILE. The gate's own roster is
-#    "the directory minus a four-entry exclusion set" with each reason
-#    written down once (gate.sh PREFLIGHT_EXCLUDES); an unexplained
+#    "the directory minus what each excluded lint declares in its own
+#    header, with its reason" (gate.sh `--exclusions`); an unexplained
 #    exclusion is how a unit stops being watched without anybody
 #    deciding so.
 n_excl=0
@@ -124,26 +136,86 @@ if grep -qE '^Environment="?UNITS=' "$unit"; then
     fail "$unit still hardcodes a UNITS list:
 $(grep -nE '^Environment="?UNITS=' "$unit")
     That is the second copy this check exists to delete. The roster comes from
-    deploy-services.sh's TIMERS; a host that runs a DIFFERENT set still overrides with a
+    the installer's rows; a host that runs a DIFFERENT set still overrides with a
     drop-in (the forge does), but boss-gcp's roster must be derived."
 fi
 
 # 6. AN UNREADABLE SOURCE REFUSES. A roster that silently fell back to a
 #    short hand-written list would answer a smaller question and look
 #    exactly as confident — the failure this whole car is about.
-out=$(env -u UNITS OBSERVE_UNITS_DEPLOY="$repo/infra/does-not-exist.sh" \
+out=$(env -u UNITS OBSERVE_UNITS_INSTALLER="$repo/infra/does-not-exist.sh" \
     bash "$observer" --roster 2>&1)
 rc=$?
 [ "$rc" -ne 0 ] \
-    || fail "the observer derived a roster from a TIMERS source that does not exist (exit $rc):
+    || fail "the observer derived a roster from an installer that does not exist (exit $rc):
 $out"
 [ "$rc" -eq 78 ] \
-    || fail "an unreadable TIMERS source exited $rc; EX_CONFIG (78) is what this script
+    || fail "an unreadable installer exited $rc; EX_CONFIG (78) is what this script
     already uses for 'nothing to watch is a config fault':
 $out"
-printf '%s' "$out" | grep -q "does-not-exist.sh" \
+grep -q "does-not-exist.sh" <<<"$out" \
     || fail "the refusal does not name the file it could not read:
 $out"
 
-echo "the-host-observer-watches-what-is-installed: ok — the host-units roster is derived from deploy-services.sh's TIMERS ($got units, both halves of $((got / 2)) pairs, $n_excl justified exclusions), boss-ml-inference-batch.timer among them, the unit file holds no second copy, and an unreadable source refuses with EX_CONFIG instead of answering a smaller question"
+# 7. UNDER ROLES, THE ROSTER IS THE INSTALLER'S. boss-gcp's declared
+#    roles as of 2026-09-16 (ml-batch-host, off-cluster-observer,
+#    wireguard-bastion; the legacy-stack role gone the day before): the
+#    installer's `roster` mode says which rows are in role, and the
+#    observer must watch those and only those.
+roles="ml-batch-host,off-cluster-observer,wireguard-bastion"
+in_role=$(BOSS_REPO_ROOT="$repo" BOSS_NODE_ROLES="$roles" bash "$installer" roster 2>/dev/null \
+    | sed -n 's/^in-role //p')
+not_in_role=$(BOSS_REPO_ROOT="$repo" BOSS_NODE_ROLES="$roles" bash "$installer" roster 2>/dev/null \
+    | sed -n 's/^not-in-role //p')
+[ -n "$in_role" ] && [ -n "$not_in_role" ] \
+    || fail "install-units.sh roster under roles '$roles' named no in-role or no not-in-role
+    row — the derivation this check compares against broke, so a green here would mean nothing"
+role_roster="$(env -u UNITS -u HOST_ID -u JOBS_API BOSS_NODE_ROLES="$roles" bash "$observer" --roster 2>&1)" \
+    || fail "observe-units.sh --roster under BOSS_NODE_ROLES='$roles' exited non-zero:
+$role_roster"
+for stem in $not_in_role; do
+    for ext in timer service; do
+        ! grep -qx "$stem.$ext" <<< "$role_roster" \
+            || fail "$stem.$ext is NOT IN ROLE for '$roles' and the observer watches it anyway.
+    The installer does not install it there and the uninstall verb removes it, so the
+    reading is not-found forever: a broken watch list filed as a broken host — twelve
+    urgent unit_unhealthy alarms on 2026-09-15. Roster under roles was:
+$role_roster"
+    done
+done
+role_want=0
+for stem in $in_role; do
+    src="$repo/infra"
+    row=$(grep -m1 "^$stem:" <<<"$rows") || continue
+    sub="${row##*:}"
+    [ "$sub" = "missing" ] && continue
+    [ "$sub" = "." ] || src="$repo/infra/$sub"
+    [ -f "$src/$stem.service" ] && [ -f "$src/$stem.timer" ] || continue
+    for ext in timer service; do
+        case " $excludes " in *" $stem.$ext "*) continue ;; esac
+        grep -qx "$stem.$ext" <<< "$role_roster" \
+            || fail "$stem.$ext is IN ROLE for '$roles' and the observer does not watch it:
+$role_roster"
+        role_want=$((role_want + 1))
+    done
+done
+role_got=$(printf '%s\n' "$role_roster" | sed '/^$/d' | wc -l | tr -d ' ')
+[ "$role_got" -eq "$role_want" ] \
+    || fail "under roles '$roles' the roster carries $role_got units but $role_want are in role:
+$role_roster"
+[ "$role_got" -lt "$got" ] \
+    || fail "the roster under roles '$roles' ($role_got) is not smaller than the every-row roster
+    ($got) — the roles did not narrow it, which is the 2026-09-15 defect"
+# The converge's dark-registry sentinel maps to [always] only — the
+# observer narrows the same way, never widening to every row.
+sentinel_roster="$(env -u UNITS -u HOST_ID -u JOBS_API BOSS_NODE_ROLES=registry-unread bash "$observer" --roster 2>&1)" \
+    || fail "--roster under the registry-unread sentinel exited non-zero:
+$sentinel_roster"
+! grep -qx 'boss-ml-inference-batch.timer' <<< "$sentinel_roster" \
+    || fail "under the registry-unread sentinel the roster still carries a role's unit;
+    a dark registry must narrow the watch to [always], never widen it:
+$sentinel_roster"
+
+lint_scanned the-host-observer-watches-what-is-installed "$got" "unit(s) derived from the installer's roles.toml rows"
+echo "the-host-observer-watches-what-is-installed: ok — the host-units roster is derived from the installer's roles.toml rows ($got units, both halves of $((got / 2)) pairs, $n_excl justified exclusions), boss-ml-inference-batch.timer among them, the unit file holds no second copy, an unreadable source refuses with EX_CONFIG instead of answering a smaller question, and under boss-gcp's roles the roster is the installer's in-role set ($role_got units)"
 exit 0

@@ -6,6 +6,7 @@
   // credential lands in BOSS's own table. Presence-gated steps then
   // verify fresh assertions against these credentials, bound to each
   // step's shape hash.
+  import { PHONE_QR_HINT } from './passkeyHints';
   import { enrollPasskey } from '../steps/presence';
   import { formatDate } from '@boss/web-kit/ui/date';
 
@@ -52,6 +53,35 @@
     }
   }
 
+  // Removal: a lost or retired authenticator can go, the LAST one
+  // stays. David, feedback 16414d99: "Important so users can add a
+  // backup key, but don't let them delete all their keys." The server
+  // enforces the rule (409, with the way out in its text); the button
+  // says the same thing before the click, so a single key never
+  // offers a control that can only refuse.
+  const LAST_KEY_STAYS = 'Your last passkey stays — add a backup key first, then remove this one.';
+
+  async function remove(cred: CredentialRow): Promise<void> {
+    if (!confirm(`Remove the passkey "${cred.label}"? It can no longer sign approvals.`)) return;
+    busy = true;
+    error = '';
+    try {
+      const resp = await fetch(
+        `/api/auth/passkey/credentials/${encodeURIComponent(cred.credential_id)}`,
+        { method: 'DELETE' },
+      );
+      if (!resp.ok) {
+        const text = await resp.text();
+        error = text || `Could not remove the passkey (${resp.status}).`;
+      }
+      await refresh();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
   $effect(() => {
     void refresh();
   });
@@ -63,7 +93,8 @@
     <p class="passkeys-blurb">
       Steps that demand proof of presence ask your passkey to sign the
       exact content being approved. Enrol one here; approvals then
-      prompt for it in place.
+      prompt for it in place. Keep a backup key enrolled — a lost one
+      can be removed, but the last one always stays.
     </p>
     {#if panel.credentials.length === 0}
       <p class="passkeys-empty">No passkey enrolled yet.</p>
@@ -80,6 +111,14 @@
                 · never used
               {/if}
             </span>
+            <button
+              class="passkeys-remove"
+              onclick={() => void remove(cred)}
+              disabled={busy || panel.credentials.length === 1}
+              title={panel.credentials.length === 1 ? LAST_KEY_STAYS : `Remove ${cred.label}`}
+            >
+              Remove
+            </button>
           </li>
         {/each}
       </ul>
@@ -95,6 +134,9 @@
         {busy ? 'Waiting for authenticator…' : 'Add passkey'}
       </button>
     </div>
+    <!-- The browser draws the enrolment dialog and its phone QR; this
+         page owes the sentence the dialog does not say (a55d9a01). -->
+    <p class="passkeys-hint">{PHONE_QR_HINT}</p>
     {#if error}
       <p class="passkeys-error">{error}</p>
     {/if}
@@ -104,6 +146,12 @@
 <style>
   .passkeys-panel {
     margin-top: 1rem;
+  }
+  .passkeys-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-muted, #8a939c);
+    max-width: 60ch;
   }
   .passkeys-panel h3 {
     margin: 0 0 0.25rem;
@@ -132,6 +180,13 @@
   .passkeys-meta {
     font-size: 0.8rem;
     color: var(--dl-text-muted, #667);
+  }
+  .passkeys-remove {
+    margin-left: auto;
+    font-size: 0.75rem;
+  }
+  .passkeys-remove:disabled {
+    cursor: not-allowed;
   }
   .passkeys-add {
     display: flex;

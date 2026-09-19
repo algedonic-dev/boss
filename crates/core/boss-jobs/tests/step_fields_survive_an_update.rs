@@ -34,7 +34,7 @@ fn job(id: JobId) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 
@@ -45,6 +45,7 @@ fn field(name: &str, required: bool) -> StepField {
         required,
         filled_by: boss_core::job::FilledBy::Executor,
         item_keys: Vec::new(),
+        covers: None,
     }
 }
 

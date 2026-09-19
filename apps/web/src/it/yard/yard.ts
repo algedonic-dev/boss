@@ -36,15 +36,55 @@ export type JobLite = Readonly<{
   tags?: readonly string[];
   metadata?: Record<string, unknown> | null;
   steps?: readonly StepLite[];
-  /** Admission-fixed sim-vs-real flag on the Job row itself. */
+  /** Admission-fixed partition on the Job row itself (508cc38c) —
+   *  parsed at the fetch boundary through `partitionOf`; `simulated`
+   *  is the wire's derived not-real bool, kept for rows a lens builds
+   *  from a server that predates the word. */
+  partition?: Partition;
   simulated?: boolean;
 }>;
+
+/** What [`carRow`] reads off a packet: a JobLite minus the envelope
+ *  fields no card field derives from (`status`, `opened_on`). Narrower
+ *  than JobLite on purpose — the /me lenses hold projections that are
+ *  not Jobs (an assignment row names the job but carries no metadata),
+ *  and they still map through the one constructor, passing what they
+ *  have. Everything optional reads as absent, never as an error. */
+export type CarFacts = Readonly<{
+  id: string;
+  kind: string;
+  title: string;
+  tags?: readonly string[];
+  metadata?: Record<string, unknown> | null;
+  steps?: readonly StepLite[] | null;
+  partition?: Partition;
+  simulated?: boolean;
+  /** The conductor's strike count as a FIELD — what a projection that
+   *  is not a Job carries (the My Day assignment row, d6e53a35). A Job
+   *  carries the same stamp in `metadata.red_trains`; the constructor
+   *  reads whichever the caller has, through one guard. */
+  red_trains?: number;
+}>;
+
+/** The four ways a change ships, in the order the arrivals sidings are
+ *  laid: the lightest artifact first. Mirrors `DeliveryChannel` in
+ *  boss-cli/src/channels.rs, which stamps the heaviest path a car
+ *  touched as its `metadata.delivery_channel` when the gate files it
+ *  (crates/ and apps/ are software; manifests, units, lints are config;
+ *  schema, workflows, rules, seeds, docs are data; Talos config is
+ *  infra). A fact that lives twice: this list is the rendering order,
+ *  the Rust enum is the classifier, and a channel added there without
+ *  a siding here lands on software (`deliveryChannelOf`). */
+export const DELIVERY_CHANNELS = ['data', 'config', 'software', 'infra'] as const;
+export type DeliveryChannel = (typeof DELIVERY_CHANNELS)[number];
 
 // A car in the yard is a job packet, and it renders as a card (David's
 // call, 2026-08-12): protocol names the color, tags ride along, and a
 // simulated packet is visibly not a real one. The same card grammar is
 // meant to travel to every queue lens, so everything here derives from
-// packet data — no per-kind code paths.
+// packet data — no per-kind code paths. Built ONLY by [`carRow`]: it was
+// built in three places until fb3b5ce1 (2026-09-14), and `redTrains`
+// reached one of them.
 export type CarRow = Readonly<{
   id: string;
   kind: string;
@@ -63,6 +103,22 @@ export type CarRow = Readonly<{
    *  reader existed. The inspection shed is a lens over this and
    *  nothing else. */
   proof?: CarProof | null;
+  /** How many red consists this car has ridden — the conductor's
+   *  `red_trains` stamp, incremented once per red train that released
+   *  it (`release_stamps` in boss-cli/src/train.rs). Absent on the
+   *  record is 0. One strike is the state in which the NEXT red holds
+   *  the car out, and until 2bb0d014 (2026-09-14) the floor drew it
+   *  exactly like a clean car; the dock wagon reads this to look struck.
+   *  Optional so a test fixture built as a literal still typechecks;
+   *  every row the constructor builds carries it. */
+  redTrains?: number;
+  /** Which siding the car lands on: its `metadata.delivery_channel`,
+   *  stamped by the gate from the paths it changed (design c6bd173e,
+   *  car 1 — backlog 953aaf30). `software` when the packet carries none:
+   *  the stamp is written at gate time, so an absent one is a car parked
+   *  before the stamp existed — and software (the image rolled) is what
+   *  "landed" meant for every car until the sidings were laid. */
+  deliveryChannel: DeliveryChannel;
 }>;
 
 /** A probe run the forge wrote back onto the car (`proof_attempt`). Only
@@ -88,6 +144,11 @@ export type ProofAttempt = Readonly<{
   why: string | null;
   /** Tools the probe needed and the host did not have. */
   missingTools: readonly string[];
+  /** The probe exited 75 (EX_TEMPFAIL): it ran, found the world not yet
+   *  able to judge the claim, and said so — the daily recheck runs it
+   *  again. Not a verdict against the change, and the shed must not
+   *  draw it red (2026-09-12: four early probes read as regressions). */
+  notYet: boolean;
 }>;
 
 /** The `proven` step completed — the transition a car leaves the
@@ -125,6 +186,7 @@ function proofAttempt(v: unknown): ProofAttempt | null {
     stderr: text(a.stderr),
     why: text(a.why),
     missingTools: tools,
+    notYet: a.not_yet === true || a.exit === 75,
   };
 }
 
@@ -134,7 +196,7 @@ function proofAttempt(v: unknown): ProofAttempt | null {
  *  about proving it" and "this packet records an empty probe" are
  *  different facts, and the second one is a defect an operator should
  *  see rather than a shape the floor smooths over. */
-export function readCarProof(j: JobLite | null | undefined): CarProof | null {
+export function readCarProof(j: CarFacts | null | undefined): CarProof | null {
   if (!j) return null;
   const md = (j.metadata ?? {}) as Record<string, unknown>;
   const proven = step(j, 'proven', 'Proven in production');
@@ -168,10 +230,12 @@ export function readCarProof(j: JobLite | null | undefined): CarProof | null {
 // the definitions live exactly once (CLAUDE.md §9a) and yard consumers
 // need no change.
 import { isSim } from '@boss/web-kit/ui/packet-card';
+import type { Partition } from '@boss/web-kit/ui/packet-card';
 // The server-computed read model. The approach lane's verdict rows are
 // ITS lanes, not this lens's derivation — see [`approach`].
 import type { YardStatus } from './yard-status';
-export { isSim, PROTOCOL_PALETTE, protocolHue } from '@boss/web-kit/ui/packet-card';
+export { isSim, partitionOf, PROTOCOL_PALETTE, protocolHue, redTrainsPhrase } from '@boss/web-kit/ui/packet-card';
+export type { Partition } from '@boss/web-kit/ui/packet-card';
 
 export type TrainStatus = 'BOARDING' | 'BOARDED' | 'DEPARTED' | 'CONVERGING' | 'ARRIVED';
 export type Lamp = 'green' | 'failing' | 'pending';
@@ -198,6 +262,10 @@ export type TrainRow = Readonly<{
   eta: Eta;
   /** Non-null when the train is in trouble the board must show. */
   trouble: TrainTrouble | null;
+  /** THE TRAIN GATE (design 128b5496): the cluster gate-run of the train
+   *  branch the conductor files when it opens the PR, read off the train
+   *  and its ci step. Null on a train that predates it. */
+  gate?: TrainGateReading | null;
   /** An operator's standing request that the conductor cancel this
    *  train (`metadata.cancel_requested`), read back off the Job so a
    *  reload shows the pending state. */
@@ -322,6 +390,21 @@ export type YardState = Readonly<{
   /** Closed without arriving. Kept visible — a train that cancelled is
    *  a fact about the day, it just isn't an arrival. */
   cancelled: readonly TrainRow[];
+  /** Cars WITHDRAWN — the `abandoned` terminal completed — newest first,
+   *  the newest `CANCELLED_SHOWN` of them. The third terminal track
+   *  (design c6bd173e, outcomes): beside arrivals and the inspection
+   *  shed, and unlike struck or left-behind, which are states of a car
+   *  still on the dock. `at` is the terminal step's stamp. */
+  withdrawn: readonly WithdrawnCar[];
+  /** THE DAY, FROM THE RECORD: every pr-train the system of record
+   *  closed today on its own clock (`closed_within=0`), split by
+   *  outcome, and whether that page was complete. The production tile
+   *  counts over this. `null` when the read failed or the server is
+   *  older — the tile then falls back to the five-train window and says
+   *  it is a floor. Additive, like `delivery`: a yard that cannot read
+   *  its day is still a yard. (2026-09-11: the tile read '≥ 5 trains'
+   *  on a day the record held 29 arrived and 66 cars.) */
+  day: Readonly<{ arrived: readonly TrainRow[]; cancelled: readonly TrainRow[]; complete: boolean }> | null;
   /** The scoreboard. Empty when the report is unavailable or has
    *  resolved nothing — the yard renders nothing rather than zeros. */
   delivery: readonly DeliveryStat[];
@@ -981,6 +1064,67 @@ function readCancelRefused(j: JobLite): boolean {
   return v !== undefined && v !== null;
 }
 
+/** What the train records about its gate-run: the packet id while it
+ *  runs (train metadata), the conductor's one-line reading and the
+ *  forge's own result once the ci step completes, the fallback stamp
+ *  when the gate could not be filed and CI alone judged the train, and
+ *  WHY the gate is not filed yet while the conductor keeps trying (the
+ *  bound line naming the running gates; nulled the pass it is filed).
+ *  Every field is a packet field; nothing is derived. */
+export type TrainGateReading = Readonly<{
+  run: string | null;
+  line: string | null;
+  forge: string | null;
+  fallback: string | null;
+  wait_reason: string | null;
+  relaunches: number;
+}>;
+
+export function readTrainGate(j: JobLite): TrainGateReading | null {
+  const md = (j.metadata ?? {}) as {
+    train_gate_run?: unknown;
+    train_gate_fallback?: unknown;
+    train_gate_wait_reason?: unknown;
+    train_gate_relaunches?: unknown;
+  };
+  const ci = (step(j, 'ci', 'CI verdict')?.metadata ?? {}) as {
+    train_gate?: unknown;
+    train_gate_run?: unknown;
+    forge_result?: unknown;
+  };
+  const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+  const run = text(ci.train_gate_run) ?? text(md.train_gate_run);
+  const line = text(ci.train_gate);
+  const forge = text(ci.forge_result);
+  const fallback = text(md.train_gate_fallback);
+  const wait_reason = text(md.train_gate_wait_reason);
+  const relaunches = typeof md.train_gate_relaunches === 'number' ? md.train_gate_relaunches : 0;
+  if (run === null && line === null && forge === null && fallback === null && wait_reason === null) return null;
+  return { run, line, forge, fallback, wait_reason, relaunches };
+}
+
+/** The verdict row's one line: both halves, in words the conductor
+ *  already used. A train whose gate is still running says so; one
+ *  whose gate is waiting to be filed says why (backlog 0d16df6f: train
+ *  ccd8b08e sat two hours at the bound drawn like a healthy transit);
+ *  one that fell back to CI alone says that. The last two are trouble. */
+export function trainGateLabel(g: TrainGateReading): string {
+  const forge = g.forge ? `forge ${g.forge}` : 'forge pending';
+  if (g.fallback) return `${forge} · gate UNAVAILABLE — CI alone judged this train`;
+  if (g.line) return `${forge} · ${g.line.replace(/^train gate: /, 'gate ')}`;
+  if (g.wait_reason) return `${forge} · gate waiting: ${g.wait_reason}`;
+  if (g.run) return `${forge} · gate running (${g.run.slice(0, 8)})${g.relaunches > 0 ? ` · relaunched ${g.relaunches}×` : ''}`;
+  return forge;
+}
+
+/** Whether the verdict row wears the yard's trouble style: a gate that
+ *  could not be filed, whether the conductor gave up (fallback) or is
+ *  still waiting at the bound (wait_reason). A troubled packet must
+ *  look troubled — the same rule the label follows, in one place. */
+export function trainGateTroubled(g: TrainGateReading): boolean {
+  return g.fallback !== null || g.wait_reason !== null;
+}
+
 export function ciLamp(j: JobLite): Lamp {
   const ci = step(j, 'ci', 'CI verdict');
   const result = (ci?.metadata as { result?: string } | null)?.result;
@@ -1005,23 +1149,13 @@ export function toTrainRow(
   const status = trainStatus(j);
   const cars: CarRow[] = (md.boarded_jobs ?? []).map(id => {
     const car = shipById.get(id);
-    const cmd = (car?.metadata ?? {}) as {
-      branch?: string;
-      skip_reason?: string;
-    };
-    return {
-      id,
-      kind: car?.kind ?? 'ship-a-change',
-      branch: cmd.branch ?? id.slice(0, 8),
-      title: car?.title ?? '(car not in window)',
-      tags: car?.tags ?? [],
-      sim: car ? isSim(car) : false,
-      skipReason: cmd.skip_reason ?? null,
-      head: car ? headOf(car) : null,
-      // A car outside the window says nothing about its own proof, and
-      // the arrivals stack must not read that silence as "not proven".
-      proof: readCarProof(car),
-    };
+    // A car outside the fetch window is a packet with nothing on it:
+    // every fact reads absent — including its proof, which the arrivals
+    // stack must not read as "not proven" — and its short id stands in
+    // for the branch it cannot name.
+    return car
+      ? carRow(car)
+      : { ...carRow({ id, kind: 'ship-a-change', title: '(car not in window)' }), branch: id.slice(0, 8) };
   });
   return {
     id: j.id,
@@ -1040,6 +1174,7 @@ export function toTrainRow(
     arrivedAt: arrivalStamp(j),
     eta: trainEta(j, medians, nowMs),
     trouble: trainTrouble(j),
+    gate: readTrainGate(j),
     cancelRequested: readCancelRequest(j),
     cancelRefused: readCancelRefused(j),
   };
@@ -1052,7 +1187,7 @@ const shortSha = (v: unknown): string | null =>
 /** The head a car names: `boarded_head` once the conductor boarded it,
  *  else the `head` inside the gate step's receipt (a JSON string the
  *  runner wrote). No record, no sha — the floor paints a dash. */
-export function headOf(j: JobLite): string | null {
+export function headOf(j: CarFacts): string | null {
   const boarded = shortSha((j.metadata as { boarded_head?: unknown } | null)?.boarded_head);
   if (boarded) return boarded;
   const receipt = (step(j, 'gate', 'Gate')?.metadata as { receipt?: unknown } | null)?.receipt;
@@ -1065,11 +1200,23 @@ export function headOf(j: JobLite): string | null {
 }
 
 // One packet → one card, whoever chose the packet: the station
-// envelope, the publish queue, the awaiting-proof set and the open-car
-// set all map through here, so the card grammar cannot fork between
-// lanes.
-function carRow(j: JobLite): CarRow {
-  const md = (j.metadata ?? {}) as { branch?: string; skip_reason?: string };
+// envelope, the publish queue, the awaiting-proof set, the open-car
+// set, a train's consist, and the two /me lenses all map through here,
+// so the card grammar cannot fork between lanes — a field this reader
+// learns, every lens carries (fb3b5ce1). A lens that owns its own
+// provenance line or chips spreads the result and overrides those two;
+// nothing overrides a packet fact.
+//
+// A packet naming no branch reads `''`, and that is a fact two readers
+// test for (the open-car set drops it; the floor does not claim it) —
+// not a gap to paper over with the id.
+export function carRow(j: CarFacts): CarRow {
+  const md = (j.metadata ?? {}) as {
+    branch?: string;
+    skip_reason?: string;
+    red_trains?: unknown;
+    delivery_channel?: unknown;
+  };
   return {
     id: j.id,
     kind: j.kind,
@@ -1080,12 +1227,49 @@ function carRow(j: JobLite): CarRow {
     skipReason: md.skip_reason ?? null,
     head: headOf(j),
     proof: readCarProof(j),
+    redTrains: redTrainsOf(j.red_trains ?? md.red_trains),
+    deliveryChannel: deliveryChannelOf(md.delivery_channel),
   };
+}
+
+/** The gate's `delivery_channel` stamp as a siding. Absent is `software`
+ *  — an old car, see [`CarRow.deliveryChannel`] — and so is a value this
+ *  reader has no siding for: a channel the classifier learns before the
+ *  map does still has to stand somewhere, and software is the siding
+ *  whose landing evidence (the image rolled) every car has today. */
+export function deliveryChannelOf(v: unknown): DeliveryChannel {
+  return (DELIVERY_CHANNELS as readonly unknown[]).includes(v) ? (v as DeliveryChannel) : 'software';
+}
+
+/** The conductor's `red_trains` stamp as a count: absent — a car no red
+ *  train has released — is 0, and anything that is not a non-negative
+ *  integer is read as 0 rather than painted as a strike (2bb0d014). */
+function redTrainsOf(v: unknown): number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0;
 }
 
 /** How many arrivals the board shows, and how many cancellations. */
 export const ARRIVALS_SHOWN = 5;
 export const CANCELLED_SHOWN = 3;
+
+/** The record's day page as TrainRows, split by outcome. A page shorter
+ *  than its own `total` is cut off — a limit is not a filter — and the
+ *  tile renders '≥' on it rather than a smaller day. */
+function dayOf(
+  page: Readonly<{ data: readonly JobLite[]; total: number }>,
+  shipById: ReadonlyMap<string, JobLite>,
+  medians: ArrivalMedians,
+  nowMs: number,
+): NonNullable<YardState['day']> {
+  const closed = page.data.filter(t => t.status === 'closed').map(t => ({ t, outcome: trainOutcome(t) }));
+  const rows = (pick: (o: ReturnType<typeof trainOutcome>) => boolean): TrainRow[] =>
+    closed.filter(c => pick(c.outcome)).map(c => toTrainRow(c.t, shipById, false, medians, nowMs));
+  return {
+    arrived: rows(o => o === 'arrived'),
+    cancelled: rows(o => o !== 'arrived'),
+    complete: page.data.length >= page.total,
+  };
+}
 
 export function assembleYard(
   trains: readonly JobLite[],
@@ -1098,6 +1282,9 @@ export function assembleYard(
   report: TerminalReport | null = null,
   gateRuns: readonly JobLite[] = [],
   publishQueue: StationQueueEnvelope | null = null,
+  // The day's closed trains as the record served them, with the list's
+  // own `total` so a cut-off page is known to be one. Last, additive.
+  dayPage: Readonly<{ data: readonly JobLite[]; total: number }> | null = null,
 ): YardState {
   const shipById = new Map(ships.map(j => [j.id, j]));
   const open = trains.filter(t => t.status === 'open');
@@ -1138,8 +1325,10 @@ export function assembleYard(
       .filter(c => c.outcome !== 'arrived')
       .slice(0, CANCELLED_SHOWN)
       .map(c => toTrainRow(c.t, shipById, false, medians, nowMs)),
+    withdrawn: withdrawnCars(ships),
     delivery: deliveryStats(report),
     awaitingProof: awaitingProof(ships).map(carRow),
+    day: dayPage === null ? null : dayOf(dayPage, shipById, medians, nowMs),
     publishing: publishRows(publishQueue),
     packets: { trains, gateRuns },
     cars: ships
@@ -1166,7 +1355,7 @@ async function fetchStationQueue(name: string): Promise<StationQueueEnvelope | n
 }
 
 export async function fetchYard(): Promise<YardState | null> {
-  const [tr, sr, dockQueue, report, gateRuns, publishQueue] = await Promise.all([
+  const [tr, sr, dockQueue, report, gateRuns, publishQueue, dayPage] = await Promise.all([
     // 40, not 20: the window has to hold the open trains, the five
     // arrivals the board shows, AND the arrivals the ETA medians are
     // taken over — cancelled trains sit in the same list and would
@@ -1190,11 +1379,19 @@ export async function fetchYard(): Promise<YardState | null> {
       .then((b) => b?.data ?? [])
       .catch(() => [] as JobLite[]),
     fetchStationQueue('publish-dock'),
+    // THE DAY FROM THE RECORD, for the production tile: every pr-train
+    // closed today on the authoritative clock (`closed_within=0`). Its
+    // `total` rides along so a cut-off page is known. Additive: null on
+    // any failure, and the tile falls back to the window as a floor.
+    fetch('/api/jobs?kind=pr-train&closed_within=0&limit=500')
+      .then((r) => (r.ok ? (r.json() as Promise<{ data?: JobLite[]; total?: number }>) : null))
+      .then((b) => (b && Array.isArray(b.data) && typeof b.total === 'number' ? { data: b.data, total: b.total } : null))
+      .catch(() => null),
   ]);
   if (!tr.ok || !sr.ok) return null;
   const trains = ((await tr.json()) as { data?: JobLite[] }).data ?? [];
   const ships = ((await sr.json()) as { data?: JobLite[] }).data ?? [];
-  return assembleYard(trains, ships, dockQueue, Date.now(), report, gateRuns, publishQueue);
+  return assembleYard(trains, ships, dockQueue, Date.now(), report, gateRuns, publishQueue, dayPage);
 }
 
 // ---------------------------------------------------------------------
@@ -1349,4 +1546,31 @@ export function awaitingProof(cars: readonly JobLite[]): readonly JobLite[] {
     const step = (c.steps ?? []).find((s) => s.status === 'ready' || s.status === 'active');
     return step?.spec_slug === 'proven';
   });
+}
+
+export type WithdrawnCar = Readonly<{ car: CarRow; at: string | null }>;
+
+/**
+ * Cars withdrawn — closed on the `abandoned` terminal — newest first, at
+ * most `CANCELLED_SHOWN` of them, each with the instant it was abandoned.
+ *
+ * Read the way [`trainOutcome`] reads a train: the stamped
+ * `metadata.outcome` first (`close_job_on_terminal` writes it from the
+ * Workflow's terminal step), the completed terminal step second, so a
+ * car closed before the stamp existed still counts. STRICTLY completed,
+ * as there: the terminal close marks every step it did not fire as
+ * skipped, so every merged car carries a skipped `abandoned` — and one
+ * read as done would put every delivered car on the cancelled siding.
+ */
+export function withdrawnCars(cars: readonly JobLite[]): readonly WithdrawnCar[] {
+  return cars
+    .filter((c) => c.status === 'closed')
+    .flatMap((c): WithdrawnCar[] => {
+      const stamped = (c.metadata as { outcome?: unknown } | null)?.outcome;
+      const terminal = step(c, 'abandoned', 'Abandoned');
+      if (stamped !== 'abandoned' && !completed(terminal)) return [];
+      return [{ car: carRow(c), at: stampAt(terminal) }];
+    })
+    .sort((a, b) => (b.at === null ? 0 : Date.parse(b.at)) - (a.at === null ? 0 : Date.parse(a.at)))
+    .slice(0, CANCELLED_SHOWN);
 }

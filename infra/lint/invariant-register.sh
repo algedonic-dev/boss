@@ -63,6 +63,8 @@
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 REGISTER_DIR="docs/invariants"
 REQUIRED_KEYS="id claim source enforcement mechanism last_verified note"
@@ -119,10 +121,10 @@ validate_entry() {
     if [ "$f_id" != "$ABSENT" ]; then
         if [ -z "$f_id" ]; then
             finding "$file" "$line" "" "id" "must not be empty"
-        elif ! printf '%s' "$f_id" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+        elif ! grep -qE '^[a-z0-9][a-z0-9-]*$' <<<"$f_id"; then
             finding "$file" "$line" "$f_id" "id" \
                 "must be a lowercase slug (a-z, 0-9, dashes) so findings can cite it"
-        elif printf '%s\n' "$SEEN_IDS" | grep -qx -- "$f_id"; then
+        elif grep -qx -- "$f_id" <<< "$SEEN_IDS"; then
             finding "$file" "$line" "$f_id" "id" \
                 "duplicate id — an id is cited by conformance findings and must be unique"
         fi
@@ -159,7 +161,7 @@ ${f_id}"
             if [ -z "$f_last_verified" ]; then
                 finding "$file" "$line" "$f_id" "last_verified" \
                     "enforcement = checked requires a date — an unverified 'checked' is an 'unenforced'"
-            elif ! printf '%s' "$f_last_verified" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            elif ! grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$f_last_verified"; then
                 finding "$file" "$line" "$f_id" "last_verified" \
                     "must be YYYY-MM-DD, got '${f_last_verified}'"
             fi
@@ -348,7 +350,7 @@ assert_caught() {
         ST_FAILS=1
         return
     fi
-    if ! printf '%s' "$out" | grep -q "${want_id}: ${want_field}:"; then
+    if ! grep -q "${want_id}: ${want_field}:" <<<"$out"; then
         echo "invariant-register self-test FAIL: ${label} — caught, but did not name '${want_id}: ${want_field}'; said:" >&2
         printf '%s\n' "$out" >&2
         ST_FAILS=1
@@ -376,7 +378,7 @@ assert_caught_dir() {
         ST_FAILS=1
         return
     fi
-    if ! printf '%s' "$out" | grep -q "${want_id}: ${want_field}:"; then
+    if ! grep -q "${want_id}: ${want_field}:" <<<"$out"; then
         echo "invariant-register self-test FAIL: ${label} — caught, but did not name '${want_id}: ${want_field}'; said:" >&2
         printf '%s\n' "$out" >&2
         ST_FAILS=1
@@ -444,7 +446,7 @@ EOF
     valid_entry > "${st_dupe_dir}/fixture-two.toml"
     st_out=$(check_register "$st_dupe_dir")
     rm -rf "$st_dupe_dir"
-    if ! printf '%s' "$st_out" | grep -q 'fixture-one: id:'; then
+    if ! grep -q 'fixture-one: id:' <<<"$st_out"; then
         echo "invariant-register self-test FAIL: duplicate id across two files was not caught by id; said:" >&2
         printf '%s\n' "$st_out" >&2
         ST_FAILS=1
@@ -678,6 +680,7 @@ main_scan() {
         exit 1
     fi
 
+    lint_scanned invariant-register "$files" "invariant file(s) under $REGISTER_DIR"
     echo "invariant-register: ok — ${files} invariants declared (${enforced} enforced, ${checked} checked, ${unenforced} unenforced)"
 }
 

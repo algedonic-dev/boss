@@ -288,3 +288,114 @@ fn the_seed_refreshes_only_on_a_green_near_tip_run() {
          count, not a feeling"
     );
 }
+
+/// THE SEED COPY IS A REFLINK (backlog 5b3dabb5). Every gate copied the
+/// warm target from a Longhorn volume with a plain `cp -a` — 184 s and
+/// tens of GB written per gate, the single largest writer on w-1's SSD
+/// (~3.6 TB/day). Both copies — seeding the workspace and refreshing
+/// the seed — must ask for a reflink, and the seed must live where a
+/// reflink can happen: a `local` PV on the build node's own filesystem,
+/// bound by name so a typo binds nothing rather than the wrong disk.
+/// Three files state one arrangement; this pins them to each other.
+#[test]
+fn the_seed_is_copied_by_reflink_from_a_local_volume_on_the_build_node() {
+    let sh = run_sh();
+    let seeding = sh
+        .lines()
+        .filter(|l| l.contains("cp -a") && l.contains("$SEED/target/."))
+        .count();
+    let refreshing = sh
+        .lines()
+        .filter(|l| l.contains("cp -a") && l.contains("$SEED/target.partial"))
+        .count();
+    assert_eq!(seeding, 1, "one seeding copy in run.sh");
+    assert_eq!(refreshing, 1, "one refresh copy in run.sh");
+    for l in sh
+        .lines()
+        .filter(|l| l.contains("cp -a") && l.contains("$SEED/target"))
+    {
+        assert!(
+            l.contains("--reflink=auto"),
+            "a seed copy without --reflink=auto rewrites the whole target: {l}"
+        );
+    }
+
+    let job = job_doc();
+    assert_eq!(volume_backing(&job, "gate-seed"), "persistentVolumeClaim");
+    assert!(
+        job.contains("persistentVolumeClaim: {claimName: gate-seed}"),
+        "the seed volume must be the local-PV claim `gate-seed`, not the Longhorn one"
+    );
+    assert!(
+        !job.contains("claimName: gate-runner-disk"),
+        "the Job must no longer mount the Longhorn claim"
+    );
+
+    let manifest = manifest();
+    let pvc = manifest
+        .split(
+            "
+---
+",
+        )
+        .find(|d| {
+            d.contains("kind: PersistentVolumeClaim")
+                && d.contains(
+                    "name: gate-seed
+",
+                )
+        })
+        .expect("the gate-seed claim is declared beside the Job");
+    assert!(pvc.contains("storageClassName: gate-seed-local"), "{pvc}");
+    assert!(pvc.contains("volumeName: gate-seed-w-1"), "{pvc}");
+
+    let local = read("infra/cluster/manifests/gate-seed-local.yaml");
+    assert!(
+        local.contains("name: gate-seed-local")
+            && local.contains("provisioner: kubernetes.io/no-provisioner")
+    );
+    assert!(
+        local.contains("name: gate-seed-w-1")
+            && local.contains("storageClassName: gate-seed-local")
+    );
+    assert!(
+        local.contains("path: /var/local/gate-seed"),
+        "the PV's path"
+    );
+    // The directory is the NODE's declaration (Talos machine.files on
+    // w-1), not a CronJob's hostPath mount: boss-dev enforces the Talos
+    // default `baseline`, which refuses hostPath — measured on
+    // 2026-09-12 (backlog d42d4967) when the prepare Job created no pod
+    // in ten minutes while its emptyDir twin completed in twenty
+    // seconds. A manifest that reintroduces the mount is refused by
+    // infra/lint/no-manifest-mounts-a-hostpath.sh; this pins the
+    // manifest's own account of where the directory comes from.
+    assert!(
+        !local.contains("kind: CronJob") && !local.contains("hostPath:"),
+        "nothing in the cluster may create the seed directory — baseline refuses hostPath"
+    );
+    assert!(
+        local.contains("machine.files") && local.contains("talosctl"),
+        "the manifest names the Talos declaration that creates the PV's path"
+    );
+    // The directory alone is not enough: the kubelet runs in its own
+    // mount namespace and does not see /var/local unless the machine
+    // config binds it in. With only machine.files applied, a pod
+    // mounting the PVC sat nine hours at ContainerCreating while the
+    // kubelet logged `path "/var/local/gate-seed" does not exist` 296
+    // times, on a node where `talosctl ls` showed it (2026-09-12).
+    assert!(
+        local.contains("machine.kubelet.extraMounts"),
+        "the manifest names the kubelet mount that lets the PV's path be seen"
+    );
+    assert!(
+        !repo_root()
+            .join("infra/platform/workflows/maintenance-gate-seed.toml")
+            .exists(),
+        "the prepare CronJob's workflow went with it"
+    );
+    assert!(
+        local.contains(r#"operator: In, values: ["w-1"]"#),
+        "the PV binds only on the build node"
+    );
+}

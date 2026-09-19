@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use crate::cadence::{CadenceRuleRow, LastFiring};
 use crate::delivery::DeliveryPolicyRow;
+use crate::landing;
 use crate::stranded;
 
 /// A pr-train's step vocabulary, addressed by spec slug with a title
@@ -113,7 +114,7 @@ fn is_done(step: Option<&Step>) -> bool {
 /// same rule off the API's JSON — the typed read model and that JSON
 /// cannot share one signature, so each side's test names the other
 /// (CLAUDE.md §9a).
-fn holds_the_track(steps: &[Step]) -> bool {
+pub(crate) fn holds_the_track(steps: &[Step]) -> bool {
     !is_done(find_step(steps, &MERGED))
 }
 
@@ -230,6 +231,16 @@ pub struct TrainStatus {
     pub pr_url: Option<String>,
     /// How many cars boarded (from `metadata.boarded_jobs`).
     pub car_count: usize,
+    /// How this train ships — `metadata.delivery_channel`, the heaviest
+    /// of its cars' (data < config < software < infra), stamped by the
+    /// conductor at board beside `boarded_jobs` (cffef553, 2026-09-15).
+    /// The yard names it: 'data train · 1 car'. `None` for a train
+    /// boarded before the stamp existed, or a stamp naming no channel
+    /// the order knows — drawn as nothing, never guessed into software:
+    /// unlike a car, an old train has no default worth asserting.
+    /// `#[serde(default)]` so an older payload still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// When the cars boarded — the `collect` step's `completed_at`, the
     /// conductor's own RFC3339 stamp — so the page can say "aboard
     /// since". `None` until the collect completes, or when it carries
@@ -410,9 +421,22 @@ pub fn train_status(
             .and_then(|s| meta_str(&s.metadata, "pr_url"))
             .map(str::to_string),
         car_count,
+        channel: train_channel(&job.metadata).map(str::to_string),
         boarded_at: boarded_at(steps).map(str::to_string),
         eta: train_eta(steps, eta, now),
     }
+}
+
+/// The four delivery channels, lightest first — the labels
+/// `boss-cli/src/channels.rs::DeliveryChannel::label` writes and
+/// `apps/web/.../yard.ts::DELIVERY_CHANNELS` lays sidings for. A fact
+/// that lives three times; this copy is the read-side guard, so a stamp
+/// that names none of them is `None` rather than a fifth siding.
+const DELIVERY_CHANNELS: [&str; 4] = ["data", "config", "software", "infra"];
+
+/// The channel stamped on a train's metadata, when it names one.
+fn train_channel(md: &Value) -> Option<&str> {
+    meta_str(md, "delivery_channel").filter(|c| DELIVERY_CHANNELS.contains(c))
 }
 
 /// One parked car on the loading dock.
@@ -425,6 +449,15 @@ pub struct DockCar {
     /// step-level "parked since review became ready" is the queue-age
     /// lens; the dock row carries the packet's own stamp.
     pub parked_since: String,
+    /// How many red trains have released this car — the conductor's
+    /// `red_trains` stamp, absent = 0. On the ROW, not derived by a
+    /// surface: the dock station stops listing a held car (36c3d4ca), so
+    /// the yard's held lane is drawn from [`HeldCar`] alone, and a row
+    /// without the count showed a twice-struck car as its reason sentence
+    /// with the strike itself invisible (ac80357b). `default` so a row
+    /// from an older server reads back as 0 rather than failing to parse.
+    #[serde(default)]
+    pub red_trains: u32,
 }
 
 pub fn dock_car(job: &Job) -> DockCar {
@@ -433,7 +466,28 @@ pub fn dock_car(job: &Job) -> DockCar {
         title: job.title.clone(),
         branch: meta_str(&job.metadata, "branch").map(str::to_string),
         parked_since: job.opened_on.to_string(),
+        red_trains: red_trains_of(&job.metadata),
     }
+}
+
+/// The `red_trains` stamp as a count. Only a non-negative integer is a
+/// strike count — a negative, a string, or a fraction reads as 0, the
+/// same reading the client's `redTrainsOf` gives (2bb0d014), so a
+/// malformed stamp cannot paint a car struck. Shared with the
+/// assignments rows ([`crate::port::AssignmentRow::red_trains`]) so My
+/// Day and the yard read one stamp one way (d6e53a35).
+pub(crate) fn red_trains_of(metadata: &Value) -> u32 {
+    red_trains_count(metadata.get("red_trains"))
+}
+
+/// The stamp's VALUE as a count — the half of [`red_trains_of`] the
+/// Postgres assignments JOIN needs, since it selects
+/// `metadata -> 'red_trains'` rather than the whole document.
+pub(crate) fn red_trains_count(stamp: Option<&Value>) -> u32 {
+    stamp
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 /// A car ON the dock that CANNOT board: parked, gated green, and held by
@@ -620,10 +674,51 @@ pub struct BoardingReadings {
     /// Whether `active_rules()` answered. `Unread` → the threshold, the
     /// cooldown and the clock times are unknown, not absent.
     pub cadence: Reading,
-    /// Whether the board rule's `last_firing()` answered. `Unread` → no
-    /// cooldown can be computed, and "no cooldown in force" must not be
-    /// implied by the nulls that stand in its place.
+    /// Whether the board rules' `last_firing()` reads answered — one per
+    /// rule that departs a train, see [`BoardFirings`]. `Unread` → no
+    /// cooldown can be computed and no last board stated, and "no
+    /// cooldown in force" must not be implied by the nulls that stand in
+    /// their place.
     pub last_board: Reading,
+}
+
+/// The board rules' newest firings, one per rule that departs a train
+/// — the facts the boarding block reads from `cadence_firings`.
+///
+/// Two firings rather than one because the two numbers derived from
+/// them belong to DIFFERENT rules, and the block stated them as if they
+/// were one (43fb424f). The conductor paces each cadence row on its own
+/// firing history (`cadence::last_firing(&rule.name)`), and
+/// `cooldown_minutes` lives in the depth row alone — so a clock window
+/// boards regardless of the depth rule's cooldown and does not reset it.
+/// Measured 2026-09-14: train 33eaad45 boarded at 18:06:11 on the 18:05
+/// window and train d078acd2 at 18:22:09 on the depth rule, 16 min apart
+/// under a stated "min 45 min between boards", while `last_board_at`
+/// (read from the depth rule only) still showed 17:26:57. Both boards
+/// were legal; the reading was the defect. Now the last board is the
+/// newest of the two, and the cooldown is measured on `depth` alone.
+///
+/// A struct rather than two adjacent `Option<&LastFiring>` parameters,
+/// for the reason [`BoardingReadings`] and [`YardInputs`] give: adjacent
+/// parameters of one type compile transposed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BoardFirings<'a> {
+    /// The depth rule's newest firing. The cooldown is measured on THIS
+    /// and only this.
+    pub depth: Option<&'a LastFiring>,
+    /// The clock rule's newest firing — a scheduled window's board.
+    pub clock: Option<&'a LastFiring>,
+}
+
+impl<'a> BoardFirings<'a> {
+    /// The newest firing across the board rules — what `last_board_at`
+    /// states: when a train last boarded, whichever rule boarded it.
+    pub fn newest(self) -> Option<&'a LastFiring> {
+        [self.depth, self.clock]
+            .into_iter()
+            .flatten()
+            .max_by_key(|f| f.fired_at)
+    }
 }
 
 /// The boarding predicate, rendered from the live cadence rows — the
@@ -709,13 +804,24 @@ pub struct BoardHold {
     /// N-car threshold cannot be evaluated"`), because `None` here is
     /// read as a go-ahead and the read-model has no grounds for one.
     pub held_because: Option<String>,
-    /// Minutes until the board cooldown clears; `None` when none is
-    /// running — never fired, elapsed, or released by a firing that
-    /// boarded nothing.
+    /// Minutes until the DEPTH rule's board cooldown clears; `None` when
+    /// none is running — never fired, elapsed, or released by a firing
+    /// that boarded nothing. Measured on the depth rule's own last
+    /// firing, never on `last_board_at`: a clock-window board neither
+    /// resets it nor waits for it (43fb424f).
     pub cooldown_remaining_minutes: Option<u32>,
-    /// When the board rule last fired, released or not.
+    /// The rule whose pacing `cooldown_remaining_minutes` measures — the
+    /// depth rule's name, when one with a `cooldown_minutes` is
+    /// configured. Stated beside the minutes so the pair above cannot be
+    /// read as a property of the track: the last board may be another
+    /// rule's.
+    #[serde(default)]
+    pub cooldown_rule: Option<String>,
+    /// When a board rule last fired, released or not — the newest firing
+    /// across the rules that depart a train (depth AND clock window), see
+    /// [`BoardFirings::newest`]. The track's last board, not one rule's.
     pub last_board_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether that firing could be READ. `unread` says `last_board_at`
+    /// Whether those firings could be READ. `unread` says `last_board_at`
     /// and `cooldown_remaining_minutes` are nulls nobody read — not "it
     /// has never boarded" and not "no cooldown is running", which is how
     /// the pair reads on its own and is the permissive answer.
@@ -767,10 +873,14 @@ pub fn depth_rule(rules: &[CadenceRuleRow]) -> Option<&CadenceRuleRow> {
 
 /// A cadence rule fires by CLOCK when it declares `at_times` (and is not
 /// the calendar basis, which also uses `at_times` but for whole days).
-fn clock_rule(rules: &[CadenceRuleRow]) -> Option<&CadenceRuleRow> {
-    rules
-        .iter()
-        .find(|r| r.basis == "clock" && r.at_times.is_some())
+/// Public for the same reason [`depth_rule`] is: the handler reads this
+/// rule's last firing under the row the predicate reads `at_times` from.
+pub fn clock_rule(rules: &[CadenceRuleRow]) -> Option<&CadenceRuleRow> {
+    // A clock row is a BOARDING trigger only if its verb departs a train
+    // — the conductor's own rule, read from its one home (634a475b).
+    rules.iter().find(|r| {
+        r.basis == "clock" && r.at_times.is_some() && crate::cadence::departs_a_train(&r.verb)
+    })
 }
 
 /// The `at_times` array as a list of `HH:MM` strings, dropping anything
@@ -796,13 +906,13 @@ fn at_times_of(rule: Option<&CadenceRuleRow>) -> Vec<String> {
 /// ("no clock, no claim").
 ///
 /// `readings` says which of the two registry reads behind `rules` and
-/// `last_board` ANSWERED — see [`BoardingReadings`]. It rides last, the
+/// `firings` ANSWERED — see [`BoardingReadings`]. It rides last, the
 /// qualifier on everything before it, the same position it takes on
 /// [`build_status_for`].
 pub fn boarding_predicate(
     rules: &[CadenceRuleRow],
     dock_depth: Option<usize>,
-    last_board: Option<&LastFiring>,
+    firings: BoardFirings<'_>,
     on_track: usize,
     now: Option<chrono::DateTime<chrono::Utc>>,
     readings: BoardingReadings,
@@ -820,8 +930,12 @@ pub fn boarding_predicate(
     let mut clauses: Vec<String> = Vec::new();
     if let Some(t) = dock_threshold {
         let mut c = format!("{t} parked cars");
+        // WHOSE minimum: the depth rule's, not the track's. "between
+        // boards" read as a spacing every train keeps, and a clock window
+        // boards through it (43fb424f: two trains 16 min apart under a
+        // stated 45). `cooldown_rule` carries the row's name.
         if let Some(cd) = cooldown_minutes {
-            c.push_str(&format!(" (min {cd} min between boards)"));
+            c.push_str(&format!(" (min {cd} min between depth-rule boards)"));
         }
         clauses.push(c);
     }
@@ -870,7 +984,7 @@ pub fn boarding_predicate(
         threshold_met,
         cadence_reading: readings.cadence,
         summary,
-        hold: boarding_hold(rules, last_board, dock_depth, on_track, now, readings),
+        hold: boarding_hold(rules, firings, dock_depth, on_track, now, readings),
     }
 }
 
@@ -886,26 +1000,30 @@ fn cooldown_released(last: &LastFiring) -> bool {
 /// The boarding decision for the queue-depth rule, as the conductor
 /// would make it on its next tick — see [`BoardHold`].
 ///
-/// Pure: (rules, the board rule's last firing, dock depth, trains on the
-/// track — open and still before their merge, see `holds_the_track` —
-/// now) in, the hold out. The cooldown needs a clock: no clock, no
+/// Pure: (rules, the board rules' last firings, dock depth, trains on
+/// the track — open and still before their merge, see `holds_the_track`
+/// — now) in, the hold out. The cooldown needs a clock: no clock, no
 /// cooldown reading — the rule `build_status` keeps for stalls. Only the
 /// clockless empty status takes that path, and it carries no firing.
 ///
 /// `held_because` and `cooldown_remaining_minutes` are the queue-depth
-/// rule's answer and only its. `next_board` is not: it answers "when
-/// does the next train board?", and a CLOCK rule boards too. The
-/// conductor evaluates each cadence row against its own last firing
+/// rule's answer and only its. `next_board` and `last_board_at` are not:
+/// the first answers "when does the next train board?", the second "when
+/// did one last board?", and a CLOCK rule boards too. The conductor
+/// evaluates each cadence row against its own last firing
 /// (`cadence::last_firing(&rule.name)`), and `cooldown_minutes` /
 /// `min_dock_depth` live inside `Basis::QueueDepth` — `due_window` reads
 /// them in that arm alone. So the cooldown and the depth threshold hold
 /// the depth rule and nothing else, while the open-train count holds
 /// every departing verb. `next_board` says which of its holds the clock
 /// rule is exempt from, because a reader who acts on the sentence is
-/// otherwise told to wait for a board that already happened.
+/// otherwise told to wait for a board that already happened; the
+/// cooldown is computed from `firings.depth` alone and `last_board_at`
+/// from the newest of both, because the pair used to be read from the
+/// depth rule together and a clock board never appeared (43fb424f).
 pub fn boarding_hold(
     rules: &[CadenceRuleRow],
-    last_board: Option<&LastFiring>,
+    firings: BoardFirings<'_>,
     dock_depth: Option<usize>,
     on_track: usize,
     now: Option<chrono::DateTime<chrono::Utc>>,
@@ -913,7 +1031,17 @@ pub fn boarding_hold(
 ) -> BoardHold {
     let depth = depth_rule(rules);
     let threshold = depth.and_then(|r| r.min_dock_depth);
-    let cooldown_remaining = last_board
+    // The rule the cooldown paces, named whenever one declares a
+    // cooldown — in force or not, so the field reads the same across
+    // the arms below.
+    let cooldown_rule = depth
+        .filter(|r| r.cooldown_minutes.is_some())
+        .map(|r| r.name.clone());
+    // The newest board of ANY rule: the track's last board.
+    let last_board_at = firings.newest().map(|l| l.fired_at);
+    // The DEPTH rule's own firing paces the depth rule's cooldown.
+    let cooldown_remaining = firings
+        .depth
         .filter(|l| !cooldown_released(l))
         .zip(now)
         .zip(depth.and_then(|r| r.cooldown_minutes).filter(|cd| *cd > 0))
@@ -978,23 +1106,43 @@ pub fn boarding_hold(
                     .map_or_else(|| admission.clone(), |(why, _, _)| why.clone()),
             ),
             cooldown_remaining_minutes: None,
-            last_board_at: last_board.map(|l| l.fired_at),
+            cooldown_rule: cooldown_rule.clone(),
+            last_board_at,
             last_board_reading: readings.last_board,
             next_board: format!("cannot say — {}{admission}", held_by(&holds)),
         };
     }
 
     // The rows WERE read and hold no depth rule → nothing boards on dock
-    // depth, and nothing can HOLD a boarding that does not exist: no
-    // "track occupied", no cooldown, no threshold. Pinned by
-    // no_depth_rule_says_so_rather_than_inventing_a_hold.
+    // depth, so no cooldown and no threshold apply. But "no depth rule"
+    // is NOT "nothing holds" (382d3383): an open train holds the track
+    // for EVERY departing verb, the clock board included, and a clock
+    // rule that exists still boards at its window. Both are facts the
+    // rows did not create, so both are stated; only the depth trigger is
+    // absent. Pinned by no_depth_rule_says_so_rather_than_inventing_a_hold
+    // (no train, no invented hold) and no_depth_rule_with_a_train_on_the_
+    // track_still_names_the_track_hold.
     if threshold.is_none() {
+        let holds: Vec<_> = track_hold.into_iter().collect();
+        let clock = match (clock_rule(rules), holds.is_empty()) {
+            (Some(_), true) => " — a scheduled clock window still boards",
+            (Some(_), false) => " — a scheduled clock window boards once the track clears",
+            (None, _) => "",
+        };
         return BoardHold {
-            held_because: None,
+            held_because: holds.first().map(|(why, _, _)| why.clone()),
             cooldown_remaining_minutes: None,
-            last_board_at: None,
+            cooldown_rule: cooldown_rule.clone(),
+            last_board_at,
             last_board_reading: readings.last_board,
-            next_board: "no depth rule is configured — nothing boards on dock depth".to_string(),
+            next_board: format!(
+                "no depth rule is configured — nothing boards on dock depth{clock}{}",
+                if holds.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", held_by(&holds).trim_end_matches(", and "))
+                }
+            ),
         };
     }
     // (why it holds, what clears it, what a clock rule is exempt from)
@@ -1130,7 +1278,8 @@ pub fn boarding_hold(
             .map(|(why, _, _)| why)
             .or_else(|| admissions.first().map(|(_, line, _)| line.clone())),
         cooldown_remaining_minutes: cooldown_remaining,
-        last_board_at: last_board.map(|l| l.fired_at),
+        cooldown_rule,
+        last_board_at,
         last_board_reading: readings.last_board,
         next_board,
     }
@@ -1722,24 +1871,76 @@ fn gate_run_verdict(steps: &[Step]) -> Option<&str> {
 /// read for the receipts already sitting on landed cars, which nothing
 /// will rewrite.
 fn failing_check(steps: &[Step]) -> Option<String> {
+    let failed = failing_checks(&gate_run_receipt(steps)?)?;
+    (!failed.is_empty()).then(|| failed.join(", "))
+}
+
+/// The receipt on a gate-run's `record-verdict` step, parsed — `None`
+/// when no step carries one or it is not JSON (a runner that died before
+/// a receipt leaves prose there). The one parse [`failing_check`] and
+/// [`failed_line`] both read, so the check a car names and the line it
+/// quotes come from the same record.
+fn gate_run_receipt(steps: &[Step]) -> Option<Value> {
     let raw = steps
         .iter()
         .find_map(|s| meta_str(&s.metadata, "receipt"))?;
-    let receipt: Value = serde_json::from_str(raw).ok()?;
-    let failed: Vec<String> = match receipt.get("checks").and_then(Value::as_array) {
-        Some(checks) => checks
-            .iter()
-            .filter(|c| c.get("result").and_then(Value::as_str) != Some("pass"))
-            .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_string))
-            .collect(),
-        None => receipt
-            .get("fails")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(|f| f.as_str().map(str::to_string))
-            .collect(),
-    };
-    (!failed.is_empty()).then(|| failed.join(", "))
+    serde_json::from_str(raw).ok()
+}
+
+/// The failed checks a receipt names, in its order (see
+/// [`failing_check`] for the two shapes). `None` when neither shape is
+/// present. ONE definition, in `crate::flake`, since 2026-09-18: the
+/// re-gate that records a flake names the prior's checks off the same
+/// read the garage names them with (36cc4913).
+fn failing_checks(receipt: &Value) -> Option<Vec<String>> {
+    crate::flake::failing_checks(receipt)
+}
+
+/// Longest `failed_line` the garage will carry, in chars. It is a
+/// status line beside the check's name, not the excerpt — the packet
+/// has the whole excerpt.
+const FAILED_LINE_CHARS: usize = 200;
+
+/// WHY the red gate-run failed, in one line: the first line of the
+/// failed check's `fails_excerpt` that reads as the failure. Since #372
+/// (backlog 5708cbd5) the receipt carries `fails_excerpt: {check: text}`
+/// — the same lines the runner replays to its pod log — and the garage
+/// still said only WHICH check, so an operator opened the packet to read
+/// an assertion that was one field away (backlog 6730dccb).
+///
+/// The excerpt read is the first failed check (in the receipt's own
+/// order, as [`failing_check`] lists them) that has one, so the line
+/// matches the head of the car's `failed_check`; a receipt naming no
+/// checks reads the first excerpt in key order. Within it, the line is
+/// the first that MARKS the failure, the markers tried in the order
+/// `panicked at`, `assertion`, `error:`, `FAILED` — the runner's own
+/// extractor's, ranked — so a test excerpt yields its panic line, not
+/// its `---- stdout ----` header and not the `test … FAILED` roll-call
+/// the runner's 40 lines of context can carry above it, and a clippy
+/// excerpt its `error:`, not its `Checking` preamble. With no marker,
+/// the first non-empty line that is not the
+/// runner's own "... (N … omitted" note. Bounded to
+/// [`FAILED_LINE_CHARS`] with a trailing ellipsis, so the bound shows.
+/// `None` for a receipt from before the field existed, an empty
+/// excerpt, or no receipt at all — an absence, never a fabricated why.
+fn failed_line(steps: &[Step]) -> Option<String> {
+    let receipt = gate_run_receipt(steps)?;
+    let excerpts = receipt.get("fails_excerpt").and_then(Value::as_object)?;
+    let named = failing_checks(&receipt).unwrap_or_default();
+    let text = named
+        .iter()
+        .find_map(|check| excerpts.get(check).and_then(Value::as_str))
+        .or_else(|| excerpts.values().find_map(Value::as_str))?;
+    let lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let marked = ["panicked at", "assertion", "error:", "FAILED"]
+        .iter()
+        .find_map(|m| lines.clone().find(|l| l.contains(m)));
+    let line = marked.or_else(|| lines.clone().find(|l| !l.starts_with("... (")))?;
+    let mut bounded: String = line.chars().take(FAILED_LINE_CHARS).collect();
+    if line.chars().count() > FAILED_LINE_CHARS {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 /// One gate currently being assessed — an open gate-run that has not
@@ -1764,6 +1965,12 @@ pub struct ActiveGate {
     /// and a third silently ate a car that was never gated at all.
     #[serde(default)]
     pub stale: bool,
+    /// The train this run tests, when it is a TRAIN gate (128b5496:
+    /// `metadata.train_gate` true, `metadata.train` the pr-train id) —
+    /// `None` for a car's gate. The floor reads it to draw the bay as
+    /// the train under test rather than as a PR car (2026-09-14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub train: Option<String>,
 }
 
 /// The metadata key a gate-run carries while it is WAITING for a
@@ -1823,6 +2030,10 @@ pub struct QueuedGate {
     /// [`estimated_waits`]. `None` when nothing has been measured: a
     /// wait nobody can derive is reported unknown, never invented.
     pub estimated_wait_seconds: Option<i64>,
+    /// The train this run tests when it is a train gate; see
+    /// [`ActiveGate::train`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub train: Option<String>,
 }
 
 /// The gate slots the Approach renders: how many gates run at once
@@ -1977,15 +2188,27 @@ fn queued_gates(
                     .zip(parse_instant(stamp))
                     .map(|(n, t)| (n - t).num_seconds()),
                 estimated_wait_seconds: waits.get(i).copied(),
+                train: train_of_gate(g),
             }
         })
         .collect();
     (queued, typical)
 }
 
+/// The pr-train a gate-run tests, when it is a TRAIN gate (128b5496):
+/// `metadata.train`, read only when `metadata.train_gate` is true, so a
+/// car's run — whatever else its metadata says — names no train.
+fn train_of_gate(g: &Job) -> Option<String> {
+    crate::stranded::is_train_gate(&g.metadata)
+        .then(|| meta_str(&g.metadata, "train").filter(|t| !t.is_empty()))
+        .flatten()
+        .map(str::to_string)
+}
+
 /// A car that gated RED and is waiting for rework — the garage. Named
-/// with its failing check (when the verdict recorded one) so an operator
-/// reads WHAT to fix without opening the packet.
+/// with its failing check (when the verdict recorded one) and the line
+/// that check failed on (when the receipt carries the excerpt) so an
+/// operator reads WHAT to fix, and WHY, without opening the packet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GaragedCar {
     pub branch: String,
@@ -1994,6 +2217,13 @@ pub struct GaragedCar {
     /// check).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_check: Option<String>,
+    /// WHY: the first line of the failed check's excerpt that reads as
+    /// the failure (the panic, the `error:`), bounded — as
+    /// [`failed_line`] picks it. `None` when the receipt carries no
+    /// `fails_excerpt` (every receipt before #372) or no excerpt for the
+    /// check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_line: Option<String>,
     /// When the failing gate-run opened — the instant when stamped, else
     /// the date, as [`opened_since`] reads it.
     pub since: String,
@@ -2071,6 +2301,7 @@ pub fn gates(
                     (Some(cutoff), Some(at)) => at < cutoff,
                     _ => false,
                 },
+                train: train_of_gate(g),
             })
         })
         .collect();
@@ -2113,6 +2344,7 @@ pub fn garage(gate_runs: &[(Job, Vec<Step>)], settled_branches: &[String]) -> Ve
             (verdict == "failed").then(|| GaragedCar {
                 branch: branch.to_string(),
                 failed_check: failing_check(steps),
+                failed_line: failed_line(steps),
                 since: opened_since(g),
                 packet_id: g.id.to_string(),
                 sha: sha_of(g),
@@ -2187,6 +2419,13 @@ fn unsettled_latest<'a>(
             continue;
         };
         if settled_branches.iter().any(|b| b == branch) {
+            continue;
+        }
+        // A train's own gate-run (128b5496) is the TRAIN's verdict: it
+        // renders on the train card and strikes the cars aboard. It is
+        // no car awaiting rework (garage) and no car nobody judged
+        // (limbo) — the held lane makes the same exclusion for a green.
+        if crate::stranded::is_train_gate(&g.metadata) {
             continue;
         }
         match latest.get(branch) {
@@ -2326,6 +2565,15 @@ pub struct YardStatus {
     pub limbo: Vec<LimboCar>,
     /// The alarm thresholds the yard enforces, from the delivery policy.
     pub policy: PolicyThresholds,
+    /// The arrivals sidings: one row per boarded car of every merged
+    /// train on the board (open ones first, then the recent arrivals),
+    /// each judged on ITS channel's live evidence — a config car on the
+    /// cluster converge packet, an infra car on the host converges, a
+    /// software car on the train's converged step (design c6bd173e,
+    /// car 3; [`crate::landing`]). Absent on an older payload → empty,
+    /// and the floor then reads "landed" the way it did before the lane.
+    #[serde(default)]
+    pub sidings: Vec<landing::SidingCar>,
 }
 
 /// How many trains each of the handler's two train reads fetches: every
@@ -2335,6 +2583,32 @@ pub struct YardStatus {
 /// seeds exactly one window of arrivals rather than a second copy of
 /// this number (CLAUDE.md §9a).
 pub const TRAIN_WINDOW: i64 = 60;
+
+/// How many gate-runs the handler's RECENCY read fetches — the slots,
+/// the garage, limbo and the stranded lane read the newest this many.
+/// Named here, beside `TRAIN_WINDOW`, for the same reason: the test
+/// that pins what the window must NOT hide
+/// (`a_held_green_older_than_the_window_is_still_named_by_the_held_lane`)
+/// seeds exactly one window plus one rather than a second copy of this
+/// number. Measured 2026-09-15: 891 gate-runs on record, 112 in the
+/// last two days, so this window is about half a busy day — which is
+/// why a held green is read by its HOLD, never by its place in here.
+pub const GATE_RUN_WINDOW: i64 = 60;
+
+/// The HELD read's page and how many pages it will turn. Not a recency
+/// window — the filter is the hold itself (`metadata_has = "hold"`) —
+/// and the read follows `total` across pages rather than trusting one,
+/// because the newest page is exactly where a long-held green is NOT.
+/// Measured 2026-09-15: 44 gate-runs carry a `hold`, 43 of them train
+/// gates (128b5496 stamps one on every train's own run), accruing at
+/// the train cadence (~20/day) — so one page holds today's record ten
+/// times over and the cap is ~100 days of train gates away. Past it the
+/// read warns rather than pretends; the durable fix is a hold marker
+/// the train gate does not share, or a filter that can say "not a train
+/// gate". Public for the same reason `GATE_RUN_WINDOW` is: the test
+/// that pins the page turn seeds one page plus one.
+pub const HELD_RUN_PAGE: i64 = 400;
+pub const HELD_RUN_PAGES: i64 = 5;
 
 /// How many recent trains the status carries. Enough to read a trend in
 /// arrivals/cancellations without turning the surface into a history log
@@ -2371,8 +2645,10 @@ pub struct YardInputs<'a> {
     pub dock_cars: &'a [(Job, Vec<Step>)],
     /// The active cadence rows.
     pub rules: &'a [CadenceRuleRow],
-    /// The board rule's last firing, which the cooldown hold is read from.
-    pub last_board: Option<&'a LastFiring>,
+    /// The board rules' last firings — the depth rule's, which the
+    /// cooldown hold is read from, and the clock rule's; the newest of
+    /// the two is the last board.
+    pub board_firings: BoardFirings<'a>,
     /// The active delivery policy, if any.
     pub policy: Option<&'a DeliveryPolicyRow>,
     /// Recent gate-runs with their steps — the stranded/held/garage/limbo
@@ -2394,6 +2670,17 @@ pub struct YardInputs<'a> {
     /// The clock instant. `None` asserts no trouble rather than inventing
     /// a reading, and keeps wall-clock out of the read-model.
     pub now: Option<chrono::DateTime<chrono::Utc>>,
+    /// The ship-a-change window the handler already reads for
+    /// `car_branches` — the sidings lane looks a train's `boarded_jobs`
+    /// up in it for each car's `delivery_channel`. A boarded car outside
+    /// it gets no row rather than a guessed siding.
+    pub cars: &'a [Job],
+    /// The converge packets each channel's landing is read from — the
+    /// newest [`landing::CONVERGE_WINDOW`] of the cluster converge and of
+    /// each host converge, with their steps (the evidence is on the `run`
+    /// step). Empty when unread: every row then says `unread`, never
+    /// "converging".
+    pub converges: &'a [(Job, Vec<Step>)],
 }
 
 /// Assemble the full status from the rows the handler fetched, asserting
@@ -2430,13 +2717,15 @@ pub fn build_status_for(
         closed_trains,
         dock_cars,
         rules,
-        last_board,
+        board_firings,
         policy,
         gate_runs,
         car_branches,
         settled_car_branches,
         arrived_trains,
         now,
+        cars,
+        converges,
     } = inputs;
     // The instant a train must have completed SOMETHING after, or it is
     // standing still. Computed once so train_status stays a pure
@@ -2480,7 +2769,7 @@ pub fn build_status_for(
     let boarding = boarding_predicate(
         rules,
         dock_depth,
-        last_board,
+        board_firings,
         on_track,
         now,
         boarding_readings,
@@ -2495,6 +2784,20 @@ pub fn build_status_for(
     // No policy → the CLI's own compiled fallback, so the page shows the
     // same bound a gate would obey with an unreachable registry.
     let capacity = policy.map_or(COMPILED_GATE_MAX_CONCURRENT, |p| p.gate_max_concurrent);
+    // The sidings: the open trains (a merged one past its image roll
+    // may already have a config car landed), then the recent arrivals
+    // the board draws — the same `RECENT_LIMIT` tail `recent` lists, so
+    // a wagon on the arrivals board has a row to be judged by.
+    let sidings = landing::sidings(
+        open_trains.iter().chain(
+            closed_trains
+                .iter()
+                .filter(|(j, s)| outcome_of(j, s) == "arrived")
+                .take(RECENT_LIMIT),
+        ),
+        cars,
+        converges,
+    );
     YardStatus {
         trains,
         dock,
@@ -2507,6 +2810,7 @@ pub fn build_status_for(
         garage: garage(gate_runs, settled_car_branches),
         limbo: limbo(gate_runs, settled_car_branches),
         policy: policy_thresholds(policy),
+        sidings,
     }
 }
 
@@ -2540,7 +2844,7 @@ mod tests {
             closed_on: None,
             metadata,
             tags: vec![],
-            simulated: false,
+            partition: boss_core::partition::Partition::Real,
         }
     }
 
@@ -2987,13 +3291,31 @@ mod tests {
         clock.at_times = Some(json!(["06:00", "18:00"]));
         let rules = vec![depth, clock];
 
-        let p = boarding_predicate(&rules, Some(2), None, 0, None, BoardingReadings::default());
+        let p = boarding_predicate(
+            &rules,
+            Some(2),
+            BoardFirings::default(),
+            0,
+            None,
+            BoardingReadings::default(),
+        );
         assert_eq!(p.dock_threshold, Some(4));
         assert_eq!(p.cooldown_minutes, Some(120));
         assert_eq!(p.at_times, vec!["06:00", "18:00"]);
         assert_eq!(p.dock_depth, Some(2));
         assert_eq!(p.threshold_met, Some(false));
         assert!(p.summary.contains("4 parked cars"));
+        // The cooldown is the DEPTH rule's own pacing, and the sentence
+        // says whose it is: "between boards" read as a property of the
+        // track, and two trains boarded 16 min apart under a stated 45
+        // (43fb424f — one on the 18:05 clock window, one on the depth
+        // rule, each paced by its own firing history).
+        assert!(
+            p.summary
+                .contains("4 parked cars (min 120 min between depth-rule boards)"),
+            "{}",
+            p.summary
+        );
         assert!(p.summary.contains("06:00 / 18:00 UTC"));
         assert!(p.summary.contains("2 car(s) parked now"));
         assert!(p.summary.contains("below the dock threshold"));
@@ -3006,7 +3328,7 @@ mod tests {
         let p = boarding_predicate(
             &[depth],
             Some(5),
-            None,
+            BoardFirings::default(),
             0,
             None,
             BoardingReadings::default(),
@@ -3025,7 +3347,14 @@ mod tests {
     fn an_unread_dock_says_the_depth_is_unknown_rather_than_zero() {
         let mut depth = rule("queue-depth");
         depth.min_dock_depth = Some(4);
-        let p = boarding_predicate(&[depth], None, None, 0, None, BoardingReadings::default());
+        let p = boarding_predicate(
+            &[depth],
+            None,
+            BoardFirings::default(),
+            0,
+            None,
+            BoardingReadings::default(),
+        );
         assert_eq!(p.dock_depth, None, "a depth nobody read is not a depth");
         assert_eq!(
             p.threshold_met, None,
@@ -3048,7 +3377,14 @@ mod tests {
     /// must not imply a dock reading it never took.
     #[test]
     fn an_unread_dock_with_no_cadence_still_says_so_rather_than_zero() {
-        let p = boarding_predicate(&[], None, None, 0, None, BoardingReadings::default());
+        let p = boarding_predicate(
+            &[],
+            None,
+            BoardFirings::default(),
+            0,
+            None,
+            BoardingReadings::default(),
+        );
         assert_eq!(p.dock_depth, None);
         assert!(
             p.summary.contains("No boarding cadence is configured"),
@@ -3069,7 +3405,7 @@ mod tests {
         let v = serde_json::to_value(boarding_predicate(
             &[depth],
             None,
-            None,
+            BoardFirings::default(),
             0,
             None,
             BoardingReadings::default(),
@@ -3090,7 +3426,7 @@ mod tests {
         let p = boarding_predicate(
             &[depth],
             Some(0),
-            None,
+            BoardFirings::default(),
             0,
             None,
             BoardingReadings::default(),
@@ -3107,7 +3443,14 @@ mod tests {
 
     #[test]
     fn no_cadence_rules_reads_as_no_configured_cadence_not_a_fake_schedule() {
-        let p = boarding_predicate(&[], Some(3), None, 0, None, BoardingReadings::default());
+        let p = boarding_predicate(
+            &[],
+            Some(3),
+            BoardFirings::default(),
+            0,
+            None,
+            BoardingReadings::default(),
+        );
         assert_eq!(p.dock_threshold, None);
         assert_eq!(p.threshold_met, None);
         assert!(p.at_times.is_empty());
@@ -3122,7 +3465,7 @@ mod tests {
         let p = boarding_predicate(
             &[clock],
             Some(0),
-            None,
+            BoardFirings::default(),
             0,
             None,
             BoardingReadings::default(),
@@ -3156,7 +3499,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(5),
             0,
             Some(at("2026-09-07T20:33:30Z")),
@@ -3171,6 +3517,64 @@ mod tests {
         );
     }
 
+    /// 43fb424f, measured 2026-09-14: train 33eaad45 boarded at 18:06:11
+    /// on the 18:05 clock window and train d078acd2 at 18:22:09 on the
+    /// depth rule, 16 min apart under a stated 45-min minimum — because
+    /// the conductor paces each rule on ITS OWN last firing, and the yard
+    /// read `last_board_at` from the depth rule alone, so the clock board
+    /// never appeared (at 18:06 it still showed 17:26:57). The reading
+    /// now keeps the two apart: the last board is the newest firing of
+    /// ANY board rule, the cooldown is measured on the depth rule's, and
+    /// the block names whose cooldown it is.
+    #[test]
+    fn a_clock_window_board_is_the_last_board_but_never_the_cooldown() {
+        let depth = fired("2026-09-14T17:26:57Z", Some(0));
+        let clock = fired("2026-09-14T18:06:11Z", Some(0));
+        let h = boarding_hold(
+            &[board_rule(3, 45)],
+            BoardFirings {
+                depth: Some(&depth),
+                clock: Some(&clock),
+            },
+            Some(5),
+            0,
+            Some(at("2026-09-14T18:10:00Z")),
+            BoardingReadings::default(),
+        );
+        // The track's last board is the clock window's, 4 min ago …
+        assert_eq!(h.last_board_at, Some(at("2026-09-14T18:06:11Z")));
+        // … and the cooldown is the depth rule's: 45 − 43 = 2 min left of
+        // ITS window, not 41 min of the clock board's.
+        assert_eq!(h.cooldown_remaining_minutes, Some(2));
+        assert_eq!(h.held_because.as_deref(), Some("cooldown — 2 min left"));
+        assert_eq!(
+            h.cooldown_rule.as_deref(),
+            Some("train-board-on-dock-depth")
+        );
+    }
+
+    /// The other order: a depth board newer than the clock board is both
+    /// the last board and the cooldown's basis.
+    #[test]
+    fn a_depth_board_newer_than_the_clock_board_is_the_last_board() {
+        let depth = fired("2026-09-14T18:22:09Z", Some(0));
+        let clock = fired("2026-09-14T18:06:11Z", Some(0));
+        let h = boarding_hold(
+            &[board_rule(3, 45)],
+            BoardFirings {
+                depth: Some(&depth),
+                clock: Some(&clock),
+            },
+            Some(5),
+            0,
+            Some(at("2026-09-14T18:30:00Z")),
+            BoardingReadings::default(),
+        );
+        assert_eq!(h.last_board_at, Some(at("2026-09-14T18:22:09Z")));
+        // 7 min 51 s elapsed reads as 7 whole minutes: 45 − 7.
+        assert_eq!(h.cooldown_remaining_minutes, Some(38));
+    }
+
     #[test]
     fn a_board_that_boarded_nothing_releases_the_cooldown() {
         // The conductor's own release rule (`due_window`): a failed board
@@ -3181,7 +3585,10 @@ mod tests {
             let last = fired("2026-09-07T20:00:00Z", Some(rc));
             let h = boarding_hold(
                 &[board_rule(4, 45)],
-                Some(&last),
+                BoardFirings {
+                    depth: Some(&last),
+                    clock: None,
+                },
                 Some(5),
                 0,
                 now,
@@ -3201,7 +3608,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", None);
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(5),
             0,
             Some(at("2026-09-07T20:05:00Z")),
@@ -3216,7 +3626,10 @@ mod tests {
         let last = fired("2026-09-07T19:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(5),
             0,
             Some(at("2026-09-07T20:00:00Z")),
@@ -3232,7 +3645,7 @@ mod tests {
     fn a_shallow_dock_is_held_below_threshold() {
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             Some(2),
             0,
             Some(at("2026-09-07T20:00:00Z")),
@@ -3259,7 +3672,10 @@ mod tests {
         let now = Some(at("2026-09-07T20:10:00Z"));
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(2),
             2,
             now,
@@ -3277,7 +3693,7 @@ mod tests {
         );
         let one = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             Some(5),
             1,
             now,
@@ -3405,6 +3821,22 @@ mod tests {
         r
     }
 
+    /// 634a475b: a clock row is a boarding trigger only if its verb
+    /// departs a train. A `basis=clock` row that opens a packet at a time
+    /// of day must not be described as "Boards at …".
+    #[test]
+    fn a_clock_row_that_departs_no_train_is_not_a_boarding_trigger() {
+        let mut opens_a_packet = clock_rule_row();
+        opens_a_packet.name = "protocol-retro-window".into();
+        opens_a_packet.verb = "open:protocol-retro".into();
+        assert!(clock_rule(&[opens_a_packet.clone()]).is_none());
+        // The real train-window (verb `run`) still is one, and is found
+        // past a non-boarding clock row.
+        let rows = [opens_a_packet, clock_rule_row()];
+        let found = clock_rule(&rows).expect("train-window");
+        assert_eq!(found.name, "train-window");
+    }
+
     /// 2026-09-10 18:04:47Z this field read "boards on the next tick once
     /// the cooldown clears (16 min)" and a train boarded at 18:06:00Z on
     /// the 18:05 clock window — wrong by fifteen minutes.
@@ -3420,7 +3852,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45), clock_rule_row()],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(5),
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3448,7 +3883,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45), clock_rule_row()],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(2),
             1,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3471,7 +3909,7 @@ mod tests {
         // and saying otherwise would be this same defect mirrored.
         let h = boarding_hold(
             &[board_rule(4, 45), clock_rule_row()],
-            None,
+            BoardFirings::default(),
             Some(5),
             1,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3488,7 +3926,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             Some(2),
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3505,7 +3946,7 @@ mod tests {
     fn a_clear_dock_boards_on_the_next_tick_never_at_a_time() {
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             Some(4),
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3526,7 +3967,7 @@ mod tests {
     fn an_unread_dock_will_not_promise_a_board_nor_a_threshold_it_cannot_check() {
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             None,
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3567,7 +4008,10 @@ mod tests {
         let last = fired("2026-09-07T20:00:00Z", Some(0));
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             None,
             1,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3597,7 +4041,7 @@ mod tests {
         clock.at_times = Some(json!(["06:00", "18:00"]));
         let h = boarding_hold(
             &[board_rule(4, 45), clock],
-            None,
+            BoardFirings::default(),
             None,
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3620,16 +4064,74 @@ mod tests {
         clock.at_times = Some(json!(["06:00"]));
         let h = boarding_hold(
             &[clock],
-            None,
+            BoardFirings::default(),
             Some(3),
             0,
             Some(at("2026-09-07T20:10:00Z")),
             BoardingReadings::default(),
         );
         assert_eq!(h.held_because, None);
+        // The depth trigger's absence is the sentence's claim; the clock
+        // board that still exists is named after it (382d3383).
+        assert!(
+            h.next_board
+                .starts_with("no depth rule is configured — nothing boards on dock depth"),
+            "{}",
+            h.next_board
+        );
+    }
+
+    /// 382d3383: "no depth rule" is not "nothing holds". With a clock rule
+    /// and NO depth rule, an open train is still a track hold — on the
+    /// clock board too (`decide` checks the track for every departing
+    /// verb) — and the surface must say so instead of `None`, which
+    /// reads as a go-ahead.
+    #[test]
+    fn no_depth_rule_with_a_train_on_the_track_still_names_the_track_hold() {
+        let mut clock = rule("clock");
+        clock.at_times = Some(json!(["06:00"]));
+        let h = boarding_hold(
+            &[clock],
+            BoardFirings::default(),
+            Some(3),
+            1,
+            Some(at("2026-09-07T20:10:00Z")),
+            BoardingReadings::default(),
+        );
         assert_eq!(
-            h.next_board,
-            "no depth rule is configured — nothing boards on dock depth"
+            h.held_because.as_deref(),
+            Some("track occupied (1 open train)"),
+            "{h:?}"
+        );
+        assert!(
+            h.next_board.contains("no depth rule is configured")
+                && h.next_board.contains("the track clears")
+                && h.next_board.contains("clock window"),
+            "next_board must state the depth trigger is absent, the track hold, and the clock board that still happens: {}",
+            h.next_board
+        );
+    }
+
+    /// The same registry with a clear track: no hold, and the clock board
+    /// is still named as the way anything boards.
+    #[test]
+    fn no_depth_rule_with_a_clear_track_names_the_clock_board_and_no_hold() {
+        let mut clock = rule("clock");
+        clock.at_times = Some(json!(["06:00"]));
+        let h = boarding_hold(
+            &[clock],
+            BoardFirings::default(),
+            Some(3),
+            0,
+            Some(at("2026-09-07T20:10:00Z")),
+            BoardingReadings::default(),
+        );
+        assert_eq!(h.held_because, None);
+        assert!(
+            h.next_board.contains("no depth rule is configured")
+                && h.next_board.contains("clock window"),
+            "{}",
+            h.next_board
         );
     }
 
@@ -3639,7 +4141,10 @@ mod tests {
         let p = boarding_predicate(
             &[board_rule(4, 45)],
             Some(5),
-            Some(&last),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
             0,
             Some(at("2026-09-07T20:33:00Z")),
             BoardingReadings::default(),
@@ -3675,7 +4180,7 @@ mod tests {
     /// to "unknown cadence"; the sentences said "is not configured".
     #[test]
     fn an_unread_cadence_says_so_rather_than_no_cadence_is_configured() {
-        let p = boarding_predicate(&[], Some(2), None, 0, None, unread());
+        let p = boarding_predicate(&[], Some(2), BoardFirings::default(), 0, None, unread());
         assert!(
             !p.summary.contains("No boarding cadence is configured"),
             "{}",
@@ -3715,7 +4220,7 @@ mod tests {
     /// swallow it, the same way an unread dock does not.
     #[test]
     fn an_unread_cadence_still_names_the_track_hold_it_can_read() {
-        let p = boarding_predicate(&[], Some(2), None, 1, None, unread());
+        let p = boarding_predicate(&[], Some(2), BoardFirings::default(), 1, None, unread());
         assert_eq!(
             p.hold.held_because.as_deref(),
             Some("track occupied (1 open train)")
@@ -3741,7 +4246,7 @@ mod tests {
     fn an_unread_firing_does_not_read_as_no_cooldown_in_force() {
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             Some(5),
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3772,7 +4277,7 @@ mod tests {
     fn a_board_rule_that_has_never_fired_still_boards_on_the_next_tick() {
         let h = boarding_hold(
             &[board_rule(4, 45)],
-            None,
+            BoardFirings::default(),
             Some(5),
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3791,7 +4296,7 @@ mod tests {
         clock.at_times = Some(json!(["06:00"]));
         let h = boarding_hold(
             &[board_rule(4, 45), clock],
-            None,
+            BoardFirings::default(),
             None,
             0,
             Some(at("2026-09-07T20:10:00Z")),
@@ -3815,8 +4320,15 @@ mod tests {
     /// dock settled the same question as `dock_source`.
     #[test]
     fn the_readings_ride_the_wire_beside_the_nulls_they_qualify() {
-        let v = serde_json::to_value(boarding_predicate(&[], Some(0), None, 0, None, unread()))
-            .unwrap();
+        let v = serde_json::to_value(boarding_predicate(
+            &[],
+            Some(0),
+            BoardFirings::default(),
+            0,
+            None,
+            unread(),
+        ))
+        .unwrap();
         assert!(v["dock_threshold"].is_null(), "{v}");
         assert!(v["cooldown_minutes"].is_null(), "{v}");
         assert_eq!(v["at_times"], json!([]), "{v}");
@@ -3827,7 +4339,7 @@ mod tests {
         let read = serde_json::to_value(boarding_predicate(
             &[],
             Some(0),
-            None,
+            BoardFirings::default(),
             0,
             None,
             Default::default(),
@@ -4025,6 +4537,143 @@ mod tests {
         assert!(v.get("boarded_at").is_none());
     }
 
+    // ---- the sidings lane (design c6bd173e, car 3 — edae6e8b) ----
+
+    /// The status carries one row per boarded car of a MERGED train,
+    /// judged on the car's own channel: an open train past its merge
+    /// whose config car's manifests applied lands that car before the
+    /// train arrives, while its software car waits on the converged
+    /// step. Closed arrived trains contribute too, newest first behind
+    /// the open ones. The reading itself is `landing::sidings`; this
+    /// pins that the status wires it from the same rows the trains are
+    /// built from.
+    #[test]
+    fn the_sidings_lane_judges_each_car_on_its_channel() {
+        let mut config_car = train(
+            vec![],
+            json!({ "branch": "fix/manifest", "delivery_channel": "config" }),
+        );
+        config_car.kind = "ship-a-change".into();
+        let mut software_car = train(
+            vec![],
+            json!({ "branch": "fix/crate", "delivery_channel": "software" }),
+        );
+        software_car.kind = "ship-a-change".into();
+        let mut merged = done("merged", "Merged into main", "2026-09-04T11:00:00Z");
+        merged.metadata["merge_ref"] = json!("34db7093e3b7");
+        let open = vec![(
+            train(
+                vec![],
+                json!({ "boarded_jobs": [config_car.id.to_string(), software_car.id.to_string()] }),
+            ),
+            vec![
+                merged,
+                done(
+                    "deployed",
+                    "Deployed to the playground",
+                    "2026-09-04T11:00:00Z",
+                ),
+                step(
+                    "converged",
+                    "Cluster converged",
+                    StepStatus::Ready,
+                    json!({}),
+                ),
+            ],
+        )];
+        let mut converge = train(
+            vec![],
+            json!({ "opened_at": "2026-09-04T11:01:00Z", "closed_at": "2026-09-04T11:05:00Z" }),
+        );
+        converge.kind = crate::landing::CLUSTER_CONVERGE.into();
+        converge.status = JobStatus::Closed;
+        let converges = vec![(
+            converge,
+            vec![step(
+                "run",
+                "run",
+                StepStatus::Completed,
+                json!({ "result": "ok", "build_head": "34db709", "verify_s": "6" }),
+            )],
+        )];
+        let cars = vec![config_car.clone(), software_car.clone()];
+        let status = build_status(YardInputs {
+            open_trains: &open,
+            cars: &cars,
+            converges: &converges,
+            now: fixed_now(),
+            ..Default::default()
+        });
+        assert_eq!(status.trains[0].phase, TrainPhase::Converging);
+        let by_id = |id: &str| {
+            status
+                .sidings
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no siding row for {id}"))
+        };
+        let config = by_id(&config_car.id.to_string());
+        assert_eq!(config.channel, "config");
+        assert!(
+            matches!(&config.landing, crate::landing::Landing::Landed { evidence, .. } if evidence.contains("34db709")),
+            "{config:?}"
+        );
+        let software = by_id(&software_car.id.to_string());
+        assert!(
+            matches!(
+                &software.landing,
+                crate::landing::Landing::Converging { .. }
+            ),
+            "{software:?}"
+        );
+        // On the wire, tagged — the shape the floor reads.
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["sidings"][0]["landing"]["kind"], "landed");
+        assert_eq!(v["sidings"][1]["landing"]["kind"], "converging");
+        // An older payload without the lane still deserializes.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("sidings");
+        let back: YardStatus = serde_json::from_value(old).unwrap();
+        assert!(back.sidings.is_empty());
+    }
+
+    // ---- the train's channel (cffef553) ----
+
+    /// The conductor stamps `metadata.delivery_channel` on a train at
+    /// board — the heaviest of its cars'. The row carries it so the yard
+    /// can name a 'data train' without opening every car.
+    #[test]
+    fn a_train_carries_the_channel_the_conductor_stamped() {
+        let job = train(
+            vec![],
+            json!({ "boarded_jobs": ["c1"], "delivery_channel": "data" }),
+        );
+        let t = train_status(&job, &[], None, &no_history(), None);
+        assert_eq!(t.channel.as_deref(), Some("data"));
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["channel"], "data");
+    }
+
+    /// A train boarded before the stamp existed has no channel — drawn
+    /// as nothing, never guessed into 'software'. Same for a stamp that
+    /// names no channel the order knows.
+    #[test]
+    fn an_unstamped_train_has_no_channel() {
+        let job = train(vec![], json!({ "boarded_jobs": ["c1"] }));
+        let t = train_status(&job, &[], None, &no_history(), None);
+        assert_eq!(t.channel, None);
+        let v = serde_json::to_value(&t).unwrap();
+        assert!(v.get("channel").is_none(), "absent from the wire, not null");
+        let odd = train(
+            vec![],
+            json!({ "boarded_jobs": ["c1"], "delivery_channel": "firmware" }),
+        );
+        assert_eq!(
+            train_status(&odd, &[], None, &no_history(), None).channel,
+            None
+        );
+    }
+
     // ---- dock + policy ----
 
     #[test]
@@ -4045,7 +4694,6 @@ mod tests {
             version: 3,
             max_red_trains: 2,
             stall_hours: 6,
-            consist_excluded_lints: json!([]),
             consist_budget_secs: 600,
             consist_output_budget: 2000,
             consist_files_named: 5,
@@ -4425,6 +5073,61 @@ mod tests {
         assert!(v["title"].is_string());
     }
 
+    /// A held car's STRIKES ride the row. The dock station stops listing
+    /// a held car (36c3d4ca), so the yard's HELD lane is drawn from this
+    /// row alone — and a row that carried the reason sentence without the
+    /// count showed "held after 2 red trains" as prose while the strike
+    /// itself stayed invisible (ac80357b). The conductor's `red_trains`
+    /// stamp is the count, absent is 0, and a parked (unheld) car carries
+    /// it the same way since the field lives on the dock row both lanes
+    /// share.
+    #[test]
+    fn a_held_car_carries_its_red_train_count_and_a_clean_one_carries_zero() {
+        let mut struck = car(
+            "fix/struck",
+            review(json!({ "hold": "held after 2 red trains" })),
+        );
+        struck.0.metadata["red_trains"] = json!(2);
+        let clean = car("fix/clean", review(json!({ "hold": "waiting on a node" })));
+        let mut parked = car("fix/parked", review(json!({})));
+        parked.0.metadata["red_trains"] = json!(1);
+        let (dock, held) = dock_lanes(&[struck, clean, parked]);
+        assert_eq!(
+            held.iter()
+                .map(|h| (h.car.branch.as_deref(), h.car.red_trains))
+                .collect::<Vec<_>>(),
+            vec![(Some("fix/struck"), 2), (Some("fix/clean"), 0)],
+            "a twice-struck held car carries 2; a clean held car carries 0"
+        );
+        assert_eq!(
+            dock[0].red_trains, 1,
+            "the parked lane carries the same field"
+        );
+        // On the wire it is a plain integer beside the reason, and a row
+        // from an older server that lacks it reads back as 0.
+        let v = serde_json::to_value(&held[0]).unwrap();
+        assert_eq!(v["red_trains"], 2);
+        let older: HeldCar = serde_json::from_value(json!({
+            "id": "x", "title": "t", "branch": "fix/old",
+            "parked_since": "2026-09-03", "reason": "why"
+        }))
+        .unwrap();
+        assert_eq!(older.car.red_trains, 0);
+    }
+
+    /// The stamp is read as a count and nothing else: a negative, a
+    /// string, or a fraction is NOT a strike (the client's `redTrainsOf`
+    /// reads the same way, 2bb0d014), so a malformed stamp cannot paint
+    /// a car struck.
+    #[test]
+    fn a_malformed_red_trains_stamp_reads_as_zero() {
+        for bad in [json!(-1), json!("2"), json!(1.5), json!(null)] {
+            let mut c = car("fix/bad", review(json!({})));
+            c.0.metadata["red_trains"] = bad.clone();
+            assert_eq!(dock_car(&c.0).red_trains, 0, "{bad} is not a strike count");
+        }
+    }
+
     /// The relaxed membership question takes the marker off and nothing
     /// else — the rest of a held car's metadata is the evidence a reader
     /// came for, and the input is left alone (immutable by default).
@@ -4578,6 +5281,45 @@ mod tests {
             branches,
             vec!["feat/running"],
             "a run waiting for a slot is not occupying one"
+        );
+    }
+
+    /// A TRAIN's gate-run in a bay (128b5496) is the train being tested,
+    /// not a car being gated; the bay has to be able to say so, or the
+    /// floor draws a `train/…` wagon that reads as a PR car and every
+    /// viewer asks why a PR is in the gates (David, 2026-09-14, twice).
+    /// The row carries the train's id when the run is a train gate, and
+    /// nothing otherwise — a car's row does not change.
+    #[test]
+    fn a_train_gate_in_a_bay_names_its_train() {
+        let mut tg = gate_run_on("train/20260914-1727", 2);
+        tg.metadata["train_gate"] = json!(true);
+        tg.metadata["train"] = json!("9a3af298-0000-4000-8000-000000000000");
+        let mut queued_tg = gate_run_on("train/20260914-1800", 2);
+        queued_tg.metadata["train_gate"] = json!(true);
+        queued_tg.metadata["train"] = json!("b1b1b1b1-0000-4000-8000-000000000000");
+        queued_tg.metadata[QUEUED_AT] = json!("2026-09-02T01:00:00Z");
+        let runs = vec![
+            (gate_run_on("feat/car", 2), vec![in_flight_step()]),
+            (tg, vec![in_flight_step()]),
+            (queued_tg, vec![in_flight_step()]),
+        ];
+        let g = gates(&runs, 2, None);
+        let by_branch: std::collections::HashMap<&str, Option<&str>> = g
+            .active
+            .iter()
+            .map(|a| (a.branch.as_str(), a.train.as_deref()))
+            .collect();
+        assert_eq!(by_branch["feat/car"], None, "a car's row carries no train");
+        assert_eq!(
+            by_branch["train/20260914-1727"],
+            Some("9a3af298-0000-4000-8000-000000000000"),
+            "a train gate names the train it tests"
+        );
+        assert_eq!(
+            g.queued[0].train.as_deref(),
+            Some("b1b1b1b1-0000-4000-8000-000000000000"),
+            "and so does one waiting in line"
         );
     }
 
@@ -4795,6 +5537,195 @@ mod tests {
         assert_eq!(g[0].branch, "feat/x");
         assert_eq!(g[0].failed_check.as_deref(), Some("test"));
         assert_eq!(g[0].since, "2026-09-03");
+    }
+
+    /// The garage said WHICH check failed and not WHY, though the
+    /// receipt has carried the why since #372 (`fails_excerpt`, backlog
+    /// 5708cbd5): an operator opened the packet to read an assertion
+    /// that was one field away (backlog 6730dccb). The car now carries
+    /// the first line of the failed check's excerpt that reads as the
+    /// failure — the panic line here, past the `---- stdout ----` header.
+    #[test]
+    fn the_garage_says_what_the_assertion_said() {
+        let raw = serde_json::to_string(&json!({
+            "verdict": "failed",
+            "head": "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8",
+            "checks": [
+                {"name": "clippy", "result": "pass"},
+                {"name": "test", "result": "fail"},
+            ],
+            "fails": ["test: refuses_while_legacy - panicked at yard.rs:9: assertion failed: refused"],
+            "fails_excerpt": {
+                "test": "---- refuses_while_legacy stdout ----\nthread 'refuses_while_legacy' panicked at crates/core/boss-jobs/src/yard.rs:9:5:\nassertion failed: refused\n\nfailures:\n    refuses_while_legacy"
+            },
+        }))
+        .unwrap();
+        let steps = vec![step(
+            "record-verdict",
+            "Record the receipt",
+            StepStatus::Completed,
+            json!({ "verdict": "failed", "receipt": raw }),
+        )];
+        let g = garage(&[(gate_run_on("feat/x", 3), steps)], &[]);
+        assert_eq!(g[0].failed_check.as_deref(), Some("test"));
+        assert_eq!(
+            g[0].failed_line.as_deref(),
+            Some(
+                "thread 'refuses_while_legacy' panicked at crates/core/boss-jobs/src/yard.rs:9:5:"
+            )
+        );
+    }
+
+    /// A receipt written before `fails_excerpt` existed (every landed
+    /// car's) names its check and carries no line — `None`, never a
+    /// fabricated why; and the `checks`-shaped garage test above, whose
+    /// receipt has no excerpt either, keeps reading as it did.
+    #[test]
+    fn a_receipt_without_an_excerpt_names_no_failed_line() {
+        let runs = vec![(
+            gate_run_on("feat/x", 3),
+            vec![verdict_step(
+                "failed",
+                json!([{"name": "test", "result": "fail"}]),
+            )],
+        )];
+        let g = garage(&runs, &[]);
+        assert_eq!(g[0].failed_check.as_deref(), Some("test"));
+        assert_eq!(g[0].failed_line, None);
+        // Present-and-empty — a green receipt's `{}` — is the same absence.
+        let steps = vec![step(
+            "record-verdict",
+            "Record the receipt",
+            StepStatus::Completed,
+            json!({ "verdict": "failed", "receipt": serde_json::to_string(&json!({
+                "verdict": "failed", "fails": ["test"], "fails_excerpt": {}
+            })).unwrap() }),
+        )];
+        assert_eq!(failed_line(&steps), None);
+    }
+
+    /// The line the garage picks: the first that MARKS the failure
+    /// (`panicked at`, `assertion`, `error:`, `FAILED`), so a clippy
+    /// excerpt reads its `error:` and not its `Checking …` preamble;
+    /// with no marker, the first non-empty line that is not the runner's
+    /// own omission note; and never longer than 200 chars — a status
+    /// line, not the excerpt.
+    #[test]
+    fn the_failed_line_is_the_first_marker_line_bounded() {
+        let with = |excerpt: &str| {
+            vec![step(
+                "record-verdict",
+                "Record the receipt",
+                StepStatus::Completed,
+                json!({ "verdict": "failed", "receipt": serde_json::to_string(&json!({
+                    "verdict": "failed",
+                    "checks": [{"name": "clippy", "result": "fail"}],
+                    "fails_excerpt": {"clippy": excerpt},
+                })).unwrap() }),
+            )]
+        };
+        assert_eq!(
+            failed_line(&with(
+                "    Checking boss-jobs v0.1.0\nerror: unused variable `x`\n  --> src/yard.rs:1:1"
+            ))
+            .as_deref(),
+            Some("error: unused variable `x`")
+        );
+        // The runner keeps up to 40 lines of context above the first
+        // header, and cargo's roll-call sits there: the panic outranks
+        // the `test … FAILED` line that names the same test.
+        assert_eq!(
+            failed_line(&with("test refuses ... FAILED\ntest other ... ok\n\n---- refuses stdout ----\nthread 'refuses' panicked at src/yard.rs:9:5:\nassertion failed: refused")).as_deref(),
+            Some("thread 'refuses' panicked at src/yard.rs:9:5:")
+        );
+        // No marker: the first line that says something, past the
+        // runner's "... (N line(s) ... omitted" note and blank lines.
+        assert_eq!(
+            failed_line(&with("... (12 line(s) before the first failure marker omitted; the Job log replay has them)\n\n  disk floor: 3 GB free")).as_deref(),
+            Some("disk floor: 3 GB free")
+        );
+        // Bounded, and saying so.
+        let long = format!("error: {}", "x".repeat(300));
+        let got = failed_line(&with(&long)).unwrap();
+        assert_eq!(got.chars().count(), 201);
+        assert!(got.ends_with('…'), "{got}");
+        // Nothing but whitespace is no line.
+        assert_eq!(failed_line(&with("  \n\n")), None);
+    }
+
+    /// Two failed checks: the line comes from the FIRST failed check the
+    /// receipt names that has an excerpt, so the garage's line matches
+    /// the head of its `failed_check` list.
+    #[test]
+    fn the_failed_line_follows_the_first_named_check_with_an_excerpt() {
+        let raw = serde_json::to_string(&json!({
+            "verdict": "failed",
+            "checks": [
+                {"name": "fmt", "result": "fail"},
+                {"name": "clippy", "result": "fail"},
+                {"name": "test", "result": "fail"},
+            ],
+            "fails_excerpt": {
+                "test": "assertion failed: later",
+                "clippy": "error: first with an excerpt",
+            },
+        }))
+        .unwrap();
+        let steps = vec![step(
+            "record-verdict",
+            "Record the receipt",
+            StepStatus::Completed,
+            json!({ "verdict": "failed", "receipt": raw }),
+        )];
+        assert_eq!(failing_check(&steps).as_deref(), Some("fmt, clippy, test"));
+        assert_eq!(
+            failed_line(&steps).as_deref(),
+            Some("error: first with an excerpt")
+        );
+    }
+
+    /// Train #361, 2026-09-14: its own gate-run (`train/20260914-1641`,
+    /// filed by the conductor under design 128b5496) went red and the
+    /// garage drew it as a car awaiting rework. A train gate is the
+    /// TRAIN's verdict — it renders on the train card, it strikes the
+    /// cars aboard, and no builder reworks a `train/…` branch — so it is
+    /// no car in the garage, and no car in limbo when it is lost, the
+    /// way the held lane already refuses to call it a stranded green.
+    #[test]
+    fn a_train_gate_is_no_car_in_the_garage_or_limbo() {
+        let mut red = gate_run_on("train/20260914-1641", 3);
+        red.metadata["train_gate"] = json!(true);
+        red.metadata["train"] = json!("7cf3e5fe-b8c7-4cc5-af4c-8f47f6a94b1f");
+        let mut lost = gate_run_on("train/20260914-1555", 3);
+        lost.metadata["train_gate"] = json!(true);
+        let runs = vec![
+            (
+                red,
+                vec![verdict_step(
+                    "failed",
+                    json!([{"name": "test", "result": "fail"}]),
+                )],
+            ),
+            (lost, vec![verdict_step("lost", json!([]))]),
+            // A car's red beside them still garages.
+            (
+                gate_run_on("feat/x", 3),
+                vec![verdict_step(
+                    "failed",
+                    json!([{"name": "test", "result": "fail"}]),
+                )],
+            ),
+        ];
+        let g = garage(&runs, &[]);
+        assert_eq!(
+            g.iter().map(|c| c.branch.as_str()).collect::<Vec<_>>(),
+            vec!["feat/x"],
+            "the train's red is the train's, not a car's"
+        );
+        assert!(
+            limbo(&runs, &[]).is_empty(),
+            "a lost train gate is relaunched by the conductor, not reworked by a builder"
+        );
     }
 
     /// 2026-09-04: every one of the garage's three entries was landed
@@ -5177,7 +6108,6 @@ mod tests {
             version: 1,
             max_red_trains: 2,
             stall_hours: 6,
-            consist_excluded_lints: json!([]),
             consist_budget_secs: 600,
             consist_output_budget: 2000,
             consist_files_named: 5,
@@ -5267,7 +6197,6 @@ mod tests {
             version: 1,
             max_red_trains: 2,
             stall_hours: 6,
-            consist_excluded_lints: json!([]),
             consist_budget_secs: 600,
             consist_output_budget: 2000,
             consist_files_named: 5,

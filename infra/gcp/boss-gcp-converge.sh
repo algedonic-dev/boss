@@ -27,27 +27,43 @@
 # docs/design/the-build-plane-manages-itself.md).
 #
 # WHAT IT DOES, AND DELIBERATELY DOES NOT. It fast-forwards the checkout
-# to forge main and runs `deploy-services.sh units` — the EXISTING
+# to forge main and runs `infra/gcp/install-units.sh units` — the
 # installer, in a mode that installs unit FILES and nothing else. It
 # does not build, stage binaries, converge the schema, or restart a
 # service. That restraint is the point: boss-gcp is the WireGuard
-# bastion and still carries a second, older BOSS stack
-# (boss-gcp-local), and a loop that bounced ~24 of its services every
-# half hour would be a worse defect than the one it fixes. Code and
-# schema on this host stay a deliberate, human-run `deploy-services.sh
-# prod`; unit files converge.
+# bastion, and a loop that bounced services every half hour would be a
+# worse defect than the one it fixes. (Until 2026-09-18 the installer
+# was the `units` mode of infra/deploy-services.sh, the bare-metal
+# deploy this host's second, older stack ran on; the stack was retired
+# on 2026-09-15 and the deploy path deleted with backlog e109bd71 — the
+# container launcher is the one way to run BOSS, and this host installs
+# unit files only.)
+#
+# ONE BINARY IS THE EXCEPTION, since 2026-09-15: the `boss` CLI. After
+# the units, the converge runs infra/estate/install-cli-from-image.sh
+# (host-neutral since 2026-09-18, backlog 9f00a805: the forge's
+# install.sh runs the same file for its cluster-operator role) with
+# the sha it just converged to, which takes /usr/local/bin/boss out of
+# the cluster image built for that commit (backlog 6f58e9a1, David's
+# option (b)). Nothing else refreshed that binary — `prod` is a deploy of
+# the stack 45641c91 retires — so it printed `boss 0.1.0` with no commit
+# and every host verb that shells to it (publish-workflow, and the Drift
+# tab's Approve through the same door) refused 78 by name (ops-request
+# 20ba7cdf). Now the CLI on this host is the tree's CLI by construction,
+# and the packet says so: `cli_sha` beside `converge_sha`, `cli_result`
+# the verdict. Nothing is restarted by it; no service execs the CLI.
 #
 # ONE-TIME BOOTSTRAP — the hand action that ends the hand actions.
 # Nothing on boss-gcp installs the loop that does the installing, so
 # somebody runs this once, from boss-gcp, as root. It is idempotent:
 #
 #   cd /opt/boss && git fetch forge main && git merge --ff-only FETCH_HEAD \
-#     && sudo ./infra/deploy-services.sh units
+#     && sudo ./infra/gcp/install-units.sh units
 #
-# The `units` mode installs every TIMERS row, and `boss-gcp-converge` is
-# one of them — so that command installs the loop that from then on
-# installs everything, itself included. After it, no unit on this host
-# needs a hand again.
+# The `units` mode installs every row infra/estate/roles.toml names for
+# this host, and `boss-gcp-converge` is one of them — so that command
+# installs the loop that from then on installs everything, itself
+# included. After it, no unit on this host needs a hand again.
 #
 # Exercised on every gate by infra/lint/boss-gcp-converges-itself.sh,
 # which runs the whole loop against a scratch checkout and a stub
@@ -109,14 +125,14 @@ resolve_remote() {
     remotes=$(as_owner "git -C '$REPO' remote")
     if [ -n "${BOSS_GCP_CONVERGE_REMOTE:-}" ]; then
         want="$BOSS_GCP_CONVERGE_REMOTE"
-        if printf '%s\n' "$remotes" | grep -qxF -- "$want"; then
+        if grep -qxF -- "$want" <<< "$remotes"; then
             printf '%s\n' "$want"; return 0
         fi
         echo "boss-gcp-converge: BOSS_GCP_CONVERGE_REMOTE=$want names no remote of $REPO" >&2
         echo "    remotes: $(printf '%s' "$remotes" | tr '\n' ' ')" >&2
         return 1
     fi
-    if printf '%s\n' "$remotes" | grep -qx forge; then
+    if grep -qx forge <<< "$remotes"; then
         echo forge; return 0
     fi
     local candidates=""
@@ -169,7 +185,10 @@ if [ -z "${BOSS_GCP_CONVERGE_SNAPSHOT:-}" ]; then
 fi
 trap 'rm -f "$BOSS_GCP_CONVERGE_SNAPSHOT"' EXIT
 
-INSTALLER="${BOSS_GCP_CONVERGE_INSTALLER:-$REPO/infra/deploy-services.sh}"
+INSTALLER="${BOSS_GCP_CONVERGE_INSTALLER:-$REPO/infra/gcp/install-units.sh}"
+# Read from $REPO AFTER the fast-forward below, like the installer: the
+# step that runs is the one the converged tree carries.
+CLI_INSTALLER="${BOSS_GCP_CONVERGE_CLI_INSTALLER:-$REPO/infra/estate/install-cli-from-image.sh}"
 
 # WHAT THIS RUN LEAVES FOR ITS OWN PACKET.
 #
@@ -255,6 +274,37 @@ run_summary_field converge_sha "$after"
 # the cost is paid by whoever is next in front of the failure. So the
 # installer's every line is kept and every line is printed, with a loud
 # banner when it failed.
+# WHAT THIS HOST IS FOR, read off the system of record — one definition
+# for every managed host, in infra/estate/node-roles.sh (the forge reads
+# its roles the same way). Best-effort: an unreachable registry leaves
+# the roles empty and every row installs, as before roles existed.
+NODE_ID="${BOSS_NODE_ID:-$(hostname -s)}"
+# THE ADDRESS FILE, BEFORE ANYTHING THAT READS IT. /etc/boss/sor.env is
+# the one place on this host that spells the system of record; every
+# unit the installer below puts down reads it with EnvironmentFile=, the
+# ops-runner installer checks it, and the roles read next uses it.
+# Rendered from infra/estate/estate.toml on every tick — the one tree
+# source (backlog 5222163e, audit H10) — so a moved address reaches this
+# host by a merge and a tick, not an ssh. Written first so a unit
+# installed on this tick never starts without it. The renderer is read
+# from this script's own infra directory (on the host, $REPO/infra
+# after the fast-forward above, so the converged tree's source; under
+# test, the tree the script came from — a fixture checkout carries no
+# estate.toml). The path is a knob only so a test never writes /etc.
+SOR_ENV="${BOSS_GCP_CONVERGE_SOR_ENV:-/etc/boss/sor.env}"
+if ! bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/estate/render-sor-env.sh" --to "$SOR_ENV"; then
+    echo "boss-gcp-converge: could not render $SOR_ENV from infra/estate/estate.toml —" >&2
+    echo "    nothing installed: every unit reads that file, and a unit without its address" >&2
+    echo "    would answer a wrong target instead of erroring." >&2
+    run_summary_field sor_env "not rendered"
+    exit 1
+fi
+export BOSS_SOR_ENV="$SOR_ENV"
+run_summary_field sor_env "$SOR_ENV"
+. "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")}/estate/node-roles.sh"
+BOSS_CONVERGE_NAME="boss-gcp-converge" read_node_roles "$NODE_ID"
+run_summary_field node_id "$NODE_ID"
+
 log="$(mktemp -t boss-gcp-converge-install.XXXXXX)"
 rc=0
 "$INSTALLER" units >"$log" 2>&1 || rc=$?
@@ -267,7 +317,33 @@ if [ "$rc" -ne 0 ]; then
     # systemd's own verdict says the run died; this says WHERE, on the
     # packet, beside whatever the installer had already recorded.
     run_summary_field installer_exit "$rc"
-    run_summary_note "deploy-services.sh units exited $rc — see this host's journal for every line"
+    run_summary_note "install-units.sh units exited $rc — see this host's journal for every line"
     exit "$rc"
 fi
-echo "boss-gcp-converge: converged on ${after:0:8} ($REMOTE/main)"
+echo "boss-gcp-converge: units converged on ${after:0:8} ($REMOTE/main)"
+
+# THE CLI, FROM THE IMAGE AT THE SHA JUST CONVERGED TO. After the units
+# and never instead of them: a CLI step that cannot pull (the forge or
+# the LAN dark, a tag the deploy runner has not built yet) must leave
+# the units converged and REPORTED, which they are by now — its own
+# facts (cli_sha, cli_result, cli_action, cli_image) it records itself
+# through the same summary file. Its output is captured and printed
+# whole under its own prefix, like the installer's. A failure here is
+# still a failed converge: the host has not converged on the tree until
+# its CLI is the tree's, and a packet that read `ok` over a stale CLI
+# would be the 2026-09-15 defect with a green light on it.
+log="$(mktemp -t boss-gcp-converge-cli.XXXXXX)"
+cli_rc=0
+"$CLI_INSTALLER" "$after" >"$log" 2>&1 || cli_rc=$?
+sed 's/^/  cli: /' "$log"
+rm -f "$log"
+if [ "$cli_rc" -ne 0 ]; then
+    echo "boss-gcp-converge: the CLI step FAILED (exit $cli_rc) at ${after:0:8} — its complete" >&2
+    echo "    output is above. Units on this host are converged; /usr/local/bin/boss is" >&2
+    echo "    whatever the previous converge confirmed (cli_result on the packet says why)." >&2
+    # The step records cli_result itself when it can; a step that died
+    # before it could still leaves the exit on the packet.
+    run_summary_field cli_exit "$cli_rc"
+    exit "$cli_rc"
+fi
+echo "boss-gcp-converge: converged on ${after:0:8} ($REMOTE/main) — units and CLI"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# consist: skip — psql against a live database; a tree cannot answer it, and it has its own systemd timer
 #
 # Causal / temporal ordering sweep over the audit-log-derived
 # projections. Per docs/design/correctness-protocol.md, the audit log
@@ -40,7 +41,7 @@ run_invariant() {
     }
     if [[ -n "$rows" ]]; then
         echo "[VIOLATION] $label"
-        echo "$rows" | head -10 | sed 's/^/    /'
+        head -10 <<< "$rows" | sed 's/^/    /'
         local n
         n=$(echo "$rows" | wc -l)
         if (( n > 10 )); then

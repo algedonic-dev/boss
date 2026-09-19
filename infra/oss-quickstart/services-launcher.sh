@@ -65,13 +65,15 @@ SERVICES=(
     # telemetry (with the SPA-side "demo mode" banner on /ops).
     "boss-observability"
     # The views tier + search + ML + the simulator UX. These four
-    # were absent from this roster while present in boss-ports and
-    # deploy-services.sh — the fact-lives-thrice drift (CLAUDE.md
-    # §9a) surfacing as 502s on /system/os-map, /api/search/*,
-    # /api/ml/* and /simulator in every quickstart/container deploy
-    # (aab30bbf). The binaries were always in the image; only this
-    # list forgot them. A pin tying this roster to boss-ports (the
-    # deploy-services.sh treatment) is proposed on the feedback item.
+    # were absent from this roster while present in boss-ports — the
+    # fact-lives-twice drift (CLAUDE.md §9a) surfacing as 502s on
+    # /system/os-map, /api/search/*, /api/ml/* and /simulator in every
+    # quickstart/container deploy (aab30bbf). The binaries were always
+    # in the image; only this list forgot them. Since 2026-09-18 this
+    # roster is PINNED to boss-ports (`launcher_roster_agreement` in
+    # crates/core/boss-ports/src/lib.rs): a port row with no line here,
+    # or a `boss-*-api` line with no port row, fails that crate's tests
+    # by name.
     "boss-views-api"
     "boss-search-api"
     "boss-ml-api"
@@ -88,7 +90,7 @@ SERVICES=(
 # `--check` is how the converge proves it did before rolling the
 # cluster (2026-09-05: it had not, and the pod crash-looped for hours).
 HERE="$(dirname "${BASH_SOURCE[0]}")"
-SOURCED=(tenant-launch.sh)
+SOURCED=(tenant-launch.sh tenant-modules.sh)
 if [[ "${1:-}" == "--check" ]]; then
     missing=0
     for f in "${SOURCED[@]}"; do
@@ -102,11 +104,36 @@ if [[ "${1:-}" == "--check" ]]; then
 fi
 PIDS=()
 
+# THE TENANT DIRECTORY (backlog f4f5c387, car 2 of fcc1d57b; David
+# 2026-09-16 'Let's do it'). The deployment names ONE directory the pod
+# reads its tenant from — BOSS_TENANT_DIR: from the image
+# (/opt/boss/examples/<name>) or the ConfigMap the converge delivers at
+# /opt/boss/tenant — and the two paths the N-1 readers take are derived
+# here, once: BOSS_TENANT_MANIFEST_TOML for the gateway (tenant.toml at
+# the root, else seeds/tenant.toml — both spellings the contract
+# accepts, docs/tenant-contract.md) and BOSS_SIM_SEEDS_DIR for the seed
+# scripts and the engine. An explicit value wins (the compose file
+# sets them directly), and a directory holding no
+# manifest REFUSES the launch: a pod that fell through to the gateway's
+# default path would answer instead of erroring (CLAUDE.md §Doors).
+if [[ -n "${BOSS_TENANT_DIR:-}" ]]; then
+    if [[ -f "$BOSS_TENANT_DIR/tenant.toml" ]]; then
+        export BOSS_TENANT_MANIFEST_TOML="${BOSS_TENANT_MANIFEST_TOML:-$BOSS_TENANT_DIR/tenant.toml}"
+    elif [[ -f "$BOSS_TENANT_DIR/seeds/tenant.toml" ]]; then
+        export BOSS_TENANT_MANIFEST_TOML="${BOSS_TENANT_MANIFEST_TOML:-$BOSS_TENANT_DIR/seeds/tenant.toml}"
+    else
+        echo "boss-launch: BOSS_TENANT_DIR=$BOSS_TENANT_DIR holds no tenant.toml or seeds/tenant.toml — not a tenant directory; not starting" >&2
+        exit 1
+    fi
+    export BOSS_SIM_SEEDS_DIR="${BOSS_SIM_SEEDS_DIR:-$BOSS_TENANT_DIR/seeds}"
+    echo "==> tenant: BOSS_TENANT_DIR=$BOSS_TENANT_DIR BOSS_TENANT_MANIFEST_TOML=$BOSS_TENANT_MANIFEST_TOML BOSS_SIM_SEEDS_DIR=$BOSS_SIM_SEEDS_DIR"
+fi
+
 # Generate /etc/boss-*.toml configs at container start. The API
-# binaries default --config to /etc/<name>.toml; bare-metal installs
-# get these via infra/deploy-services.sh, the docker image via this
-# generator. Single-container assumption: every cross-service URL
-# is 127.0.0.1:<port>.
+# binaries default --config to /etc/<name>.toml and this generator is
+# the one thing that writes them (the bare-metal deploy's heredoc twin
+# left with that path on 2026-09-18). Single-container assumption:
+# every cross-service URL is 127.0.0.1:<port>.
 if command -v boss-generate-configs >/dev/null 2>&1; then
     boss-generate-configs
 else
@@ -123,13 +150,14 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# Seed the platform operator-baseline (emp-audit + the bootstrap-admin)
-# and then the brewery tenant (Workflows + policy + accounts/vendors/data)
-# before the sim starts. Both go through the public API — and boss-init
-# can't do them (the API isn't up during init), so they run here, just
-# before the sim opens its first Job. operator-baseline FIRST so the
-# platform-admin login + emp-audit exist before the brewery seed + sim.
-# Shared with bare-metal bootstrap-local.sh.
+# Publish the tenant (`boss tenant publish`, the door every tenant
+# takes — brewery included since backlog b644d727), then the platform
+# operator-baseline (emp-audit + the bootstrap-admin), then the
+# brewery's engine prepare (the sim data + the reset baseline) before
+# the sim starts. All of it goes through the public API — and
+# boss-init can't do it (the API isn't up during init), so it runs
+# here, just before the sim opens its first Job; the order and its
+# reasons are on publish_tenant in tenant-launch.sh.
 #
 # A FAILED PREPARE DEGRADES THE POD, IT DOES NOT END IT. The publish and
 # the sim start live in tenant-launch.sh: on failure the APIs stay up,
@@ -142,8 +170,36 @@ for f in "${SOURCED[@]}"; do
     . "$HERE/$f"
 done
 
+# WHAT THE TENANT ASKED FOR (backlog 18d6a6c9, 2026-09-17). A module's
+# service starts only when the tenant manifest lists that module true
+# (tenant-modules.sh — the SPA's rule since ce68f137, read from the
+# same file); BOSS_SIM_ENABLED derives from `sim` when the deployment
+# did not set it; the sim's loopback pair (BOSS_SIM_CALLBACK_BIND +
+# BOSS_EVENT_WEBHOOK_URL) is exported only when the sim runs, and
+# before the dispatcher — which reads the URL once, at boot — starts.
+# `--plan` prints the decision per service and exits without starting
+# anything: the door the shell test uses, and what an operator asks
+# when a service is missing from a pod ("was it skipped, and why?").
+# (Called in THIS shell, not a subshell: it exports.)
+echo "==> tenant modules:"
+derive_sim_env
+if [[ "${1:-}" == "--plan" ]]; then
+    for svc in "${SERVICES[@]}"; do
+        if service_wanted "$svc"; then
+            echo "start $svc"
+        else
+            echo "skip $svc ($SERVICE_SKIP_REASON)"
+        fi
+    done
+    exit 0
+fi
+
 echo "==> boss-launch starting ${#SERVICES[@]} services"
 for svc in "${SERVICES[@]}"; do
+    if ! service_wanted "$svc"; then
+        echo "    SKIP: $svc ($SERVICE_SKIP_REASON)"
+        continue
+    fi
     # Just before the sim — which posts jobs immediately — make sure the
     # brewery Workflows + policy grants exist (the jobs-api it needs is up
     # by now, having been started earlier in this loop).

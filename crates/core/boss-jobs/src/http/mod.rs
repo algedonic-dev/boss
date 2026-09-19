@@ -35,6 +35,7 @@ mod kinds;
 mod plugins;
 mod queue_age;
 mod refusals;
+mod regions;
 mod sim_clock;
 mod stations;
 mod steps;
@@ -47,6 +48,7 @@ use kinds::*;
 use plugins::*;
 use queue_age::*;
 use refusals::*;
+use regions::*;
 use sim_clock::*;
 use stations::*;
 use steps::*;
@@ -120,6 +122,13 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// the conductor enforces, read from the live policy row rather than
     /// a constant.
     pub delivery: Option<Arc<dyn crate::delivery::DeliveryPolicyRepository>>,
+    /// THE CLAIM DOOR'S BUDGET GATE (design c87fb59b car 3, backlog
+    /// cb78818d): the agents registry and the run log, read together
+    /// when a step with an agent block is claimed — the claimant's row
+    /// (its cap, and the model a station capability compares) and its
+    /// hour-window spend. `None` is a deployment without the two
+    /// registries, where every claim is admitted exactly as before.
+    pub agent_budget: Option<Arc<crate::agent_budget::BudgetDoor>>,
 }
 
 /// `GET /api/jobs/job-edges` — the declared job-to-job link fields.
@@ -184,6 +193,11 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // rows, recent arrivals. Read-only, own row shape; Job and Step
         // untouched, `terminal-report` and `queue-age` the precedents.
         .route("/api/yard/status", get(yard_status::<R, B>))
+        // The IT system map's KPI read (design 0524fc95, car 1): eight
+        // regions with count / state / trend, computed from the SAME
+        // pass as the status above so the map, the yard and `boss
+        // orient` cannot disagree.
+        .route("/api/yard/regions", get(yard_regions::<R, B>))
         .route("/api/jobs", get(list_jobs::<R, B>))
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
@@ -196,6 +210,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
         .route("/api/jobs/{id}/convert", post(convert_job::<R, B>))
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
+        // The tree's estate declaration (backlog ee368d0c): the
+        // launcher publishes infra/estate/estate.toml on every start.
+        .route(
+            "/api/estate/nodes/batch",
+            post(declare_estate_nodes::<R, B>),
+        )
         .route(
             "/api/estate/observations",
             get(list_estate_observations::<R, B>),
@@ -457,6 +477,27 @@ pub(super) fn job_scope_from_predicate(
 /// per-actor station the same question, so both must bind the same id.
 pub(super) fn self_id(user: &boss_policy_client::User) -> Option<&str> {
     user.ambient_actor().is_some().then_some(user.id.as_str())
+}
+
+/// The precise close instant beside the one-day-resolution
+/// `closed_on`: `metadata.closed_at`, which the terminal report prefers
+/// over date arithmetic (`cycle_days_sample`, port.rs). First close
+/// wins — a Job closes once — and a non-object metadata is replaced by
+/// the one-key object rather than skipped.
+///
+/// ONE write for the three close sites (the declared-terminal hook and
+/// the all-steps-terminal catch-all in steps.rs, the status PUT in
+/// jobs.rs). Until 2026-09-15 each hook carried its own copy of this
+/// and the PUT had none, so a packet the operator closed by hand read
+/// as "no cycle time" beside its stamped neighbours (backlog
+/// a7a07ffb). A fact that lives three times gets one definition.
+pub(super) fn stamp_close_instant(job: &mut Job, now: &chrono::DateTime<chrono::Utc>) {
+    if let serde_json::Value::Object(map) = &mut job.metadata {
+        map.entry("closed_at")
+            .or_insert_with(|| serde_json::json!(now.to_rfc3339()));
+    } else {
+        job.metadata = serde_json::json!({ "closed_at": now.to_rfc3339() });
+    }
 }
 
 // ---------------------------------------------------------------------------

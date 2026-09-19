@@ -15,8 +15,6 @@ use anyhow::{Context, Result};
 use axum::Router;
 use tracing::{info, warn};
 
-#[allow(unused_imports)]
-use boss_policy::ReconcileStats;
 use boss_policy::http::{PolicyApiState, router};
 use boss_policy::port::PolicyRepository;
 use boss_policy::{PgPolicy, PolicyEngine, default_rules};
@@ -63,7 +61,7 @@ async fn main() -> Result<()> {
     let app: Router = router(state);
 
     // Default port pulled from boss_ports — single source of truth
-    // shared with infra/deploy-services.sh + every BOSS_POLICY_URL
+    // shared with the config generator + every BOSS_POLICY_URL
     // default. The 7060/7250 collision once lived right here; the
     // table now makes drift impossible.
     let port = std::env::var("BOSS_POLICY_PORT")

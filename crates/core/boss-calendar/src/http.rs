@@ -14,10 +14,17 @@
 //! - `POST /api/calendar/cancel-by-reason` — cascade cancel by
 //!   `(reason_kind, reason_ref_id)`. Body: `{kind, ref_id, actor}`.
 //!   Returns `{ "cancelled": <n> }`.
-//! - `POST /api/calendar/business-calendars/batch` — seed/replace
-//!   business calendars. Body: `Vec<BusinessCalendar>`. Operator-gated
+//! - `POST /api/calendar/business-calendars/batch[?mode=insert-if-absent|take]`
+//!   — publish
+//!   business calendars, insert-if-absent by code (design e187198f: the
+//!   instance is the truth; `take` replaces a held code wholesale).
+//!   Body: `Vec<BusinessCalendar>`. Operator-gated
 //!   (with the `x-sim-origin` bypass). Returns
-//!   `{ "received": <n>, "upserted": <m> }`.
+//!   `{ received, inserted, kept: [{id, differs}], updated: [{id, changes}], unchanged }`.
+//! - `GET  /api/calendar/business-calendars` — every business calendar
+//!   with its closed-day set, sorted by code (the batch's own input
+//!   shape: what `boss tenant export` writes the seed file from, backlog
+//!   e618f3ac). Open read.
 //! - `GET  /api/calendar/business-calendars/{code}` — fetch one business
 //!   calendar with its full closed-day set, or 404. Open read.
 
@@ -33,6 +40,7 @@ use serde::Deserialize;
 
 use boss_core::calendar::{BusinessCalendar, ReservationId, ReservationRequest, TimeWindow};
 use boss_core::job::Subject;
+use boss_core::publish::ModeQuery;
 use boss_policy_client::{AccessTier, CurrentUser};
 
 use crate::port::{CalendarClient, CalendarError};
@@ -60,6 +68,10 @@ pub fn router(state: CalendarApiState) -> Router {
             delete(cancel_reservation),
         )
         .route("/api/calendar/cancel-by-reason", post(cancel_by_reason))
+        .route(
+            "/api/calendar/business-calendars",
+            get(list_business_calendars),
+        )
         .route(
             "/api/calendar/business-calendars/batch",
             post(batch_business_calendars),
@@ -231,6 +243,7 @@ async fn cancel_by_reason(
 async fn batch_business_calendars(
     State(state): State<CalendarApiState>,
     CurrentUser(user): CurrentUser,
+    Query(ModeQuery { mode }): Query<ModeQuery>,
     Json(calendars): Json<Vec<BusinessCalendar>>,
 ) -> Response {
     let sim = boss_core::sim_origin::is_in_sim_chain();
@@ -239,13 +252,21 @@ async fn batch_business_calendars(
         return (StatusCode::FORBIDDEN, "operator tier required").into_response();
     }
 
-    let received = calendars.len();
-    match state.calendar.upsert_business_calendars(&calendars).await {
-        Ok(upserted) => Json(serde_json::json!({
-            "received": received,
-            "upserted": upserted,
-        }))
-        .into_response(),
+    match state
+        .calendar
+        .publish_business_calendars(&calendars, mode)
+        .await
+    {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Every business calendar, sorted by code, each with its closed-day
+/// set. Open read, like the per-code GET.
+async fn list_business_calendars(State(state): State<CalendarApiState>) -> Response {
+    match state.calendar.list_business_calendars().await {
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => calendar_error_response(e),
     }
 }
@@ -479,6 +500,53 @@ mod tests {
         (status, Some(serde_json::from_slice(&bytes).unwrap()))
     }
 
+    /// `boss tenant export` writes the instance's calendars back into
+    /// `seeds/business_calendars.json` (design e187198f car 3, backlog
+    /// e618f3ac): until 2026-09-18 the only read was per code, so an
+    /// export had no way to learn WHICH codes the instance held. The
+    /// list is every calendar with its closed set, sorted by code —
+    /// the batch's own input shape, so export and publish are inverses.
+    #[tokio::test]
+    async fn list_business_calendars_answers_every_code_sorted_in_the_batch_shape() {
+        let app = app();
+        let body = serde_json::json!([
+            {"code": "us-tax", "name": "US Tax", "weekend": [5, 6], "closed": ["2026-04-15"]},
+            {"code": "us-banking", "name": "US Banking", "weekend": [5, 6], "closed": ["2026-01-01"]},
+        ]);
+        let resp = app
+            .clone()
+            .oneshot(batch_request(Some(&operator_header()), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/calendar/business-calendars")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<BusinessCalendar> = serde_json::from_slice(&bytes).unwrap();
+        let codes: Vec<&str> = rows.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(codes, ["us-banking", "us-tax"], "sorted by code");
+        assert_eq!(
+            rows[1]
+                .closed
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+            ["2026-04-15"],
+            "each row carries its full closed set, as the per-code GET does"
+        );
+    }
+
     #[tokio::test]
     async fn get_business_calendar_404_for_missing() {
         let (status, _) = get_calendar(&app(), "no-such-calendar").await;
@@ -502,7 +570,7 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["received"], serde_json::json!(1));
-        assert_eq!(v["upserted"], serde_json::json!(1));
+        assert_eq!(v["inserted"], serde_json::json!(1));
 
         let (status, cal) = get_calendar(&app, "us-banking").await;
         assert_eq!(status, StatusCode::OK);
@@ -514,8 +582,12 @@ mod tests {
         );
     }
 
+    /// THE INSTANCE IS THE TRUTH (design e187198f, 2026-09-18): a
+    /// re-seed of a held code KEEPS it by default and names the field
+    /// that differs; only `?mode=take` replaces the closed set
+    /// wholesale (no merge), naming the change from → to.
     #[tokio::test]
-    async fn batch_upsert_replaces_closed_set_wholesale() {
+    async fn batch_keeps_a_held_code_by_default_and_take_replaces_the_closed_set_wholesale() {
         let app = app();
         // v1: one closed day.
         let r1 = app
@@ -527,7 +599,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
-        // v2 (same code): a different closed set — replaces, does NOT merge.
+        // v2 (same code), by default: kept, and the answer says on what.
         let r2 = app
             .clone()
             .oneshot(batch_request(
@@ -537,12 +609,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["inserted"], serde_json::json!(0));
+        assert_eq!(v["kept"][0]["id"], "us-banking");
+        assert_eq!(v["kept"][0]["differs"], serde_json::json!(["closed"]));
+        assert_eq!(v["updated"], serde_json::json!([]));
+        let (_, cal) = get_calendar(&app, "us-banking").await;
+        assert_eq!(
+            cal.unwrap()["closed"],
+            serde_json::json!(["2026-01-01"]),
+            "the instance's closed set is kept under the default"
+        );
 
+        // v2 under take: replaces, does NOT merge, and names the change.
+        let r3 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/calendar/business-calendars/batch?mode=take")
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", operator_header())
+                    .body(Body::from(
+                        one_calendar(&["2026-07-03", "2026-12-25"]).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r3.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["kept"], serde_json::json!([]));
+        assert_eq!(v["updated"][0]["id"], "us-banking");
+        assert_eq!(v["updated"][0]["changes"][0]["field"], "closed");
+        assert_eq!(
+            v["updated"][0]["changes"][0]["from"],
+            serde_json::json!(["2026-01-01"])
+        );
         let (_, cal) = get_calendar(&app, "us-banking").await;
         assert_eq!(
             cal.unwrap()["closed"],
             serde_json::json!(["2026-07-03", "2026-12-25"]),
-            "re-seed replaces the closed set wholesale (no merge with v1)"
+            "take replaces the closed set wholesale (no merge with v1)"
         );
     }
 

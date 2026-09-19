@@ -16,15 +16,25 @@
 //!
 //! Idempotent: if a `workflow-design` Job has already published a
 //! given target kind (the registry has an active row with an
-//! `authoring_job_id`), the publish skips it. Re-running after a
-//! partial failure resumes from where it left off.
+//! `authoring_job_id`), the publish keeps it — and when the file
+//! differs from the live row on a facet the drift lint compares
+//! ([`workflow_facets`]), the kind is NAMED in the outcome with those
+//! facets (design e187198f, 2026-09-18: the instance is the truth,
+//! and a repo edit that does not land is named, never silent; until
+//! then a differing kind was skipped without a word, so a repo edit to
+//! `seeds/workflows.toml` was dead text on a running instance).
+//! `force_republish` supersedes ONLY the kinds that differ, each
+//! change named. Re-running after a partial failure resumes from
+//! where it left off.
 //!
 //! Hard-fails on any non-2xx response. The seed regens that consume
 //! this output expect every kind to actually land in the registry.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use boss_core::publish::{FieldChange, KeptRow, UpdatedRow};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -40,8 +50,8 @@ use crate::registry::WorkflowSpec;
 /// `"<tenant>-bootstrap"` — see
 /// [`crate::seed_loader::load_workflows_with_owning_team`]); `dev`
 /// auto-walks the sign-off step (development only);
-/// `force_republish` re-publishes even already-operator-published
-/// kinds (each lands as a new version); `x_boss_user` overrides the
+/// `force_republish` re-publishes an already-operator-published kind
+/// whose file differs (a new version supersedes); `x_boss_user` overrides the
 /// default `automation:bootstrap` / `platform-admin` / `operator`
 /// header when `Some`.
 ///
@@ -54,7 +64,7 @@ pub fn publish_workflows(
     dev: bool,
     force_republish: bool,
     x_boss_user: Option<&str>,
-) -> Result<()> {
+) -> Result<WorkflowPublishOutcome> {
     let user_header = x_boss_user.map(|s| s.to_string()).unwrap_or_else(|| {
         json!({
             "id": "automation:bootstrap",
@@ -66,6 +76,13 @@ pub fn publish_workflows(
         })
         .to_string()
     });
+    // WHO SIGNS. The walk's synthetic approvals are recorded against
+    // the actor the walk RUNS AS — the id in the header every call
+    // below already carries — never a named person. Until 2026-09-18
+    // this was a literal `emp-cto` (backlog 3c23662d): a signature by
+    // someone who did not sign, the forged-actor defect CLAUDE.md
+    // §Doors names, on every tenant's bootstrap.
+    let signer = signer_of(&user_header)?;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
@@ -93,38 +110,202 @@ pub fn publish_workflows(
         "starting workflow bootstrap"
     );
 
-    let mut published = 0usize;
-    let mut skipped = 0usize;
+    let mut out = WorkflowPublishOutcome::default();
     for spec in &specs {
         // Skip if already operator-published. The registry's
         // `created_by` discriminator is the source of truth: rows
         // landed via a Job have `created_by = "job-<uuid>"`,
         // rows that came from `platform_workflows()` carry
         // `created_by = "bootstrap"`.
-        match active_kind_provenance(&client, api_base, &headers, &spec.kind)? {
-            Provenance::OperatorPublished if !force_republish => {
-                info!(kind = %spec.kind, "already operator-published; skipping");
-                skipped += 1;
-                continue;
-            }
+        let (provenance, live) = active_kind(&client, api_base, &headers, &spec.kind)?;
+        let changes = match provenance {
             Provenance::OperatorPublished => {
+                // The kind is live: what does the file say differently?
+                // Named either way (design e187198f) — kept under the
+                // default, superseded under force.
+                let changes = workflow_changes(&live, spec);
+                if changes.is_empty() {
+                    info!(kind = %spec.kind, "already published as the file declares; skipping");
+                    out.unchanged += 1;
+                    continue;
+                }
+                if !force_republish {
+                    info!(kind = %spec.kind, differs = ?changes.iter().map(|c| c.field.as_str()).collect::<Vec<_>>(), "already operator-published and the file differs; kept (the instance is the truth)");
+                    out.kept.push(KeptRow {
+                        id: spec.kind.clone(),
+                        differs: changes.into_iter().map(|c| c.field).collect(),
+                    });
+                    continue;
+                }
                 info!(kind = %spec.kind, "already operator-published; --force-republish set, publishing new version");
+                Some(changes)
             }
-            Provenance::BootstrapOwned | Provenance::Missing => {}
-        }
-        bootstrap_kind(&client, api_base, &headers, spec, dev)
+            Provenance::BootstrapOwned | Provenance::Missing => None,
+        };
+        bootstrap_kind(&client, api_base, &headers, spec, dev, &signer)
             .with_context(|| format!("bootstrap of `{}`", spec.kind))?;
-        published += 1;
+        match changes {
+            Some(changes) => out.superseded.push(UpdatedRow {
+                id: spec.kind.clone(),
+                changes,
+            }),
+            None => out.published.push(spec.kind.clone()),
+        }
     }
 
     info!(
-        published,
-        skipped,
+        published = out.published.len(),
+        superseded = out.superseded.len(),
+        kept = out.kept.len(),
+        unchanged = out.unchanged,
         total = specs.len(),
         owning_team = %owning_team,
         "workflow bootstrap complete"
     );
-    Ok(())
+    Ok(out)
+}
+
+/// What a workflow publish did: kinds published (new, or over a
+/// bootstrap-owned row), kinds a `force_republish` SUPERSEDED with a
+/// new version (each differing facet named from → to), kinds kept as
+/// the instance publishes them with the differing facets named, and
+/// kinds already as the file declares.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkflowPublishOutcome {
+    pub published: Vec<String>,
+    pub superseded: Vec<UpdatedRow>,
+    pub kept: Vec<KeptRow>,
+    pub unchanged: usize,
+}
+
+impl WorkflowPublishOutcome {
+    /// One line for a publish report.
+    pub fn summary(&self) -> String {
+        let mut s = format!("{} published", self.published.len());
+        if !self.published.is_empty() {
+            s.push_str(&format!(" ({})", self.published.join(", ")));
+        }
+        if !self.superseded.is_empty() {
+            s.push_str(&format!(
+                ", superseded {}: {}",
+                self.superseded.len(),
+                self.superseded
+                    .iter()
+                    .map(UpdatedRow::render)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        if self.unchanged > 0 {
+            s.push_str(&format!(", {} already as declared", self.unchanged));
+        }
+        let kept = boss_core::publish::render_kept(&self.kept, Some("workflows"));
+        if !kept.is_empty() {
+            s.push_str("; ");
+            s.push_str(&kept);
+        }
+        s
+    }
+}
+
+/// The facets a live kind and its file are compared on — the SAME
+/// list `infra/lint/the-live-protocols-are-the-authored-protocols.sh`
+/// compares (its `FIELDS` and `step_facets`), so the publish line and
+/// the daily drift measurement name the same disagreements: the three
+/// scalar strings an operator reads (`label`, `description`,
+/// `category`) and the step facets both sides state verbatim
+/// (`steps.count`, `steps.titles`, and per title held on BOTH sides
+/// `steps.<title>.required` + `steps.<title>.title_template`). The
+/// structural fields (predicates, kinds, metadata_schema) are not
+/// compared here for the reason the lint gives: they need the publish
+/// path's normalisation before an equality means anything.
+pub fn workflow_facets(spec: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for f in ["label", "description", "category"] {
+        out.insert(
+            f.to_string(),
+            spec.get(f)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    let steps: Vec<&Value> = spec
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let titles: Vec<String> = steps
+        .iter()
+        .map(|s| {
+            s.get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    out.insert("steps.count".to_string(), titles.len().to_string());
+    out.insert("steps.titles".to_string(), titles.join(","));
+    for (s, title) in steps.iter().zip(&titles) {
+        let mut required: Vec<String> = s
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter(|f| f.get("required") == Some(&Value::Bool(true)))
+                    .map(|f| {
+                        f.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        required.sort();
+        out.insert(format!("steps.{title}.required"), required.join(","));
+        out.insert(
+            format!("steps.{title}.title_template"),
+            s.get("title_template")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// Every facet the file's `spec` disagrees with the `live` row on,
+/// from → to. Per-step facets compare only for titles BOTH sides hold
+/// (the lint's rule): a step on one side only shows in `steps.titles`
+/// once, not as a line against nothing.
+pub fn workflow_changes(live: &Value, spec: &WorkflowSpec) -> Vec<FieldChange> {
+    let file = workflow_facets(&serde_json::to_value(spec).unwrap_or(Value::Null));
+    let live = workflow_facets(live);
+    file.iter()
+        .filter(|(k, _)| {
+            // A per-step facet is compared only when the live side
+            // holds the same title.
+            !k.starts_with("steps.")
+                || ["steps.count", "steps.titles"].contains(&k.as_str())
+                || live.contains_key(*k)
+        })
+        .filter_map(|(k, want)| {
+            let have = live.get(k).cloned().unwrap_or_default();
+            (have != *want).then(|| FieldChange::new(k, &have, want))
+        })
+        .collect()
+}
+
+/// The actor id an `x-boss-user` header names — the walk's signer.
+/// Refuses a header with no `id` rather than signing as nobody.
+fn signer_of(user_header: &str) -> Result<String> {
+    serde_json::from_str::<Value>(user_header)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| !id.is_empty())
+        .context("x-boss-user header names no actor id, so the walk has nobody to sign as")
 }
 
 fn jobs_url(api_base: &str, path: &str) -> String {
@@ -157,16 +338,18 @@ fn provenance_of(body: &Value) -> Provenance {
     }
 }
 
-fn active_kind_provenance(
+/// The active row for `kind` as the registry answers it, with its
+/// provenance; `Missing` rides an empty body.
+fn active_kind(
     client: &Client,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     kind: &str,
-) -> Result<Provenance> {
+) -> Result<(Provenance, Value)> {
     let url = jobs_url(api_base, &format!("/api/workflows/{kind}"));
     let resp = client.get(&url).headers(headers.clone()).send()?;
     if resp.status() == 404 {
-        return Ok(Provenance::Missing);
+        return Ok((Provenance::Missing, Value::Null));
     }
     if !resp.status().is_success() {
         anyhow::bail!(
@@ -176,7 +359,7 @@ fn active_kind_provenance(
         );
     }
     let body: Value = resp.json()?;
-    Ok(provenance_of(&body))
+    Ok((provenance_of(&body), body))
 }
 
 fn bootstrap_kind(
@@ -185,6 +368,7 @@ fn bootstrap_kind(
     headers: &reqwest::header::HeaderMap,
     target: &WorkflowSpec,
     dev: bool,
+    signer: &str,
 ) -> Result<()> {
     info!(kind = %target.kind, "opening workflow-design Job");
 
@@ -297,7 +481,7 @@ fn bootstrap_kind(
         // validated against.
         let step = current.as_ref().unwrap_or(step);
         walk_step(
-            client, api_base, headers, &job_id, step_id, step_kind, step, target, dev,
+            client, api_base, headers, &job_id, step_id, step_kind, step, target, dev, signer,
         )
         .with_context(|| format!("walk_step `{step_kind}` ({step_id})"))?;
     }
@@ -380,9 +564,9 @@ fn synthesized_completion_metadata(step: &Value) -> serde_json::Map<String, Valu
 ///   `decision: "approved"` wherever the step declares one unauthored
 ///   (the walk IS the approval; `synthesized_completion_metadata`
 ///   alone would record the enum's first variant, "pending", on a
-///   step the walk is about to approve and complete). The hardcoded
-///   approver identity is fine because the walk only ever walks
-///   `workflow-design` Jobs.
+///   step the walk is about to approve and complete). `signed_by` is
+///   the actor the walk runs as — the record says who actually did
+///   it, which the literal it replaced did not.
 /// - `workflow-publish` — the full WorkflowSpec the dispatch handler
 ///   publishes from.
 ///
@@ -393,6 +577,7 @@ fn walk_completion_metadata(
     step_kind: &str,
     step: &Value,
     publish_spec: Option<&Value>,
+    signer: &str,
 ) -> serde_json::Map<String, Value> {
     let authored = step
         .get("metadata")
@@ -415,7 +600,7 @@ fn walk_completion_metadata(
                 out.insert("decision".into(), json!("approved"));
             }
             out.insert("authority_role".into(), json!("workflow-approver"));
-            out.insert("signed_by".into(), json!("emp-cto"));
+            out.insert("signed_by".into(), json!(signer));
         }
         "workflow-publish" => {
             if let Some(spec) = publish_spec {
@@ -492,6 +677,7 @@ fn walk_step(
     step: &Value,
     target: &WorkflowSpec,
     dev: bool,
+    signer: &str,
 ) -> Result<()> {
     let url = jobs_url(api_base, &format!("/api/jobs/{job_id}/steps/{step_id}"));
 
@@ -511,16 +697,20 @@ fn walk_step(
             // The `workflow-design` approve step requires the
             // `workflow-approver` authority (boss-jobs registry), so the
             // stamp's `role` must equal that — the sign-off endpoint
-            // rejects any role not in `sign_offs_required`. We stamp as the
-            // `platform-admin` automation identity, which holds
-            // `step-signoff:workflow-approver` via the core policy defaults;
-            // seed-time provisioning therefore never depends on the tenant's
-            // approver grants having loaded first.
+            // rejects any role not in `sign_offs_required`. The stamp
+            // goes out under the walk's own header — a `platform-admin`
+            // automation identity, which holds
+            // `step-signoff:workflow-approver` via the core policy
+            // defaults — so seed-time provisioning never depends on the
+            // tenant's approver grants having loaded first, and the
+            // stamp names the actor that made it.
             let md_url = jobs_url(api_base, &format!("/api/jobs/{job_id}/steps/{step_id}"));
             let md_resp = client
                 .put(&md_url)
                 .headers(headers.clone())
-                .json(&json!({ "metadata": walk_completion_metadata(step_kind, step, None) }))
+                .json(
+                    &json!({ "metadata": walk_completion_metadata(step_kind, step, None, signer) }),
+                )
                 .send()
                 .with_context(|| format!("PUT {md_url}"))?;
             if !md_resp.status().is_success() {
@@ -532,22 +722,9 @@ fn walk_step(
                 api_base,
                 &format!("/api/jobs/{job_id}/steps/{step_id}/sign-offs"),
             );
-            let stamper = json!({
-                "id": "emp-cto",
-                "role": "platform-admin",
-                "access_tier": "operator",
-                "territory_account_ids": [],
-                "direct_report_ids": [],
-                "department": "executive",
-            })
-            .to_string();
             let resp = client
                 .post(&stamp_url)
                 .headers(headers.clone())
-                .header(
-                    "x-boss-user",
-                    reqwest::header::HeaderValue::from_str(&stamper).context("stamper header")?,
-                )
                 .json(&json!({ "role": "workflow-approver" }))
                 .send()
                 .with_context(|| format!("POST {stamp_url}"))?;
@@ -567,7 +744,7 @@ fn walk_step(
                 .context("serializing WorkflowSpec for publish step")?;
             json!({
                 "status":"completed",
-                "metadata": walk_completion_metadata(step_kind, step, Some(&spec_value)),
+                "metadata": walk_completion_metadata(step_kind, step, Some(&spec_value), signer),
             })
         }
         other => {
@@ -579,7 +756,7 @@ fn walk_step(
             if !matches!(other, "task" | "outcome") {
                 warn!(step_kind = %other, "unrecognized step kind on workflow-design; flipping to done");
             }
-            let md = walk_completion_metadata(other, step, None);
+            let md = walk_completion_metadata(other, step, None, signer);
             if md.is_empty() {
                 json!({ "status":"completed" })
             } else {
@@ -627,6 +804,77 @@ mod tests {
         assert_eq!(
             jobs_url("http://localhost:7900/", "/api/jobs"),
             "http://localhost:7900/api/jobs"
+        );
+    }
+
+    /// The live-vs-file comparison names the lint's facets and nothing
+    /// else (design e187198f): a description edit, a step added on one
+    /// side (once, in `steps.titles`, never per facet against
+    /// nothing), a required field, a title template; predicates and
+    /// kinds are structural and out. Identical rows compare empty.
+    #[test]
+    fn a_live_kind_is_compared_on_the_lints_facets() {
+        let file: WorkflowSpec = serde_json::from_value(json!({
+            "kind": "receive-a-sponsorship", "version": 1, "status": "active",
+            "label": "Receive a sponsorship", "description": "Stripe reported a payment",
+            "category": "sales", "subject_kinds": ["account"],
+            "steps": [
+                {"title": "received", "kind": "trigger", "ready_when": "true",
+                 "title_template": "Stripe reported a payment", "fields": []},
+                {"title": "reconcile", "kind": "task", "ready_when": "steps.received.done",
+                 "title_template": "Match the payment",
+                 "fields": [{"name": "stripe_event_id", "field_type": "string", "required": true}]}
+            ],
+            "metadata_schema": {}, "entitlements": {}, "metadata": {},
+            "on_complete_create": [], "owning_team": "acme", "authoring_job_id": null,
+            "created_at": "2026-09-18T00:00:00Z"
+        }))
+        .unwrap();
+        let mut live = serde_json::to_value(&file).unwrap();
+        assert!(workflow_changes(&live, &file).is_empty());
+
+        live["description"] = json!("Stripe reported a payment (edited in /it/registry)");
+        live["steps"][1]["ready_when"] = json!("steps.received.done && true");
+        live["steps"][1]["fields"][0]["required"] = json!(false);
+        live["steps"].as_array_mut().unwrap().push(
+            json!({"title": "sponsored", "kind": "outcome", "ready_when": "steps.reconcile.done",
+                         "title_template": "Sponsorship recognized", "fields": []}),
+        );
+        let changes = workflow_changes(&live, &file);
+        let fields: Vec<&str> = changes.iter().map(|c| c.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "description",
+                "steps.count",
+                "steps.reconcile.required",
+                "steps.titles"
+            ],
+            "{changes:?}"
+        );
+        assert_eq!(changes[1].render(), "steps.count 3 → 2");
+        assert_eq!(
+            changes[2].render(),
+            "steps.reconcile.required  → stripe_event_id"
+        );
+        assert!(
+            !fields.iter().any(|f| f.contains("sponsored")),
+            "a step on one side only is one finding, in steps.titles"
+        );
+
+        let out = WorkflowPublishOutcome {
+            published: vec!["x".into()],
+            superseded: vec![],
+            kept: vec![KeptRow {
+                id: "receive-a-sponsorship".into(),
+                differs: vec!["description".into()],
+            }],
+            unchanged: 2,
+        };
+        assert_eq!(
+            out.summary(),
+            "1 published (x), 2 already as declared; kept: receive-a-sponsorship differs on \
+             description (the instance is the truth; --take workflows overwrites)"
         );
     }
 }
@@ -693,6 +941,17 @@ mod walker_tests {
         assert_eq!(md.get("when"), Some(&json!("2026-01-01")));
     }
 
+    /// The signer is the actor the header names; a header naming no
+    /// actor is refused rather than signed as nobody (backlog 3c23662d).
+    #[test]
+    fn the_walk_signs_as_the_actor_its_header_names() {
+        let header = json!({"id": "automation:tenant-seed", "role": "platform-admin"}).to_string();
+        assert_eq!(signer_of(&header).unwrap(), "automation:tenant-seed");
+        assert!(signer_of(r#"{"role":"platform-admin"}"#).is_err());
+        assert!(signer_of(r#"{"id":""}"#).is_err());
+        assert!(signer_of("not json").is_err());
+    }
+
     /// The 2026-09-02 EVENING crash-loop shape verbatim: the
     /// workflow-design `approve` step requires `decision` (cdfe2e1a)
     /// and the sign-off arm's bare completion missed it. The walk IS
@@ -708,10 +967,14 @@ mod walker_tests {
                 "required": true
             }]
         });
-        let md = walk_completion_metadata("sign-off", &step, None);
+        let md = walk_completion_metadata("sign-off", &step, None, "automation:bootstrap");
         assert_eq!(md.get("decision"), Some(&json!("approved")));
         assert_eq!(md.get("authority_role"), Some(&json!("workflow-approver")));
-        assert_eq!(md.get("signed_by"), Some(&json!("emp-cto")));
+        assert_eq!(
+            md.get("signed_by"),
+            Some(&json!("automation:bootstrap")),
+            "the walk signs as the actor it runs as, never a named person"
+        );
     }
 
     /// An authored decision is a record already made; the walk must
@@ -726,7 +989,7 @@ mod walker_tests {
                 "required": true
             }]
         });
-        let md = walk_completion_metadata("sign-off", &step, None);
+        let md = walk_completion_metadata("sign-off", &step, None, "automation:bootstrap");
         assert_eq!(md.get("decision"), Some(&json!("changes-requested")));
     }
 
@@ -787,9 +1050,9 @@ mod walker_tests {
     #[test]
     fn a_fieldless_sign_off_keeps_existing_keys_and_adds_no_decision() {
         let step = json!({ "metadata": { "already": "here" } });
-        let md = walk_completion_metadata("sign-off", &step, None);
+        let md = walk_completion_metadata("sign-off", &step, None, "automation:bootstrap");
         assert_eq!(md.get("already"), Some(&json!("here")));
-        assert_eq!(md.get("signed_by"), Some(&json!("emp-cto")));
+        assert_eq!(md.get("signed_by"), Some(&json!("automation:bootstrap")));
         assert!(!md.contains_key("decision"));
     }
 
@@ -804,7 +1067,7 @@ mod walker_tests {
                 {"name": "review_notes", "field_type": "string", "required": true}
             ]
         });
-        let md = walk_completion_metadata("sign-off", &step, None);
+        let md = walk_completion_metadata("sign-off", &step, None, "automation:bootstrap");
         assert_eq!(md.get("decision"), Some(&json!("approved")));
         assert!(md.get("review_notes").and_then(|v| v.as_str()).is_some());
     }
@@ -820,7 +1083,12 @@ mod walker_tests {
             "fields": [{"name": "release_note", "field_type": "string", "required": true}]
         });
         let spec = json!({"kind": "x"});
-        let md = walk_completion_metadata("workflow-publish", &step, Some(&spec));
+        let md = walk_completion_metadata(
+            "workflow-publish",
+            &step,
+            Some(&spec),
+            "automation:bootstrap",
+        );
         assert_eq!(md.get("workflow_spec"), Some(&spec));
         assert_eq!(md.get("already"), Some(&json!("here")));
         assert!(md.get("release_note").is_some());
@@ -864,6 +1132,7 @@ mod walker_tests {
                 &step.kind,
                 &step_value,
                 Some(&dummy_spec),
+                "automation:bootstrap",
             ));
             if let Err(errors) = registry.validate_metadata(&step.kind, &md).and_then(|()| {
                 crate::step_registry::StepRegistry::validate_authored_fields(&step.fields, &md)

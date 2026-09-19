@@ -81,8 +81,26 @@ runuser -l "$OWNER" -c "cd '$REPO' && . infra/forge/checkout-lock.sh && checkout
 
 # WHICH COMMIT THIS HOST'S UNITS NOW COME FROM, read as the checkout's
 # owner for the same reason every git call above is: root cannot even READ
-# a clone it does not own.
-run_summary_field converge_sha "$(runuser -l "$OWNER" -c "git -C '$REPO' rev-parse HEAD")"
+# a clone it does not own. Handed to install.sh as BOSS_CONVERGE_SHA:
+# the CLI it installs for the cluster-operator role is taken out of the
+# cluster image built for exactly this commit (infra/estate/
+# install-cli-from-image.sh, backlog 9f00a805), and install.sh, running
+# as root, cannot read the sha off the owner's clone itself.
+BOSS_CONVERGE_SHA="$(runuser -l "$OWNER" -c "git -C '$REPO' rev-parse HEAD")"
+export BOSS_CONVERGE_SHA
+run_summary_field converge_sha "$BOSS_CONVERGE_SHA"
+
+# WHAT THIS HOST IS FOR, read off the system of record the same way
+# boss-gcp reads it (infra/estate/node-roles.sh, one definition). The
+# forge's id is declared on the unit (BOSS_NODE_ID=forge), never guessed
+# from a hostname. install.sh inherits BOSS_NODE_ROLES and installs what
+# the roles bring — today `cluster-operator` brings talosctl and the
+# credential check (design 1bc4b4ed).
+NODE_ID="${BOSS_NODE_ID:-forge}"
+. "${BOSS_FORGE_CONVERGE_INFRA:-$(dirname "$0")/..}/estate/node-roles.sh"
+BOSS_CONVERGE_NAME="forge-converge" read_node_roles "$NODE_ID"
+run_summary_field node_id "$NODE_ID"
+run_summary_field node_roles "${BOSS_NODE_ROLES:-}"
 
 # install.sh needs root (writes /etc/systemd/system). This script runs
 # as root; git already finished above, so install.sh's bytes are stable

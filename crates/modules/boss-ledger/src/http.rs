@@ -2,6 +2,12 @@
 //!
 //! - `GET /api/ledger/health`
 //! - `GET /api/ledger/accounts` — full chart of accounts
+//! - `POST /api/ledger/accounts/batch` — the tenant declares its chart,
+//!   insert-if-absent by code (backlog 41af5195; `accounts` module)
+//! - `POST /api/ledger/tax/batch` — the tenant declares its tax kinds
+//!   and sales-tax rates, insert-if-absent (backlog 7f163e58;
+//!   `tax_registry` module); `GET /api/ledger/tax-kinds` and
+//!   `GET /api/ledger/sales-tax-rates` read them back
 //! - `GET /api/ledger/trial-balance?as_of=YYYY-MM-DD` — per-account totals
 //! - `GET /api/ledger/entries?account_code=XXXX&limit=N` — drill-down entries
 //! - `GET /api/ledger/entries?fact_id=UUID` — entries for a specific fact
@@ -21,6 +27,7 @@ use axum::routing::get;
 use boss_policy::User;
 use sqlx::PgPool;
 
+mod accounts;
 mod bank_settlements;
 mod bills;
 mod entries;
@@ -28,10 +35,13 @@ mod facts;
 mod keg_deposits;
 mod payroll;
 mod periods;
+mod posting_rules;
 mod revenue;
 mod statements;
 mod tax;
+mod tax_registry;
 
+use accounts::*;
 use bank_settlements::*;
 use bills::*;
 use entries::*;
@@ -39,9 +49,11 @@ use facts::*;
 use keg_deposits::*;
 use payroll::*;
 use periods::*;
+use posting_rules::*;
 use revenue::*;
 use statements::*;
 use tax::*;
+use tax_registry::*;
 
 /// Backend write-gate on `/api/ledger/*`. The `auditor` role is
 /// strictly read-only — prior hardening pass only hid the write
@@ -162,6 +174,19 @@ pub fn router(state: LedgerApiState) -> Router {
     Router::new()
         .route("/api/ledger/health", get(health))
         .route("/api/ledger/accounts", get(list_accounts))
+        .route(
+            "/api/ledger/accounts/batch",
+            axum::routing::post(declare_accounts_batch),
+        )
+        // The tenant's tax regime as registry data (backlog 7f163e58):
+        // the door `boss tenant publish` sends seeds/tax.toml through,
+        // insert-if-absent, and the two reads of what it landed.
+        .route(
+            "/api/ledger/tax/batch",
+            axum::routing::post(declare_tax_batch),
+        )
+        .route("/api/ledger/tax-kinds", get(list_tax_kinds))
+        .route("/api/ledger/sales-tax-rates", get(list_sales_tax_rates))
         .route("/api/ledger/trial-balance", get(trial_balance))
         .route("/api/ledger/income-statement", get(income_statement))
         .route("/api/ledger/balance-sheet", get(balance_sheet))
@@ -246,6 +271,23 @@ pub fn router(state: LedgerApiState) -> Router {
             get(list_excise_rate_schedules).put(upsert_excise_rate_schedule),
         )
         .route("/api/ledger/tax-liability", get(tax_liability_summary))
+        // Posting rules and event→fact projections as registry data
+        // (backlog a40541cb): the doors `boss tenant publish` sends
+        // seeds/posting_rules.toml and seeds/fact_projection_rules.toml
+        // through, insert-if-absent, one `.declared` fact per landed row.
+        .route("/api/ledger/posting-rules", get(list_posting_rules_handler))
+        .route(
+            "/api/ledger/posting-rules/batch",
+            axum::routing::post(publish_posting_rules_handler),
+        )
+        .route(
+            "/api/ledger/fact-projection-rules",
+            get(list_projection_rules_handler),
+        )
+        .route(
+            "/api/ledger/fact-projection-rules/batch",
+            axum::routing::post(publish_projection_rules_handler),
+        )
         .route(
             "/api/ledger/revenue-schedules",
             axum::routing::post(create_revenue_schedule),
@@ -310,6 +352,11 @@ fn ledger_err(e: crate::error::LedgerError) -> Response {
         | LedgerError::Unbalanced { .. }
         | LedgerError::LockedPeriod { .. }
         | LedgerError::UnknownFactKind(_) => StatusCode::BAD_REQUEST,
+        // A caller error naming the row (the classes door's 422 for an
+        // unregistered kind), never a storage failure.
+        LedgerError::InvalidChart(_) | LedgerError::InvalidTaxSeed(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         LedgerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, e.to_string()).into_response()

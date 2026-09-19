@@ -168,6 +168,26 @@ pub fn api_client() -> reqwest::Client {
         .expect("reqwest client always builds")
 }
 
+/// The owner a handler files a packet with: the platform owner as the
+/// port answers it, or NOBODY with the refusal in the journal under the
+/// rule's name (backlog 3c23662d — every alarm handler wrote
+/// `"emp-david"` until 2026-09-18). The filing goes ahead either way:
+/// the jobs API resolves the kind's `owner_role` from the same registry
+/// or refuses by name, and a handler that fell silent for want of an
+/// owner would be the failure mode the alarms exist to end.
+pub async fn owner_for_filing(
+    port: &dyn boss_core::platform_owner::PlatformOwner,
+    rule_name: &str,
+) -> String {
+    boss_core::platform_owner::owner_for_filing(port, |e| {
+        tracing::warn!(
+            rule = rule_name,
+            "{e}; filing with no owner named — the jobs API resolves the kind's owner_role, or refuses"
+        )
+    })
+    .await
+}
+
 /// Re-exported, not defined here: the rules runner in core writes as
 /// this same actor when it lands a dead-letter on a packet
 /// (`boss_dispatcher::rules::dead_letter`), and an identity that exists
@@ -222,6 +242,49 @@ pub(crate) async fn post_json(
     Ok(())
 }
 
+/// POST a packet and read the id the jobs API minted for it — the one
+/// thing [`post_json`] does not return, and the thing a judging
+/// handler's note on the judged packet names. Same 422 contract.
+///
+/// Lived in `ops_judge` until `maintenance.chore.file_reds` needed the
+/// same POST-and-read (ac3270c7) — one definition rather than a second
+/// copy (CLAUDE.md §9a).
+pub(crate) async fn post_json_minted_id(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    rule_name: &str,
+) -> Result<String, HandlerError> {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            HandlerError::Permanent(format!("POST {url} returned {status}: {text}"))
+        } else {
+            HandlerError::Downstream(format!("POST {url} returned {status}: {text}"))
+        });
+    }
+    let created: Value = resp
+        .json()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("POST {url} answer not JSON: {e}")))?;
+    created
+        .get("id")
+        .or_else(|| created.get("data").and_then(|d| d.get("id")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| HandlerError::Downstream(format!("POST {url} answered no id: {created}")))
+}
+
 /// GET a JSON document from a downstream service, stamping the same
 /// rule-as-actor `x-boss-user` header as [`post_json`], mapping
 /// transport failures and non-2xx responses into
@@ -254,6 +317,47 @@ pub(crate) async fn get_json(
     resp.json()
         .await
         .map_err(|e| HandlerError::Downstream(format!("GET {url} not JSON: {e}")))
+}
+
+/// Every open Job of `kind`, steps inline, paged on the list's `total`
+/// so a packet sorted past one page is still found — a capped page is
+/// a false negative that grows with the board's age.
+///
+/// Lived in `jobs_run_car_probes` until `jobs.complete_step_matching`
+/// needed the same walk (c34583cb) — one definition rather than a
+/// second copy (CLAUDE.md §9a).
+pub(crate) async fn open_jobs_of_kind(
+    client: &reqwest::Client,
+    jobs_base: &str,
+    kind: &str,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    const PAGE: usize = 500;
+    let mut rows: Vec<Value> = Vec::new();
+    loop {
+        let body = get_json(
+            client,
+            &format!(
+                "{}/api/jobs?kind={kind}&status=open&limit={PAGE}&offset={}",
+                jobs_base.trim_end_matches('/'),
+                rows.len()
+            ),
+            rule_name,
+        )
+        .await?;
+        let total = body.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let page: Vec<Value> = body
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let got = page.len();
+        rows.extend(page);
+        if got == 0 || rows.len() >= total {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 /// PUT or PATCH a body, mapping non-2xx the same way [`post_json`]
@@ -290,6 +394,37 @@ pub(crate) async fn write_json(
         });
     }
     Ok(())
+}
+
+/// The step a machine completes to close a `backlog-item` alarm it
+/// raised. The kind routes on `triage.disposition`, and `stale` is the
+/// terminal whose title is literally "Closed — the claim no longer
+/// holds" (infra/platform/workflows/backlog-item.toml).
+pub(crate) const TRIAGE_SLUG: &str = "triage";
+
+/// The `triage` step of one alarm packet, as (id, existing metadata).
+///
+/// Lived in `cadence_silence` until `estate.recover` closed alarms the
+/// same way (backlog ef421cd3) — one definition of "the step that
+/// closes an alarm", not a second copy (CLAUDE.md §9a). The existing
+/// metadata rides back because PUT on a step REPLACES top-level
+/// metadata, and `authority_role` living there is what keeps the step
+/// gated.
+pub(crate) fn triage_step(job: &Value) -> Option<(String, serde_json::Map<String, Value>)> {
+    job.get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(TRIAGE_SLUG))
+        .and_then(|s| {
+            let id = s.get("id").and_then(Value::as_str)?.to_string();
+            let meta = s
+                .get("metadata")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            Some((id, meta))
+        })
 }
 
 #[cfg(test)]

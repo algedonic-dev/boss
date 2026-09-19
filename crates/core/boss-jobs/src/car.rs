@@ -37,12 +37,16 @@ pub fn stamp(now: chrono::DateTime<chrono::Utc>) -> String {
     now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// The ship-a-change packet body for a car.
+/// The ship-a-change packet body for a car. `owner` is who answers
+/// for it — the platform owner as `boss_core::platform_owner` resolved
+/// it, or `NOBODY` when it refused (backlog 3c23662d: this line named
+/// one person, on every car on every deployment, until 2026-09-18).
 pub fn car_body(
     branch: &str,
     summary: &str,
     backlog_item: Option<&str>,
     delivery_channel: Option<&str>,
+    owner: &str,
 ) -> Value {
     let mut metadata = json!({ "branch": branch, "summary": summary });
     if let Some(item) = backlog_item {
@@ -62,7 +66,7 @@ pub fn car_body(
         "kind": "ship-a-change",
         "title": summary_title(summary),
         "subject": {"subject_kind": "custom", "id": branch},
-        "owner_id": "emp-david",
+        "owner_id": owner,
         "priority": "standard",
         "status": "open",
         "tags": [],
@@ -451,6 +455,37 @@ pub fn item_provenance(
     m
 }
 
+/// The SET of tiers a change touched (`infra/platform/tiers.toml`,
+/// design 01c3cc3f), sorted, stamped on the gate-run by `boss gate`
+/// beside `delivery_channel` and carried onto the car — a sorted JSON
+/// array of tier names, empty for a change no tier claims.
+pub const SOFTWARE_TIERS: &str = "software_tiers";
+/// The headline among [`SOFTWARE_TIERS`]: the lowest-ranked tier the
+/// change touched (core wins over frontend), the way `delivery_channel`
+/// is the heaviest of a mixed car's paths. Absent when the set is empty.
+pub const SOFTWARE_TIER: &str = "software_tier";
+
+/// The tier stamps a gate-run carries, copied VERBATIM for the car —
+/// the same copy-don't-rebuild rule the receipt and the proof intent
+/// live by (ba429e7f, 2026-09-19). A set that is not an array, or a
+/// headline that is not a non-empty string, is omitted (never nulled:
+/// the metadata door deletes a null key, and a re-gate that classified
+/// nothing must not strip what the first park recorded).
+pub fn tier_stamps(md: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    if let Some(set) = md.get(SOFTWARE_TIERS).filter(|v| v.is_array()) {
+        m.insert(SOFTWARE_TIERS.to_string(), set.clone());
+    }
+    if let Some(head) = md
+        .get(SOFTWARE_TIER)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        m.insert(SOFTWARE_TIER.to_string(), json!(head));
+    }
+    m
+}
+
 /// A step by its registry slug, falling back to its title. The same
 /// lookup the conductor uses; one definition (CLAUDE.md 9a).
 pub fn find_step<'a>(job: &'a Value, slug: &str, title: &str) -> Option<&'a Value> {
@@ -656,6 +691,42 @@ pub fn regate_patch(receipt: &Receipt, note: &str, delivery_channel: Option<&str
     patch
 }
 
+/// The prose a re-gate carries onto a parked car, beside the receipt it
+/// supersedes.
+///
+/// A car's account of itself — summary, excludes, test, verified — is
+/// stamped on its scope/build/gate steps at the first park, and a
+/// completed step is frozen. So until 2026-09-16 (c30e6276) a re-gate
+/// wrote the fresh receipt, note and proof onto the job and left the
+/// prose at the first build's words: a rebuilt car described what it
+/// USED to do, to the yard, the train and the operator. The same rule
+/// the receipt lives by applies — the frozen step stays as the first
+/// head's record, and the current account rides the JOB under
+/// `regate_*`, verbatim, where `regate_receipt` already is. Empty
+/// prose is omitted, never nulled: the metadata door deletes a null
+/// key, and a re-gate that restated nothing must not strip what an
+/// earlier one carried.
+pub fn regate_prose(
+    summary: &str,
+    excludes: &str,
+    test: &str,
+    verified: &str,
+) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    for (key, text) in [
+        ("regate_summary", summary),
+        ("regate_excludes", excludes),
+        ("regate_test", test),
+        ("regate_verified", verified),
+    ] {
+        let text = text.trim();
+        if !text.is_empty() {
+            m.insert(key.to_string(), json!(text));
+        }
+    }
+    m
+}
+
 /// Is this packet still open? Callers list `status=open`, so the field
 /// is usually redundant — and a fixture without one must still answer —
 /// but a list that also holds finished cars (the handler pages both)
@@ -692,11 +763,25 @@ fn is_set(v: Option<&Value>) -> bool {
     }
 }
 
-/// The kind of linked packet a park may ROUTE. A `user-feedback`
-/// packet's triage is the filer's own routing decision and stays
-/// theirs — the same scoping the arrival rule's `route` arg carries
-/// (`jobs.complete_linked_step`, dda0713c).
-pub const TRIAGEABLE_KIND: &str = "backlog-item";
+/// The kinds of linked packet a park may ROUTE — the same two the
+/// merge-time route lists (`complete-feedback-branch-on-car-merged`
+/// v4, `route = [...]`), so the park and the merge agree about whose
+/// triage a car may complete.
+///
+/// `user-feedback` joined on 2026-09-14 (backlog a29c3687). Until then
+/// a feedback packet's triage was "the filer's own routing decision"
+/// and the park left it alone — but a car PARKED AGAINST the packet is
+/// that decision already made, by whoever built and linked the car,
+/// and the v4 merge route closes it on the same reasoning. Leaving the
+/// hours between park and merge un-routed put David's 9827c699 on the
+/// feedback board as nobody's decision for seventy minutes while its
+/// car sat on the dock and then rode a train. Its triage vocabulary
+/// (`reproduce|design|build|duplicate|needs-info|decline`,
+/// infra/platform/workflows/user-feedback.toml) admits `build`; the
+/// `build` step then opens by `ready_when` and the merge route
+/// completes it. A feedback packet with no car parked against it never
+/// reaches this function, so its triage stays a person's.
+pub const TRIAGEABLE_KINDS: &[&str] = &["backlog-item", "user-feedback"];
 
 /// The routing step on that kind. Its `spec_slug` is the lookup;
 /// `find_step`'s title fallback is given the same string because this
@@ -743,12 +828,14 @@ pub struct TriageWrite {
 /// routing step is still OPEN (`ready`/`active` — the same "open" the
 /// arrival rule's route reads) AND carries no disposition. A triage a
 /// person already completed, an item a person routed to `verify` /
-/// `design` / `stale` / `decline`, a closed or cancelled item, an item
-/// with no routing step, and a kind whose triage is not a park's to
-/// make all answer `None` — so a re-gate, a refresh or a redelivery
-/// writes nothing, and no human's disposition is ever overwritten.
+/// `design` / `stale` / `decline` (or feedback its filer sent to
+/// `reproduce` / `needs-info`), a closed or cancelled packet, a packet
+/// with no routing step, and a kind outside `TRIAGEABLE_KINDS` all
+/// answer `None` — so a re-gate, a refresh or a redelivery writes
+/// nothing, and no human's disposition is ever overwritten.
 pub fn triage_on_park(item: &Value, car_id: &str, branch: &str) -> Option<TriageWrite> {
-    if item.get("kind").and_then(Value::as_str) != Some(TRIAGEABLE_KIND) {
+    let kind = item.get("kind").and_then(Value::as_str)?;
+    if !TRIAGEABLE_KINDS.contains(&kind) {
         return None;
     }
     if matches!(
@@ -787,16 +874,21 @@ pub fn triage_on_park(item: &Value, car_id: &str, branch: &str) -> Option<Triage
     })
 }
 
-/// The `evidence` the routing step requires at done, naming WHAT made
-/// the decision — a reader of the item should not have to go find out
-/// why its route says `build`.
+/// The `evidence` the routing step records at done, naming WHAT made
+/// the decision — a reader of the packet should not have to go find
+/// out why its route says `build`. Shaped as the merge route's own
+/// sentence is (`shipped and proven: {branch} — {title} (car {car})`,
+/// complete-feedback-branch-on-car-merged v4): the moment differs, the
+/// form does not, so the two reads on one packet's history read as
+/// one story. `backlog-item`'s triage REQUIRES this key at done;
+/// `user-feedback`'s declares only `finding`, and an extra key is
+/// carried, not refused — the same key the merge route writes there.
 fn park_triage_evidence(car_id: &str, branch: &str) -> String {
     format!(
-        "routed at park: car {} on {branch} is this item's build. \
-         `--park-backlog-item` names the car as the build, so the route is stated when \
-         the car is filed rather than left un-triaged for the arrival rule to find \
-         nothing to advance (backlog ca76d8f9).",
-        &car_id[..8.min(car_id.len())]
+        "routed at park: {branch} is this packet's build (car {car_id}). \
+         --park-backlog-item names the car as the build, so the route is stated when \
+         the car is filed rather than left un-triaged until the car merges \
+         (backlog ca76d8f9, a29c3687)."
     )
 }
 
@@ -826,6 +918,33 @@ mod tests {
         assert_eq!(e[PROOF_EVENT], "event-bound — the next yard cancel");
     }
 
+    /// THE TIER STAMPS ARE COPIED, NOT REBUILT (ba429e7f): the set rides
+    /// as the gate-run wrote it, an empty set included (a root-only
+    /// change touched no tier, and that is a reading); a headline that
+    /// is blank or a set that is not an array is left out, never nulled.
+    #[test]
+    fn tier_stamps_copy_the_set_and_headline_verbatim_and_omit_what_is_malformed() {
+        let md = json!({
+            "software_tiers": ["core", "frontend"],
+            "software_tier": "core",
+            "delivery_channel": "software",
+        });
+        let t = tier_stamps(md.as_object().unwrap());
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[SOFTWARE_TIERS], json!(["core", "frontend"]));
+        assert_eq!(t[SOFTWARE_TIER], "core");
+        assert!(!t.contains_key("delivery_channel"));
+
+        let empty = json!({ "software_tiers": [] });
+        let t = tier_stamps(empty.as_object().unwrap());
+        assert_eq!(t[SOFTWARE_TIERS], json!([]));
+        assert!(!t.contains_key(SOFTWARE_TIER));
+
+        let bad = json!({ "software_tiers": "core", "software_tier": " " });
+        assert!(tier_stamps(bad.as_object().unwrap()).is_empty());
+        assert!(tier_stamps(&serde_json::Map::new()).is_empty());
+    }
+
     /// PROVENANCE WITHOUT THE CLOSE. Same write-only-what-was-stated
     /// contract as the proof keys — and the key that matters here is the
     /// one NOT written: `backlog_item` is what the arrival rule follows,
@@ -850,12 +969,18 @@ mod tests {
 
     #[test]
     fn the_car_body_carries_the_fields_the_api_demands() {
-        let b = car_body("feat/x", "A thing does the thing. And more.", None, None);
+        let b = car_body(
+            "feat/x",
+            "A thing does the thing. And more.",
+            None,
+            None,
+            "emp-owner",
+        );
         assert!(
             b["metadata"].get("delivery_channel").is_none(),
             "no delivery_channel when None"
         );
-        let d = car_body("feat/x", "A thing.", None, Some("data"));
+        let d = car_body("feat/x", "A thing.", None, Some("data"), "emp-owner");
         assert_eq!(
             d["metadata"]["delivery_channel"], "data",
             "the car carries the delivery channel the gate stamped"
@@ -867,6 +992,7 @@ mod tests {
         }
         assert_eq!(b["title"], "A thing does the thing");
         assert_eq!(b["subject"]["id"], "feat/x");
+        assert_eq!(b["owner_id"], "emp-owner", "the owner is the one handed in");
         assert!(b["metadata"].get("backlog_item").is_none());
     }
 
@@ -877,6 +1003,7 @@ mod tests {
             "Summary",
             Some("de6f0c06-a341-4445-9f47-399dc27a60fb"),
             None,
+            "emp-owner",
         );
         assert_eq!(
             b["metadata"]["backlog_item"],
@@ -1030,6 +1157,19 @@ mod regate_tests {
         // is how the conductor's "left behind" reason goes away.
         assert!(p.get("skip_reason").is_some_and(Value::is_null));
         assert_eq!(p["regate_note"], json!("why"));
+    }
+
+    /// The re-gate's prose rides the job under `regate_*`, trimmed,
+    /// and an empty field is absent rather than null — a null key is
+    /// deleted by the metadata door.
+    #[test]
+    fn the_regate_prose_rides_the_job_and_omits_what_was_not_said() {
+        let m = regate_prose(" rebuilt: now does X ", "not Y", "", "   ");
+        assert_eq!(m["regate_summary"], "rebuilt: now does X");
+        assert_eq!(m["regate_excludes"], "not Y");
+        assert!(!m.contains_key("regate_test"), "{m:?}");
+        assert!(!m.contains_key("regate_verified"), "{m:?}");
+        assert!(regate_prose("", "", "", "").is_empty());
     }
 
     #[test]
@@ -1307,14 +1447,82 @@ mod park_triage_tests {
         assert!(triage_on_park(&active, CAR_ID, BRANCH).is_some());
     }
 
-    /// A `user-feedback` packet's triage is the FILER's routing
-    /// decision. A car answering one says so in its own evidence; it
-    /// does not choose the filer's route for them.
+    /// A `user-feedback` packet as the chrome bar files it: submitted,
+    /// un-triaged, every branch still pending. Its triage vocabulary is
+    /// `reproduce|design|build|duplicate|needs-info|decline`
+    /// (infra/platform/workflows/user-feedback.toml), so `build` is a
+    /// route it admits.
+    fn untriaged_feedback() -> Value {
+        json!({
+            "id": "9827c699-3e49-4494-a812-d3ab5fa4bd69",
+            "kind": "user-feedback",
+            "status": "open",
+            "steps": [
+                { "id": "s-submitted", "spec_slug": "submitted", "status": "completed", "metadata": {} },
+                { "id": "s-triage", "spec_slug": "triage", "status": "ready",
+                  "metadata": { "finding": "a page for the codebase stats" } },
+                { "id": "s-build", "spec_slug": "build", "status": "pending", "metadata": {} },
+            ],
+        })
+    }
+
+    /// A car parked against a user-feedback packet states its route at
+    /// PARK time, not at merge (backlog a29c3687). Until this test the
+    /// park covered `backlog-item` only and the packet sat un-triaged
+    /// until the v4 merge route closed it — David's 9827c699 read as
+    /// nobody's decision for seventy minutes with its car on the dock.
     #[test]
-    fn a_filers_own_packet_keeps_its_routing_decision() {
-        let mut feedback = untriaged_item();
-        feedback["kind"] = json!("user-feedback");
-        assert!(triage_on_park(&feedback, CAR_ID, BRANCH).is_none());
+    fn parking_a_car_against_untriaged_feedback_routes_it_to_build() {
+        let w = triage_on_park(&untriaged_feedback(), CAR_ID, BRANCH)
+            .expect("un-triaged feedback gets the route its car states");
+        assert_eq!(w.step_id, "s-triage");
+        assert_eq!(w.body["status"], "completed");
+        assert_eq!(w.body["metadata"]["disposition"], DISPOSITION_BUILD);
+        let evidence = w.body["metadata"]["evidence"].as_str().unwrap_or_default();
+        assert!(
+            evidence.contains(CAR_ID) && evidence.contains(BRANCH),
+            "the evidence names the car and its branch: {evidence}"
+        );
+        // The filer's own words ride along with the route.
+        assert_eq!(
+            w.body["metadata"]["finding"],
+            "a page for the codebase stats"
+        );
+    }
+
+    /// Feedback a person already routed — to `reproduce`, `design`, or
+    /// anything else — is a decision, and a park never overwrites it;
+    /// nor does it touch a packet whose triage is done and whose open
+    /// step is further along.
+    #[test]
+    fn feedback_already_past_triage_is_left_exactly_alone() {
+        let mut investigating = untriaged_feedback();
+        investigating["steps"][1]["status"] = json!("completed");
+        investigating["steps"][1]["metadata"] = json!({ "disposition": "reproduce" });
+        investigating["steps"][2] = json!({ "id": "s-investigate", "spec_slug": "investigate",
+            "status": "ready", "metadata": {} });
+        assert!(triage_on_park(&investigating, CAR_ID, BRANCH).is_none());
+
+        let mut decided = untriaged_feedback();
+        decided["steps"][1]["metadata"] = json!({ "disposition": "needs-info" });
+        assert!(triage_on_park(&decided, CAR_ID, BRANCH).is_none());
+    }
+
+    /// The park routes the two kinds a car may be parked against and no
+    /// other: a `design-doc`, an `ops-request`, a `ship-a-change` with a
+    /// step that happens to be called `triage` is not a park's to decide.
+    #[test]
+    fn a_packet_of_any_other_kind_is_untouched() {
+        for kind in ["design-doc", "ops-request", "ship-a-change", "gate-run"] {
+            let mut other = untriaged_item();
+            other["kind"] = json!(kind);
+            assert!(triage_on_park(&other, CAR_ID, BRANCH).is_none(), "{kind}");
+        }
+        let mut kindless = untriaged_item();
+        if let Some(m) = kindless.as_object_mut() {
+            m.remove("kind");
+        }
+        assert!(triage_on_park(&kindless, CAR_ID, BRANCH).is_none());
     }
 
     #[test]

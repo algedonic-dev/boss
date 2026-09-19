@@ -66,7 +66,7 @@ STEP_TITLE="$1"; shift
 # service result: `ok` for success (the word the outcome predicates
 # route on), otherwise systemd's word for how it died, with the exit
 # status beside it. An explicit result= pair still wins.
-if [ -n "${SERVICE_RESULT:-}" ] && ! printf '%s\n' "$@" | grep -q '^result='; then
+if [ -n "${SERVICE_RESULT:-}" ] && ! grep -q '^result=' <<< "$(printf '%s\n' "$@")"; then
     if [ "$SERVICE_RESULT" = "success" ]; then
         set -- "$@" "result=ok"
     else
@@ -137,15 +137,16 @@ fi
 # So: no default. A maintenance tool with no system of record
 # configured refuses, loudly, and systemd records a failed unit — which
 # is a state somebody notices, unlike a packet filed in the wrong
-# database. Set BOSS_JOBS_URL explicitly; deploy-services.sh writes it
-# into a drop-in for every timer it installs.
+# database. Set BOSS_JOBS_URL explicitly; every unit reads it from the
+# host's /etc/boss/sor.env (infra/estate/estate.toml, rendered by the
+# converge).
 if [ -z "${BOSS_JOBS_URL:-}" ]; then
     echo "$(basename "$0"): BOSS_JOBS_URL is not set, and there is no safe default." >&2
     echo "    Defaulting to 127.0.0.1 is how nightly maintenance packets spent weeks" >&2
     echo "    landing on a non-authoritative instance (2026-08-17). Name the system of" >&2
     echo "    record explicitly:" >&2
     echo "        BOSS_JOBS_URL=http://<jobs-api-host>:<port> $(basename "$0") ..." >&2
-    echo "    Installed timers get it from deploy-services.sh's jobs-url.conf drop-in." >&2
+    echo "    A unit pins it inline with env(1) on its Exec lines (timers-leave-a-packet check 7)." >&2
     exit 78   # EX_CONFIG — a configuration fault, not a run-time one.
 fi
 BASE="${BOSS_JOBS_URL}"

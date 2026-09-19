@@ -9,12 +9,16 @@
 
 use async_trait::async_trait;
 use boss_core::actor::ActorId;
+use boss_core::agent::{AgentCaps, BudgetDecision};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
-use super::port::{AgentRunError, AgentRunLog, RecordedRun, validate};
+use super::port::{
+    AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit, resolve_model, validate,
+};
 use super::types::{
-    AgentRun, NewAgentRun, RateCardRow, RunFilter, RunOutcome, TokenUsage, price_run,
+    ADMISSION_WINDOW, AgentRun, NewAgentRun, RateCardRow, RunFilter, RunOutcome, TokenUsage,
+    measure_load, price_run,
 };
 
 pub struct PgAgentRuns {
@@ -33,9 +37,9 @@ fn storage(e: sqlx::Error) -> AgentRunError {
 
 /// Every column `agent_runs` holds, in one place, so the SELECTs here
 /// and the rebuilder's INSERT cannot disagree about the row's shape.
-pub(super) const RUN_COLUMNS: &str = "run_id, actor_id, started_at, finished_at, outcome, error, \
-     total_tokens, input_tokens, output_tokens, tool_calls, usd_micros, priced_by, job_id, branch, \
-     detail, recorded_at";
+pub(super) const RUN_COLUMNS: &str = "run_id, actor_id, model, started_at, finished_at, outcome, \
+     error, total_tokens, input_tokens, output_tokens, tool_calls, usd_micros, priced_by, job_id, \
+     branch, detail, budget, recorded_at";
 
 /// `INSERT INTO agent_runs (<cols>) VALUES ($1,…,$n)`, with the
 /// placeholder list DERIVED from [`RUN_COLUMNS`] rather than typed out
@@ -85,6 +89,18 @@ pub(super) fn row_to_run(row: &sqlx::postgres::PgRow) -> Result<AgentRun, AgentR
     })?;
     let tool_calls: i32 = row.try_get("tool_calls").map_err(storage)?;
     let usd_micros: Option<i64> = row.try_get("usd_micros").map_err(storage)?;
+    // NULL on a row recorded before budgets were consulted: "no
+    // decision was made", kept distinct from an allow with no cap.
+    let budget = row
+        .try_get::<Option<serde_json::Value>, _>("budget")
+        .map_err(storage)?
+        .map(serde_json::from_value::<BudgetDecision>)
+        .transpose()
+        .map_err(|e| {
+            AgentRunError::Storage(format!(
+                "agent_runs row {run_id:?} has an unreadable budget decision: {e}"
+            ))
+        })?;
     Ok(AgentRun {
         run: NewAgentRun {
             run_id,
@@ -95,6 +111,11 @@ pub(super) fn row_to_run(row: &sqlx::postgres::PgRow) -> Result<AgentRun, AgentR
             actor_id: actor
                 .parse()
                 .unwrap_or_else(|_| ActorId::Automation("platform".into())),
+            // The column as stored. NULL only on a row older than the
+            // column whose actor id the backfill could not read; the
+            // colon-form fallback in `NewAgentRun::model` still answers
+            // for those.
+            model: row.try_get("model").map_err(storage)?,
             started_at: row.try_get("started_at").map_err(storage)?,
             finished_at: row.try_get("finished_at").map_err(storage)?,
             outcome,
@@ -107,7 +128,25 @@ pub(super) fn row_to_run(row: &sqlx::postgres::PgRow) -> Result<AgentRun, AgentR
         },
         usd_micros: usd_micros.map(|v| u64::try_from(v).unwrap_or(0)),
         priced_by: row.try_get("priced_by").map_err(storage)?,
+        budget,
         recorded_at: row.try_get("recorded_at").map_err(storage)?,
+    })
+}
+
+/// The columns of an `agents` row the recorder reads. Both caps are
+/// nullable there (20260915212644: NULL is "no cap declared") and stay
+/// `None` here, which `admit` reads as unbudgeted.
+fn agent_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredAgent, AgentRunError> {
+    let hourly: Option<i64> = row.try_get("hourly_budget_usd_micros").map_err(storage)?;
+    let concurrent: Option<i32> = row.try_get("max_concurrent_runs").map_err(storage)?;
+    Ok(RegisteredAgent {
+        default_model: row.try_get("default_model").map_err(storage)?,
+        caps: AgentCaps {
+            // The table's CHECK refuses a negative, so the conversion
+            // cannot fail on a row it admitted.
+            hourly_budget_usd_micros: hourly.map(|v| u64::try_from(v).unwrap_or(0)),
+            max_concurrent_runs: concurrent.map(|v| u32::try_from(v).unwrap_or(0)),
+        },
     })
 }
 
@@ -146,13 +185,74 @@ impl AgentRunLog for PgAgentRuns {
             .iter()
             .map(card_row)
             .collect::<Result<Vec<_>, _>>()?;
+
+        // The agent row — its default model and its caps — read in the
+        // same transaction as the price so the row names the registry
+        // it was resolved and admitted against. Only a registered id
+        // has a row to read; the colon form says its own model, has no
+        // caps, and the lookup is skipped.
+        let agent: Option<RegisteredAgent> = match &run.actor_id {
+            ActorId::RegisteredAgent(id) => sqlx::query(
+                "SELECT default_model, hourly_budget_usd_micros, max_concurrent_runs \
+                 FROM agents WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?
+            .map(|r| agent_row(&r))
+            .transpose()?,
+            _ => None,
+        };
+        // Resolved ONCE, and the run is recorded with it set: the row,
+        // the event and the price all read the same word.
+        let run = &NewAgentRun {
+            model: Some(resolve_model(
+                run,
+                agent.as_ref().map(|a| a.default_model.as_str()),
+            )?),
+            ..run.clone()
+        };
         let priced = price_run(&card, run);
 
-        let event = super::events::run_recorded_event(recorded_by, run, &priced);
+        // Admit against the budget before anything is written. The
+        // actor's rows since the window opened are the whole input to
+        // the ONE load measure (`measure_load`): every row that counts
+        // toward spend finished inside the window, and every row in
+        // flight at the run's start finished after it, so one bounded
+        // read holds both. A refusal commits its event and nothing
+        // else, then answers `Denied`.
+        let prior_rows = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM agent_runs WHERE actor_id = $1 AND finished_at >= $2"
+        ))
+        .bind(run.actor_id.to_string())
+        .bind(ADMISSION_WINDOW.cutoff(run.started_at))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let prior = prior_rows
+            .iter()
+            .map(row_to_run)
+            .collect::<Result<Vec<_>, _>>()?;
+        let load = measure_load(&prior, run);
+        let budget = admit(agent.as_ref(), load);
+        if let BudgetDecision::Deny { reason } = budget {
+            let caps: AgentCaps = agent.map(|a| a.caps).unwrap_or_default();
+            let denied =
+                super::events::run_denied_event(recorded_by, run, &priced, caps, load, &reason);
+            boss_events::outbox::record_event_in_tx(&mut tx, &denied)
+                .await
+                .map_err(AgentRunError::Storage)?;
+            tx.commit().await.map_err(storage)?;
+            return Err(AgentRunError::Denied { reason });
+        }
+
+        let event = super::events::run_recorded_event(recorded_by, run, &priced, &budget);
 
         let inserted = sqlx::query(&insert_run_sql())
             .bind(&run.run_id)
             .bind(run.actor_id.to_string())
+            .bind(run.model.as_deref())
             .bind(run.started_at)
             .bind(run.finished_at)
             .bind(run.outcome.as_str())
@@ -182,6 +282,7 @@ impl AgentRunLog for PgAgentRuns {
             .bind(run.job_id)
             .bind(run.branch.as_deref())
             .bind(&run.detail)
+            .bind(serde_json::to_value(&budget).unwrap_or_default())
             // The event's instant, so the row and the record agree.
             .bind(event.timestamp)
             .execute(&mut *tx)

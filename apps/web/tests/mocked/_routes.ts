@@ -25,7 +25,7 @@ export const ROUTES: ReadonlyArray<string> = [
   '/', '/ux/me', '/ux/inbox', '/ux/views', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
   '/ux/products', '/ux/shipping', '/ux/assets', '/ux/catalog',
   '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar', '/ux/calendar/me',
-  '/ux/support', '/ux/service', '/ux/refurb', '/ux/qa', '/ux/hr', '/ux/sales',
+  '/ux/support', '/ux/service', '/ux/qa', '/ux/hr', '/ux/sales',
   '/ux/shop', '/ux/manual',
   // The IT department — six surfaces, families as tabs (1f6d55e0).
   // /system is GONE (David's Q1/Q4: no legacy users, no redirects), so
@@ -54,13 +54,50 @@ export const ROUTES: ReadonlyArray<string> = [
   // Yard status renders the empty yard under the mock's `[]` catch-all
   // for /api/yard/status — chrome + "no trains / no cars", no crash.
   '/it/operate/yard-status',
+  // The yard's FLOORS (design 0524fc95, car 2). /it above is the MAP —
+  // eight region cards read from /api/yard/regions — and each yard
+  // card opens the Train Yard at /it/yard/<region>, focused on that
+  // region's panel; the bare /it/yard is the yard on the track. The
+  // page is the same one /it used to mount, so each floor renders the
+  // yard's empty states under the mocks and its `load-failed` line
+  // under the outage. Receiving and marshalling floors are the two
+  // pages below.
+  '/it/yard',
+  '/it/yard/dock',
+  '/it/yard/gates',
+  '/it/yard/track',
+  '/it/yard/shed',
+  '/it/yard/arrivals',
+  '/it/yard/garage',
   // The Marshalling Yard — the upstream third. Under the mock's `[]`
   // catch-all, /api/stations/load and /api/stations/flow come back as
   // collections with no rows, so the page renders its "every watched
-  // station is clear" state. Crawled here rather than via a catalog
-  // entry because it is a tab, not a sidebar row (same as yard-status
-  // above): pages live in their department.
+  // station is clear" state. It was crawled here as a tab before it
+  // had a catalog row; since feedback 92921c2f (2026-09-18) it is a
+  // sidebar row and the drift test in route-smoke.mocked.spec.ts
+  // enforces this line instead of the line being its whole coverage.
   '/it/operate/marshalling',
+  // The Receiving Yard — the intake floor, a sidebar row with the
+  // Marshalling Yard (92921c2f). Its reads are /api/workflows and
+  // `/api/jobs?kind=…&closed_within=…`; under the mock's `[]` catch-all
+  // both come back empty, so the page renders its no-intake state,
+  // and every read goes through fetchRemote, so the outage renders a
+  // failure line rather than an empty yard.
+  '/it/operate/receiving',
+  // The codebase — its own sidebar row since feedback 9827c699
+  // (2026-09-14; a Design tab before, backlog 06048ade). Its one read is
+  // `/api/jobs?kind=maintenance-codebase-metrics`; under the mock's `[]`
+  // catch-all it renders "no packet carries a measurement" as a bordered
+  // notice, and under the outage it renders `load-failed`. The row's
+  // path is what the catalog registers; the older tab path still routes
+  // and is crawled so a bookmark cannot rot unnoticed.
+  '/it/codebase',
+  '/it/design/codebase',
+  // Protocol drift — a Registry tab (4ae9969e). Its one read is
+  // `/api/jobs?kind=maintenance-protocol-drift`; under the mock's `[]`
+  // catch-all it renders "the 05:20 measurement has not filed" as a
+  // bordered notice, and under the outage it renders `load-failed`.
+  '/it/registry/drift',
   // The risk watchlist. Since CAR-6 it HAS a catalog entry, so the
   // drift test in route-smoke.mocked.spec.ts now enforces its presence
   // here instead of this line being the whole of its coverage.
@@ -80,17 +117,53 @@ export const ROUTES: ReadonlyArray<string> = [
   // the route actually mounts.
   '/it/estate',
   // The Crew Board — the middle third of the operator surface, and a
-  // sidebar row of its own (backlog 04c5bbc0). Its four reads are
+  // sidebar row of its own (backlog 04c5bbc0). Its five reads are
   // `/api/jobs?kind=ship-a-change`, `/api/jobs?kind=gate-run`,
-  // `/api/yard/status` and `/api/jobs/queue-age`: the first, second and
-  // fourth come back `[]` from the catch-all and the third from the
-  // well-formed empty yard fixture above, so the crawl renders the
-  // board's five empty stage columns and its empty crew list. Every read
+  // `/api/yard/status`, `/api/jobs/queue-age` and
+  // `/api/jobs?kind=agent-run&status=open` (c87fb59b car 2): all but
+  // the yard come back `[]` from the catch-all and the yard from the
+  // well-formed empty fixture above, so the crawl renders the board's
+  // five empty stage columns, its empty crew list and no runs. Every read
   // goes through fetchRemote, so an unreachable backend renders a
   // bordered failure line per lane rather than an idle pipeline — the
   // same failed-never-empty bar as the estate row above.
   '/it/crew',
+  // A department's jobs view — in / working / out (cc76f755). One
+  // surface for every department the Class registry declares, so it
+  // has no catalog entry and is crawled here by one code; the mock's
+  // `[]` catch-all for `/api/jobs?department=sales` renders the "no
+  // jobs in Sales" state, and the outage renders `load-failed`.
+  '/ux/departments/sales',
+  // The router's catch-all — see LANDING_FALLBACK.
+  '/ux/unknown-path',
 ];
+
+/// The one ROUTES entry the router does NOT serve, on purpose: an
+/// unknown path renders LandingPage (the System Model live view) as the
+/// catch-all, and nothing else reaches that page. Until 2026-09-18 this
+/// row was spelled '/ux/refurb' and both crawls believed they were
+/// crawling a refurb page — there is no refurb route, and the outage
+/// roster explained its silence with reads the landing page makes.
+/// interaction-crawl pins every OTHER row to the router (f2b8a01c).
+export const LANDING_FALLBACK = '/ux/unknown-path';
+
+/// Routes the crawls cannot cover yet, each with why. Shrinking this
+/// list is the work; adding to it is a decision.
+///
+/// It lives beside ROUTES for the same reason ROUTES lives here: two
+/// specs walk the catalog (route-smoke.mocked.spec.ts and
+/// interaction-crawl.mocked.spec.ts, since f2b8a01c) and a route
+/// deferred in one and not the other would be crash-checked and never
+/// interaction-checked, or the reverse, with nothing to say so. One
+/// definition cannot disagree with itself (CLAUDE.md §9a).
+export const DEFERRED: ReadonlyMap<string, string> = new Map([
+  ['/it/operate/audit', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
+  ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
+  ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
+  ['/ux/exec', '.find/.length over object-shaped summaries'],
+  // '/system/os-map' deferral dropped: the page retired with the
+  // pre-network framing and its catalog entry is gone.
+]);
 
 /// The ONE class a surface puts on a line that says "this read failed".
 ///

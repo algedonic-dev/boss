@@ -26,22 +26,26 @@
 #    precedes it, so no "already initialized" shortcut can grow back.
 #
 # This is the CLAUDE.md §9a rule applied to a property rather than a
-# constant — it lives in three files that cannot be collapsed into one,
+# constant — it lives in two files that cannot be collapsed into one,
 # so it gets a test that names the file when it drifts.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 RUNNER="infra/postgres/migrate.sh"
 FAIL=0
 
 # Deploy entry points, each with what it deploys. A new one belongs here
 # the day it is written — a deploy path that cannot converge the schema
-# is the defect this lint exists to catch.
+# is the defect this lint exists to catch. ONE since 2026-09-18: the
+# conductor's own deploy hop (train.rs pulling a host tree and running
+# the bare-metal scripts) left with that path (train #443, backlog
+# ed64f852); the container converges on every train, and this is the
+# path it converges through.
 PATHS=(
     "infra/oss-quickstart/init.sh|cluster initContainer + compose init (boss-init)"
-    "infra/deploy-services.sh|playground service deploy (bare-metal, systemd)"
-    "crates/orchestrators/boss-cli/src/train.rs|train deploy verb (boss train)"
 )
 
 for entry in "${PATHS[@]}"; do
@@ -63,8 +67,8 @@ done
 # The 2026-08-13 gap was exactly one `exit 0` above this line.
 INIT="infra/oss-quickstart/init.sh"
 if [ -f "$INIT" ]; then
-    migrate_line=$(grep -n "$RUNNER" "$INIT" | head -1 | cut -d: -f1)
-    exit_line=$(grep -n '^[[:space:]]*exit[[:space:]]' "$INIT" | head -1 | cut -d: -f1)
+    migrate_line=$(grep -n "$RUNNER" "$INIT" | sed -n 1p | cut -d: -f1)
+    exit_line=$(grep -n '^[[:space:]]*exit[[:space:]]' "$INIT" | sed -n 1p | cut -d: -f1)
     if [ -n "$migrate_line" ] && [ -n "$exit_line" ] && [ "$exit_line" -lt "$migrate_line" ]; then
         echo "schema-converge: $INIT exits at line $exit_line, before it converges the" >&2
         echo "    schema at line $migrate_line. The converge must be unconditional:" >&2
@@ -78,4 +82,5 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
+lint_scanned schema-converge "${#PATHS[@]}" "deploy path(s)"
 echo "schema-converge: ok — ${#PATHS[@]} deploy paths converge the schema from the tree"

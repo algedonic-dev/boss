@@ -4,7 +4,7 @@
 # restore sequence:
 #
 #   migrate.sh from empty → restore the copy-set → boss-rebuild-all →
-#   boss-audit-integrity-check green → deploy-services + deploy-web
+#   boss-audit-integrity-check green → converge the instance onto it
 #
 # This script owns everything up to (not including) the deploys. It is
 # deliberately shape-independent: all it needs is a Postgres it may
@@ -67,7 +67,7 @@ psql_db() { sudo -u postgres psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$DB" -c "$1
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 tar -C "$WORKDIR" -xzf "$TARBALL"
-SRC=$(find "$WORKDIR" -maxdepth 1 -mindepth 1 -type d | head -1)
+SRC=$(find "$WORKDIR" -maxdepth 1 -mindepth 1 -type d | sed -n 1p)
 [ -n "$SRC" ] || fail "tarball has no top-level directory"
 echo "==> verifying checksums"
 (cd "$SRC" && sha256sum -c SHA256SUMS >/dev/null) || fail "checksum mismatch — the tarball is corrupt"
@@ -141,4 +141,4 @@ else
 fi
 
 echo "==> restore complete: $DB carries the log, the registries, and rebuilt projections"
-echo "    next on the real move: deploy-services + deploy-web, then point services at $DB"
+echo "    next on the real move: point the instance's services at $DB and converge"

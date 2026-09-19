@@ -7,13 +7,14 @@
 //! with full crate suites missed a shell lint only CI ran. CLAUDE.md
 //! §9a: collapse the pair, and pin what cannot collapse.
 //!
-//! The collapse: the CI workflow's test job invokes `infra/gate.sh`
-//! instead of inlining cargo commands and lint scripts, so CI and a
-//! local run are the same definition. What cannot collapse is pinned
-//! here:
-//! - the workflow must actually call the script, and must not grow a
-//!   second inline definition beside it (a new `run: infra/lint/...`
-//!   line in the test job is the pair reopening);
+//! The collapse: the gate runner (`infra/gate-runner/run.sh`) invokes
+//! `infra/gate.sh` for every car and — since 2026-09-13, design 128b5496
+//! — for every train, so a gate and a local run are the same definition.
+//! The CI workflow's `test` job used to be the train's copy of it; that
+//! job is gone. What cannot collapse is pinned here:
+//! - the runner must actually call the script, and the workflow must
+//!   not grow a second inline definition (a `test` job or a
+//!   `run: infra/lint/...` line is the pair reopening);
 //! - the script must keep covering the checks the gate exists to run —
 //!   a trimmed roster is exactly the under-covering gate that let both
 //!   #226 failures through.
@@ -100,57 +101,49 @@ fn gate_cmd(args: &[&str]) -> std::process::Command {
     cmd
 }
 
-/// The `test`-job slice of the Forgejo workflow — the job that carries
-/// the Postgres service, and so the only one that can run the gate's
-/// DB-backed test phase. `test` is the last job in the file, so the
-/// slice runs to the end; a job appended after it would be swept in,
-/// which only ever makes the no-second-definition check stricter.
-fn forge_test_job() -> String {
-    let ci = read(".forgejo/workflows/ci.yml");
-    let start = ci
-        .find("\n  test:")
-        .expect(".forgejo/workflows/ci.yml has a test job");
-    ci[start + 1..].to_string()
+/// Since 2026-09-13 (design 128b5496) the workflow has NO `test` job:
+/// the Rust checks run as the train's cluster gate-run, which is
+/// `infra/gate-runner/run.sh` invoking `infra/gate.sh` — the same one
+/// definition every car's gate runs. What the workflow must not do is
+/// grow the second definition back: no `test` job, no inline cargo or
+/// lint invocation anywhere in it.
+fn forge_workflow() -> String {
+    read(".forgejo/workflows/ci.yml")
 }
 
-/// The forge workflow is the one that actually gates a train — since
-/// the 2026-08-12 cutover every car lands through Forgejo. For a day it
-/// ran locomotive + fmt + clippy + migrate + build + test and NOT the
-/// script, so the whole lint roster was unenforced in production and
-/// thirteen trains landed green over a real `no-wallclock` violation.
-/// The pin at the time only knew about the GitHub file, which is why
-/// nothing caught it.
+/// The gate runner — the thing that now judges a train's Rust — runs
+/// the script, not a copy of its checks.
 #[test]
-fn forge_test_job_invokes_the_gate_script() {
-    let job = forge_test_job();
+fn the_gate_runner_invokes_the_gate_script() {
+    let run = read("infra/gate-runner/run.sh");
     assert!(
-        job.contains("infra/gate.sh"),
-        ".forgejo/workflows/ci.yml's test job does not invoke \
-         infra/gate.sh — the workflow that gates every train has \
-         forked away from the gate's definition"
+        run.contains("./infra/gate.sh"),
+        "infra/gate-runner/run.sh does not invoke infra/gate.sh — the runner that gates \
+         every car and every train has forked away from the gate's definition"
     );
 }
 
 #[test]
-fn forge_test_job_has_no_inline_second_definition() {
-    let job = forge_test_job();
-    // Environment setup (services, schema apply) stays in the
-    // workflow, checks live in the script. The
-    // `fast` job's fmt + clippy are deliberately outside this slice —
-    // they are a duplicated fast-signal loop, not a second definition.
+fn the_forge_workflow_carries_no_second_definition_of_the_gate() {
+    let ci = forge_workflow();
+    assert!(
+        !ci.contains("\n  test:") && !ci.contains("\n  fast:"),
+        ".forgejo/workflows/ci.yml has a test or fast job again — the Rust checks run as \
+         the train's cluster gate (128b5496); a second run of them here is the pair reopening"
+    );
     let inline_checks = [
         "run: cargo clippy",
         "run: cargo test",
         "run: cargo build",
         "run: cargo fmt",
         "run: infra/lint/",
+        "run: infra/gate.sh",
     ];
     for needle in inline_checks {
         assert!(
-            !job.contains(needle),
-            ".forgejo/workflows/ci.yml's test job inlines `{needle}` \
-             beside infra/gate.sh — the gate now has two definitions \
-             again; move the check into the script"
+            !ci.contains(needle),
+            ".forgejo/workflows/ci.yml inlines `{needle}` — the gate has two definitions \
+             again; the checks live in infra/gate.sh, run by the gate runner"
         );
     }
 }
@@ -184,31 +177,25 @@ fn gate_script_covers_the_checks() {
     // manifest.txt lesson one level up).
     //
     // Under-covering can therefore arrive only one way now: a lint
-    // slipping into that exclusion set. So the exclusion set is what is
-    // pinned. It is asked of the script itself (`--roster`), not
-    // re-parsed from its text — a second parser of the array would be
-    // the pair reopening.
-    let not_preflighted: &[(&str, &str)] = &[
-        (
-            "conservation-invariants.sh",
-            "live-DB sweep on a systemd timer, not a static check",
-        ),
-        (
-            "audit-ordering.sh",
-            "live-DB sweep; needs a populated audit_log to say anything",
-        ),
-        (
-            "no-snapshot-arrays.sh",
-            "needs a built workspace (boss-ports-list) — gating it is \
-             proposed separately; it is the check that would have caught \
-             the stale _generated/ports.ts",
-        ),
-        (
-            "svelte-check.sh",
-            "installs packages — minutes, not seconds; the gate's web phase \
-             runs it, and that is asserted below",
-        ),
-    ];
+    // slipping into that exclusion set. Until 2026-09-18 the set was
+    // pinned by a second hand-typed copy of it HERE — one of FIVE copies
+    // the tech-debt audit counted (H9, backlog 6fa15484): gate.sh's
+    // array, this list, the conductor's compiled fallback, the
+    // delivery-policy seed row and the live registry row, with nothing
+    // holding gate.sh's copy equal to the conductor's. Now each excluded
+    // lint declares its own exclusion in its header (`# consist: skip —
+    // <why>`), gate.sh derives the set from those (`--exclusions`), and
+    // the conductor asks the assembled tree's gate.sh for its roster.
+    // So what is pinned is the DERIVATION: the roster is exactly the
+    // directory minus what the lints themselves declare, asked of the
+    // script rather than re-parsed from its text — a second parser
+    // would be the pair reopening.
+    let excluded = exclusions_of(&mut gate_cmd(&["--exclusions"]));
+    assert!(
+        !excluded.is_empty(),
+        "no lint declares a consist skip — the four that need a live database, a \
+         built workspace or a package manager must still say so in their headers"
+    );
 
     let out = gate_cmd(&["--roster"])
         .output()
@@ -229,33 +216,197 @@ fn gate_script_covers_the_checks() {
         "the pre-flight must open by saying what the workspace cannot cover"
     );
 
-    let mut missing = Vec::new();
+    let mut disagree = Vec::new();
     for entry in std::fs::read_dir(repo_root().join("infra/lint")).expect("read infra/lint") {
         let path = entry.expect("dir entry").path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) if n.ends_with(".sh") => n.to_string(),
             _ => continue,
         };
-        let excluded = not_preflighted.iter().any(|(n, _)| *n == name);
-        let runs = preflighted
-            .iter()
-            .any(|p| *p == format!("infra/lint/{name}"));
-        if excluded == runs {
-            missing.push(name);
+        let rel = format!("infra/lint/{name}");
+        let declared_skip = excluded.iter().any(|(p, _)| *p == rel);
+        let runs = preflighted.iter().any(|p| *p == rel);
+        if declared_skip == runs {
+            disagree.push(name);
         }
     }
-    missing.sort();
+    disagree.sort();
     assert!(
-        missing.is_empty(),
-        "infra/lint/ and gate.sh's pre-flight disagree on: {missing:?}. A lint \
-         listed here as not-preflighted must be in gate.sh's PREFLIGHT_EXCLUDES, \
-         and one excluded there must be listed here with the reason it is exempt."
+        disagree.is_empty(),
+        "infra/lint/ and gate.sh's pre-flight disagree on: {disagree:?}. A lint is out \
+         of the pre-flight exactly when its own header declares `# consist: skip — <why>`, \
+         and `--exclusions` must print exactly those."
     );
     assert!(
         gate.contains("infra/lint/svelte-check.sh"),
         "svelte-check.sh is kept out of the pre-flight for cost, not for coverage: \
          the gate's web phase must still run it"
     );
+    // Not `contains("infra/lint/no-snapshot-arrays.sh")` — the exclusion
+    // list already names the path, so that would pass with the lint
+    // never run. From 2026-08-31 to 2026-09-12 the lint was excluded
+    // here "because CI builds, then runs it", and nothing ran it: it
+    // named a page deleted in #161 and stayed red, unread, for twelve
+    // days (docs/invariants/spa-lists-are-generated.toml recorded the
+    // gap as `unenforced`). A check nobody runs is not running.
+    assert!(
+        gate.contains("check \"no-snapshot-arrays\""),
+        "no-snapshot-arrays.sh is kept out of the pre-flight because it needs the built \
+         boss-ports-list: the gate's build phase must still run it as a check"
+    );
+}
+
+/// `gate.sh --exclusions`, parsed: one `(path, why)` per line, the two
+/// separated by a tab because a reason has spaces in it.
+fn exclusions_of(cmd: &mut std::process::Command) -> Vec<(String, String)> {
+    let out = cmd.output().expect("run gate.sh --exclusions");
+    assert!(
+        out.status.success(),
+        "gate.sh --exclusions refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            let (path, why) = l
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("an exclusion line is `<path>\\t<why>`, got {l:?}"));
+            (path.to_string(), why.to_string())
+        })
+        .collect()
+}
+
+/// A bare tree holding THIS tree's gate.sh and only the lints a test
+/// puts there, so the derivation can be exercised on lints written for
+/// the purpose rather than on whatever `infra/lint/` holds today. The
+/// gate's first-pinned lint is stubbed because the roster refuses a
+/// tree without it, which is a different claim.
+fn skeleton(label: &str, lints: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = boss_testing::scratch_dir(label);
+    let tree = dir.join("tree");
+    boss_testing::create_dir(&tree.join("infra/lint/lib"));
+    // gate.sh sources the lint vocabulary (LINT_CANNOT_ANSWER) from the
+    // lib and refuses to run without it, so the skeleton carries both.
+    for rel in ["infra/gate.sh", "infra/lint/lib/git-answer.sh"] {
+        std::fs::copy(repo_root().join(rel), tree.join(rel))
+            .unwrap_or_else(|e| panic!("carry this tree's {rel} into the skeleton: {e}"));
+    }
+    boss_testing::write_file(
+        &tree.join("infra/lint/workspace-declares-what-it-runs.sh"),
+        "#!/usr/bin/env bash\nexit 0\n",
+    );
+    for (name, body) in lints {
+        boss_testing::write_file(&tree.join("infra/lint").join(name), body);
+    }
+    tree
+}
+
+fn skeleton_gate(tree: &std::path::Path, mode: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(tree.join("infra/gate.sh"))
+        .arg(mode)
+        .current_dir(tree);
+    cmd
+}
+
+/// THE ONE DEFINITION OF "NOT PRE-FLIGHTED" IS THE LINT'S OWN HEADER.
+///
+/// A lint that needs something a bare tree cannot answer in seconds — a
+/// live database, a built workspace, a package manager — says so on a
+/// header line, and that line is the whole mechanism: gate.sh reads it
+/// to build the roster, prints it on `--exclusions`, and the conductor
+/// asks gate.sh. Nothing else in the tree lists the excluded lints, so
+/// nothing else can drift from this.
+#[test]
+fn a_lint_declares_its_own_consist_skip_in_its_header() {
+    let tree = skeleton(
+        "boss-gate-consist-skip",
+        &[
+            (
+                "declared.sh",
+                "#!/usr/bin/env bash\n\
+                 # A lint that sweeps the live database.\n\
+                 #\n\
+                 # consist: skip — psql against a live database, not a question about a tree\n\
+                 exit 0\n",
+            ),
+            (
+                "plain.sh",
+                "#!/usr/bin/env bash\n# An ordinary static check.\nexit 0\n",
+            ),
+            (
+                "late.sh",
+                "#!/usr/bin/env bash\n\
+                 set -euo pipefail\n\
+                 # consist: skip — below the first line of code, so prose, not a declaration\n\
+                 exit 0\n",
+            ),
+        ],
+    );
+
+    let excluded = exclusions_of(&mut skeleton_gate(&tree, "--exclusions"));
+    assert_eq!(
+        excluded,
+        vec![(
+            "infra/lint/declared.sh".to_string(),
+            "psql against a live database, not a question about a tree".to_string()
+        )],
+        "exactly the lint whose HEADER declares the skip, with its reason; a marker \
+         below the first line of code is prose"
+    );
+
+    let out = skeleton_gate(&tree, "--roster")
+        .output()
+        .expect("run the skeleton's gate.sh --roster");
+    assert!(
+        out.status.success(),
+        "--roster refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let roster = String::from_utf8_lossy(&out.stdout);
+    let paths: Vec<&str> = roster
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, p)| p))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "infra/lint/workspace-declares-what-it-runs.sh",
+            "infra/lint/late.sh",
+            "infra/lint/plain.sh",
+        ],
+        "the roster is the directory minus what the lints themselves declare"
+    );
+    let _ = std::fs::remove_dir_all(tree.parent().expect("skeleton has a parent"));
+}
+
+/// An exemption nobody explained is one nobody can later judge — the
+/// rule the delivery-policy row used to enforce on its JSON, kept at
+/// the one place the declaration now lives. Refused loudly, by name,
+/// in both modes that derive from it: a bare `# consist: skip` must
+/// not quietly drop a lint out of every gate.
+#[test]
+fn a_consist_skip_with_no_reason_is_refused() {
+    let tree = skeleton(
+        "boss-gate-consist-skip-mute",
+        &[("mute.sh", "#!/usr/bin/env bash\n# consist: skip\nexit 0\n")],
+    );
+    for mode in ["--exclusions", "--roster"] {
+        let out = skeleton_gate(&tree, mode)
+            .output()
+            .unwrap_or_else(|e| panic!("run the skeleton's gate.sh {mode}: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{mode} accepted a consist skip with no reason: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains("infra/lint/mute.sh") && stderr.contains("consist: skip"),
+            "{mode}'s refusal names the lint and the line it wants: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(tree.parent().expect("skeleton has a parent"));
 }
 
 /// THE GATE MUST NOT EAT THE DISK IT IS RUNNING ON.
@@ -331,9 +482,9 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
     let counter = dir.join("calls");
     let fake = dir.join("df");
     // 1st call: 900GB free. Every later call: 1GB.
-    std::fs::write(
+    boss_testing::write_exec(
         &fake,
-        format!(
+        &format!(
             "#!/usr/bin/env bash\n\
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
@@ -342,13 +493,7 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
              else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
             c = counter.display()
         ),
-    )
-    .expect("write fake df");
-    std::fs::set_permissions(
-        &fake,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .expect("chmod");
+    );
 
     let out = gate_cmd(&["--auto"])
         .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
@@ -387,6 +532,44 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
         !stdout.contains("all checks green"),
         "an aborted gate must never report green.\nstdout: {stdout}"
     );
+}
+
+/// THE LISTINGS ANSWER BEFORE THE FLOOR. `--exclusions` and `--roster`
+/// read no tree and run no check — they list `infra/lint/` and what its
+/// headers declare — and the conductor's consist check asks the
+/// assembled tree's gate.sh for them. Until 2026-09-18 the disk floor
+/// ran before ANY mode dispatched, so at 9GB free on the conductor's
+/// volume `gate.sh --exclusions` was refused with "9GB free, need
+/// 12GB. Refusing to start." and the consist check recorded a failure
+/// it could not judge (backlog 13700f6f; CLAUDE.md Diagnosis: an
+/// infrastructure refusal is not a consist failure). The floor guards a
+/// gate run, not a question about the roster — and the impossible
+/// floor is set the way `the_gate_refuses_to_run_without_headroom`
+/// sets it, so the two tests disagree only about the mode.
+#[test]
+fn the_listings_answer_below_the_disk_floor() {
+    for mode in ["--exclusions", "--roster"] {
+        let out = gate_cmd(&[mode])
+            .env("BOSS_GATE_MIN_FREE_GB", "99999999")
+            .output()
+            .expect("run gate.sh");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "`gate.sh {mode}` is a read-only listing and must answer below the disk floor \
+             (the conductor's consist check reads it, and a refusal there was recorded as \
+             a consist failure at 9GB free on 2026-09-18).\nstderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Refusing to start"),
+            "the floor must not speak on a listing.\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("infra/lint/"),
+            "`gate.sh {mode}` answered nothing.\nstdout: {stdout}"
+        );
+    }
 }
 
 /// THE HEADROOM CHECK MUST COME BEFORE SCOPE DERIVATION.
@@ -718,9 +901,9 @@ fn the_receipt_times_every_check() {
     // Calls 1 (startup) and 2 (before `fmt`) see plenty; call 3 (before
     // the first lint) trips, which is what makes the gate write a
     // receipt holding exactly one, real, timed check.
-    std::fs::write(
+    boss_testing::write_exec(
         &fake,
-        format!(
+        &format!(
             "#!/usr/bin/env bash\n\
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
@@ -729,13 +912,7 @@ fn the_receipt_times_every_check() {
              else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
             c = counter.display()
         ),
-    )
-    .expect("write fake df");
-    std::fs::set_permissions(
-        &fake,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .expect("chmod");
+    );
 
     let out = gate_cmd(&["--quick"])
         .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
@@ -777,4 +954,396 @@ fn the_receipt_times_every_check() {
              check and a broken one read the same: {body}"
         );
     }
+}
+
+/// `--auto` in a SCRATCH TREE: a shared clone of this checkout carrying
+/// the working tree's `infra/gate.sh` (committed, so the clone is clean),
+/// plus the files `touch` names as untracked scratch, gated with a `df`
+/// that reports plenty at startup and trips at the first phase boundary
+/// after it (`fixture`). The gate has derived its scope by then and the
+/// refusal writes the receipt, so this reads what `--auto` DECIDED
+/// without compiling anything — the same trick
+/// `the_receipt_times_every_check` uses to get a receipt cheaply.
+///
+/// The gate under test is the one in THIS tree, not the one at HEAD: a
+/// clone alone would gate the committed script and pass or fail about
+/// the wrong version (a read without its version is a guess).
+fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
+    let root = repo_root();
+    let dir = boss_testing::scratch_dir(label);
+    let tree = dir.join("tree");
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let slot = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_COUNT", (slot + 1).to_string())
+            .env(format!("GIT_CONFIG_KEY_{slot}"), "safe.directory")
+            .env(format!("GIT_CONFIG_VALUE_{slot}"), &root)
+            .output()
+            .unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} in {} failed: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(
+        &[
+            "clone",
+            "--shared",
+            "--quiet",
+            root.to_str().expect("utf8"),
+            tree.to_str().expect("utf8"),
+        ],
+        &dir,
+    );
+    std::fs::copy(root.join("infra/gate.sh"), tree.join("infra/gate.sh"))
+        .expect("carry this tree's gate.sh into the scratch clone");
+    git(
+        &[
+            "-c",
+            "user.email=gate-scope@test",
+            "-c",
+            "user.name=gate-scope",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-am",
+            "the gate under test",
+        ],
+        &tree,
+    );
+    for rel in touch {
+        let path = tree.join(rel);
+        boss_testing::create_dir(path.parent().expect("a scratch path has a parent"));
+        boss_testing::write_file(&path, "-- scratch\n");
+    }
+
+    let counter = dir.join("calls");
+    let fake = dir.join("df");
+    boss_testing::write_exec(
+        &fake,
+        &format!(
+            "#!/usr/bin/env bash\n\
+             n=$(cat {c} 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > {c}\n\
+             echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+            c = counter.display()
+        ),
+    );
+    let receipt = dir.join("receipt.json");
+    let out = std::process::Command::new("bash")
+        .arg(tree.join("infra/gate.sh"))
+        .arg("--auto")
+        .current_dir(&tree)
+        .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
+        .env("BOSS_GATE_MIN_FREE_GB", "12")
+        .env("BOSS_GATE_RECEIPT", receipt.to_str().expect("utf8"))
+        .env("BOSS_GATE_TRUNK", "HEAD")
+        .output()
+        .expect("run gate.sh --auto in the scratch clone");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let body = std::fs::read_to_string(&receipt).unwrap_or_else(|e| {
+        panic!(
+            "the refusal at the first phase must still write a receipt ({e}).\nstdout: {stdout}\nstderr: {stderr}"
+        )
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("receipt is not JSON ({e}): {body}\nstderr: {stderr}"));
+    (stdout, parsed)
+}
+
+fn scope_of(receipt: &serde_json::Value) -> Vec<String> {
+    receipt
+        .get("scope")
+        .and_then(|s| s.as_str())
+        .unwrap_or_else(|| panic!("receipt carries no scope: {receipt}"))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does this crate stand up the shared schema in a test? `TestDb::new`
+/// (and `new_without`) is the one constructor that applies
+/// `infra/postgres/schema/` to a fresh database, so a crate that calls
+/// it reads every migration, whatever its test files are named and
+/// whether or not its manifest declares a `postgres` feature.
+fn stands_up_the_schema(crate_name: &str) -> bool {
+    let root = repo_root();
+    let manifest = std::fs::read_dir(root.join("crates"))
+        .expect("crates/")
+        .filter_map(Result::ok)
+        .map(|tier| tier.path().join(crate_name))
+        .find(|p| p.join("Cargo.toml").is_file())
+        .unwrap_or_else(|| panic!("{crate_name} is not a crate under crates/*/"));
+    fn mentions(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                mentions(&p)
+            } else {
+                p.extension().is_some_and(|x| x == "rs")
+                    && std::fs::read_to_string(&p)
+                        .map(|s| s.contains("TestDb::new"))
+                        .unwrap_or(false)
+            }
+        })
+    }
+    mentions(&manifest.join("src")) || mentions(&manifest.join("tests"))
+}
+
+const SCRATCH_MIGRATION: &str =
+    "infra/postgres/schema/99991231235959-a-scratch-migration-gates-its-readers.sql";
+
+/// THE PACKET (backlog 4711828d). On 2026-09-16 two cars each added a
+/// credentials-registry migration; `--auto` scoped each to the crates
+/// whose FILES changed (boss-dispatcher-handlers, boss-testing) and never
+/// ran boss-jobs, whose `credentials_pg.rs` pins the seeded rows. Both
+/// gated green (receipts 4c2f15c5, 719b6e61); the train gate ran boss-jobs
+/// on the assembled tree and struck all six cars aboard (train 767cfb14,
+/// gate-run 06995f6c). A schema change is a change to every crate that
+/// stands up the schema, and the scope has to say so.
+#[test]
+fn a_migration_only_car_scopes_every_crate_that_stands_up_the_schema() {
+    let (stdout, receipt) = auto_scope_of("gate-scope-migration-only", &[SCRATCH_MIGRATION]);
+    let scope = scope_of(&receipt);
+    // The crate from the incident, and the crate that owns the fixture.
+    for must in ["boss-jobs", "boss-testing"] {
+        assert!(
+            scope.iter().any(|c| c == must),
+            "a migration-only car must scope {must} — the car that struck train 767cfb14 \
+             gated without it.\nscope: {scope:?}\nstdout: {stdout}"
+        );
+    }
+    // The HONEST predicate, not the convenient one: boss-dispatcher
+    // declares no `postgres` feature and still stands up a TestDb in
+    // tests/rules_wait_pg.rs. A derivation keyed on the feature flag
+    // would drop it and read 13 crates where 25 read the schema.
+    assert!(
+        scope.iter().any(|c| c == "boss-dispatcher"),
+        "boss-dispatcher stands up the schema without a `postgres` feature; a scope \
+         that omits it was derived from the manifest instead of from the tests.\n\
+         scope: {scope:?}"
+    );
+    // Every crate pulled in is one that reads the schema — nothing rides
+    // in on a name or a list.
+    for c in &scope {
+        assert!(
+            stands_up_the_schema(c),
+            "{c} was scoped by a schema change but constructs no TestDb — the \
+             derivation named a crate that does not read the schema.\nscope: {scope:?}"
+        );
+    }
+    assert!(
+        scope.len() >= 10,
+        "the schema readers came back suspiciously few ({}) — a grep that matches \
+         nothing is a map that covers nothing.\nscope: {scope:?}",
+        scope.len()
+    );
+    // The receipt names WHY: the migration it saw and the crates it
+    // pulled in for it, so a reader of the packet can tell "scoped
+    // because the tree changed these crates" from "scoped because the
+    // schema moved".
+    let why = receipt
+        .get("schema_change")
+        .unwrap_or_else(|| panic!("receipt carries no schema_change field: {receipt}"));
+    let paths: Vec<&str> = why
+        .get("paths")
+        .and_then(|p| p.as_array())
+        .unwrap_or_else(|| panic!("schema_change carries no paths array: {receipt}"))
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![SCRATCH_MIGRATION],
+        "schema_change.paths must name the migration the gate saw: {receipt}"
+    );
+    let readers: Vec<String> = why
+        .get("readers")
+        .and_then(|r| r.as_str())
+        .unwrap_or_else(|| panic!("schema_change carries no readers: {receipt}"))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        readers, scope,
+        "for a migration-only car the scope IS the readers, and the receipt must say \
+         so in one place: {receipt}"
+    );
+    assert!(
+        stdout.contains("schema change ->"),
+        "the gate must say on stdout that the schema change is what widened the \
+         scope.\nstdout: {stdout}"
+    );
+}
+
+/// A migration beside a crate change scopes BOTH: the crate the tree
+/// changed and the crates that read the schema. And the contrast — a
+/// crate change with no migration pulls no reader in — pins that the
+/// widening is keyed on `infra/postgres/schema/`, not on every car.
+#[test]
+fn a_migration_beside_a_crate_change_scopes_both() {
+    // boss-expr constructs no TestDb, so it can only enter the scope
+    // through its own changed file.
+    assert!(
+        !stands_up_the_schema("boss-expr"),
+        "this test needs a crate that does NOT read the schema; pick another"
+    );
+    let (stdout, receipt) = auto_scope_of(
+        "gate-scope-migration-and-crate",
+        &[SCRATCH_MIGRATION, "crates/core/boss-expr/src/zz_scratch.rs"],
+    );
+    let scope = scope_of(&receipt);
+    for must in ["boss-expr", "boss-jobs"] {
+        assert!(
+            scope.iter().any(|c| c == must),
+            "a migration beside a boss-expr change must scope {must}.\nscope: {scope:?}\n\
+             stdout: {stdout}"
+        );
+    }
+
+    let (stdout, receipt) = auto_scope_of(
+        "gate-scope-crate-only",
+        &["crates/core/boss-expr/src/zz_scratch.rs"],
+    );
+    let scope = scope_of(&receipt);
+    assert_eq!(
+        scope,
+        vec!["boss-expr".to_string()],
+        "a crate change with no migration must not pull the schema readers in — \
+         that would make every car a whole-workspace gate.\nstdout: {stdout}"
+    );
+    let paths = receipt
+        .get("schema_change")
+        .and_then(|w| w.get("paths"))
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        paths.is_empty(),
+        "no migration changed, so schema_change.paths must be empty: {receipt}"
+    );
+}
+
+/// THE PACKET (backlog f532c345). The platform bundle grew two more
+/// registries on 2026-09-18 — `infra/platform/stations/` (H4 car 1) and
+/// `infra/platform/step-plugins/` (car 3), each held equal to the
+/// migrations by a `*_bundle_is_the_migrations_pg.rs` pin in boss-jobs —
+/// and the gate's `path_shapes` still named only `workflows/`. Measured
+/// on main at #452 through the gate's own `path_map`:
+/// `infra/platform/stations/repair.toml` and
+/// `infra/platform/step-plugins/sign-off.toml` each derived NO crate,
+/// while `infra/platform/workflows/gate-run.toml` derived boss-jobs. The
+/// three bundle cars gated `boss-cli boss-jobs boss-testing` (receipts on
+/// gate-runs dd939905, 531ab449, 0c6e6ac9) only because each also
+/// changed Rust; a bundle-ONLY car — the ordinary kind, once the bundle
+/// is the registry — would have gated lints-only and never run the pin
+/// that exists to reject it (the class "a green gate only covers what it
+/// runs"). Same hole, same fix as the tenant bundle (b59efe54): the
+/// shape is derived from the DIRECTORY, so this walks `infra/platform/`
+/// and gates one scratch row in each bundle it finds — a fourth bundle
+/// is covered the day its directory appears, and a bundle the map
+/// forgets names itself here.
+#[test]
+fn a_platform_bundle_edit_scopes_the_crate_whose_pins_hold_it_to_the_migrations() {
+    let root = repo_root();
+    let mut bundles: Vec<String> = std::fs::read_dir(root.join("infra/platform"))
+        .expect("infra/platform/ is the platform bundle")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    bundles.sort();
+    assert!(
+        bundles.len() >= 3,
+        "infra/platform/ holds fewer bundle directories ({bundles:?}) than the three that \
+         existed when this test was written — a walk that finds nothing pins nothing"
+    );
+    for bundle in &bundles {
+        let scratch = format!("infra/platform/{bundle}/zz-a-scratch-row.toml");
+        let (stdout, receipt) = auto_scope_of(&format!("gate-scope-bundle-{bundle}"), &[&scratch]);
+        let scope = scope_of(&receipt);
+        assert!(
+            scope.iter().any(|c| c == "boss-jobs"),
+            "a car that only edits {scratch} must scope boss-jobs — that crate holds \
+             the bundle equal to the migrations, and a bundle-only car that gates \
+             lints-only never runs the one test that can reject it.\n\
+             scope: {scope:?}\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("--auto scoping to"),
+            "the gate must say it scoped for {scratch}, not fall to lints-only.\n\
+             stdout: {stdout}"
+        );
+    }
+}
+
+/// THE PACKET (backlog 1b52c278). Train #470's car 4f1ba1f9 edited
+/// `docs/tenant-contract.md` (one sentence on the tenant.toml row)
+/// without touching `CONTRACT` in boss-cli's tenant.rs. The equality pin
+/// `the_contract_doc_carries_the_codes_table` lives in boss-cli, which
+/// the car did not change, so neither the car's gate nor the train gate
+/// (both `--auto`, both scoped to boss-gateway) ran it; origin/main went
+/// red on that pin at 04:38Z and struck the next car gated on top of it
+/// (5e4951a4) — the FIRST time the pin ran at all.
+///
+/// Measured through the gate's own `file_input_index` at #471: 191
+/// (path, crate) pairs, and `docs/tenant-contract.md` in none of them.
+/// The index counted a repo-relative literal only inside a crate's
+/// `tests/` directory and, elsewhere, only a `../`-escaping one — and
+/// the pin is a `#[cfg(test)]` module under `src/` that reads the doc
+/// through `boss_testing::repo_root().join("docs/tenant-contract.md")`,
+/// which is neither. Eight (path, crate) pairs sat outside the map for
+/// the same reason (estate.toml, sor-ports.env, pod-build.env,
+/// as-gate-uid.sh, access.toml, tax.toml, this doc). The idiom is the
+/// discriminator the index lacked: a literal that is the argument of
+/// `.join(` is a path being read, not a sentence that mentions one, so
+/// the gate now counts it under `src/` too. This gates a scratch edit to
+/// the doc and asserts the crate holding its pin is in scope.
+#[test]
+fn a_doc_a_test_module_reads_by_repo_path_scopes_the_crate_that_pins_it() {
+    // The doc's path is read off the pin's own source rather than
+    // restated here: a repo-path literal in this file would be a second
+    // reader the index counts (this crate), and a pin that stops
+    // reading the doc must fail by name rather than pass about nothing.
+    let pin = read("crates/orchestrators/boss-cli/src/tenant.rs");
+    let doc = pin
+        .split("repo_root().join(\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|p| p.starts_with("docs/"))
+        .unwrap_or_else(|| {
+            panic!(
+                "boss-cli's tenant.rs no longer reads a doc through repo_root().join(\"docs/…\") — \
+                 move this test to whichever crate pins the contract doc now"
+            )
+        })
+        .to_string();
+    let (stdout, receipt) = auto_scope_of("gate-scope-doc-read-by-a-pin", &[&doc]);
+    let scope = scope_of(&receipt);
+    assert!(
+        scope.iter().any(|c| c == "boss-cli"),
+        "a car that only edits {doc} must scope boss-cli — that crate's tenant.rs holds \
+         the doc's table equal to CONTRACT, and a docs-only car that gates lints-only \
+         never runs the pin that exists to reject it (train #470).\n\
+         scope: {scope:?}\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("--auto scoping to"),
+        "the gate must say it scoped for {doc}, not fall to lints-only.\nstdout: {stdout}"
+    );
 }

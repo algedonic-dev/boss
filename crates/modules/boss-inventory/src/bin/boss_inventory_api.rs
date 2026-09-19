@@ -44,21 +44,13 @@ async fn main() -> Result<()> {
 
     // One pool per service. PgPool is internally Arc'd, so cloning is
     // cheap and every sub-router/audit-writer shares the same slots.
-    #[cfg(feature = "postgres")]
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(20)
         .connect(&cfg.postgres_url)
         .await
         .with_context(|| "connecting to Postgres")?;
 
-    #[cfg(feature = "postgres")]
     let inventory = Arc::new(boss_inventory::PgInventory::new(pool.clone()));
-
-    #[cfg(not(feature = "postgres"))]
-    let inventory = {
-        boss_core::startup::require_postgres_or_explicit_inmemory("boss-inventory-api")?;
-        Arc::new(boss_inventory::InMemoryInventory::new(vec![], vec![]))
-    };
 
     // Connect to NATS for domain event publishing (optional).
     let publisher = match &cfg.nats_url {
@@ -66,14 +58,10 @@ async fn main() -> Result<()> {
             let bus = boss_nats::NatsEventBus::connect(url)
                 .await
                 .with_context(|| format!("connecting to NATS at {url}"))?;
-            #[allow(unused_mut)]
-            let mut pub_ = boss_core::publisher::DomainPublisher::new(Arc::new(bus), "inventory");
-            #[cfg(feature = "postgres")]
-            {
-                pub_ = pub_.with_audit(std::sync::Arc::new(boss_events::PgAuditWriter::new(
+            let pub_ = boss_core::publisher::DomainPublisher::new(Arc::new(bus), "inventory")
+                .with_audit(std::sync::Arc::new(boss_events::PgAuditWriter::new(
                     pool.clone(),
                 )));
-            }
             info!(nats_url = %url, "domain event publishing + audit trail enabled");
             Some(pub_)
         }
@@ -135,7 +123,6 @@ async fn main() -> Result<()> {
     // team-needs). Postgres-only: it reads/writes vendor_contacts,
     // vendor_interactions, vendor_account_team, vendor_contracts
     // directly via PgProcurement.
-    #[cfg(feature = "postgres")]
     let app = {
         use boss_inventory::procurement::http::{
             ProcurementApiState, router as procurement_router,
@@ -148,8 +135,6 @@ async fn main() -> Result<()> {
             clock: proc_clock,
         }))
     };
-    #[cfg(not(feature = "postgres"))]
-    let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a

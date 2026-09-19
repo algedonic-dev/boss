@@ -36,18 +36,20 @@
 
 use std::collections::BTreeSet;
 
-use boss_dispatcher::rules::registry::parse_raw_path;
+use boss_dispatcher::rules::registry::{RawRegistry, parse_raw_path};
 use boss_dispatcher_handlers::handlers::cadence_roster::{
     ClockCadence, Guard, NotACadence, clock_cadences,
 };
 use boss_dispatcher_handlers::handlers::cadence_silence::declarations;
+use boss_testing::dispatcher_rules_dir;
 
 /// The authored registry — the directory, not a file. Adding a rule is
-/// dropping a file in.
-const RULES_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../infra/dispatcher/rules"
-);
+/// dropping a file in. Where it is has ONE definition, shared with the
+/// boss-dispatcher tests: `boss_testing::dispatcher_rules_dir` (94f150f9;
+/// until 2026-09-14 this file spelled the path itself).
+fn shipped_raw() -> RawRegistry {
+    parse_raw_path(dispatcher_rules_dir()).expect("parse the shipped rule registry directory")
+}
 
 /// The sweep whose roster this is.
 const SWEEP_RULE: &str = "cadence-silence-sweep-daily";
@@ -77,16 +79,63 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          as 'never fired' is the claim cf0f5e2d's first pass withdrew.",
     ),
     (
+        "recheck-failing-probes-daily",
+        "runs `jobs.run-car-probes` scoped to cars whose probe already failed; it files \
+         a `run-car-probe` ops-request per such car, so on a day with no failing probe \
+         it produces NOTHING, and that zero is the healthy reading. The packets it does \
+         file are the same kind the arrival rule files, so a sweep keyed by kind could \
+         not tell the two apart either.",
+    ),
+    (
         SWEEP_RULE,
         "IS the sweep. Its own firing leaves no packet of a kind — its findings are \
          backlog-items keyed by cadence, and a silence in the sweep itself is the gap \
          backlog 6bf34846 tracks (an alarm that reports through its subject dies with \
          it).",
     ),
+    (
+        "broker-revokes-the-cloudflare-tunnel-daily",
+        "runs `credential.rotate.cloudflare-tunnel` with phase = revoke over rotation \
+         packets already parked at `revoke`; it advances those and files nothing, so on \
+         a day with no deferred revoke it produces NOTHING, and that zero is the healthy \
+         reading (5e8efcf5). The packets it advances are rotate-a-credential, opened by \
+         an operator, not by this rule — a sweep keyed by kind would be watching the \
+         operator's cadence, not this one's.",
+    ),
+    (
+        "sensors-poll-every-5-minutes",
+        "runs `sensor.poll`, which reads every declared sensor's SOURCE and opens a packet \
+         of the kind the SENSOR ROW declares only when the source recorded something new \
+         (design 14c9b2ad, backlog 2d33e111). On a quiet day it produces NOTHING, and that \
+         zero is the healthy reading; the kind it opens is tenant data, not a literal in \
+         the rule, so a sweep keyed by kind could not name it. A sensor it cannot read is \
+         its own loud packet (`sensor_unreadable:<id>`), which is the failure this sweep \
+         would otherwise be for.",
+    ),
+    (
+        "agent-run-dies-when-building-is-silent",
+        "runs `jobs.age_out_step`, which completes the `building` step of every open \
+         agent-run that has gone silent past the bound (design c87fb59b car 2, backlog \
+         39d0b528). It files nothing: it CLOSES packets a dispatch opened, so on an hour \
+         with no dead builder it produces NOTHING, and that zero is the healthy reading. \
+         The packets it advances are agent-runs opened by `boss dispatch`, an operator's \
+         act — a sweep keyed by kind would be watching the operator's cadence, not this \
+         one's.",
+    ),
+    (
+        "work-session-ends-when-silent",
+        "runs `jobs.age_out_step`, which completes the `active` step of every open \
+         work-session whose heartbeat is older than the bound (design 511fa7d4 car 2b, \
+         backlog da925366). The same shape as the agent-run rule above: it files nothing \
+         and CLOSES packets the SessionStart hook opened, so on an hour with no abandoned \
+         session it produces NOTHING, and that zero is the healthy reading. The packets it \
+         advances are opened by an operator sitting down at a terminal — a sweep keyed by \
+         kind would be watching the operator's working hours, not this rule.",
+    ),
 ];
 
 fn shipped() -> (Vec<ClockCadence>, Vec<NotACadence>) {
-    let raw = parse_raw_path(RULES_DIR).expect("parse the shipped rule registry directory");
+    let raw = shipped_raw();
     clock_cadences(&raw.rules)
 }
 
@@ -98,7 +147,7 @@ fn every_scheduled_rule_declares_a_cadence_or_says_why_not() {
     let (cadences, skipped) = shipped();
     assert!(
         !cadences.is_empty(),
-        "no clock-rule cadences derived from {RULES_DIR} — the scrape broke, so a green \
+        "no clock-rule cadences derived from infra/dispatcher/rules — the scrape broke, so a green \
          result here would mean nothing"
     );
     for s in &skipped {
@@ -143,9 +192,18 @@ fn the_measured_clock_cadences_are_on_the_roster() {
         "maintenance-sweep/disk-headroom",
         "maintenance-sweep/empty-decisions",
         "maintenance-sweep/deploy-convergence",
-        "maintenance-sweep/stale-build-caches",
+        // `maintenance-sweep/stale-build-caches` left this list on
+        // 2026-09-18: backlog 18df96c4 retired
+        // `maintenance-sweep-build-caches-daily`, whose measurement was a
+        // disk-report on the forge (blind to a cargo target dir on the dev
+        // pod) and whose question the hourly maintenance-dev-scratch-reclaim
+        // packet answers on the host where the caches live.
         "maintenance-sweep/cluster-conformance",
         "publish-to-github/github-mirror",
+        // Added 2026-09-18 (1dffde5d): the platform retro, weekly, off
+        // the `department-retros-weekly` rule's platform half. It was
+        // a cadence_rules row before, which NO sweep watched.
+        "protocol-retro/infra/protocol-retro",
     ] {
         assert!(
             labels.contains(want),
@@ -181,13 +239,13 @@ fn the_measured_clock_cadences_are_on_the_roster() {
 /// Where it does, prefer it; `assert_roster_floor!` is for the rest.
 #[test]
 fn every_scheduled_rule_lands_in_exactly_one_bucket() {
-    let raw = parse_raw_path(RULES_DIR).expect("parse the shipped rule registry directory");
+    let raw = shipped_raw();
     let scheduled = raw.rules.iter().filter(|r| r.schedule.is_some()).count();
     let (cadences, skipped) = clock_cadences(&raw.rules);
     assert_eq!(
         cadences.len() + skipped.len(),
         scheduled,
-        "{scheduled} rules in {RULES_DIR} carry a schedule, but the derivation accounted for \
+        "{scheduled} rules in infra/dispatcher/rules carry a schedule, but the derivation accounted for \
          {} of them ({} cadences + {} named non-cadences). A scheduled rule in neither bucket \
          is a cadence nobody watches and nobody can name — and unlike a thinned roster, no \
          floor would notice, because the count it left behind is still plausible.",
@@ -199,7 +257,7 @@ fn every_scheduled_rule_lands_in_exactly_one_bucket() {
     boss_testing::assert_roster_floor!(
         raw.rules,
         40,
-        "the authored dispatcher rule registry at {RULES_DIR} (61 files on 2026-09-11)"
+        "the authored dispatcher rule registry infra/dispatcher/rules (61 files on 2026-09-11)"
     );
 }
 
@@ -213,7 +271,7 @@ fn every_derived_cadence_has_a_readable_guard_or_none_at_all() {
     boss_testing::assert_roster_floor!(
         cadences,
         6,
-        "the clock cadences derived from {RULES_DIR} (7 on 2026-09-11)"
+        "the clock cadences derived from infra/dispatcher/rules (7 on 2026-09-11)"
     );
     for c in &cadences {
         if let Some(Guard::Unreadable(src)) = &c.guard {
@@ -235,7 +293,7 @@ fn every_derived_cadence_has_a_readable_guard_or_none_at_all() {
 /// alarm twice and disagree about what is silent.
 #[test]
 fn no_clock_rule_kind_is_also_declared_on_the_sweeps_args() {
-    let raw = parse_raw_path(RULES_DIR).expect("parse the shipped rule registry directory");
+    let raw = shipped_raw();
     let sweep = raw
         .rules
         .iter()

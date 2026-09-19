@@ -1,0 +1,195 @@
+# infra/cluster/instances.toml — the BOSS instances the converge renders
+# and applies on EVERY train (backlog 07d7549c car 1; design ffc83387,
+# decided by David 2026-09-16: "Playground is part of prod. Let's do (b)
+# and just be very reliable!" — and prod converges every train too:
+# "I want to run our operations so tightly that we are confident in
+# converging prod on every train").
+#
+# Read by infra/cluster/render-instance.sh (`--all`), and through it by
+# infra/forge/cluster-deploy-runner.sh (the apply, the image roll and
+# the step-plugins ConfigMap, per instance) and
+# infra/cluster/check-manifests-applied.sh (every rendered object must
+# be present). ONE key per line, `key = "value"` or `key = true|false`:
+# the renderer reads this file with the shell, not a TOML parser — the
+# same rule infra/estate/roles.toml lives under.
+#
+# THE SOURCE. The manifests under infra/cluster/manifests/ are written
+# for exactly one instance — the one named here as `source` — and every
+# other instance is that directory with these four values substituted
+# for the source's. So the source's values here MUST be what the files
+# say: the renderer refuses a source value it cannot find in the
+# instance manifests, because a prod entry that drifted from the files
+# would turn every other instance's substitution into a no-op that
+# answers instead of erroring. When prod's hostname moves (www, say),
+# boss.yaml's BOSS_PUBLIC_URL and this line change together, and the
+# byte-identity test in crates/core/boss-testing/tests/render_instance_sh.rs
+# holds them equal.
+#
+# THE FIVE PARAMETERS
+#   namespace  the Kubernetes namespace; `boss` or `boss-<name>`. boss-dev
+#              is the pipeline's and is refused.
+#   tenant     THE TENANT SOURCE — one of two spellings, below. The pod
+#              reads a tenant DIRECTORY (BOSS_TENANT_DIR on the boss
+#              container: tenant.toml or seeds/tenant.toml, and seeds/;
+#              the launcher derives the N-1 readers' paths from it).
+#   sim        BOSS_SIM_ENABLED — whether the tenant's tick daemon
+#              generates packets. Parked on prod 2026-09-05 (packet
+#              59f063de); the playground is where it runs from now.
+#   hostname   the instance's public hostname — BOSS_PUBLIC_URL on the
+#              boss container, and the ingress rule the tunnel connector
+#              routes to the instance's gateway (render-tunnel-config.sh).
+#              TLS is the edge's: since 21c17ebc (2026-09-17) no TLS
+#              front and no certificate exist in the cluster.
+#   guest      BOSS_GUEST_ACCESS — whether an anonymous visitor gets a
+#              synthetic read-only session (the "Browse as a guest"
+#              button; the gateway reads "1" as on, anything else as
+#              off). Right for the public example, wrong for the
+#              operating company's site behind Access (backlog
+#              0d2d7daa, 2026-09-16): true renders "1", false renders
+#              "0". Required, like sim — an instance that inherited the
+#              manifest's "1" by silence would hand strangers the
+#              company's read-only view. Prod keeps true until the flip
+#              car sets it false here AND writes "0" into boss.yaml
+#              (prod is the source; the byte-identity test holds them
+#              equal).
+#   site       OPTIONAL — a second public hostname the instance's
+#              gateway answers from the tenant repository's site/
+#              directory, with no session (design b64c4377, decided
+#              2026-09-17: the company website is company data,
+#              published like the seeds). BOSS_SITE_HOST on the boss
+#              container, a second tunnel ingress rule beside the
+#              instance hostname (same gateway), and the `boss-site`
+#              ConfigMap the converge stages from `<checkout>/site/`
+#              (cluster-deploy-lib.sh site_stage; 1 MiB, flat, like
+#              boss-tenant) mounted at BOSS_SITE_DIR. Needs a
+#              tenant_repo — the site is staged from the checkout — and
+#              must differ from every hostname in this file. An
+#              instance without one renders BOSS_SITE_HOST as "", the
+#              gateway's spelling of "no site", over the same optional
+#              mount. A tenant that declares a site but has no site/
+#              yet gets an EMPTY ConfigMap and its site answers 404
+#              until the directory lands (the converge names it as
+#              `site_source`); it is not a refusal, so the instance
+#              converges either way.
+#
+# THE TENANT SOURCE (backlog f4f5c387, car 2 of fcc1d57b; David
+# 2026-09-16 'Let's do it'). The image bakes examples/ in, so a tenant
+# that is NOT in the product tree — david/algedonic-llc, private on the
+# forge — had no way into a pod. An instance names where its tenant
+# comes from, ONE of:
+#
+#   tenant_dir   a directory in the product checkout, served from the
+#                image: the pod reads /opt/boss/<tenant_dir>. The example
+#                tenant (examples/brewery) stays here — its engine
+#                hardcodes the baked seeds path, and its seeds/ is 500 KB
+#                beside a data/ subdirectory a ConfigMap cannot hold.
+#   tenant_repo  a repository on the forge, `owner/name`, with
+#   tenant_ref   the branch or tag to deliver. The converge MEASURES that
+#                its own credential can read it (ls-remote, the URL
+#                derived from the checkout's forgejo remote — never a
+#                token or URL of its own; cluster-deploy-lib.sh
+#                tenant_source_check), clones it beside the product and
+#                delivers it as the `boss-tenant` ConfigMap in the
+#                instance's namespace, mounted at /opt/boss/tenant/seeds
+#                (the step-plugins ConfigMap's mechanism; a ConfigMap is
+#                flat and a mount inside a read-only mount cannot be
+#                created, so the root tenant.toml rides as seeds/
+#                tenant.toml — the spelling the contract accepts). The
+#                pod reads /opt/boss/tenant. An instance whose tenant
+#                the converge CANNOT read is skipped whole — named on
+#                the packet as `tenant_source: <ns>: unreadable
+#                (<repo>@<ref>)` and in `instances_skipped` — so the
+#                first converge answers whether the runner's token needs
+#                a scope from David (a root ceremony) instead of a person
+#                guessing; the verdict for every instance rides the
+#                packet as `tenant_source`.
+#
+# The retired `tenant = "examples/<name>/seeds/tenant.toml"` line is
+# REFUSED by name: a stale key must not read as "no source".
+#
+# THE FLIP — prod onto the real tenant — is David's decision moment,
+# not this car's (the packet: prod keeps its manifest values until he
+# flips it). When he does, two lines change together, and the
+# byte-identity test holds them equal because prod is the source:
+#   here, under [prod], replace the tenant_dir line with
+#     tenant_repo = "david/algedonic-llc"
+#     tenant_ref = "main"
+#   and in infra/cluster/manifests/boss.yaml set BOSS_TENANT_DIR to
+#   /opt/boss/tenant (the `boss-tenant` ConfigMap it then reads is
+#   mounted there already, `optional` so an image-sourced instance
+#   boots without it). The orphan sweep (infra/cluster/
+#   undeclared-objects.sh EXEMPT) then needs `ConfigMap/boss/boss-tenant`
+#   the way it names step-plugins — a generated object, not a manifest.
+#
+# THE SECRETS, and the one optional key. The manifests reference their
+# Secrets by name (README: secrets never live here), and the converge
+# DERIVES the list an instance needs from its rendered manifests
+# (cluster-deploy-lib.sh manifest_secrets — every secretKeyRef, secret
+# volume and imagePullSecret not marked optional; measured 2026-09-16
+# for the playground: boss-oidc, boss-secrets, boss-session-key,
+# forgejo-registry, resend — and boss-tls, until its last reference
+# left with the TLS front on 2026-09-17, 21c17ebc). PROVISIONING MINTS
+# THEM (backlog
+# dc1bc724; David 2026-09-16: no hand work unless absolutely required):
+# on the first converge that finds one absent the runner creates the
+# instance's Namespace and then, per Secret and by its class
+# (cluster-deploy-lib.sh provision_instance_secrets):
+#
+#   internal  boss-secrets, boss-session-key — random values nobody
+#             needs to know, minted in the namespace; names only reach
+#             the journal and the packet
+#   shared    forgejo-registry, resend — the same credential as another
+#             instance's, COPIED from the namespace of the instance this
+#             one names as `shares_with` (the optional fifth key, an
+#             instance name in this file; the renderer refuses one it
+#             cannot find). Without it they stay absent and are named.
+#   root      boss-oidc — created with an EMPTY client-secret: the
+#             gateway then boots guest-only (its OidcConfig reads empty
+#             as "no OIDC"), and registering the Kanidm client is the
+#             ceremony that fills it
+#   by hand   anything else. Nothing today: boss-tls was the one, and
+#             the playground was skipped on every converge for want of
+#             it until the TLS front left (21c17ebc, 2026-09-17). After
+#             that the playground needs only its boss-oidc filled.
+#
+# The packet records the line as `instance_secrets_minted`. Then the
+# secret gate asks the cluster again: an instance still missing any
+# Secret is SKIPPED whole, named as `instances_skipped`, with the
+# `kubectl create secret` shapes printed in the journal, and the
+# converge exits 0; one that has everything applies on this same
+# converge. Prod is applied, rolled, stamped and verified first and is
+# unaffected either way.
+
+source = "prod"
+
+# THE FLIP, 2026-09-16 (design ffc83387, decided; e652c7c6 Option 3,
+# decided; David: "prep the flip car"): prod is Algedonic, LLC. The
+# tenant is the private repo the converge checks out and delivers as the
+# boss-tenant ConfigMap; the database is the fresh one
+# switch-instance-database repointed the Secret at while the converge
+# was held (063dba4e). The public example lives on as the playground.
+[prod]
+namespace = "boss"
+tenant_repo = "david/algedonic-llc"
+tenant_ref = "main"
+sim = false
+hostname = "boss.algedonic.dev"
+# The company website (design b64c4377): www is the same gateway
+# answering from the tenant repo's site/ — declared in the zone and in
+# Access beside boss. (infra/cluster/dns/), behind Access until the
+# public-launch design.
+site = "www.algedonic.dev"
+# No anonymous read session on the operating site: the edge asks for an
+# identity (Access) and the gateway asks for a login; the playground keeps
+# the guest door (decided 2026-09-16, 0d2d7daa).
+guest = false
+
+[playground]
+namespace = "boss-playground"
+tenant_dir = "examples/brewery"
+sim = true
+hostname = "playground.algedonic.dev"
+guest = true
+# The playground pulls the same images and sends mail as the same
+# sender: its shared Secrets are prod's, copied.
+shares_with = "prod"

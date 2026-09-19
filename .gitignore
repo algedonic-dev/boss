@@ -9,7 +9,12 @@ target
 # context).
 
 # Node
-node_modules/
+# No trailing slash: with one the pattern matches directories only, and
+# infra/dev/wt-web links a worktree's node_modules to the operator's as
+# SYMLINKS, which are not directories to the ignore rules — so the
+# pattern that hid a bun install left three untracked paths in every
+# builder worktree (backlog ef4394e1, 2026-09-14). Pinned in wt_web_sh.rs.
+node_modules
 dist/
 .next/
 *.tsbuildinfo
@@ -30,8 +35,12 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Claude Code
-.claude/
+# Claude Code — everything under .claude/ is per-machine (worktrees,
+# settings.local.json, locks) EXCEPT the project settings, which ship
+# the hooks that make a session a work-session packet (design 511fa7d4
+# car 2b, backlog da925366; pinned by dev_hooks_sh.rs).
+.claude/*
+!.claude/settings.json
 
 # Build artifacts
 *.log
@@ -50,7 +59,7 @@ docs/formal/*.toolbox/
 
 # Generated seed bundles — `infra/postgres/regenerate-brewery-seed.sh`
 # rebuilds them from source (JobKinds + tenant.toml + the live sim).
-# Don't commit; runtime consumers (bootstrap-local.sh,
+# Don't commit; runtime consumers (the container launcher,
 # reset-to-baseline.sh, oss-quickstart/init.sh) fetch or regenerate
 # as needed. Keeps git history slim and forces every deployment to
 # start from a known-fresh artifact rather than a stale snapshot.

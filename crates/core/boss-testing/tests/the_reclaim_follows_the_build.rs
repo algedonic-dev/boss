@@ -3,7 +3,8 @@
 //! Measured on the forge host, 2026-09-11 (backlog `0357e0eb`): six
 //! consecutive observations fifteen minutes apart read 89, 100, 99,
 //! **60**, 92, 98 GB free of 227. The locomotive refuses to START a CI
-//! run below 70 GB (`infra/forge/locomotive.sh`, `BOSS_CI_MIN_FREE_GB`),
+//! run below 40 GB (`infra/forge/locomotive.sh`, `BOSS_CI_MIN_FREE_GB`;
+//! 70 until 2026-09-16),
 //! so the 04:03 trough sat ten gigabytes under the door a train boards
 //! through — and a locomotive refusal happens BEFORE any check runs, so
 //! it says nothing about the branch while striking every car aboard.
@@ -15,14 +16,14 @@
 //! pulls a per-train `boss-ci:<sha>` image into the system docker
 //! daemon. The RECLAIM is timer-driven: `disk-floor-sweep.timer` runs
 //! hourly and its unit defends 100 GB — deliberately higher than the
-//! locomotive's 70, so a floor buys headroom above the one being
+//! locomotive's 40, so a floor buys headroom above the one being
 //! defended. A dip whose amplitude exceeds that 30 GB gap, inside one
 //! timer interval, walks straight through it.
 //!
 //! So the reclaim must follow the EVENT that fills the disk. The
 //! mechanism was already complete and only the trigger was missing: the
 //! forge runs an ops-runner on a ~1-minute poll, and `reclaim-disk` is
-//! an allowlisted bounded verb (`infra/ops/verbs.json`) that runs the
+//! an allowlisted bounded verb (`infra/ops/verbs/reclaim-disk.json`) that runs the
 //! SAME `disk-floor-sweep.sh` the timer runs. `request-reclaim-disk.sh`
 //! is the trigger, and the CI workflow — which already runs on every
 //! train, green or red, and needs no install step on the host — is what
@@ -40,8 +41,8 @@
 //!    train would cause the exact strike it exists to prevent, and the
 //!    hourly timer remains the independent floor.
 
-use boss_testing::repo_root;
-use std::path::{Path, PathBuf};
+use boss_testing::{repo_root, write_exec};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn read(rel: &str) -> String {
@@ -61,15 +62,6 @@ fn fixture_dir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir fixture");
     dir
-}
-
-fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write stub");
-    std::fs::set_permissions(
-        path,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .expect("chmod stub");
 }
 
 /// A stub `df` reporting a fixed number of free GB in POSIX columns, and
@@ -196,7 +188,10 @@ fn the_reclaim_waits_for_the_heavy_jobs_and_runs_whatever_their_verdict() {
         .find(|l| l.trim_start().starts_with("needs:"))
         .unwrap_or_else(|| panic!("the `reclaim` job declares no `needs:`"))
         .to_string();
-    for heavy in ["fast", "test", "web"] {
+    // `fast` and `test` left this workflow on 2026-09-13 (design
+    // 128b5496: the Rust checks run as the train's cluster gate); `web`
+    // is the heavy job that remains on the forge.
+    for heavy in ["build-image", "web"] {
         assert!(
             needs.contains(heavy),
             "the `reclaim` job does not wait for `{heavy}` ({needs}) — reclaiming \

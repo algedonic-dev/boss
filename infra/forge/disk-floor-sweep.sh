@@ -48,11 +48,13 @@
 #   0. per-train CI images in the SYSTEM daemon whose TRAIN IS DONE,
 #      plus anything the record cannot vouch for that is older than
 #      CI_IMAGE_AGE_HOURS, keeping the newest few — NOT floor-gated
-#   a. docker builder prune -af  (ALL build cache, no age filter)
-#      (build cache is regenerable by definition; the converge runner
-#      uses a gentler filter because it runs above the floor — below it,
-#      a slower next build is the cheapest thing on the menu, so take
-#      all of it. A 24h filter here left the floor unmet on 2026-09-04.)
+#   a. docker builder prune -af --filter type!=exec.cachemount
+#      (ALL regenerable build cache, no age filter — but NOT the
+#      compiler's cache mounts, which are what make a converge build
+#      warm; an hourly wipe of those made every build cold, 2026-09-12.
+#      A 24h filter here left the floor unmet on 2026-09-04.)
+#   a'. below the HARD floor (half of FLOOR_GB) the mounts go too,
+#      with the size spent in the log.
 #   b. docker image prune -f            (dangling images only, no -a)
 #   c. registry-verified old-tag removal — the SAME loop as its
 #      sibling cluster-deploy-runner.sh, via the shared
@@ -68,7 +70,7 @@
 # sweep's packets are the alarm. Escalating to more aggressive
 # deletion is a human's call, never this script's.
 #
-# AGENT-WORKABLE TOO: once infra/ops/verbs.json lands (branch
+# AGENT-WORKABLE TOO: once the ops allowlist (now infra/ops/verbs/) lands (branch
 # feat/ops-request-the-host-answers), `reclaim-disk` registers THIS
 # script as the first mutating ops verb — authorized by David,
 # 2026-09-03, bounded to regenerable caches by construction of what
@@ -79,24 +81,31 @@
 #
 # Install (forge host): disk-floor-sweep is in install.sh's UNITS
 # list, so the standing idiom covers it —
-#   ssh 10.20.0.15 'cd /home/david/boss && git pull && sudo infra/forge/install.sh'
+#   ssh <forge> 'cd /home/david/boss && git pull && sudo infra/forge/install.sh'
 #
 # Usage: disk-floor-sweep.sh [floor_gb]
 #   floor_gb overrides BOSS_DISK_FLOOR_GB (default 70, = CI's floor). The optional
 #   arg is what the reclaim-disk ops verb passes.
 set -euo pipefail
 
-REGISTRY="${BOSS_FORGE_REGISTRY:-10.20.0.15:3000/david/boss}"
+# The image repos this sweep prunes — the converge's and the per-train
+# CI runner's — from forge-defaults.sh, off the registry host in
+# /etc/boss/sor.env (BOSS_FORGE_REGISTRY / BOSS_CI_IMAGE_REPO override).
+. "$(dirname "$0")/forge-defaults.sh"
+forge_need REGISTRY CI_IMAGE_REPO
 export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1000/docker.sock}"
 
-# 70, not 25, and it MUST match locomotive.sh's BOSS_CI_MIN_FREE_GB (§9a
-# — one number wearing two names). The sweep's job is to keep at least
-# what CI needs to START a cold build. A 25GB floor defended NOTHING in
-# the 65-70GB band where CI actually refuses (LOCOMOTIVE RED, need 70):
-# the sweep logged "nothing to do" at 67GB free while train after train
-# died there on 2026-09-04. If these two floors ever diverge, the sweep
-# keeps less than CI needs and every build gambles on luck.
-FLOOR_GB="${1:-${BOSS_DISK_FLOOR_GB:-70}}"
+# 40 (70 until 2026-09-16), not 25, and it MUST match locomotive.sh's
+# BOSS_CI_MIN_FREE_GB (§9a — one number wearing two names). The sweep's
+# job is to keep at least what CI needs to START a cold build. A 25GB
+# floor defended NOTHING in the 65-70GB band where CI refused at the
+# time (LOCOMOTIVE RED, need 70): the sweep logged "nothing to do" at
+# 67GB free while train after train died there on 2026-09-04. If these
+# two floors ever diverge, the sweep keeps less than CI needs and every
+# build gambles on luck. The Rust build moved to the cluster gate
+# (128b5496) and CI's need fell to ~7GB a run; both floors moved to 40
+# together (locomotive.sh says why). The unit keeps 100, deliberately.
+FLOOR_GB="${1:-${BOSS_DISK_FLOOR_GB:-40}}"
 
 # THE TWO CI-IMAGE WINDOWS, NAMED SO THEIR ORDER CAN BE CHECKED.
 # CI_IMAGE_AGE_HOURS is the ROUTINE window, applied hourly whatever the
@@ -142,8 +151,8 @@ CI_IMAGE_FLOOR_AGE_HOURS=4
 # starting right now pulls. Same keep-N idiom as the registry-tag loop.
 CI_IMAGE_KEEP_NEWEST="${BOSS_CI_IMAGE_KEEP_NEWEST:-3}"
 # The per-train CI image repo (.forgejo/workflows/ci.yml stamps
-# `boss-ci:${GITHUB_SHA}` on every train's build-image job).
-CI_IMAGE_REPO="${BOSS_CI_IMAGE_REPO:-10.20.0.15:3000/david/boss-ci}"
+# `boss-ci:${GITHUB_SHA}` on every train's build-image job) is
+# CI_IMAGE_REPO, resolved above.
 # HOW MANY TRAIN PACKETS TO READ. A limit is not a filter: this is a
 # window on the newest packets, not the whole record, and an image whose
 # train is older than the window resolves to nothing and falls to the age
@@ -284,9 +293,33 @@ fi
 if floor_met_after "system-daemon unused-image prune (older than ${CI_IMAGE_FLOOR_AGE_HOURS}h)"; then
     done_at "system-daemon image prune"
 fi
-docker builder prune -af || true
-if floor_met_after "builder cache prune (all)"; then
+# EXCEPT THE COMPILER'S CACHE MOUNTS. Since 2026-09-12 the image build
+# keeps cargo's target and registry in BuildKit cache mounts
+# (`exec.cachemount` records) so a train pays only for what it changed;
+# the forge has sat under this floor for days, and an hourly `-af` here
+# is what made the first "warm" converge build in 331 s against a cold
+# 329 — a cache wiped every hour is not a cache. Below the floor the
+# regenerable layers go (that is most of the build cache) and the mounts
+# stay; only the HARD floor — half the defended one, the disk truly in
+# danger — takes them too, and says so with the size it spent. A
+# docker version whose prune filter refuses the exclusion says so here
+# rather than falling back to -af silently.
+HARD_FLOOR_GB=$((FLOOR_GB / 2))
+cache_size=$(docker system df 2>/dev/null | awk '/^Build Cache/ { print $5 }')
+if docker builder prune -af --filter 'type!=exec.cachemount' 2>&1 | tail -1; then
+    echo "disk-floor-sweep: kept the compiler's cache mounts (build cache was ${cache_size:-unknown}; hard floor ${HARD_FLOOR_GB}GB)"
+else
+    echo "disk-floor-sweep: builder prune with the cache-mount exclusion refused (docker too old for type!=?) — mounts NOT pruned, nothing else pruned either" >&2
+fi
+if floor_met_after "builder cache prune (all but the compiler's cache mounts)"; then
     done_at "builder cache prune"
+fi
+if [ $((last_kb / 1024 / 1024)) -lt "$HARD_FLOOR_GB" ]; then
+    echo "disk-floor-sweep: HARD FLOOR — $((last_kb / 1024 / 1024))GB free < ${HARD_FLOOR_GB}GB: taking the compiler's cache mounts too (build cache was ${cache_size:-unknown}); the next converge builds cold"
+    docker builder prune -af || true
+    if floor_met_after "builder cache prune (everything, cache mounts included)"; then
+        done_at "builder cache prune (hard floor)"
+    fi
 fi
 
 # (b) Dangling images only — deliberately no -a, which would take

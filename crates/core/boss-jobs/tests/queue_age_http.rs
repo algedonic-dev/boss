@@ -101,6 +101,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
         )),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     (router(state), jobs)
 }
@@ -120,7 +121,7 @@ fn packet(id: &str, owner: &str, status: JobStatus, title: &str) -> Job {
         closed_on: None,
         metadata: serde_json::json!({}),
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 

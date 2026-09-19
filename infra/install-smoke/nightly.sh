@@ -25,18 +25,49 @@
 # would test something easier than what a new operator does.
 #
 # Env: JOBS_API (required — where a red files its packet),
-#      FORGE_URL (default http://10.20.0.15:3000/david/boss.git),
+#      FORGE_URL (default: the forge in /etc/boss/sor.env, david/boss.git),
 #      SMOKE_DIR (default /var/tmp/boss-install-smoke).
 # sh + jq, no python (directive 26d61c97). Same posture as
 # observe-host.sh: failures are LOUD and name their stage.
 set -eu
 
 : "${JOBS_API:?JOBS_API is required — a red must be able to file}"
-FORGE_URL="${FORGE_URL:-http://10.20.0.15:3000/david/boss.git}"
+# The forge's clone URL, from /etc/boss/sor.env when the unit did not
+# name one (FORGE_URL overrides).
+if [ -z "${FORGE_URL:-}" ]; then
+    # shellcheck source=infra/lib/sor.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
+    sor_require BOSS_FORGE_URL
+    FORGE_URL="$BOSS_FORGE_URL/${BOSS_FORGE_OWNER:-david}/boss.git"
+fi
 SMOKE_DIR="${SMOKE_DIR:-/var/tmp/boss-install-smoke}"
 
 STAGE="setup"
 LOG_TAIL=""
+
+# Who the red is filed to (backlog 3c23662d — until 2026-09-18 a person
+# was written here): BOSS_PLATFORM_OWNER when the unit carries it; else
+# the people registry's first active platform-admin hire, read from
+# PEOPLE_API (the unit names the SoR's people door); else nobody — an
+# empty owner_id the jobs API resolves from the kind's owner_role or
+# refuses by name. Best-effort: a dark registry must not stop the red.
+platform_owner() {
+    if [ -n "${BOSS_PLATFORM_OWNER:-}" ]; then printf '%s' "$BOSS_PLATFORM_OWNER"; return 0; fi
+    # The people door is the record's host on boss-ports' people port
+    # (infra/forge/sor-ports.env, the machine-door table): derived from
+    # JOBS_API (/etc/boss/sor.env, backlog 5222163e) — never a second
+    # spelling of the address in this unit.
+    local people="${PEOPLE_API:-}"
+    if [ -z "$people" ] && [ -n "${JOBS_API:-}" ]; then
+        local port
+        port=$(sed -n 's/^people=\([0-9]*\)$/\1/p' "$(dirname "$0")/../forge/sor-ports.env" 2>/dev/null)
+        [ -n "$port" ] && people="${JOBS_API%:*}:$port"
+    fi
+    [ -n "$people" ] || return 0
+    curl -sf --max-time 5 "$people/api/people?role=platform-admin&status=active" 2>/dev/null \
+        | jq -r '[.[] | {id, hire_date: (.hire_date // "~")}] | sort_by(.hire_date, .id) | .[0].id // empty' 2>/dev/null
+    return 0
+}
 
 file_red() {
     # One urgent packet naming the failing stage, with the log tail as
@@ -45,11 +76,12 @@ file_red() {
     body=$(jq -n \
         --arg stage "$STAGE" \
         --arg tail "$LOG_TAIL" \
+        --arg owner "$(platform_owner)" \
         '{
             kind: "backlog-item",
             title: ("install-smoke RED at stage " + $stage + " — a fresh install does not boot"),
             subject: {subject_kind: "custom", id: "bosspipeline"},
-            owner_id: "emp-david",
+            owner_id: $owner,
             priority: "urgent",
             status: "open",
             tags: [],

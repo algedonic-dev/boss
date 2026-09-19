@@ -33,11 +33,18 @@
 #      UNITS   (optional, space-separated; overrides the derived roster
 #      below for a host that runs a DIFFERENT set — the forge does, by
 #      drop-in. Unset, the roster is derived, which is what boss-gcp
-#      wants: see THE ROSTER IS DERIVED).
+#      wants: see THE ROSTER IS DERIVED),
+#      BOSS_NODE_ROLES (optional; set, it is the host's roles and no
+#      registry read happens — a test, a hand run, `--roster`. Unset,
+#      the roles are read off JOBS_API the way the converge reads them:
+#      infra/estate/node-roles.sh).
 #
 # `--roster` prints the derived watch list and stops: no systemctl, no
 # POST, no required env. The one question worth asking a host without
 # changing it, the same shape as boss-gcp-converge.sh --resolve-remote.
+# With no BOSS_NODE_ROLES it is the roster of a host declaring no roles
+# (every row, as the installer installs); pass the roles to see a
+# host's own.
 #
 # THE ALARM MUST NOT DEPEND ONLY ON THE API IT REPORTS TO (a7a19a1a).
 # Every failure here is LOUD in two places: a failed POST or an
@@ -63,11 +70,34 @@ set -eu
 # showed it firing and FAILING nightly since 2026-08-17, 23 consecutive
 # status=22; a correction had to be written onto a live alarm.
 #
-# So the roster comes from infra/deploy-services.sh's TIMERS list — the
-# one place that knows what is installed on this host, re-run every half
-# hour by infra/gcp/boss-gcp-converge.sh. Same file, same commit: the
-# watch list and the install list cannot disagree (CLAUDE.md §9a — and
-# this is a collapse, not a pin, because the hand-written copy is gone).
+# So the roster comes from the installer, infra/gcp/install-units.sh —
+# whose rows are infra/estate/roles.toml, the one place that knows what
+# is installed on this host, re-run every half hour by
+# infra/gcp/boss-gcp-converge.sh. Same tree, same commit: the watch list
+# and the install list cannot disagree (CLAUDE.md §9a — and this is a
+# collapse, not a pin, because the hand-written copy is gone). Until
+# 2026-09-18 the rows were a TIMERS array scraped out of the bare-metal
+# deploy script; that script is deleted (backlog e109bd71) and the
+# installer's `rows` mode prints the same `<stem>:<dir>` shape from
+# roles.toml, so nothing here scrapes shell.
+#
+# UNDER THIS HOST'S ROLES. The installer stopped installing every row on
+# 2026-09-12: a host declares roles in the estate registry,
+# infra/estate/roles.toml maps each role to its stems, `install-units.sh
+# roster` says `in-role` / `not-in-role` per row, and the
+# uninstall-not-in-role verb removes the rest. This observer kept
+# scraping the whole list. The measured cost: the legacy-stack role left
+# boss-gcp on 2026-09-15 and its ten chores were uninstalled the same
+# day, so from 22:58Z every five-minute reading found 19 units
+# `not-found`, 32 watched, and estate.alarm filed TWELVE urgent
+# `unit_unhealthy:boss-gcp/...` packets into the operator's queue for
+# units the tree says that host must not run. A not-found unit is a
+# broken watch list, as the rule below says — and the watch list was
+# broken here, not on the host. So the roster is the installer's own
+# `roster` mode filtered to `in-role`, under the same roles read the
+# converge makes (node-roles.sh): what a host installs and what its
+# observer watches are one derivation, and a role that leaves takes its
+# units out of both on the same tick.
 #
 # BOTH HALVES OF EACH PAIR, because they answer different questions and
 # the 2026-09-10 failure needed both: the `.timer` says whether the unit
@@ -76,47 +106,73 @@ set -eu
 # so a quiet fleet stays quiet; a unit that exited 22 last night is the
 # finding, carried with its last ~20 journal lines.
 #
-# A row whose source files are absent is skipped, the same way
-# deploy-services.sh SKIPs it: a unit the installer never installs would
-# report not-found forever, which is a broken watch list, not a finding.
-DEPLOY="${OBSERVE_UNITS_DEPLOY:-$(dirname "$0")/../deploy-services.sh}"
+# A row whose source files are absent (`<stem>:missing`) is skipped, the
+# same way install-units.sh SKIPs it: a unit the installer never installs
+# would report not-found forever, which is a broken watch list, not a
+# finding.
+INSTALLER="${OBSERVE_UNITS_INSTALLER:-$(dirname "$0")/../gcp/install-units.sh}"
 
 # WHAT IS DELIBERATELY NOT WATCHED, written down once each, the way
-# gate.sh writes down what its pre-flight does not run. Two entries, and
+# gate.sh writes down what its pre-flight does not run. One entry, and
 # an exclusion set that grows is a hand-written roster in disguise.
+# (boss-deploy-confirm.timer, the bare-metal deploy's dead-man armed on
+# demand rather than by the clock, was the second until the deploy path
+# was deleted on 2026-09-18.)
 #
-# boss-deploy-confirm.timer — the deploy dead-man is ARMED ON DEMAND
-#   (OnActiveSec only, no OnCalendar): between generation flips it is
-#   inactive by design, so "an armed timer must be active" is
-#   permanently false for it. A red nobody would read is the same defect
-#   as no check at all (CLAUDE.md §Diagnosis).
 # boss-estate-observe-units.service — this script. It exits non-zero
 #   whenever anything it watches is unhealthy, so watching itself would
 #   LATCH: the next reading sees its own failure and stays unhealthy
 #   forever, long after the cause cleared. A dead observer posts nothing
 #   at all, and estate.alarm's silence sweep is what notices that.
-ROSTER_EXCLUDE="boss-deploy-confirm.timer boss-estate-observe-units.service"
+ROSTER_EXCLUDE="boss-estate-observe-units.service"
 
 derive_roster() {
-    if [ ! -f "$DEPLOY" ]; then
-        echo "observe-units: the watch roster is derived from the TIMERS list in" >&2
-        echo "    $DEPLOY" >&2
+    if [ ! -f "$INSTALLER" ]; then
+        echo "observe-units: the watch roster is derived by the installer" >&2
+        echo "    $INSTALLER" >&2
         echo "    and that file is not readable. REFUSING rather than falling back to a" >&2
         echo "    shorter list: a smaller roster answers a smaller question and looks" >&2
         echo "    exactly as confident, which is the defect this derivation replaced." >&2
         return 1
     fi
-    _rows=$(sed -n '/^TIMERS=(/,/^)/p' "$DEPLOY" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"') || _rows=""
+    _infra=$(cd "$(dirname "$INSTALLER")/.." && pwd)
+    _rows=$(BOSS_REPO_ROOT="${BOSS_REPO_ROOT:-$(cd "$_infra/.." && pwd)}"         bash "$INSTALLER" rows 2>/dev/null | grep -E '^[a-z0-9-]+:[^:]+$') || _rows=""
     if [ -z "$_rows" ]; then
-        echo "observe-units: no TIMERS rows could be read out of $DEPLOY — the list moved" >&2
-        echo "    or changed shape. REFUSING; an empty roster is a config fault." >&2
+        echo "observe-units: $INSTALLER rows printed no <stem>:<dir> row — the mode failed" >&2
+        echo "    or roles.toml names nothing. REFUSING; an empty roster is a config fault." >&2
         return 1
     fi
-    _infra=$(dirname "$DEPLOY")
+    # The installer's own answer to "which rows are this host's", under
+    # BOSS_NODE_ROLES — the one derivation the `units` mode installs by
+    # and the uninstall verb removes by. Unset roles read as every row,
+    # exactly as the installer reads them. A `roster` mode that cannot
+    # answer is a refusal, not a fallback to the whole list: a roster
+    # wider than the host would file the same false alarms this fixes.
+    _in_role=$(BOSS_REPO_ROOT="${BOSS_REPO_ROOT:-$(cd "$_infra/.." && pwd)}" \
+        BOSS_NODE_ROLES="${BOSS_NODE_ROLES:-}" bash "$INSTALLER" roster 2>/dev/null \
+        | sed -n 's/^in-role //p') || _in_role=""
+    if [ -z "$_in_role" ]; then
+        echo "observe-units: $INSTALLER roster named no in-role row for roles" >&2
+        echo "    '${BOSS_NODE_ROLES:-}' — the mode failed or the roles map to nothing." >&2
+        echo "    REFUSING; a roster that is not the installer's is the defect this" >&2
+        echo "    derivation replaced (the 2026-09-15 false alarms)." >&2
+        return 1
+    fi
     _out=""
     for _row in $_rows; do
         _stem=${_row%%:*}
         _sub=${_row##*:}
+        # Not this host's row: not installed here, removed by the
+        # uninstall verb if it ever was, and not-found forever if watched.
+        case "
+$_in_role
+" in
+        *"
+$_stem
+"*) ;;
+        *) continue ;;
+        esac
+        [ "$_sub" = "missing" ] && continue
         _src="$_infra"
         [ "$_sub" = "." ] || _src="$_infra/$_sub"
         [ -f "$_src/$_stem.service" ] && [ -f "$_src/$_stem.timer" ] || continue
@@ -128,7 +184,7 @@ derive_roster() {
         done
     done
     if [ -z "$_out" ]; then
-        echo "observe-units: every TIMERS row in $DEPLOY was skipped or excluded, so the" >&2
+        echo "observe-units: every roles.toml row was skipped or excluded, so the" >&2
         echo "    derived roster is empty. REFUSING; nothing to watch is a config fault." >&2
         return 1
     fi
@@ -151,6 +207,27 @@ esac
 
 : "${HOST_ID:?HOST_ID is required and must match the estate node id}"
 : "${JOBS_API:?JOBS_API is required}"
+
+# THE ROLES, read the way the converge reads them (node-roles.sh: the
+# registry, else the last declaration this host has evidence for, else
+# [always] only — never every row on a dark read). node-roles.sh is
+# bash; this observer is sh, so the read runs in a bash child and hands
+# back the two values it exports. Its notes go to stderr, where the
+# unit's journal keeps them. A preset BOSS_NODE_ROLES wins, as it does
+# for the converge.
+roles_source="preset"
+if [ -z "${UNITS:-}" ] && [ -z "${BOSS_NODE_ROLES+set}" ]; then
+    _read=$(BOSS_ESTATE_NODES_URL="${BOSS_ESTATE_NODES_URL:-$JOBS_API/api/estate/nodes}" \
+        BOSS_CONVERGE_NAME=observe-units \
+        bash -c '. "$1" && read_node_roles "$2" >&2 && printf "%s\n%s" "$BOSS_NODE_ROLES" "$BOSS_NODE_ROLES_SOURCE"' \
+        _ "$(dirname "$0")/node-roles.sh" "$HOST_ID") || {
+        echo "observe-units: the roles read ($(dirname "$0")/node-roles.sh) failed for $HOST_ID" >&2
+        exit 78 # EX_CONFIG
+    }
+    BOSS_NODE_ROLES=$(printf '%s\n' "$_read" | sed -n 1p)
+    roles_source=$(printf '%s\n' "$_read" | sed -n 2p)
+    export BOSS_NODE_ROLES
+fi
 
 # NOT `$(derive_roster | tr ...)`: a pipeline's status is the LAST
 # command's, so a refusal would be laundered into tr's 0 and the observer
@@ -227,19 +304,26 @@ if [ -z "$unhealthy" ]; then node_healthy=true; else node_healthy=false; fi
 # an observation with no nodes (a probe that saw nothing is a failed
 # probe), and every estate consumer finds the host id where the other
 # scopes put it.
+# The roles the roster was derived under, and which source answered
+# them, ride the observation: a reading of 3 units under `none` and a
+# reading of 13 under `registry` are different questions, and the
+# record says which was asked.
 observation=$(jq -n \
     --arg id "$HOST_ID" \
     --arg observer "boss-estate-observe-units" \
+    --arg roles "${BOSS_NODE_ROLES:-}" \
+    --arg roles_source "$roles_source" \
     --argjson healthy "$node_healthy" \
     --argjson units "$units_json" \
     '{
       observed_at: (now | todate),
       observer: $observer,
       scope: "host-units",
-      nodes: [{ id: $id, healthy: $healthy, units: $units }]
+      nodes: [{ id: $id, healthy: $healthy, units: $units,
+                roles: $roles, roles_source: $roles_source }]
     }')
 
-echo "observing $HOST_ID units: $# watched, unhealthy:${unhealthy:- none}"
+echo "observing $HOST_ID units: $# watched (roles: ${BOSS_NODE_ROLES:-none}, $roles_source), unhealthy:${unhealthy:- none}"
 
 # No temp file, body and status in one capture — the same lesson
 # observe-host.sh carries (its first scheduled firing turned a curl -o

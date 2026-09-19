@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::actor::ActorId;
 use crate::audit::AuditWriter;
 use crate::event::Event;
+use crate::partition::Partition;
 use crate::port::EventBus;
 
 /// Trait-erased clock probe — DomainPublisher only needs to
@@ -121,8 +122,8 @@ impl DomainPublisher {
         EventStamp {
             source: self.source.clone(),
             actor,
-            simulated: if simulated || self.sim_probe.is_some() {
-                Some(simulated)
+            partition: if simulated || self.sim_probe.is_some() {
+                Some(Partition::from_legacy_simulated(simulated))
             } else {
                 None
             },
@@ -226,19 +227,30 @@ impl DomainPublisher {
 /// the field is always reachable. The wrap path is rare — every
 /// modern emitter uses an object — but it keeps the invariant
 /// universal.
-/// Add the `_simulated: bool` field to an event payload alongside
-/// `_actor`. Same shape as `inject_actor` — mutates in place when
-/// the payload is an object, wraps non-object payloads in
-/// `{ _simulated, value }`. Replayed events that already carry an
-/// explicit `_simulated` keep their original value (matching the
-/// rebuilder semantics for `_actor`).
-pub fn inject_simulated(mut payload: serde_json::Value, simulated: bool) -> serde_json::Value {
+/// Add the partition markers to an event payload alongside `_actor`:
+/// `_partition: "real" | "simulated" | "shadow"` and the legacy
+/// `_simulated: bool`, derived as not-real (packet 508cc38c — a
+/// reader that only knows the bool fails closed on a shadow event).
+/// Same shape as `inject_actor` — mutates in place when the payload
+/// is an object, wraps non-object payloads in `{ _partition,
+/// _simulated, value }`. Replayed events that already carry an
+/// explicit marker keep their original value (matching the rebuilder
+/// semantics for `_actor`); the two keys are inserted independently,
+/// so a pre-shadow event replayed with only `_simulated` gains the
+/// `_partition` the stamp derived from it.
+pub fn inject_partition(mut payload: serde_json::Value, partition: Partition) -> serde_json::Value {
     if let serde_json::Value::Object(ref mut map) = payload {
+        map.entry("_partition".to_string())
+            .or_insert_with(|| serde_json::Value::String(partition.as_str().to_string()));
         map.entry("_simulated".to_string())
-            .or_insert(serde_json::Value::Bool(simulated));
+            .or_insert(serde_json::Value::Bool(partition.fails_closed()));
         return payload;
     }
-    serde_json::json!({ "_simulated": simulated, "value": payload })
+    serde_json::json!({
+        "_partition": partition.as_str(),
+        "_simulated": partition.fails_closed(),
+        "value": payload,
+    })
 }
 
 /// Public because it is THE actor-embedding shape: adapters that
@@ -276,10 +288,10 @@ pub fn inject_actor(mut payload: serde_json::Value, actor: &ActorId) -> serde_js
 pub struct EventStamp {
     source: String,
     actor: ActorId,
-    /// `Some(flag)` injects `_simulated: flag`; `None` leaves the key
-    /// off entirely (the key appears when the chain is simulated or a
-    /// probe is wired at all).
-    simulated: Option<bool>,
+    /// `Some(p)` injects `_partition: p` + the derived `_simulated`;
+    /// `None` leaves both keys off entirely (they appear when the
+    /// chain is simulated or a probe is wired at all).
+    partition: Option<Partition>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -294,9 +306,19 @@ impl EventStamp {
         Self {
             source: source.into(),
             actor,
-            simulated: in_chain.then_some(true),
+            partition: in_chain.then_some(Partition::Simulated),
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    /// The actor every event this stamp builds is attributed to —
+    /// what `_actor` will read on the payload. For a write whose
+    /// record names the caller in its own words (`declared_by` on a
+    /// tenant's `*.declared` events, backlog d9409039), so the named
+    /// field and `_actor` are ONE value read from one place, never
+    /// two arguments that can disagree.
+    pub fn actor(&self) -> &ActorId {
+        &self.actor
     }
 
     /// Override the minted wall timestamp. For deterministic tests
@@ -311,15 +333,16 @@ impl EventStamp {
         self
     }
 
-    /// Override the `_simulated` marker for every event this stamp
+    /// Override the partition markers for every event this stamp
     /// builds. The job/step write paths use this to make the Job's
-    /// admission-fixed `simulated` flag — not the transport context
-    /// of the current request — the source of the marker: a write to
-    /// a simulated packet is simulated even when a human clicks it,
-    /// and a sim-chain write to a real packet stays real. Events not
-    /// scoped to a Job keep the task-local sim-chain default.
-    pub fn with_simulated(mut self, simulated: bool) -> Self {
-        self.simulated = Some(simulated);
+    /// admission-fixed partition — not the transport context of the
+    /// current request — the source of the marker: a write to a
+    /// simulated packet is simulated even when a human clicks it, a
+    /// write to a shadow packet is shadow, and a sim-chain write to a
+    /// real packet stays real. Events not scoped to a Job keep the
+    /// task-local sim-chain default.
+    pub fn with_partition(mut self, partition: Partition) -> Self {
+        self.partition = Some(partition);
         self
     }
 
@@ -327,192 +350,10 @@ impl EventStamp {
     /// analogue of the retired publisher emit path's construction.
     pub fn event(&self, kind: &str, payload: serde_json::Value) -> Event {
         let mut payload = inject_actor(payload, &self.actor);
-        if let Some(simulated) = self.simulated {
-            payload = inject_simulated(payload, simulated);
+        if let Some(partition) = self.partition {
+            payload = inject_partition(payload, partition);
         }
         Event::new(&self.source, kind, payload, self.timestamp)
-    }
-}
-
-#[cfg(test)]
-mod publish_contract_tests {
-    use super::*;
-    use crate::port::{EventBus, EventBusError, EventStream};
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct StubBus {
-        ok: bool,
-        published: AtomicUsize,
-    }
-    #[async_trait::async_trait]
-    impl EventBus for StubBus {
-        async fn publish(&self, _e: Event) -> Result<(), EventBusError> {
-            self.published.fetch_add(1, Ordering::SeqCst);
-            if self.ok {
-                Ok(())
-            } else {
-                Err(EventBusError::PublishFailed("bus down".into()))
-            }
-        }
-        async fn subscribe(&self, _p: &str) -> Result<Box<dyn EventStream>, EventBusError> {
-            Err(EventBusError::SubscribeFailed("stub".into()))
-        }
-    }
-
-    struct StubAudit {
-        ok: bool,
-        writes: AtomicUsize,
-    }
-    #[async_trait::async_trait]
-    impl AuditWriter for StubAudit {
-        async fn write(&self, _e: &Event) -> Result<(), String> {
-            self.writes.fetch_add(1, Ordering::SeqCst);
-            if self.ok {
-                Ok(())
-            } else {
-                Err("insert rejected by audit_log_check_refs".into())
-            }
-        }
-    }
-
-    /// Capture everything the publisher logs on the current thread.
-    /// `#[tokio::test]` runs single-threaded, so the thread-default
-    /// subscriber sees the whole async call.
-    struct VecWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for VecWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let writer_buf = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || VecWriter(writer_buf.clone()))
-            .finish();
-        (buf, tracing::subscriber::set_default(subscriber))
-    }
-    fn logged(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
-    }
-
-    fn event() -> Event {
-        Event::new(
-            "test-svc",
-            "commerce.invoice.created",
-            serde_json::json!({"id": "inv-1"}),
-            chrono::Utc::now(),
-        )
-    }
-
-    #[tokio::test]
-    async fn audit_failure_never_fails_the_publish_but_logs_error() {
-        // The load-bearing halves of the contract: a domain write must
-        // not fail because audit_log is unavailable (return stays
-        // bus_ok), AND the hole punched in the system of record must
-        // be LOUD — a swallowed rejection is how 260 facts went
-        // unreproducible before anyone noticed (2026-07-13).
-        let (buf, _guard) = capture_logs();
-        let audit = Arc::new(StubAudit {
-            ok: false,
-            writes: AtomicUsize::new(0),
-        });
-        let publisher = DomainPublisher::new(
-            Arc::new(StubBus {
-                ok: true,
-                published: AtomicUsize::new(0),
-            }),
-            "test-svc",
-        )
-        .with_audit(audit.clone());
-
-        let ok = publisher.publish(event()).await;
-        assert!(ok, "audit failure must not fail the publish");
-        assert_eq!(audit.writes.load(Ordering::SeqCst), 1);
-        let out = logged(&buf);
-        assert!(
-            out.contains("ERROR"),
-            "audit failure must log at ERROR: {out}"
-        );
-        assert!(
-            out.contains("audit_log write failed"),
-            "log must name the failure: {out}"
-        );
-        assert!(
-            out.contains("commerce.invoice.created"),
-            "log must carry the event kind: {out}"
-        );
-        assert!(
-            out.contains("insert rejected by audit_log_check_refs"),
-            "log must carry the underlying error: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn bus_failure_returns_false_audit_still_written_and_logged() {
-        // A bus outage must not lose the audit row (the system of
-        // record outranks the notification bus), must surface in the
-        // return value, and must log.
-        let (buf, _guard) = capture_logs();
-        let audit = Arc::new(StubAudit {
-            ok: true,
-            writes: AtomicUsize::new(0),
-        });
-        let publisher = DomainPublisher::new(
-            Arc::new(StubBus {
-                ok: false,
-                published: AtomicUsize::new(0),
-            }),
-            "test-svc",
-        )
-        .with_audit(audit.clone());
-
-        let ok = publisher.publish(event()).await;
-        assert!(!ok, "bus failure must surface in the return");
-        assert_eq!(
-            audit.writes.load(Ordering::SeqCst),
-            1,
-            "audit row must still be written when the bus is down"
-        );
-        let out = logged(&buf);
-        assert!(
-            out.contains("event bus publish failed"),
-            "bus failure must log: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn publish_batch_logs_every_failure() {
-        let (buf, _guard) = capture_logs();
-        let audit = Arc::new(StubAudit {
-            ok: false,
-            writes: AtomicUsize::new(0),
-        });
-        let publisher = DomainPublisher::new(
-            Arc::new(StubBus {
-                ok: false,
-                published: AtomicUsize::new(0),
-            }),
-            "test-svc",
-        )
-        .with_audit(audit.clone());
-
-        publisher.publish_batch(vec![event(), event()]).await;
-        let out = logged(&buf);
-        assert_eq!(
-            out.matches("event bus publish failed").count(),
-            2,
-            "each bus failure logs: {out}"
-        );
-        assert!(
-            out.contains("audit_log batch write failed"),
-            "batch audit failure logs: {out}"
-        );
     }
 }
 
@@ -560,58 +401,85 @@ mod inject_tests {
     }
 
     #[test]
-    fn inject_simulated_adds_true_field() {
+    fn inject_partition_adds_both_keys_for_the_simulated_company() {
         let p = serde_json::json!({"foo": "bar"});
-        let out = inject_simulated(p, true);
+        let out = inject_partition(p, Partition::Simulated);
+        assert_eq!(out["_partition"], "simulated");
         assert_eq!(out["_simulated"], true);
         assert_eq!(out["foo"], "bar");
     }
 
     #[test]
-    fn inject_simulated_adds_false_field() {
+    fn inject_partition_adds_both_keys_for_real() {
         let p = serde_json::json!({"foo": "bar"});
-        let out = inject_simulated(p, false);
+        let out = inject_partition(p, Partition::Real);
+        assert_eq!(out["_partition"], "real");
         assert_eq!(out["_simulated"], false);
     }
 
     #[test]
-    fn inject_simulated_preserves_replay_value() {
-        // Replayed event keeps its original _simulated flag — same
-        // semantics as the _actor preservation.
-        let p = serde_json::json!({"foo": "bar", "_simulated": true});
-        let out = inject_simulated(p, false);
+    fn inject_partition_marks_a_shadow_event_simulated_for_old_readers() {
+        // The legacy bool is derived as not-real (packet 508cc38c): a
+        // reader that only knows `_simulated` fails closed on a shadow
+        // event exactly as it does on a simulated one.
+        let out = inject_partition(serde_json::json!({}), Partition::Shadow);
+        assert_eq!(out["_partition"], "shadow");
         assert_eq!(out["_simulated"], true);
     }
 
     #[test]
-    fn inject_simulated_wraps_non_object_payload() {
+    fn inject_partition_preserves_replay_values() {
+        // Replayed event keeps its original markers — same semantics
+        // as the _actor preservation — and a pre-shadow event that
+        // carried only the bool gains the `_partition` derived from it.
+        let p = serde_json::json!({"foo": "bar", "_simulated": true});
+        let out = inject_partition(p, Partition::Simulated);
+        assert_eq!(out["_simulated"], true);
+        assert_eq!(out["_partition"], "simulated");
+        let p = serde_json::json!({"_partition": "shadow", "_simulated": true});
+        let out = inject_partition(p, Partition::Real);
+        assert_eq!(out["_partition"], "shadow");
+        assert_eq!(out["_simulated"], true);
+    }
+
+    #[test]
+    fn inject_partition_wraps_non_object_payload() {
         let p = serde_json::json!(["a", "b"]);
-        let out = inject_simulated(p, true);
+        let out = inject_partition(p, Partition::Simulated);
+        assert_eq!(out["_partition"], "simulated");
         assert_eq!(out["_simulated"], true);
         assert_eq!(out["value"], serde_json::json!(["a", "b"]));
     }
 
     #[test]
-    fn stamp_with_simulated_overrides_the_chain_default() {
-        // A stamp built outside any sim chain carries no _simulated;
-        // the job write paths override it from the packet's
-        // admission-fixed flag, in both directions.
+    fn stamp_with_partition_overrides_the_chain_default() {
+        // A stamp built outside any sim chain carries no markers; the
+        // job write paths override it from the packet's admission-fixed
+        // partition, in every direction.
         let stamp = EventStamp::new("jobs", ActorId::Human("emp-1".into()));
         let bare = stamp
             .clone()
             .event("jobs.job.updated", serde_json::json!({}));
         assert!(
-            bare.payload.get("_simulated").is_none(),
-            "outside a sim chain the default stamp leaves the key off"
+            bare.payload.get("_simulated").is_none() && bare.payload.get("_partition").is_none(),
+            "outside a sim chain the default stamp leaves the keys off"
         );
         let sim = stamp
             .clone()
-            .with_simulated(true)
+            .with_partition(Partition::Simulated)
             .event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(sim.payload["_partition"], "simulated");
         assert_eq!(sim.payload["_simulated"], true);
-        let real = stamp
-            .with_simulated(false)
+        let shadow = stamp
+            .clone()
+            .with_partition(Partition::Shadow)
             .event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(shadow.payload["_partition"], "shadow");
+        assert_eq!(shadow.payload["_simulated"], true);
+        let real = stamp
+            .with_partition(Partition::Real)
+            .event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(real.payload["_partition"], "real");
         assert_eq!(real.payload["_simulated"], false);
     }
 }

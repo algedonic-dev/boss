@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  flakeLabel,
+  flakeTally,
   inspectionShed,
   probeRun,
   shedCounts,
@@ -34,6 +36,7 @@ const car = (id: string, proof: CarProof | null): CarRow => ({
   sim: false,
   skipReason: null,
   head: 'abc1234',
+  deliveryChannel: 'software',
   proof,
 });
 
@@ -93,6 +96,7 @@ describe('readCarProof', () => {
         stderr: 'jq: error — category=null',
         why: 'the probe RAN on david-asus-minipc and exited 1. What it said: jq: error — category=null',
         missingTools: ['jq'],
+        notYet: false,
       },
       stamped: null,
     });
@@ -139,12 +143,13 @@ describe('readCarProof', () => {
 
   test('a packet recording nothing about proof reads null, not a row of nulls', () => {
     expect(
+      // The reader takes CarFacts — the packet facts a card derives
+      // from, not the envelope — so the fixture carries no status or
+      // opened_on (fb3b5ce1).
       readCarProof({
         id: 'c4',
         kind: 'ship-a-change',
         title: 'x',
-        status: 'open',
-        opened_on: '2026-09-11',
         metadata: { branch: 'feat/x' },
       }),
     ).toBeNull();
@@ -223,6 +228,7 @@ describe('the run the forge drains', () => {
         stderr: 'boom',
         why: 'it exited 1',
         missingTools: [],
+        notYet: false,
       },
     });
     expect(probeRun('a', ran, [request('r1', 'a', 'closed')])).toEqual({
@@ -234,6 +240,7 @@ describe('the run the forge drains', () => {
       stderr: 'boom',
       why: 'it exited 1',
       missingTools: [],
+      notYet: false,
     });
   });
 
@@ -248,6 +255,7 @@ describe('the run the forge drains', () => {
         stderr: null,
         why: null,
         missingTools: [],
+        notYet: false,
       },
     });
     expect(probeRun('a', ran, [request('r1', 'a', 'open')]).kind).toBe('queued');
@@ -286,6 +294,27 @@ describe('the shed as a whole', () => {
         stderr: 'boom',
         why: 'it exited 1',
         missingTools: [],
+        notYet: false,
+      },
+    }),
+  );
+  // NOT YET (exit 75): ran, said the world is not ready to judge the
+  // claim — early, not wrong. Four of the eight probes recorded on
+  // 2026-09-12 were this shape and drew red beside real failures.
+  const early = car(
+    'f',
+    proofOf({
+      probe: 'bash f.sh',
+      expect: 'F-OK',
+      attempt: {
+        at: '2026-09-12T22:00:00Z',
+        exit: 75,
+        host: 'forge',
+        stdout: 'no disk-report request carrying for_sweep yet — the sweeps fire daily',
+        stderr: null,
+        why: 'NOT YET: the probe ran on forge and said the claim cannot be judged until something happens — no disk-report request carrying for_sweep yet. Not a verdict against the change; recheck-failing-probes-daily runs it again.',
+        missingTools: [],
+        notYet: true,
       },
     }),
   );
@@ -319,13 +348,13 @@ describe('the shed as a whole', () => {
 
   test('the counts and the label are the three places, nothing invented', () => {
     const shed = inspectionShed([probed, failed, evented, bare], null);
-    expect(shedCounts(shed)).toEqual({ inspecting: 2, failed: 1, onEvent: 1, noProbe: 1 });
+    expect(shedCounts(shed)).toEqual({ inspecting: 2, failed: 1, notYet: 0, onEvent: 1, noProbe: 1 });
     expect(shedLabel(shedCounts(shed))).toBe('2 inspecting · 1 probe failed · 1 on an event · 1 with no probe');
   });
 
   test('an empty shed says clear', () => {
     expect(shedLabel(shedCounts([]))).toBe('clear');
-    expect(shedCounts([])).toEqual({ inspecting: 0, failed: 0, onEvent: 0, noProbe: 0 });
+    expect(shedCounts([])).toEqual({ inspecting: 0, failed: 0, notYet: 0, onEvent: 0, noProbe: 0 });
   });
 
   test('each place states itself in one line', () => {
@@ -351,6 +380,7 @@ describe('the shed as a whole', () => {
           stderr: null,
           why: null,
           missingTools: [],
+          notYet: false,
         },
       }),
     );
@@ -364,5 +394,67 @@ describe('the shed as a whole', () => {
     const shed = inspectionShed([probed, failed, evented, bare], null);
     expect(shed.map(shedTone)).toEqual(['ok', 'red', 'static', 'static']);
     expect(shed.map(shedLamp)).toEqual(['working', 'err', 'off', 'off']);
+  });
+
+  test('a probe that said not yet stands in the shed working, not red, and is counted apart', () => {
+    const shed = inspectionShed([failed, early], null);
+    expect(shed.map(shedTone)).toEqual(['red', 'ok']);
+    expect(shed.map(shedLamp)).toEqual(['err', 'working']);
+    const e = shed[1];
+    expect(e && shedStatus(e)).toBe('inspection shed · probe says not yet — rechecked daily');
+    const counts = shedCounts(shed);
+    expect(counts.failed).toBe(1);
+    expect(counts.notYet).toBe(1);
+    expect(shedLabel(counts)).toBe('2 inspecting · 1 probe failed · 1 not yet');
+  });
+
+  test('an attempt that exited 75 without the not_yet flag still reads as not yet', () => {
+    const j: JobLite = {
+      id: 'g',
+      kind: 'ship-a-change',
+      title: 'g',
+      status: 'open',
+      opened_on: '2026-09-12',
+      metadata: { branch: 'feat/g', proof_probe: 'x', proof_attempt: { exit: 75, why: 'NOT YET: …' } },
+    };
+    expect(readCarProof(j)?.attempt?.notYet).toBe(true);
+  });
+});
+
+// Backlog 36cc4913: a red gate re-gated at an UNCHANGED head that comes
+// back green is a flake, and the record says so — `flake_of` names the
+// prior run, `flaky_checks` its failing checks. The shed lists the count
+// by check, read off the gate-run packets the page already holds, so the
+// flakiest check is a number here as it is on `boss orient`.
+describe('the flake tally', () => {
+  const run = (id: string, md: Record<string, unknown>): JobLite => ({
+    id,
+    kind: 'gate-run',
+    title: `Gate: ${id}`,
+    status: 'closed',
+    opened_on: '2026-09-18',
+    metadata: { branch: `fix/${id}`, sha: 'abc', ...md },
+  });
+
+  test('counts each check on flake-stamped runs, most flaky first, and ignores the rest', () => {
+    const runs = [
+      run('a', { flake_of: 'p1', flaky_checks: ['test'] }),
+      run('b', { flake_of: 'p2', flaky_checks: ['test', 'fmt'] }),
+      run('c', { flake_of: 'p3', flaky_checks: [] }),
+      // A re-gate that stayed red is the branch's, not a flake.
+      run('d', { regate_of: 'p4', prior_failed: ['clippy'] }),
+      run('e', {}),
+    ];
+    expect(flakeTally(runs)).toEqual([
+      { check: 'test', count: 2 },
+      { check: '(no check named)', count: 1 },
+      { check: 'fmt', count: 1 },
+    ]);
+    expect(flakeLabel(flakeTally(runs))).toBe('flakes · test: 2 · (no check named): 1 · fmt: 1');
+  });
+
+  test('none is a stated none, one line', () => {
+    expect(flakeTally([])).toEqual([]);
+    expect(flakeLabel([])).toBe('no flakes in the runs read');
   });
 });

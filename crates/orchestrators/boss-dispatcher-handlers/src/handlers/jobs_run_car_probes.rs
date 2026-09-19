@@ -30,13 +30,15 @@
 //! exit code with empty streams. `boss gate` now refuses a probe
 //! naming a tool in infra/forge/host-absent-tools.txt, and the runner
 //! records `unrunnable` with the tool named rather than a bare exit
-//! code. This rule does not restate either refusal; it applies the one
-//! of them nothing downstream can — see [`ship_refusal`], which is
-//! where that call is argued rather than described (23b2dffa).
+//! code. This rule does not restate every gate-side refusal; it applies
+//! the ones nothing downstream can (the unidentified read, the offset
+//! git date) — see [`ship_refusal`], which is where that call is argued
+//! rather than described (23b2dffa, 71ec5a58).
 //! The forge already answers
 //! ops-request packets through a reviewed verb allowlist
-//! (`infra/ops/verbs.json`), so the run goes through that door:
-//! `infra/forge/run-car-probe.sh` re-reads the car, refuses unless it
+//! (`infra/ops/verbs/run-car-probe.json`), so the run goes through that door:
+//! `boss prove <car> --from-car --unattended` (the tree's CLI on the
+//! forge, backlog 9f00a805) re-reads the car, refuses unless it
 //! has merged and recorded a probe, runs the probe as `david` (never
 //! root) with a timeout, judges it by the two rules `boss prove`
 //! applies, and writes the verdict on the car — `proven` completed
@@ -58,9 +60,9 @@ use serde_json::{Value, json};
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::car;
 
-use super::common::{api_client, get_json, post_json, write_json};
+use super::common::{api_client, open_jobs_of_kind, post_json, write_json};
 
-/// The allowlisted verb (`infra/ops/verbs.json`) and the host that
+/// The allowlisted verb (a file under `infra/ops/verbs/`) and the host that
 /// answers it. One definition each, read by the request builder and
 /// the twice-guard.
 pub const VERB: &str = "run-car-probe";
@@ -95,34 +97,10 @@ impl JobsRunCarProbes {
     /// Every open Job of `kind`, paged on `total` so a car sorted past
     /// one page is still found — the same paging `boss prove` does,
     /// for the same reason (a capped page is a false negative that
-    /// grows with the pipeline's age).
+    /// grows with the pipeline's age). One definition, in `common`,
+    /// since `jobs.complete_step_matching` walks the same list.
     async fn all_open(&self, kind: &str, rule: &str) -> Result<Vec<Value>, HandlerError> {
-        const PAGE: usize = 500;
-        let mut rows: Vec<Value> = Vec::new();
-        loop {
-            let body = get_json(
-                &self.client,
-                &format!(
-                    "{}/api/jobs?kind={kind}&status=open&limit={PAGE}&offset={}",
-                    self.base(),
-                    rows.len()
-                ),
-                rule,
-            )
-            .await?;
-            let total = body.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let page: Vec<Value> = body
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let got = page.len();
-            rows.extend(page);
-            if got == 0 || rows.len() >= total {
-                break;
-            }
-        }
-        Ok(rows)
+        open_jobs_of_kind(&self.client, self.base(), kind, rule).await
     }
 }
 
@@ -167,10 +145,10 @@ pub(crate) struct Arrival {
     pub refusals: Vec<(String, Value)>,
 }
 
-/// WHY THIS DOOR RE-CHECKS ONE RULE AND NOT THE OTHER (backlog
-/// 23b2dffa, settled here rather than described).
+/// WHY THIS DOOR RE-CHECKS THE FAILS-OPEN RULES AND NOT THE OTHER
+/// (backlog 23b2dffa, settled here rather than described).
 ///
-/// `boss gate --park-probe` refuses both shapes of bad probe at park
+/// `boss gate --park-probe` refuses every shape of bad probe at park
 /// time, so most cars reaching this rule were already checked. Most is
 /// not all: a car's `proof_probe` can be written straight onto it with a
 /// metadata PATCH (a documented door), and cars parked before the
@@ -191,26 +169,53 @@ pub(crate) struct Arrival {
 /// car that then closes (61085a9e). By the time the text reaches the
 /// forge it is too late for anything but the refusal, and this is the
 /// last place that can make one.
+///
+/// THE OFFSET GIT DATE IS RE-CHECKED for the same reason (71ec5a58,
+/// left by the builder of c0ac92b8). A string compare of `%cI` against
+/// the SoR's UTC timestamps lies in BOTH directions — FAILED for a
+/// not-yet on 746a1fac, and PASS for an event that never happened with
+/// the offsets the other way round — and the runner sees only a compare
+/// that succeeded. The gate and `boss prove` refuse the token; a probe
+/// PATCHed onto a car met neither, so this door refuses it too, under
+/// the rule id both of them record.
 fn ship_refusal(probe: &str, expect: Option<&str>) -> Option<Value> {
-    let client = boss_jobs::probe::reads_the_sor_unidentified(probe)?;
+    let (rule, why) = if let Some(client) = boss_jobs::probe::reads_the_sor_unidentified(probe) {
+        (
+            boss_jobs::probe::UNIDENTIFIED_RULE,
+            format!(
+                "THE PROBE WAS NOT RUN: it reads the system of record with `{client}` and no \
+                 identity, so it would read as operator:unidentified and be answered with a \
+                 NARROWER WORLD, silently. {evidence} Re-park the car with a probe that reads \
+                 as a named reader ({reader} /api/...), or prove it by hand.",
+                evidence = boss_jobs::probe::UNIDENTIFIED_READ_EVIDENCE,
+                reader = boss_jobs::probe::SOR_READER,
+            ),
+        )
+    } else {
+        let token = boss_jobs::probe::reads_git_time_with_an_offset(probe)?;
+        (
+            boss_jobs::probe::GIT_TIME_RULE,
+            format!(
+                "THE PROBE WAS NOT RUN: it reads a git date with `{token}`, which carries the \
+                 committer's UTC offset, and a probe that compares that string against the \
+                 system of record's UTC timestamps lies in BOTH directions. {evidence} \
+                 Re-park the car with a probe that compares epochs (git log -1 --format=%ct \
+                 against date -u -d \"$ts\" +%s, the empty guard first), or prove it by hand.",
+                evidence = boss_jobs::probe::GIT_TIME_STRING_EVIDENCE,
+            ),
+        )
+    };
     // No `at`: this rule holds no clock (the dispatcher's time comes
     // from the clock port, which this handler does not carry), and the
     // PATCH that records the attempt is itself an audit-log event with
     // one. The same attempt re-written on a redelivered arrival is
     // idempotent by content, which is what at-least-once needs.
     Some(json!({
-        "refused": boss_jobs::probe::UNIDENTIFIED_RULE,
+        "refused": rule,
         "probe": probe,
         "expect": expect.unwrap_or(""),
         "unrunnable": false,
-        "why": format!(
-            "THE PROBE WAS NOT RUN: it reads the system of record with `{client}` and no \
-             identity, so it would read as operator:unidentified and be answered with a \
-             NARROWER WORLD, silently. {evidence} Re-park the car with a probe that reads as \
-             a named reader ({reader} /api/...), or prove it by hand.",
-            evidence = boss_jobs::probe::UNIDENTIFIED_READ_EVIDENCE,
-            reader = boss_jobs::probe::SOR_READER,
-        ),
+        "why": why,
     }))
 }
 
@@ -223,8 +228,38 @@ fn ship_refusal(probe: &str, expect: Option<&str>) -> Option<Value> {
 /// A car whose recorded probe this door refuses ([`ship_refusal`]) is
 /// not shipped, and comes back in `refusals` so the reason lands on the
 /// car instead of vanishing.
+/// Which cars a firing asks after.
+///
+/// `Train`: the cars aboard the train that just arrived — the first
+/// honest moment for their probes. `Failing`: every landed car whose
+/// probe has RUN and not settled it (a `proof_attempt` is on the car),
+/// whatever train it rode. On 2026-09-12 two such cars sat at `proven`
+/// waiting on tomorrow's timer firing, correct but early, and the only
+/// way their probe would run again was a human refiling
+/// `run-car-probe` by hand (rule `recheck-failing-probes-daily`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope<'a> {
+    Train(&'a str),
+    Failing,
+}
+
+impl Scope<'_> {
+    fn admits(&self, car: &Value) -> bool {
+        match self {
+            Scope::Train(t) => md(car, "train") == Some(t),
+            Scope::Failing => car.pointer("/metadata/proof_attempt").is_some(),
+        }
+    }
+    fn train_of(&self, car: &Value) -> String {
+        match self {
+            Scope::Train(t) => t.to_string(),
+            Scope::Failing => md(car, "train").unwrap_or("").to_string(),
+        }
+    }
+}
+
 pub(crate) fn probe_requests(
-    train_id: &str,
+    scope: Scope<'_>,
     cars: &[Value],
     open_requests: &[Value],
     rule_name: &str,
@@ -239,7 +274,7 @@ pub(crate) fn probe_requests(
     let mut refusals: Vec<(String, Value)> = Vec::new();
     let requests = cars
         .iter()
-        .filter(|c| md(c, "train") == Some(train_id))
+        .filter(|c| scope.admits(c))
         .filter(|c| md(c, PROOF_PROBE).is_some())
         .filter(|c| proven_is_open(c))
         .filter_map(|c| {
@@ -271,7 +306,8 @@ pub(crate) fn probe_requests(
                     "args": [id],
                     "car": id,
                     "branch": md(c, "branch").unwrap_or(""),
-                    "train": train_id,
+                    "train": scope.train_of(c),
+                    "recheck": matches!(scope, Scope::Failing),
                     "spawned_by_rule": rule_name,
                     "triggered_by_event_id": event_id,
                     "triggered_by_topic": topic,
@@ -290,16 +326,29 @@ impl Handler for JobsRunCarProbes {
 
     async fn invoke(
         &self,
-        _args: &[(String, boss_dispatcher::rules::expr::Value)],
+        args: &[(String, boss_dispatcher::rules::expr::Value)],
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
-        let Some(train_id) = arrived_train(&ctx.event_payload) else {
-            return Ok(());
+        // The rule says which cars: `scope = "failing"` for the daily
+        // recheck; no arg means the arrival rule, which names its train
+        // in the closing event.
+        let scope = match boss_dispatcher::rules::handler::arg_string(args, "scope") {
+            Ok("failing") => Scope::Failing,
+            Ok(other) => {
+                return Err(HandlerError::Permanent(format!(
+                    "jobs.run-car-probes: scope must be \"failing\" (or absent for the arrival rule), not {other:?}"
+                )));
+            }
+            Err(HandlerError::MissingArg(_)) => match arrived_train(&ctx.event_payload) {
+                Some(t) => Scope::Train(t),
+                None => return Ok(()),
+            },
+            Err(e) => return Err(e),
         };
         let cars = self.all_open("ship-a-change", &ctx.rule_name).await?;
         let open_requests = self.all_open("ops-request", &ctx.rule_name).await?;
         let arrival = probe_requests(
-            train_id,
+            scope,
             &cars,
             &open_requests,
             &ctx.rule_name,
@@ -386,7 +435,7 @@ mod tests {
     fn a_probed_car_aboard_the_train_gets_one_bounded_request() {
         let cars = [car("c1", "t1", probed(), "ready")];
         let got = probe_requests(
-            "t1",
+            Scope::Train("t1"),
             &cars,
             &[],
             "run-car-probes-on-train-arrived",
@@ -408,6 +457,69 @@ mod tests {
             "run-car-probes-on-train-arrived"
         );
         assert!(r["title"].as_str().unwrap().contains("Car c1"));
+    }
+
+    /// THE DAILY RECHECK: a landed car whose probe ran and did not settle
+    /// it (a `proof_attempt` on the car) is asked again whatever train it
+    /// rode; a car whose probe never ran, an event-bound car, a proven
+    /// car and an already-asked car are not. The request says it is a
+    /// recheck and names the car's own train.
+    #[test]
+    fn the_failing_scope_asks_again_for_every_landed_car_whose_probe_ran_and_failed() {
+        let failed = json!({"proof_attempt": {"exit": "1", "why": "printed nothing"}});
+        let mut f1 = probed();
+        f1["proof_attempt"] = failed["proof_attempt"].clone();
+        let mut f2 = probed();
+        f2["proof_attempt"] = failed["proof_attempt"].clone();
+        let cars = [
+            car("f1", "t1", f1, "ready"),
+            car("f2", "t7", f2, "ready"),
+            car("never-ran", "t1", probed(), "ready"),
+            car(
+                "event",
+                "t1",
+                json!({"proof_event": "the next red train", "proof_attempt": failed["proof_attempt"].clone()}),
+                "ready",
+            ),
+            car(
+                "done",
+                "t1",
+                {
+                    let mut m = probed();
+                    m["proof_attempt"] = failed["proof_attempt"].clone();
+                    m
+                },
+                "completed",
+            ),
+        ];
+        let open = [json!({"metadata": {"verb": VERB, "car": "f2"}})];
+        let got = probe_requests(
+            Scope::Failing,
+            &cars,
+            &open,
+            "recheck-failing-probes-daily",
+            "clock-day:2026-09-13",
+            "clock.day",
+        );
+        let asked: Vec<&str> = got
+            .requests
+            .iter()
+            .map(|r| r["metadata"]["car"].as_str().unwrap())
+            .collect();
+        assert_eq!(asked, vec!["f1"], "{got:?}");
+        assert_eq!(got.requests[0]["metadata"]["train"], "t1");
+        assert_eq!(got.requests[0]["metadata"]["recheck"], true);
+        assert_eq!(
+            got.requests[0]["metadata"]["spawned_by_rule"],
+            "recheck-failing-probes-daily"
+        );
+    }
+
+    #[test]
+    fn an_arrival_request_is_not_a_recheck() {
+        let cars = [car("c1", "t1", probed(), "ready")];
+        let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
+        assert_eq!(got.requests[0]["metadata"]["recheck"], false);
     }
 
     /// Everything that must NOT be asked: another train's car, an
@@ -433,7 +545,14 @@ mod tests {
             "id": "r1", "kind": "ops-request", "status": "open",
             "metadata": {"host": "forge", "verb": "run-car-probe", "car": "asked"}
         })];
-        let got = probe_requests("t1", &cars, &open, "r", "ev", "jobs.job.closed");
+        let got = probe_requests(
+            Scope::Train("t1"),
+            &cars,
+            &open,
+            "r",
+            "ev",
+            "jobs.job.closed",
+        );
         let ids: Vec<&str> = got
             .requests
             .iter()
@@ -461,7 +580,7 @@ mod tests {
             "proof_expect": "c0ffee",
         });
         let cars = [car("c1", "t1", bad, "ready")];
-        let got = probe_requests("t1", &cars, &[], "r", "ev", "jobs.job.closed");
+        let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
         assert!(
             got.requests.is_empty(),
             "a probe that reads unidentified must not be shipped to the forge: {:?}",
@@ -484,6 +603,47 @@ mod tests {
         );
     }
 
+    /// THE OTHER RULE WITH NO BACKSTOP DOWNSTREAM (backlog 71ec5a58,
+    /// left by the builder of c0ac92b8). A probe that compares `git log
+    /// --format=%cI` — a committer date carrying a -07:00 offset —
+    /// against the SoR's UTC timestamps as STRINGS lies in both
+    /// directions: it answered FAILED for a not-yet on car 746a1fac,
+    /// and with the offsets the other way it answers PASS for an event
+    /// that never happened. The forge runner cannot see that: the probe
+    /// runs, the compare succeeds, and a proof of nothing is recorded
+    /// on a car that then closes. The gate and `boss prove` refuse the
+    /// token; a PATCHed probe meets neither, so this door refuses it
+    /// too, under the same rule id.
+    #[test]
+    fn a_car_whose_probe_reads_git_time_with_an_offset_is_refused_not_shipped() {
+        let probe = "c=$(git log -1 --format=%cI HEAD); t=$(boss-sor-read /api/audit | jq -r \
+                     '.data[0].at // empty'); [ \"$t\" \\> \"$c\" ] && echo retire:after";
+        let cars = [car(
+            "c1",
+            "t1",
+            json!({"proof_probe": probe, "proof_expect": "retire:after"}),
+            "ready",
+        )];
+        let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
+        assert!(
+            got.requests.is_empty(),
+            "a probe that compares an offset git date as a string must not be shipped: {:?}",
+            got.requests
+        );
+        assert_eq!(got.refusals.len(), 1);
+        let (id, attempt) = &got.refusals[0];
+        assert_eq!(id, "c1");
+        assert_eq!(attempt["refused"], boss_jobs::probe::GIT_TIME_RULE);
+        assert_eq!(attempt["unrunnable"], false);
+        assert_eq!(attempt["probe"], probe);
+        assert_eq!(attempt["expect"], "retire:after");
+        let why = attempt["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("%cI") && why.contains("%ct"),
+            "the attempt must name the token and the epoch rewrite: {attempt}"
+        );
+    }
+
     /// And the absent-tool rule is deliberately NOT re-checked here: the
     /// runner measures the actual host, which is strictly better than
     /// this handler predicting it from a manifest. A `kubectl` probe is
@@ -497,7 +657,7 @@ mod tests {
                    "proof_expect": "boss-jobs"}),
             "ready",
         )];
-        let got = probe_requests("t1", &cars, &[], "r", "ev", "jobs.job.closed");
+        let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
         assert_eq!(got.requests.len(), 1);
         assert!(got.refusals.is_empty());
     }

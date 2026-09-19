@@ -32,6 +32,16 @@
 //!   `job.metadata.x != ""` / `NOT job.metadata.x` footgun over an
 //!   `Absent` field that auto-superseded `incident-post-mortem` packets
 //!   on create (cb9661fe).
+//! - **Phase 7 — a step declares its audience once.** An `audience`
+//!   beside a disagreeing legacy `authority_role` is two answers to
+//!   "who is this for"; an audience shape nothing derives a selector
+//!   from yet (`department`, until f5ebd2e1 car 2) would publish a step
+//!   no queue holds. Both refused, naming the step.
+//! - **Phase 8 — an agent block is runnable.** `agent = { … }` names a
+//!   model the rate card prices (else a run of it could not be costed)
+//!   and a positive budget, and does not sit on a `human_only` step —
+//!   two answers to "who executes this". Refused naming the step and,
+//!   for the model, the models it could have named.
 //!
 //! Runs at author time (`POST /api/workflows/_validate`), publish
 //! time (every registry path that can set a row ACTIVE — see
@@ -77,6 +87,7 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
     for step in &spec.steps {
         check_metadata_defaults_values(spec, step, registry, &mut errs);
         check_item_keys_name_an_array(spec, step, &mut errs);
+        check_covers_names_an_array_on_the_same_step(spec, step, &mut errs);
     }
     // Phases 1–3 — viability of the predicate graph.
     check_viability(spec, registry, &mut errs);
@@ -89,7 +100,112 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
     check_decisions_leave_a_record(spec, registry, &mut errs);
     // Phase 6 — a job-metadata-gated terminal must hold on create.
     check_terminals_hold_on_create(spec, &mut errs);
+    // Phase 7 — a step declares its audience once.
+    for step in &spec.steps {
+        check_audience_is_declared_once(spec, step, &mut errs);
+    }
+    // Phase 8 — an agent block is runnable.
+    for step in &spec.steps {
+        check_agent_block_is_runnable(spec, step, &mut errs);
+    }
     errs
+}
+
+/// Phase 8: a step's `agent` block can actually be run (design
+/// c87fb59b car 1, backlog 028891cf).
+///
+/// The block's shape is serde's to refuse (every key required, effort a
+/// closed set); this is the part a parse cannot know. The model must be
+/// one `agent_rate_card` prices — the card is the registry of models
+/// the system can cost, and a run on a model it does not name is
+/// recorded unpriced, which is exactly the "component answering
+/// instead of erroring" that table's comment refuses — so the refusal
+/// names every model it does price. The budget must be positive: zero
+/// would read as "free" the same way. And a `human_only` step that also
+/// says how an agent runs it carries two answers to "who executes
+/// this", the same defect Phase 7 refuses for audiences.
+fn check_agent_block_is_runnable(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    let Some(agent) = &step.agent else {
+        return;
+    };
+    if let Some(why) = crate::agent_spec::refusal(agent) {
+        errs.push(err(spec, &step.title, why));
+    }
+    if crate::human_only::declared(&step.metadata_defaults) {
+        errs.push(err(
+            spec,
+            &step.title,
+            "declares an `agent` block on a `human_only` step — two answers to who executes              it; drop the block or the human_only default",
+        ));
+    }
+}
+
+/// Phase 7: a step declares its audience ONCE, and in a shape a reader
+/// derives from (design f5ebd2e1, backlog 67a58840).
+///
+/// Two refusals, both about the same defect the design ends — a step
+/// whose audience is stated implicitly, more than once, in keys nothing
+/// reconciles:
+///
+/// - **Declared twice, disagreeing.** `audience = { role = "x" }` beside
+///   `authority_role = "y"`. The legacy key is the PROJECTION of the
+///   audience (the seed loader writes it from `selectors_for`), so the
+///   two agreeing is the expected state of every migrated protocol and
+///   is not refused; disagreeing means the row carries two answers to
+///   "who is this for" and every reader picks one without saying so.
+///   An `individual` or `station` audience derives no role, so a
+///   legacy role beside either is a second declaration too.
+/// - **Declared in a shape nothing reads.** `selectors_for` derives no
+///   key from a `department` until car 2 lands department-as-Class on
+///   the station registry. Admitting it would publish a step no queue
+///   will ever hold — precisely the orphan this design exists to make
+///   impossible — so it is refused, naming the car that lifts it.
+fn check_audience_is_declared_once(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    let Some(audience) = &step.audience else {
+        return;
+    };
+    let derived = crate::audience::selectors_for(audience);
+    if derived.is_empty() {
+        errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(),
+            step: step.title.clone(),
+            reason: format!(
+                "declares an audience of shape `{}` that no reader derives a selector from yet \
+                 (design f5ebd2e1 car 2, department-is-data) — publishing it would admit a step \
+                 no queue holds. Declare a `role`, `individual` or `station` audience until \
+                 that car lands.",
+                audience.shape()
+            ),
+        });
+        return;
+    }
+    if let Some(legacy) = &step.authority_role
+        && derived.authority_role.as_deref() != Some(legacy.as_str())
+    {
+        errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(),
+            step: step.title.clone(),
+            reason: format!(
+                "declares its audience twice: `audience` derives authority {} and \
+                 `authority_role` says `{legacy}`. One declaration answers who a step is \
+                 for; drop `authority_role` (it is written as the projection of the \
+                 audience) or make them agree.",
+                derived
+                    .authority_role
+                    .as_deref()
+                    .map(|r| format!("`{r}`"))
+                    .unwrap_or_else(|| "none".into())
+            ),
+        });
+    }
 }
 
 /// Phase 5: a decision must leave a record.
@@ -969,6 +1085,55 @@ fn check_item_keys_name_an_array(
     }
 }
 
+/// `covers` relates two ARRAY fields on ONE step — the anchors of the
+/// covered field must each be answered by an element of this one. A
+/// `covers` that names a missing field, a non-array, or itself would be
+/// stored and never checked (or checked vacuously); refuse the spec.
+fn check_covers_names_an_array_on_the_same_step(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    for field in &step.fields {
+        let Some(covered) = &field.covers else {
+            continue;
+        };
+        let reason = if field.field_type != "array" {
+            Some(format!(
+                "field '{}' declares covers = '{covered}' but is a '{}', not an array — \
+                 coverage is a relation between element anchors and would never be checked",
+                field.name, field.field_type
+            ))
+        } else if covered == &field.name {
+            Some(format!(
+                "field '{}' declares covers = itself, which is vacuously true and checks nothing",
+                field.name
+            ))
+        } else {
+            match step.fields.iter().find(|f| &f.name == covered) {
+                None => Some(format!(
+                    "field '{}' declares covers = '{covered}', but this step has no field of that \
+                     name — coverage is checked at done against a field on the SAME step",
+                    field.name
+                )),
+                Some(f) if f.field_type != "array" => Some(format!(
+                    "field '{}' declares covers = '{covered}', which is a '{}', not an array — \
+                     there are no element anchors to cover",
+                    field.name, f.field_type
+                )),
+                Some(_) => None,
+            }
+        };
+        if let Some(reason) = reason {
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
+                step: step.title.clone(),
+                reason,
+            });
+        }
+    }
+}
+
 fn is_placeholder_default(field_type: &str, value: &Value) -> bool {
     match (field_type, value) {
         ("date" | "date-time" | "uri", Value::String(s)) => s.is_empty(),
@@ -1078,6 +1243,152 @@ mod tests {
         assert!(validate_workflow(&viable_spec("ok"), &reg).is_empty());
     }
 
+    // Phase 7 — a step declares its audience ONCE (f5ebd2e1 car 1).
+
+    fn with_audience(
+        audience: crate::audience::Audience,
+        authority_role: Option<&str>,
+    ) -> WorkflowSpec {
+        let mut spec = viable_spec("audience");
+        spec.steps[1].audience = Some(audience);
+        spec.steps[1].authority_role = authority_role.map(String::from);
+        spec
+    }
+
+    #[test]
+    fn an_audience_alone_or_agreeing_with_the_legacy_key_is_viable() {
+        use crate::audience::Audience;
+        let reg = StepRegistry::v1();
+        let alone = with_audience(Audience::Role("platform-admin".into()), None);
+        assert!(validate_workflow(&alone, &reg).is_empty());
+        // The expand phase: the loader writes the projection beside the
+        // declaration, and a row carrying both AGREEING is the expected
+        // state of every migrated protocol.
+        let agreeing = with_audience(
+            Audience::Role("platform-admin".into()),
+            Some("platform-admin"),
+        );
+        assert!(validate_workflow(&agreeing, &reg).is_empty());
+        let person = with_audience(Audience::Individual("emp-david".into()), None);
+        assert!(validate_workflow(&person, &reg).is_empty());
+        let station = with_audience(Audience::Station("design-review".into()), None);
+        assert!(validate_workflow(&station, &reg).is_empty());
+    }
+
+    #[test]
+    fn a_step_that_declares_its_audience_twice_and_disagrees_is_refused() {
+        use crate::audience::Audience;
+        let reg = StepRegistry::v1();
+        let spec = with_audience(Audience::Role("platform-admin".into()), Some("bookkeeper"));
+        let errs = validate_workflow(&spec, &reg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].step, "finish");
+        assert!(errs[0].reason.contains("bookkeeper"), "{}", errs[0].reason);
+        assert!(
+            errs[0].reason.contains("platform-admin"),
+            "{}",
+            errs[0].reason
+        );
+        // An individual audience derives NO role, so a legacy role beside
+        // it is a second declaration too.
+        let spec = with_audience(
+            Audience::Individual("emp-david".into()),
+            Some("platform-admin"),
+        );
+        let errs = validate_workflow(&spec, &reg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].step, "finish");
+    }
+
+    #[test]
+    fn an_audience_no_reader_derives_from_yet_is_refused() {
+        use crate::audience::Audience;
+        let reg = StepRegistry::v1();
+        let spec = with_audience(Audience::Department("it".into()), None);
+        let errs = validate_workflow(&spec, &reg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].step, "finish");
+        assert!(errs[0].reason.contains("department"), "{}", errs[0].reason);
+        assert!(errs[0].reason.contains("f5ebd2e1"), "{}", errs[0].reason);
+    }
+
+    // Phase 8 — an agent block names a priced model and a positive
+    // budget (c87fb59b car 1, 028891cf).
+    fn with_agent(agent: crate::agent_spec::AgentSpec) -> WorkflowSpec {
+        let mut spec = viable_spec("agent");
+        spec.steps[1].agent = Some(agent);
+        spec
+    }
+
+    fn builder() -> crate::agent_spec::AgentSpec {
+        crate::agent_spec::AgentSpec {
+            profile: "builder".into(),
+            model: "opus-5[1m]".into(),
+            budget_usd: 5.0,
+            effort: crate::agent_spec::Effort::High,
+        }
+    }
+
+    #[test]
+    fn an_agent_block_on_a_priced_model_is_viable() {
+        let reg = StepRegistry::v1();
+        let errs = validate_workflow(&with_agent(builder()), &reg);
+        assert!(errs.is_empty(), "{errs:?}");
+        // And the publish gate — the one every ACTIVE write runs —
+        // admits it, the same call `_validate` and the seed use.
+        assert!(gate_active(&with_agent(builder())).is_ok());
+    }
+
+    #[test]
+    fn an_agent_block_naming_an_unpriced_model_is_refused_naming_the_priced_ones() {
+        let reg = StepRegistry::v1();
+        let spec = with_agent(crate::agent_spec::AgentSpec {
+            model: "claude-opus-5".into(),
+            ..builder()
+        });
+        let errs = validate_workflow(&spec, &reg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].step, "finish");
+        assert!(
+            errs[0].reason.contains("`claude-opus-5`"),
+            "{}",
+            errs[0].reason
+        );
+        assert!(errs[0].reason.contains("opus-5[1m]"), "{}", errs[0].reason);
+        assert!(errs[0].reason.contains("sonnet-5"), "{}", errs[0].reason);
+        assert!(gate_active(&spec).is_err());
+    }
+
+    #[test]
+    fn an_agent_block_with_a_non_positive_budget_is_refused() {
+        let reg = StepRegistry::v1();
+        for budget in [0.0, -5.0] {
+            let spec = with_agent(crate::agent_spec::AgentSpec {
+                budget_usd: budget,
+                ..builder()
+            });
+            let errs = validate_workflow(&spec, &reg);
+            assert_eq!(errs.len(), 1, "{budget}: {errs:?}");
+            assert!(errs[0].reason.contains("budget_usd"), "{}", errs[0].reason);
+        }
+    }
+
+    /// A step that requires a person and declares how an agent runs it
+    /// carries two answers to "who executes this"; refuse it the way
+    /// two audiences are refused.
+    #[test]
+    fn an_agent_block_on_a_human_only_step_is_refused() {
+        let reg = StepRegistry::v1();
+        let mut spec = with_agent(builder());
+        spec.steps[1].metadata_defaults = json!({ "human_only": true });
+        let errs = validate_workflow(&spec, &reg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].reason.contains("human_only"), "{}", errs[0].reason);
+        // The `false` the retro bundles write is not a declaration.
+        spec.steps[1].metadata_defaults = json!({ "human_only": false });
+        assert!(validate_workflow(&spec, &reg).is_empty());
+    }
+
     #[test]
     fn item_keys_on_a_non_array_field_is_refused() {
         // `item_keys` is the registry stating an element shape. On a
@@ -1091,6 +1402,7 @@ mod tests {
             required: true,
             filled_by: boss_core::job::FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into()],
+            covers: None,
         };
         let spec_with = |field_type: &str| {
             WorkflowSpec::platform_seed(
@@ -1134,6 +1446,82 @@ mod tests {
         );
     }
 
+    /// `covers` must relate two array fields on the same step; each way
+    /// it can fail to is refused by name, and the intended shape passes.
+    #[test]
+    fn covers_must_name_another_array_field_on_the_same_step() {
+        let reg = StepRegistry::v1();
+        let mk = |name: &str, field_type: &str, covers: Option<&str>| boss_core::job::StepField {
+            name: name.into(),
+            field_type: field_type.into(),
+            required: true,
+            filled_by: boss_core::job::FilledBy::Executor,
+            item_keys: Vec::new(),
+            covers: covers.map(str::to_string),
+        };
+        let spec_with = |fields: Vec<boss_core::job::StepField>| {
+            WorkflowSpec::platform_seed(
+                "doc",
+                "doc",
+                "test",
+                vec!["custom".into()],
+                vec![
+                    StepSpec {
+                        title: "drafted".into(),
+                        kind: "trigger".into(),
+                        ready_when: "true".into(),
+                        metadata_defaults: serde_json::json!({
+                            "trigger_kind": "operator", "trigger_name": "t"
+                        }),
+                        ..Default::default()
+                    },
+                    StepSpec {
+                        title: "review".into(),
+                        kind: "task".into(),
+                        ready_when: "steps.drafted.done".into(),
+                        fields,
+                        terminal: Some(Terminal {
+                            outcome: "published".into(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            )
+        };
+        let covers_errs = |fields| {
+            validate_workflow(&spec_with(fields), &reg)
+                .into_iter()
+                .filter(|e| e.reason.contains("covers"))
+                .map(|e| e.reason)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            covers_errs(vec![
+                mk("questions", "array", None),
+                mk("resolutions", "array", Some("questions"))
+            ])
+            .is_empty(),
+            "the intended shape passes"
+        );
+        let e = covers_errs(vec![mk("resolutions", "array", Some("questions"))]);
+        assert!(
+            e.iter().any(|r| r.contains("no field of that name")),
+            "{e:?}"
+        );
+        let e = covers_errs(vec![
+            mk("questions", "string", None),
+            mk("resolutions", "array", Some("questions")),
+        ]);
+        assert!(e.iter().any(|r| r.contains("not an array")), "{e:?}");
+        let e = covers_errs(vec![
+            mk("questions", "array", None),
+            mk("resolutions", "string", Some("questions")),
+        ]);
+        assert!(e.iter().any(|r| r.contains("not an array")), "{e:?}");
+        let e = covers_errs(vec![mk("resolutions", "array", Some("resolutions"))]);
+        assert!(e.iter().any(|r| r.contains("itself")), "{e:?}");
+    }
+
     /// An empty string can never be a member of an enum, so `""` as a
     /// metadata_default on an enum field is the unset placeholder the
     /// executor overwrites — the reading `""` already gets on date /
@@ -1171,6 +1559,7 @@ mod tests {
                             required: true,
                             filled_by: boss_core::job::FilledBy::Executor,
                             item_keys: Vec::new(),
+                            covers: None,
                         }],
                         metadata_defaults: serde_json::json!({ "route": default }),
                         terminal: Some(Terminal {
@@ -1327,6 +1716,7 @@ mod tests {
                         required: true,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     ..Default::default()
                 },
@@ -1340,6 +1730,7 @@ mod tests {
                         required: true,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     // Stamped at materialization, so the step carries the
                     // key from the moment it exists — which is why the
@@ -1411,6 +1802,7 @@ mod tests {
                         required: true,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     ..Default::default()
                 },
@@ -1424,6 +1816,7 @@ mod tests {
                         required: false,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     ..Default::default()
                 },
@@ -1481,6 +1874,7 @@ mod tests {
                         required: false,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     ..Default::default()
                 },
@@ -1533,6 +1927,7 @@ mod tests {
                         required: false,
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
+                        covers: None,
                     }],
                     ..Default::default()
                 },
@@ -1647,6 +2042,7 @@ mod tests {
             required: true,
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
+            covers: None,
         }
     }
 
@@ -1697,6 +2093,7 @@ mod tests {
             required: false,
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
+            covers: None,
         });
         assert!(
             validate_workflow(&spec, &reg)

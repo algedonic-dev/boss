@@ -16,23 +16,27 @@
 # Three of eleven timers were wired that way. Eight ran nightly with no
 # packet, no findings, no event-log trace and nobody's queue, which
 # means a silent failure in any of them was indistinguishable from a
-# success. deploy-services.sh's own comment records that four of these
-# units were "authored but never installed" and each was caught by
-# hand; this is the same class one step later — installed, running, and
-# unobservable.
+# success. The bare-metal deploy script's own comment recorded that four
+# of these units were "authored but never installed" and each was caught
+# by hand; this is the same class one step later — installed, running,
+# and unobservable.
 #
 # David, 2026-08-16: "Let's make sure we have a job to handle each" and
 # "get as much maintenance and management into job protocols rather
 # than floating around scripts or system timers elsewhere."
 #
-# WHAT IT CHECKS, for every row of deploy-services.sh's TIMERS array:
-#   1. the .service unit exists where the array says it does
+# WHAT IT CHECKS, for every row of infra/estate/roles.toml (read off the
+# installer's `rows` mode, infra/gcp/install-units.sh — until 2026-09-18
+# the rows were the TIMERS array of the bare-metal deploy-services.sh,
+# deleted with backlog e109bd71):
+#   1. the .service unit exists where the installer finds it
 #   2. it calls boss-maintenance-wrap.sh with a kind (opens the Job)
 #   3. it calls boss-step.sh with the SAME kind (records the verdict)
 #   3b. that call is on ExecStopPost, the one phase that runs on failure
 #   4. that kind is a real Workflow in the platform bundle
-#   7. a boss-gcp unit whose kind only the bundle defines pins the
-#      system of record inline and opens its packet best-effort (`-`)
+#   7. a boss-gcp unit reads the system of record from /etc/boss/sor.env
+#      (EnvironmentFile=, no inline copy) and opens its packet
+#      best-effort (`-`)
 #   8. and every CLUSTER CRONJOB does (2)–(4) too, because that is where
 #      the chores live since the 2026-09-04 cutover — the nightly backup
 #      ran unrecorded for twenty days inside this lint's blind spot
@@ -54,16 +58,18 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
-DEPLOY="infra/deploy-services.sh"
+INSTALLER="infra/gcp/install-units.sh"
 # The FORGE host's own installer, added 2026-08-17. This lint read
-# boss-gcp's TIMERS array and called itself complete, which was the
-# same shape as the bug it was written for: the forge host runs two
-# timers of its own and neither was covered. reap-dead-ci-jobs was
-# committed and never installed anywhere as a result.
+# boss-gcp's roster and called itself complete, which was the same
+# shape as the bug it was written for: the forge host runs two timers
+# of its own and neither was covered. reap-dead-ci-jobs was committed
+# and never installed anywhere as a result.
 FORGE_INSTALL="infra/forge/install.sh"
 BUNDLE="infra/platform/workflows"   # a directory: one <kind>.toml per protocol
-[ -f "$DEPLOY" ] || { echo "timers-leave-a-packet: $DEPLOY not found" >&2; exit 1; }
+[ -f "$INSTALLER" ] || { echo "timers-leave-a-packet: $INSTALLER not found" >&2; exit 1; }
 [ -d "$BUNDLE" ] || { echo "timers-leave-a-packet: $BUNDLE not found" >&2; exit 1; }
 
 # The kinds a Workflow actually defines. ONE SOURCE since 2026-09-11:
@@ -76,9 +82,9 @@ BUNDLE="infra/platform/workflows"   # a directory: one <kind>.toml per protocol
 # test in Rust still names it.
 kinds=$(cat "$BUNDLE"/*.toml | grep -oE '^kind = "maintenance-[a-z-]+"' | sed -E 's/kind = "(.*)"/\1/' | sort -u)
 
-rows=$(sed -n '/^TIMERS=(/,/^)/p' "$DEPLOY" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"')
+rows=$(BOSS_REPO_ROOT="$PWD" bash "$INSTALLER" rows 2>/dev/null | grep -E '^[a-z0-9-]+:[^:]+$')
 # Forge-host units live beside their installer, so the "subdirectory"
-# is always forge/. Same shape as a TIMERS row so the loop below is
+# is always forge/. Same shape as an installer row so the loop below is
 # unchanged.
 if [ -f "$FORGE_INSTALL" ]; then
     forge_rows=$(sed -n '/^UNITS=(/,/^)/p' "$FORGE_INSTALL" \
@@ -88,7 +94,7 @@ ${forge_rows}"
 fi
 count=$(printf '%s\n' "$rows" | grep -c . || true)
 if [ "$count" -lt 5 ]; then
-    echo "timers-leave-a-packet: only parsed $count timer rows from $DEPLOY —" >&2
+    echo "timers-leave-a-packet: only parsed $count timer rows from $INSTALLER —" >&2
     echo "  the scrape broke, so a green result would mean nothing." >&2
     exit 1
 fi
@@ -98,13 +104,13 @@ for row in $rows; do
     name="${row%%:*}"; sub="${row##*:}"
     [ "$sub" = "." ] && unit="infra/$name.service" || unit="infra/$sub/$name.service"
 
-    if [ ! -f "$unit" ]; then
-        echo "timers-leave-a-packet: $name is installed by $DEPLOY but $unit does not exist" >&2
+    if [ "$sub" = "missing" ] || [ ! -f "$unit" ]; then
+        echo "timers-leave-a-packet: $name is a roles.toml row but no $name.service + $name.timer pair exists under infra/" >&2
         problems=$((problems + 1)); continue
     fi
 
-    open_kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | head -1)
-    done_kind=$(grep -oE 'boss-step\.sh [a-z-]+' "$unit" | awk '{print $2}' | head -1)
+    open_kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | sed -n 1p)
+    done_kind=$(grep -oE 'boss-step\.sh [a-z-]+' "$unit" | awk '{print $2}' | sed -n 1p)
 
     if [ -z "$open_kind" ]; then
         echo "timers-leave-a-packet: $name runs with no Job — add an ExecStartPre calling" >&2
@@ -131,59 +137,65 @@ for row in $rows; do
         echo "timers-leave-a-packet: $name opens '$open_kind' but completes '$done_kind'." >&2
         problems=$((problems + 1)); continue
     fi
-    if ! printf '%s\n' "$kinds" | grep -qxF -- "$open_kind"; then
+    if ! grep -qxF -- "$open_kind" <<< "$kinds"; then
         echo "timers-leave-a-packet: $name uses kind '$open_kind', which no Workflow defines." >&2
         echo "    The wrapper's spawn would fail at run time, in the middle of the night." >&2
         problems=$((problems + 1))
     fi
 done
 
-# 5. AND THE DEPLOY MUST POINT THEM AT A JOBS API.
+# 5. WHERE A TIMER WRITES ITS PACKET.
 #
 # The four checks above prove a timer opens and completes a packet of a
 # real kind. They cannot see WHERE it writes it, and that turns out to
-# be the difference between visibility and none.
-#
-# boss-maintenance-wrap.sh falls back to
-# `BOSS_JOBS_URL:-http://127.0.0.1:7900`. On a box whose local instance
-# is not the system of record, that default is a silent redirect:
-# measured 2026-08-17, the backup / audit-integrity / ledger-replay
-# timers had fired on schedule for weeks and left 7 packets EACH on
-# boss-gcp's legacy instance and ZERO on the cluster SoR. Every check
-# in this lint passed the whole time. The 2026-08-13 split-brain
-# (incident c4b4a6b0) fixed the pipeline units by hand and missed
-# these.
-#
-# So: the deploy that installs a timer must also write its
-# BOSS_JOBS_URL, from the tree, where a reader can see it.
-if ! grep -q 'BOSS_JOBS_URL=' "$DEPLOY" || ! grep -q 'jobs-url.conf' "$DEPLOY"; then
-    echo "timers-leave-a-packet: deploy-services.sh installs timers but writes no" >&2
-    echo "    BOSS_JOBS_URL drop-in for them, so boss-maintenance-wrap.sh falls back to" >&2
-    echo "    127.0.0.1 — which on this deployment is not the system of record. Every" >&2
-    echo "    nightly packet would open and close where nobody is looking." >&2
-    problems=$((problems + 1))
-fi
+# be the difference between visibility and none: measured 2026-08-17,
+# the backup / audit-integrity / ledger-replay timers had fired on
+# schedule for weeks and left 7 packets EACH on boss-gcp's legacy
+# instance and ZERO on the cluster SoR, with every check in this lint
+# green. Until 2026-09-18 the answer was a jobs-url drop-in the
+# bare-metal deploy wrote per unit, naming the local instance; that
+# instance was retired on 2026-09-15 and the deploy path deleted, so a
+# boss-gcp unit now reads the system of record from /etc/boss/sor.env
+# (rendered on the host from infra/estate/estate.toml) or it names
+# nothing — check 7 is the whole rule, and check 6 keeps the helpers
+# from inventing a default.
 
-# 5b. THE FORGE INSTALLER MUST DO THE SAME FOR ITS OWN UNITS.
+# 5b. THE FORGE INSTALLER MUST NAME THE SYSTEM OF RECORD FOR ITS UNITS.
 #
-# The check above reads deploy-services.sh (boss-gcp). The forge host is
-# installed by install.sh, which had NO jobs-url drop-in — a blind spot
+# The forge host is installed by install.sh, which had NO jobs-url — a blind spot
 # that let reap-dead-ci-jobs run without BOSS_JOBS_URL and FAIL every
 # time on 2026-09-03, with this lint green throughout. Same bug as the
 # split-brain above, one installer over: a check that reads only one
 # deploy manifest calls itself complete while the other host's units are
 # uncovered — the exact shape the FORGE_INSTALL rows were added to close.
-if [ -f "$FORGE_INSTALL" ] && ! grep -q 'BOSS_JOBS_URL=' "$FORGE_INSTALL"; then
-    echo "timers-leave-a-packet: install.sh installs forge timers but writes no" >&2
-    echo "    BOSS_JOBS_URL for them, so boss-maintenance-wrap.sh REFUSES (it has no" >&2
-    echo "    localhost default) and every forge maintenance packet fails to open —" >&2
-    echo "    which is how reap-dead-ci-jobs failed on 2026-09-03." >&2
+#
+# Since 2026-09-18 (backlog 5222163e) the address is not a drop-in but
+# /etc/boss/sor.env, which install.sh RENDERS from infra/estate/
+# estate.toml before it installs a unit, and which every forge unit
+# reads with EnvironmentFile= — so both halves are checked: the render
+# call, and the line on every unit the installer lists.
+if [ -f "$FORGE_INSTALL" ] && ! grep -q 'render-sor-env.sh' "$FORGE_INSTALL"; then
+    echo "timers-leave-a-packet: install.sh installs forge timers but does not render" >&2
+    echo "    /etc/boss/sor.env for them (infra/estate/render-sor-env.sh), so" >&2
+    echo "    boss-maintenance-wrap.sh REFUSES (it has no localhost default) and every" >&2
+    echo "    forge maintenance packet fails to open — which is how reap-dead-ci-jobs" >&2
+    echo "    failed on 2026-09-03." >&2
     problems=$((problems + 1))
 fi
+for row in $forge_rows; do
+    unit="infra/forge/${row%%:*}.service"
+    [ -f "$unit" ] || continue   # check 1 named it
+    if ! grep -qE '^EnvironmentFile=-?/etc/boss/sor.env$' "$unit"; then
+        echo "timers-leave-a-packet: $unit does not read /etc/boss/sor.env (EnvironmentFile=)," >&2
+        echo "    and install.sh no longer writes a per-unit drop-in: the unit would start" >&2
+        echo "    with no system of record and its wrap would refuse." >&2
+        problems=$((problems + 1))
+    fi
+done
 
 # 6. AND NEITHER HELPER MAY CARRY A LOCALHOST DEFAULT.
 #
-# The drop-in above is the belt; this is the braces. A default of
+# The sor.env line (check 7) is the belt; this is the braces. A default of
 # 127.0.0.1 in boss-maintenance-wrap.sh or boss-step.sh makes a missing
 # BOSS_JOBS_URL look like a working configuration, which is exactly how
 # 21 nightly packets landed on a non-authoritative instance without one
@@ -193,7 +205,7 @@ for helper in infra/boss-maintenance-wrap.sh infra/boss-step.sh; do
     # Comment lines are exempt: the refusal blocks quote the old
     # default to explain what they replaced, and a lint that cannot
     # tell code from prose would forbid documenting the fix.
-    if grep -v '^[[:space:]]*#' "$helper" 2>/dev/null | grep -q 'BOSS_JOBS_URL:-http'; then
+    if grep -q 'BOSS_JOBS_URL:-http' <<<"$(grep -v '^[[:space:]]*#' "$helper" 2>/dev/null)"; then
         echo "timers-leave-a-packet: $helper still defaults BOSS_JOBS_URL to a host." >&2
         echo "    A maintenance tool with no system of record configured must refuse," >&2
         echo "    not guess: a failed unit is noticed, a packet in the wrong database" >&2
@@ -214,16 +226,16 @@ verdict() { # <service result> <exit status> [explicit pairs...]
         BOSS_JOBS_URL=http://example.invalid \
         bash infra/boss-step.sh maintenance-selftest run "$@" 2>/dev/null | tr '\n' ' '
 }
-if ! verdict success 0 | grep -q 'result=ok'; then
+if ! grep -q 'result=ok' <<<"$(verdict success 0)"; then
     echo "timers-leave-a-packet: boss-step.sh does not record a successful run as result=ok" >&2
     problems=$((problems + 1))
 fi
-if ! verdict exit-code 1 | grep -q 'result=exit-code exit_status=1'; then
+if ! grep -q 'result=exit-code exit_status=1' <<<"$(verdict exit-code 1)"; then
     echo "timers-leave-a-packet: boss-step.sh does not record a failed run's service result" >&2
     echo "    and exit status (SERVICE_RESULT=exit-code EXIT_STATUS=1 gave: $(verdict exit-code 1))" >&2
     problems=$((problems + 1))
 fi
-if ! verdict exit-code 1 result=floor-unmet | grep -q 'result=floor-unmet'; then
+if ! grep -q 'result=floor-unmet' <<<"$(verdict exit-code 1 result=floor-unmet)"; then
     echo "timers-leave-a-packet: boss-step.sh overrides a caller's explicit result=" >&2
     problems=$((problems + 1))
 fi
@@ -249,7 +261,7 @@ printf '{"units_installed":"14","anomalies":"SKIP boss-backup\\nand why"}' >"$rs
 rs_out=$(SERVICE_RESULT=success EXIT_STATUS=0 BOSS_STEP_DRY_RUN=1 \
     BOSS_JOBS_URL=http://example.invalid BOSS_RUN_SUMMARY_FILE="$rs_file" \
     bash infra/boss-step.sh maintenance-selftest run 2>/dev/null)
-if ! printf '%s' "$rs_out" | grep -q 'units_installed'; then
+if ! grep -q 'units_installed' <<<"$rs_out"; then
     echo "timers-leave-a-packet: boss-step.sh ignores \$BOSS_RUN_SUMMARY_FILE, so a unit that" >&2
     echo "    recorded what it did cannot get those facts onto its own packet. Got: $rs_out" >&2
     problems=$((problems + 1))
@@ -263,7 +275,7 @@ fi
 rs_out=$(SERVICE_RESULT=exit-code EXIT_STATUS=1 BOSS_STEP_DRY_RUN=1 \
     BOSS_JOBS_URL=http://example.invalid BOSS_RUN_SUMMARY_FILE="$rs_dir/never-written.json" \
     bash infra/boss-step.sh maintenance-selftest run 2>/dev/null)
-if ! printf '%s' "$rs_out" | grep -q 'summary_absent'; then
+if ! grep -q 'summary_absent' <<<"$rs_out"; then
     echo "timers-leave-a-packet: a run that left NO summary records nothing about that." >&2
     echo "    'the run left no summary' is a finding; silence makes the packet look like" >&2
     echo "    every other packet. Got: $rs_out" >&2
@@ -271,77 +283,86 @@ if ! printf '%s' "$rs_out" | grep -q 'summary_absent'; then
 fi
 rm -rf "$rs_dir"
 
-# 7. A CHORE WHOSE KIND ONLY THE BUNDLE DEFINES FILES WHERE THE BUNDLE
-#    IS SEEDED — and its packet never blocks its run.
+# 7. A boss-gcp CHORE READS THE SYSTEM OF RECORD FROM /etc/boss/sor.env
+#    — and its packet never blocks its run.
 #
-# Measured 2026-09-08 on boss-gcp (backlog e109f57e). deploy-services'
-# jobs-url.conf drop-in points every timer at the LOCAL instance
-# (127.0.0.1:7900, "a chore reports to the instance whose data it
-# maintains", 2026-08-19). That instance carries only the three kinds
-# baked into registry.rs — the platform bundle was never seeded there
-# and never will be (the-cluster-is-the-system retires it). So a
-# boss-gcp timer whose kind exists ONLY in the bundle gets
+# Measured 2026-09-08 on boss-gcp (backlog e109f57e). The bare-metal
+# deploy's jobs-url.conf drop-in pointed every timer at the LOCAL
+# instance (127.0.0.1:7900, "a chore reports to the instance whose data
+# it maintains", 2026-08-19). That instance carried only the three kinds
+# then baked into registry.rs — the platform bundle was never seeded
+# there. So a boss-gcp timer whose kind existed ONLY in the bundle got
 # `400 unknown or inactive job kind` from its own ExecStartPre, and a
-# hard ExecStartPre turns that into a run that never starts:
+# hard ExecStartPre turned that into a run that never started:
 # boss-ml-inference-batch failed 23 nights in a row and the ML
 # predictions went three weeks stale, while boss-conservation-
-# invariants and boss-deploy-confirm (the deploy dead-man) did the
-# same. The estate observers had already met this bug and pinned the
-# system of record INLINE with env(1) on the Exec line, which outranks
-# the drop-in (91ddebfb); this check makes that the rule.
+# invariants and the deploy dead-man did the same. The estate observers
+# had already met this bug and pinned the system of record INLINE with
+# env(1) on the Exec line, which outranks a drop-in (91ddebfb); this
+# check made that the rule. Since 2026-09-18 there is no drop-in and no
+# local instance at all (the second stack was retired 2026-09-15, the
+# deploy path deleted), and the address a unit reads is the ONE file
+# the host renders from estate.toml, not an inline copy per unit.
 #
-# WHICH UNITS. Kinds the bundle defines minus the baked-in three,
-# minus kinds a cluster CronJob already opens (a boss-gcp copy of
-# those is the vestige the-cluster-is-the-system retires: pinning it
-# to the SoR would file a second packet of a kind the cluster already
-# runs, and the wrap's reuse-the-open-packet recovery would then
-# "recover" the cluster's. Retirement is their fix, not a pin.)
+# WHICH UNITS. Every rostered row minus kinds a cluster CronJob already
+# opens (a boss-gcp copy of those is the vestige the-cluster-is-the-
+# system retires: pinning it to the SoR would file a second packet of a
+# kind the cluster already runs, and the wrap's reuse-the-open-packet
+# recovery would then "recover" the cluster's. Retirement is their fix,
+# not a pin.)
 #
-# WHAT THEY MUST DO. Name the system of record on BOTH the wrap and
-# the boss-step lines (a packet opened on one instance and closed on
-# another is the split-brain) — the URL infra/deploy.env.example names
-# for boss-gcp, so the tree states it once — and prefix the packet-
-# opening ExecStartPre with `-`: the packet is visibility, never a
-# precondition (CLAUDE.md §Diagnosis, "an arm that needs the patient
-# is not an arm"; cluster-watchdog.service is the precedent).
-sor=$(grep -oE '^BOSS_JOBS_URL=http://[^ ]+' infra/deploy.env.example | head -1 | cut -d= -f2)
-if [ -z "$sor" ]; then
-    echo "timers-leave-a-packet: infra/deploy.env.example names no BOSS_JOBS_URL — check 7 cannot know the system of record" >&2
-    problems=$((problems + 1))
-fi
-baked=$(grep -oE '"maintenance-[a-z-]+"' crates/core/boss-jobs/src/registry.rs | tr -d '"' | sort -u)
-cluster_kinds=$(grep -ohE 'boss-maintenance-wrap\.sh maintenance-[a-z-]+' infra/cluster/manifests/*.yaml 2>/dev/null \
+# WHAT THEY MUST DO. Read the system of record from /etc/boss/sor.env
+# with `EnvironmentFile=` (a packet opened on one instance and closed on
+# another is the split-brain, so ONE file feeds both the wrap and the
+# boss-step line) — the file every host's converge renders from
+# infra/estate/estate.toml, so the tree states the address once
+# (backlog 5222163e; until 2026-09-18 this check wanted the URL pinned
+# inline with env(1) on both Exec lines, against a drop-in that pointed
+# at the retired second stack; EnvironmentFile= outranks any Environment=
+# drop-in) — and prefix the packet-opening ExecStartPre with `-`: the
+# packet is visibility, never a precondition (CLAUDE.md §Diagnosis, "an
+# arm that needs the patient is not an arm"; cluster-watchdog.service
+# is the precedent). The two converges (boss-gcp-converge,
+# forge-converge) read the file OPTIONALLY (`EnvironmentFile=-`): they
+# are the arm that renders it, and must start on a host that has none.
+sor_env_line='EnvironmentFile=/etc/boss/sor.env'
+# A cluster chore opens its packet through boss-chore.sh (which runs the
+# wrap) since 480e183c; boss-backup.yaml's multi-image Pod still calls
+# the wrap itself. Both spellings name the kind second.
+cluster_kinds=$(grep -ohE 'boss-(maintenance-wrap|chore)\.sh maintenance-[a-z-]+' infra/cluster/manifests/*.yaml 2>/dev/null \
     | awk '{print $2}' | sort -u)
-gcp_rows=$(sed -n '/^TIMERS=(/,/^)/p' "$DEPLOY" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"')
+gcp_rows=$(BOSS_REPO_ROOT="$PWD" bash "$INSTALLER" rows 2>/dev/null | grep -E '^[a-z0-9-]+:[^:]+$')
 for row in $gcp_rows; do
     name="${row%%:*}"; sub="${row##*:}"
+    [ "$sub" = "missing" ] && continue   # check 1 already named it
     [ "$sub" = "." ] && unit="infra/$name.service" || unit="infra/$sub/$name.service"
     [ -f "$unit" ] || continue   # check 1 already named it
-    kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | head -1)
+    kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | sed -n 1p)
     [ -n "$kind" ] || continue   # check 2 already named it
-    printf '%s\n' "$baked" | grep -qxF -- "$kind" && continue          # local instance knows it
-    printf '%s\n' "$cluster_kinds" | grep -qxF -- "$kind" && continue  # the cluster runs it; this copy is a vestige
-    pre=$(grep -E '^ExecStartPre=' "$unit" | grep 'boss-maintenance-wrap' | head -1)
-    post=$(grep -E '^ExecStopPost=' "$unit" | grep 'boss-step\.sh' | head -1)
-    if ! printf '%s' "$pre" | grep -qF -- "BOSS_JOBS_URL=$sor " \
-        || ! printf '%s' "$post" | grep -qF -- "BOSS_JOBS_URL=$sor "; then
-        echo "timers-leave-a-packet: $name opens '$kind', a kind only the platform bundle defines," >&2
-        echo "    but does not pin the system of record on both its Exec lines. deploy-services'" >&2
-        echo "    drop-in points it at the local instance, which has never heard of that kind:" >&2
-        echo "    every run dies 400 in ExecStartPre. Pin it inline, where env(1) outranks the" >&2
-        echo "    drop-in, on the wrap AND the boss-step call:" >&2
-        echo "      ExecStartPre=-/usr/bin/env BOSS_JOBS_URL=$sor /opt/boss/infra/boss-maintenance-wrap.sh $kind \"<label>\"" >&2
-        echo "      ExecStopPost=-/usr/bin/env BOSS_JOBS_URL=$sor /opt/boss/infra/boss-step.sh $kind run" >&2
+    grep -qxF -- "$kind" <<< "$cluster_kinds" && continue  # the cluster runs it; this copy is a vestige
+    pre=$(grep -E '^ExecStartPre=' "$unit" | grep 'boss-maintenance-wrap' | sed -n 1p)
+    post=$(grep -E '^ExecStopPost=' "$unit" | grep 'boss-step\.sh' | sed -n 1p)
+    if ! grep -qE "^${sor_env_line/=/=-?}\$" "$unit"; then
+        echo "timers-leave-a-packet: $name opens '$kind' but does not read the system of record" >&2
+        echo "    from /etc/boss/sor.env. Nothing else names one for it — the installer writes" >&2
+        echo "    no drop-in and the helpers refuse to default — so every run refuses 78 in" >&2
+        echo "    ExecStartPre and the chore runs unrecorded. Add, under [Service]:" >&2
+        echo "      $sor_env_line" >&2
         problems=$((problems + 1)); continue
     fi
-    if ! printf '%s' "$pre" | grep -q '^ExecStartPre=-'; then
+    if grep -qE '^Exec(StartPre|Start|StopPost)=-?/usr/bin/env BOSS_JOBS_URL=' "$unit"; then
+        echo "timers-leave-a-packet: $name still pins BOSS_JOBS_URL inline on an Exec line — a" >&2
+        echo "    second copy of the address, beside the file. The file is the one spelling." >&2
+        problems=$((problems + 1)); continue
+    fi
+    if ! grep -q '^ExecStartPre=-' <<<"$pre"; then
         echo "timers-leave-a-packet: $name opens its packet from a HARD ExecStartPre. The packet is" >&2
         echo "    visibility, not a precondition: an API that answers 400 must not stop the" >&2
         echo "    chore (boss-ml-inference-batch lost 23 nights to exactly that). Prefix it:" >&2
-        echo "      ExecStartPre=-/usr/bin/env BOSS_JOBS_URL=$sor ..." >&2
+        echo "      ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh ..." >&2
         problems=$((problems + 1)); continue
     fi
-    if printf '%s\n%s' "$pre" "$post" | grep -qE '127\.0\.0\.1|localhost'; then
+    if grep -qE '127\.0\.0\.1|localhost' <<< "$pre"$'\n'"$post"; then
         echo "timers-leave-a-packet: $name names a localhost jobs API on an Exec line — that is" >&2
         echo "    boss-gcp's non-authoritative instance, never the system of record." >&2
         problems=$((problems + 1))
@@ -357,7 +378,7 @@ done
 # service's ExecStartPre with it. The backups kept running and kept
 # succeeding — verified artefact, both offsite legs — while the system
 # of record's last backup packet stayed at 2026-08-19 for twenty days.
-# Nothing here noticed, because a CronJob is not a TIMERS row. Found by
+# Nothing here noticed, because a CronJob is not a roles.toml row. Found by
 # hand (backlog 60095754), which is the definition of a gap in this
 # lint.
 #
@@ -366,18 +387,28 @@ done
 # indistinguishable from this one — CLAUDE.md §Diagnosis, a check nobody
 # can read is a check that is not running.
 #
-# WHAT IT CHECKS, per manifest holding a CronJob: it calls
-# boss-maintenance-wrap.sh with a kind, calls boss-step.sh with the SAME
-# kind, and that kind is a real Workflow — or its name is listed below
-# with the reason it files its visibility some other way.
+# WHAT IT CHECKS, per manifest holding a CronJob: it opens a packet of a
+# kind, records a verdict on the SAME kind, and that kind is a real
+# Workflow — or its name is listed below with the reason it files its
+# visibility some other way. Two spellings open and record:
 #
-# WHAT IT DELIBERATELY DOES NOT CHECK YET: that the packet-opening call
-# cannot fail the chore. boss-backup.yaml swallows it (the packet is
-# visibility, never a precondition — check 7 states the same rule for
-# boss-gcp units), but the seven siblings open theirs inside
-# `set -euo pipefail`, so an API answering 400 would stop them. That is
-# the boss-ml-inference-batch shape one layer over, and fixing seven
-# working chores belongs in its own change rather than riding this one.
+#   boss-chore.sh <kind> "<title>" -- <check>   ONE call is both halves.
+#       The wrapper (infra/boss-chore.sh, 480e183c) opens best-effort,
+#       runs the check, and records `ok` OR `failed` — the CronJob's
+#       ExecStopPost. Every single-container boss-image chore uses it;
+#       crates/core/boss-testing/tests/a_chore_records_ok_and_failed.rs
+#       is the ratchet that keeps the old three-line dance out.
+#   boss-maintenance-wrap.sh <kind> … boss-step.sh <kind> run   the
+#       pair, in SEPARATE containers: boss-backup.yaml's multi-image
+#       Pod, whose verdict is the Pod's own structure (the closer is the
+#       one main container, so it runs iff every init leg passed).
+#
+# Until 480e183c the eight siblings carried the pair in ONE `bash -c`
+# block under `set -euo pipefail`: a failing check ended the script
+# before boss-step ran, so a violated invariant left an OPEN packet that
+# read as a run in progress — the check-3b defect one layer over — and a
+# wrap refused by the API stopped the check from running at all. The
+# wrapper does both legs best-effort and exits with the check's status.
 CLUSTER_MANIFESTS="infra/cluster/manifests"
 # A CronJob whose visibility is its own, with the reason. Adding a name
 # here is a decision; the default is that a scheduled run leaves a
@@ -411,18 +442,23 @@ if [ -d "$CLUSTER_MANIFESTS" ]; then
                 ;;
         esac
 
-        open_kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$file" | awk '{print $2}' | head -1)
-        done_kind=$(grep -oE 'boss-step\.sh [a-z-]+' "$file" | awk '{print $2}' | head -1)
+        # The wrapper's one call is both halves; the pair's two calls are
+        # read separately so a Pod that opens and never records is seen.
+        chore_kind=$(grep -oE 'boss-chore\.sh [a-z-]+' "$file" | awk '{print $2}' | sed -n 1p)
+        open_kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$file" | awk '{print $2}' | sed -n 1p)
+        done_kind=$(grep -oE 'boss-step\.sh [a-z-]+' "$file" | awk '{print $2}' | sed -n 1p)
+        open_kind="${open_kind:-$chore_kind}"
+        done_kind="${done_kind:-$chore_kind}"
 
         if [ -z "$open_kind" ]; then
             echo "timers-leave-a-packet: CronJob $cname ($file) runs with no packet." >&2
-            echo "    Add a boss-image container that calls" >&2
-            echo "      boss-maintenance-wrap.sh <kind> \"<label>\"   before the work, and" >&2
-            echo "      boss-step.sh <kind> run result=ok            after it," >&2
-            echo "    with BOSS_JOBS_URL pointing at the in-cluster jobs API. Seven siblings" >&2
-            echo "    under $CLUSTER_MANIFESTS show the shape; boss-backup.yaml shows it for a" >&2
-            echo "    multi-image Pod. A scheduled run the system of record cannot see is a" >&2
-            echo "    run whose silence means nothing." >&2
+            echo "    Add a boss-image container that runs the check through" >&2
+            echo "      boss-chore.sh <kind> \"<label>\" -- <check>" >&2
+            echo "    with BOSS_JOBS_URL pointing at the in-cluster jobs API. Eight siblings" >&2
+            echo "    under $CLUSTER_MANIFESTS show the shape; boss-backup.yaml shows the" >&2
+            echo "    wrap/boss-step pair in separate containers for a multi-image Pod. A" >&2
+            echo "    scheduled run the system of record cannot see is a run whose silence" >&2
+            echo "    means nothing." >&2
             problems=$((problems + 1)); continue
         fi
         if [ -z "$done_kind" ]; then
@@ -436,7 +472,7 @@ if [ -d "$CLUSTER_MANIFESTS" ]; then
             echo "    '$done_kind' — one packet is left open and another is closed blind." >&2
             problems=$((problems + 1)); continue
         fi
-        if ! printf '%s\n' "$kinds" | grep -qxF -- "$open_kind"; then
+        if ! grep -qxF -- "$open_kind" <<< "$kinds"; then
             echo "timers-leave-a-packet: CronJob $cname uses kind '$open_kind', which no" >&2
             echo "    Workflow defines. The wrapper's spawn would fail at run time, on a" >&2
             echo "    schedule nobody is watching." >&2
@@ -493,10 +529,12 @@ fi
 # A timer whose schedule shape this cannot read FAILS rather than being
 # skipped — the same fail-closed posture the sweep itself takes for a
 # declaration it cannot parse. A timer with no schedule directive at
-# all (boss-deploy-confirm is armed by `systemctl restart`, not by the
-# clock) is not a cadence and is not checked. A DECLARED kind with no
-# rostered timer is left alone: it may be a cluster CronJob or a
-# dispatcher-driven kind, neither of which this file can see.
+# all (one armed by `systemctl restart`, not by the clock — the
+# bare-metal deploy's dead-man was the one instance, and it left with
+# that path on 2026-09-18) is not a cadence and is not checked. A
+# DECLARED kind with no rostered timer is left alone: it may be a
+# cluster CronJob or a dispatcher-driven kind, neither of which this
+# file can see.
 # The cadence roster is the args of ONE rule, and since 2026-09-09 each
 # rule is its own file (infra/dispatcher/rules/README.md).
 #
@@ -523,7 +561,7 @@ RULES_TOML="infra/dispatcher/rules/cadence-silence-sweep-daily.toml"
 # clock schedule and UNPARSED:<text> for a shape this cannot read.
 timer_interval_minutes() {
     local unit="$1" oua oc n
-    oua=$(grep -oE '^OnUnitActiveSec=[^ ]+' "$unit" 2>/dev/null | head -1 | cut -d= -f2)
+    oua=$(grep -oE '^OnUnitActiveSec=[^ ]+' "$unit" 2>/dev/null | sed -n 1p | cut -d= -f2)
     if [ -n "$oua" ]; then
         case "$oua" in
             *min) n="${oua%min}"; [ "$n" -gt 0 ] 2>/dev/null && { echo "$n"; return; } ;;
@@ -532,7 +570,7 @@ timer_interval_minutes() {
         esac
         echo "UNPARSED:OnUnitActiveSec=$oua"; return
     fi
-    oc=$(grep -E '^OnCalendar=' "$unit" 2>/dev/null | head -1 | cut -d= -f2-)
+    oc=$(grep -E '^OnCalendar=' "$unit" 2>/dev/null | sed -n 1p | cut -d= -f2-)
     if [ -z "$oc" ]; then echo NONE; return; fi
     case "$oc" in
         hourly)  echo 60 ;;
@@ -560,16 +598,17 @@ if [ -z "$declared" ]; then
 fi
 
 # The loosest rostered timer per kind — the number the sweep must carry.
-# Same row shapes checks 1-7 already walk: boss-gcp's TIMERS plus the
-# forge installer's UNITS.
+# Same row shapes checks 1-7 already walk: boss-gcp's roles.toml rows
+# plus the forge installer's UNITS.
 expected=""
 for row in $rows; do
     name="${row%%:*}"; sub="${row##*:}"
+    [ "$sub" = "missing" ] && continue
     if [ "$sub" = "." ]; then unit="infra/$name.service"; timer="infra/$name.timer"
     else unit="infra/$sub/$name.service"; timer="infra/$sub/$name.timer"; fi
     [ -f "$unit" ] || continue
     [ -f "$timer" ] || continue
-    kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | head -1)
+    kind=$(grep -oE 'boss-maintenance-wrap\.sh [a-z-]+' "$unit" | awk '{print $2}' | sed -n 1p)
     [ -n "$kind" ] || continue
     mins=$(timer_interval_minutes "$timer")
     case "$mins" in
@@ -589,7 +628,7 @@ done
 # Reduce to the maximum per kind, then compare with the declaration.
 for kind in $(printf '%s' "$expected" | awk '{print $1}' | sort -u); do
     want=$(printf '%s' "$expected" | awk -v k="$kind" '$1 == k {print $2}' | sort -n | tail -1)
-    got=$(printf '%s\n' "$declared" | awk -v k="$kind" '$1 == k {print $2}' | head -1)
+    got=$(awk -v k="$kind" '$1 == k { print $2; exit }' <<<"$declared")
     if [ -z "$got" ]; then
         echo "timers-leave-a-packet: a timer opens '$kind' every $want minutes, but the" >&2
         echo "    cadence-silence-sweep-daily rule does not declare it — so nothing notices" >&2
@@ -614,4 +653,5 @@ if [ "$problems" -gt 0 ]; then
     echo "  $problems scheduled run(s) without working Job visibility." >&2
     exit 1
 fi
+lint_scanned timers-leave-a-packet "$((count + ${cron_count:-0}))" "scheduled run(s): $count timers and ${cron_count:-0} cluster CronJobs"
 echo "timers-leave-a-packet: $count timers and ${cron_count:-0} cluster CronJobs, each opens and completes a defined Job"

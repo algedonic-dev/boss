@@ -21,25 +21,56 @@ use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use boss_dispatcher::rules::seed::seed_authored_rules;
 use boss_dispatcher_handlers::handlers::{
-    bill_payment_batch::BillPaymentBatch, cadence_silence::CadenceSilenceSweep,
-    commerce_invoice_issue::CommerceInvoiceIssue, credential_issuer,
-    credential_rotate_forgejo::CredentialRotateForgejo, estate_alarm::EstateAlarm,
-    estate_compare::EstateCompare, gate_resolve::GateResolve,
+    bill_payment_batch::BillPaymentBatch,
+    cadence_silence::CadenceSilenceSweep,
+    chore_file_reds::ChoreFileReds,
+    commerce_invoice_issue::CommerceInvoiceIssue,
+    credential_issuer,
+    credential_rotate_cloudflare_tunnel::CredentialRotateCloudflareTunnel,
+    credential_rotate_forgejo::CredentialRotateForgejo,
+    dns_observe::DnsObserve,
+    estate_alarm::EstateAlarm,
+    estate_compare::EstateCompare,
+    estate_recover::EstateRecover,
+    gate_resolve::GateResolve,
     inventory_bill_approve::InventoryBillApprove,
     inventory_overhead_absorb::InventoryOverheadAbsorb,
-    inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
-    inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
-    jobs_auto_park::JobsAutoPark, jobs_clear_waiting::JobsClearWaiting,
-    jobs_complete_linked_step::JobsCompleteLinkedStep, jobs_complete_step::JobsCompleteStep,
-    jobs_run_car_probes::JobsRunCarProbes, jobs_subjob_resolve::JobsSubjobResolve,
-    ledger_bill_approve::LedgerBillApprove, ledger_keg_deposit_settle::LedgerKegDepositSettle,
-    ledger_payroll_run_submit::LedgerPayrollRunSubmit, ledger_tax_accrue::LedgerTaxAccrue,
-    ledger_tax_remit::LedgerTaxRemit, messages_expire_for_job::MessagesExpireForJob,
-    messages_notify::MessagesNotify, messages_notify_job_terminal::MessagesNotifyJobTerminal,
-    network_census::NetworkCensus, packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
-    people_terminate::PeopleTerminate, products_consume::ProductsConsume,
-    products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
-    shipping_create::ShippingCreate, sweep_empty_decisions::MaintenanceSweepInspect,
+    inventory_parts_consume::InventoryPartsConsume,
+    inventory_parts_produce::InventoryPartsProduce,
+    inventory_po_place::InventoryPoPlace,
+    inventory_receive::InventoryReceive,
+    jobs_age_out_step::JobsAgeOutStep,
+    jobs_auto_park::JobsAutoPark,
+    jobs_clear_waiting::JobsClearWaiting,
+    jobs_complete_linked_step::JobsCompleteLinkedStep,
+    jobs_complete_step::JobsCompleteStep,
+    jobs_complete_step_matching::JobsCompleteStepMatching,
+    jobs_run_car_probes::JobsRunCarProbes,
+    jobs_subjob_resolve::JobsSubjobResolve,
+    ledger_bill_approve::LedgerBillApprove,
+    ledger_keg_deposit_settle::LedgerKegDepositSettle,
+    ledger_payroll_run_submit::LedgerPayrollRunSubmit,
+    ledger_tax_accrue::LedgerTaxAccrue,
+    ledger_tax_remit::LedgerTaxRemit,
+    messages_expire_for_job::MessagesExpireForJob,
+    messages_notify::MessagesNotify,
+    messages_notify_job_terminal::MessagesNotifyJobTerminal,
+    network_census::NetworkCensus,
+    ops_file_tag_release::OpsFileTagRelease,
+    ops_judge::OpsJudge,
+    packaging_allocate::PackagingAllocate,
+    people_hire::PeopleHire,
+    people_terminate::PeopleTerminate,
+    products_consume::ProductsConsume,
+    products_consume_from_invoice::ProductsConsumeFromInvoice,
+    products_produce::ProductsProduce,
+    retro_open::RetroOpen,
+    sensor_poll::{CredentialValues, SensorPoll, SensorSource},
+    shipping_create::ShippingCreate,
+    stripe_charges::StripeCharges,
+    stripe_payouts::StripePayouts,
+    sweep_empty_decisions::MaintenanceSweepInspect,
+    sweep_judge_report::MaintenanceSweepJudge,
     webhook_notify::WebhookNotify,
 };
 use tokio::net::TcpListener;
@@ -257,6 +288,13 @@ async fn main() -> Result<()> {
                 "rules registry loaded from dispatcher_rules"
             );
             let mut handlers = HandlerRegistry::new();
+            // WHO THE PLATFORM'S PACKETS ARE FILED TO (backlog 3c23662d):
+            // the platform owner, read from the people registry through
+            // the one port and cached for this process — never a literal
+            // person. Every alarm handler and auto-park share this one.
+            let platform_owner: Arc<dyn boss_core::platform_owner::PlatformOwner> = Arc::new(
+                boss_people_client::ReqwestPlatformOwner::new(cfg.people_api_url.clone()),
+            );
             handlers.register(JobsSpawn::new(cfg.jobs_api_url.clone()));
             // Auto-park: on a gate-run's green `gate-verdict` step, file
             // the car the `--park-*` intent describes, so a gate-green
@@ -270,7 +308,14 @@ async fn main() -> Result<()> {
             handlers.register(EstateAlarm::new(
                 cfg.jobs_api_url.clone(),
                 cfg.clock_api_url.clone(),
+                platform_owner.clone(),
             ));
+            // The half that closes (ef421cd3): an alarm whose finding
+            // has been ABSENT from N consecutive comparisons of its
+            // series completes its own triage step as `stale`. Reads
+            // the same series the raiser reads; needs no clock — the
+            // recovery instant is the record's own.
+            handlers.register(EstateRecover::new(cfg.jobs_api_url.clone()));
             // A DECLARED cadence with no packet files an alarm
             // (ecca2f43). The estate alarm hears a host that stopped
             // being observed; this hears a CHORE that stopped running —
@@ -290,10 +335,24 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 cfg.clock_api_url.clone(),
                 enforced_rules,
+                platform_owner.clone(),
             ));
             handlers.register(JobsAutoPark::new(
                 cfg.jobs_api_url.clone(),
                 cfg.clock_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // The week's retros (design 3613f0af, backlog 1dffde5d):
+            // one department-retro per department the classes registry
+            // holds, read at fire time through GET /api/departments, and
+            // the platform's own protocol-retro under the same ISO-week
+            // window. Needs the clock for the firing day the window is
+            // judged against. Inert until a scheduled rule names it
+            // (infra/dispatcher/rules/department-retros-weekly.toml).
+            handlers.register(RetroOpen::new(
+                cfg.jobs_api_url.clone(),
+                cfg.clock_api_url.clone(),
+                platform_owner.clone(),
             ));
             // D7 delegate-subjob write-back: on a child Job's
             // close, resolve the parent delegate-subjob step.
@@ -312,11 +371,65 @@ async fn main() -> Result<()> {
             // checklist, and route (action_needed) to Remediate or Clear
             // (ee8ec68a — mechanical inspections become automation).
             handlers.register(MaintenanceSweepInspect::new(cfg.jobs_api_url.clone()));
+            // The host-measured sweeps judge themselves from the verb's
+            // answer: on an ops-request closing `answered`, read its
+            // `verdict:` line and, for the sweep it was filed for,
+            // complete the Inspect checklist when clean or write the
+            // finding onto the open step when not (970c0c94). Which
+            // (target, verb) pair ride the rule row.
+            handlers.register(MaintenanceSweepJudge::new(cfg.jobs_api_url.clone()));
+            // An answered ops-request's verdict line files the NEXT
+            // verb, with args: on the close, match the rule's
+            // `verdict_pattern` against the run step's output, evaluate
+            // its `when` over the named groups, and spawn `then_verb
+            // then_args` on `then_host` linked back by `for_check` — or
+            // note on the judged request why nothing was filed
+            // (a1d3c762: publish-drift's --for-real by rule). Every noun
+            // rides the rule row, so the next verb chain is a rule file.
+            handlers.register(OpsJudge::new(cfg.jobs_api_url.clone()));
+            // A release packet's `tag` step going ready files the
+            // forge's tag-release request itself — v<version> off the
+            // packet, the newest closed train's merge_ref off the
+            // record, the packet id as the `release` edge the
+            // completing rule follows (89c95245: the last hand act on
+            // a release). Inert until a rule on step.ready.task names
+            // it with the packet kind and step slug.
+            handlers.register(OpsFileTagRelease::new(cfg.jobs_api_url.clone()));
+            // A chore that closed red opens one backlog-item per RED
+            // route on its recorded step (ac3270c7): on the close, parse
+            // `RED <route> <kind>: <error>` lines off the step the rule
+            // names, dedup by route against the open board, file the
+            // rest carrying the design id, and note on the chore what
+            // was filed. Which chore, which step and which design ride
+            // the rule row. Files to the platform owner like every
+            // alarm handler.
+            handlers.register(ChoreFileReds::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A closing Job completes the open step it was authorized
             // by, on the Job its declared edge names — the merged car
             // → feedback-packet obligation (2c4ae549). Generic: which
-            // edge and which steps ride the rule row.
-            handlers.register(JobsCompleteLinkedStep::new(cfg.jobs_api_url.clone()));
+            // edge and which steps ride the rule row. Files to the
+            // platform owner when a rule asks for the failure mode
+            // (f47861a5: a FAILED verb annotates the step and alerts).
+            handlers.register(JobsCompleteLinkedStep::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // A closing Job completes a step on every open packet whose
+            // RECORDED step metadata matches a value it carries — the
+            // converge that records a site's hash making the packet
+            // that published it `live` (c34583cb). Generic: kind, the
+            // two steps, the field and the path ride the rule row, and
+            // the rule is the tenant's.
+            handlers.register(JobsCompleteStepMatching::new(cfg.jobs_api_url.clone()));
+            // A clock rule completes an open step on every packet of a
+            // kind that has gone silent past a bound — an agent-run
+            // whose builder died is a packet that ages (c87fb59b car 2).
+            // Generic: kind, step, the bound and what to write ride the
+            // rule row; the tick's own `_at` is the clock.
+            handlers.register(JobsAgeOutStep::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints
@@ -348,7 +461,8 @@ async fn main() -> Result<()> {
             // the missing knob instead.
             {
                 use credential_issuer::{
-                    ForgeTokenIssuer, ForgejoAdmin, KubeSecretStore, SecretStore, Unconfigured,
+                    AccessApps, CloudflareApi, CloudflareTunnels, ForgeTokenIssuer, ForgejoAdmin,
+                    KubeSecretStore, SecretStore, Unconfigured, WorkloadRestarter, ZoneRecords,
                 };
                 let issuer: Arc<dyn ForgeTokenIssuer> = match &cfg.broker_forgejo_token {
                     Some(root) => ForgejoAdmin::new(cfg.broker_forge_url.clone(), root.clone()),
@@ -358,8 +472,12 @@ async fn main() -> Result<()> {
                             .to_string(),
                     )),
                 };
-                let secrets: Arc<dyn SecretStore> = match KubeSecretStore::in_cluster() {
-                    Ok(s) => s,
+                // One k8s client serves the Secret writes AND the
+                // connector restart (the same ServiceAccount, two
+                // name-scoped grants).
+                let kube = KubeSecretStore::in_cluster();
+                let secrets: Arc<dyn SecretStore> = match &kube {
+                    Ok(s) => s.clone(),
                     Err(e) => Arc::new(Unconfigured(format!(
                         "credential broker has no in-cluster k8s credential: {e}"
                     ))),
@@ -367,7 +485,105 @@ async fn main() -> Result<()> {
                 handlers.register(CredentialRotateForgejo::new(
                     cfg.jobs_api_url.clone(),
                     issuer,
+                    secrets.clone(),
+                ));
+                // The Cloudflare Tunnel rotation (04e5f833): same
+                // protocol, second issuer — the account API with the
+                // Cloudflare root token from the same root Secret
+                // (key cloudflare-token), the connector's Secret in
+                // the boss namespace, and a rollout restart of the
+                // declared connector Deployment.
+                // ONE client serves the rotation AND the zone observer
+                // below (zone reads and interlocked writes, and the
+                // account's Access applications): the same root token
+                // is the only credential that can read any of them.
+                let (cloudflare, zone_reader, access_apps): (
+                    Arc<dyn CloudflareTunnels>,
+                    Arc<dyn ZoneRecords>,
+                    Arc<dyn AccessApps>,
+                ) = match &cfg.broker_cloudflare_token {
+                    Some(root) => {
+                        let api =
+                            CloudflareApi::new(cfg.broker_cloudflare_api_url.clone(), root.clone());
+                        (api.clone(), api.clone(), api)
+                    }
+                    None => {
+                        let why =
+                            "credential broker unconfigured: BOSS_BROKER_CLOUDFLARE_TOKEN unset \
+                                   (secret boss-credential-broker-root, key cloudflare-token)"
+                                .to_string();
+                        (
+                            Arc::new(Unconfigured(why.clone())),
+                            Arc::new(Unconfigured(why.clone())),
+                            Arc::new(Unconfigured(why)),
+                        )
+                    }
+                };
+                let workloads: Arc<dyn WorkloadRestarter> = match &kube {
+                    Ok(s) => s.clone(),
+                    Err(e) => Arc::new(Unconfigured(format!(
+                        "credential broker has no in-cluster k8s credential: {e}"
+                    ))),
+                };
+                handlers.register(CredentialRotateCloudflareTunnel::new(
+                    cfg.jobs_api_url.clone(),
+                    cloudflare,
+                    secrets.clone(),
+                    workloads,
+                ));
+                // The zone observer (5e58922c, 198c5fe9): on a
+                // dns-zone-observation packet's observe step, read the
+                // account's Access applications and the zone with the
+                // same root token, run the tree's comparator
+                // (infra/cluster/dns/check-declared.sh, at
+                // BOSS_DNS_DECLARATIONS in the image) over the records,
+                // create an ABSENT declared Access application, apply a
+                // zone record declaring `interlock = "access"` once its
+                // application reads present with an allow policy, and
+                // complete the step with a verdict per record and per
+                // application; DRIFT or ABSENT on either files or
+                // refreshes the dns_drift:<zone> estate alarm. Reads the
+                // Secret store only to resolve a `tunnel:` reference to
+                // its installed TunnelID.
+                handlers.register(DnsObserve::new(
+                    cfg.jobs_api_url.clone(),
+                    zone_reader,
+                    access_apps,
                     secrets,
+                    cfg.dns_declarations_dir.clone(),
+                    platform_owner.clone(),
+                ));
+            }
+            // The first sensor (design 14c9b2ad, backlog 2d33e111): the
+            // 5-minute platform cadence fires sensor.poll, which reads
+            // the tenant-published sensor registry and, per due sensor,
+            // its source adapter — Stripe's charges, with the restricted
+            // read-only key from the broker's root Secret — recording
+            // readings outside the audit log and opening the declared
+            // packet per new one. An absent key is an alarm naming the
+            // env var, not a silent skip. The second source (backlog
+            // 21eb9516) reads the same account's paid payouts with the
+            // same key; a sensor row picks one by its `source`.
+            {
+                let mut sources: std::collections::HashMap<String, Arc<dyn SensorSource>> =
+                    std::collections::HashMap::new();
+                sources.insert(
+                    "stripe".to_string(),
+                    Arc::new(StripeCharges::new(cfg.stripe_api_base.clone())),
+                );
+                sources.insert(
+                    "stripe-payouts".to_string(),
+                    Arc::new(StripePayouts::new(cfg.stripe_api_base.clone())),
+                );
+                handlers.register(SensorPoll::new(
+                    cfg.jobs_api_url.clone(),
+                    sources,
+                    CredentialValues::new().with(
+                        "stripe-restricted-read",
+                        "BOSS_BROKER_STRIPE_KEY",
+                        cfg.broker_stripe_key.clone(),
+                    ),
+                    platform_owner.clone(),
                 ));
             }
             // Packaging allocation — splits a brewed batch across formats by
@@ -538,6 +754,11 @@ async fn main() -> Result<()> {
                         // this pod's log. Best-effort; see
                         // boss_dispatcher::rules::dead_letter.
                         dead_letters: Some(dead_letters.clone()),
+                        // Counted on the liveness surface whether or not
+                        // the annotation could land (8834804a): the six
+                        // packet-less topics and a failed write both
+                        // leave a number at /api/dispatcher/health.
+                        live: Some(live_rules.clone()),
                     });
                     let ev = {
                         let live = live_rules.clone();

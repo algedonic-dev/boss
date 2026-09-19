@@ -1,8 +1,9 @@
 <script lang="ts">
   // The yard as a rail map. Scenery is drawn from the scene's shape
   // (one gate shed per bay the policy allows, the mainline under one
-  // signal per stage, the dock and garage sidings, the arrivals yard and
-  // the inspection shed it feeds with its two sidings); tokens —
+  // signal per stage, the dock and garage sidings, the four arrival
+  // sidings and the cancelled siding off one ladder, and the inspection
+  // shed under them with its two sidings); tokens —
   // wagons and locomotives — are keyed by id and positioned by a CSS
   // transform, so when a wagon's station changes between two polls the
   // browser slides the same node from the old place to the new one.
@@ -14,6 +15,7 @@
   // its facts and the verbs that apply. The map draws; it never decides.
   import { fade } from 'svelte/transition';
   import { ARRIVALS_DRAWN, STAGES, drawnWagons, type Bay, type Loco, type Scene, type Wagon } from './yard-floor';
+  import { DELIVERY_CHANNELS, type DeliveryChannel } from './yard';
   import { clusterLabel, runnerLabel, runnerProgress } from './yard-machines';
 
   type Props = Readonly<{
@@ -49,14 +51,28 @@
   const mainY = $derived(
     Math.max(250, 70 + nBays * BAY_H + 24 + (queueRows > 0 ? queueRows * QUEUE_ROW_H + 12 : 0)),
   );
-  // The arrivals stack starts under its sign and grows the map downward
-  // — to the newest ARRIVALS_DRAWN landed wagons; the rest are one plate.
-  const ARRIVALS_Y = 66;
+  // THE ARRIVALS SIDINGS (design c6bd173e, car 1): four rows off one
+  // ladder down the left, one per delivery channel in DELIVERY_CHANNELS
+  // order — data, config, software, infra — then the cancelled siding a
+  // step apart, and the inspection band under them. A siding is ONE row
+  // of up to ARRIVALS_DRAWN wagons at the inspection lanes' columns,
+  // with its own "+N" plate at the row's end: a full software siding
+  // hides no data wagon. The single stack that stood here grew two
+  // columns downward (2026-09-08); four labelled rows across the same
+  // width stay readable at 1280 px.
+  const SIDING_ROW_H = 38;
+  /** Below the mainline's own sign ("The track · …" at mainY + 32). */
+  const SIDING_TOP = 60;
+  const sidingY = (i: number): number => mainY + SIDING_TOP + i * SIDING_ROW_H;
+  const sidingIndex = (ch: DeliveryChannel | undefined): number =>
+    Math.max(0, DELIVERY_CHANNELS.indexOf(ch ?? 'software'));
+  const cancelledY = $derived(sidingY(DELIVERY_CHANNELS.length) + 10);
   const drawn = $derived(drawnWagons(scene.wagons));
-  const stackRows = $derived(Math.ceil(Math.min(drawn.drawn.filter(w => w.station === 'arrivals').length, ARRIVALS_DRAWN) / 2));
-  const plateY = $derived(mainY + ARRIVALS_Y + stackRows * 40 + 2);
-  // THE INSPECTION SHED AND ITS TWO SIDINGS — the band the arrivals yard
-  // feeds, under everything else. Three lanes, each as tall as it needs
+  const onSiding = (ch: DeliveryChannel) => scene.wagons.filter(w => w.station === 'arrivals' && w.siding === ch);
+  /** How many landed wagons the siding's plate stands for. */
+  const sidingHidden = (ch: DeliveryChannel): number => Math.max(0, onSiding(ch).length - ARRIVALS_DRAWN);
+  // THE INSPECTION SHED AND ITS TWO SIDINGS — the band under the
+  // arrivals ladder. Three lanes, each as tall as it needs
   // to be: the yard GROWS a lane rather than hiding wagons, the way the
   // gate queue does, so nothing here is ever capped or counted away.
   const LANE_COLS = 8;
@@ -67,10 +83,9 @@
   const onEvent = $derived(lane('siding-event'));
   const noProbe = $derived(lane('siding-no-probe'));
   const laneRows = (n: number): number => Math.max(1, Math.ceil(n / LANE_COLS));
-  // Below the garage siding AND below the arrivals stack, whichever
-  // reaches further down — the band must not sit on another machine's
-  // click area.
-  const shedY = $derived(Math.max(mainY + 140, plateY + (drawn.hidden > 0 ? 40 : 34)));
+  // Below the cancelled siding's wheels, with room for the shed's sign —
+  // the band must not sit on another machine's click area.
+  const shedY = $derived(cancelledY + 44);
   const eventY = $derived(shedY + laneRows(inspecting.length) * LANE_ROW_H + 22);
   const noProbeY = $derived(eventY + laneRows(onEvent.length) * LANE_ROW_H + 20);
   const laneBottom = $derived(noProbeY + laneRows(noProbe.length) * LANE_ROW_H + 8);
@@ -79,7 +94,7 @@
     top + 14 + Math.floor(slot / LANE_COLS) * LANE_ROW_H,
   ];
   const shed = $derived(scene.machines.inspection);
-  const height = $derived(Math.max(mainY + 150, plateY + (drawn.hidden > 0 ? 18 : 8), laneBottom + 10));
+  const height = $derived(Math.max(mainY + 150, laneBottom + 10));
   // The machines the page feeds from outside the yard status, and the
   // clock their elapsed readings run on (the scene's — the server's
   // when the status served).
@@ -122,7 +137,9 @@
         return [(l ? locoX(l) : STAGE_X[0] ?? 0) - (WAGON_W + 6) - w.slot * WAGON_STEP, mainY - 2];
       }
       case 'arrivals':
-        return [1080 + (w.slot % 2) * WAGON_STEP, mainY + ARRIVALS_Y + Math.floor(w.slot / 2) * 40];
+        return [LANE_X + w.slot * WAGON_STEP, sidingY(sidingIndex(w.siding))];
+      case 'cancelled':
+        return [LANE_X + w.slot * WAGON_STEP, cancelledY];
       case 'inspection-shed':
         return laneXY(shedY, w.slot);
       case 'siding-event':
@@ -178,7 +195,7 @@
         class="rail" />
     {/each}
     <path d="M400 {mainY} C 420 {mainY}, 410 {mainY + 70}, 430 {mainY + 70} L 590 {mainY + 70}" class="rail" />
-    <path d="M1060 {mainY} C 1075 {mainY}, 1070 {mainY + 50}, 1085 {mainY + 50} L {VIEW_W - 15} {mainY + 50}" class="rail" />
+    <path d="M1060 {mainY} C 1075 {mainY}, 1070 {sidingY(0)}, 1085 {sidingY(0)}" class="rail" />
     <!-- the queue lane's rails, and the connector taking it into the
          gate branch: a queued run is next through those sheds -->
     {#each queueRowIndexes as r (r)}
@@ -242,8 +259,9 @@
     </g>
 
     <!-- the deploy-runner shed: read off the newest converge ops-request
-         (yard-machines.ts). It smokes while the converge runs; dark and
-         "no reading" until the page has read the packets -->
+         (yard-machines.ts) composed with the run's own maintenance
+         packet (yard-converge.ts). It smokes while the converge runs;
+         dark and "no reading" until the page has read the packets -->
     <g
       class="machine"
       class:selected={selected === 'runner'}
@@ -313,8 +331,8 @@
         >{scene.machines.conductor.label}</text>
     </g>
 
-    <!-- the sidings: approach, dock, garage, arrivals — each a machine
-         with its sign and its status line -->
+    <!-- the sidings: approach, dock, garage, arrivals, cancelled — each a
+         machine with its sign and its status line -->
     <g
       class="machine area"
       class:selected={selected === 'approach'}
@@ -376,20 +394,51 @@
       aria-label="arrivals · {scene.machines.arrivals.label}"
       onclick={pick('arrivals')}
       onkeydown={pickKey('arrivals')}>
-      <!-- bounded at the plate: the inspection band below is its own
-           machine, and an area that swallowed those clicks would make
-           the shed unselectable -->
-      <rect x="1062" y={mainY - 50} width={VIEW_W - 1070} height={plateY - mainY + 60} class="hit" />
-      <text x="1066" y={mainY + 32}>Arrivals</text>
-      <text x="1066" y={mainY + 44} class="tiny">{scene.machines.arrivals.label}</text>
-      {#if drawn.hidden > 0}
-        <!-- the stack is capped; the departure board lists every landed car -->
-        <rect x="1080" y={plateY - 2} width="144" height="14" class="plate" />
-        <text x="1152" y={plateY + 8} text-anchor="middle" class="tiny">+{drawn.hidden} more landed · see the board</text>
-      {/if}
+      <!-- the sign's corner plus the four sidings, one area; bounded
+           above the cancelled siding and the inspection band, which are
+           their own machines — an area that swallowed their clicks would
+           make them unselectable -->
+      <path
+        d="M600 {sidingY(0) - 24} H1062 V{mainY + 20} H{VIEW_W - 16} V{sidingY(DELIVERY_CHANNELS.length - 1) + 22} H600 Z"
+        class="hit" />
+      <text x={VIEW_W - 16} y={mainY + 32} text-anchor="end">Arrivals · by channel</text>
+      <text x={VIEW_W - 16} y={mainY + 44} text-anchor="end" class="tiny">{scene.machines.arrivals.label}</text>
+      <!-- the ladder: siding 0 runs from the turnout; each next siding
+           hangs off the one above at the left end -->
+      {#each DELIVERY_CHANNELS as ch, i (ch)}
+        {@const y = sidingY(i)}
+        {#if i > 0}
+          <path d="M668 {sidingY(i - 1)} C 652 {sidingY(i - 1)}, 648 {y}, 632 {y}" class="rail" />
+        {/if}
+        <line x1="632" y1={y} x2={VIEW_W - 15} y2={y} class="rail" />
+        <text x="634" y={y - 14} class="tiny">{ch}</text>
+        {#if sidingHidden(ch) > 0}
+          <!-- the siding is capped; the departure board lists every landed car -->
+          <rect x="1088" y={y - 8} width="136" height="14" class="plate" />
+          <text x="1156" y={y + 2} text-anchor="middle" class="tiny">+{sidingHidden(ch)} more · see the board</text>
+        {/if}
+      {/each}
+    </g>
+    <!-- THE CANCELLED SIDING — withdrawn cars, the third terminal track
+         (design c6bd173e, outcomes). Off the ladder below the arrivals,
+         a step apart: a withdrawal is settled, and it is not a landing. -->
+    <g
+      class="machine area"
+      class:selected={selected === 'cancelled'}
+      role="button"
+      tabindex="0"
+      aria-label="cancelled siding · {scene.machines.cancelled.label}"
+      onclick={pick('cancelled')}
+      onkeydown={pickKey('cancelled')}>
+      <rect x="600" y={cancelledY - 24} width={VIEW_W - 616} height="46" class="hit" />
+      <path
+        d="M668 {sidingY(DELIVERY_CHANNELS.length - 1)} C 652 {sidingY(DELIVERY_CHANNELS.length - 1)}, 648 {cancelledY}, 632 {cancelledY}"
+        class="rail" />
+      <line x1="632" y1={cancelledY} x2={VIEW_W - 15} y2={cancelledY} class="rail" />
+      <text x="634" y={cancelledY - 14} class="tiny">cancelled · {scene.machines.cancelled.label}</text>
     </g>
 
-    <!-- THE INSPECTION SHED — fed by the arrivals yard. A car that landed
+    <!-- THE INSPECTION SHED — fed by the arrivals sidings. A car that landed
          carrying a probe stands here until the forge's `run-car-probe`
          request is drained and the `proven` step is stamped; the two
          sidings under it hold the cars no probe can settle. Everything
@@ -404,10 +453,8 @@
       onclick={pick('inspection-shed')}
       onkeydown={pickKey('inspection-shed')}>
       <rect x="24" y={shedY - 22} width={VIEW_W - 40} height={laneBottom - shedY + 26} class="hit" />
-      <!-- the spur down off the arrivals lead, and one rail per lane -->
-      <path
-        d="M1085 {mainY + 50} C 1068 {mainY + 58}, 1062 {shedY - 10}, 1040 {shedY + 14} L 632 {shedY + 14}"
-        class="rail" />
+      <!-- the ladder continues down to the inspection lane, and one rail per lane -->
+      <path d="M668 {cancelledY} C 652 {cancelledY}, 648 {shedY + 14}, 632 {shedY + 14}" class="rail" />
       <path d="M668 {shedY + 14} C 652 {shedY + 14}, 648 {eventY + 14}, 632 {eventY + 14} L {VIEW_W - 15} {eventY + 14}" class="rail" />
       <path d="M668 {eventY + 14} C 652 {eventY + 14}, 648 {noProbeY + 14}, 632 {noProbeY + 14} L {VIEW_W - 15} {noProbeY + 14}" class="rail" />
       <line x1="632" y1={shedY + 14} x2={VIEW_W - 15} y2={shedY + 14} class="rail" />
@@ -437,8 +484,9 @@
         {@const [x, y] = wagonXY(w)}
         <g
           class="token wagon {w.tone}"
-          class:landed={w.station === 'arrivals'}
+          class:landed={w.station === 'arrivals' || w.station === 'cancelled'}
           class:sim={w.sim}
+          class:train-gate={w.kind === 'train-gate'}
           class:selected={selected === `car:${w.id}`}
           style="transform: translate({x}px, {y}px)"
           role="button"
@@ -449,11 +497,12 @@
           transition:fade={{ duration: 500 }}>
           <!-- A wagon standing in the inspection shed shows the probe
                command and the string it must print; the entity panel
-               carries them unwrapped. -->
+               carries them unwrapped. A wagon in the garage shows the
+               line its check failed on (6730dccb). -->
           <title
             >{w.title} — {w.branch}@{w.head ?? '—'}{w.probe
               ? `\nprobe: ${w.probe.command}\nmust print: ${w.probe.expect ?? '(nothing recorded)'}`
-              : ''}{w.event ? `\nwaiting on: ${w.event}` : ''}</title>
+              : ''}{w.event ? `\nwaiting on: ${w.event}` : ''}{w.why ? `\nfailed on: ${w.why}` : ''}</title>
           <rect x="0" y="-10" width={WAGON_W} height="20" class="body" />
           <rect x="0" y="-10" width="5" height="20" class="stripe" />
           <circle cx="12" cy="12" r="3" class="wheel" />
@@ -469,11 +518,18 @@
           style="transform: translate({locoX(l)}px, {mainY - 2}px)"
           role="button"
           tabindex="0"
-          aria-label="{l.title}{l.blocked ? ` — ${l.blocked}` : ''}"
+          aria-label="{l.title}{l.channel ? ` — ${l.channel} train` : ''}{l.blocked ? ` — ${l.blocked}` : ''}"
           onclick={pick(`train:${l.id}`)}
           onkeydown={pickKey(`train:${l.id}`)}
           transition:fade={{ duration: 500 }}>
-          <title>{l.title}{l.n !== null ? ` — PR #${l.n}` : ''}</title>
+          <title>{l.title}{l.channel ? ` — ${l.channel} train` : ''}{l.n !== null ? ` — PR #${l.n}` : ''}</title>
+          <!-- THE CHANNEL PLATE — how this train ships, the heaviest of its
+               cars' (the conductor's stamp at board, cffef553). A train
+               boarded before the stamp carries no plate: nothing drawn,
+               never 'software' guessed. -->
+          {#if l.channel}
+            <text x="6" y="-26" class="plate">{l.channel} train</text>
+          {/if}
           <rect x="0" y="-12" width="44" height="24" class="body" />
           <rect x="30" y="-20" width="12" height="8" class="body" />
           <circle cx="42" cy="-2" r="3" class="lamp-f" />
@@ -568,6 +624,11 @@
   .wagon.static rect.stripe { fill: var(--border-strong, #3a434d); }
   .wagon.landed rect.body { opacity: 0.55; }
   .wagon.sim rect.body { stroke-dasharray: 3 2; }
+  /* A TRAIN's gate in a bay is drawn in the locomotive's livery — the
+     train under test, not a PR car (128b5496; asked twice 2026-09-14). */
+  .wagon.train-gate rect.body { stroke: var(--fog, #e8ecef); }
+  .wagon.train-gate rect.stripe { fill: var(--fog, #e8ecef); }
+  .wagon.train-gate text { font-weight: 600; }
   .wagon text { fill: var(--fog, #e8ecef); font-size: 9px; letter-spacing: 0; text-transform: none; }
   .wagon.selected rect.body, .wagon:hover rect.body, .wagon:focus-visible rect.body {
     stroke: var(--signal, #5fd4a8); stroke-width: 1.5;
@@ -580,6 +641,9 @@
     stroke: var(--signal, #5fd4a8); stroke-width: 1.5;
   }
   .loco text { fill: var(--fog, #e8ecef); font-size: 9px; letter-spacing: 0; text-transform: none; }
+  /* The channel plate rides above the cab in the signals' muted ink — a
+     reading, not livery. */
+  .loco text.plate { fill: var(--static, #7a838c); letter-spacing: 0.04em; }
 
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
   @keyframes blink { 50% { opacity: 0.25; } }

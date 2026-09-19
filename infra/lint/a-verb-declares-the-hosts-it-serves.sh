@@ -3,7 +3,7 @@
 # hosts it serves, every named host is a real one, and a verb scoped to
 # a host can actually run there.
 #
-# WHY. The ops-request allowlist (infra/ops/verbs.json) had no notion of
+# WHY. The ops-request allowlist (infra/ops/verbs/, one file per verb) had no notion of
 # a host: a runner executed any verb a packet named. That was harmless
 # while exactly one host had a runner, and stopped being harmless on
 # 2026-09-11 when boss-gcp got one (backlog c3d06016). Eleven of the
@@ -27,13 +27,15 @@
 #      filesystem, and may be scoped only to that host. This is the
 #      check that would have caught the whole class: the forge scripts
 #      are reachable by path only on the forge.
-#   4. NO MUTATING VERB SERVES boss-gcp. The host was made answerable,
+#   4. NO MUTATING VERB SERVES boss-gcp unless it is ADMITTED BY NAME
+#      below, with its authorization. The host was made answerable,
 #      not powerful: its set is the read-only, host-agnostic reads, and
 #      widening is a reviewed per-verb change with its own
 #      authorization — the same process reclaim-disk / converge /
-#      publish-github-pr each went through (infra/ops/verbs.json
-#      _about). A mutating verb appearing here silently would be that
-#      process skipped.
+#      publish-github-pr each went through (infra/ops/verbs/README.md
+#      §Authorization). A mutating verb appearing here silently would be that
+#      process skipped; one appearing in GCP_MUTATING_ADMITTED is that
+#      process having happened, and this file is where it is noticed.
 #   5. at least one verb serves boss-gcp, or the runner there answers
 #      nothing and this lint is green over a dead door.
 #   6. the runner actually READS `hosts`, or the field is decoration.
@@ -41,16 +43,28 @@
 # The sibling is infra/lint/the-controls-are-bounded-verbs.sh, which
 # asks whether a MUTATING verb is bounded and authorized; this one asks
 # WHERE a verb runs. Both derive their rosters from the allowlist rather
-# than listing verbs (§9a).
+# than listing verbs (§9a) — and the allowlist itself is DERIVED from the
+# directory infra/ops/verbs/ by the one script the runner uses
+# (infra/ops/verbs-allowlist.sh, 5086842d), so this lint reads exactly
+# what the runner reads, assembled the same way.
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
-python3 - "$repo" <<'PY' || exit 1
-import json, re, sys, glob
+allowlist="$(sh "$repo/infra/ops/verbs-allowlist.sh" "$repo/infra/ops/verbs")" \
+    || { echo "FAIL: infra/ops/verbs-allowlist.sh could not assemble infra/ops/verbs/ (see above)" >&2; exit 1; }
+
+python3 - "$repo" "$allowlist" <<'PY' || exit 1
+import json, os, re, sys, glob
 
 repo = sys.argv[1]
-verbs = json.load(open(f"{repo}/infra/ops/verbs.json"))["verbs"]
+verbs = json.loads(sys.argv[2])["verbs"]
+# The scanned line every scanner prints (infra/lint/lib/scanned.sh);
+# printed from here because the count lives in this program, with the
+# same refusal on zero the shell helper makes.
+if not verbs:
+    sys.exit("a-verb-declares-the-hosts-it-serves: scanned 0 verb(s) under infra/ops/verbs — refusing rather than passing vacuously (lib/scanned.sh; backlog cdf2d959)")
+print(f"a-verb-declares-the-hosts-it-serves: scanned {len(verbs)} verb(s) under infra/ops/verbs")
 
 # ---- the hosts that EXIST, derived from the estate registry's seeds.
 # `nodes` is the estate registry's table; its id is what an ops-request
@@ -81,6 +95,57 @@ if len(node_ids) < 5:
              f"infra/postgres/schema — the derivation broke, so every host check below "
              f"would be vacuous: {sorted(node_ids)}")
 
+# MUTATING verbs boss-gcp may serve, each with the authorization that
+# admitted it. Empty until 2026-09-14. An entry here is the review
+# check 4 exists to force: the verb's own `about` must carry the same
+# authorization (the-controls-are-bounded-verbs.sh checks for "David"),
+# and this table says which verbs went through it.
+GCP_MUTATING_ADMITTED = {
+    # design 9e3e093f, decided by David 2026-09-11 ("Go ahead and retire
+    # it quickly ... part of our tech debt payoff"); backlog d5941ef3
+    # car 2. Bounded to infra/gcp/second-stack-units.txt, capture before
+    # stop, --dry-run exercisable without acting.
+    "retire-second-stack": "David 2026-09-11, design 9e3e093f",
+    # backlog 3ce95b85, car 3a of 8f4e9cc0: David 2026-09-11 asked for
+    # "some sort of doc diff view for me to approve"; this verb is the
+    # publish that approve fires. Bounded to the checkout's own
+    # infra/platform/workflows/<kind>.toml, refuses a live row the tree
+    # never said unless --force-tree, --check exercisable without
+    # acting, the read-back is the verdict. Flagged for David's review
+    # as the first verb that writes the workflow registry from a host,
+    # the way run-car-probe was flagged as the first to run builder text.
+    "publish-workflow": "David 2026-09-11, 8f4e9cc0 / backlog 3ce95b85 — flagged for review",
+    # design 9e3e093f, decided by David 2026-09-11 — its accepted
+    # proposal names this path: "an uninstall path for units the role
+    # does not name ... through the ops-runner door as a bounded verb";
+    # backlog d5941ef3 car 4. Bounded to the installer's own roster
+    # derivation (install-units.sh roster: roles.toml minus what the
+    # host's LIVE roles name), refuses an empty set, --dry-run
+    # exercisable without acting.
+    "uninstall-not-in-role": "David 2026-09-11, design 9e3e093f",
+    # design 4c565f8c, decided by David 2026-09-16 ("agreed, fold it in
+    # and file the cars") — its accepted proposal names this path:
+    # "Car 4: a bounded ops verb (retire-cloudflared, the retire-second-
+    # stack shape ...) ... David runs --for-real"; backlog 0b7804f3.
+    # Bounded to the one unit named in the script (cloudflared.service,
+    # never a param), the hand-over verified through the SoR before
+    # anything stops, the token masked through unit-cat, --dry-run
+    # exercisable without acting. Never touches the tunnel in
+    # Cloudflare (the broker's revoke phase).
+    "retire-cloudflared": "David 2026-09-16, design 4c565f8c",
+    # retro 27fad542, approved by David 2026-09-18 14:18Z — item 2 of
+    # the order he ratified, "publish-drift verb + converge rule";
+    # backlog a2f97942. Composes the admitted publish-workflow verb
+    # and nothing else: the drift set is that verb's --check per kind,
+    # the publish is that verb per tree-ahead kind, a live row the
+    # tree never said is listed and NEVER published (no --force-tree
+    # here). `mode` defaults to --check so a rule-filed packet can
+    # only read; --for-real is a word a packet carries on purpose.
+    # Flagged for David's review as the first verb that publishes
+    # MORE THAN ONE registry row per request.
+    "publish-drift": "David 2026-09-18, retro 27fad542 / backlog a2f97942 — flagged for review",
+}
+
 problems = []
 serving_gcp = []
 for name in sorted(verbs):
@@ -102,22 +167,26 @@ for name in sorted(verbs):
                 f"verb nobody can reach.")
     argv0 = spec["argv"][0]
     if argv0.startswith("/"):
-        # An absolute argv[0] is one host's filesystem. The only
-        # checkout path the allowlist names is the forge's.
-        if argv0.startswith("/home/david/boss/"):
-            if hosts != ["forge"]:
-                problems.append(
-                    f"{name} runs {argv0} — a path that exists only in the FORGE's checkout — "
-                    f"but is scoped to {hosts}. On any other host that is an ENOENT dressed up "
-                    f"as an answer. Scope it to forge, or give the verb a path the other host has.")
-        else:
+        # An absolute argv[0] is ONE host's filesystem baked into a file
+        # every host reads. Until 2026-09-12 eleven verbs carried the
+        # forge checkout's path and could run nowhere else (66077f9c).
+        # The runner resolves a repo-relative script against its own
+        # checkout, so every managed host can carry every script.
+        problems.append(
+            f"{name}'s argv[0] is the absolute path {argv0}. Name the script relative to "
+            f"the repo (infra/forge/reach.sh); the runner resolves it against its own "
+            f"checkout, on whichever host runs it. A bare command stays a bare command.")
+    elif "/" in argv0:
+        script = os.path.join(repo, argv0)
+        if not os.path.isfile(script):
             problems.append(
-                f"{name}'s argv[0] is the absolute path {argv0}, which no host is known to "
-                f"carry. Either use a bare command (host-agnostic, resolved on PATH) or a path "
-                f"under a checkout whose host this lint can name.")
+                f"{name}'s argv[0] {argv0} is not a file in this tree — the runner would refuse "
+                f"it as 'not in this checkout' on every host.")
+        elif not os.access(script, os.X_OK):
+            problems.append(f"{name}'s argv[0] {argv0} is in the tree but not executable.")
     if "boss-gcp" in hosts:
         serving_gcp.append(name)
-        if "MUTATING" in spec.get("about", ""):
+        if "MUTATING" in spec.get("about", "") and name not in GCP_MUTATING_ADMITTED:
             problems.append(
                 f"{name} is MUTATING and scoped to boss-gcp. boss-gcp was made ANSWERABLE, not "
                 f"powerful (c3d06016): its verbs are the read-only, host-agnostic reads. A "
@@ -127,7 +196,7 @@ for name in sorted(verbs):
 
 if not serving_gcp:
     problems.append(
-        "no verb serves boss-gcp. The host runs an ops-runner (deploy-services.sh units "
+        "no verb serves boss-gcp. The host runs an ops-runner (install-units.sh units "
         "installs it) and would answer nothing — a door that opens onto a wall.")
 
 if problems:
@@ -144,8 +213,18 @@ if "$spec.hosts" not in runner or "does not serve host" not in runner:
              "(expected `$spec.hosts` in the decision jq and a refusal naming the host)")
 
 mutating = sorted(n for n, s in verbs.items() if "MUTATING" in s.get("about", ""))
+gcp_mutating = sorted(n for n in serving_gcp if n in mutating)
+# An admitted name that no longer exists, or that exists but no longer
+# serves boss-gcp as a MUTATING verb, is a stale admission — say so
+# rather than carry it.
+for n in GCP_MUTATING_ADMITTED:
+    if n not in verbs:
+        sys.exit(f"FAIL: GCP_MUTATING_ADMITTED names {n}, which is not a verb — drop the stale admission")
+    if n not in gcp_mutating:
+        sys.exit(f"FAIL: GCP_MUTATING_ADMITTED names {n}, which is not a MUTATING verb serving boss-gcp — drop the stale admission")
 print(f"a-verb-declares-the-hosts-it-serves: ok — {len(verbs)} verbs each name the hosts they "
       f"serve, from the {len(node_ids)} estate node ids in the tree; boss-gcp serves "
-      f"{', '.join(sorted(serving_gcp))} and none of the {len(mutating)} MUTATING verbs; every "
-      f"forge-path verb is scoped to forge; the runner refuses on the field")
+      f"{', '.join(sorted(serving_gcp))}, and of the {len(mutating)} MUTATING verbs only the admitted "
+      f"{', '.join(gcp_mutating) or 'none'}; every "
+      f"script is repo-relative and in the tree; the runner refuses on the field")
 PY

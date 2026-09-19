@@ -28,8 +28,23 @@
 import { formatDate } from '@boss/web-kit/ui/date';
 import type { ClusterMachine, RunnerMachine } from './yard-machines';
 export type { ClusterMachine, RunnerMachine } from './yard-machines';
-import { approach, failedChecks, stampAt, troubleLabel, type CarRow, type JobLite, type TrainRow, type WithSteps, type YardState } from './yard';
 import {
+  DELIVERY_CHANNELS,
+  approach,
+  failedChecks,
+  redTrainsPhrase,
+  stampAt,
+  troubleLabel,
+  type CarRow,
+  type DeliveryChannel,
+  type JobLite,
+  type TrainRow,
+  type WithSteps,
+  type YardState,
+} from './yard';
+import {
+  flakeLabel,
+  flakeTally,
   inspectionShed,
   runAt,
   shedCounts,
@@ -37,6 +52,7 @@ import {
   shedLamp,
   shedStatus,
   shedTone,
+  type FlakeCount,
   type ShedPlace,
 } from './yard-shed';
 import {
@@ -77,7 +93,12 @@ export type Station =
   | 'dock'
   | 'garage'
   | 'train'
+  /** Landed — on one of the four sidings, named by the wagon's `siding`. */
   | 'arrivals'
+  /** Withdrawn: the car's `abandoned` terminal completed. The third
+   *  terminal track (design c6bd173e); struck and left-behind are dock
+   *  badges, not a station. */
+  | 'cancelled'
   /** Landed, carrying a probe, not yet stamped `proven`. */
   | 'inspection-shed'
   /** Landed, settled only by an event no probe can run. */
@@ -107,8 +128,11 @@ export type Wagon = Readonly<{
   sim: boolean;
   station: Station;
   /** Position within the station: the bay index, the dock slot, the
-   *  place in the consist, the stack position in the arrivals yard. */
+   *  place in the consist, the place along its arrivals siding. */
   slot: number;
+  /** Which arrivals siding — the car's delivery channel. Present only on
+   *  a wagon in `arrivals`; `slot` counts along this siding. */
+  siding?: DeliveryChannel;
   trainId: string | null;
   tone: Tone;
   lamp: Lamp;
@@ -122,6 +146,12 @@ export type Wagon = Readonly<{
   /** The event prose on a wagon standing on the event siding; absent
    *  elsewhere. */
   event?: string | null;
+  /** WHY a wagon IN THE GARAGE is there: the line its failed check
+   *  failed on, as the server reads it off the receipt (6730dccb). The
+   *  status line carries it too; this is the whole line for the
+   *  tooltip. Absent everywhere else, and on a garaged wagon whose
+   *  receipt carries no excerpt. */
+  why?: string | null;
   /** When it reached this station — an RFC3339 instant or a bare date,
    *  whichever the record carries; null when it carries none. */
   since: string | null;
@@ -140,6 +170,11 @@ export type Loco = Readonly<{
   /** Why it is not moving — the server's block first, else the board's
    *  trouble badge; null when it is simply moving. */
   blocked: string | null;
+  /** How this train ships — the heaviest of its cars' channels, from the
+   *  server row (the conductor's stamp at board, cffef553). Named on the
+   *  locomotive as '<channel> train'; null — nothing drawn — for a train
+   *  boarded before the stamp, or with no server row. */
+  channel: DeliveryChannel | null;
   /** Wagon ids aboard, in consist order. */
   cars: readonly string[];
 }>;
@@ -215,15 +250,25 @@ export type Machines = Readonly<{
   }>;
   garage: Readonly<{ label: string; count: number }>;
   arrivals: Readonly<{ label: string; landed: number }>;
+  /** The cancelled siding: how many withdrawn cars stand on it. */
+  cancelled: Readonly<{ label: string; count: number }>;
   /** The inspection shed and its two sidings — the counts are the three
-   *  places, and `failed` is how many of the inspected cars have a
-   *  non-zero probe run on record. */
+   *  places; `failed` is how many of the inspected cars have a failing
+   *  probe run on record, and `notYet` how many said "not yet" (exit
+   *  75) — early, not wrong, and not red. */
   inspection: Readonly<{
     label: string;
     inspecting: number;
     failed: number;
+    notYet: number;
     onEvent: number;
     noProbe: number;
+    /** Reds that were flakes, by check — a green after a red at the
+     *  same head, read off the gate-runs the page holds (yard-shed.ts
+     *  `flakeTally`, backlog 36cc4913). The shed's line for it is
+     *  `flakeLabel`, a stated none when empty. */
+    flakes: readonly FlakeCount[];
+    flakeLabel: string;
   }>;
   conductor: ConductorMachine;
   runner: RunnerMachine;
@@ -259,6 +304,26 @@ const FILLER = new Set([
  *  plus each following word that still fits in eleven characters, at
  *  most three words. A first word longer than eleven is cut. Pure and
  *  deterministic: the same branch always paints the same nameplate. */
+/** The wagon a TRAIN's gate-run is drawn as in a bay or the queue:
+ *  the train's id, the `train gate` tag and its own kind — read off the
+ *  server's `train` on the row (128b5496), never off the branch name.
+ *  Null for a car's gate, which is drawn as before. */
+export function trainGateOf(g: Readonly<{ branch: string; train?: string | null }>): Readonly<{
+  trainId: string;
+  tag: string;
+  title: string;
+  kind: 'train-gate';
+}> | null {
+  const t = g.train;
+  if (typeof t !== 'string' || t === '') return null;
+  return {
+    trainId: t,
+    tag: 'train gate',
+    title: `train gate — testing train ${t.slice(0, 8)} (${g.branch})`,
+    kind: 'train-gate',
+  };
+}
+
 export function wagonTag(branch: string): string {
   const words = tagWords(branch);
   const first = words[0];
@@ -367,6 +432,18 @@ export function sinceText(since: string | null | undefined, nowMs: number): stri
  *  `stale` flag is the alarm. */
 export const GATE_USUAL_MINUTES = 12;
 
+/** The strike count a dock wagon appends to its status — empty for a
+ *  clean car, so the clean sentence is unchanged (2bb0d014, 2026-09-14).
+ *  Read after train #361: a car one red train had released stood on the
+ *  dock indistinguishable from a clean one, and the first the operator
+ *  heard was the hold at the second. The words are the card's
+ *  (`redTrainsPhrase`, d6e53a35), so My Day and the floor cannot name
+ *  one count two ways; only the ` · ` join is the wagon's own. */
+const redTrainsSuffix = (n: number | undefined): string => {
+  const phrase = redTrainsPhrase(n);
+  return phrase ? ` · ${phrase}` : '';
+};
+
 /** An operator's hold marker often opens with its own "held:" — the
  *  wagon already says held, so the reason is what follows it. */
 const holdReason = (hold: string | null): string =>
@@ -375,13 +452,15 @@ const holdReason = (hold: string | null): string =>
 const shortSha = (v: unknown): string | null =>
   typeof v === 'string' && /^[0-9a-f]{7,40}$/i.test(v) ? v.slice(0, 7) : null;
 
-/** How many landed wagons the map stacks before a "+N more" plate. On
- *  2026-09-08 eleven landed cars in two columns outgrew the map. */
+/** How many landed wagons the map draws PER SIDING before a "+N more"
+ *  plate. On 2026-09-08 eleven landed cars in two columns outgrew the
+ *  map; since the sidings (c6bd173e) a siding is one row, this many
+ *  wagons long, and a full software siding hides no data wagon. */
 export const ARRIVALS_DRAWN = 6;
 
 /** The wagons the map draws: everything in flight, and the newest
- *  `ARRIVALS_DRAWN` landed; `hidden` is how many landed wagons the
- *  plate stands for. The departure board lists them all. */
+ *  `ARRIVALS_DRAWN` landed on each siding; `hidden` is how many landed
+ *  wagons the plates stand for. The departure board lists them all. */
 export function drawnWagons(wagons: readonly Wagon[]): Readonly<{ drawn: readonly Wagon[]; hidden: number }> {
   const drawn = wagons.filter(w => w.station !== 'arrivals' || w.slot < ARRIVALS_DRAWN);
   return { drawn, hidden: wagons.length - drawn.length };
@@ -401,6 +480,7 @@ export type Selection =
   | Readonly<{ kind: 'approach' }>
   | Readonly<{ kind: 'gate-queue' }>
   | Readonly<{ kind: 'arrivals' }>
+  | Readonly<{ kind: 'cancelled' }>
   /** The inspection shed and its two sidings, selected as one area. */
   | Readonly<{ kind: 'inspection-shed' }>
   | Readonly<{ kind: 'conductor' }>
@@ -408,7 +488,7 @@ export type Selection =
   | Readonly<{ kind: 'cluster' }>;
 
 const PLAIN_SELECTIONS = [
-  'track', 'dock', 'garage', 'approach', 'gate-queue', 'arrivals', 'inspection-shed', 'conductor', 'runner', 'cluster',
+  'track', 'dock', 'garage', 'approach', 'gate-queue', 'arrivals', 'cancelled', 'inspection-shed', 'conductor', 'runner', 'cluster',
 ] as const;
 type PlainSelection = (typeof PLAIN_SELECTIONS)[number];
 
@@ -496,6 +576,8 @@ const STATION_RANK: Readonly<Record<Station, number>> = {
   'inspection-shed': 8,
   'siding-event': 9,
   'siding-no-probe': 10,
+  // Never on the board (see `boardRows`); ranked so the record is total.
+  cancelled: 11,
 };
 
 function stageOf(t: TrainRow): number {
@@ -611,6 +693,14 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     sim: c.sim,
   });
 
+  // EACH SIDING LANDS ON ITS OWN EVIDENCE (design c6bd173e, car 3 —
+  // edae6e8b). The server judges every car of a merged train on ITS
+  // channel's live evidence and sends the rows as `sidings`; the floor
+  // joins them by car id and draws the judgement rather than "the train
+  // arrived, so every car landed". No row — an older server, or a car
+  // outside the server's window — reads as it did before the lane.
+  const sidingOf = new Map((status?.sidings ?? []).map(r => [r.id, r]));
+
   // THE TRACK — open trains as locomotives, their cars coupled behind.
   const serverTrain = new Map((status?.trains ?? []).map(t => [t.id, t]));
   const locos: Loco[] = yard.inFlight.map(t => {
@@ -624,6 +714,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       stage,
       progress: progressOf(t, stage),
       blocked,
+      channel: st?.channel ?? null,
       cars: t.cars.map(c => c.id),
     };
   });
@@ -637,6 +728,13 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     const boardedAt = serverTrain.get(t.id)?.boarded_at ?? boardedAtFromTitle(t.title);
     t.cars.forEach((c, i) => {
       if (claimedIds.has(c.id)) return;
+      // The EARLIER half of the claim: a car aboard a merged train whose
+      // own evidence already exists (a config car's manifests apply in
+      // the converge run that closes minutes before the image roll is
+      // stamped) is live while its train is still converging. It stays
+      // coupled — the consist is the train's — and its line says so.
+      const landing = sidingOf.get(c.id)?.landing ?? null;
+      const landed = !l.blocked && landing?.kind === 'landed' ? landing : null;
       place({
         id: c.id,
         ...base(c),
@@ -644,10 +742,12 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
         slot: i,
         trainId: t.id,
         tone: l.blocked ? 'red' : 'ok',
-        lamp: l.blocked ? 'err' : 'working',
+        lamp: l.blocked ? 'err' : landed ? 'ok' : 'working',
         status: l.blocked
           ? `aboard ${locoName(l)} · blocked at ${STAGES[l.stage]}`
-          : `aboard ${locoName(l)} · ${STAGES[l.stage]}`,
+          : landed
+            ? `aboard ${locoName(l)} · ${STAGES[l.stage]} · landed on ${c.deliveryChannel}: ${landed.evidence}`
+            : `aboard ${locoName(l)} · ${STAGES[l.stage]}`,
         since: boardedAt,
       });
     });
@@ -690,33 +790,82 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     });
   });
   const shedTally = shedCounts(shed);
+  // The flake tally rides the shed machine: reds that went green at the
+  // same head, by check, off the gate-run window the page already reads.
+  const flakes = flakeTally(yard.packets.gateRuns);
 
-  // THE ARRIVALS YARD — landed cars stack newest first.
+  // THE ARRIVALS YARD — four sidings, one per delivery channel, landed
+  // cars newest first along each. A car lands on the siding of its channel (design c6bd173e, car 1):
+  // the wagon's `siding` is the car's `deliveryChannel`, stamped by the
+  // gate, and its slot counts along that siding alone, so the map can
+  // lay the four as rows. WHETHER it has landed is the server's siding
+  // row (car 3): a car whose channel evidence has not arrived stands on
+  // its siding CONVERGING — its train arrived, its change is not live —
+  // with what it waits for named; a landed one carries its evidence.
   const landed = [...yard.arrivals].sort((a, b) => b.arrivedAt.ms - a.arrivedAt.ms);
-  let landedSlot = 0;
+  const sidingSlot = Object.fromEntries(DELIVERY_CHANNELS.map(ch => [ch, 0])) as Record<DeliveryChannel, number>;
   let landedRecently = 0;
   landed.forEach(t => {
     const recent = t.arrivedAt.ms > 0 && nowMs - t.arrivedAt.ms <= DAY_MS;
     t.cars.forEach(c => {
       if (claimedIds.has(c.id)) return;
-      if (recent) landedRecently += 1;
-      place({
+      const landing = sidingOf.get(c.id)?.landing ?? null;
+      // LEAVING THE SHED STAMPED. The `proven` step completing is the
+      // one transition: the car drops out of `awaitingProof`, its
+      // wagon leaves the shed, and it stands here reading `proven`
+      // instead of `arrived`. Silence is `arrived` — a car outside the
+      // window says nothing about its own proof.
+      const proof = c.proof?.stamped ? 'proven' : 'arrived';
+      const landedIn = t.mergeRef ? `landed in ${t.mergeRef}` : 'landed';
+      const arrived = t.arrivedAt.at !== '' ? t.arrivedAt.at : null;
+      const common = {
         id: c.id,
         ...base(c),
-        station: 'arrivals',
-        slot: landedSlot,
+        station: 'arrivals' as const,
+        siding: c.deliveryChannel,
+        slot: sidingSlot[c.deliveryChannel]++,
         trainId: t.id,
-        tone: 'ok',
-        lamp: 'ok',
-        // LEAVING THE SHED STAMPED. The `proven` step completing is the
-        // one transition: the car drops out of `awaitingProof`, its
-        // wagon leaves the shed, and it stands here reading `proven`
-        // instead of `arrived`. Silence is `arrived` — a car outside the
-        // window says nothing about its own proof.
-        status: `${t.mergeRef ? `landed in ${t.mergeRef}` : 'landed'} · ${c.proof?.stamped ? 'proven' : 'arrived'}`,
-        since: t.arrivedAt.at !== '' ? t.arrivedAt.at : null,
-      });
-      landedSlot += 1;
+      };
+      if (landing?.kind === 'converging') {
+        place({ ...common, tone: 'warn', lamp: 'working', status: `converging · awaiting ${landing.awaiting}`, since: arrived });
+        return;
+      }
+      // Counted as landed only past this line: a converging wagon is on
+      // its siding, not landed, and the arrivals label says how many
+      // LANDED in the day.
+      if (recent) landedRecently += 1;
+      if (landing?.kind === 'landed') {
+        place({ ...common, tone: 'ok', lamp: 'ok', status: `${landedIn} · ${landing.evidence} · ${proof}`, since: landing.at ?? arrived });
+        return;
+      }
+      // Unread is not converging: the train arrived, and the row says
+      // the channel's own evidence was not read — never that it is
+      // missing.
+      const unread = landing?.kind === 'unread' ? ` · ${c.deliveryChannel} evidence unread` : '';
+      place({ ...common, tone: 'ok', lamp: 'ok', status: `${landedIn} · ${proof}${unread}`, since: arrived });
+    });
+  });
+
+  // THE CANCELLED SIDING — withdrawn cars, newest first (yard.ts
+  // `withdrawnCars`). A car already standing somewhere keeps that place:
+  // one branch, one wagon, and a withdrawal is read off a closed packet
+  // that nothing upstream should still be placing. Static, lamp off — a
+  // withdrawal is settled, not wrong. A packet that names no branch
+  // (the six on record were withdrawn before they had one) is named by
+  // its short id, the way a car outside the window is.
+  yard.withdrawn.forEach((w, i) => {
+    if (claimedIds.has(w.car.id)) return;
+    place({
+      id: w.car.id,
+      ...base(w.car),
+      tag: w.car.branch !== '' ? tagOf(w.car.branch) : w.car.id.slice(0, 8),
+      station: 'cancelled',
+      slot: i,
+      trainId: null,
+      tone: 'static',
+      lamp: 'off',
+      status: 'withdrawn · abandoned',
+      since: w.at,
     });
   });
 
@@ -736,23 +885,28 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     const progress = Number.isNaN(startedMs)
       ? 0
       : Math.min(Math.max(nowMs - startedMs, 0) / (GATE_USUAL_MINUTES * 60_000), 1);
+    // A TRAIN's gate (128b5496) is the train being tested, not a car
+    // being gated: it takes the train's id, the `train gate` tag and
+    // its own kind, so the bay never reads as a PR car in the gates
+    // (asked twice on 2026-09-14). The car branch below is unchanged.
+    const tg = trainGateOf(g);
     if (!claimedBranches.has(g.branch)) {
       place({
         id,
-        tag: tagOf(g.branch),
-        title: car?.title ?? g.branch,
+        tag: tg?.tag ?? tagOf(g.branch),
+        title: tg?.title ?? car?.title ?? g.branch,
         branch: g.branch,
         head: car?.head ?? null,
-        kind: car?.kind ?? 'gate-run',
+        kind: tg?.kind ?? car?.kind ?? 'gate-run',
         sim: car?.sim ?? false,
         station: 'gate',
         slot: i,
-        trainId: null,
+        trainId: tg?.trainId ?? null,
         tone: g.stale ? 'warn' : 'ok',
         lamp: g.stale ? 'warn' : 'working',
         status: g.stale
-          ? `gating · ${elapsed} · STALE — past the runner's usual; the verdict may never reach the packet, re-gate`
-          : `gating · ${elapsed}`,
+          ? `${tg ? 'testing the train' : 'gating'} · ${elapsed} · STALE — past the runner's usual; the verdict may never reach the packet, re-gate`
+          : `${tg ? 'testing the train' : 'gating'} · ${elapsed}`,
         since: g.since,
       });
     }
@@ -762,7 +916,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       branch: g.branch,
       packetId: g.packet_id,
       wagonId: id,
-      tag: tagOf(g.branch),
+      tag: tg?.tag ?? tagOf(g.branch),
       since: g.since,
       elapsed,
       stale: g.stale,
@@ -780,17 +934,18 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     if (claimedBranches.has(q.branch)) return;
     const car = carByBranch.get(q.branch);
     const id = car && !claimedIds.has(car.id) ? car.id : q.packet_id;
+    const tg = trainGateOf(q);
     place({
       id,
-      tag: tagOf(q.branch),
-      title: car?.title ?? q.branch,
+      tag: tg?.tag ?? tagOf(q.branch),
+      title: tg?.title ?? car?.title ?? q.branch,
       branch: q.branch,
       head: car?.head ?? null,
-      kind: car?.kind ?? 'gate-run',
+      kind: tg?.kind ?? car?.kind ?? 'gate-run',
       sim: car?.sim ?? false,
       station: 'gate-queue',
       slot: q.position > 0 ? q.position - 1 : 0,
-      trainId: null,
+      trainId: tg?.trainId ?? null,
       tone: 'static',
       lamp: 'off',
       status: `queued · ${queueLabel(q)}`,
@@ -820,15 +975,22 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     // the client dock still lists it — skipped here so it is ONE wagon,
     // held, never a parked one beside a held twin.
     if (claimedIds.has(c.id) || claimedBranches.has(c.branch) || heldCarIds.has(c.id)) return;
+    // A struck car looks struck: one red behind it is the state in which
+    // the NEXT red holds it out, so it takes the warn stripe the map
+    // already paints and names the count (2bb0d014). Lamp stays ok — it
+    // can still board; the stripe is the invitation to look first.
+    const struck = (c.redTrains ?? 0) >= 1;
     place({
       id: c.id,
       ...base(c),
       station: 'dock',
       slot: dockSlot,
       trainId: null,
-      tone: 'ok',
+      tone: struck ? 'warn' : 'ok',
       lamp: 'ok',
-      status: c.skipReason ? `parked · held: ${c.skipReason}` : 'parked · gated green, waiting to board',
+      status:
+        (c.skipReason ? `parked · held: ${c.skipReason}` : 'parked · gated green, waiting to board') +
+        redTrainsSuffix(c.redTrains),
       since: parkedSince.get(c.id) ?? null,
     });
     dockSlot += 1;
@@ -851,7 +1013,15 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       trainId: null,
       tone: 'static',
       lamp: 'off',
-      status: `held — ${holdReason(h.reason)}`,
+      // The held reason stays first and the tone stays neutral; the
+      // strike count is appended so the siding reads WHY as well as THAT
+      // (2bb0d014). The count comes off the SERVER's row: the dock
+      // station stops listing a held car (36c3d4ca), so the client's
+      // CarRow is usually absent here, and reading it alone left a
+      // twice-struck held car showing its reason sentence with the
+      // strike invisible (ac80357b). The client row is the fallback for
+      // an older server that states no count — never a fabricated one.
+      status: `held — ${holdReason(h.reason)}${redTrainsSuffix(h.red_trains ?? fromDock?.redTrains)}`,
       since: h.parked_since,
     });
     dockSlot += 1;
@@ -908,13 +1078,18 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
         return;
       case 'gated-red': {
         const g = garageByBranch.get(row.branch);
+        // WHICH check, then WHY (6730dccb): the receipt has carried the
+        // assertion since #372, and a troubled packet must look
+        // troubled without being opened. No excerpt, no claim.
+        const why = g?.failed_line ?? null;
         place({
           ...shared,
           station: 'garage',
           slot: garageSlot++,
           tone: 'red',
           lamp: 'err',
-          status: `garaged · red gate (${g?.failed_check ?? 'run died outside a check'}) — rework`,
+          status: `garaged · red gate (${g?.failed_check ?? 'run died outside a check'})${why ? ` — ${why}` : ''} — rework`,
+          why,
           since: g?.since ?? row.opened_on,
         });
         return;
@@ -981,7 +1156,9 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
         return l ? `Track · ${locoName(l)} at ${STAGES[l.stage]}` : 'Track';
       }
       case 'arrivals':
-        return 'Arrivals';
+        return `Arrivals · ${w.siding ?? 'software'}`;
+      case 'cancelled':
+        return 'Cancelled siding';
       case 'inspection-shed':
         return 'Inspection shed';
       case 'siding-event':
@@ -994,13 +1171,17 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
     const ms = w.since ? Date.parse(w.since) : Number.NaN;
     return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
   };
+  // A withdrawn car is on neither half of the board: it is not in flight
+  // and it did not land, and the board's two counts are exactly those.
+  // The cancelled siding's own panel lists it.
   const inFlight = wagons
-    .filter(w => w.station !== 'arrivals')
+    .filter(w => w.station !== 'arrivals' && w.station !== 'cancelled')
     .sort(
       (a, b) =>
         STATION_RANK[a.station] - STATION_RANK[b.station] || a.slot - b.slot || sinceMs(a) - sinceMs(b),
     );
-  const landedRows = wagons.filter(w => w.station === 'arrivals').sort((a, b) => a.slot - b.slot);
+  // Newest first across all four sidings — the order they were placed.
+  const landedRows = wagons.filter(w => w.station === 'arrivals');
   const boardRows: BoardRow[] = [
     ...inFlight.map(w => ({ id: w.id, where: whereOf(w), landed: false })),
     ...landedRows.map(w => ({ id: w.id, where: whereOf(w), landed: true })),
@@ -1059,6 +1240,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
   const heldCarLabel =
     heldCars.length > 0 ? `${dockLabel} · ${heldCars.length} held` : dockLabel;
   const garageCount = wagons.filter(w => w.station === 'garage').length;
+  const withdrawnCount = wagons.filter(w => w.station === 'cancelled').length;
 
   return {
     now: status?.now ?? new Date(nowMs).toISOString(),
@@ -1086,7 +1268,8 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       queue: { label: queueLaneLabel(queue), count: queue.length },
       garage: { label: garageCount > 0 ? `${garageCount} gated red` : 'empty', count: garageCount },
       arrivals: { label: `${landedRecently} landed · 24h`, landed: landedRecently },
-      inspection: { label: shedLabel(shedTally), ...shedTally },
+      cancelled: { label: withdrawnCount > 0 ? `${withdrawnCount} withdrawn` : 'empty', count: withdrawnCount },
+      inspection: { label: shedLabel(shedTally), ...shedTally, flakes, flakeLabel: flakeLabel(flakes) },
       conductor: conductorMachine(status?.conductor ?? null),
       runner: feeds.runner,
       cluster: feeds.cluster,

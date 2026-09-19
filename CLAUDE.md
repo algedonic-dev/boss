@@ -233,7 +233,7 @@ real failure:
 
 | pair | what broke | now |
 |---|---|---|
-| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | pinned by a test — the fallback must stand alone when the binary is unbuilt |
+| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | **collapsed** — the bare-metal deploy and its arrays were deleted (2026-09-18); the pin now holds the LIVE container launcher's roster to the registry, which was the unpinned copy the whole time |
 | `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed twice** — `build.rs` generated the list from the manifest, then the manifest itself was deleted and the schema directory became the definition |
 | `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently | **collapsed** — one `nav-catalog.ts` answers both questions |
 | gate.sh `PREFLIGHT_LINTS` ↔ `infra/lint/` | four cars collided on the roster's tail line in one day, one left behind by #218 | **collapsed** — the roster is the directory minus a four-entry exclusion set, read the way the consist check already read it |
@@ -586,7 +586,12 @@ picking up any work:
 
 **`boss orient` runs steps 2–4 for you** — trains in transit, gates
 running, stranded greens with rescue guidance, the dock, and the task
-queue, one read (needs `BOSS_JOBS_URL`, like every SoR verb). Run it
+queue, one read (needs `BOSS_JOBS_URL`, like every SoR verb). Its
+**MY WORK** section is the actor's own queue — every ready/active
+step assigned to the id the verb signs as or to any alias the agents
+registry ties to it, grouped by kind, oldest first — because 25 such
+steps sat on the agent's alias unseen while it read only the backlog
+station (65a89769). Run it
 first; this section is the checklist behind it, and the reason each
 line exists. On its first live run it named three stranded greens —
 one of which was rescued onto the next train instead of rebuilt blind.
@@ -698,6 +703,29 @@ new surface against.
   destructive-by-policy actions are not, and keeping that line sharp is
   what makes handing over the first kind safe.
 
+- **A verdict once judged is re-read the way it was first read.** On
+  2026-09-14 train #361's ci step recorded `failing` — forge CI green,
+  the train gate RED — and ten minutes later the conductor merged it.
+  The judged-step arm recomputed the live verdict from CI ALONE; the
+  gate half was consulted only while the step was still open. Every
+  later reader of that step (the merge, the drift note, the alert,
+  auto-cancel) must see the same two halves the judgement saw, and the
+  merge holds a second lock on the frozen result (`6f18390b`). The
+  red-train alert filed for it read "check names unavailable" for the
+  same reason — it consulted only the forge rollup while the gate's
+  receipt held the name. When a verdict has two sources, every
+  consumer takes both.
+
+- **A combined-tree failure is repaired as ONE car.** The same red was
+  real: two cars each green on their own gate — a roles reader that
+  answers a dark registry with a non-empty sentinel, and a retire verb
+  whose bound checked only for emptiness — stopped the second stack
+  under a dark registry only when assembled. Neither half of the repair
+  is green alone on main (the reader's `BOSS_NODE_ROLES_SOURCE` without
+  the verb's check, or the verb's check without the source, still fails
+  the same test), so the repair rode as one car. The train gate exists
+  for exactly this class; a per-car gate cannot see it.
+
 **What held, and is worth protecting:** the seed's baseline guard
 refused to stamp over a failed prepare and saved the tenant model; the
 trains refused to claim convergence they could not evidence and filed
@@ -720,8 +748,25 @@ constraint."* An agent is trusted with a step because the protocol makes
 that step hard to get wrong — not because it promised to be careful. So
 a door that stops being true is a defect worth a car.
 
+- **The pod's doors are versioned: `infra/dev/`.** `boss-api`, the
+  `boss` shim, `wt-cargo` and `wt-web` were pod-local text under
+  `/work/tools/bin` until 2026-09-14 — unversioned, untested, and one
+  restart from disagreeing with this document. Each now lives in
+  `infra/dev/`, pinned by a shell test in `crates/core/boss-testing/tests/`
+  (`boss_api_sh`, `boss_shim_sh`, `wt_cargo_sh`, `wt_web_sh`), and
+  `/work/tools/bin/<name>` is a SYMLINK to the main checkout's copy —
+  which is why the main checkout stays on `origin/main`. The pod's
+  system-of-record spelling is `infra/dev/sor-url`, which both
+  `boss-api` and the shim read — WRITTEN from the one tree source,
+  `infra/estate/estate.toml`, and held equal to it by a test (since
+  2026-09-18, backlog 5222163e). A builder in a worktree builds
+  through `wt-cargo` (its own reflink-seeded target; 4-wide and niced
+  for `agent-*` worktrees so the operator's shell wins the scheduler)
+  and links `node_modules` through `wt-web` before any web check.
+
 - **The jobs API — `boss-api METHOD /api/path [body.json]`**
-  (`/Users/david/bin/boss-api`). Pinned to the system of record, signs
+  (`infra/dev/boss-api`; `/Users/david/bin/boss-api` on the
+  workstation). Pinned to the system of record, signs
   as the session's own actor, allowlisted so it never prompts. Invoke it
   **bare**: `boss-api GET … > file` stays inside the allowlist, `boss-api
   GET … | python3` falls out of it and gets adjudicated. Speaks
@@ -739,10 +784,25 @@ a door that stops being true is a defect worth a car.
   agent's work.
 
 - **Which deployment.** The system of record is
-  **`http://10.20.0.34:7900`**. boss-gcp's `127.0.0.1:7900` is a
-  *second, older, complete stack* with different data. The conductor's
-  systemd unit sets `BOSS_JOBS_URL` explicitly for this reason; a verb
-  run by hand inherits no unit.
+  **`http://10.20.0.34:7900`**, and since 2026-09-15 it is the ONLY
+  jobs API in the estate. boss-gcp's `127.0.0.1:7900` was a *second,
+  older, complete stack* with different data; David retired it through
+  the bounded `retire-second-stack` verb (ops-request 7912c9ae: 52
+  units stopped and disabled, the database captured first to
+  `/var/backups/boss/second-stack/second-stack-20260915T211123Z.sql`,
+  unit files and binaries untouched). The rule it taught outlives it:
+  a query against a wrong or dark instance answers `total: 0` instead
+  of erroring, so every verb pins `BOSS_JOBS_URL` explicitly (the
+  conductor's unit, the pod shim's `sor-url`) and a verb run by hand
+  inherits no unit. **The address is spelled ONCE in the tree**, in
+  `infra/estate/estate.toml` (with the forge's): each managed host's
+  converge renders it into `/etc/boss/sor.env`, every unit reads that
+  file with `EnvironmentFile=`, every script through `infra/lib/sor.sh`
+  (which refuses, naming the file, rather than fall back to a literal),
+  and the lint `the-estate-address-lives-once` refuses either IP
+  anywhere else. Until 2026-09-18 it was spelled in 47 files three ways
+  (backlog 5222163e); the cutover to `boss.algedonic.dev` is now an edit
+  to that file.
 
 - **Who a verb signs as — `BOSS_ACTOR`.** Every `boss` verb signs its
   jobs-API calls as the actor RUNNING it, read from `BOSS_ACTOR` or,
@@ -773,7 +833,33 @@ a door that stops being true is a defect worth a car.
 - **Gating a branch — `boss gate <branch> [--wait]`.** Files or reuses
   the packet, renders the runner, creates the Job. `--wait` polls to a
   verdict; hand-rolled pollers have been written three times and two
-  were broken.
+  were broken. Two ways to spend a gate for nothing, each paid for
+  once (2026-08-28) and neither discoverable from the code: **a gated
+  branch must not move** — the receipt vouches for the sha the gate
+  resolved at launch, so a commit pushed after it leaves a car the dock
+  refuses as "gated, then changed" — a rebase of a parked car is the
+  same event. The repair is to gate the new tip again: a re-gate
+  REFRESHES the parked car (the fresh receipt rides it as
+  `regate_receipt`) rather than filing a twin, and `boss rerail
+  --finish` does the same once a green vouches for the head; and
+  **prose with backticks does not survive argv** — every `--park-*`
+  text goes through the shell, where a backtick is command substitution
+  and the phrase is replaced by nothing, silently. Single quotes, or no
+  backticks in car prose.
+
+- **The train's gate is the assembled tree's test — it belongs in the
+  gate lane.** Since design 128b5496 (2026-09-13) the conductor files
+  one gate-run for every train's `train/…` branch when the PR opens;
+  the cluster gate runs the Rust checks on the ASSEMBLED consist (warm
+  target, ~2–10 min) and forge CI builds only the image, the locomotive
+  and the web. So a `train/…` run in a gate bay is not a PR car in the
+  wrong place; it is the train being tested, and it caught the
+  interaction above. What was wrong, and is fixed, was every OTHER lane
+  drawing that run as a car — stranded green, garage, limbo — and the
+  bay drawing it in a car's wagon (`is_train_gate` is the one
+  predicate; the yard, orient and the stranded sweep all use it). The
+  question "why is a PR train in the gates" was asked three times in
+  one afternoon; this paragraph is the answer.
 
 - **Publishing a branch to the forge.** A workstation has no forge
   credential. Push to the conductor clone (`gcp` remote) under

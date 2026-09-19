@@ -36,12 +36,182 @@
 # The three hooks below are functions so the self-test can replace
 # them; the launcher uses the defaults.
 
-# Publish the platform operator baseline, then the tenant. Both go
-# through the public API. Non-zero means the tenant is NOT published
-# and the baseline is untouched.
+# Where the seed scripts live in the image; overridable so the shell
+# test (crates/core/boss-testing/tests/the_launcher_publishes_a_tenant_
+# by_its_id.rs) can point publish_tenant at stubs.
+BOSS_INFRA_DIR="${BOSS_INFRA_DIR:-/opt/boss/infra}"
+
+# The tenant directory (tenant.toml + seeds/). BOSS_TENANT_DIR names it
+# outright (fcc1d57b car 2); the N-1 deployment sets only
+# BOSS_TENANT_MANIFEST_TOML, whose dirname is the tenant dir at the
+# root spelling and one above it at the examples' seeds/ spelling.
+tenant_dir() {
+    if [[ -n "${BOSS_TENANT_DIR:-}" ]]; then
+        echo "$BOSS_TENANT_DIR"
+        return
+    fi
+    local d
+    d="$(dirname "${BOSS_TENANT_MANIFEST_TOML:-/opt/boss/examples/brewery/seeds/tenant.toml}")"
+    [[ "$(basename "$d")" == "seeds" ]] && d="$(dirname "$d")"
+    echo "$d"
+}
+
+# `[meta] tenant_id` from the manifest at either spelling; empty when
+# there is none — which the generic publish then refuses by name.
+tenant_id_of() {
+    local f
+    for f in "$1/tenant.toml" "$1/seeds/tenant.toml"; do
+        [[ -f "$f" ]] || continue
+        sed -n 's/^tenant_id *= *"\([^"]*\)".*/\1/p' "$f" | head -1
+        return
+    done
+}
+
+# The platform operator baseline, then the tenant publish, then — for
+# a tenant with an engine — what only the engine seeds. All of it goes
+# through the public API. Non-zero means the tenant is NOT published.
+#
+# ONE DOOR FOR EVERY TENANT (tenant-publish-for-every-tenant; backlog
+# b644d727, 2026-09-17). Until ee7b62bb (2026-09-16) seed-brewery-
+# tenant.sh ran unconditionally, so a deployment pointed at a tenant
+# with no engine — Algedonic, LLC — would still have seeded the
+# brewery; that car chose the script by `[meta] tenant_id`, and the
+# brewery kept its engine's prepare as its ONLY publish. Measured
+# 2026-09-17: that prepare POSTs classes.json but never
+# seeds/locations.toml nor seeds/chart_of_accounts.toml — the
+# playground inherited its sites and its chart from the migrations —
+# and nothing published the brewery's own seeds/rules.toml at all, so
+# an instance whose product files no longer carry those reactors ran
+# the brewery with none. Now `boss tenant publish <dir>`
+# (seed-tenant.sh) runs for every tenant, brewery included — after
+# the operator baseline, see below — and the engine script runs LAST
+# for the sim data (accounts, vendors, products, parts, opening
+# balances), the operator hires and the reset-baseline stamp. Both
+# are idempotent against each other, in
+# this order: the engine's own classes post is insert-if-absent
+# (inserted 0), its calendars batch replaces the same rows by code,
+# its company mint upserts, its policy publish GETs first, its people
+# posts answer 409 on the roster the door just landed, and its
+# workflow walk skips every kind an authoring Job already published —
+# which also stamps the brewery's Workflows with owning_team
+# `brewery` (the contract's rule: the manifest's tenant_id), where the
+# engine wrote `brewery-bootstrap`. The reverse order is NOT safe once
+# a fresh instance evicts the migrations' example rows (backlog
+# 718ac982): the engine's people posts count a 409 as "already there",
+# so a roster whose `location` no door had seeded would be skipped in
+# silence.
+#
+# THE BASELINE GOES FIRST, handed the tenant dir (backlog 1ee28274,
+# 2026-09-18). Two constraints pull on this order, and the file the
+# publish is about to send satisfies both:
+#
+#   Q7 — the baseline's injected emp-bootstrap-admin is the ONLY
+#   platform-admin on an example instance, and owner resolution needs
+#   a human platform-admin before ANY platform Job can open. With the
+#   baseline second (b644d727, 2026-09-17) the fresh playground's
+#   publish 400ed at seeds/workflows.toml — "no responsible human
+#   resolvable for owner automation:bootstrap (owner_role
+#   platform-admin)" — and the pod ran DEGRADED, sim down, retrying
+#   every 300 s: 0 tenant rules, 0 workflow-design packets (read
+#   through pod-logs, 2026-09-18 04:42Z).
+#
+#   0d2d7daa (2026-09-16) — a real company's roster declares its
+#   founder with exactly the BOSS_BOOTSTRAP_ADMIN_EMAIL address, and a
+#   baseline that injects first gives the fresh instance the bootstrap
+#   row and then refuses the founder on the LOWER(email) unique index.
+#   That is why the baseline was moved second in the first place.
+#
+# The resolution: boss-operator-baseline-seed reads the tenant's
+# DECLARED roster from the seed file — BOSS_TENANT_DIR/seeds/
+# employees.json, not the API, which is empty until the publish — and
+# skips the bootstrap-admin injection when that file declares the
+# email ("declared by the tenant's roster; the publish lands it"),
+# while still seeding the other operator hires. A roster that does not
+# declare it (the brewery's) gets the injection as before, and the
+# publish then finds its platform-admin. The brewery's engine expects
+# the bootstrap admin to exist, so it runs last. Each step returns at
+# once on failure — the DEGRADED loop retries this function whole — so
+# the publish never runs against an instance that cannot open a
+# platform Job, and the engine never seeds against a half-published
+# tenant.
+#
+# THE ESTATE GOES BEFORE ALL OF IT (backlog ee368d0c, 2026-09-18). The
+# machines this instance runs on are the INSTANCE's declaration —
+# infra/estate/estate.toml, published by seed-estate.sh through the
+# estate door, insert-if-absent — not a tenant's and not a
+# migration's: until that car the estate reached a database only as a
+# schema migration, so every fresh database booted declaring this
+# LAN's seven machines. It needs no platform-admin (no packet opens)
+# and nothing after it needs to wait, but the converges that read a
+# host's roles off /api/estate/nodes and the observer that compares
+# declared against observed want it before anything else, so it runs
+# first; its failure is the verdict like the others'.
+#
+# ONCE PER DATABASE (backlog 6a8d4972, design e187198f car 2,
+# 2026-09-18). Until this car the tenant publish ran at EVERY services
+# start with no guard, so a converge's ConfigMap rebuild implied a
+# publish and — until car 1 made every door insert-if-absent — four
+# doors overwrote a live row on each boot. Now the publish reads the
+# stamp a successful `boss tenant publish` leaves in the database
+# (`boss tenant published`, tenant_publishes) and runs only while it
+# is absent — a fresh instance: the OSS quickstart, the playground, a
+# switched database — or when BOSS_TENANT_TAKE names registries, car
+# 1's `--take` for one boot. A running instance's launcher prints ONE
+# line and moves on. The estate, the baseline and the engine are not
+# the tenant publish and keep running: each is idempotent, the engine
+# owns the sim's reset baseline, and the baseline's operator hires are
+# the platform's, not the tenant's. The verb run by an operator reads
+# no stamp — `boss tenant publish <dir>` after the stamp still inserts
+# absent rows (car 1's behaviour), which is how a row authored in the
+# repo reaches a running instance; the stamp gates only THIS automatic
+# publish.
+tenant_publish_wanted() {
+    if [[ -n "${BOSS_TENANT_TAKE:-}" ]]; then
+        echo "    tenant publish: BOSS_TENANT_TAKE=${BOSS_TENANT_TAKE} — publishing with --take over any stamp (the operator's decision for this boot)"
+        return 0
+    fi
+    if [[ -z "${BOSS_POSTGRES_URL:-}" ]]; then
+        echo "    WARN: tenant publish stamp not read — BOSS_POSTGRES_URL is unset in this container; publishing (insert-if-absent) as before the stamp existed" >&2
+        return 0
+    fi
+    local stamp rc err reason
+    # The verb: 0 stamped (the date is the first word of its one
+    # stdout line), 1 no stamp, 2 the database could not be read; its
+    # stderr is the reason, kept apart so a warning never becomes the
+    # date.
+    err="$(mktemp)"
+    stamp="$(boss tenant published 2>"$err")"
+    rc=$?
+    reason="$(tr '
+' ' ' <"$err")"
+    rm -f "$err"
+    case "$rc" in
+        0)
+            echo "    tenant published ${stamp%% *}; the instance is the truth; publish --take to overwrite (a new repo row lands through an operator's boss tenant publish, insert-if-absent, or one boot with BOSS_TENANT_TAKE=<registries>)"
+            return 1
+            ;;
+        1)
+            echo "    ${stamp} — publishing"
+            return 0
+            ;;
+        *)
+            echo "    WARN: tenant publish stamp unreadable (exit ${rc}: ${reason}${stamp}) — publishing (insert-if-absent) rather than guessing the database is stamped" >&2
+            return 0
+            ;;
+    esac
+}
+
 publish_tenant() {
-    /opt/boss/infra/seed-operator-baseline.sh
-    /opt/boss/infra/seed-brewery-tenant.sh
+    local dir
+    dir="$(tenant_dir)"
+    "$BOSS_INFRA_DIR/seed-estate.sh" || return $?
+    BOSS_TENANT_DIR="$dir" "$BOSS_INFRA_DIR/seed-operator-baseline.sh" || return $?
+    if tenant_publish_wanted; then
+        BOSS_TENANT_DIR="$dir" "$BOSS_INFRA_DIR/seed-tenant.sh" || return $?
+    fi
+    case "$(tenant_id_of "$dir")" in
+        brewery) "$BOSS_INFRA_DIR/seed-brewery-tenant.sh" ;;
+    esac
 }
 
 # The sim posts jobs the moment it starts, and their side effects fire

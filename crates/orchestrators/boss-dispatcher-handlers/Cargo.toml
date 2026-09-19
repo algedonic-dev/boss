@@ -14,6 +14,7 @@ boss-core = { path = "../../core/boss-core" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-nats = { path = "../../core/boss-nats" }
 boss-jobs = { path = "../../core/boss-jobs" }
+boss-people-client = { path = "../../modules/boss-people-client" }
 boss-expr = { path = "../../core/boss-expr" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-calendar-client = { path = "../../core/boss-calendar-client" }
@@ -26,6 +27,8 @@ base64 = "0.22"
 chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+rand = "0.10"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

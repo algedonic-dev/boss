@@ -158,8 +158,50 @@ pub struct StepSpec {
     /// so every existing spec is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimable: Option<bool>,
+    /// WHO THIS STEP IS FOR, declared once (design f5ebd2e1, backlog
+    /// 67a58840). A closed set of shapes — an individual, a role, a
+    /// department, a named station — from which today's three placement
+    /// keys are DERIVED by [`crate::audience::selectors_for`] and written
+    /// onto the packet at materialisation. `authority_role` above is the
+    /// legacy spelling of the `role` shape and is kept as the projection
+    /// so every existing reader (the assignment query, the projected
+    /// `q.<role>.<kind>` stations, the workflow editor) keeps working
+    /// unchanged; the seed loader fills it in from a `role` audience,
+    /// and the publish lint refuses a step that declares both and
+    /// disagrees. `None` means today's behaviour, exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<crate::audience::Audience>,
+    /// HOW AN AGENT RUNS THIS STEP, declared once (design c87fb59b car
+    /// 1, backlog 028891cf): `agent = { profile = "builder", model =
+    /// "opus-5[1m]", budget_usd = 5, effort = "high" }`. The prompt is
+    /// the step's own `procedure`. Projected at materialisation by
+    /// [`crate::agent_spec::projection`] onto four plain step-metadata
+    /// keys (`agent_profile`, `agent_model`, `agent_budget_usd`,
+    /// `agent_effort`) the way an audience projects, so a station's
+    /// `step.metadata_equals` and the claim door read the packet. The
+    /// publish lint refuses a model the rate card cannot price and a
+    /// budget that is not positive. `None` means today's behaviour,
+    /// exactly: nothing is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent_spec::AgentSpec>,
     #[serde(default)]
     pub metadata_defaults: serde_json::Value,
+}
+
+impl StepSpec {
+    /// The placement keys this step projects — the ONE reader's door
+    /// for "who is this for" on a spec. An audience wins outright; a
+    /// step that declares none projects its legacy `authority_role`
+    /// alone, which is today's behaviour unchanged.
+    pub fn selectors(&self) -> crate::audience::Selectors {
+        match &self.audience {
+            Some(audience) => crate::audience::selectors_for(audience),
+            None => crate::audience::Selectors {
+                authority_role: self.authority_role.clone(),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// An outcome marker on a terminal step. Reaching `Completed` on a
@@ -326,6 +368,7 @@ fn workflow_design_spec() -> WorkflowSpec {
                 required: true,
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
+                covers: None,
             }],
             ..Default::default()
         },
@@ -361,6 +404,7 @@ fn workflow_design_spec() -> WorkflowSpec {
                 required: true,
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
+                covers: None,
             }],
             ..Default::default()
         },
@@ -418,339 +462,6 @@ fn workflow_design_spec() -> WorkflowSpec {
          The terminal `workflow-publish` step writes the spec into the registry and \
          emits `jobs.kind.published` into audit_log. See \
          docs/architecture-decisions.md (Jobs, Workflows, Steps)."
-            .to_string(),
-    );
-    spec
-}
-
-/// Build the canonical `ship-a-change` WorkflowSpec.
-///
-/// Shipping is work, so it is a Job — the same argument feedback got.
-/// What it buys here is different, though: a Job gives a change an
-/// owner, a recorded decision about its boundary, and a place in the
-/// same throughput view as everything else the team does. `/system/flow`
-/// counts these against a cadence target without a second mechanism.
-///
-/// The Subject is a `custom` Subject whose id is the branch name, the
-/// shape feedback uses for a route and design-doc-review uses for a
-/// path. "What shipped on this branch" then answers from Subject
-/// history rather than from a report someone writes.
-///
-/// ## Why `scope` comes first, and is gated on a person
-///
-/// The problem this kind exists to solve is that a PR's boundary gets
-/// decided at the END, when whoever is working is tired and everything
-/// is already entangled. The branch that added this spec is the
-/// evidence: one PR carrying a guest sign-in, a dispatcher fix, a
-/// ledger determinism fix and two new surfaces, because nothing ever
-/// asked where it should have been cut.
-///
-/// So the first step is a human declaring what this change contains
-/// and what it deliberately leaves out, BEFORE the work. `excludes` is
-/// required for exactly that reason: naming what you are not doing is
-/// the act that keeps a change small, and a field nobody has to fill
-/// in would be filled in never. It is the split point, made a state
-/// transition instead of a judgement call.
-///
-/// Step graph:
-///  -1. `opened`  — someone started a change
-///   0. `scope`   — declare the boundary (human-gated)
-///   1. `build`   — the change, with the test that fails without it
-///   2. `gate`    — everything green, and observed working
-///   3. `review`  — opened for review, url recorded
-///   999. `merged`/`abandoned` — outcomes
-// Kept only as the fidelity test's expected value — see
-// `the_platform_bundle_matches_the_specs_it_replaced`. Out of
-// `platform_workflows()`, so the lib build has no caller: the kind
-// now lives in infra/platform/workflows/ and an operator edit
-// to it survives a boot, which is the whole point of the move.
-#[cfg(test)]
-fn ship_a_change_spec() -> WorkflowSpec {
-    let steps = vec![
-        StepSpec {
-            title: "opened".into(),
-            kind: "trigger".into(),
-            ready_when: "true".into(),
-            title_template: "Change started".into(),
-            metadata_defaults: serde_json::json!({
-                "trigger_kind": "operator",
-                "trigger_name": "operator-starts-a-change",
-            }),
-            ..Default::default()
-        },
-        StepSpec {
-            title: "scope".into(),
-            kind: "task".into(),
-            ready_when: "steps.opened.done".into(),
-            title_template: "Declare the boundary".into(),
-            // Human-gated for the same reason triage is: `task` carries
-            // no required role, and an ungated ready step gets
-            // role-matched and completed by the simulated workforce. A
-            // scope nobody chose is worse than no scope step, because
-            // the audit trail then says someone decided.
-            authority_role: Some("platform-admin".into()),
-            fields: vec![
-                boss_core::job::StepField {
-                    name: "summary".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-                // Required, deliberately. See the doc comment: the
-                // sentence that keeps a change small is the one about
-                // what it is not doing, and an optional field for it
-                // would be skipped every time under exactly the
-                // conditions that need it.
-                boss_core::job::StepField {
-                    name: "excludes".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "build".into(),
-            kind: "task".into(),
-            ready_when: "steps.scope.done".into(),
-            title_template: "Build it".into(),
-            authority_role: Some("platform-admin".into()),
-            fields: vec![
-                // The test that fails without the change. Named rather
-                // than checkboxed: "tests pass" is true of a change
-                // with no test, and a name is something a reviewer can
-                // go read.
-                boss_core::job::StepField {
-                    name: "test".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "gate".into(),
-            kind: "task".into(),
-            ready_when: "steps.build.done".into(),
-            title_template: "Green, and observed working".into(),
-            authority_role: Some("platform-admin".into()),
-            fields: vec![
-                boss_core::job::StepField {
-                    name: "gates".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-                // How the change was seen working on a running system
-                // — or why there is nothing to observe. Required
-                // because "the tests passed" and "the operator can use
-                // it" came apart repeatedly: a deploy that copied a
-                // stale binary, a fix reported from a green suite while
-                // the running service still had the bug.
-                boss_core::job::StepField {
-                    name: "verified".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-                // The gate's OWN account of the run, not the author's.
-                //
-                // `gates` and `verified` are prose, so "the gate was
-                // green" has always been something the protocol takes
-                // on trust. On 2026-08-17 a car asserted
-                // `infra/gate.sh --auto green` while its crate did not
-                // compile, and the train it boarded reddened twice
-                // (742d1faa). Two more reds the same day were the
-                // subtler version: the gate really did pass, on a
-                // laptop, in a shape CI does not run — one suite that
-                // had never seen `FORGEJO_ACTIONS`, one that had never
-                // run against a clean tree whose HEAD is its own trunk.
-                // Neither prose field would have shown that, because
-                // the author did not know it either.
-                //
-                // `infra/gate.sh` now writes a receipt (see
-                // `write_receipt`) recording the mode, the commit,
-                // whether the tree was dirty, the host, whether any CI
-                // marker was set, the free space, and every check with
-                // its result. Paste it here.
-                //
-                // This is EVIDENCE, NOT ENFORCEMENT — nothing stops
-                // someone typing a fiction into a string field, and
-                // pretending otherwise would be the same trust the
-                // prose fields already misplace. What it changes is
-                // that the honest answer is now the easy one, and that
-                // the fact which keeps catching us — WHERE the gate ran
-                // — is written down by something other than the person
-                // making the claim.
-                boss_core::job::StepField {
-                    name: "receipt".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-                // What the change LOOKS like, for a car that changes a
-                // rendered surface — a screenshot path, or what was
-                // rendered and looked at.
-                //
-                // Optional, because most cars change no surface and a
-                // required field would be answered "n/a" into
-                // meaninglessness. It exists because the protocol is a
-                // better place to carry this than any one actor's
-                // notes: on 2026-08-15 a UI change was "fixed" twice in
-                // the wrong file and both diffs compiled, typechecked
-                // and read plausibly. The tooling to render it was
-                // already in the repo — `apps/web/playwright.mocked
-                // .config.ts`, chromium installed — and one screenshot
-                // named the mistake in a minute. Asking the question on
-                // the step is what makes that habit belong to whoever
-                // holds the car rather than to whoever happened to
-                // learn it.
-                boss_core::job::StepField {
-                    name: "rendered".into(),
-                    field_type: "string".into(),
-                    required: false,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "review".into(),
-            kind: "task".into(),
-            ready_when: "steps.gate.done".into(),
-            title_template: "Open for review".into(),
-            authority_role: Some("platform-admin".into()),
-            fields: vec![boss_core::job::StepField {
-                name: "pr_url".into(),
-                field_type: "string".into(),
-                required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-            }],
-            ..Default::default()
-        },
-        // Merged is not done. David, 2026-08-19, after a day of
-        // "changes are done that are not visible in my UI experience":
-        // *"Since I am using 'prod', I should have the definitive view
-        // and proof that the change is fully deployed, which should be
-        // the happy path terminal outcome."* The step's contract is
-        // proof AT THE CONSUMING LAYER of the deployed system — a
-        // browser check (infra/uxprobe) for anything with a surface,
-        // endpoint/log evidence for anything without one. `verified`
-        // is required at done so the proof is on the record, and
-        // `method` names which kind of proof it was.
-        //
-        // Same trigger the terminal used to fire on: the conductor (or
-        // a person) observed the merge. The terminal below now waits
-        // for the proof instead.
-        StepSpec {
-            title: "proven".into(),
-            kind: "task".into(),
-            ready_when: "steps.review.done AND job.metadata.merged = \"true\"".into(),
-            title_template: "Proven in prod".into(),
-            authority_role: Some("platform-admin".into()),
-            fields: vec![
-                boss_core::job::StepField {
-                    name: "verified".into(),
-                    field_type: "string".into(),
-                    required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-                boss_core::job::StepField {
-                    name: "method".into(),
-                    field_type: "browser|api|log".into(),
-                    required: false,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "merged".into(),
-            kind: "outcome".into(),
-            // The happy terminal fires on the PROOF, not the merge —
-            // the outcome value stays "merged" so every consumer of
-            // the close marker (the feedback obligation above all)
-            // keeps matching, and now fires only once the change is
-            // verified where the operator actually lives. The
-            // conductor's own bookkeeping is untouched: it still
-            // completes `review` and sets the merge marker, and the
-            // packet then waits at `proven` instead of closing.
-            ready_when: "steps.proven.done".into(),
-            title_template: "Merged".into(),
-            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
-            terminal: Some(Terminal {
-                outcome: "merged".into(),
-            }),
-            ..Default::default()
-        },
-        // A change that gets abandoned is a real outcome, and the
-        // cadence view should tell it apart from one still in flight.
-        //
-        // Gated on an explicit `job.metadata.abandoned` marker, NOT on
-        // "scope is done". The first version used the latter and it
-        // closed the very first Job filed against this Workflow: an
-        // ungated terminal that is ready is a terminal the dispatcher
-        // completes, so `complete-marker-on-step-ready` fired the
-        // instant scope finished, skipped build/gate/review, and shut
-        // the Job as abandoned seconds after it opened.
-        //
-        // An always-ready escape hatch is indistinguishable from "this
-        // Job is finished". Abandoning has to be an act someone
-        // performs, which is what the marker makes it.
-        StepSpec {
-            title: "abandoned".into(),
-            kind: "outcome".into(),
-            // BOTH halves are load-bearing. `steps.scope.done` is the
-            // DAG edge — the viability lint rejects a step no trigger
-            // can reach, and gating on metadata alone left this one
-            // orphaned. The marker is what stops it being ready by
-            // default, which is what let the dispatcher close a Job
-            // the moment its scope was declared.
-            ready_when: "steps.scope.done AND job.metadata.abandoned = \"true\"".into(),
-            title_template: "Abandoned".into(),
-            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
-            terminal: Some(Terminal {
-                outcome: "abandoned".into(),
-            }),
-            ..Default::default()
-        },
-    ];
-
-    let mut spec = WorkflowSpec::platform_seed(
-        "ship-a-change",
-        "Ship a change",
-        "platform",
-        vec!["custom".into()],
-        steps,
-    );
-    // Same owner as the other platform meta-kinds — and what puts
-    // these Jobs on `/system/flow`, which selects by owner_role rather
-    // than by a list of kinds.
-    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
-    spec.description = Some(
-        "One change, from declaring its boundary to merging it. The Subject is a `custom` \
-         Subject whose id is the branch, so \"what shipped here\" is a Subject-history \
-         question. The `scope` step is the point of the kind: it asks a person what the \
-         change contains and what it deliberately excludes BEFORE the work, which is the \
-         only moment that decision keeps a PR small. Counted on /system/flow, so a cadence \
-         target needs no second mechanism. Name the feedback packet this change answers in \
-         `metadata.backlog_item` — a declared job edge, ref-checked at the write, and the \
-         link the dispatcher follows on merge to complete that packet's open branch and \
-         tell its filer. Use `metadata.backlog_text` only when the referent is not a Job \
-         on this instance (legacy, or a request that arrived as prose); it is free text \
-         and nothing follows it."
             .to_string(),
     );
     spec
@@ -824,6 +535,7 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                 required: true,
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
+                covers: None,
             }],
             ..Default::default()
         }
@@ -856,6 +568,7 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     required: true,
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
+                    covers: None,
                 },
                 boss_core::job::StepField {
                     name: "destroying".into(),
@@ -863,6 +576,7 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     required: true,
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
+                    covers: None,
                 },
             ],
             ..Default::default()
@@ -1039,101 +753,6 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
     // code used to. They are deleted for real once that test has
     // watched a release go by.
     vec![]
-}
-
-/// One maintenance kind per chore (internal-forge.md Q6): the systemd
-/// timer stays the EXECUTOR; the Job is the visibility layer. The
-/// timer's unit ensures the open Job exists at start
-/// (`boss-maintenance-wrap.sh`) and completes `run` on success via
-/// `boss-step.sh` — which is also why it is one KIND per chore:
-/// boss-step's contract is "the single open Job of a workflow".
-/// Failure completes nothing, so the Job stays OPEN — visible on the
-/// fleet and the canvas until a later successful run (or a human)
-/// closes it. A failed backup is an algedonic signal, not a journal
-/// line.
-///
-/// Deliberately NOT spawned by the dispatcher's schedule runner: it
-/// fires on SIM-day boundaries, and at warp a "daily" rule fires
-/// every couple of wall-minutes — maintenance is wall-clock work.
-///
-/// `description` is prose and goes in the `description` column;
-/// `category` is the grouping key, and these are platform chores like
-/// every other `maintenance-*` protocol authored under
-/// infra/platform/workflows/, so it is "platform" for all of them.
-///
-/// TEST-ONLY since 2026-09-11. All three chores this built are authored
-/// at infra/platform/workflows/maintenance-{backup,audit-integrity,
-/// ledger-replay}.toml, and it survives as
-/// `the_platform_bundle_matches_the_specs_it_replaced`'s expected
-/// value — the proof the bundle says exactly what the code used to.
-/// Deleted once that test has watched a release go by.
-#[cfg(test)]
-fn maintenance_spec(kind: &str, label: &str, description: &str) -> WorkflowSpec {
-    let steps = vec![
-        StepSpec {
-            title: "scheduled".into(),
-            kind: "trigger".into(),
-            ready_when: "true".into(),
-            title_template: "Timer fired".into(),
-            metadata_defaults: serde_json::json!({
-                "trigger_kind": "periodic",
-                "trigger_name": "systemd-timer",
-            }),
-            ..Default::default()
-        },
-        StepSpec {
-            title: "run".into(),
-            kind: "task".into(),
-            ready_when: "steps.scheduled.done".into(),
-            title_template: "Run to completion".into(),
-            // Gated so the simulated workforce cannot role-match and
-            // "complete" real maintenance (the ship-a-change scope
-            // comment's hazard); the timer's boss-step call presents
-            // the automation actor with this role.
-            authority_role: Some("platform-admin".into()),
-            fields: vec![boss_core::job::StepField {
-                name: "result".into(),
-                field_type: "string".into(),
-                required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-            }],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "completed".into(),
-            kind: "outcome".into(),
-            ready_when: "steps.run.done AND steps.run.metadata.result = \"ok\"".into(),
-            title_template: "Maintenance completed".into(),
-            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
-            terminal: Some(Terminal {
-                outcome: "completed".into(),
-            }),
-            ..Default::default()
-        },
-        // A run that died records how (boss-step.sh from ExecStopPost:
-        // the service result and exit status) and lands here, instead
-        // of sitting open looking like a run in progress until a later
-        // run closed it "ok" (2026-09-05, twice in one afternoon).
-        StepSpec {
-            title: "failed".into(),
-            kind: "outcome".into(),
-            ready_when: "steps.run.done AND steps.run.metadata.result != \"ok\"".into(),
-            title_template: "Maintenance failed".into(),
-            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
-            terminal: Some(Terminal {
-                outcome: "failed".into(),
-            }),
-            ..Default::default()
-        },
-    ];
-    let mut spec =
-        WorkflowSpec::platform_seed(kind, label, "platform", vec!["custom".into()], steps);
-    spec.description = Some(description.to_string());
-    // Owner + /system/flow membership: maintenance is the department's
-    // own labor, so it appears with the other platform kinds.
-    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
-    spec
 }
 
 /// Which `user-feedback` step a triage disposition opens, and whether
@@ -1582,7 +1201,10 @@ where
             // in-flight step keeps the assurance its Workflow version
             // declared even if the protocol is later edited.
             assurance_required: spec_step.assurance_required,
-            assignee_id: None,
+            // An `individual` audience is born assigned — the one key
+            // the assignment query's individual arm reads. Every other
+            // shape (and no audience) is born unassigned, as before.
+            assignee_id: spec_step.selectors().assignee_id,
             status: StepStatus::Pending,
             sort_order: idx as i32,
             blocked_by,
@@ -1591,7 +1213,7 @@ where
                 .iter()
                 .filter_map(|r| {
                     if r == "@authority_role" {
-                        spec_step.authority_role.clone()
+                        spec_step.selectors().authority_role
                     } else {
                         Some(r.clone())
                     }
@@ -2094,17 +1716,46 @@ fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::
         serde_json::Value::Object(_) => defaults.clone(),
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
-    if let (Some(role), serde_json::Value::Object(m)) = (&step.authority_role, &mut merged) {
+    // The placement keys are DERIVED from the step's one audience
+    // declaration (`selectors()`; the legacy `authority_role` when it
+    // declares none — today's behaviour unchanged). `authority_role`
+    // is what the assignment query's role arm and every projected
+    // `q.<role>.<kind>` station read; `station` is new and readable by
+    // any station predicate through `step.metadata_equals`; the
+    // audience itself rides beside them so the projection can be
+    // checked against its source on the packet (f5ebd2e1 car 1).
+    let selectors = step.selectors();
+    if let (Some(role), serde_json::Value::Object(m)) = (&selectors.authority_role, &mut merged) {
         m.insert(
             "authority_role".to_string(),
             serde_json::Value::String(role.clone()),
         );
+    }
+    if let (Some(station), serde_json::Value::Object(m)) = (&selectors.station, &mut merged) {
+        m.insert(
+            "station".to_string(),
+            serde_json::Value::String(station.clone()),
+        );
+    }
+    if let (Some(audience), serde_json::Value::Object(m)) = (&step.audience, &mut merged)
+        && let Ok(value) = serde_json::to_value(audience)
+    {
+        m.insert("audience".to_string(), value);
     }
     // Surfaced the same way `authority_role` is, because the
     // dispatcher reads the materialized STEP, never the spec — it is
     // reacting to an event and has no workflow row in hand.
     if let (Some(claimable), serde_json::Value::Object(m)) = (step.claimable, &mut merged) {
         m.insert("claimable".to_string(), serde_json::Value::Bool(claimable));
+    }
+    // HOW an agent runs it, the same way: the one block, four plain
+    // keys (`agent_spec::projection`), so a station's
+    // `step.metadata_equals` and the claim door read the packet
+    // (c87fb59b car 1). A step with no block writes none of them.
+    if let (Some(agent), serde_json::Value::Object(m)) = (&step.agent, &mut merged) {
+        for (key, value) in crate::agent_spec::projection(agent) {
+            m.insert(key.to_string(), value);
+        }
     }
     merged
 }
@@ -3659,26 +3310,33 @@ mod tests {
         //
         // The presence half is kept for it by `CONVERTED` above, which
         // is the assertion that actually caught something.
+        //
+        // `ship-a-change` LEFT THE SAME WAY on 2026-09-15 (backlog
+        // 0ccf23ec), for the same reason one version later. Its live row
+        // had moved to v31 through operator publishes — a `settled`
+        // outcome, a required `proof` field on `proven` (the machine-
+        // probe rule, v22), a procedure on every step — while the pin
+        // here still described the v14 shape, so the bundle file it
+        // vouched for was the one copy that could NOT be brought level
+        // with the deployment without editing Rust. The file now
+        // carries the live row, the drift lint compares steps as well
+        // as prose, and this literal held nothing the file does not.
+        //
+        // THE THREE `maintenance_spec` CHORES LEFT ON 2026-09-18 (backlog
+        // 4f909642), a week and 133 landed trains after their move. Every
+        // chore's `run` step now declares the automation that completes
+        // it as its audience instead of a bare `platform-admin` role
+        // (the shape that had the dispatcher nominate each one to the
+        // agent alias), and that is a protocol change the literal would
+        // have had to mirror in Rust — the same backwards edit that
+        // retired the two above. The presence half stays in `CONVERTED`;
+        // `platform_bundle_maintenance.rs` pins the new shape from the
+        // bundle side, for every chore rather than the three that
+        // happened to be literals.
         let expected = [
             workflow_design_spec(),
             regenerate_deployment_spec(),
-            ship_a_change_spec(),
             design_doc_review_spec(),
-            maintenance_spec(
-                "maintenance-backup",
-                "Nightly backup",
-                "The 03:00 backup run — configs, Postgres dump, kanidm state.",
-            ),
-            maintenance_spec(
-                "maintenance-audit-integrity",
-                "Audit-log integrity check",
-                "The 03:00 chain scan + event-kind drift guard.",
-            ),
-            maintenance_spec(
-                "maintenance-ledger-replay",
-                "Ledger replay check",
-                "The 03:30 rooted-at-audit-log replay comparison.",
-            ),
         ];
         // Every CONVERTED kind must still be here. This is the
         // load-bearing half and it has earned its keep: it went red
@@ -4001,6 +3659,7 @@ mod tests {
                 required: true,
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
+                covers: None,
             },
             StepField {
                 name: "markdown".into(),
@@ -4008,6 +3667,7 @@ mod tests {
                 required: true,
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
+                covers: None,
             },
             StepField {
                 name: "resolutions".into(),
@@ -4015,6 +3675,7 @@ mod tests {
                 required: true,
                 filled_by: FilledBy::Executor,
                 item_keys: Vec::new(),
+                covers: None,
             },
         ];
         step.metadata = serde_json::json!({ "title": "Packet loss" });
@@ -4042,6 +3703,7 @@ mod tests {
             required: true,
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
+            covers: None,
         }];
 
         // An explicit null is not a value.
@@ -4081,6 +3743,7 @@ mod tests {
             required: true,
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
+            covers: None,
         }];
 
         // A title-less element is named by index and key.
@@ -4135,6 +3798,7 @@ mod tests {
             required: false,
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
+            covers: None,
         }];
         assert!(
             missing_filer_fields(std::slice::from_ref(&step)).is_empty(),
@@ -4754,11 +4418,13 @@ mod tests {
             vec![
                 "Triage feedback.disposition".to_string(),
                 "Reproduce and investigate.disposition".to_string(),
+                "Draft the design.design_id".to_string(),
                 "Decide the design.verdict".to_string(),
             ],
-            "the feedback flow collects a disposition at each deciding step and a \
-             verdict at the design review, nothing else; anything else here is a \
-             step no surface can complete"
+            "the feedback flow collects a disposition at each deciding step, the id of \
+             the design the draft filed (`boss design --answers` writes it, f90ca046), \
+             and a verdict at the design review, nothing else; anything else here is \
+             a step no surface can complete"
         );
     }
 
@@ -4771,7 +4437,9 @@ mod tests {
     fn each_disposition_names_the_branch_it_opened() {
         for (disposition, slug, terminal) in [
             ("reproduce", "investigate", false),
-            ("design", "design-review", false),
+            // The route opens the executor's draft; the founder's
+            // design-review waits on it (f90ca046).
+            ("design", "draft-design", false),
             ("build", "build", false),
             ("needs-info", "needs-info", false),
             ("duplicate", "duplicate", true),
@@ -4954,6 +4622,173 @@ mod tests {
         assert_eq!(
             steps[0].sign_offs_required,
             vec!["platform-admin".to_string()]
+        );
+    }
+
+    /// One declaration, three keys written (f5ebd2e1 car 1, 67a58840).
+    /// The spec below declares ONLY an audience on each step — no
+    /// `authority_role`, no assignee — and the materialised packet
+    /// carries exactly the keys today's readers already look for:
+    /// `assignee_id` for an individual, `metadata.authority_role` for a
+    /// role, `metadata.station` for a station, and the audience itself
+    /// so a later reader can check the projection against its source.
+    fn one_step_with(title: &str, audience: crate::audience::Audience) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: "true".into(),
+            title_template: title.into(),
+            audience: Some(audience),
+            terminal: Some(Terminal {
+                outcome: "done".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn materialize_writes_the_selectors_an_audience_derives() {
+        use crate::audience::Audience;
+        let spec = WorkflowSpec::platform_seed(
+            "audience-probe",
+            "Audience probe",
+            "platform",
+            vec!["custom".into()],
+            vec![
+                one_step_with("for-a-person", Audience::Individual("emp-david".into())),
+                one_step_with("for-a-role", Audience::Role("platform-admin".into())),
+                one_step_with("for-a-station", Audience::Station("design-review".into())),
+            ],
+        );
+        let subject = Subject::new("custom", "x");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, StepId::new);
+        let by_slug = |slug: &str| {
+            steps
+                .iter()
+                .find(|s| s.spec_slug.as_deref() == Some(slug))
+                .expect("materialised")
+        };
+
+        let person = by_slug("for-a-person");
+        assert_eq!(person.assignee_id.as_deref(), Some("emp-david"));
+        assert!(person.metadata.get("authority_role").is_none());
+
+        let role = by_slug("for-a-role");
+        assert_eq!(role.assignee_id, None);
+        assert_eq!(
+            role.metadata.get("authority_role").and_then(|v| v.as_str()),
+            Some("platform-admin"),
+            "the role arm of the assignment query and every q.<role>.<kind> station read \
+             this key; a role audience must write it"
+        );
+
+        let station = by_slug("for-a-station");
+        assert_eq!(
+            station.metadata.get("station").and_then(|v| v.as_str()),
+            Some("design-review")
+        );
+        assert!(station.metadata.get("authority_role").is_none());
+
+        // The declaration rides the packet beside its projection.
+        for (slug, want) in [
+            (
+                "for-a-person",
+                serde_json::json!({"individual": "emp-david"}),
+            ),
+            ("for-a-role", serde_json::json!({"role": "platform-admin"})),
+            (
+                "for-a-station",
+                serde_json::json!({"station": "design-review"}),
+            ),
+        ] {
+            assert_eq!(
+                by_slug(slug).metadata.get("audience"),
+                Some(&want),
+                "{slug}"
+            );
+        }
+    }
+
+    /// One block, four keys written (c87fb59b car 1, 028891cf). The
+    /// spec below declares an `agent` block on one step and none on the
+    /// other; the materialised packet carries exactly the four plain
+    /// keys a station predicate or the claim door reads on the first,
+    /// and nothing agent-shaped on the second.
+    #[test]
+    fn materialize_writes_the_keys_an_agent_block_projects() {
+        use crate::agent_spec::{AgentSpec, Effort};
+        let mut with_agent = one_step_with("build", crate::audience::Audience::Role("x".into()));
+        with_agent.agent = Some(AgentSpec {
+            profile: "builder".into(),
+            model: "opus-5[1m]".into(),
+            budget_usd: 5.0,
+            effort: Effort::High,
+        });
+        with_agent.metadata_defaults = serde_json::json!({"procedure": "Build it."});
+        let without = one_step_with("review", crate::audience::Audience::Role("x".into()));
+        let spec = WorkflowSpec::platform_seed(
+            "agent-probe",
+            "Agent probe",
+            "platform",
+            vec!["custom".into()],
+            vec![with_agent, without],
+        );
+        let subject = Subject::new("custom", "x");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, StepId::new);
+        let by_slug = |slug: &str| {
+            steps
+                .iter()
+                .find(|s| s.spec_slug.as_deref() == Some(slug))
+                .expect("materialised")
+        };
+
+        let build = by_slug("build");
+        assert_eq!(build.metadata["agent_profile"], "builder");
+        assert_eq!(build.metadata["agent_model"], "opus-5[1m]");
+        assert_eq!(build.metadata["agent_budget_usd"], 5.0);
+        assert_eq!(build.metadata["agent_effort"], "high");
+        // Beside, not instead of, the defaults and the audience keys.
+        assert_eq!(build.metadata["procedure"], "Build it.");
+        assert_eq!(build.metadata["authority_role"], "x");
+
+        let review = by_slug("review");
+        for key in crate::agent_spec::KEYS {
+            assert!(
+                review.metadata.get(key).is_none(),
+                "a step with no agent block writes no `{key}`"
+            );
+        }
+    }
+
+    /// A step that declares no audience is materialised exactly as
+    /// before: no `audience` key appears, and the legacy keys come from
+    /// where they always did.
+    #[test]
+    fn materialize_leaves_a_step_without_an_audience_untouched() {
+        let mut step = one_step_with("legacy", crate::audience::Audience::Role("x".into()));
+        step.audience = None;
+        step.authority_role = Some("qa-lead".into());
+        let spec = WorkflowSpec::platform_seed(
+            "legacy-probe",
+            "Legacy probe",
+            "platform",
+            vec!["custom".into()],
+            vec![step],
+        );
+        let subject = Subject::new("custom", "x");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, StepId::new);
+        assert_eq!(steps[0].assignee_id, None);
+        assert!(steps[0].metadata.get("audience").is_none());
+        assert!(steps[0].metadata.get("station").is_none());
+        assert_eq!(
+            steps[0]
+                .metadata
+                .get("authority_role")
+                .and_then(|v| v.as_str()),
+            Some("qa-lead")
         );
     }
 
@@ -5796,12 +5631,17 @@ mod tests {
             .expect("pr-train present in the platform bundle");
 
         // Every evidence step — one that carries required fields for
-        // the conductor to fill — is authority-gated: an ungated ready
-        // step gets role-matched and completed by the simulated
-        // workforce, and a train whose steps the sim closes records
-        // fiction. Property-based, not kind-named (ADR-0021): "has
-        // evidence fields, is not a terminal" IS the conductor-closed
-        // set, whatever kinds those steps declare.
+        // the conductor to fill — is the CONDUCTOR'S, born assigned to
+        // it through an `individual` audience (backlog af796788). Until
+        // 2026-09-18 the gate here was `authority_role = platform-admin`,
+        // against the sim workforce role-matching an ungated step and
+        // closing a train on fiction; that concern is now held by the
+        // workforce's partition rule (88798c96: a real row is never the
+        // sim's), and the role had a cost of its own — the dispatcher's
+        // executes-lane nominated every such step to the agent alias.
+        // Property-based, not kind-named (ADR-0021): "has evidence
+        // fields, is not a terminal" IS the conductor-closed set,
+        // whatever kinds those steps declare.
         let evidence_steps: Vec<_> = train
             .steps
             .iter()
@@ -5813,10 +5653,17 @@ mod tests {
         );
         for s in &evidence_steps {
             assert_eq!(
-                s.authority_role.as_deref(),
-                Some("platform-admin"),
-                "evidence step `{}` must be closed by the conductor or a person, \
-                 never the sim workforce",
+                s.selectors().assignee_id.as_deref(),
+                Some("automation:train-conductor"),
+                "evidence step `{}` is the conductor's: born assigned to it, so neither \
+                 the executes-lane nor a role queue can hand it to anyone else",
+                s.title
+            );
+            assert_eq!(
+                s.selectors().authority_role,
+                None,
+                "evidence step `{}` declares no role — a role with no assignee is what \
+                 nominated every train step to the agent alias",
                 s.title
             );
         }
@@ -6693,7 +6540,13 @@ mod frozen_job_tests {
     /// reviewer's queue.
     #[test]
     fn an_added_step_freezes_the_job_and_is_detectable() {
-        let spec = ship_a_change_spec();
+        // The real ship-a-change protocol, read from the bundle file
+        // that is its home since the Rust literal left on 2026-09-15.
+        let spec = crate::seed_loader::load_workflows(platform_bundle_path())
+            .expect("the platform bundle parses")
+            .into_iter()
+            .find(|w| w.kind == "ship-a-change")
+            .expect("ship-a-change is in the platform bundle");
         let subject = Subject::new("custom", "x");
         let mut n = 0u32;
         let mut steps = materialize_steps(

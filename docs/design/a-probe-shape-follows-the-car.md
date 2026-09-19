@@ -145,26 +145,31 @@ explained the failure (`probe::rewrites_its_exit_status` warns on it).
 The one thing about a probe that is easy to get wrong. A probe is
 **authored** on the dev pod, where the cluster is one hop away, and
 **run** on the **forge host** — as `david`, in `/home/david/boss`, with
-that host's tools, by `infra/forge/run-car-probe.sh`. Two machines. The
+that host's tools, by `boss prove --from-car --unattended` (the shell twin
+run-car-probe.sh until 9f00a805 car 2). Two machines. The
 forge is outside the cluster and holds no kubeconfig, so a probe that
 reaches for `kubectl` is correct and unrunnable.
 
 **`infra/forge/host-absent-tools.txt` is the authority**, and it says
 this three ways deliberately. Read it rather than a restatement of it:
-it carries every tool measured absent (`kubectl`, `boss`), the
-distinction from the CI runner image's `required-tools.txt`, the reason a
-guessed entry is worse than the failure it prevents, and the identified
-reader (`boss-sor-read`, already in the converged checkout and first on
-the probe's PATH) that a probe reads the SoR with there.
+it carries every tool measured absent (`kubectl`), the distinction from
+the CI runner image's `required-tools.txt`, the reason a guessed entry is
+worse than the failure it prevents, the identified reader
+(`boss-sor-read`, already in the converged checkout and first on the
+probe's PATH) that a probe reads the SoR with there, and — since `boss`
+left the list on 2026-09-18 (H8 car 1 installed the CLI on the forge) —
+the rule a probe that shells to a `boss` verb is held to: it may read,
+it must not act, and the text that would let it act (an actor
+assignment) is refused.
 
 `boss gate --park-probe` checks that file at gate time, on the builder's
 terminal, so the common case never reaches the forge as an exit code
 hours later on a car.
 
 A probe run by hand with `boss prove` runs wherever you are, which is
-usually the pod — so `kubectl` and `boss` are available to a hand proof
-and not to a parked one. That asymmetry is the single most common reason
-a probe that worked yesterday fails at arrival.
+usually the pod — so `kubectl` is available to a hand proof and not to a
+parked one. That asymmetry is the single most common reason a probe that
+worked yesterday fails at arrival.
 
 ## Judgement, not fact
 

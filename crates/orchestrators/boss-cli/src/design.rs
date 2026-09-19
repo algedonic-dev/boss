@@ -46,6 +46,8 @@
 //! guard resolves the empty string trivially". A packet that simply
 //! left the flag out would stall its own review step.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -75,6 +77,59 @@ pub(crate) fn parse_question(raw: &str) -> Result<Value> {
     Ok(question(a, t, p))
 }
 
+/// Is this value a file's NAME rather than a document's text? A single
+/// line (nothing after trimming but one line) that either is one token
+/// ending in `.md`/`.txt` or names a file `exists` answers for. Prose
+/// that merely mentions a file ("fold it into decisions.md") is several
+/// words and no file, so it passes; an empty body is not a path.
+/// `exists` is handed in so the shape is pinned without a filesystem.
+pub(crate) fn path_shaped(text: &str, exists: impl Fn(&str) -> bool) -> bool {
+    let line = text.trim();
+    if line.is_empty() || line.contains('\n') {
+        return false;
+    }
+    let one_token = !line.contains(char::is_whitespace);
+    (one_token && (line.ends_with(".md") || line.ends_with(".txt"))) || exists(line)
+}
+
+/// `--markdown` takes the doc's TEXT, and the natural misreading of an
+/// option whose value is a whole document is to hand it a file name.
+/// The verb accepted that: two designs (11e60367, 55417146) reached
+/// David's review queue with a one-line /tmp path for a body, rendered
+/// on /it/design as "carried by this packet · not yet a file" followed
+/// by the path, and neither could be reviewed until the packet and the
+/// step's copy were rewritten by hand (backlog 1763d5af, 2026-09-18).
+/// A body is prose and a path is not prose, so the path-shaped value
+/// is refused at the flag, naming the door that reads a file.
+pub(crate) fn body_is_prose(flag: &str, text: &str, exists: impl Fn(&str) -> bool) -> Result<()> {
+    if path_shaped(text, exists) {
+        bail!(
+            "{flag} takes the doc body as text, and {:?} is a path, not prose — pass \
+             `--markdown-file <PATH>` to read the body from that file. A design filed \
+             with a path for a body reaches the reviewer with nothing to read.",
+            text.trim()
+        );
+    }
+    Ok(())
+}
+
+/// The same refusal one flag over: a question's title and proposal are
+/// prose too, and a path in either reaches the reviewer as a question
+/// nobody can answer.
+pub(crate) fn question_is_prose(q: &Value, exists: impl Fn(&str) -> bool) -> Result<()> {
+    for key in ["title", "proposal"] {
+        let text = q.get(key).and_then(Value::as_str).unwrap_or("");
+        if path_shaped(text, &exists) {
+            bail!(
+                "--question takes its {key} as text, and {text:?} is a path, not prose — write \
+                 the question inline (`anchor|title|proposal`); only the doc body can come \
+                 from a file, through `--markdown-file <PATH>`."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The job body, pure so the shape is pinned by tests rather than by
 /// the doc comment above it.
 pub(crate) fn design_job_body(
@@ -82,9 +137,10 @@ pub(crate) fn design_job_body(
     markdown: &str,
     questions: &[Value],
     no_open_questions: bool,
-    opened_on: &str,
+    answers: Option<&str>,
+    owner: &str,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "kind": "design-doc",
         // THE ENVELOPE'S OWN TITLE, not merely metadata's. The filer
         // requires it at admission ("one line; every lens leads with
@@ -96,10 +152,16 @@ pub(crate) fn design_job_body(
         // argument, so the card and the doc cannot disagree.
         "title": title,
         "status": "open",
-        "owner_id": "emp-david",
+        // The platform owner as the registry answers it (backlog
+        // 3c23662d), or nobody for the jobs API to resolve from the
+        // kind's owner_role — never a literal person.
+        "owner_id": owner,
         "priority": "standard",
         "tags": ["design"],
-        "opened_on": opened_on,
+        // No `opened_on`: the create handler injects it off its clock
+        // and stamps the filing instant as `metadata.opened_at` only
+        // when it does — this body's `today` silenced the stamp on
+        // every design doc (dd3624a0, 2026-09-15; envelope: a7a07ffb).
         "subject": {"subject_kind": "custom", "id": "boss-platform"},
         "metadata": {
             "title": title,
@@ -108,7 +170,143 @@ pub(crate) fn design_job_body(
             // Always present, never omitted — see the module header.
             "no_open_questions": if no_open_questions { "true" } else { "false" },
         },
-    })
+    });
+    // The feedback (or backlog item) this design answers, as the
+    // DECLARED `design-doc.answers` job edge — ref-checked and
+    // prefix-normalised at the write like ship-a-change's
+    // `backlog_item`, and the link the dispatcher follows when the
+    // design's review completes to complete that packet's
+    // design-review (complete-feedback-design-review-on-design-
+    // review-decided; the -on-design-doc-published rule is the
+    // backstop for a design decided before it was live, 8f83cade).
+    // Absent, not null, when there is none: the edge guard resolves a
+    // present key.
+    if let Some(feedback) = answers {
+        body["metadata"]["answers"] = json!(feedback);
+    }
+    body
+}
+
+/// The question the feedback's `design-review` step is given at the
+/// moment a design is filed for it. Until backlog 5f0b2661 that step
+/// carried `verdict: ""` and nothing else — the design IS the question,
+/// and it lived on the other packet — so it rendered as a statement,
+/// and if the operator decided it first the design went unread (David,
+/// bug 4f6019d7: "There is no question, just a statement"). Prose a
+/// person reads, so the short id.
+pub(crate) fn feedback_question(design_title: &str, design_id: &str) -> String {
+    let short = &design_id[..8.min(design_id.len())];
+    format!(
+        "Decide design '{design_title}' ({short}) at /it/design — deciding it completes this \
+         step: approved when its questions are all decided, and the build goes ahead as the \
+         design proposes."
+    )
+}
+
+/// The feedback's design-review step metadata with the question laid
+/// over what is already there. PATCH-on-PUT replaces `metadata`
+/// wholesale, and `authority_role` living there is what keeps the step
+/// gated — so the existing keys are kept, and only `question` is added.
+pub(crate) fn design_review_step_metadata(
+    existing: &Value,
+    design_title: &str,
+    design_id: &str,
+) -> Value {
+    let mut md = match existing {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    md.insert(
+        "question".to_string(),
+        json!(feedback_question(design_title, design_id)),
+    );
+    Value::Object(md)
+}
+
+/// Where a packet stands on its design route, as `--answers` needs it:
+/// the `design-review` step the question goes onto, and the
+/// `draft-design` step this verb completes when the route has one.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DesignRoute {
+    pub review: Value,
+    pub draft: Option<Value>,
+}
+
+fn step_by_slug<'a>(packet: &'a Value, slug: &str) -> Option<&'a Value> {
+    packet
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(slug))
+}
+
+fn is_open(step: &Value) -> bool {
+    matches!(
+        step.get("status").and_then(Value::as_str),
+        Some("ready" | "active")
+    )
+}
+
+/// Can a design be filed against this packet, and what does the verb
+/// then write? Pure, so the two shapes it must accept are pinned.
+///
+/// Two protocol versions are live at once (in-flight packets keep
+/// theirs). Before f90ca046, routing to `design` opened
+/// `design-review` directly, so an OPEN review is the whole test.
+/// Since it, the route opens the executor's `draft-design` and the
+/// review is `ready_when = steps.draft-design.done` — so an open
+/// DRAFT is the other way in, and the verb completes it with the
+/// design's id after filing. Neither open is a refusal that names the
+/// fix: triage the packet to `design`, or it was already decided.
+pub(crate) fn answerable(packet: &Value) -> std::result::Result<DesignRoute, String> {
+    let short = packet
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| &id[..8.min(id.len())])
+        .unwrap_or("?");
+    let kind = packet.get("kind").and_then(Value::as_str).unwrap_or("?");
+    let review = step_by_slug(packet, "design-review").ok_or_else(|| {
+        format!(
+            "packet {short} ({kind}) has no design-review step — only a user-feedback or \
+             backlog-item routed to design can be answered by a design"
+        )
+    })?;
+    if is_open(review) {
+        return Ok(DesignRoute {
+            review: review.clone(),
+            draft: None,
+        });
+    }
+    let draft = step_by_slug(packet, "draft-design");
+    if let Some(draft) = draft.filter(|d| is_open(d)) {
+        return Ok(DesignRoute {
+            review: review.clone(),
+            draft: Some(draft.clone()),
+        });
+    }
+    let status = review.get("status").and_then(Value::as_str).unwrap_or("?");
+    Err(format!(
+        "packet {short}'s design-review is {status} and its draft-design is {} — triage it \
+         to `design` first (or it was already decided); a design filed against it would \
+         complete nothing when it closes",
+        draft
+            .and_then(|d| d.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("absent")
+    ))
+}
+
+/// The draft-design completion: `design_id` laid over the step's own
+/// metadata (PATCH-on-PUT replaces `metadata` wholesale, and
+/// `authority_role` lives there), status done.
+pub(crate) fn draft_done_body(existing: &Value, design_id: &str) -> Value {
+    let mut md = match existing {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    md.insert("design_id".to_string(), json!(design_id));
+    json!({ "status": "completed", "metadata": Value::Object(md) })
 }
 
 /// The review step's own copy. The tracker reads the STEP, so a doc
@@ -128,10 +326,11 @@ pub(crate) fn review_step_metadata(body: &Value, doc_path: &str) -> Value {
 pub async fn run(
     title: String,
     markdown: String,
+    markdown_file: Option<PathBuf>,
     questions: Vec<String>,
     no_questions: bool,
     doc_path: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    answers: Option<String>,
 ) -> Result<()> {
     // Refuse before filing, not after: a doc with neither questions nor
     // the flag is the exact packet this verb exists to stop reaching a
@@ -145,19 +344,56 @@ pub async fn run(
              failure this verb exists to prevent."
         );
     }
+    // The body: read from the file named, or the text given — and a
+    // path handed to the text flag is refused here, before anything is
+    // filed (backlog 1763d5af). clap keeps the two flags exclusive.
+    let is_file = |p: &str| Path::new(p).is_file();
+    let markdown = match markdown_file {
+        Some(path) => std::fs::read_to_string(&path)
+            .with_context(|| format!("--markdown-file: reading {}", path.display()))?,
+        None => {
+            body_is_prose("--markdown", &markdown, is_file)?;
+            markdown
+        }
+    };
     let parsed = questions
         .iter()
-        .map(|q| parse_question(q))
+        .map(|q| parse_question(q).and_then(|q| question_is_prose(&q, is_file).map(|()| q)))
         .collect::<Result<Vec<_>>>()?;
+    let http = reqwest::Client::new();
 
+    // `--answers`: the feedback (or backlog item) this design decides.
+    // Read BEFORE filing — the edge needs the full id, and the packet
+    // must be on its design route (`answerable`); a design filed for a
+    // packet nobody routed to design would carry an edge the close
+    // rule can act on nothing with. Refusing here keeps the filer on
+    // the line, where the fix is one triage away.
+    let answered = match answers.as_deref() {
+        Some(given) => {
+            let id = crate::job::fetch_and_resolve(&http, given).await?;
+            let packet = api(
+                &http,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await?
+            .with_context(|| format!("--answers: reading packet {id}"))?;
+            let route = answerable(&packet).map_err(|e| anyhow::anyhow!("--answers: {e}"))?;
+            Some((id, route))
+        }
+        None => None,
+    };
+
+    let owner = crate::owner::for_filing_at(&crate::gate::resolve_jobs_base(None)?).await;
     let body = design_job_body(
         &title,
         &markdown,
         &parsed,
         no_questions,
-        &now.date_naive().to_string(),
+        answered.as_ref().map(|(id, _)| id.as_str()),
+        &owner,
     );
-    let http = reqwest::Client::new();
     let created = api(
         &http,
         reqwest::Method::POST,
@@ -173,6 +409,66 @@ pub async fn run(
         .context("jobs api returned no id for the new design doc")?
         .to_string();
     let short = &id[..8.min(id.len())];
+
+    // The other half of the link: the answered packet's design-review
+    // step gets a real question, naming this design. The edge on the
+    // design is what the close rule follows; this is what the person
+    // assigned that step reads. Merged over the step's own metadata —
+    // PATCH-on-PUT replaces it wholesale.
+    if let Some((feedback, route)) = &answered {
+        let review = &route.review;
+        let sid = review
+            .get("id")
+            .and_then(Value::as_str)
+            .context("the answered packet's design-review step has no id")?;
+        let existing = review.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        api(
+            &http,
+            reqwest::Method::PUT,
+            &format!("/api/jobs/{feedback}/steps/{sid}"),
+            Some(json!({ "metadata": design_review_step_metadata(&existing, &title, &id) })),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "writing the question onto {}'s design-review (the design {short} is filed \
+                 and carries the edge; only the question is missing)",
+                &feedback[..8]
+            )
+        })?;
+        // The draft step is done BY THIS VERB, carrying the id it just
+        // got back (f90ca046): the record is copied from the filing,
+        // never retyped, and completing it is what opens the review —
+        // which by now already asks its question, so it is never ready
+        // and empty.
+        if let Some(draft) = &route.draft {
+            let did = draft
+                .get("id")
+                .and_then(Value::as_str)
+                .context("the answered packet's draft-design step has no id")?;
+            let existing = draft.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            api(
+                &http,
+                reqwest::Method::PUT,
+                &format!("/api/jobs/{feedback}/steps/{did}"),
+                Some(draft_done_body(&existing, &id)),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "completing {}'s draft-design with design_id {short} (the design is \
+                     filed, the edge and the question are written; only the draft's record \
+                     is missing)",
+                    &feedback[..8]
+                )
+            })?;
+        }
+        println!(
+            "boss design: {short} answers {} — its design-review now asks for this design, \
+             and deciding the design completes it",
+            &feedback[..8]
+        );
+    }
 
     if no_questions {
         println!("boss design: {short} filed — no open questions, no review queued");
@@ -224,8 +520,8 @@ mod tests {
     /// own review step — the trap the module header records.
     #[test]
     fn the_flag_is_always_present() {
-        let with = design_job_body("t", "m", &[], true, "2026-09-02");
-        let without = design_job_body("t", "m", &[], false, "2026-09-02");
+        let with = design_job_body("t", "m", &[], true, None, "emp-owner");
+        let without = design_job_body("t", "m", &[], false, None, "emp-owner");
         assert_eq!(with["metadata"]["no_open_questions"], json!("true"));
         assert_eq!(without["metadata"]["no_open_questions"], json!("false"));
     }
@@ -236,7 +532,7 @@ mod tests {
     #[test]
     fn the_review_step_carries_the_questions_too() {
         let q = vec![question("Q1", "which brick first?", "the cheap one")];
-        let body = design_job_body("t", "# doc", &q, false, "2026-09-02");
+        let body = design_job_body("t", "# doc", &q, false, None, "emp-owner");
         let step = review_step_metadata(&body, "docs/design/x.md");
         assert_eq!(step["questions"].as_array().map(Vec::len), Some(1));
         assert_eq!(step["questions"][0]["anchor"], json!("Q1"));
@@ -265,16 +561,55 @@ mod tests {
     /// demands rather than asking my memory. `gate.rs` carries the same
     /// pin for the same reason (its verb shipped unable to file too,
     /// for want of `tags`); this crate now has it on both bodies.
+    ///
+    /// `opened_on` is injected by the handler before it deserializes
+    /// (the body leaves it to the clock, dd3624a0), so injecting it
+    /// here reproduces what the type actually sees — as gate.rs does.
     #[test]
     fn the_body_deserializes_into_the_job_type_the_api_parses_it_as() {
-        let body = design_job_body("the doc", "# body", &[], true, "2026-09-04");
+        let body = as_the_handler_sees_it(design_job_body(
+            "the doc",
+            "# body",
+            &[],
+            true,
+            None,
+            "emp-owner",
+        ));
         let job: boss_core::job::Job = serde_json::from_value(body).expect(
             "design body must deserialize into Job — this is verbatim what the API does before \
              it admits the packet",
         );
         assert_eq!(job.kind, "design-doc");
         assert_eq!(job.title, "the doc");
-        assert_eq!(job.owner_id, "emp-david");
+        assert_eq!(job.owner_id, "emp-owner", "the owner is the one handed in");
+    }
+
+    /// The create handler injects `opened_on` off its clock before it
+    /// deserializes the body (boss-jobs http/jobs.rs); a test that asks
+    /// `Job` what it admits has to do the same.
+    fn as_the_handler_sees_it(mut body: Value) -> Value {
+        body.as_object_mut()
+            .expect("body is an object")
+            .insert("opened_on".into(), json!("2026-09-15"));
+        body
+    }
+
+    /// The create handler stamps `metadata.opened_at` — the precise
+    /// filing instant behind the one-day `opened_on` — ONLY when its
+    /// clock owns the date, i.e. when the body carries no `opened_on`
+    /// (boss-jobs http/jobs.rs). This body sent `now.date_naive()`, so
+    /// no design doc had a filing instant (measured 2026-09-15: the
+    /// three newest design-docs all lacked `opened_at` while every
+    /// pr-train beside them carried one; backlog dd3624a0). `boss
+    /// design` files today's doc, never a backdated one.
+    #[test]
+    fn the_design_body_leaves_the_open_date_to_the_api_clock() {
+        let body = design_job_body("t", "m", &[], true, None, "emp-owner");
+        assert!(
+            body.get("opened_on").is_none(),
+            "`opened_on` must be left to the create handler's clock, \
+             or the packet gets no `opened_at`: {body}"
+        );
     }
 
     /// The title is written TWICE by design — once on the envelope
@@ -290,7 +625,8 @@ mod tests {
             "# doc",
             &[],
             true,
-            "2026-09-04",
+            None,
+            "emp-owner",
         );
         assert_eq!(body["title"], json!("stations hold, they do not drop"));
         assert_eq!(body["title"], body["metadata"]["title"]);
@@ -314,5 +650,220 @@ mod tests {
         for bad in ["Q1|only-two", "|title|proposal", "Q1||proposal"] {
             assert!(parse_question(bad).is_err(), "should refuse {bad:?}");
         }
+    }
+
+    /// `--answers <feedback>` (backlog 5f0b2661). The design names the
+    /// feedback it answers as `metadata.answers` — a DECLARED job edge
+    /// on `design-doc`, ref-checked at the write like ship-a-change's
+    /// `backlog_item` — never as prose. Until now the only link was
+    /// `metadata.design_packet`, a string an operator typed onto the
+    /// feedback, which nothing read: the design was decided at
+    /// /it/design and the feedback's own design-review step stayed
+    /// open, an empty second decision for the same person (David's bug
+    /// 4f6019d7, 2026-09-15). ABSENT when not given, not null: the edge
+    /// guard treats a present key as a reference to resolve.
+    #[test]
+    fn answers_rides_as_the_declared_edge_and_is_absent_otherwise() {
+        const FEEDBACK: &str = "61366e5a-d15f-472c-a667-f4cc007ef8f8";
+        let with = design_job_body("t", "m", &[], false, Some(FEEDBACK), "emp-owner");
+        assert_eq!(with["metadata"]["answers"], json!(FEEDBACK));
+        let without = design_job_body("t", "m", &[], false, None, "emp-owner");
+        assert!(
+            without["metadata"].get("answers").is_none(),
+            "a design that answers nothing carries no edge key at all"
+        );
+        // Still the body the API admits.
+        let job: boss_core::job::Job =
+            serde_json::from_value(as_the_handler_sees_it(with)).expect("deserializes");
+        assert_eq!(job.metadata["answers"], json!(FEEDBACK));
+    }
+
+    /// The feedback's design-review step is an `answer-question` with
+    /// no question — the design IS the question, and it lives on the
+    /// other packet. So the verb writes a real one, naming the design
+    /// and saying what deciding it does. The step's own keys survive:
+    /// PATCH-on-PUT replaces `metadata` wholesale, and `authority_role`
+    /// living there is what keeps the step gated.
+    #[test]
+    fn the_feedbacks_design_review_gets_a_real_question_and_keeps_its_own_keys() {
+        let existing = json!({ "authority_role": "platform-admin", "verdict": "" });
+        let md = design_review_step_metadata(
+            &existing,
+            "A car lands where its change goes live",
+            "c6bd173e-3dc9-426f-8fff-866a3b2a6117",
+        );
+        assert_eq!(md["authority_role"], json!("platform-admin"));
+        assert_eq!(md["verdict"], json!(""));
+        let q = md["question"].as_str().expect("a question is written");
+        assert!(
+            q.contains("A car lands where its change goes live") && q.contains("c6bd173e"),
+            "the question names the design by title and short id: {q}"
+        );
+        assert!(
+            q.contains("completes this step"),
+            "and says that deciding the design is what completes it: {q}"
+        );
+        assert!(
+            !q.contains("c6bd173e-3dc9"),
+            "the short id, not the full one — this is prose a person reads"
+        );
+    }
+
+    fn packet(steps: Vec<Value>) -> Value {
+        json!({
+            "id": "54f0ab33-335e-46a7-a49f-d9afd3107d54",
+            "kind": "user-feedback",
+            "steps": steps,
+        })
+    }
+
+    fn step(slug: &str, status: &str) -> Value {
+        json!({ "id": format!("s-{slug}"), "spec_slug": slug, "status": status,
+                "metadata": { "authority_role": "platform-admin" } })
+    }
+
+    /// Backlog f90ca046: the design route opens the executor's draft
+    /// first, and the review waits on it. The verb must take BOTH
+    /// shapes — a packet in flight under the version before (review
+    /// open, no draft step at all) and one under it (draft open,
+    /// review pending) — and in the second complete the draft. What
+    /// it refuses is a packet on neither: not routed to design, or
+    /// already decided.
+    #[test]
+    fn a_packet_is_answerable_at_its_open_review_or_at_its_open_draft() {
+        // The shape before f90ca046, still live for in-flight packets.
+        let v1 = packet(vec![
+            step("triage", "completed"),
+            step("design-review", "ready"),
+        ]);
+        let route = answerable(&v1).expect("an open review is answerable");
+        assert_eq!(route.review["spec_slug"], json!("design-review"));
+        assert!(route.draft.is_none(), "no draft to complete");
+
+        // The shape since: the draft is open and the review pending.
+        let v2 = packet(vec![
+            step("triage", "completed"),
+            step("draft-design", "ready"),
+            step("design-review", "pending"),
+        ]);
+        let route = answerable(&v2).expect("an open draft is answerable");
+        assert_eq!(route.review["status"], json!("pending"));
+        assert_eq!(
+            route.draft.as_ref().map(|d| d["spec_slug"].clone()),
+            Some(json!("draft-design")),
+            "the verb completes the draft it stands at"
+        );
+
+        // The draft done by hand and the review open: the review is
+        // the target, and the draft is not touched again.
+        let drafted = packet(vec![
+            step("draft-design", "completed"),
+            step("design-review", "active"),
+        ]);
+        assert!(answerable(&drafted).expect("open review").draft.is_none());
+
+        // Not routed to design (both pending), or already decided.
+        for (draft, review) in [("pending", "pending"), ("completed", "completed")] {
+            let err = answerable(&packet(vec![
+                step("draft-design", draft),
+                step("design-review", review),
+            ]))
+            .expect_err("nothing open on the design route");
+            assert!(
+                err.contains("54f0ab33") && err.contains(review) && err.contains(draft),
+                "the refusal names the packet and both statuses: {err}"
+            );
+        }
+        // A kind with no design route at all.
+        let err = answerable(&json!({ "id": "abc", "kind": "ship-a-change", "steps": [] }))
+            .expect_err("no design-review step");
+        assert!(err.contains("ship-a-change"), "{err}");
+    }
+
+    /// `--markdown` takes the doc's TEXT, and the natural misreading of
+    /// an option whose value is a whole document is to hand it a file
+    /// name. The verb accepted that: two designs (11e60367, 55417146)
+    /// reached David's review queue with a one-line /tmp path for a
+    /// body, and neither could be reviewed until the packet and the
+    /// step's copy were rewritten by hand (backlog 1763d5af,
+    /// 2026-09-18). A body is prose; a path is not prose. A single
+    /// token ending in .md/.txt, or a single line naming a file that
+    /// exists, is refused and told about `--markdown-file`.
+    #[test]
+    fn a_path_is_not_a_body() {
+        let none = |_: &str| false;
+        let tmp_file = |p: &str| p == "/home/david/design-body.md" || p == "notes";
+        for path in [
+            "/home/david/design-body.md",
+            "docs/design/x.md",
+            "body.txt",
+            " README.md\n",
+        ] {
+            assert!(path_shaped(path, none), "a path-shaped body: {path:?}");
+            let err = body_is_prose("--markdown", path, none).expect_err("refused");
+            assert!(
+                err.to_string().contains("--markdown-file")
+                    && err.to_string().contains(path.trim()),
+                "the refusal names the path and the door: {err}"
+            );
+        }
+        // A bare name is a path when it names a file that exists.
+        assert!(path_shaped("notes", tmp_file));
+        assert!(
+            !path_shaped("notes", none),
+            "and just a word when it does not"
+        );
+        // Prose is prose: several lines, or one that only mentions a file.
+        for prose in [
+            "# the doc\n\nBody, on lines.\n",
+            "fold it into architecture-decisions.md",
+            "ship the cheap one",
+            "",
+        ] {
+            assert!(
+                !path_shaped(prose, tmp_file),
+                "prose, not a path: {prose:?}"
+            );
+            body_is_prose("--markdown", prose, tmp_file).expect("accepted");
+        }
+        // A one-line body that is prose still passes: the shape refused
+        // is a path, not brevity.
+        body_is_prose("--markdown", "# only a heading", none).expect("accepted");
+    }
+
+    /// The same refusal on a question: its title and proposal are prose
+    /// too, and a path in either is the same misreading one flag over.
+    #[test]
+    fn a_question_is_prose_too() {
+        let none = |_: &str| false;
+        let q = parse_question("Q1|first brick?|ship the cheap one").unwrap();
+        question_is_prose(&q, none).expect("prose");
+        let bad = parse_question("Q1|first brick?|/home/david/proposal.md").unwrap();
+        let err = question_is_prose(&bad, none).expect_err("a path proposal is refused");
+        assert!(
+            err.to_string().contains("/home/david/proposal.md")
+                && err.to_string().contains("--question"),
+            "{err}"
+        );
+        let bad = parse_question("Q1|title.txt|a real proposal").unwrap();
+        assert!(
+            question_is_prose(&bad, none).is_err(),
+            "a path title is refused"
+        );
+    }
+
+    /// The draft's completion carries the id the filing returned —
+    /// copied, never retyped — over the step's own keys.
+    #[test]
+    fn the_draft_is_completed_with_the_filed_id_and_keeps_its_own_keys() {
+        let existing = json!({ "authority_role": "platform-admin", "procedure": "file it" });
+        let body = draft_done_body(&existing, "5fc71f03-db4f-4be2-9839-484ccf29781a");
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(
+            body["metadata"]["design_id"],
+            json!("5fc71f03-db4f-4be2-9839-484ccf29781a")
+        );
+        assert_eq!(body["metadata"]["authority_role"], json!("platform-admin"));
+        assert_eq!(body["metadata"]["procedure"], json!("file it"));
     }
 }

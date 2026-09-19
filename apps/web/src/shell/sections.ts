@@ -20,6 +20,7 @@
 //     `sections.test.ts` pins every value now (CLAUDE.md §9a).
 
 import type { Route } from '../router';
+import { appForSection, type AppId } from './nav-catalog';
 
 /// Sections that deliberately resolve to the Home app instead of a
 /// catalog entry, each with the reason. The bar for adding one is
@@ -36,6 +37,34 @@ export const HOME_CHROME_SECTIONS: ReadonlyMap<string, string> = new Map([
   // catalog entries now — exactly the departure their rows here said
   // they were waiting for.
 ]);
+
+/// Sections whose APP is carried by the route rather than by a catalog
+/// entry, each with the reason. The catalog's `app` field is static —
+/// one surface, one department — and that is right for every surface
+/// built for a department by name. A department's jobs view is one
+/// surface for EVERY department the Class registry declares
+/// (cc76f755, 2026-09-18): the app it renders under is the route's
+/// `code`, so no catalog row can answer for it, and `appForRoute`
+/// reads the route instead. The sidebar row that highlights for it is
+/// the permKey-less "Jobs" row AppShell adds to every department group.
+export const DYNAMIC_APP_SECTIONS: ReadonlyMap<string, string> = new Map([
+  [
+    'department-jobs',
+    'the department jobs view renders under the department named in the ' +
+      'route (/ux/departments/<code>), which is registry data',
+  ],
+]);
+
+/// Which app a route renders under. The catalog answers for every
+/// surface with a static owner (`appForSection`); a route whose app is
+/// its own data answers for itself. This is the ONE derivation
+/// App.svelte's tab highlight reads — before it existed the
+/// department view would have highlighted Home, the exact defect the
+/// packet was filed on ("lands on All jobs with Home highlighted").
+export function appForRoute(route: Route): AppId {
+  if (route.kind === 'department') return route.code;
+  return appForSection(SECTION_FOR_ROUTE[route.kind]);
+}
 
 export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   // Renders outside AppShell (or has no sidebar row) — see
@@ -82,6 +111,9 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   schedule: 'schedule',
   exec: 'exec',
   warehouse: 'warehouse',
+  // The department jobs view: its app is the route's own code, not a
+  // catalog field — see DYNAMIC_APP_SECTIONS and `appForRoute`.
+  department: 'department-jobs',
   catalog: 'catalog',
   device: 'catalog',
   marketingAssets: 'marketing-assets',
@@ -101,19 +133,29 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   systemMonitoringAtlas: 'system-incidents',
   systemMonitoringConductor: 'system-incidents',
   systemFleet: 'system-incidents',
-  systemMarshallingYard: 'system-incidents',
+  // The two yards have rows of their own since feedback 92921c2f
+  // (2026-09-18); they highlight those, not Operate, though the
+  // Operate tab strip still lists them.
+  systemMarshallingYard: 'system-marshalling',
+  systemReceivingYard: 'system-receiving',
   systemYardStatus: 'system-incidents',
   systemStepPlugins: 'system-step-plugins',
   systemStepPluginDetail: 'system-step-plugins',
   systemSubjects: 'system-subjects',
+  systemRegistryDrift: 'system-registry-drift',
   systemFeedback: 'system-feedback',
   systemBacklog: 'system-backlog',
   systemYard: 'system-yard',
+  // A yard floor is the Train Yard opened on one panel (0524fc95 car
+  // 2): it highlights the yard's own row.
+  systemYardFloor: 'system-yard',
   systemCrew: 'system-crew',
   systemEstate: 'system-estate',
   incidents: 'system-incidents',
   systemKb: 'system-kb',
   systemDesign: 'system-design',
+  // The codebase has its own row since 2026-09-14 (feedback 9827c699).
+  systemCodebase: 'system-codebase',
   experiments: 'system-experiments',
   policy: 'policy',
   authAdmin: 'auth-admin',

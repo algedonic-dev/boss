@@ -47,11 +47,14 @@ Wants=network-online.target
 #   (BOSS_TRAIN_AUTO_MERGE=1, BOSS_TRAIN_DEPLOY_REMOTE, … ride the
 #   same drop-ins.)
 #
-# infra/deploy-services.sh installs THIS file only; it never writes
+# infra/gcp/install-units.sh installs THIS file only; it never writes
 # or removes anything under boss-train.service.d/, so host drop-ins
 # survive every deploy.
 
 [Service]
+# BOSS_JOBS_URL from /etc/boss/sor.env, rendered on this host from
+# infra/estate/estate.toml (backlog 5222163e) — the one spelling.
+EnvironmentFile=/etc/boss/sor.env
 # The scheduling knowledge that used to live in this directory's two
 # timers (06:00/18:00 boarding, 10-minute reconcile) is now rows in
 # the cadence_rules registry (infra/postgres/schema/114-cadence-rules.sql):

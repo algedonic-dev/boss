@@ -71,7 +71,7 @@ fn job_at(id: &str, title: &str) -> Job {
         closed_on: None,
         metadata: serde_json::json!({}),
         tags: vec![],
-        simulated: false,
+        partition: boss_core::partition::Partition::Real,
     }
 }
 
@@ -108,6 +108,7 @@ async fn seed() -> axum::Router {
         clock: Arc::new(boss_clock_client::WallClockClient),
         cadence: None,
         delivery: None,
+        agent_budget: None,
     };
     router(state)
 }

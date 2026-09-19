@@ -29,15 +29,19 @@
 # Exit:  0 clean / 1 a documented count disagrees with the tree
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 fails=0
+compared=0
 
 # Each row: <tier dir> <file> <regex capturing the claimed count>
 check_count() {
     local tier="$1" file="$2" pattern="$3" label="$4"
     local actual claimed
+    compared=$((compared + 1))
     actual=$(find "crates/$tier" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-    claimed=$(grep -oE "$pattern" "$file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    claimed=$(grep -oE "$pattern" "$file" 2>/dev/null | grep -oE '[0-9]+' | sed -n 1p)
     if [ -z "$claimed" ]; then
         echo "crate-counts-fresh: $label — no count found in $file (pattern moved?)"
         fails=$((fails + 1))
@@ -64,7 +68,7 @@ if [ "${1:-}" = "--self-test" ]; then
     mkdir -p "$tmp/crates/core/a" "$tmp/crates/core/b"
     printf 'blah (`crates/core/`, 99 crates). blah\n' > "$tmp/diagram.md"
     got=$(cd "$tmp" && actual=$(find crates/core -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') \
-        && claimed=$(grep -oE '`crates/core/`, [0-9]+ crates' diagram.md | grep -oE '[0-9]+' | head -1) \
+        && claimed=$(grep -oE '`crates/core/`, [0-9]+ crates' diagram.md | grep -oE '[0-9]+' | sed -n 1p) \
         && [ "$claimed" != "$actual" ] && echo caught)
     rm -rf "$tmp"
     if [ "$got" = "caught" ]; then
@@ -79,5 +83,6 @@ if [ "$fails" -gt 0 ]; then
     echo "crate-counts-fresh: $fails stale count(s) — update the prose to match the tree"
     exit 1
 fi
+lint_scanned crate-counts-fresh "$compared" "documented tier count(s) compared to the tree"
 echo "crate-counts-fresh: clean — every documented tier count matches the tree"
 exit 0

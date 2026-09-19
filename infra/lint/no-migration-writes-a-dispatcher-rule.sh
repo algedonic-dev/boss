@@ -35,14 +35,29 @@
 #
 # DDL IS NOT A RULE WRITE. `ALTER TABLE dispatcher_rules`, an index, a
 # constraint — all fine; the table's SHAPE is schema. What is refused is
-# INSERT / UPDATE / DELETE against its rows, because those are the
-# registry's content, and the registry's content comes from the tree.
+# INSERT / UPDATE against its rows, because those are the registry's
+# content, and the registry's content comes from the tree.
+#
+# NEITHER IS A DELETE (backlog b5f21e82, 2026-09-18). The property this
+# lint holds is "one home": a migration must not be able to put a rule
+# in the database that the tree does not author, or change what a
+# tree-authored rule does. A DELETE can do neither — it can only take
+# rows OUT, and the only rows a post-collapse migration has any reason
+# to take out are the ones the thirty-one historical inserts still write
+# on every fresh database under names no file authors any longer (seed
+# residue, which the boot seed retired on every new instance and a
+# tenant then had to take over; 20260918022108-seed-residue-is-not-a-
+# retirement.sql is the one that removes them). Retiring a LIVE rule is
+# still deleting its file, never a migration: the seed does that, and an
+# UPDATE that flips status is still refused here.
 #
 # Usage:  infra/lint/no-migration-writes-a-dispatcher-rule.sh
 
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 
 # The collapse landed 2026-09-11. Migrations at or after this prefix are
 # checked; everything before it is applied history.
@@ -63,11 +78,30 @@ SCHEMA_DIR="infra/postgres/schema"
 # `-- INSERT INTO dispatcher_rules` trailing a statement is deliberately
 # still read, because failing closed on a comment costs a rewording and
 # failing open costs the property.
+# A prefix compared against CUTOVER at CUTOVER's own width. Three
+# prefix widths coexist in the schema directory (`NNN-`, minute stamps,
+# second stamps), and a numeric compare across widths is not a compare
+# of instants: `202609122000` (2026-09-12, minute width) is 2.0e11 and
+# CUTOVER is 2.0e13, so the first rule car after the collapse — carrying
+# the INSERT this lint exists to refuse — passed it on 2026-09-12 by
+# being stamped to the minute. A minute stamp (twelve digits) is
+# right-padded to fourteen so it reads as its first second; a legacy
+# `NNN-` number is left alone and stays below every stamp, as the apply
+# order has it. 10# forces base-10: a prefix with a leading zero is not
+# octal.
+at_seconds_width() {
+    local p="$1"
+    if [ "${#p}" -ge 12 ]; then
+        while [ "${#p}" -lt 14 ]; do p="${p}0"; done
+    fi
+    printf '%s' "$((10#$p))"
+}
+
 writes_a_rule() {
     LC_ALL=C awk '
         { line = $0 }
         line ~ /^[ \t]*--/ { next }
-        tolower(line) ~ /(insert[ \t]+into|update|delete[ \t]+from)[ \t]+dispatcher_rules([ \t(;]|$)/ {
+        tolower(line) ~ /(insert[ \t]+into|update)[ \t]+dispatcher_rules([ \t(;]|$)/ {
             print FNR ": " line
         }
     ' "$1"
@@ -81,8 +115,7 @@ check_dir() {
         prefix="${base%%-*}"
         # Not a numeric-prefixed migration: nothing to order it by.
         case "$prefix" in ''|*[!0-9]*) continue ;; esac
-        # 10# forces base-10: a prefix with a leading zero is not octal.
-        [ "$((10#$prefix))" -ge "$CUTOVER" ] || continue
+        [ "$(at_seconds_width "$prefix")" -ge "$CUTOVER" ] || continue
         case " ${ALLOWLIST[*]} " in *" $base "*) continue ;; esac
         hit="$(writes_a_rule "$path")"
         if [ -n "$hit" ]; then
@@ -116,6 +149,24 @@ if check_dir "$tmp" 2>/dev/null; then
     exit 1
 fi
 rm -f "$tmp"/*.sql
+# A DELETE is not a rule write (backlog b5f21e82, 2026-09-18): it cannot
+# put a rule in a second home, only take seed residue out of the one it
+# was never meant to be in. Must pass, and an UPDATE beside it must not.
+printf "DELETE FROM dispatcher_rules d WHERE d.source IS NULL AND d.name IN ('x');\n" \
+    > "$tmp/20260918000000-seed-residue-goes.sql"
+if ! check_dir "$tmp"; then
+    echo "no-migration-writes-a-dispatcher-rule: SELF-TEST FAILED — a post-cutover DELETE of rule rows must pass; it opens no second home" >&2
+    exit 1
+fi
+rm -f "$tmp"/*.sql
+# The 2026-09-12 shape: a post-cutover INSERT stamped to the minute.
+printf "INSERT INTO dispatcher_rules (name, version, status) VALUES ('y', 1, 'active');\n" \
+    > "$tmp/202609122000-a-minute-width-rule-insert.sql"
+if check_dir "$tmp" 2>/dev/null; then
+    echo "no-migration-writes-a-dispatcher-rule: SELF-TEST FAILED — a minute-width post-cutover rule write must be refused, not read as history" >&2
+    exit 1
+fi
+rm -f "$tmp"/*.sql
 
 # ---------------------------------------------------------------------------
 # The tree.
@@ -139,6 +190,7 @@ if ! check_dir "$SCHEMA_DIR"; then
 fi
 
 checked=$(find "$SCHEMA_DIR" -maxdepth 1 -name '*.sql' -type f | wc -l | tr -d ' ')
-echo "no-migration-writes-a-dispatcher-rule: self-test ok — applied history and DDL pass, a post-cutover rule write is refused by name and line"
+lint_scanned no-migration-writes-a-dispatcher-rule "$checked" "migration(s) under $SCHEMA_DIR"
+echo "no-migration-writes-a-dispatcher-rule: self-test ok — applied history, DDL and a DELETE pass, a post-cutover rule insert or update is refused by name and line"
 echo "no-migration-writes-a-dispatcher-rule: clean — no migration at or after $CUTOVER writes dispatcher-rule rows ($checked migrations)"
 exit 0

@@ -14,10 +14,13 @@
 //!   that commerce and inventory call synchronously inside their
 //!   write transactions
 
+pub mod chart;
 pub mod error;
 pub mod excise;
+pub mod posting_rules;
 pub mod recognize;
 pub mod rules;
+pub mod tax_registry;
 pub mod types;
 
 // Kani bounded-model-checker proofs. The module compiles under both
@@ -36,6 +39,8 @@ pub mod config;
 pub mod events;
 #[cfg(feature = "postgres")]
 pub mod http;
+#[cfg(feature = "postgres")]
+pub mod live_facts;
 #[cfg(feature = "postgres")]
 pub mod payroll;
 #[cfg(feature = "postgres")]
@@ -60,6 +65,7 @@ pub mod supersede;
 pub mod tax_filings;
 
 pub use error::LedgerError;
+pub use posting_rules::{DataRuleSet, PostingRule, PostingRuleInput};
 pub use rules::{BossRuleSet, RuleSet, evaluate, revenue_accounts_map};
 pub use types::{
     AccountCode, AccountKind, FactRef, JournalEntryDraft, JournalLineDraft, NormalSide,
@@ -73,8 +79,8 @@ pub use rebuild::{RebuildReport, rebuild};
 
 #[cfg(feature = "postgres")]
 pub use rebuild_facts::{
-    ProjectedFact, ProjectionError, ProjectionRule, RebuildFactsReport, project_event,
-    rebuild_facts, rebuild_facts_in_tx,
+    ProjectedFact, ProjectionError, ProjectionRule, ProjectionRules, RebuildFactsReport,
+    project_event, rebuild_facts, rebuild_facts_in_tx,
 };
 
 #[cfg(feature = "postgres")]

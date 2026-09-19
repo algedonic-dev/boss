@@ -35,7 +35,7 @@ struct Cli {
     seeds: PathBuf,
 
     /// boss-policy-api base URL. Default pulled from boss_ports —
-    /// single source of truth shared with deploy-services.sh.
+    /// single source of truth shared with the config generator.
     #[arg(long, default_value_t = boss_ports::url("policy"))]
     policy_base: String,
 
@@ -79,11 +79,15 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| cli.policy_base.clone());
 
-    boss_policy::bootstrap::publish_policy_rules(
+    let out = boss_policy::bootstrap::publish_policy_rules(
         &api_base,
         &cli.seeds,
         cli.force,
         &cli.changed_by,
         cli.x_boss_user.as_deref(),
-    )
+    )?;
+    // What landed, what was kept and differs, what force overwrote —
+    // the same line `boss tenant publish` prints (design e187198f).
+    println!("{}", out.summary());
+    Ok(())
 }

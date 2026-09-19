@@ -45,6 +45,49 @@ fn at_step(v: &Value) -> String {
         .to_string()
 }
 
+/// One GATING line for a running gate-run. A car's run is its branch. A
+/// TRAIN's run (`metadata.train_gate`, filed by the conductor for the
+/// train branch — design 128b5496) is the train being tested, not a car
+/// being gated, and the lane has to say so: on 2026-09-14 it listed
+/// `train/20260914-1641` beside a car branch as two indistinguishable
+/// runs, and David asked three times why a PR train was in the gates
+/// (b96a878f). The predicate is `boss_jobs::stranded::is_train_gate` —
+/// the ONE definition, never the branch name (§9a). The title is read
+/// off the trains IN TRANSIT already fetched; a train not among them is
+/// named by id alone rather than by a second read or an invented title.
+fn gating_line(run: &Value, trains: &[Value]) -> String {
+    let branch = md_str(run, "branch");
+    let metadata = run.get("metadata").unwrap_or(&Value::Null);
+    if !boss_jobs::stranded::is_train_gate(metadata) {
+        return branch.to_string();
+    }
+    let train_id = md_str(run, "train");
+    let id8: String = train_id.chars().take(8).collect();
+    let title = trains
+        .iter()
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(train_id))
+        .and_then(|t| t.get("title").and_then(Value::as_str))
+        .filter(|t| !t.is_empty());
+    match title {
+        Some(title) => format!("{branch}  (train gate — testing train {id8}, {title})"),
+        None => format!("{branch}  (train gate — testing train {id8})"),
+    }
+}
+
+/// One QUEUED FOR A SLOT line for a gate-run holding a place in line:
+/// the same words as [`gating_line`] — the ONE definition of how a
+/// train's gate is named (§9a) — with the run's `queued_at` stamp kept
+/// as it was. Until 90ee6fcd (2026-09-14) this lane printed the bare
+/// branch, so a train gate waiting for a bay was indistinguishable from
+/// a queued car the same afternoon GATING learned to name it (#365).
+fn queued_lane_line(run: &Value, trains: &[Value]) -> String {
+    format!(
+        "{}  since {}",
+        gating_line(run, trains),
+        md_str(run, boss_jobs::yard::QUEUED_AT)
+    )
+}
+
 /// Branches whose base has fallen behind `origin/main`. Each pair is
 /// (branch, exit code of `git merge-base --is-ancestor origin/main
 /// origin/<branch>`), read through the ONE definition of that code
@@ -111,6 +154,70 @@ fn held_dock_cars(cars: &[Value]) -> Vec<(String, String)> {
         })
         .collect();
     out.sort();
+    out
+}
+
+/// The two gate-run reads behind the STRANDED and HELD GREENS lanes,
+/// composed here so the test that pins their shape reads the strings
+/// the server will.
+///
+/// A held green is read BY THE HOLD (`metadata_has=hold`, the
+/// `metadata ? $n` door), never by its place in a recency page: it is
+/// the one state that exists to be seen until a person releases it, and
+/// it stays exactly as long as the hold does. On 2026-09-15 the dev-pod
+/// car (gate-run 3164b0d5, green on `--hold` since 17:56Z the day
+/// before) had 80 gate-runs open behind it and this verb read the newest
+/// 60 — the held green was on the record and on no surface (backlog
+/// 2fa96d34). The stranded read is windowed in DAYS (`closed_within`,
+/// the boards' retention field) for the same reason a count is not a
+/// filter; measured 2026-09-15, a week is 415 gate-runs and 4.3 MB, read
+/// in 0.2 s. Both pages are bounded by the server's ceiling and judged
+/// against `total` — see [`cut_note`].
+pub(crate) const GATE_RUN_PAGE: i64 = 1000;
+pub(crate) fn held_gate_runs_query() -> String {
+    format!("/api/jobs?kind=gate-run&metadata_has=hold&limit={GATE_RUN_PAGE}")
+}
+/// The week the stranded read is windowed in — and the week the FLAKES
+/// line counts over, since it reads the same page (one query, one
+/// window, one number in both sentences).
+pub(crate) const GATE_RUN_WINDOW_DAYS: i64 = 7;
+pub(crate) fn stranded_gate_runs_query() -> String {
+    format!("/api/jobs?kind=gate-run&closed_within={GATE_RUN_WINDOW_DAYS}&limit={GATE_RUN_PAGE}")
+}
+
+/// The FLAKES section: how many times each check went red then green
+/// at one head this week, read off gate-runs the green stamped
+/// `flake_of` (`boss_jobs::flake`, backlog 36cc4913). One line either
+/// way — the count is the point, and a zero is a stated zero.
+pub(crate) fn flakes_line(gate_runs: &[Value]) -> String {
+    format!(
+        "\n  {}",
+        boss_jobs::flake::line(&boss_jobs::flake::tally(gate_runs), GATE_RUN_WINDOW_DAYS)
+    )
+}
+
+/// `Some("<read> of <total>")` when the record held more rows than the
+/// page — the note a lane prints so an empty lane never reads as a fact
+/// about the whole record. `None` with no `total`: absence is not a
+/// claim either way.
+pub(crate) fn cut_note(total: Option<i64>, read: usize) -> Option<String> {
+    let total = total?;
+    (total > read as i64).then(|| format!("{read} of {total}"))
+}
+
+/// Green gate-runs no car claims WITH a hold — `(branch, reason)`,
+/// branch-sorted and de-duped. The other half of the stranded predicate
+/// (one definition, `boss_jobs::stranded::unparked_green`, through the
+/// census's JSON adapter): a stranded green was forgotten, a held green
+/// is deliberately waiting, and a lane that shows only the first makes
+/// the second invisible.
+fn held_greens(gate_runs: &[Value], car_branches: &BTreeSet<String>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = crate::census::unparked_greens(gate_runs, car_branches)
+        .into_iter()
+        .filter_map(|u| Some((u.branch, u.hold?)))
+        .collect();
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -191,6 +298,62 @@ fn bases_behind(checks: &[(String, Option<i32>)]) -> Vec<&str> {
 /// set, and the tail line names the flag that shows the rest.
 pub(crate) const ORPHANS_SHOWN: usize = 12;
 
+/// Where a landed, unproven car stands — `boss_jobs::regions::ShedPlace`,
+/// the ONE classification the yard's regions read and this verb share
+/// (design 0524fc95). Until 2026-09-19 it lived here alone; the read
+/// that bubbles the shed's state up to the map needed the same rule,
+/// and a second copy would have been the drift the design exists to
+/// end (CLAUDE.md §9a).
+pub(crate) use boss_jobs::regions::ShedPlace as Shed;
+
+pub(crate) fn shed_place(car: &Value) -> Shed {
+    boss_jobs::regions::shed_place(car.get("metadata").unwrap_or(&Value::Null))
+}
+
+/// One terminal line's worth of a probe verdict or an event's prose.
+/// The full text rides the packet and the yard shows it; here the
+/// reader wants the first clause, not the paragraph (a 600-character
+/// `why` was the first live line).
+pub(crate) const SHED_TEXT_CHARS: usize = 160;
+
+fn clipped(text: &str) -> String {
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= SHED_TEXT_CHARS {
+        t
+    } else {
+        let cut: String = t.chars().take(SHED_TEXT_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// The SHED listing lines: every open car at `Proven in prod`, one
+/// line each, saying which of the three places it stands in. Pure so
+/// the shape is testable; the caller prints the heading from the count.
+pub(crate) fn shed_lines(cars: &[Value]) -> Vec<String> {
+    cars.iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| at_step(c) == "Proven in prod")
+        .map(|c| {
+            let branch = md_str(c, "branch");
+            match shed_place(c) {
+                Shed::ProbePending { last: None } => {
+                    format!("    {branch}: probe pending (the forge runs it on arrival)")
+                }
+                Shed::ProbePending { last: Some(why) } => {
+                    format!("    {branch}: probe FAILING — {}", clipped(&why))
+                }
+                Shed::ProbeNotYet { said } => {
+                    format!("    {branch}: probe says NOT YET — {}", clipped(&said))
+                }
+                Shed::WaitingOn(ev) => format!("    {branch}: waiting on: {}", clipped(&ev)),
+                Shed::Unproven => format!(
+                    "    {branch}: UNPROVEN — no probe, no event; nothing mechanical can settle it (boss prove --probe)"
+                ),
+            }
+        })
+        .collect()
+}
+
 /// The ORPHANS listing lines for a set of forge heads, bounded to
 /// `shown` entries unless `all` — and when bounded, the tail line
 /// SAYS how to see the rest, because a list truncated with no way to
@@ -213,6 +376,287 @@ pub(crate) fn orphan_lines(orphans: &[String], shown: usize, all: bool) -> Vec<S
     out
 }
 
+/// A stranded green that is the second half of a `boss rerail` a killed
+/// waiter never finished: `<branch>-rerail` gated green while the car
+/// still points at `<branch>`. It lists as stranded (a green no car
+/// claims) — correctly — but the lane's generic rescue, "rebase + re-gate",
+/// is the wrong verb for it: everything durable is done and one PATCH is
+/// owed. `Some(advice)` names the car and the verb that finishes it
+/// (464309ee: a `--finish` that existed and nothing pointed at).
+pub(crate) fn half_done_rerail(
+    branch: &str,
+    car_ids: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let base = branch.strip_suffix("-rerail")?;
+    let car = car_ids.get(base)?;
+    let id8 = &car[..8.min(car.len())];
+    Some(format!(
+        "← half-done rerail of {base} (car {id8}): everything but the repoint is done — \
+         finish it with `boss rerail {id8} --finish`, never re-gate"
+    ))
+}
+
+// ---- MY WORK ----------------------------------------------------------
+//
+// THE CASE (65a89769). Measured 2026-09-18 03:10Z: 25 ready steps sat
+// on `claude@algedonic.dev` — the four daily sweep inspections, the
+// publish-to-github measure, a user-feedback triage the founder did
+// himself, cadence-silent and estate-alarm triages, every landed car's
+// proven step — nominated by the dispatcher and never read, because the
+// agent's standing order reads the backlog station and this verb
+// printed everything about the pipeline except the actor's own queue.
+// The section below is that queue: the ready + active steps assigned to
+// the actor this process signs as, or to any id the agents registry
+// ties to it. Two identities, because the dispatcher nominates to the
+// ALIAS while a box may be named by the agent's id (25 on the alias, 0
+// on `agent-claude`, the same morning).
+
+/// How many characters of a title a MY WORK line shows.
+pub(crate) const MY_WORK_TITLE_CHARS: usize = 60;
+
+/// The identities one MY WORK read asks for: the caller first, then
+/// every id the agents registry ties to it — the aliases when the
+/// caller is an agent's id, the id and sibling aliases when the caller
+/// IS an alias. A caller the registry does not know is read alone.
+pub(crate) fn my_work_identities(caller: &str, agents: &[Value]) -> Vec<String> {
+    let mut out = vec![caller.to_string()];
+    for agent in agents {
+        let id = agent.get("id").and_then(Value::as_str).unwrap_or_default();
+        let aliases: Vec<&str> = agent
+            .get("aliases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if id != caller && !aliases.contains(&caller) {
+            continue;
+        }
+        for candidate in std::iter::once(id).chain(aliases) {
+            if !candidate.is_empty() && !out.iter().any(|o| o == candidate) {
+                out.push(candidate.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// What a step of this shape IS, for an actor deciding what to do
+/// with it — one clause per (workflow, slug) the section knows. A
+/// slug it does not know gets no hint rather than a wrong one.
+fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
+    let text = match (workflow, slug) {
+        (_, "triage") => "a decision the agent makes: measure the claim, choose a route",
+        ("ship-a-change", "proven") => {
+            "a probe to run: the forge runs it via run-car-probe (boss prove --recheck re-runs it)"
+        }
+        ("maintenance-sweep", "inspect") => {
+            "a measurement to record: findings + measured on the step, action_needed on the job"
+        }
+        ("user-feedback", "design-review") => {
+            "file the design that answers it: boss design ... --answers <feedback id>"
+        }
+        (_, "build") => "a change to build: branch, gate, park (boss brief <packet>)",
+        (_, "measure") => "a measurement to record on the checklist",
+        _ => return None,
+    };
+    Some(format!("{slug} = {text}"))
+}
+
+/// The MY WORK listing lines: rows deduplicated by step id (one step
+/// answers once however many identities it was read under), grouped
+/// by workflow, groups and rows both oldest first, each group headed
+/// by its count and closed by one hint line. Pure so the shape is
+/// testable; the caller prints the section heading from the count.
+pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut keyed: Vec<(Option<chrono::NaiveDate>, &Value)> = rows
+        .iter()
+        .filter(|r| {
+            let step_id = r
+                .pointer("/step/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            seen.insert(step_id)
+        })
+        .map(|r| {
+            let opened = r
+                .get("opened_on")
+                .and_then(Value::as_str)
+                .and_then(|d| d.parse::<chrono::NaiveDate>().ok());
+            (opened, r)
+        })
+        .collect();
+    // Unknown ages sort last: an older server's row is still listed,
+    // never mistaken for today's.
+    keyed.sort_by_key(|(opened, r)| {
+        (
+            opened.is_none(),
+            *opened,
+            r.get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        )
+    });
+    // Groups in order of their oldest row.
+    let mut groups: Vec<(&str, Vec<(Option<chrono::NaiveDate>, &Value)>)> = Vec::new();
+    for (opened, r) in keyed {
+        let kind = r.get("workflow").and_then(Value::as_str).unwrap_or("?");
+        match groups.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, rows)) => rows.push((opened, r)),
+            None => groups.push((kind, vec![(opened, r)])),
+        }
+    }
+    let mut out = Vec::new();
+    for (kind, rows) in groups {
+        out.push(format!("    {kind} — {}", rows.len()));
+        let mut slugs: Vec<&str> = Vec::new();
+        for (opened, r) in rows {
+            let job = r.get("job_id").and_then(Value::as_str).unwrap_or("");
+            let id8 = &job[..8.min(job.len())];
+            let slug = r
+                .pointer("/step/spec_slug")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
+            let title: String = r
+                .get("job_title")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .chars()
+                .take(MY_WORK_TITLE_CHARS)
+                .collect();
+            let age = match opened {
+                Some(d) => format!("{}d", crate::census::age_days(d, now)),
+                None => "age ?".to_string(),
+            };
+            out.push(format!(
+                "      {id8} {kind} {slug} {} ({age})",
+                title.trim_end()
+            ));
+        }
+        let hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
+        if !hints.is_empty() {
+            out.push(format!("      → {}", hints.join("; ")));
+        }
+    }
+    out
+}
+
+/// The whole section as printed. `None` for the identities is the
+/// unnamed caller: the read is REFUSED rather than made under
+/// `operator:unidentified`, which would answer 0 and read as an empty
+/// queue — the wrong-target trap (CLAUDE.md §Doors), with the two ways
+/// to name yourself on the line.
+pub(crate) fn my_work_section(
+    identities: Option<&[String]>,
+    rows: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let Some(ids) = identities else {
+        return vec![format!(
+            "  MY WORK — REFUSED: nothing names the actor running this command, so its own \
+             queue cannot be read (an unidentified read answers 0, not an error). Name \
+             yourself with `export {}=<your id>` or by writing that id into {}.",
+            crate::identity::ACTOR_ENV,
+            crate::identity::actor_file_display()
+        )];
+    };
+    let who = match ids {
+        [] => "nobody".to_string(),
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} (+ {})", rest.join(", ")),
+    };
+    let lines = my_work_lines(rows, now);
+    if lines.is_empty() {
+        return vec![format!(
+            "  MY WORK — nothing: no ready/active step is assigned to {who}"
+        )];
+    }
+    let count = lines
+        .iter()
+        .filter(|l| l.starts_with("      ") && !l.starts_with("      →"))
+        .count();
+    let mut out = vec![format!(
+        "  MY WORK — {count} ready/active step(s) assigned to {who} — yours to move, oldest first"
+    )];
+    out.extend(lines);
+    out
+}
+
+/// The REGIONS header — the IT system map's eight KPI cards, one line
+/// each, from `GET /api/yard/regions` (design 0524fc95, car 1). The
+/// server owns these numbers now: the count, the clear/busy/troubled
+/// state and the trend are ONE definition in `boss_jobs::regions`, the
+/// same one the map reads, so this verb and the yard cannot disagree
+/// about how many trains are in transit or what the time at CI is. The
+/// lanes below still list WHAT is there — the header says how much and
+/// whether it is trouble.
+///
+/// Pure over the payload, so the shape is testable; a state other than
+/// `clear` is printed upper-case so trouble reads as trouble. The
+/// `window_hours` the server answered rides the heading, because a
+/// rate without its window is not a number.
+pub(crate) fn region_lines(map: &Value) -> Vec<String> {
+    let hours = map.get("window_hours").and_then(Value::as_i64).unwrap_or(0);
+    let mut out = vec![format!(
+        "  REGIONS — the IT system map over the last {hours}h (count · state · trend)"
+    )];
+    let regions = map
+        .get("regions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for r in &regions {
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+        let count = match r.get("count") {
+            Some(Value::Number(n)) => n.to_string(),
+            _ => "?".to_string(),
+        };
+        let bound = r
+            .get("bound")
+            .and_then(Value::as_i64)
+            .map(|b| format!(" of {b}"))
+            .unwrap_or_default();
+        let state = r.get("state").and_then(Value::as_str).unwrap_or("?");
+        let state = if state == "clear" {
+            state.to_string()
+        } else {
+            state.to_uppercase()
+        };
+        let why = r.get("why").and_then(Value::as_str).unwrap_or("");
+        out.push(format!(
+            "    {name:<12} {count:>5}{bound:<6} {state:<9} {}  — {why}",
+            trend_text(r.get("trend").unwrap_or(&Value::Null))
+        ));
+    }
+    out
+}
+
+/// `dock wait 1.5h (was 2.0h)` / `arrivals 17/day (was 12/day)` /
+/// `time at CI — (was —)`: the trend as a phrase, with a null half
+/// printed as `—` rather than as a zero.
+fn trend_text(t: &Value) -> String {
+    let metric = t.get("metric").and_then(Value::as_str).unwrap_or("?");
+    let unit = t.get("unit").and_then(Value::as_str).unwrap_or("");
+    let one = |key: &str| -> String {
+        match t.get(key).and_then(Value::as_f64) {
+            None => "—".to_string(),
+            Some(v) => match unit {
+                "hours" => format!("{v:.1}h"),
+                "minutes" => format!("{v:.0}m"),
+                "per day" => format!("{v:.1}/day"),
+                _ => format!("{v:.1} {unit}"),
+            },
+        }
+    };
+    format!("{metric} {} (was {})", one("current"), one("previous"))
+}
+
 pub async fn run(all: bool) -> Result<()> {
     let http = reqwest::Client::new();
 
@@ -223,13 +667,31 @@ pub async fn run(all: bool) -> Result<()> {
     );
     // The tool reading the approach must say what IT is: a binary that
     // lags main runs older verbs silently (895c9a3b).
+    let built = crate::built_from::built_from();
+    let main = crate::built_from::origin_main_head();
+    let ancestry = main
+        .as_deref()
+        .map(|m| crate::built_from::ancestry(built, m))
+        .unwrap_or(crate::built_from::Ancestry::Unknown);
     println!(
         "{}",
-        crate::built_from::freshness_line(
-            crate::built_from::BUILT_FROM,
-            crate::built_from::origin_main_head().as_deref()
-        )
+        crate::built_from::freshness_line(built, main.as_deref(), ancestry)
     );
+
+    // THE REGIONS — the map's numbers, from the server's one definition
+    // (design 0524fc95). A server without the read (older than this
+    // verb) says so and the approach still prints; the lanes below are
+    // unchanged and still list what is there.
+    println!();
+    match api(&http, reqwest::Method::GET, "/api/yard/regions", None).await {
+        Ok(Some(map)) => {
+            for line in region_lines(&map) {
+                println!("{line}");
+            }
+        }
+        Ok(None) => println!("  REGIONS — unavailable: the read answered nothing"),
+        Err(e) => println!("  REGIONS — unavailable: {e}"),
+    }
 
     // Trains in transit.
     let trains = rows(
@@ -269,7 +731,7 @@ pub async fn run(all: bool) -> Result<()> {
         .partition(|g| !md_str(g, boss_jobs::yard::QUEUED_AT).is_empty());
     println!("\n  GATING — {} run(s)", running.len());
     for g in &running {
-        println!("    {}", md_str(g, "branch"));
+        println!("    {}", gating_line(g, &trains));
     }
     // A PLACE NOBODY HOLDS IS NOT A QUEUE. The two readings are the
     // system of record's own: `queue_order` is every place a live
@@ -291,11 +753,7 @@ pub async fn run(all: bool) -> Result<()> {
             let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
             in_line.iter().any(|held| held == id)
         }) {
-            println!(
-                "    {}  since {}",
-                md_str(g, "branch"),
-                md_str(g, boss_jobs::yard::QUEUED_AT)
-            );
+            println!("    {}", queued_lane_line(g, &trains));
         }
     }
     for line in abandoned_report(&abandoned) {
@@ -304,16 +762,31 @@ pub async fn run(all: bool) -> Result<()> {
 
     // Stranded greens: gated, never parked — the census cross-ref, not a
     // second definition (§9a). A gate-run CLOSES on its verdict, so this
-    // reads closed ones; a status=open query cannot see them.
-    let gate_runs = rows(
-        api(
-            &http,
-            reqwest::Method::GET,
-            "/api/jobs?kind=gate-run&limit=60",
-            None,
-        )
-        .await?,
-    );
+    // reads closed ones; a status=open query cannot see them. Windowed
+    // in DAYS, not by count, and the page judged against `total` — see
+    // [`stranded_gate_runs_query`] for the held green a count hid.
+    let stranded_body = api(
+        &http,
+        reqwest::Method::GET,
+        &stranded_gate_runs_query(),
+        None,
+    )
+    .await?;
+    let stranded_total = stranded_body
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_i64);
+    let gate_runs = rows(stranded_body);
+    let stranded_cut = cut_note(stranded_total, gate_runs.len());
+    // Held greens: read BY THE HOLD, so a hold is seen for as long as it
+    // stands, whatever gated after it.
+    let held_body = api(&http, reqwest::Method::GET, &held_gate_runs_query(), None).await?;
+    let held_total = held_body
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_i64);
+    let held_runs = rows(held_body);
+    let held_cut = cut_note(held_total, held_runs.len());
     let cars = rows(
         api(
             &http,
@@ -337,9 +810,51 @@ pub async fn run(all: bool) -> Result<()> {
              onto origin/main + re-gate; never rebuild blind):",
             stranded.len()
         );
+        let car_ids: std::collections::BTreeMap<String, String> = cars
+            .iter()
+            .filter_map(|c| {
+                let b = md_str(c, "branch");
+                let id = c.get("id")?.as_str()?;
+                (!b.is_empty()).then(|| (b.to_string(), id.to_string()))
+            })
+            .collect();
         for b in &stranded {
-            println!("    {b}");
+            match half_done_rerail(b, &car_ids) {
+                Some(line) => println!("    {b}  {line}"),
+                None => println!("    {b}"),
+            }
         }
+    }
+    if let Some(cut) = &stranded_cut {
+        println!("    (read {cut} gate-runs in the week — the rest were not cross-referenced)");
+    }
+
+    // Held greens: gated green, no car, and an operator's hold — the
+    // deliberate half of the stranded predicate. A brake on is not an
+    // alarm; an invisible brake is (2fa96d34).
+    let held_greens = held_greens(&held_runs, &car_branches);
+    if held_greens.is_empty() {
+        println!("\n  HELD GREENS — none: no green gate is held before parking");
+    } else {
+        println!(
+            "\n  HELD GREENS — {} green gate(s) held off the dock on purpose (release = \
+             re-gate with the --park-* intent; never rebuild one blind):",
+            held_greens.len()
+        );
+        for (branch, reason) in &held_greens {
+            println!("    {branch}  —  {reason}");
+        }
+    }
+    if let Some(cut) = &held_cut {
+        println!("    (read {cut} held gate-runs — the rest were not cross-referenced)");
+    }
+
+    // Flakes: reds that went green at the same head, by check — read
+    // off the week of gate-runs already fetched above, so the count
+    // costs no second read and names the same window (36cc4913).
+    println!("{}", flakes_line(&gate_runs));
+    if let Some(cut) = &stranded_cut {
+        println!("    (read {cut} gate-runs in the week — the rest were not counted)");
     }
 
     // Orphans: forge heads no packet claims (281f9842 — 60 of 80 the
@@ -352,6 +867,7 @@ pub async fn run(all: bool) -> Result<()> {
     claimed.extend(
         gate_runs
             .iter()
+            .chain(held_runs.iter())
             .chain(gating.iter())
             .map(|g| md_str(g, "branch").to_string())
             .filter(|b| !b.is_empty()),
@@ -374,6 +890,16 @@ pub async fn run(all: bool) -> Result<()> {
                 for line in orphan_lines(&orphans, ORPHANS_SHOWN, all) {
                     println!("{line}");
                 }
+                // A car that landed before a database switch is recorded
+                // in the ARCHIVE, where the arrival sweep never looks, so
+                // its branch stays an orphan forever (dfd83788: 50 of them
+                // on 2026-09-17). The door that reads the archive's
+                // records and applies the sweep's own rule is a forge
+                // verb; name it here, or the operator deletes by hand.
+                println!(
+                    "    landed before a database switch? the archive decides: \
+                     boss ops forge sweep-archive-branches --wait -- --dry-run boss <archive-db>"
+                );
             }
             // RESIDUE (L3, acedf981): the inverse cross-ref. Orphans are
             // forge heads no packet claims; residue is open car packets
@@ -461,6 +987,34 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // MY WORK — the actor's own queue, after the dock (65a89769). One
+    // read of the agents registry for the aliases, one assignments read
+    // per identity; a caller nobody named is refused here and the rest
+    // of the approach still prints (identity's read/write split).
+    let identities = match crate::identity::caller() {
+        Some(c) => {
+            let agents = rows(api(&http, reqwest::Method::GET, "/api/agents", None).await?);
+            Some(my_work_identities(&c.id, &agents))
+        }
+        None => None,
+    };
+    let mut my_rows: Vec<Value> = Vec::new();
+    for id in identities.iter().flatten() {
+        my_rows.extend(rows(
+            api(
+                &http,
+                reqwest::Method::GET,
+                &format!("/api/jobs/assignments?assignee_id={id}&limit=1000"),
+                None,
+            )
+            .await?,
+        ));
+    }
+    println!();
+    for line in my_work_section(identities.as_deref(), &my_rows, now) {
+        println!("{line}");
+    }
+
     // FRESHNESS (L2, acedf981) — parked and stranded branches whose
     // base has fallen behind origin/main. A car cut from an old main
     // merges clean and reverts the trains, so a green gate on a stale
@@ -481,6 +1035,9 @@ pub async fn run(all: bool) -> Result<()> {
     // train ([[parked-cars-go-stale]]). It has to be re-gated before it is
     // released, so it belongs in the freshness check beside the parked.
     fresh_targets.extend(held.iter().map(|(b, _)| b.clone()));
+    // A held GREEN too: it has no car yet, but the same hold keeps its
+    // base falling behind, and releasing it is a re-gate.
+    fresh_targets.extend(held_greens.iter().map(|(b, _)| b.clone()));
     fresh_targets.sort();
     fresh_targets.dedup();
     if !fresh_targets.is_empty() {
@@ -532,6 +1089,20 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // THE SHED — landed cars not yet proven, and what each waits on.
+    let shed = shed_lines(&cars);
+    if shed.is_empty() {
+        println!("\n  SHED — empty: every landed car is proven");
+    } else {
+        println!(
+            "\n  SHED — {} landed car(s) awaiting proof (probe pending / waiting on an event / UNPROVEN):",
+            shed.len()
+        );
+        for line in &shed {
+            println!("{line}");
+        }
+    }
+
     // The task queue, as a number.
     let tasks = api(
         &http,
@@ -564,6 +1135,116 @@ pub async fn run(all: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A TRAIN's gate-run (128b5496) in the GATING lane is the train being
+    /// tested, not a car being gated. On 2026-09-14 `boss orient` listed
+    /// `train/20260914-1641` and a car branch as two indistinguishable
+    /// runs, the afternoon David asked three times why a PR train was in
+    /// the gates (b96a878f). The yard learned to say so in three lanes
+    /// that day; the terminal says the same thing in the same words — the
+    /// predicate is `boss_jobs::stranded::is_train_gate`, never the
+    /// branch name, and the title comes from the trains IN TRANSIT
+    /// already fetched, so no extra read. A car's line does not change.
+    #[test]
+    fn a_train_gate_in_the_gating_lane_is_named_as_the_trains_test() {
+        use serde_json::json;
+        let trains = vec![json!({
+            "id": "9a3af298-0000-4000-8000-000000000000",
+            "title": "PR train 2026-09-14 16:41",
+        })];
+        let car =
+            json!({"metadata": {"branch": "fix/a-dark-registry-does-not-widen-what-a-host-runs"}});
+        let train_gate = json!({"metadata": {
+            "branch": "train/20260914-1641",
+            "train_gate": true,
+            "train": "9a3af298-0000-4000-8000-000000000000",
+        }});
+        assert_eq!(
+            super::gating_line(&car, &trains),
+            "fix/a-dark-registry-does-not-widen-what-a-host-runs",
+            "a car's line is its branch, as before"
+        );
+        assert_eq!(
+            super::gating_line(&train_gate, &trains),
+            "train/20260914-1641  (train gate — testing train 9a3af298, PR train 2026-09-14 16:41)"
+        );
+        // The QUEUED FOR A SLOT lane says the same thing in the same
+        // words, with its place-in-line stamp kept: until 90ee6fcd a
+        // train gate waiting for a bay printed as a bare branch there,
+        // indistinguishable from a queued car, while GATING named it.
+        let queued_train_gate = json!({"metadata": {
+            "branch": "train/20260914-1641",
+            "train_gate": true,
+            "train": "9a3af298-0000-4000-8000-000000000000",
+            boss_jobs::yard::QUEUED_AT: "2026-09-14T20:01:00Z",
+        }});
+        assert_eq!(
+            super::queued_lane_line(&queued_train_gate, &trains),
+            "train/20260914-1641  (train gate — testing train 9a3af298, PR train 2026-09-14 16:41)  since 2026-09-14T20:01:00Z"
+        );
+        let queued_car = json!({"metadata": {
+            "branch": "fix/a-dark-registry-does-not-widen-what-a-host-runs",
+            boss_jobs::yard::QUEUED_AT: "2026-09-14T20:02:00Z",
+        }});
+        assert_eq!(
+            super::queued_lane_line(&queued_car, &trains),
+            "fix/a-dark-registry-does-not-widen-what-a-host-runs  since 2026-09-14T20:02:00Z",
+            "a queued car's line is its branch and its stamp, as before"
+        );
+    }
+
+    /// The IN TRANSIT fetch is capped at ten trains; a train gate whose
+    /// train is not among them still says WHICH train, by id, and does
+    /// not invent a title. And a `train/…` branch WITHOUT the flag is a
+    /// car (the predicate is the metadata, not the name).
+    #[test]
+    fn a_train_gate_whose_train_was_not_fetched_names_the_id_alone() {
+        use serde_json::json;
+        let train_gate = json!({"metadata": {
+            "branch": "train/20260914-1641",
+            "train_gate": true,
+            "train": "9a3af298-0000-4000-8000-000000000000",
+        }});
+        assert_eq!(
+            super::gating_line(&train_gate, &[]),
+            "train/20260914-1641  (train gate — testing train 9a3af298)"
+        );
+        let named_like_a_train = json!({"metadata": {"branch": "train/20260914-1641"}});
+        assert_eq!(
+            super::gating_line(&named_like_a_train, &[]),
+            "train/20260914-1641",
+            "the branch name is not the predicate"
+        );
+    }
+
+    #[test]
+    fn a_stranded_rerail_head_names_the_car_and_the_finishing_verb() {
+        let cars: std::collections::BTreeMap<String, String> = [(
+            "feat/x".to_string(),
+            "abcdef12-0000-4000-8000-000000000000".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let line = super::half_done_rerail("feat/x-rerail", &cars).expect("a half-done rerail");
+        assert!(
+            line.contains("feat/x") && line.contains("boss rerail abcdef12 --finish"),
+            "{line}"
+        );
+        assert!(line.contains("never re-gate"), "{line}");
+    }
+
+    #[test]
+    fn a_plain_stranded_green_gets_no_rerail_advice() {
+        let cars: std::collections::BTreeMap<String, String> = [(
+            "feat/x".to_string(),
+            "abcdef12-0000-4000-8000-000000000000".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(super::half_done_rerail("feat/y", &cars), None);
+        // a -rerail head whose base has no car is just stranded
+        assert_eq!(super::half_done_rerail("feat/z-rerail", &cars), None);
+    }
+
     #[test]
     fn a_bounded_orphan_list_names_the_flag_that_shows_the_rest() {
         let orphans: Vec<String> = (0..46).map(|i| format!("feat/b{i}")).collect();
@@ -616,6 +1297,119 @@ mod tests {
 
     fn heads(bs: &[&str]) -> std::collections::BTreeSet<String> {
         bs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn landed(branch: &str, md: Value) -> Value {
+        let mut m = md;
+        m["branch"] = json!(branch);
+        json!({
+            "status": "open",
+            "metadata": m,
+            "steps": [
+                { "title": "Boarded", "status": "completed" },
+                { "title": "Proven in prod", "status": "ready" }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_probe_wins_over_an_event_and_a_failed_attempt_is_named() {
+        assert_eq!(
+            shed_place(&landed(
+                "fix/a",
+                json!({ "proof_probe": "bash x.sh", "proof_event": "the next red train" })
+            )),
+            Shed::ProbePending { last: None }
+        );
+        assert_eq!(
+            shed_place(&landed(
+                "fix/b",
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1: grep found nothing" } })
+            )),
+            Shed::ProbePending {
+                last: Some("exit 1: grep found nothing".into())
+            }
+        );
+        assert_eq!(
+            shed_place(&landed(
+                "fix/c",
+                json!({ "proof_event": "the next red train" })
+            )),
+            Shed::WaitingOn("the next red train".into())
+        );
+        assert_eq!(shed_place(&landed("fix/d", json!({}))), Shed::Unproven);
+    }
+
+    /// Exit 75 is "not yet": early, not wrong — a different word from
+    /// FAILING, and the probe's own reason rides the line.
+    #[test]
+    fn a_probe_that_said_not_yet_is_not_failing() {
+        let early = landed(
+            "fix/early",
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "not_yet": true, "why": "NOT YET: no disk-report request yet — the sweeps fire daily" } }),
+        );
+        assert!(matches!(shed_place(&early), Shed::ProbeNotYet { .. }));
+        let line = &shed_lines(&[early])[0];
+        assert!(
+            line.contains("probe says NOT YET — NOT YET: no disk-report"),
+            "{line}"
+        );
+        assert!(!line.contains("FAILING"), "{line}");
+        // An attempt written before the flag existed, exit 75 alone, reads the same.
+        let bare = landed(
+            "fix/bare",
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "why": "later" } }),
+        );
+        assert!(matches!(shed_place(&bare), Shed::ProbeNotYet { .. }));
+    }
+
+    #[test]
+    fn the_shed_lists_only_open_cars_at_proven_and_says_what_each_waits_on() {
+        let mut closed = landed("fix/closed", json!({}));
+        closed["status"] = json!("closed");
+        let mut gating = landed("fix/gating", json!({}));
+        gating["steps"] = json!([{ "title": "Gated", "status": "ready" }]);
+        let cars = vec![
+            landed("fix/event", json!({ "proof_event": "the next red train" })),
+            landed("fix/probe", json!({ "proof_probe": "bash x.sh" })),
+            landed(
+                "fix/failing",
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1" } }),
+            ),
+            landed("fix/forgot", json!({})),
+            closed,
+            gating,
+        ];
+        let lines = shed_lines(&cars);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "    fix/event: waiting on: the next red train");
+        assert_eq!(
+            lines[1],
+            "    fix/probe: probe pending (the forge runs it on arrival)"
+        );
+        assert_eq!(lines[2], "    fix/failing: probe FAILING — exit 1");
+        assert!(
+            lines[3].starts_with("    fix/forgot: UNPROVEN — no probe, no event"),
+            "{}",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn a_paragraph_long_verdict_is_clipped_to_one_line_and_says_so() {
+        let long = "x ".repeat(400);
+        let lines = shed_lines(&[landed(
+            "fix/long",
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": long } }),
+        )]);
+        let line = &lines[0];
+        assert!(line.ends_with('…'), "{line}");
+        assert!(
+            line.chars().count() < SHED_TEXT_CHARS + 40,
+            "{}",
+            line.chars().count()
+        );
+        assert_eq!(clipped("short  and\n spaced"), "short and spaced");
     }
 
     #[test]
@@ -683,6 +1477,151 @@ mod tests {
             vec![(
                 "fix/held".to_string(),
                 "waiting on an operator action".to_string()
+            )]
+        );
+    }
+
+    /// The query string as `(key, value)` pairs — what the server reads,
+    /// not what the string looks like.
+    fn params(query: &str) -> Vec<(&str, &str)> {
+        query
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .collect()
+    }
+
+    /// A held green is read by its HOLD, a stranded one by a window in
+    /// DAYS — neither by a recency COUNT. David, 2026-09-15: the dev-pod
+    /// car (gate-run 3164b0d5, green on `--hold` since 17:56Z 09-14)
+    /// vanished from every surface after 80 newer gate-runs, because the
+    /// approach read the newest N and cross-referenced those. A limit is
+    /// not a filter (backlog 2fa96d34): the held read narrows on
+    /// `metadata_has=hold` (the `metadata ? $n` door, 4d9aa761) and the
+    /// stranded read keeps every run closed inside the retention window
+    /// (`closed_within`, the same field the boards use), so a count only
+    /// bounds the page and is checked against `total`.
+    #[test]
+    fn the_held_read_narrows_on_the_hold_and_the_stranded_read_on_days() {
+        let held_q = held_gate_runs_query();
+        let held = params(&held_q);
+        assert!(held.contains(&("kind", "gate-run")), "{held_q}");
+        assert!(
+            held.contains(&("metadata_has", "hold")),
+            "the held lane reads BY THE HOLD: {held_q}"
+        );
+
+        let stranded_q = stranded_gate_runs_query();
+        let stranded = params(&stranded_q);
+        assert!(stranded.contains(&("kind", "gate-run")), "{stranded_q}");
+        assert!(
+            stranded
+                .iter()
+                .any(|(k, v)| *k == "closed_within" && v.parse::<u32>().is_ok_and(|d| d >= 7)),
+            "the stranded lane is windowed in DAYS, a week or more: {stranded_q}"
+        );
+        // The page bound is the server's ceiling, not a recency window:
+        // the read is judged against `total`, and a count below the
+        // ceiling would silently be one.
+        for q in [&held_q, &stranded_q] {
+            let limit = params(q)
+                .iter()
+                .find(|(k, _)| *k == "limit")
+                .and_then(|(_, v)| v.parse::<i64>().ok());
+            assert_eq!(limit, Some(GATE_RUN_PAGE), "{q}");
+        }
+    }
+
+    /// Backlog 36cc4913: the flakiest check is a number, not a memory.
+    /// The FLAKES line is read over the SAME week of gate-runs the
+    /// stranded lane reads — one query, one window — counting the
+    /// checks on runs a green-after-red stamped `flake_of`, and it is
+    /// one line either way.
+    #[test]
+    fn the_flakes_line_counts_checks_over_the_weeks_gate_runs_and_says_none() {
+        let runs = vec![
+            gate_run(
+                "fix/a",
+                json!({ "flake_of": "p1", "flaky_checks": ["test"] }),
+                "green",
+            ),
+            gate_run(
+                "fix/b",
+                json!({ "flake_of": "p2", "flaky_checks": ["test", "fmt"] }),
+                "green",
+            ),
+            gate_run(
+                "fix/c",
+                json!({ "regate_of": "p3", "prior_failed": ["clippy"] }),
+                "failed",
+            ),
+            gate_run("fix/d", json!({}), "green"),
+        ];
+        let line = flakes_line(&runs);
+        assert_eq!(
+            line,
+            "\n  FLAKES — 2 check(s) red then green at the same head in the last 7 days: test: 2, fmt: 1"
+        );
+        assert_eq!(
+            flakes_line(&[]),
+            "\n  FLAKES — none: no gate went red then green at the same head in the last 7 days"
+        );
+        // The window the line names is the window the read narrows on.
+        let q = stranded_gate_runs_query();
+        assert!(params(&q).contains(&("closed_within", "7")), "{q}");
+        assert!(line.contains("last 7 days"), "{line}");
+    }
+
+    /// The truncation note is a reading of `total` against the page, and
+    /// silent when the page held everything.
+    #[test]
+    fn a_cut_read_says_how_much_it_read() {
+        assert_eq!(cut_note(Some(1200), 1000), Some("1000 of 1200".to_string()));
+        assert_eq!(cut_note(Some(415), 415), None);
+        assert_eq!(cut_note(None, 415), None, "no total is no claim");
+    }
+
+    fn gate_run(branch: &str, md: Value, verdict: &str) -> Value {
+        let mut m = md;
+        m["branch"] = json!(branch);
+        json!({
+            "id": branch,
+            "kind": "gate-run",
+            "status": "closed",
+            "metadata": m,
+            "steps": [{ "spec_slug": "gate", "metadata": { "verdict": verdict } }],
+        })
+    }
+
+    /// The held-green lane: a green no car claims WITH a hold, named with
+    /// the operator's reason. A stranded green (no hold) is the other
+    /// lane's; a train's own gate-run carries a hold too (128b5496) and
+    /// is neither — the shared predicate (`stranded::unparked_green`)
+    /// decides, not this lane.
+    #[test]
+    fn a_held_green_is_named_with_its_reason_and_a_train_gate_is_not() {
+        let runs = vec![
+            gate_run(
+                "feat/held",
+                json!({ "hold": "lands at the next restart" }),
+                "green",
+            ),
+            gate_run("feat/stranded", json!({}), "green"),
+            gate_run(
+                "train/20260915-1427",
+                json!({ "hold": "train gate", "train_gate": true }),
+                "green",
+            ),
+            gate_run("feat/red-held", json!({ "hold": "x" }), "failed"),
+            gate_run("feat/parked", json!({ "hold": "x" }), "green"),
+        ];
+        assert_eq!(
+            held_greens(&runs, &heads(&["feat/parked"])),
+            vec![(
+                "feat/held".to_string(),
+                "lands at the next restart".to_string()
             )]
         );
     }
@@ -791,5 +1730,323 @@ mod tests {
         let boarded = car("fix/boarded", "open", "completed", held.clone());
         let closed = car("fix/closed", "closed", "ready", held.clone());
         assert!(held_dock_cars(&[boarded, closed]).is_empty());
+    }
+
+    // ---- MY WORK (65a89769) --------------------------------------------
+
+    fn agents() -> Vec<Value> {
+        vec![json!({
+            "id": "agent-claude",
+            "aliases": ["claude@algedonic.dev"],
+            "display_name": "Claude (engineering)",
+        })]
+    }
+
+    /// One assignment row as `/api/jobs/assignments` answers it (the
+    /// measured shape, 2026-09-18): the packet's identity beside the
+    /// step, and the admission date this car adds to the row.
+    fn asg(job: &str, workflow: &str, slug: &str, title: &str, opened: &str, step: &str) -> Value {
+        json!({
+            "job_id": job,
+            "job_title": title,
+            "workflow": workflow,
+            "opened_on": opened,
+            "priority": "standard",
+            "step": { "id": step, "spec_slug": slug, "kind": "task", "status": "ready" },
+        })
+    }
+
+    /// The pod signs as the ALIAS (`BOSS_ACTOR=claude@algedonic.dev`)
+    /// while the dispatcher nominates to the alias too — but a box
+    /// named by the agent's id would read 0 (measured: 25 on the alias,
+    /// 0 on `agent-claude`, 2026-09-18). So the read asks for the
+    /// caller AND every id the registry ties to it, from either end.
+    #[test]
+    fn my_work_reads_for_the_caller_and_every_registry_alias() {
+        assert_eq!(
+            my_work_identities("agent-claude", &agents()),
+            vec![
+                "agent-claude".to_string(),
+                "claude@algedonic.dev".to_string()
+            ]
+        );
+        assert_eq!(
+            my_work_identities("claude@algedonic.dev", &agents()),
+            vec![
+                "claude@algedonic.dev".to_string(),
+                "agent-claude".to_string()
+            ]
+        );
+        // Nobody in the registry: the caller alone, never nothing.
+        assert_eq!(
+            my_work_identities("emp-david", &agents()),
+            vec!["emp-david".to_string()]
+        );
+    }
+
+    #[test]
+    fn my_work_groups_by_kind_oldest_first_with_one_hint_per_group() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rows = vec![
+            asg(
+                "2604d814-0000-4000-8000-000000000000",
+                "backlog-item",
+                "build",
+                "DECISION: 37 orphan forge branches are provably landed (forge PR ancestry); 13 have no merged PR",
+                "2026-09-16",
+                "s-build",
+            ),
+            asg(
+                "9e627310-0000-4000-8000-000000000000",
+                "backlog-item",
+                "triage",
+                "CADENCE SILENT: maintenance-conservation-invariants",
+                "2026-09-11",
+                "s-triage",
+            ),
+            asg(
+                "f827bd78-0000-4000-8000-000000000000",
+                "maintenance-sweep",
+                "inspect",
+                "Disk headroom sweep",
+                "2026-09-17",
+                "s-inspect",
+            ),
+            asg(
+                "3c1f843f-0000-4000-8000-000000000000",
+                "ship-a-change",
+                "proven",
+                "The Stripe sensor adapter",
+                "2026-09-18",
+                "s-proven",
+            ),
+            // The same step answered under a second identity: one line.
+            asg(
+                "f827bd78-0000-4000-8000-000000000000",
+                "maintenance-sweep",
+                "inspect",
+                "Disk headroom sweep",
+                "2026-09-17",
+                "s-inspect",
+            ),
+        ];
+        let lines = my_work_lines(&rows, now);
+        let all = lines.join("\n");
+        assert_eq!(
+            lines.len(),
+            3 + 4 + 3,
+            "3 headers + 4 rows + 3 hints:\n{all}"
+        );
+        // Groups oldest-first, rows oldest-first inside each.
+        let header_at = |kind: &str| {
+            lines
+                .iter()
+                .position(|l| l.starts_with(&format!("    {kind} — ")))
+                .unwrap()
+        };
+        assert!(header_at("backlog-item") < header_at("maintenance-sweep"));
+        assert!(header_at("maintenance-sweep") < header_at("ship-a-change"));
+        assert_eq!(lines[0], "    backlog-item — 2");
+        assert_eq!(
+            lines[1],
+            "      9e627310 backlog-item triage CADENCE SILENT: maintenance-conservation-invariants (7d)"
+        );
+        // The title is cut at 60 characters; the age is whole days.
+        assert_eq!(
+            lines[2],
+            "      2604d814 backlog-item build DECISION: 37 orphan forge branches are provably landed (forg (2d)"
+        );
+        // One hint line per group, naming what the step IS.
+        assert!(lines[3].contains("triage = a decision"), "{}", lines[3]);
+        assert!(lines[3].contains("build = "), "{}", lines[3]);
+        assert!(all.contains("inspect = a measurement to record"), "{all}");
+        assert!(all.contains("run-car-probe"), "{all}");
+        // A step with no opened_on (an older server) reads as unknown,
+        // never as 0d.
+        let mut bare = asg(
+            "aaaaaaaa-0000-4000-8000-000000000000",
+            "user-feedback",
+            "design-review",
+            "Feedback on /it/estate",
+            "2026-09-18",
+            "s-dr",
+        );
+        bare.as_object_mut().unwrap().remove("opened_on");
+        let l = my_work_lines(&[bare], now).join("\n");
+        assert!(l.contains("(age ?)"), "{l}");
+        assert!(l.contains("--answers"), "{l}");
+    }
+
+    /// The whole section, as printed: the count and who it read for;
+    /// "nothing" when empty; a loud refusal when nobody is named —
+    /// a MY WORK read under `operator:unidentified` would answer 0
+    /// and read as an empty queue (CLAUDE.md §Doors: a wrong target
+    /// answers instead of erroring).
+    #[test]
+    fn my_work_section_counts_says_nothing_and_refuses_the_unnamed() {
+        let now = chrono::Utc::now();
+        let ids = vec![
+            "claude@algedonic.dev".to_string(),
+            "agent-claude".to_string(),
+        ];
+        let one = vec![asg(
+            "f827bd78-0000-4000-8000-000000000000",
+            "maintenance-sweep",
+            "inspect",
+            "Disk headroom sweep",
+            "2026-09-17",
+            "s",
+        )];
+        let full = my_work_section(Some(&ids), &one, now).join("\n");
+        assert!(
+            full.starts_with(
+                "  MY WORK — 1 ready/active step(s) assigned to claude@algedonic.dev (+ agent-claude)"
+            ),
+            "{full}"
+        );
+        let empty = my_work_section(Some(&ids), &[], now).join("\n");
+        assert!(empty.contains("MY WORK — nothing"), "{empty}");
+        assert!(empty.contains("claude@algedonic.dev"), "{empty}");
+        let refused = my_work_section(None, &[], now).join("\n");
+        assert!(refused.contains("MY WORK — REFUSED"), "{refused}");
+        assert!(refused.contains("BOSS_ACTOR"), "{refused}");
+        assert!(refused.contains(".config/boss/actor"), "{refused}");
+    }
+
+    /// `boss orient` reads the map from the server rather than deriving
+    /// the numbers itself (design 0524fc95): the fixture is built with
+    /// the SERVER's own types, so a renamed field on `boss_jobs::regions`
+    /// breaks this before it can print `?` at an operator.
+    #[test]
+    fn the_regions_header_prints_the_servers_eight_cards() {
+        use boss_jobs::regions::{Region, RegionState, Regions, Trend};
+        let trend = |metric: &str, unit: &str, cur: Option<f64>, prev: Option<f64>| Trend {
+            metric: metric.into(),
+            unit: unit.into(),
+            current: cur,
+            previous: prev,
+            samples: usize::from(cur.is_some()),
+            previous_samples: usize::from(prev.is_some()),
+        };
+        let region =
+            |name: &str, count: Option<usize>, bound: Option<usize>, state, why: &str, trend| {
+                Region {
+                    name: name.into(),
+                    count,
+                    bound,
+                    state,
+                    why: why.into(),
+                    trend,
+                }
+            };
+        let map = Regions {
+            window_hours: 24,
+            regions: vec![
+                region(
+                    "dock",
+                    Some(2),
+                    Some(4),
+                    RegionState::Clear,
+                    "2 cars parked",
+                    trend("dock wait", "hours", Some(1.5), Some(2.0)),
+                ),
+                region(
+                    "gates",
+                    Some(3),
+                    Some(3),
+                    RegionState::Busy,
+                    "3 of 3 bays in use — at the bound",
+                    trend("gate duration", "minutes", Some(14.0), None),
+                ),
+                region(
+                    "track",
+                    Some(1),
+                    Some(1),
+                    RegionState::Troubled,
+                    "blocked: train #470",
+                    trend("time at CI", "minutes", None, None),
+                ),
+                region(
+                    "shed",
+                    Some(0),
+                    None,
+                    RegionState::Clear,
+                    "every landed car is proven",
+                    trend("proven", "per day", Some(17.0), Some(12.0)),
+                ),
+                region(
+                    "arrivals",
+                    Some(17),
+                    None,
+                    RegionState::Clear,
+                    "17 arrivals in 24h",
+                    trend("arrivals", "per day", Some(17.0), Some(12.0)),
+                ),
+                region(
+                    "garage",
+                    Some(0),
+                    None,
+                    RegionState::Clear,
+                    "nothing held, stranded or red",
+                    trend("reds", "per day", Some(0.0), Some(1.0)),
+                ),
+                region(
+                    "receiving",
+                    None,
+                    None,
+                    RegionState::Troubled,
+                    "the workflow registry that names the inbound kinds could not be read",
+                    trend("inbound", "per day", None, None),
+                ),
+                region(
+                    "marshalling",
+                    Some(4),
+                    None,
+                    RegionState::Busy,
+                    "4 packets standing at 2 stations",
+                    trend("served", "per day", Some(6.0), Some(6.0)),
+                ),
+            ],
+        };
+        let lines = region_lines(&serde_json::to_value(&map).unwrap());
+        assert_eq!(
+            lines.len(),
+            9,
+            "a heading and eight cards:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines[0].contains("last 24h"), "{}", lines[0]);
+        assert!(
+            lines[1].starts_with("    dock ")
+                && lines[1].contains(" 2 of 4 ")
+                && lines[1].contains("clear")
+                && lines[1].contains("dock wait 1.5h (was 2.0h)"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("BUSY") && lines[2].contains("gate duration 14m (was —)"),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("TROUBLED")
+                && lines[3].contains("blocked: train #470")
+                && lines[3].contains("time at CI — (was —)"),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[5].contains("arrivals 17.0/day (was 12.0/day)"),
+            "{}",
+            lines[5]
+        );
+        assert!(
+            lines[7].contains("    receiving        ?") && lines[7].contains("TROUBLED"),
+            "{}",
+            lines[7]
+        );
     }
 }

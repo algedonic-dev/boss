@@ -1,0 +1,29 @@
+# The registered agents of Algedonic, LLC — actors, not people.
+#
+# An agent's canonical id is agent-<slug> (design 6fda05ae); the
+# addresses it logs in with are `aliases` of that id, resolved at the
+# jobs API's door; the model is a fact about each RUN, and
+# `default_model` is what a run uses when it does not say (spelled as
+# the rate card spells it); the caps are the budget the jobs API admits
+# each run against (7dd9f28c).
+#
+# Published to the agents registry by `boss tenant publish` (POST
+# /api/agents/batch — backlog f56155f0): a row the platform already
+# registered (prod's agent-claude came from migration 20260915212644)
+# is updated on the declared fields that differ, and the publish names
+# each change (09887242).
+#
+# `role` and `department` are Class codes under (employee, role) and
+# (employee, department) in seeds/classes.json — the same rows an
+# employee's are checked against (ab192a9f). A step whose audience is
+# { role = "engineering-agent" } reaches this agent through them.
+
+[[agent]]
+id = "agent-claude"
+display_name = "Claude (engineering)"
+default_model = "opus-5[1m]"
+aliases = ["claude@algedonic.dev"]
+role = "engineering-agent"
+department = "engineering"
+# Caps are unset until the first month's spend is measured — an
+# unbudgeted agent is admitted, never refused (the boot-guard rule).

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Install the forge host's systemd units from this checkout.
 #
-# WHY THIS EXISTS. boss-gcp has had `deploy-services.sh` with a TIMERS
-# array since the day its own comment was written: "Adding a new timer
-# = author the .service + .timer in the right place under infra/, then
-# add a row here. New timers land via `sudo ./infra/deploy-services.sh
-# prod` instead of a `sudo install` treadmill that's been the source of
-# every 'this timer was authored but never installed' gap so far
-# (audit-integrity, ml-inference-batch, ledger-recognize,
-# conservation-invariants — all caught by hand)."
+# WHY THIS EXISTS. boss-gcp has had an installer with a timer roster
+# (today infra/gcp/install-units.sh reading infra/estate/roles.toml;
+# until 2026-09-18 the TIMERS array of the deleted bare-metal deploy
+# script) since the day its own comment was written: "Adding a new
+# timer = author the .service + .timer in the right place under infra/,
+# then add a row here" — instead of a `sudo install` treadmill that had
+# been the source of every 'this timer was authored but never installed'
+# gap so far (audit-integrity, ml-inference-batch, ledger-recognize,
+# conservation-invariants — all caught by hand).
 #
 # The forge host had no equivalent, so its units went on by hand, and
 # one of the two was forgotten. On 2026-08-17 the CI runner's disk
@@ -17,10 +18,11 @@
 # had never been installed. `cluster-deploy-runner` had been. Nothing
 # in the tree could tell the difference, and nothing was going to.
 #
-# WHERE IT RUNS. On the forge host (10.20.0.15), from its checkout at
-# /home/david/boss, which is where the installed units already point:
+# WHERE IT RUNS. On the forge host (infra/estate/estate.toml
+# `forge_host`), from its checkout at /home/david/boss, which is where
+# the installed units already point:
 #
-#   ssh 10.20.0.15 'cd /home/david/boss && git fetch forgejo main \
+#   ssh <forge> 'cd /home/david/boss && git fetch forgejo main \
 #     && git checkout -qf FETCH_HEAD && sudo infra/forge/install.sh'
 #
 # (NOT `git pull` — the checkout tracks no upstream branch; it is driven
@@ -57,6 +59,27 @@ if [ "$ETC" = "/etc/systemd/system" ] && [ "$(id -u)" -ne 0 ]; then
     echo "install.sh: needs root to write /etc/systemd/system — re-run with sudo." >&2
     exit 1
 fi
+
+# THE ADDRESS FILE, FIRST. /etc/boss/sor.env is the one place on this
+# host that spells the system of record and the forge's own addresses;
+# every unit installed below reads it with EnvironmentFile= (no `-`: a
+# unit that started without its address would answer a wrong target)
+# and every script sources infra/lib/sor.sh. Rendered from the tree's
+# ONE source, infra/estate/estate.toml, on every converge — so the
+# boss.algedonic.dev cutover is an edit to that file and a tick of this
+# timer (backlog 5222163e, audit H10). Before the units, deliberately:
+# a daemon-reload that finds the file absent would leave every unit
+# refusing to start until the next tick. Overridable for the scratch
+# run the lints drive (a test never writes /etc).
+SOR_ENV="${INSTALL_SOR_ENV:-/etc/boss/sor.env}"
+bash "${HERE}/../estate/render-sor-env.sh" --to "$SOR_ENV"
+run_summary_field sor_env "$SOR_ENV"
+# Now this run itself has the addresses the rest of the install reads
+# (the journal door below, the roles read, the ops-runner installer).
+export BOSS_SOR_ENV="$SOR_ENV"
+# shellcheck source=infra/lib/sor.sh
+. "${HERE}/../lib/sor.sh"
+sor_require BOSS_JOBS_URL BOSS_FORGE_JOURNAL_URL
 
 # Every unit this host runs. A unit absent from this list is a unit
 # nobody installs, which is the entire defect above.
@@ -140,18 +163,125 @@ if [ "${INSTALL_KUBECTL:-1}" = "1" ] && [ ! -x /usr/local/bin/kubectl ]; then
     rm -f "$tmp"
 fi
 
-# The system of record for the maintenance packets these units open.
-# ONE definition (§9a), written as a per-unit drop-in so
-# boss-maintenance-wrap.sh — which has NO localhost default and REFUSES
-# without it — reaches the cluster jobs API. The forge host carries no
-# deploy-services jobs-url.conf drop-in, which is why reap-dead-ci-jobs
-# failed every run on 2026-09-03 until the URL was hand-authored. Now it
-# is installed from the tree, so it converges instead of drifting.
-JOBS_URL="http://10.20.0.34:7900"
+# WHAT THE cluster-operator ROLE BRINGS (design 1bc4b4ed: cluster
+# management runs on this host; the workstation is a terminal). Read
+# off BOSS_NODE_ROLES, which forge-converge exports from the estate
+# registry; a hand run with no roles set installs nothing here and says
+# so. Two things, and a check:
+#
+#   * talosctl, pinned by sha like kubectl above — the Talos client is
+#     the ONLY interface to the nodes (no ssh), and it must stay within
+#     one minor of the cluster. v1.13.8 is the version David's own client
+#     runs, so the forge answers exactly as the workstation did.
+#   * The credentials the role needs — /etc/boss-ops/talosconfig and
+#     /etc/boss-ops/kubeconfig — are CHECKED, never written. They are
+#     placed once by David (token admin is his) and must be root:root
+#     mode 0600; anything else is reported on the converge packet as
+#     absent-or-wrong until fixed. The estate's own converge never
+#     writes a credential.
+#   * The tree's `boss` CLI, since 2026-09-18 (backlog 9f00a805,
+#     consolidation H8, car 1) — taken out of the cluster image built
+#     for the commit this converge checked out, by the same installer
+#     boss-gcp has run since 2026-09-15 (infra/estate/
+#     install-cli-from-image.sh; the store is /opt/boss-cli, the link
+#     /usr/local/bin/boss, `cli_sha` beside `converge_sha` on the
+#     packet). Measured on #448: infra/forge/*.sh was 32 scripts and
+#     9,790 lines, the largest of them shell twins of CLI verbs
+#     (run-car-probe.sh for `boss prove --from-car`, tenant-census.sh
+#     for `boss tenant`, …) each with its own pin, because this host
+#     had no binary to shell to. The role that brings it is the one
+#     the verbs serve: cluster management runs here. The CLI step runs
+#     below, after the credential check.
+. "${HERE}/../estate/node-roles.sh"
+cli_rc=0
+if has_role cluster-operator; then
+    TALOSCTL_VERSION="v1.13.8"
+    TALOSCTL_SHA256="406b56f9e4ff03b1557cc941b1f163aec8a6ebb36e28f0bbbe6d083589529261"
+    if [ "${INSTALL_TALOSCTL:-1}" = "1" ] && [ ! -x /usr/local/bin/talosctl ]; then
+        tmp="$(mktemp)"
+        if curl -sfL -o "$tmp" "https://github.com/siderolabs/talos/releases/download/${TALOSCTL_VERSION}/talosctl-linux-amd64" \
+            && echo "${TALOSCTL_SHA256}  ${tmp}" | sha256sum -c - >/dev/null; then
+            install -m 0755 "$tmp" /usr/local/bin/talosctl
+            echo "install.sh: talosctl ${TALOSCTL_VERSION} installed (cluster-operator)"
+        else
+            echo "install.sh: talosctl download or checksum failed — the cluster-operator role has no Talos client until it is present" >&2
+        fi
+        rm -f "$tmp"
+    fi
+    ops_missing=""
+    for cred in talosconfig kubeconfig; do
+        f="/etc/boss-ops/$cred"
+        if [ ! -f "$f" ]; then
+            ops_missing="$ops_missing $cred:absent"
+        elif [ "$(stat -c '%U:%G %a' "$f" 2>/dev/null)" != "root:root 600" ]; then
+            ops_missing="$ops_missing $cred:$(stat -c '%U:%G %a' "$f")"
+        fi
+    done
+    if [ -n "$ops_missing" ]; then
+        echo "install.sh: cluster-operator credentials not ready —${ops_missing} (want root:root 600 under /etc/boss-ops; placed by hand, never by this script)"
+        if declare -F run_summary_field >/dev/null; then run_summary_field ops_credentials "not ready:${ops_missing}"; fi
+    else
+        echo "install.sh: cluster-operator credentials present (root:root 600)"
+        if declare -F run_summary_field >/dev/null; then run_summary_field ops_credentials "present"; fi
+    fi
+
+    # THE CLI, FROM THE IMAGE AT THE SHA THIS CONVERGE CHECKED OUT.
+    # forge-converge.sh hands the sha over as BOSS_CONVERGE_SHA (root
+    # cannot read the owner's clone); a hand run has none and installs
+    # no CLI rather than guessing one. The installer records its own
+    # facts (cli_sha, cli_result, cli_action, cli_image) through the
+    # run summary; its output is captured and printed whole under its
+    # own prefix, like boss-gcp's converge prints it.
+    #
+    # THREE VERDICTS, NOT TWO. Exit 0 is the CLI confirmed at the sha.
+    # Exit 75 is `not yet`: the registry answered and has no image for
+    # this commit's tag — the deploy runner on THIS host builds it a
+    # few minutes after each train, and this converge fetched main ten
+    # minutes after the last one, so the first tick after every train
+    # lands here. That is a wait, recorded on the packet, retried next
+    # tick, and NOT a red: a converge that failed on every train would
+    # be an alarm nobody could read (CLAUDE.md §Diagnosis). Anything
+    # else is a real refusal — the registry dark, a digest mismatch, a
+    # binary that names another commit — and reds the run the way it
+    # reds boss-gcp's: after the units below are installed, enabled and
+    # reported, with the exit on the packet. The installer leaves
+    # /usr/local/bin/boss at whatever the previous confirmed generation
+    # was in every non-zero case.
+    if [ "${INSTALL_CLI:-1}" = "1" ]; then
+        if [ -z "${BOSS_CONVERGE_SHA:-}" ]; then
+            echo "install.sh: no converged sha in the environment (BOSS_CONVERGE_SHA, set by forge-converge.sh) — a hand run installs no CLI; the next converge tick does"
+            run_summary_field cli_result "skipped: no BOSS_CONVERGE_SHA (hand run)"
+        else
+            cli_log="$(mktemp -t forge-install-cli.XXXXXX)"
+            bash "${HERE}/../estate/install-cli-from-image.sh" "$BOSS_CONVERGE_SHA" >"$cli_log" 2>&1 || cli_rc=$?
+            sed 's/^/  cli: /' "$cli_log"
+            rm -f "$cli_log"
+            case "$cli_rc" in
+                0) echo "install.sh: the CLI is the tree's at ${BOSS_CONVERGE_SHA:0:8} (cluster-operator)" ;;
+                75)
+                    echo "install.sh: the image for ${BOSS_CONVERGE_SHA:0:8} is not in the registry yet — the deploy runner builds it after each train; the next tick retries, and /usr/local/bin/boss stays whatever the previous converge confirmed (cli_result on the packet)"
+                    cli_rc=0 ;;
+                *)
+                    echo "install.sh: the CLI step FAILED (exit $cli_rc) at ${BOSS_CONVERGE_SHA:0:8} — its complete" >&2
+                    echo "    output is above. Every unit still converges below; /usr/local/bin/boss is" >&2
+                    echo "    whatever the previous converge confirmed (cli_result on the packet says why)." >&2
+                    run_summary_field cli_exit "$cli_rc" ;;
+            esac
+        fi
+    fi
+else
+    echo "install.sh: cluster-operator not among this host's roles (${BOSS_NODE_ROLES:-none}) — no Talos client installed, no CLI"
+fi
+
+# The per-unit `jobs-url.conf` drop-in that used to carry the system of
+# record (from 2026-09-03, when reap-dead-ci-jobs failed every run for
+# want of it, to 2026-09-18) is RETIRED: every unit reads
+# /etc/boss/sor.env itself. A drop-in left behind would carry a second
+# copy of the address that nothing re-renders, so it is removed — the
+# converge that stops writing a file must also stop the file standing.
 for u in "${UNITS[@]}"; do
-    mkdir -p "${ETC}/${u}.service.d"
-    printf '[Service]\nEnvironment=BOSS_JOBS_URL=%s\n' "$JOBS_URL" \
-        > "${ETC}/${u}.service.d/jobs-url.conf"
+    rm -f "${ETC}/${u}.service.d/jobs-url.conf"
+    rmdir "${ETC}/${u}.service.d" 2>/dev/null || true
 done
 
 # The ops-request runner is the same unit boss-gcp runs, installed the
@@ -193,7 +323,7 @@ done
 # infra/journal-door-ensure.sh and both converges call it: that file
 # carries why the door exists, why nothing of ours is shipped for it, and
 # why every failure in it is non-fatal.
-JOURNAL_DOOR_URL="http://10.20.0.15:19531" bash "${HERE}/../journal-door-ensure.sh"
+JOURNAL_DOOR_URL="$BOSS_FORGE_JOURNAL_URL" bash "${HERE}/../journal-door-ensure.sh"
 
 echo "install.sh: ${installed} unit pair(s) installed and enabled"
 run_summary_field units_installed "$installed"
@@ -204,4 +334,13 @@ if [ "$ops_runner_rc" -ne 0 ]; then
     echo "    what failed above, and the run summary carries it. Every other unit converged;" >&2
     echo "    this host cannot answer an ops-request until that is fixed." >&2
     exit "$ops_runner_rc"
+fi
+# The CLI verdict last, for the same reason the ops runner's is: a
+# refused pull deserves a red unit and a packet on `failed` — the host
+# has not converged on the tree until its CLI is the tree's — but never
+# at the price of a unit left uninstalled or a timer left disabled.
+if [ "$cli_rc" -ne 0 ]; then
+    echo "install.sh: the CLI did NOT install (exit $cli_rc) — cli_result on the packet says why." >&2
+    echo "    Every unit converged; /usr/local/bin/boss is whatever the previous converge confirmed." >&2
+    exit "$cli_rc"
 fi

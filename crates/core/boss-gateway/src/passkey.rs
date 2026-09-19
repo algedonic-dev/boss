@@ -136,6 +136,41 @@ pub async fn credentials_list(
     Json(out).into_response()
 }
 
+/// `DELETE /api/auth/passkey/credentials/{credential_id}` — remove one
+/// of the session's own passkeys. The rule lives in boss-people (the
+/// last one stays, 409 in the user's terms); this proxies for the
+/// session's employee and passes that refusal through verbatim, so the
+/// panel can show the reason rather than "failed".
+pub async fn credentials_remove(
+    State(state): State<Arc<PasskeyState>>,
+    headers: HeaderMap,
+    axum::extract::Path(credential_id): axum::extract::Path<String>,
+) -> Response {
+    let (_sess, employee_id) = match employee_session(&headers, &state.session_key) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    let url = format!(
+        "{}/api/people/{}/webauthn-credentials/{}",
+        state.people_base, employee_id, credential_id
+    );
+    let resp = match state.request(reqwest::Method::DELETE, url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return err(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}"))
+                .into_response();
+        }
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    match status {
+        StatusCode::NO_CONTENT => StatusCode::NO_CONTENT.into_response(),
+        StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+            (status, resp.text().await.unwrap_or_default()).into_response()
+        }
+        _ => err(StatusCode::BAD_GATEWAY, "credential removal failed").into_response(),
+    }
+}
+
 /// The challenge recipe, in one place so the begin and any future
 /// audit tooling cannot drift: sha256 over the utf8 of
 /// `<shape_hash>:<nonce>`, both hex strings.
@@ -259,27 +294,40 @@ fn err2(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, msg.into()).into_response()
 }
 
+/// The gateway's own service identity: the actor its server-side
+/// calls sign as, and the `owner_id` of what those calls open.
+pub const GATEWAY_ACTOR: &str = "automation:gateway";
+
+/// A server-side call signed as the gateway's own internal actor,
+/// plus the machine token when the process has one. boss-people's
+/// webauthn storage requires a `platform-admin` caller (its paths
+/// are also browser-reachable through the /api/people proxy, so it
+/// cannot trust callers by position) — this identity is how the
+/// ceremony passes that gate while ordinary proxied sessions are
+/// refused. The site's inquiry door (inquiries.rs) signs its
+/// accounts and jobs writes the same way; one spelling, here, so the
+/// two cannot drift (backlog 68126ec9).
+pub fn sign_as_gateway(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let rb = rb.header(
+        "x-boss-user",
+        json!({
+            "id": GATEWAY_ACTOR,
+            "role": "platform-admin",
+            "access_tier": "operator",
+        })
+        .to_string(),
+    );
+    match boss_core::machine_token::from_env() {
+        Some(token) => rb.header(boss_core::machine_token::HEADER, token),
+        None => rb,
+    }
+}
+
 impl PasskeyState {
-    /// Machine-token-stamped server-side call, identifying as the
-    /// gateway's own internal actor. boss-people's webauthn storage
-    /// requires a `platform-admin` caller (its paths are also
-    /// browser-reachable through the /api/people proxy, so it cannot
-    /// trust callers by position) — this identity is how the ceremony
-    /// passes that gate while ordinary proxied sessions are refused.
+    /// Machine-token-stamped server-side call as the gateway — see
+    /// [`sign_as_gateway`].
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let mut rb = self.http.request(method, url).header(
-            "x-boss-user",
-            json!({
-                "id": "automation:gateway",
-                "role": "platform-admin",
-                "access_tier": "operator",
-            })
-            .to_string(),
-        );
-        if let Some(token) = boss_core::machine_token::from_env() {
-            rb = rb.header(boss_core::machine_token::HEADER, token);
-        }
-        rb
+        sign_as_gateway(self.http.request(method, url))
     }
 
     async fn stored_passkeys(&self, employee_id: &str) -> Result<Vec<Value>, ErrResp> {

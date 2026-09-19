@@ -3,6 +3,8 @@
 
 use super::*;
 
+use boss_core::partition::Partition;
+
 use axum::extract::{Path, Query};
 
 // ---------------------------------------------------------------------------
@@ -46,11 +48,122 @@ pub(super) struct ListJobsQuery {
     /// user-feedback packets to show 14 live ones and was 27 short of
     /// silently truncating at its own limit.
     closed_within: Option<i64>,
-    /// `simulated=false` drops the demo tenant's packets; `true` keeps
-    /// only those; absent is everything, so no existing caller moves.
-    /// 87% of packets are simulated, so a surface that wants real work
-    /// has to say so in the query rather than filter the page it got.
+    /// `partition=real|simulated|shadow` keeps ONE partition; absent
+    /// is everything, so no existing caller moves. 87% of packets are
+    /// simulated, so a surface that wants real work has to say so in
+    /// the query rather than filter the page it got. Any other word is
+    /// a 400 that names the vocabulary — an unknown partition that
+    /// silently answered the unfiltered count would read as "every
+    /// packet is in it".
+    partition: Option<String>,
+    /// The N-1 spelling, kept so old callers do not move:
+    /// `simulated=false` is `partition=real` — so a caller that wants
+    /// real work keeps excluding shadow packets without knowing the
+    /// word — and `simulated=true` is `partition=simulated`, exactly
+    /// the simulated company (the sim never sees the shadow lane, Q5
+    /// of packet 508cc38c). `partition` wins when both are sent.
     simulated: Option<bool>,
+    /// A URL-encoded flat JSON object of string values; the packet's
+    /// metadata must CONTAIN it (`metadata @> $n`, the shape the port
+    /// already handles for station predicates). `metadata={"branch":
+    /// "feat/x"}` is the car, not a page that may or may not hold it.
+    /// Anything else is a 400 that names the rule
+    /// (`crate::metadata_containment`) — a nested document that
+    /// silently matched nothing would read as "no such packet".
+    metadata: Option<String>,
+    /// A top-level key the packet must carry, whatever its value
+    /// (`metadata ? $n`). Letters, digits, underscore; a dotted path
+    /// is refused because `?` does not walk one.
+    metadata_has: Option<String>,
+    /// `department=<code>` keeps the packets of the kinds whose ACTIVE
+    /// workflow row declares `metadata.department = <code>` — a
+    /// packet carries no department, its workflow does, and the
+    /// registry is the one copy (`crate::department`). A code nothing
+    /// declares is `total: 0`, never the unfiltered count: measured
+    /// on prod on 2026-09-18, `?department=sales` answered 1944 —
+    /// every packet — because nothing read the parameter (backlog
+    /// cc76f755). Needs the registry; without one it is a 503, not an
+    /// answer.
+    department: Option<String>,
+}
+
+/// Resolve `department=<code>` to the kind set the port narrows on:
+/// the active kinds declaring it (`crate::department::kinds_declaring`),
+/// which may be empty — and empty is a real filter (no packet), not
+/// no filter. `None` when the param was not sent.
+async fn kinds_for_department<R: JobsRepository, B: EventBus>(
+    code: Option<&str>,
+    state: &JobsApiState<R, B>,
+) -> Result<Option<Vec<String>>, Response> {
+    let Some(code) = code else {
+        return Ok(None);
+    };
+    let reg = super::kinds::kind_registry_or_503(state)?;
+    let specs = reg.list_active(None).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("department: workflow registry read failed: {e}"),
+        )
+            .into_response()
+    })?;
+    Ok(Some(crate::department::kinds_declaring(&specs, code)))
+}
+
+/// Parse `metadata=<json>` into the containment document the port
+/// accepts, or the sentence the 400 carries.
+///
+/// The shape and its sentence are `crate::metadata_containment` — the
+/// ONE copy `boss job list --where` builds by as well (backlog 88a3b072,
+/// 2026-09-14). The TEXT goes to the rule, not a parsed value: a key
+/// that appears twice is only visible before the parse keeps its last
+/// value, and until 2026-09-14 this door kept it — `{"k":"1","k":"2"}`
+/// narrowed on `"2"` with a 200 while the terminal refused the same
+/// request (backlog 03852b47). What is this door's alone is the 400
+/// naming the param and showing the url-encoded example, and an empty
+/// object narrowing nothing as `None`.
+fn metadata_containment_from_query(raw: Option<&str>) -> Result<Option<serde_json::Value>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let doc = crate::metadata_containment::parse(raw).map_err(|why| {
+        format!("metadata {why}; e.g. metadata={{\"branch\":\"feat/x\"}} (url-encoded)")
+    })?;
+    Ok((!doc.is_empty()).then_some(serde_json::Value::Object(doc)))
+}
+
+/// Validate `metadata_has=<key>` as a plain identifier, or say why not.
+///
+/// The rule and its sentence are `crate::metadata_key` — the ONE copy
+/// `boss job list --has` refuses by as well (backlog b46e9d8e,
+/// 2026-09-14). This door adds only the name of its param, so the 400
+/// names what to fix.
+fn metadata_key_from_query(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(key) = raw else {
+        return Ok(None);
+    };
+    crate::metadata_key::check(key)
+        .map(|k| Some(k.to_string()))
+        .map_err(|why| format!("metadata_has {why}"))
+}
+
+/// Resolve the two partition spellings to one filter, or say why not.
+/// `partition=` wins; `simulated=false` is `real` and `simulated=true`
+/// is `simulated` (the N-1 spelling — see `ListJobsQuery`). An unknown
+/// word is refused: a server that ignored it would answer the
+/// unfiltered count, and "0 shadow packets" and "every packet" must not
+/// share a body.
+pub(crate) fn partition_from_query(
+    partition: Option<&str>,
+    simulated: Option<bool>,
+) -> Result<Option<Partition>, String> {
+    match (partition, simulated) {
+        (Some(word), _) => word
+            .parse::<Partition>()
+            .map(Some)
+            .map_err(|e| format!("partition: {e}")),
+        (None, Some(flag)) => Ok(Some(Partition::from_legacy_simulated(flag))),
+        (None, None) => Ok(None),
+    }
 }
 
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -79,16 +192,39 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     // passes through one policy path.
     let scope = job_scope_from_predicate(&user, &predicate);
 
+    // The two metadata filters are refused at the boundary rather than
+    // bound as-is: a document or key the SQL would accept and match
+    // nothing with is a confident wrong answer, not an empty one.
+    let metadata_contains = match metadata_containment_from_query(q.metadata.as_deref()) {
+        Ok(doc) => doc,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    let metadata_has = match metadata_key_from_query(q.metadata_has.as_deref()) {
+        Ok(key) => key,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    let partition = match partition_from_query(q.partition.as_deref(), q.simulated) {
+        Ok(p) => p,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    let kinds = match kinds_for_department(q.department.as_deref(), &state).await {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+
     let filter = JobFilter {
         kind: q.kind,
         kind_prefix: q.kind_prefix,
+        kinds,
         status: q.status,
         owner_id: q.owner_id,
         subject_id: q.subject_id,
         waiting_on: q.waiting_on,
         closed_since: closed_since_from(q.closed_within, &state).await,
+        metadata_contains,
+        metadata_has,
         scope,
-        simulated: q.simulated,
+        partition,
         ..Default::default()
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -311,6 +447,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
     let filter = JobFilter {
         kind: None,
         kind_prefix: None,
+        kinds: None,
         status: Some(boss_core::job::JobStatus::Open),
         closed_since: None,
         priority: None,
@@ -318,13 +455,14 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         subject_id: None,
         waiting_on: None,
         metadata_contains: None,
+        metadata_has: None,
         scope: JobScope::All,
         // Unchanged on purpose. This feed currently shows every
         // packet, 87% of which are the demo tenant's; narrowing it is
         // a decision about what this surface is FOR, not part of
         // adding the capability, so it is left to the caller that
         // owns the surface.
-        simulated: None,
+        partition: None,
     };
     let jobs = match state.jobs.list_jobs(&filter, 12, 0).await {
         Ok((jobs, _total)) => jobs,
@@ -632,14 +770,33 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     }
 
-    // Admission decides sim-vs-real ONCE, here, and the flag never
-    // moves again (03-jobs.sql: the epoch trim leans on a Job's rows
-    // all sharing one fate). Two admissible sources, OR-ed: an
-    // explicit `simulated: true` on the body (demo seeding, tests),
-    // or the request arriving on a sim chain (`x-sim-origin` — how
-    // every sim-engine create presents). The OR means a sim chain can
-    // never mint real work, even with a body that claims otherwise.
-    job.simulated = job.simulated || boss_core::sim_origin::is_in_sim_chain();
+    // Admission decides the partition ONCE, here, and it never moves
+    // again (03-jobs.sql: the epoch trim leans on a Job's rows all
+    // sharing one fate). Two admissible sources, OR-ed: an explicit
+    // `partition` / `simulated: true` on the body (demo seeding,
+    // tests), or the request arriving on a sim chain (`x-sim-origin`
+    // — how every sim-engine create presents). The OR means a sim
+    // chain can never mint real work, even with a body that claims
+    // otherwise.
+    //
+    // NOTHING ADMITS A SHADOW PACKET YET. Shadow admission mirrors a
+    // real packet's trigger into a candidate protocol (design
+    // network-experiments.md Tier 3, car 3 of packet 508cc38c); it is
+    // not a body flag, and a body that claims it is refused so the
+    // shadow lane cannot be populated before its side-effect skip
+    // (car 2) exists. The sim never participates (Q5), so a sim chain
+    // carrying the claim is refused the same way.
+    if job.partition == Partition::Shadow {
+        return (
+            StatusCode::BAD_REQUEST,
+            "partition=shadow is not admitted here: shadow packets are minted by the \
+             experiment lane (docs/design/network-experiments.md, Tier 3), not by a body value",
+        )
+            .into_response();
+    }
+    if boss_core::sim_origin::is_in_sim_chain() {
+        job.partition = Partition::Simulated;
+    }
 
     // Validate the kind against the Workflow registry. When no registry
     // is plumbed (older tests) we accept any kind string. We capture
@@ -760,15 +917,17 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
             .as_ref()
             .and_then(|s| s.metadata.get("owner_role"))
             .and_then(|v| v.as_str());
+        // Through `selectors()`: a role declared as `audience` is the
+        // same fallback a legacy `authority_role` is (f5ebd2e1 car 1).
         let step_fallback = kind_spec
             .as_ref()
-            .and_then(|s| s.steps.iter().find_map(|st| st.authority_role.as_deref()));
+            .and_then(|s| s.steps.iter().find_map(|st| st.selectors().authority_role));
         match crate::owner_resolution::resolve_owner(
             roster.as_ref(),
             &job.owner_id,
             &job.id.to_string(),
             owner_role,
-            step_fallback,
+            step_fallback.as_deref(),
         )
         .await
         {
@@ -905,74 +1064,76 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    // Every event about the Job inherits its admission-fixed flag as
-    // the `_simulated` marker — the packet, not the transport context
-    // of the write, is the source of truth for sim-vs-real.
+    // Every event about the Job inherits its admission-fixed partition
+    // as the `_partition` / `_simulated` markers — the packet, not the
+    // transport context of the write, is the source of truth.
     let job_stamp = state
         .publisher
         .stamp_with_actor(actor)
         .await
-        .with_simulated(job.simulated);
+        .with_partition(job.partition);
     let job_event = job_stamp.event(
         events::JOB_CREATED,
         serde_json::to_value(&job).unwrap_or_default(),
     );
-    // Row-touch columns bind the stamp's wall time — the rebuilder
-    // reproduces them from audit_log.timestamp, so live and replay
-    // must read the same instant. Business dates (opened_on, `{day}`
-    // tokens below) keep the authoritative clock's `now`.
+    // The materialized steps (pre-insert, so the filer-field gate
+    // could refuse before the Job existed) go in WITH the job: one
+    // STEP_CREATED each, on the job's stamp — one actor, one
+    // partition, one instant for every row of the graph. The
+    // rebuilder at boss-jobs/src/rebuild.rs reconstructs the step
+    // rows from exactly these events, so a step without one would
+    // make the projection diverge from the log.
+    let steps = materialized_steps.unwrap_or_default();
+    let step_events: Vec<_> = steps
+        .iter()
+        .map(|step| job_stamp.event(events::STEP_CREATED, events::step_state_payload(step)))
+        .collect();
+
+    // ONE TRANSACTION: the job row, every step row and every event
+    // commit together, or the request fails and nothing exists.
+    //
+    // This comment used to say "materialization is ATOMIC from an
+    // observer's view", and it was not (backlog f2ba226e). The job
+    // committed alone, then each step was written through a separate
+    // `add_step_at` — its own transaction — with a failed write only a
+    // warn and a 201 answered regardless. On 2026-09-16 02:32Z
+    // (pr-train 06e5610f) the database was slow: the job row at
+    // :14.87, steps 1–5 by :19.5, the dispatcher already acting on
+    // the partial graph at :19.54, steps 6–9 through :44.5 — and step
+    // 10, `cancelled`, the terminal, never. The client had timed out,
+    // axum dropped this future between steps nine and ten, and no
+    // line was logged. The train held the track for ninety minutes
+    // with no terminal to cancel it with.
+    //
+    // A dropped future now drops one open transaction, and the
+    // database rolls it back on the connection's return to the pool
+    // — the residue class cannot occur. Row-touch columns bind the
+    // stamp's wall time: the rebuilder reproduces them from
+    // audit_log.timestamp, so live and replay must read the same
+    // instant. Business dates (opened_on, `{day}` tokens) keep the
+    // authoritative clock's `now`.
     if let Err(e) = state
         .jobs
-        .create_job_at(&job, job_stamp.timestamp, &[job_event])
+        .create_job_with_steps_at(
+            &job,
+            &steps,
+            job_stamp.timestamp,
+            &[job_event],
+            &step_events,
+        )
         .await
     {
         return persist_error_response(e);
     }
 
-    // Persist the steps materialized above (pre-insert, so the
-    // filer-field gate could refuse before the Job existed).
-    if let Some(steps) = materialized_steps {
-        // Materialization is ATOMIC from an observer's view. A consumer
-        // that reacts to a `step.ready` event — the dispatcher's marker
-        // auto-complete, a delegate-subjob fork — must see the COMPLETE
-        // step graph. So two passes: (1) persist EVERY step with its
-        // STEP_CREATED event recorded in the SAME transaction (outbox
-        // phase 2 — the old emit-then-write window is gone); (2) only
-        // once the whole graph is durable, record `step.ready`.
-        // Materialized steps need their STEP_CREATED events or the
-        // rebuilder at boss-jobs/src/rebuild.rs can't reconstruct the
-        // rows from audit_log and the projection diverges from the log.
-        for step in &steps {
-            let step_actor = user
-                .ambient_actor()
-                .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-            let step_stamp = state
-                .publisher
-                .stamp_with_actor(step_actor)
-                .await
-                .with_simulated(job.simulated);
-            let step_event =
-                step_stamp.event(events::STEP_CREATED, events::step_state_payload(step));
-            if let Err(e) = state
-                .jobs
-                .add_step_at(step, step_stamp.timestamp, &[step_event])
-                .await
-            {
-                tracing::warn!(
-                    job_id = %job_id,
-                    step_id = %step.id,
-                    error = %e,
-                    "failed to write materialized step projection",
-                );
-            }
-        }
-        // Second pass: the full step graph is now persisted, so any observer
-        // of a `step.ready` event sees a complete, consistent Job.
+    if !steps.is_empty() {
+        // Second pass, AFTER the commit: the whole graph is durable,
+        // so a consumer reacting to a `step.ready` event — the
+        // dispatcher's marker auto-complete, a delegate-subjob fork —
+        // sees a complete, consistent Job, never a partial one.
         // `materialize_steps_at` ran the open-time readiness pass, so the
         // trigger (and any step whose `ready_when` already holds) is `Ready`
-        // here — record `step.ready.<kind>` on the outbox so the
-        // dispatcher's marker auto-complete + delegate-subjob forks (D7)
-        // react against the whole graph, never a partial one.
+        // here — record `step.ready.<kind>` on the outbox (D7).
         let mut ready_events = Vec::new();
         for step in &steps {
             if step.status == StepStatus::Ready && !step.kind.is_empty() {
@@ -987,14 +1148,12 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         {
             tracing::warn!(job_id = %job_id, error = %e, "failed to record step.ready markers");
         }
-        if !steps.is_empty() {
-            tracing::debug!(
-                job_id = %job_id,
-                kind = %job.kind,
-                step_count = steps.len(),
-                "materialized job kind steps",
-            );
-        }
+        tracing::debug!(
+            job_id = %job_id,
+            kind = %job.kind,
+            step_count = steps.len(),
+            "materialized job kind steps",
+        );
     }
 
     (
@@ -1268,7 +1427,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     };
     let old_status = existing.status;
 
-    // `simulated` is IMMUTABLE after admission. Ignore-not-reject,
+    // The partition is IMMUTABLE after admission. Ignore-not-reject,
     // matching how the other server-owned field on this route is
     // treated (the path-authoritative `id` above): the stored value
     // wins over anything on the wire, so a client round-tripping a
@@ -1277,7 +1436,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     // touches the column; carrying the stored value forward here
     // keeps the JOB_UPDATED event payload (and the in-memory
     // adapter) agreeing with the row.
-    job.simulated = existing.simulated;
+    job.partition = existing.partition;
 
     // Pick the right policy action: transitioning to Closed is a Close
     // action (more restricted than Update); everything else is Update.
@@ -1317,6 +1476,15 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         return resp;
     }
 
+    // The third close site (the two step-driven hooks are in steps.rs):
+    // the same `closed_at` stamp beside the caller's `closed_on`, so a
+    // Job the operator closes by hand measures a cycle time like every
+    // other. The caller's own `closed_at`, if it sent one, wins.
+    if action == Action::Close {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        stamp_close_instant(&mut job, &now);
+    }
+
     // OUTBOX (phase 2): the state event (full row state, what the
     // rebuild consumes) + the status-transition markers (topic-only
     // duplicates for downstream consumers; rebuild ignores them)
@@ -1328,7 +1496,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         .publisher
         .stamp_with_actor(actor)
         .await
-        .with_simulated(job.simulated);
+        .with_partition(job.partition);
     let mut job_events = vec![stamp.event(
         events::JOB_UPDATED,
         serde_json::to_value(&job).unwrap_or_default(),
@@ -1475,7 +1643,7 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         .publisher
         .stamp_with_actor(actor.clone())
         .await
-        .with_simulated(existing.simulated);
+        .with_partition(existing.partition);
     let merged = match state
         .jobs
         .merge_job_metadata_at(&job_id, &patch, &stamp)
@@ -1485,7 +1653,11 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         Err(crate::port::JobsError::NotFound(_)) => {
             return (StatusCode::NOT_FOUND, "job not found").into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        // The same door as create/update: a declared edge the guard
+        // refuses is the CALLER's error (400 with the guard's sentence),
+        // not a storage failure. As a 500 here it read as an outage to
+        // `boss gate --park-after` and the auto-park handler (b683f1cc).
+        Err(e) => return persist_error_response(e),
     };
 
     // Same wake as the PUT: a metadata write can flip a metadata-gated
@@ -1626,7 +1798,7 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
         .publisher
         .stamp_with_actor(actor)
         .await
-        .with_simulated(existing.simulated);
+        .with_partition(existing.partition);
     match state
         .jobs
         .repin_workflow_version_at(&job_id, to.version, &stamp)
@@ -1655,14 +1827,57 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
 /// recollection — were wrong in the same direction because none was
 /// connected to the machines (59ef456a).
 ///
-/// Read-only on purpose: declaring a machine is a schema migration that
-/// converges, not an API write.
+/// Declaring a machine is a change to the tree that converges — since
+/// backlog ee368d0c through the batch door below, before that as a
+/// schema migration.
 pub(super) async fn list_estate_nodes<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(_user): CurrentUser,
 ) -> Response {
     match state.jobs.list_estate_nodes().await {
         Ok(nodes) => Json(serde_json::json!({ "data": nodes })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/estate/nodes/batch` — the tree's estate declaration
+/// (backlog ee368d0c). The launcher sends infra/estate/estate.toml's
+/// `[[node]]` rows on every pod start; the port lands them
+/// insert-if-absent (a node already there is kept, a role not yet on
+/// it is added) and leaves one `node.declared` per node it changed.
+/// Until this door the estate reached a database only as a migration,
+/// so every fresh OSS database booted with this LAN's seven machines.
+///
+/// Operator TIER, like the observation door — not `is_trusted`, whose
+/// headerless-guest allowance exists for reads: a caller with no
+/// identity must not be able to declare hardware. The same
+/// `validate_estate_node` the file loader runs refuses the whole batch
+/// (422, naming the node) on the first bad row.
+pub(super) async fn declare_estate_nodes<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Json(batch): Json<crate::port::EstateNodeBatch>,
+) -> Response {
+    if user.access_tier != boss_policy_client::AccessTier::Operator {
+        return (
+            StatusCode::FORBIDDEN,
+            "the estate declaration door is operator machinery — operator tier required",
+        )
+            .into_response();
+    }
+    if let Some(why) = batch
+        .nodes
+        .iter()
+        .find_map(|n| crate::port::validate_estate_node(n).err())
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response();
+    }
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let stamp = boss_core::publisher::EventStamp::new("jobs", actor);
+    match state.jobs.declare_estate_nodes(&batch.nodes, &stamp).await {
+        Ok(out) => Json(out).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

@@ -62,6 +62,26 @@ row already at the authored version is left exactly as it is, whatever its
 status, so an operator who retires a misbehaving rule in an incident keeps
 it off. What the tree owns is which rules EXIST and what each one says.
 
+**What the tree owns is its OWN rules — a tenant's are the tenant's**
+(backlog 458971ef, 2026-09-17). A row's `source` says whose it is: NULL
+for everything this directory, a migration or the SPA's editor wrote;
+`tenant:<tenant_id>` for a rule a tenant declared in its own
+`seeds/rules.toml` and published through `boss tenant publish` (the
+tenant contract, docs/tenant-contract.md). The seed retires only
+NULL-sourced rows no file here names, so a tenant's reactor survives
+every converge; the namespace is still one, so a file here under a name
+a tenant holds LIVE (active or draft) is `rejected` by name, the same
+refusal the API door makes of a tenant draft under a product name.
+**A name the product retired is free for a tenant** (backlog 70bc5725,
+2026-09-18): ownership is judged on live rows only, so a name whose rows
+are all retired — the thirty-one brewery reactors the historical
+migrations still insert and this seed then retires — is taken over by
+the tenant's `boss tenant publish`, landing above the retired history
+with the product's retired versions kept under the name; the reverse
+holds for a file here under a name a tenant has retired.
+`GET /api/dispatcher/rules` reports `source` per rule, and
+`GET /api/dispatcher/rules/{name}/versions` shows both sources.
+
 **Publishing live and stopping there is still the defect it was.** The
 same change owes a file here, or the next converge retires the rule and
 the next reader cannot ask why the system was doing what it did. Measured
@@ -130,7 +150,23 @@ twenty minutes in. **It is now refused rather than merely unnecessary:**
 migration written after the collapse that writes rule rows, because §9a is
 explicit that asking the next person not to re-open a second home is not a
 mechanism. The thirty-one that predate it are applied history and are left
-alone.
+alone — but what they insert is not: on every fresh database they still
+wrote sixty-four names as active product rows, thirty-five of them under
+names no file here authors any longer (the brewery's reactors, moved to
+the tenant on 2026-09-17, and the design-doc sweep's), which the seed then
+retired at first boot and a tenant's publish had to take over at v(n+1).
+`20260918022108-seed-residue-is-not-a-retirement.sql` deletes those rows
+(backlog b5f21e82) — `source IS NULL`, no tenant row under the name — so a
+fresh database's first seed retires nothing and a tenant lands at its
+file's version. The lint reads a DELETE as what it is: it cannot open a
+second home, so it passes; an INSERT or UPDATE is still refused. The
+first rule added after the collapse (2026-09-12,
+`measure-*-sweep-on-inspect-ready`) still arrived with that INSERT, because
+`an-expectation-names-a-rule-the-tree-declares.sh` had kept demanding one —
+its non-vacuity guard predated the collapse — and the minute-width stamp on
+the file slipped under the refusing lint's date compare. Both lints now
+agree with this paragraph: a rule declared by its file alone is counted, not
+refused, and a stamp is compared at one width.
 
 The fourth place, before that, was `infra/lint/dispatcher-rules-ratchet.sh`,
 whose hand-typed `BASELINE=60` every rule car had to bump. That integer
@@ -181,15 +217,27 @@ whichever member file happens to sort first.
 `step.done.<kind>` event to the handler that runs the step's side
 effect. Handler implementations live at
 `boss-dispatcher::rules::handlers::*`. This is the routing residue
-above.
-
-**External-party callbacks** (`forward-*-to-webhook`). Forward the
-events the simulator's CounterpartyEngine reacts to — banks, suppliers,
-the keg courier, the tax authority, the operational broadcasts — to its
-callback receiver via `webhook.notify`. The simulator never subscribes
-to the event stream; the system pushes to a configured webhook,
-preserving the sim/system boundary. No-op in any deployment without
-`BOSS_EVENT_WEBHOOK_URL` set.
+above. **The business-step ones are a tenant's, and are not here**
+(design e2580840 car 4, backlog 105fb702, 2026-09-17): a reactor on
+`step.done.billing`, `step.done.production-produce`,
+`step.done.payroll-release`, `step.done.hr-hire` and the rest fires on
+a step kind no platform workflow declares — only an example tenant's
+`seeds/workflows.toml` does — and was enforced on a real instance whose
+tenant had no such protocol. Thirty-one rules moved verbatim to
+`examples/brewery/seeds/rules.toml` (thirteen of them also to
+`examples/used-device-shop/seeds/rules.toml`): eight brewery-domain
+reactors (keg return and settle, tasting panel, excise, packaging,
+produce/consume, ingredient restock), fourteen company-module reactors
+(invoice issue, FG drawdown on invoice, shipment, PO, receive, bills,
+payroll, tax remit, hire/terminate) and the nine `forward-*-to-webhook`
+callbacks, which pushed the events the simulator's CounterpartyEngine
+reacts to at `BOSS_EVENT_WEBHOOK_URL`. What stays here runs the
+platform itself: trains and gates, sweeps and their measures, the
+estate, DNS, credentials, notifications, the step markers. The test
+`the_product_rules_are_the_platforms` (boss-dispatcher) is the ratchet:
+a rule here naming an `inventory.*`, `products.*`, `commerce.*`,
+`shipping.*`, `ledger.*`, `people.*` or `webhook.notify` handler, or a
+tenant's kind in its trigger, is refused by name.
 
 **Delegate-subjob** (Workflow v2, D7) — the spawn → link → resolve loop.
 A `delegate-subjob` step spawns a child Job of `metadata.subworkflow`

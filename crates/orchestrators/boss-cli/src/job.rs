@@ -28,7 +28,7 @@
 //! that has corrupted the system of record before. Not wrapped;
 //! wrapping it would make it convenient.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 /// A full job id as the API expects it: 36 chars, dashed. Anything
@@ -78,13 +78,20 @@ pub(crate) fn resolve<'a>(rows: &'a [Value], given: &str) -> Result<&'a Value> {
 
 /// The envelope `POST /api/jobs` actually requires, learned one 422 at
 /// a time (f5dd5167). Explicit values win; everything else lands.
+///
+/// No `opened_on`: the create handler injects it off the authoritative
+/// (sim-aware) clock AND stamps the precise filing instant beside it as
+/// `metadata.opened_at` — but only when the clock owns the date. This
+/// envelope used to send the caller's `today`, which read as a
+/// deliberate (backdated) date and silenced the stamp on every packet
+/// `boss job file` / `boss ops` filed, so timing one meant reading its
+/// event stream (backlog a7a07ffb, 2026-09-15).
 pub(crate) fn envelope(
     kind: &str,
     title: &str,
     priority: Option<&str>,
     subject_id: Option<&str>,
     owner_id: &str,
-    today: &str,
     metadata: Option<Value>,
 ) -> Value {
     json!({
@@ -96,7 +103,6 @@ pub(crate) fn envelope(
             "subject_kind": "custom",
         },
         "owner_id": owner_id,
-        "opened_on": today,
         "status": "open",
         "priority": priority.unwrap_or("standard"),
         "metadata": metadata.unwrap_or_else(|| json!({})),
@@ -386,37 +392,77 @@ fn width() -> usize {
         .unwrap_or(100)
 }
 
+/// One page of the job list.
+const RESOLVE_PAGE: usize = 500;
+
+/// How many closed rows a prefix lookup will read before giving up.
+///
+/// The list is `ORDER BY opened_on DESC, created_at DESC`, so "the
+/// newest 500 closed" is the newest 500 BY OPENING DATE — and a busy
+/// day closes a thousand rows (gate-runs, chores, ops-requests), so a
+/// packet opened this morning and closed tonight sat past page one and
+/// `boss job get <prefix>` said "no job matches … give the full uuid if
+/// it is older than that" for a packet closed seconds earlier, three
+/// times in one evening (71d2334c). Ten pages covers about a week of
+/// this deployment's closings; the refusal names the depth it read.
+const RESOLVE_CLOSED_MAX: usize = 5_000;
+
+/// How many closed rows to read for a prefix lookup: the whole set when
+/// it fits, else the bound. Pure, so the arithmetic is pinned.
+pub(crate) fn closed_rows_to_read(total: usize) -> usize {
+    total.min(RESOLVE_CLOSED_MAX)
+}
+
 /// Fetch rows to resolve a reference against: open first (most lookups
-/// are live work), closed only if nothing matched.
+/// are live work), then closed — page by page, newest opening date
+/// first, up to [`RESOLVE_CLOSED_MAX`] rows — stopping at the first
+/// page that matches.
 pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> Result<String> {
     if looks_like_uuid(job_ref) {
         return Ok(job_ref.to_string());
     }
-    for status in ["open", "closed"] {
-        let rows = crate::gate::rows(
-            crate::gate::api(
-                http,
-                reqwest::Method::GET,
-                &format!("/api/jobs?status={status}&limit=500"),
-                None,
-            )
-            .await?,
-        );
+    let page = |status: &'static str, offset: usize| async move {
+        let path = format!("/api/jobs?status={status}&limit={RESOLVE_PAGE}&offset={offset}");
+        crate::gate::api(http, reqwest::Method::GET, &path, None).await
+    };
+    let id_of = |row: &Value| {
+        row.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("matched a job with no id")
+    };
+    let open = crate::gate::rows(page("open", 0).await?);
+    match resolve(&open, job_ref) {
+        Ok(row) => return id_of(row),
+        Err(e) if e.to_string().starts_with("no job matches") => {}
+        Err(e) => return Err(e),
+    }
+    let mut read = 0usize;
+    let mut to_read = RESOLVE_CLOSED_MAX;
+    while read < to_read {
+        let body = page("closed", read).await?;
+        let total = body
+            .as_ref()
+            .and_then(|b| b.get("total"))
+            .and_then(Value::as_u64)
+            .map(|t| usize::try_from(t).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        to_read = closed_rows_to_read(total);
+        let rows = crate::gate::rows(body);
+        if rows.is_empty() {
+            break;
+        }
+        read += rows.len();
         match resolve(&rows, job_ref) {
-            Ok(row) => {
-                return row
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .context("matched a job with no id");
-            }
+            Ok(row) => return id_of(row),
             Err(e) if e.to_string().starts_with("no job matches") => continue,
             Err(e) => return Err(e),
         }
     }
     bail!(
-        "no job matches {job_ref:?} in the newest 500 open or 500 closed — \
-         give the full uuid if it is older than that"
+        "no job matches {job_ref:?} in the newest {} open or the newest {read} closed (by \
+         opening date) — give the full uuid if it is older than that",
+        open.len()
     )
 }
 
@@ -489,18 +535,142 @@ pub async fn station(name: &str, raw: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn list(kind: Option<String>, status: String, limit: u32) -> Result<()> {
-    let http = reqwest::Client::new();
+/// RFC 3986 unreserved set — everything but `A-Z a-z 0-9 - . _ ~` is
+/// percent-encoded. A `--where` document goes into ONE query value, so
+/// the `{ " : , /` of its JSON, and any `&` or `+` inside a value, must
+/// not be read as query syntax on the far side.
+pub(crate) const QUERY_VALUE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The flat containment document `--where key=value` pairs compose:
+/// one object, string values, everything after the FIRST `=` is the
+/// value (a branch or a probe text carries `=` of its own). What is
+/// composed then passes the server's own rule for `metadata=`
+/// (`where_containment`), so nothing this door sends is a 400.
+///
+/// Composed as WIRE TEXT, not as a `Value`, because of the one thing
+/// only the text can show: a repeated key. A JSON object holds a key
+/// once, so `--where k=1 --where k=2` read into a map is `{"k":"2"}`
+/// with the first value gone without a word. Writing the pairs out as
+/// the JSON this door would send — repeats and all — and handing that
+/// to the server's own parser is what lets the server refuse it here,
+/// in its own sentence. Until 2026-09-14 the composer caught the repeat
+/// itself and said "names k twice" while the server said "key k
+/// repeated" for the same document: one rule, two wordings, no pin
+/// (backlog a452b11a).
+pub(crate) fn where_object(wheres: &[String]) -> Result<Value> {
+    let pairs = wheres
+        .iter()
+        .map(|w| match w.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Ok(format!("{}:{}", json!(k), json!(v))),
+            _ => bail!("--where takes key=value, e.g. --where branch=feat/x — got {w:?}"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    where_containment(&format!("{{{}}}", pairs.join(",")))
+}
+
+/// Judge the `--where` wire text by the server's own rule for
+/// `metadata=` — `boss_jobs::metadata_containment::parse`, the ONE
+/// definition and the very function the 400 comes out of, not a
+/// restatement of it (until 2026-09-14 this side decided the shape
+/// alone, related to the server's by a comment; backlog 88a3b072).
+/// Refused HERE, before the round trip, with the sentence the 400 would
+/// carry; the only word this door adds is the name of its own flag.
+fn where_containment(text: &str) -> Result<Value> {
+    boss_jobs::metadata_containment::parse(text)
+        .map(Value::Object)
+        .map_err(|why| anyhow!("--where {why}"))
+}
+
+/// Validate a `--has` key by the server's own rule for `metadata_has`
+/// — `boss_jobs::metadata_key`, the ONE definition, not a copy of it
+/// (a copy is what lived here until 2026-09-14; backlog b46e9d8e).
+/// Refused HERE, before the round trip, with the sentence the 400 would
+/// carry; the only word this door adds is the name of its own flag.
+fn has_key(key: &str) -> Result<&str> {
+    boss_jobs::metadata_key::check(key).map_err(|why| anyhow!("--has {why}"))
+}
+
+/// The query `boss job list` sends. Pure, so what reaches the wire is
+/// pinned: `--where` pairs become one url-encoded `metadata=` document,
+/// `--has` becomes `metadata_has=`, and asking for neither sends the
+/// query this verb has always sent.
+///
+/// WHY. `GET /api/jobs` learned `metadata=` (containment) and
+/// `metadata_has=` on #366, and one day later every operator and every
+/// builder brief was still `boss-api GET ... | jq` over a PAGE — the
+/// shape `a-limit-is-not-a-filter` names — because the terminal door
+/// could only say kind/status/limit (backlog 58eef0f5).
+pub(crate) fn list_query(
+    kind: Option<&str>,
+    status: &str,
+    limit: u32,
+    wheres: &[String],
+    has: &[String],
+) -> Result<String> {
     let mut path = format!("/api/jobs?status={status}&limit={limit}");
-    if let Some(k) = &kind {
+    if let Some(k) = kind {
         path.push_str(&format!("&kind={k}"));
     }
-    let rows = crate::gate::rows(crate::gate::api(&http, reqwest::Method::GET, &path, None).await?);
+    if !wheres.is_empty() {
+        let doc = where_object(wheres)?.to_string();
+        path.push_str(&format!(
+            "&metadata={}",
+            percent_encoding::utf8_percent_encode(&doc, QUERY_VALUE)
+        ));
+    }
+    match has {
+        [] => {}
+        [one] => path.push_str(&format!("&metadata_has={}", has_key(one)?)),
+        // The API takes ONE key. Sending two would keep whichever the
+        // query parser saw last and drop the other without a word.
+        many => bail!(
+            "--has takes one key per run (the API's metadata_has filters on a \
+             single top-level key) — got {}: {}",
+            many.len(),
+            many.iter()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+    Ok(path)
+}
+
+/// The list's closing line. When the page is smaller than the answer
+/// it says so — `showing N of TOTAL` — because a truncated page that
+/// looks complete answers a smaller question without telling the
+/// reader (memory: `a-limit-is-not-a-filter`).
+pub(crate) fn list_footer(shown: usize, total: Option<u64>) -> String {
+    match total {
+        Some(t) if t > shown as u64 => format!("boss job: showing {shown} of {t}"),
+        _ => format!("boss job: {shown} row(s)"),
+    }
+}
+
+pub async fn list(
+    kind: Option<String>,
+    status: String,
+    limit: u32,
+    wheres: Vec<String>,
+    has: Vec<String>,
+) -> Result<()> {
+    let path = list_query(kind.as_deref(), &status, limit, &wheres, &has)?;
+    let http = reqwest::Client::new();
+    let body = crate::gate::api(&http, reqwest::Method::GET, &path, None).await?;
+    let total = body
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_u64);
+    let rows = crate::gate::rows(body);
     let w = width();
     for r in &rows {
         println!("{}", list_line(r, w));
     }
-    println!("boss job: {} row(s)", rows.len());
+    println!("{}", list_footer(rows.len(), total));
     Ok(())
 }
 
@@ -510,7 +680,6 @@ pub async fn file(
     priority: Option<String>,
     metadata: Option<std::path::PathBuf>,
     subject_id: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let http = reqwest::Client::new();
     let md = match &metadata {
@@ -535,7 +704,6 @@ pub async fn file(
         priority.as_deref(),
         subject_id.as_deref(),
         &owner,
-        &now.format("%Y-%m-%d").to_string(),
         md,
     );
     let created = crate::gate::api(&http, reqwest::Method::POST, "/api/jobs", Some(body))
@@ -605,26 +773,24 @@ pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_prefix_lookup_reads_the_whole_closed_set_when_it_fits_and_the_bound_when_not() {
+        assert_eq!(super::closed_rows_to_read(0), 0);
+        assert_eq!(super::closed_rows_to_read(1_200), 1_200);
+        assert_eq!(super::closed_rows_to_read(25_008), 5_000);
+    }
+
     use super::*;
 
     #[test]
     fn the_envelope_defaults_land_and_explicit_values_win() {
-        let e = envelope(
-            "backlog-item",
-            "t",
-            None,
-            None,
-            "actor:x",
-            "2026-08-30",
-            None,
-        );
+        let e = envelope("backlog-item", "t", None, None, "actor:x", None);
         assert_eq!(e["tags"], json!([]));
         assert_eq!(e["subject"]["id"], "bosspipeline");
         assert_eq!(e["subject"]["subject_kind"], "custom");
         assert_eq!(e["owner_id"], "actor:x");
         assert_eq!(e["status"], "open");
         assert_eq!(e["priority"], "standard");
-        assert_eq!(e["opened_on"], "2026-08-30");
         assert_eq!(e["metadata"], json!({}));
 
         let e = envelope(
@@ -633,12 +799,30 @@ mod tests {
             Some("urgent"),
             Some("boss-dev-0"),
             "a",
-            "2026-08-30",
             Some(json!({"x": 1})),
         );
         assert_eq!(e["priority"], "urgent");
         assert_eq!(e["subject"]["id"], "boss-dev-0");
         assert_eq!(e["metadata"]["x"], 1);
+    }
+
+    /// The create handler stamps `metadata.opened_at` — the precise
+    /// filing instant behind the one-day `opened_on` — ONLY when its
+    /// clock owns the date, i.e. when the body carries no `opened_on`
+    /// (boss-jobs http/jobs.rs). This envelope sent `today`, so every
+    /// packet filed by `boss job file` / `boss ops` defeated the stamp
+    /// (backlog a7a07ffb: 9f9fa486, a7a07ffb and ops-request 25cb2f71
+    /// all lacked it, and timing one meant reading its event stream).
+    /// `boss gate` already leaves the date to the clock (gate.rs). A
+    /// caller that MEANS a backdated packet passes `opened_on` itself.
+    #[test]
+    fn the_envelope_leaves_the_open_date_to_the_api_clock() {
+        let e = envelope("backlog-item", "t", None, None, "actor:x", None);
+        assert!(
+            e.get("opened_on").is_none(),
+            "`opened_on` must be left to the create handler's clock, \
+             or the packet gets no `opened_at`: {e}"
+        );
     }
 
     #[test]
@@ -879,5 +1063,139 @@ mod tests {
         assert!(line.ends_with("..."));
         // Wide enough: untouched.
         assert!(!list_line(&row, 200).ends_with("..."));
+    }
+
+    #[test]
+    fn two_where_values_compose_one_containment_object() {
+        // `--where branch=feat/x --where merged=true` is ONE `metadata=`
+        // document, url-encoded, so the server's `@>` reads both at once.
+        let path = list_query(
+            Some("ship-a-change"),
+            "open",
+            50,
+            &["branch=feat/x".to_string(), "merged=true".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(path.starts_with("/api/jobs?status=open&limit=50"), "{path}");
+        assert!(path.contains("&kind=ship-a-change"), "{path}");
+        // RFC 3986: `{` `"` `:` `/` `,` `}` are all percent-encoded, so a
+        // value carrying `&` or `+` can never split the query.
+        assert!(
+            path.contains(
+                "&metadata=%7B%22branch%22%3A%22feat%2Fx%22%2C%22merged%22%3A%22true%22%7D"
+            ),
+            "{path}"
+        );
+        assert!(!path.contains("metadata_has"), "{path}");
+        // Nothing asked: nothing sent. The old query, byte for byte.
+        assert_eq!(
+            list_query(None, "open", 50, &[], &[]).unwrap(),
+            "/api/jobs?status=open&limit=50"
+        );
+    }
+
+    #[test]
+    fn a_where_value_keeps_everything_after_the_first_equals() {
+        let doc = where_object(&["note=a=b".to_string()]).unwrap();
+        assert_eq!(doc, json!({"note": "a=b"}));
+        // A key or value the JSON must escape composes valid wire text,
+        // so the server's parser reads back exactly what was typed.
+        let doc = where_object(&[r#"say "hi"=back\slash"#.to_string()]).unwrap();
+        assert_eq!(doc, json!({"say \"hi\"": "back\\slash"}));
+        // The same key twice cannot both hold in one flat object; one
+        // would win silently. Refused instead — in the SERVER's words:
+        // the wire text this door would send, repeats and all, is judged
+        // by `boss_jobs::metadata_containment::parse`, so the sentence is
+        // the 400's byte for byte behind the flag's name. Until
+        // 2026-09-14 this side had its own "names k twice" sentence for
+        // the same fact (backlog a452b11a).
+        let e = where_object(&["k=1".to_string(), "k=2".to_string()]).unwrap_err();
+        let server = boss_jobs::metadata_containment::parse(r#"{"k":"1","k":"2"}"#).unwrap_err();
+        assert_eq!(e.to_string(), format!("--where {server}"));
+        assert!(e.to_string().ends_with("key \"k\" repeated"), "{e}");
+        // No `=` at all is not a filter; it is refused with the shape.
+        let e = where_object(&["branch".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("key=value"), "{e}");
+        let e = where_object(&["=v".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("key=value"), "{e}");
+    }
+
+    #[test]
+    fn a_where_document_is_judged_by_the_servers_containment_rule() {
+        // What `--where` composes passes the server's rule for
+        // `metadata=` — the ONE definition both doors call
+        // (`boss_jobs::metadata_containment`), so a document the terminal
+        // sends is one the server takes. Until 2026-09-14 the two sides
+        // each decided the shape alone, related by a comment (backlog
+        // 88a3b072).
+        let doc = where_object(&["branch=feat/x".to_string(), "merged=true".to_string()]).unwrap();
+        assert_eq!(
+            boss_jobs::metadata_containment::check(&doc).map(Value::Object),
+            Ok(doc)
+        );
+        // Should this door ever build something wider than flat strings,
+        // it is refused HERE, before the round trip, with the terminal's
+        // flag in front of byte for byte what the 400 would carry.
+        for bad in [json!({"a": {"b": "c"}}), json!({"n": 1}), json!(["a"])] {
+            let said = where_containment(&bad.to_string()).unwrap_err().to_string();
+            assert!(
+                said.starts_with("--where must be"),
+                "the terminal names ITS parameter in front of the rule: {bad}: {said}"
+            );
+            assert!(
+                said.contains(boss_jobs::metadata_containment::RULE),
+                "{bad}: {said}"
+            );
+            let server = boss_jobs::metadata_containment::check(&bad).unwrap_err();
+            assert_eq!(said, format!("--where {server}"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn has_is_one_identifier_validated_like_the_server() {
+        let path = list_query(None, "open", 50, &[], &["proof_probe".to_string()]).unwrap();
+        assert!(path.ends_with("&metadata_has=proof_probe"), "{path}");
+        // The server's own rule sentence — read from the ONE definition
+        // both doors call (`boss_jobs::metadata_key`), not retyped here,
+        // so the terminal refuses BEFORE the round trip and says the
+        // same thing the 400 would. Until 2026-09-14 this string and the
+        // check behind it were a second copy (backlog b46e9d8e).
+        for bad in ["steps.0", "9lives", "a-b", ""] {
+            let e = list_query(None, "open", 50, &[], &[bad.to_string()]).unwrap_err();
+            let said = e.to_string();
+            assert!(
+                said.starts_with("--has must be"),
+                "the terminal names ITS parameter in front of the rule: {bad:?}: {said}"
+            );
+            assert!(
+                said.contains(boss_jobs::metadata_key::RULE),
+                "{bad:?}: {said}"
+            );
+            assert!(
+                said.contains("dotted paths are not walked"),
+                "{bad:?}: {said}"
+            );
+            // The whole tail after the parameter's name is the shared
+            // check's own word — byte for byte what the 400 carries.
+            let server = boss_jobs::metadata_key::check(bad).unwrap_err();
+            assert_eq!(said, format!("--has {server}"), "{bad:?}");
+        }
+        // The API takes ONE `metadata_has`; two is refused with a sentence
+        // rather than one of them silently dropped.
+        let e = list_query(None, "open", 50, &[], &["a".to_string(), "b".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("one"), "{e}");
+        assert!(e.to_string().contains("\"a\""), "{e}");
+        assert!(e.to_string().contains("\"b\""), "{e}");
+    }
+
+    #[test]
+    fn the_list_footer_says_when_the_page_is_smaller_than_the_answer() {
+        // A LIMIT IS NOT A FILTER: 50 rows of 184 must say so.
+        assert_eq!(list_footer(50, Some(184)), "boss job: showing 50 of 184");
+        // The whole answer fits: the old line, unchanged.
+        assert_eq!(list_footer(3, Some(3)), "boss job: 3 row(s)");
+        // A body with no `total` cannot claim more than it shows.
+        assert_eq!(list_footer(3, None), "boss job: 3 row(s)");
     }
 }

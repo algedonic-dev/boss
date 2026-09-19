@@ -17,6 +17,7 @@
       { label: 'Performance', path: '/it/operate/perf' },
       { label: 'Atlas', path: '/it/operate/atlas' },
       { label: 'Bottlenecks', path: '/it/operate/bottlenecks' },
+      { label: 'Receiving Yard', path: '/it/operate/receiving' },
       { label: 'Marshalling Yard', path: '/it/operate/marshalling' },
     ],
     registry: [
@@ -25,6 +26,7 @@
       { label: 'Step plugins', path: '/it/registry/step-plugins' },
       { label: 'Policy', path: '/it/registry/policy' },
       { label: 'Subjects', path: '/it/registry/subjects' },
+      { label: 'Drift', path: '/it/registry/drift' },
     ],
     design: [
       { label: 'Reviews', path: '/it/design' },

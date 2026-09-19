@@ -39,6 +39,8 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
+# shellcheck source=infra/lint/lib/scanned.sh
+. infra/lint/lib/scanned.sh || exit 3
 SCHEMA=infra/postgres/schema
 fail=0
 
@@ -79,7 +81,7 @@ for f in "$SCHEMA"/*.sql; do
             /;[[:space:]]*$/ { inblk = 0 }
         ' "$f" | head -1)
         [ -z "$ins" ] && continue
-        ret=$(grep -niE "update[[:space:]]+$t[[:space:]]+set[[:space:]]+status[[:space:]]*=[[:space:]]*'retired'" "$f" | head -1 | cut -d: -f1)
+        ret=$(grep -niE "update[[:space:]]+$t[[:space:]]+set[[:space:]]+status[[:space:]]*=[[:space:]]*'retired'" "$f" | sed -n 1p | cut -d: -f1)
         if [ -z "$ret" ]; then
             # Seeding a brand-new name is fine — there is no prior
             # active row to collide with. Only flag when the file
@@ -103,4 +105,5 @@ done
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
+lint_scanned registry-bump-retires-first "$(find "$SCHEMA" -maxdepth 1 -name '*.sql' -type f | wc -l | tr -d ' ')" "migration(s) against ${#TABLES[@]} one-active-per-name table(s)"
 echo "registry-bump-retires-first: clean — every superseding registry write retires before it inserts"

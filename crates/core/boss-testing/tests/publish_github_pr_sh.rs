@@ -56,6 +56,7 @@ fn scratch(case: &str) -> PathBuf {
     // cannot be cleared — see `boss_testing::scratch`.
     let dir = boss_testing::scratch_dir(&format!("publish-github-pr-{case}"));
     // Traversable by the second uid the ownership cases drop to.
+    // mode-bits-ok: a directory, not an executable this process runs
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
         .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", dir.display()));
     dir
@@ -110,6 +111,7 @@ fn git_in(dir: &Path, args: &[&str]) -> String {
 fn control_fetch(root: &Path, src: &Path, uid: u32, exempt_via_c: bool) -> (bool, String) {
     let pen = root.join("control");
     std::fs::create_dir_all(&pen).unwrap();
+    // mode-bits-ok: a directory the second uid writes into
     std::fs::set_permissions(&pen, std::fs::Permissions::from_mode(0o777)).unwrap();
     let dst = pen.join(if exempt_via_c {
         "via-c.git"
@@ -162,6 +164,7 @@ fn control_fetch(root: &Path, src: &Path, uid: u32, exempt_via_c: bool) -> (bool
 fn stub_bin(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    // mode-bits-ok: a directory on PATH, not an executable
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     for tool in ["gh", "jq", "curl"] {
         if Command::new("sh")
@@ -171,9 +174,7 @@ fn stub_bin(root: &Path) -> PathBuf {
         {
             continue;
         }
-        let stub = bin.join(tool);
-        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        boss_testing::write_exec(&bin.join(tool), "#!/bin/sh\nexit 0\n");
     }
     bin
 }
@@ -183,13 +184,31 @@ fn stub_bin(root: &Path) -> PathBuf {
 fn base_env(root: &Path) -> Vec<(String, String)> {
     let state = root.join("state");
     std::fs::create_dir_all(&state).unwrap();
+    // mode-bits-ok: a directory any uid writes into
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
     let token = root.join("github.token");
     std::fs::write(&token, "not-a-real-token\n").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The forge's address file: on the host /etc/boss/sor.env, rendered
+    // from infra/estate/estate.toml; here the same render into the
+    // scratch root, so the verb derives its forge clone URL as it does
+    // under the ops runner (backlog 5222163e).
+    let sor_env = root.join("sor.env");
+    let rendered = Command::new("bash")
+        .arg(repo_root().join("infra/estate/render-sor-env.sh"))
+        .arg("--to")
+        .arg(&sor_env)
+        .output()
+        .expect("render sor.env");
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
     vec![
         ("BOSS_PUBLISH_STATE_DIR".into(), state.display().to_string()),
         ("BOSS_GITHUB_TOKEN_FILE".into(), token.display().to_string()),
+        ("BOSS_SOR_ENV".into(), sor_env.display().to_string()),
     ]
 }
 
@@ -875,6 +894,19 @@ cat '{jobs}'
     }
 
     fn go(&self) -> (bool, String) {
+        self.go_as("")
+    }
+
+    /// The run with the forge push handed to `push_as` through
+    /// `runuser` — a stub on the fixture's PATH in the test that uses it.
+    fn go_as(&self, push_as: &str) -> (bool, String) {
+        self.go_with(&[("BOSS_FORGE_PUSH_AS", push_as.to_string())])
+    }
+
+    /// The run with extra environment laid over the fixture's — the
+    /// value `UNSET` removes the variable (so the verb takes its
+    /// default); an empty string is set empty, as the verb reads it.
+    fn go_with(&self, extra: &[(&str, String)]) -> (bool, String) {
         let outer = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
         // Ours first: `stub_bin` stands in for tools this box LACKS, and
         // gh/curl must be ours even where the box has them.
@@ -894,7 +926,19 @@ cat '{jobs}'
             .env("BOSS_MIRROR_URL", self.mirror.display().to_string())
             .env("BOSS_FORK_SLUG", FORK_SLUG)
             .env("BOSS_FORK_URL", self.fork.display().to_string())
-            .env("BOSS_PUBLISH_DATE", PUBLISH_DATE);
+            .env("BOSS_PUBLISH_DATE", PUBLISH_DATE)
+            // The forge push, as the test's own uid into the fixture by
+            // path: in production it is `runuser -l david` over Forgejo's
+            // HTTP, which no test box can stand in for.
+            .env("BOSS_FORGE_PUSH_URL", self.forge.display().to_string())
+            .env("BOSS_FORGE_PUSH_AS", "");
+        for (k, v) in extra {
+            if v == "UNSET" {
+                cmd.env_remove(k);
+            } else {
+                cmd.env(k, v);
+            }
+        }
         let out = cmd.output().expect("the verb runs");
         let mut text = String::from_utf8_lossy(&out.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -918,6 +962,28 @@ cat '{jobs}'
             .expect("git runs")
             .status
             .success()
+    }
+
+    /// Did the snapshot ALSO reach the forge under the same branch name?
+    /// The forge's push mirror force-syncs the fork (`git push --mirror`)
+    /// on every commit, pruning any branch the forge lacks — so a PR head
+    /// that lives only on GitHub dies at the next train (ce5339d6, PR
+    /// #238 closed 2 min after opening). On the forge it is carried.
+    fn forge_has_branch(&self) -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.forge)
+            .args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/publish/{PUBLISH_DATE}"),
+            ])
+            .output()
+            .expect("git runs");
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     fn gh_log(&self) -> String {
@@ -970,12 +1036,183 @@ fn a_real_fork_of_the_mirror_is_published_to() {
     );
 }
 
+/// THE BRANCH LIVES ON THE FORGE TOO (ce5339d6). PR #238 opened at
+/// 22:46:59Z on 2026-09-11 and was closed at 22:49:17Z with its head
+/// deleted: the forge's push mirror to dauld/boss-mirror — the same fork
+/// the PR opens from — is `git push --mirror` on every commit, and prunes
+/// what the forge lacks. `publish/2026-09-08` survived exactly because it
+/// also existed on the forge. So a run pushes the snapshot to the forge
+/// under the same name, BEFORE the fork and the PR: if the forge push
+/// fails, nothing has been opened that the next train would close.
+#[test]
+fn the_snapshot_is_pushed_to_the_forge_so_the_mirror_carries_it() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("forge-carries-the-branch");
+    run.gh_repo(
+        FORK_SLUG,
+        &format!(
+            r#"{{"full_name":"{FORK_SLUG}","fork":true,
+                 "parent":{{"full_name":"{MIRROR_SLUG}"}},
+                 "source":{{"full_name":"{MIRROR_SLUG}"}},
+                 "default_branch":"main","private":false}}"#
+        ),
+    );
+    let (ok, out) = run.go();
+    assert!(ok, "{out}");
+    let on_forge = run
+        .forge_has_branch()
+        .expect("publish/<date> must exist on the forge after a run");
+    let on_fork = git_in(
+        &run.fork,
+        &["rev-parse", &format!("refs/heads/publish/{PUBLISH_DATE}")],
+    );
+    assert_eq!(
+        on_forge,
+        on_fork.trim(),
+        "the forge and the fork must hold the SAME snapshot commit"
+    );
+    assert!(
+        out.contains("pushed publish/") && out.contains("to the forge"),
+        "the run must say it pushed to the forge: {out}"
+    );
+    let forge_line = out.find("to the forge").expect("forge push line");
+    let fork_line = out
+        .find(&format!(
+            "pushed {}:publish/",
+            FORK_SLUG.split('/').next().unwrap()
+        ))
+        .expect("fork push line");
+    assert!(
+        forge_line < fork_line,
+        "the forge push comes BEFORE the fork push, so a failed forge push opens nothing"
+    );
+}
+
 /// THE CASE THAT FAILED. A repository that EXISTS under the fork's name
 /// and is not in the mirror's fork network — today's `dauld/boss`, and
 /// below it a fork of some OTHER upstream, because "is a fork" is not the
 /// question either. Both must be refused by name, and neither may push:
 /// GitHub accepts the push (it is our own repository) and only the PR
 /// fails, one step too late to undo.
+/// The production forge push runs as ANOTHER user (`runuser -l david
+/// -c "git -C <clone> push …"`) over a clone root owns, and git ≥ 2.35.2
+/// refuses that as "dubious ownership" unless the pushing user's own
+/// config exempts it. The script's exemption is root's GIT_CONFIG_GLOBAL
+/// file in a 0700 workdir, which `runuser -l` neither carries nor could
+/// read — measured 2026-09-18 23:05Z on ops-request c98a782f, the first
+/// approved publish: `fatal: detected dubious ownership in repository at
+/// '/var/lib/boss-publish/boss.git'`, five hours unread. The command the
+/// other user runs must carry the exemption ITSELF (`-c safe.directory=
+/// <clone>`); a stub runuser records what it was handed and runs it as
+/// this uid, so the production shape is pinned without a second account.
+#[test]
+fn the_forge_push_as_another_user_carries_its_own_safe_directory() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("forge-push-as-user");
+    run.gh_repo(
+        FORK_SLUG,
+        &format!(
+            r#"{{"full_name":"{FORK_SLUG}","fork":true,
+                 "parent":{{"full_name":"{MIRROR_SLUG}"}},
+                 "source":{{"full_name":"{MIRROR_SLUG}"}},
+                 "default_branch":"main","private":false}}"#
+        ),
+    );
+    let log = run.root.join("runuser.log");
+    boss_testing::write_exec(
+        &run.stubs.join("runuser"),
+        &format!(
+            "#!/usr/bin/env bash\n# stub: runuser -l <user> -c <cmd> — record the command, run it here\nprintf '%s\\n' \"$4\" >> '{}'\nexec bash -c \"$4\"\n",
+            log.display()
+        ),
+    );
+    let (ok, out) = run.go_as("someone");
+    assert!(ok, "{out}");
+    let handed = std::fs::read_to_string(&log).expect("the stub runuser recorded the push command");
+    let clone = run.root.join("state/boss.git");
+    assert!(
+        handed.contains(&format!("-c 'safe.directory={}'", clone.display())),
+        "the command handed to the other user must carry the exemption for the clone it pushes from:\n{handed}"
+    );
+    assert!(
+        handed.contains("push"),
+        "the recorded command is the forge push:\n{handed}"
+    );
+    assert!(
+        out.contains("to the forge as someone"),
+        "the run says whom it pushed as: {out}"
+    );
+}
+
+/// The credential for the forge push is the converge's own: the
+/// checkout's `forgejo` remote URL carries it as userinfo, the way
+/// cluster-deploy-lib.sh derives every tenant URL from it. Measured
+/// 2026-09-19 04:55Z on ops-request 3d9d5f58, the second approved
+/// publish: with the URL built from sor.env the push as david died on
+/// `could not read Username for 'http://10.20.0.15:3000'` — no helper,
+/// no userinfo. With no BOSS_FORGE_PUSH_URL the verb reads the checkout's
+/// remote (as its owner) and pushes there; the userinfo never reaches a
+/// message (the FAILED line and the say line are redacted).
+#[test]
+fn the_forge_push_url_is_the_checkouts_own_credentialed_remote_and_is_redacted() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("forge-push-url-from-checkout");
+    run.gh_repo(
+        FORK_SLUG,
+        &format!(
+            r#"{{"full_name":"{FORK_SLUG}","fork":true,
+                 "parent":{{"full_name":"{MIRROR_SLUG}"}},
+                 "source":{{"full_name":"{MIRROR_SLUG}"}},
+                 "default_branch":"main","private":false}}"#
+        ),
+    );
+    // A checkout whose forgejo remote carries a credential in its URL
+    // — the shape forge-converge.sh fetches through. The push target is
+    // the fixture forge, reached by a file URL; the userinfo is the
+    // thing under test, so it rides a URL git will accept without using
+    // it (a file:// URL ignores userinfo).
+    let checkout = run.root.join("checkout");
+    git_in(&run.root, &["init", "-q", "checkout"]);
+    let secret_url = format!("file://david:s3cr3t-token@{}", run.forge.display());
+    git_in(&checkout, &["remote", "add", "forgejo", &secret_url]);
+    let log = run.root.join("runuser.log");
+    boss_testing::write_exec(
+        &run.stubs.join("runuser"),
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$4\" >> '{}'\nexec bash -c \"$4\"\n",
+            log.display()
+        ),
+    );
+    let (ok, out) = run.go_with(&[
+        ("BOSS_FORGE_PUSH_URL", "UNSET".into()),
+        ("BOSS_FORGE_CHECKOUT", checkout.display().to_string()),
+        ("BOSS_FORGE_PUSH_AS", "someone".into()),
+    ]);
+    assert!(ok, "{out}");
+    let handed = std::fs::read_to_string(&log).expect("the stub runuser recorded the push");
+    assert!(
+        handed.contains(&secret_url),
+        "the push goes to the checkout's own remote URL, credential and all:\n{handed}"
+    );
+    assert!(
+        !out.contains("s3cr3t-token"),
+        "the credential must never reach a message:\n{out}"
+    );
+    assert!(
+        out.contains("<redacted>@"),
+        "the forge URL in the say line is redacted, not omitted: {out}"
+    );
+}
+
 #[test]
 fn a_namesake_that_is_not_a_fork_of_the_mirror_is_refused_before_the_push() {
     if !have_real_jq() {

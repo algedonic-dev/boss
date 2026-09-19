@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   ARRIVALS_DRAWN,
   NO_FEEDS,
@@ -13,7 +15,7 @@ import {
   uniqueTags,
   wagonTag,
 } from './yard-floor';
-import type { ApproachRow, CarProof, CarRow, TrainRow, YardState } from './yard';
+import { carRow, type ApproachRow, type CarProof, type CarRow, type JobLite, type TrainRow, type YardState } from './yard';
 import type { YardStatus } from './yard-status';
 
 // The floor is the testable half of the map: where every wagon stands,
@@ -39,11 +41,13 @@ const yardOf = (over: Partial<YardState> = {}): YardState => ({
   },
   arrivals: [],
   cancelled: [],
+  withdrawn: [],
   delivery: [],
   awaitingProof: [],
   publishing: [],
   cars: [],
   packets: { trains: [], gateRuns: [] },
+  day: null,
   ...over,
 });
 
@@ -73,6 +77,8 @@ const statusOf = (over: Partial<YardStatus> = {}): YardStatus => ({
   limbo: [],
   policy: { stall_hours: 2, max_red_trains: 2 },
   conductor: null,
+  gate_runs: null,
+  sidings: [],
   now: NOW_ISO,
   ...over,
 });
@@ -86,6 +92,7 @@ const car = (id: string, branch: string, over: Partial<CarRow> = {}): CarRow => 
   sim: false,
   skipReason: null,
   head: 'abc1234',
+  deliveryChannel: 'software',
   ...over,
 });
 
@@ -120,6 +127,16 @@ const trainRow = (id: string, status: TrainRow['status'], over: Partial<TrainRow
   ...over,
 });
 
+/** A train that arrived at `at`, carrying one car. */
+const arrivedWith = (trainId: string, at: string, c: CarRow): TrainRow =>
+  trainRow(trainId, 'ARRIVED', {
+    live: false,
+    outcome: 'arrived',
+    mergeRef: 'b641f3a',
+    arrivedAt: { ms: Date.parse(at), at, basis: 'completed_at' },
+    cars: [c],
+  });
+
 /** A publish-dock row — the one approach lane the client still supplies
  *  (the station's queue, mapped 1:1). The verdict lanes come from the
  *  status payload's `garage` / `limbo` / `stranded` / `held` below. */
@@ -136,8 +153,8 @@ const publishRow = (id: string, branch: string, over: Partial<ApproachRow> = {})
 });
 
 const SINCE = '2026-09-07';
-const garaged = (branch: string, packet_id: string, failed_check: string | null = null) => ({
-  branch, failed_check, since: SINCE, packet_id, sha: null,
+const garaged = (branch: string, packet_id: string, failed_check: string | null = null, failed_line: string | null = null) => ({
+  branch, failed_check, failed_line, since: SINCE, packet_id, sha: null,
 });
 const unjudged = (branch: string, packet_id: string, verdict = 'lost') => ({
   branch, verdict, since: SINCE, packet_id, sha: null,
@@ -284,6 +301,42 @@ describe('the gate bays', () => {
     expect(wagon(s, 'g9').tag).toBe('y');
   });
 
+  // A TRAIN's gate-run in a bay (128b5496) is the train being tested. It
+  // used to stand there as a `train/…` wagon indistinguishable from a
+  // PR car, and the question "why is a PR car in the gates" came twice in
+  // one afternoon (2026-09-14). The server names the train on the row;
+  // the floor draws the bay as the train under test.
+  test('a train gate in a bay reads as the train under test, not a car', () => {
+    const s = scene(
+      yardOf({ inFlight: [trainRow('t1', 'DEPARTED')] }),
+      statusOf({
+        gates: {
+          capacity: 3,
+          active: [{ ...gate('train/20260914-1727', 'g7'), train: 't1' }],
+          queued: [{ branch: 'train/20260914-1800', packet_id: 'g8', queued_at: '2026-09-07T23:10:00Z', position: 1, waiting_seconds: 600, estimated_wait_seconds: null, train: 't2' }],
+          typical_seconds: null,
+        },
+      }),
+      NOW,
+    );
+    const w = wagon(s, 'g7');
+    expect(w.station).toBe('gate');
+    expect(w.kind).toBe('train-gate');
+    expect(w.tag).toBe('train gate');
+    expect(w.trainId).toBe('t1');
+    expect(w.title).toContain('train t1');
+    expect(w.status).toContain('testing the train');
+    expect(s.bays[0]?.tag).toBe('train gate');
+    const q = wagon(s, 'g8');
+    expect(q.kind).toBe('train-gate');
+    expect(q.trainId).toBe('t2');
+    expect(q.tag).toBe('train gate');
+    // A car's gate is untouched by this.
+    const c = scene(yardOf(), statusOf({ gates: { capacity: 3, active: [gate('feat/y', 'g9')], queued: [], typical_seconds: null } }), NOW);
+    expect(wagon(c, 'g9').kind).toBe('gate-run');
+    expect(wagon(c, 'g9').trainId).toBeNull();
+  });
+
   test("a gate's since as a bare date draws no elapsed and no progress; as an instant it draws both", () => {
     const dated = scene(yardOf(), statusOf({ gates: { capacity: 3, active: [{ ...gate('feat/y', 'g9'), since: '2026-09-07' }], queued: [], typical_seconds: null } }), NOW);
     expect(dated.bays[0]).toMatchObject({ elapsed: 'Sep 7, 2026', progress: 0 });
@@ -412,6 +465,102 @@ describe('the dock and the garage', () => {
     expect(wagon(s, 'c2').status).toContain('track occupied');
   });
 
+  // A STRUCK CAR LOOKS STRUCK (2bb0d014, 2026-09-14). Read after train
+  // #361: a car a red train released carried `metadata.red_trains: 1`
+  // and stood on the dock drawn exactly like a clean one. One strike is
+  // the state in which the NEXT red holds the car out, so it is the
+  // moment an operator can still look before it costs a second consist
+  // — and the floor said nothing. The count is READ off the record the
+  // conductor stamps, never inferred from a train's outcome.
+  test('a dock car with one red train behind it takes the warn tone and says so', () => {
+    const s = scene(
+      yardOf({ dock: [car('c1', 'fix/a', { redTrains: 1 })] }),
+      statusOf({ dock: [{ id: 'c1', title: 'Car c1', branch: 'fix/a', parked_since: '2026-09-07T22:00:00Z' }] }),
+      NOW,
+    );
+    expect(wagon(s, 'c1').tone).toBe('warn');
+    expect(wagon(s, 'c1').status).toBe('parked · gated green, waiting to board · 1 red train behind it');
+  });
+
+  test('two red trains pluralise; a skip reason keeps its place ahead of the count', () => {
+    const s = scene(
+      yardOf({ dock: [car('c1', 'fix/a', { redTrains: 2, skipReason: 'track occupied' })] }),
+      statusOf(),
+      NOW,
+    );
+    expect(wagon(s, 'c1').tone).toBe('warn');
+    expect(wagon(s, 'c1').status).toBe('parked · held: track occupied · 2 red trains behind it');
+  });
+
+  test('a clean car — red_trains absent or zero — reads exactly as before', () => {
+    const s = scene(
+      yardOf({ dock: [car('c1', 'fix/a'), car('c2', 'fix/b', { redTrains: 0 })] }),
+      statusOf(),
+      NOW,
+    );
+    for (const id of ['c1', 'c2']) {
+      expect(wagon(s, id).tone).toBe('ok');
+      expect(wagon(s, id).status).toBe('parked · gated green, waiting to board');
+    }
+  });
+
+  // A held car keeps its held reason and its neutral tone — a brake
+  // deliberately on is still not an alarm — and gains the count, so the
+  // operator reading the siding sees WHY it is held as well as THAT.
+  test('a held car keeps its reason and tone and gains the red-train count', () => {
+    const s = scene(
+      yardOf({ dock: [car('c9', 'fix/held', { redTrains: 2 })] }),
+      statusOf({ held_cars: [heldCar('c9', 'fix/held', 'held: 2 red trains')] }),
+      NOW,
+    );
+    expect(wagon(s, 'c9')).toMatchObject({ tone: 'static', lamp: 'off' });
+    expect(wagon(s, 'c9').status).toBe('held — 2 red trains · 2 red trains behind it');
+  });
+
+  // THE CASE THAT MATTERS. The dock station stops listing a held car
+  // (36c3d4ca), so the client dock has NO row for it and the count above
+  // had nowhere to come from — a car held out for two reds read its
+  // reason sentence alone (ac80357b). The server's HeldCar now carries
+  // `red_trains`, and the held wagon reads the count off that row.
+  test('a held car the client dock no longer lists shows its strikes from the server row', () => {
+    const s = scene(
+      yardOf({ dock: [] }),
+      statusOf({
+        held_cars: [{ ...heldCar('c9', 'fix/held', 'needs a look before it boards again'), red_trains: 2 }],
+      }),
+      NOW,
+    );
+    expect(wagon(s, 'c9')).toMatchObject({ tone: 'static', lamp: 'off' });
+    expect(wagon(s, 'c9').status).toBe(
+      'held — needs a look before it boards again · 2 red trains behind it',
+    );
+  });
+
+  // The server row's count is the authority when it states one — a
+  // stated 0 is "clean", not "unknown", and does not fall back to the
+  // client's row. Only a row WITHOUT the field (an older server) falls
+  // back to the client's CarRow, and a clean car reads as before.
+  test('a stated server count wins; an older server row falls back to the client row', () => {
+    const stated = scene(
+      yardOf({ dock: [car('c9', 'fix/held', { redTrains: 2 })] }),
+      statusOf({ held_cars: [{ ...heldCar('c9', 'fix/held', 'why'), red_trains: 0 }] }),
+      NOW,
+    );
+    expect(wagon(stated, 'c9').status).toBe('held — why');
+    const older = scene(
+      yardOf({ dock: [car('c9', 'fix/held', { redTrains: 1 })] }),
+      statusOf({ held_cars: [heldCar('c9', 'fix/held', 'why')] }),
+      NOW,
+    );
+    expect(wagon(older, 'c9').status).toBe('held — why · 1 red train behind it');
+    const clean = scene(
+      yardOf({ dock: [] }),
+      statusOf({ held_cars: [heldCar('c9', 'fix/held', 'why')] }),
+      NOW,
+    );
+    expect(wagon(clean, 'c9').status).toBe('held — why');
+  });
+
   // THE HELD SIDING. A car an operator held cannot board, so the
   // loading-dock station row stops listing it (36c3d4ca) and the client
   // dock goes quiet about it — while the floor's `held` lane counts held
@@ -487,6 +636,26 @@ describe('the dock and the garage', () => {
     expect(w.tone).toBe('red');
     expect(w.lamp).toBe('err');
     expect(w.status).toContain('clippy, test');
+    // No excerpt on the receipt: the status ends at the check, and the
+    // wagon makes no `why` claim — an older receipt reads as before.
+    expect(w.status).toBe('garaged · red gate (clippy, test) — rework');
+    expect(w.why ?? null).toBeNull();
+  });
+
+  test('a red gate with an excerpt says what the assertion said, on the wagon and in its tooltip', () => {
+    // 6730dccb: "a troubled packet must look troubled, and the reason
+    // is one field away" — the server's `failed_line` rides the status
+    // line after the check, and the tooltip carries it whole.
+    const line = "thread 'refuses_while_legacy' panicked at crates/core/boss-jobs/src/yard.rs:9:5:";
+    const s = scene(
+      yardOf({ cars: [car('c1', 'fix/red')] }),
+      statusOf({ garage: [garaged('fix/red', 'g1', 'test', line)] }),
+      NOW,
+    );
+    const w = wagon(s, 'c1');
+    expect(w.station).toBe('garage');
+    expect(w.status).toBe(`garaged · red gate (test) — ${line} — rework`);
+    expect(w.why).toBe(line);
   });
 
   test('a garaged branch with no car stands in the garage under its gate-run packet', () => {
@@ -612,7 +781,7 @@ describe('the track — wagons behind a locomotive', () => {
       }),
       statusOf({
         trains: [
-          { id: 't1', title: 'PR train 2026-09-07 23:37', phase: 'awaiting-ci', at_step: 'CI', block: { kind: 'ci-red', checks: 'clippy' }, ci_result: 'failing', pr_url: null, car_count: 1, boarded_at: null, eta: { kind: 'unknown', reason: 'not under test' } },
+          { id: 't1', title: 'PR train 2026-09-07 23:37', phase: 'awaiting-ci', at_step: 'CI', block: { kind: 'ci-red', checks: 'clippy' }, ci_result: 'failing', pr_url: null, car_count: 1, channel: null, boarded_at: null, eta: { kind: 'unknown', reason: 'not under test' } },
         ],
       }),
       NOW,
@@ -631,12 +800,39 @@ describe('the track — wagons behind a locomotive', () => {
     expect(s.boardRows[0]?.where).toBe('Track · PR train 2026-09-07 23:37 at PR');
   });
 
+  // The conductor stamps the train's channel — the heaviest of its
+  // cars' — at board, and the server row carries it (cffef553,
+  // 2026-09-15). The locomotive names it ('data train') so a reader can
+  // tell a config-only train from a software one without opening every
+  // car. An old train, or no server row, is null: drawn as nothing.
+  test("a locomotive carries the server row's channel; an unstamped train carries none", () => {
+    const row = (channel: 'data' | null) =>
+      ({ id: 't1', title: 'PR train 2026-09-07 23:37', phase: 'awaiting-ci', at_step: 'CI', block: null, ci_result: null, pr_url: null, car_count: 2, channel, boarded_at: null, eta: { kind: 'unknown', reason: 'not under test' } }) as const;
+    const yard = yardOf({ inFlight: [trainRow('t1', 'BOARDED', { cars: [car('c1', 'fix/a'), car('c2', 'fix/b')] })] });
+    expect(scene(yard, statusOf({ trains: [row('data')] }), NOW).locos[0]?.channel).toBe('data');
+    expect(scene(yard, statusOf({ trains: [row(null)] }), NOW).locos[0]?.channel).toBeNull();
+    expect(scene(yard, statusOf(), NOW).locos[0]?.channel).toBeNull();
+  });
+
+  // The two render sites, pinned at source in the yard-page-*.test.ts
+  // idiom: the map's locomotive names its channel off the loco, the
+  // page's train card off the server row — both as '<channel> train',
+  // both guarded so an unstamped train draws nothing.
+  test("the locomotive and the train card name the channel as '<channel> train', guarded", () => {
+    const strip = (s: string) => s.replace(/<!--[\s\S]*?-->/g, '');
+    const map = strip(readFileSync(join(import.meta.dir, 'YardMap.svelte'), 'utf8'));
+    expect(map).toMatch(/\{#if l\.channel\}\s*<text[^>]*class="plate">\{l\.channel\} train<\/text>/);
+    const page = strip(readFileSync(join(import.meta.dir, 'YardPage.svelte'), 'utf8'));
+    expect(page).toMatch(/\{@const channel = serverTrainById\.get\(t\.id\)\?\.channel \?\? null\}/);
+    expect(page).toMatch(/\{#if channel\}\s*<span class="yard-chip"[^>]*>\{channel\} train<\/span>/);
+  });
+
   test("a car aboard is 'since' the server's boarded_at, else the conductor's boarding minute read off the train title", () => {
     expect(wagon(aboard('BOARDED'), 'c1').since).toBe('2026-09-07T23:37:00.000Z');
     const served = scene(
       yardOf({ inFlight: [trainRow('t1', 'BOARDED', { cars: [car('c1', 'fix/a')] })] }),
       statusOf({
-        trains: [{ id: 't1', title: 'PR train 2026-09-07 23:37', phase: 'awaiting-ci', at_step: 'ci', block: null, ci_result: null, pr_url: null, car_count: 1, boarded_at: '2026-09-07T23:37:12Z', eta: { kind: 'unknown', reason: 'not under test' } }],
+        trains: [{ id: 't1', title: 'PR train 2026-09-07 23:37', phase: 'awaiting-ci', at_step: 'ci', block: null, ci_result: null, pr_url: null, car_count: 1, channel: null, boarded_at: '2026-09-07T23:37:12Z', eta: { kind: 'unknown', reason: 'not under test' } }],
       }),
       NOW,
     );
@@ -687,6 +883,7 @@ describe('the signals along the track', () => {
           stderr: 'boom',
           why: 'it exited 1',
           missingTools: [],
+          notYet: false,
         },
       }),
     });
@@ -704,15 +901,6 @@ describe('the signals along the track', () => {
 describe('the inspection shed', () => {
   const probe = (over: Partial<CarProof> = {}) =>
     proofOf({ probe: 'bash infra/lint/x.sh --self-test', expect: 'X-OK', ...over });
-
-  const arrivedWith = (trainId: string, at: string, c: CarRow): TrainRow =>
-    trainRow(trainId, 'ARRIVED', {
-      live: false,
-      outcome: 'arrived',
-      mergeRef: 'b641f3a',
-      arrivedAt: { ms: Date.parse(at), at, basis: 'completed_at' },
-      cars: [c],
-    });
 
   test('an arrived car with a probe stands in the shed, showing the command and the string', () => {
     const c = car('c1', 'feat/probed', { proof: probe() });
@@ -801,16 +989,39 @@ describe('the inspection shed', () => {
       label: '1 inspecting · 1 on an event · 1 with no probe',
       inspecting: 1,
       failed: 0,
+      notYet: 0,
       onEvent: 1,
       noProbe: 1,
+      flakes: [],
+      flakeLabel: 'no flakes in the runs read',
     });
     expect(scene(yardOf(), statusOf(), NOW).machines.inspection).toEqual({
       label: 'clear',
       inspecting: 0,
       failed: 0,
+      notYet: 0,
       onEvent: 0,
       noProbe: 0,
+      flakes: [],
+      flakeLabel: 'no flakes in the runs read',
     });
+  });
+
+  // Backlog 36cc4913: the shed lists reds-that-were-flakes by check,
+  // read off the gate-run packets the page holds — the same stamps
+  // `boss orient`'s FLAKES line counts.
+  test('the shed machine carries the flake tally off the gate-runs read', () => {
+    const flaked: JobLite = {
+      id: 'g1',
+      kind: 'gate-run',
+      title: 'Gate: fix/x',
+      status: 'closed',
+      opened_on: '2026-09-18',
+      metadata: { branch: 'fix/x', sha: 'abc', flake_of: 'p1', flaky_checks: ['test'] },
+    };
+    const s = scene(yardOf({ packets: { trains: [], gateRuns: [flaked] } }), statusOf(), NOW);
+    expect(s.machines.inspection.flakes).toEqual([{ check: 'test', count: 1 }]);
+    expect(s.machines.inspection.flakeLabel).toBe('flakes · test: 1');
   });
 
   test('the board names each place and does not call an unproven car landed', () => {
@@ -871,7 +1082,7 @@ describe('the arrivals yard', () => {
     expect(wagon(s, 't8-c').slot).toBe(1);
     const rows = s.boardRows.filter(r => r.landed);
     expect(rows.map(r => r.id)).toEqual(['t9-c', 't8-c']);
-    expect(rows[0]?.where).toBe('Arrivals');
+    expect(rows[0]?.where).toBe('Arrivals · software');
   });
 
   test('landed-in-the-last-24h is the arrivals machine\'s count', () => {
@@ -901,6 +1112,178 @@ describe('the arrivals yard', () => {
     expect(drawnWagons(busy.wagons).drawn.some(w => w.id === 'd1')).toBe(true);
   });
 
+  // FOUR SIDINGS BY DELIVERY CHANNEL (design c6bd173e, car 1 — backlog
+  // 953aaf30). A landed wagon stands on the siding of its car's
+  // `delivery_channel`, in the order data · config · software · infra,
+  // and its slot counts along THAT siding. Landing itself is still the
+  // converge for every channel (car 3 gives each its own evidence).
+  test('a landed car stands on the siding of its channel, slotted along that siding', () => {
+    const on = (id: string, at: string, ch: CarRow['deliveryChannel']) =>
+      trainRow(id, 'ARRIVED', {
+        live: false,
+        outcome: 'arrived',
+        mergeRef: 'b641f3a',
+        arrivedAt: { ms: Date.parse(at), at, basis: 'completed_at' },
+        cars: [car(`${id}-c`, `fix/${id}`, { deliveryChannel: ch })],
+      });
+    const s = scene(
+      yardOf({
+        arrivals: [
+          on('t9', '2026-09-07T23:00:00Z', 'software'),
+          on('t8', '2026-09-07T22:00:00Z', 'data'),
+          on('t7', '2026-09-07T21:00:00Z', 'infra'),
+          on('t6', '2026-09-07T20:00:00Z', 'config'),
+          on('t5', '2026-09-07T19:00:00Z', 'software'),
+        ],
+      }),
+      statusOf(),
+      NOW,
+    );
+    expect(wagon(s, 't8-c')).toMatchObject({ station: 'arrivals', siding: 'data', slot: 0 });
+    expect(wagon(s, 't6-c')).toMatchObject({ station: 'arrivals', siding: 'config', slot: 0 });
+    expect(wagon(s, 't9-c')).toMatchObject({ station: 'arrivals', siding: 'software', slot: 0 });
+    expect(wagon(s, 't5-c')).toMatchObject({ station: 'arrivals', siding: 'software', slot: 1 });
+    expect(wagon(s, 't7-c')).toMatchObject({ station: 'arrivals', siding: 'infra', slot: 0 });
+    // The board names the siding, newest first across all four.
+    expect(s.boardRows.filter(r => r.landed).map(r => [r.id, r.where])).toEqual([
+      ['t9-c', 'Arrivals · software'],
+      ['t8-c', 'Arrivals · data'],
+      ['t7-c', 'Arrivals · infra'],
+      ['t6-c', 'Arrivals · config'],
+      ['t5-c', 'Arrivals · software'],
+    ]);
+  });
+
+  test('an old car — parked before the stamp existed — lands on the software siding', () => {
+    // Built through the one constructor from a packet carrying no
+    // `delivery_channel`, the way every car before the stamp reads.
+    const old = carRow({ id: 'old', kind: 'ship-a-change', title: 'Old car', metadata: { branch: 'fix/old' } });
+    const s = scene(yardOf({ arrivals: [arrivedWith('t1', '2026-09-07T23:00:00Z', old)] }), statusOf(), NOW);
+    expect(wagon(s, 'old')).toMatchObject({ station: 'arrivals', siding: 'software', slot: 0 });
+  });
+
+  test('the drawn cap is per siding — a full software siding hides no data wagon', () => {
+    const at = (i: number) => new Date(Date.parse('2026-09-07T23:00:00Z') - i * 60_000).toISOString();
+    const arrivals = [
+      ...Array.from({ length: ARRIVALS_DRAWN + 2 }, (_, i) => landed(`s${i}`, at(i))),
+      trainRow('d', 'ARRIVED', {
+        live: false,
+        outcome: 'arrived',
+        arrivedAt: { ms: Date.parse(at(20)), at: at(20), basis: 'completed_at' },
+        cars: [car('d-c', 'fix/d', { deliveryChannel: 'data' })],
+      }),
+    ];
+    const { drawn, hidden } = drawnWagons(scene(yardOf({ arrivals }), statusOf(), NOW).wagons);
+    expect(drawn.some(w => w.id === 'd-c')).toBe(true);
+    expect(drawn.filter(w => w.siding === 'software')).toHaveLength(ARRIVALS_DRAWN);
+    expect(hidden).toBe(2);
+  });
+
+  // EACH SIDING LANDS ON ITS OWN EVIDENCE (design c6bd173e, car 3 —
+  // edae6e8b). The server judges a car on ITS channel's evidence and
+  // the floor draws that judgement: a config car whose manifests have
+  // not applied stands on its siding CONVERGING — its train arrived,
+  // but its change is not live — with the evidence it waits for named;
+  // a landed one carries its evidence on the status line. Measured
+  // 2026-09-15: boss-gcp converged 14 minutes after the image roll, so
+  // an infra car really does stand converging after its train arrives.
+  test('a landed car is judged on its siding row — converging until its own evidence exists', () => {
+    const at = '2026-09-07T23:00:00Z';
+    const arrivals = [
+      trainRow('t1', 'ARRIVED', {
+        live: false,
+        outcome: 'arrived',
+        mergeRef: 'b641f3a',
+        arrivedAt: { ms: Date.parse(at), at, basis: 'completed_at' },
+        cars: [
+          car('cfg', 'fix/manifest', { deliveryChannel: 'config' }),
+          car('inf', 'fix/talos', { deliveryChannel: 'infra' }),
+          car('sw', 'fix/crate', { deliveryChannel: 'software', proof: proofOf({ stamped: { at: at, by: 'x' } }) }),
+          car('old', 'fix/old', { deliveryChannel: 'data' }),
+        ],
+      }),
+    ];
+    const status = statusOf({
+      sidings: [
+        {
+          id: 'cfg',
+          branch: 'fix/manifest',
+          train: 't1',
+          channel: 'config',
+          landing: { kind: 'landed', evidence: 'manifests applied and verified at b641f3a', at: '2026-09-07T22:55:00Z' },
+        },
+        {
+          id: 'inf',
+          branch: 'fix/talos',
+          train: 't1',
+          channel: 'infra',
+          landing: { kind: 'converging', awaiting: 'host converge on b641f3a: boss-gcp — last reported 1111111' },
+        },
+        {
+          id: 'sw',
+          branch: 'fix/crate',
+          train: 't1',
+          channel: 'software',
+          landing: { kind: 'landed', evidence: 'the cluster jobs API self-reports b641f3a', at },
+        },
+        { id: 'old', branch: 'fix/old', train: 't1', channel: 'data', landing: { kind: 'unread', why: 'the window begins after this merge' } },
+      ],
+    });
+    const s = scene(yardOf({ arrivals }), status, NOW);
+    // Landed on its own evidence: the evidence rides the status line,
+    // the wagon reads settled.
+    expect(wagon(s, 'cfg')).toMatchObject({ station: 'arrivals', siding: 'config', tone: 'ok', lamp: 'ok' });
+    expect(wagon(s, 'cfg').status).toBe('landed in b641f3a · manifests applied and verified at b641f3a · arrived');
+    expect(wagon(s, 'cfg').since).toBe('2026-09-07T22:55:00Z');
+    // Not yet: on its siding, converging, the awaited evidence named.
+    expect(wagon(s, 'inf')).toMatchObject({ station: 'arrivals', siding: 'infra', tone: 'warn', lamp: 'working' });
+    expect(wagon(s, 'inf').status).toBe('converging · awaiting host converge on b641f3a: boss-gcp — last reported 1111111');
+    // The proof stamp still reads after the evidence.
+    expect(wagon(s, 'sw').status).toBe('landed in b641f3a · the cluster jobs API self-reports b641f3a · proven');
+    // Unread is not converging: the wagon reads landed by its train, as
+    // before the lane, and says the evidence was not read.
+    expect(wagon(s, 'old')).toMatchObject({ station: 'arrivals', siding: 'data', tone: 'ok', lamp: 'ok' });
+    expect(wagon(s, 'old').status).toBe('landed in b641f3a · arrived · data evidence unread');
+    // Converging wagons are still on the board's landed rows: the
+    // siding is where they stand — but the day's LANDED count excludes
+    // them (three of the four cars landed).
+    expect(s.boardRows.find(r => r.id === 'inf')).toMatchObject({ landed: true, where: 'Arrivals · infra' });
+    expect(s.machines.arrivals.landed).toBe(3);
+  });
+
+  test('without a siding row — an older server — a landed car reads as it did before the lane', () => {
+    const s = scene(
+      yardOf({ arrivals: [arrivedWith('t1', '2026-09-07T23:00:00Z', car('c', 'fix/c', { deliveryChannel: 'config' }))] }),
+      statusOf(),
+      NOW,
+    );
+    expect(wagon(s, 'c').status).toBe('landed in b641f3a · arrived');
+    expect(wagon(s, 'c')).toMatchObject({ tone: 'ok', lamp: 'ok', siding: 'config' });
+  });
+
+  // The EARLIER half of the claim: a config car's manifests apply in the
+  // converge run that closes minutes before the conductor stamps the
+  // image roll, so a car ABOARD a converging train can already be live.
+  // It stays coupled (the consist is the train's) and its status line
+  // says so, with the evidence.
+  test('a car aboard a converging train that has landed on its own evidence says so', () => {
+    const c = car('cfg', 'fix/manifest', { deliveryChannel: 'config' });
+    const status = statusOf({
+      sidings: [
+        {
+          id: 'cfg',
+          branch: 'fix/manifest',
+          train: 't1',
+          channel: 'config',
+          landing: { kind: 'landed', evidence: 'manifests applied and verified at b641f3a', at: '2026-09-07T22:55:00Z' },
+        },
+      ],
+    });
+    const s = scene(yardOf({ inFlight: [trainRow('t1', 'CONVERGING', { cars: [c] })] }), status, NOW);
+    expect(wagon(s, 'cfg')).toMatchObject({ station: 'train', lamp: 'ok', tone: 'ok' });
+    expect(wagon(s, 'cfg').status).toBe('aboard #259 · converge · landed on config: manifests applied and verified at b641f3a');
+  });
+
   test("a cancelled train's cars are not placed — they are back on the dock if anywhere", () => {
     const s = scene(
       yardOf({ cancelled: [trainRow('tx', 'ARRIVED', { outcome: 'cancelled', cars: [car('cx', 'fix/x')] })] }),
@@ -908,6 +1291,56 @@ describe('the arrivals yard', () => {
       NOW,
     );
     expect(s.wagons).toHaveLength(0);
+  });
+});
+
+// THE CANCELLED SIDING (design c6bd173e, outcomes): a withdrawn car —
+// its `abandoned` terminal completed — is one of the three terminal
+// tracks, beside arrivals and the inspection shed. It is drawn, not
+// listed on the departure board: a withdrawn car is neither in flight
+// nor landed, and the board's two counts are exactly those. Struck and
+// left-behind are dock badges, not a track.
+describe('the cancelled siding', () => {
+  const withdrawn = (id: string, at: string | null, over: Partial<CarRow> = {}) => ({
+    car: car(id, `fix/${id}`, over),
+    at,
+  });
+
+  test('a withdrawn car stands on the cancelled siding, since the instant it was abandoned', () => {
+    const s = scene(
+      yardOf({ withdrawn: [withdrawn('w1', '2026-09-07T22:00:00Z'), withdrawn('w2', '2026-09-07T21:00:00Z')] }),
+      statusOf(),
+      NOW,
+    );
+    expect(wagon(s, 'w1')).toMatchObject({ station: 'cancelled', slot: 0, tone: 'static', lamp: 'off', since: '2026-09-07T22:00:00Z' });
+    expect(wagon(s, 'w1').status).toBe('withdrawn · abandoned');
+    expect(wagon(s, 'w2').slot).toBe(1);
+    expect(wagon(s, 'w1').siding).toBeUndefined();
+    expect(s.boardRows.map(r => r.id)).toEqual([]);
+    expect(s.machines.cancelled).toEqual({ label: '2 withdrawn', count: 2 });
+  });
+
+  test('a withdrawn car whose packet names no branch is still a wagon, named by its id', () => {
+    // The six abandoned cars in the record on 2026-09-15 all read
+    // `branch: null` — filed as cars, withdrawn before they had one.
+    const s = scene(yardOf({ withdrawn: [withdrawn('0123456789abcdef', null, { branch: '' })] }), statusOf(), NOW);
+    expect(wagon(s, '0123456789abcdef')).toMatchObject({ station: 'cancelled', tag: '01234567', since: null });
+  });
+
+  test('an empty siding says so, and the selection is one the map and the panel share', () => {
+    expect(scene(yardOf(), statusOf(), NOW).machines.cancelled).toEqual({ label: 'empty', count: 0 });
+    expect(parseSelection('cancelled')).toEqual({ kind: 'cancelled' });
+  });
+
+  test('a car both landed and withdrawn keeps its arrival — one branch, one wagon', () => {
+    const c = car('c1', 'fix/c1');
+    const s = scene(
+      yardOf({ arrivals: [arrivedWith('t1', '2026-09-07T23:00:00Z', c)], withdrawn: [withdrawn('c1', '2026-09-07T23:30:00Z')] }),
+      statusOf(),
+      NOW,
+    );
+    expect(s.wagons.filter(w => w.id === 'c1')).toHaveLength(1);
+    expect(wagon(s, 'c1').station).toBe('arrivals');
   });
 });
 
@@ -943,7 +1376,7 @@ describe('the departure board', () => {
       ['d1', 'Dock · slot 1'],
       ['r1', 'Garage'],
       ['a1', 'Track · #259 at CI'],
-      ['z1', 'Arrivals'],
+      ['z1', 'Arrivals · software'],
     ]);
     expect(s.boardRows.map(r => r.landed)).toEqual([false, false, false, false, false, false, true]);
   });

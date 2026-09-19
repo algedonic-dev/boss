@@ -7,7 +7,8 @@
 #   1. Wait for Postgres.
 #   2. Converge the per-module schema — on every start, whatever the
 #      database already holds.
-#   3. First start only: provision the bootstrap-admin's local-auth
+#   3. First start only: evict the example tenants' reference rows when
+#      the declared tenant is not an example, provision the bootstrap-admin's local-auth
 #      credential (a file write) and prime the formula clock.
 #
 # Everything that goes through the public API — the operator-baseline +
@@ -48,6 +49,23 @@ REPO=/opt/boss
 EMAIL="${BOSS_BOOTSTRAP_ADMIN_EMAIL:?BOSS_BOOTSTRAP_ADMIN_EMAIL must be set}"
 EMAIL="${EMAIL,,}"
 
+# THE DATABASE NAME HAS ONE SOURCE: the Secret's database-url, which
+# every service reads as BOSS_POSTGRES_URL. Until 2026-09-16 this
+# container's psql took PGDATABASE from a manifest literal (`boss`)
+# beside DATABASE_URL from the Secret — two names for one fact, and the
+# day they disagree (Option 3, design e652c7c6: the instance's database
+# is repointed to a fresh one by switch-instance-database, 063dba4e)
+# the schema would converge into one database while the services
+# opened the other, and prod would be dark with every step green. So
+# when DATABASE_URL is set its path names the database (the derivation
+# is database-from-url.sh beside this file, tested) and wins over any
+# PGDATABASE in the environment; the literal is gone from the manifest.
+if [ -n "${DATABASE_URL:-}" ]; then
+    PGDATABASE="$("$REPO/infra/oss-quickstart/database-from-url.sh" "$DATABASE_URL")" || exit 78
+    export PGDATABASE
+    echo "    database:        $PGDATABASE (from DATABASE_URL)"
+fi
+
 echo "==> boss-init starting"
 echo "    bootstrap-admin: $EMAIL"
 echo "    mode:            converge schema from the tree, then live sim from empty"
@@ -71,7 +89,8 @@ FIRST_START=true
 if [[ -n "$SUBJECT_KINDS_EXISTS" ]]; then
     FIRST_START=false
     echo "==> existing database (schema present) — converging it, first-start seeds skipped"
-    echo "    boss-services re-seeds the tenant on every up; clean restart:"
+    echo "    boss-services publishes the tenant once per database (tenant_publishes"
+    echo "    stamp; boss tenant publish <dir> lands a new repo row); clean restart:"
     echo "    docker compose down -v  &&  docker compose up"
 fi
 
@@ -81,7 +100,7 @@ fi
 # manifest entries` summary — the evidence that a converge happened. Not
 # silenced: silence is what let four migrations accumulate unapplied.
 
-echo "==> [1/4] converging per-module schema (migrate.sh, manifest order)"
+echo "==> [1/5] converging per-module schema (migrate.sh, manifest order)"
 if ! "$REPO/infra/postgres/migrate.sh"; then
     {
         echo
@@ -110,7 +129,7 @@ fi
 # public mirror's install smoke, twice (2026-08-20/21). Output is shown
 # UNFILTERED and a failure warns loudly but does not kill init: the
 # downstream prepare error now has its cause printed directly above it.
-echo "==> [2/4] seeding the platform Workflow bundle (insert-if-missing)"
+echo "==> [2/5] seeding the platform Workflow bundle (insert-if-missing)"
 SEED_URL="postgres://${PGUSER}:${PGPASSWORD:-}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE:-$PGUSER}"
 if ! boss-platform-workflow-seed \
     --database-url "$SEED_URL" \
@@ -131,7 +150,7 @@ fi
 # audit_log is empty until the services run (see services-launcher.sh).
 
 # ---- everything below is FIRST START ONLY ------------------------------------
-# Both remaining steps write state an operator or a running playground owns
+# The remaining steps write state an operator or a running playground owns
 # after the first start, so re-running them on an existing database would
 # undo work rather than converge it: `boss-auth set` would reset a rotated
 # bootstrap-admin password back to the default on every restart, and the
@@ -142,6 +161,58 @@ if ! $FIRST_START; then
     exit 0
 fi
 
+# ---- 3. a fresh instance carries only what its tenant declares ---------------
+# 01-registries.sql and 40-ledger.sql seed the two worked examples'
+# reference rows on every instance (the device shop's roles and
+# departments, the brewery's location kinds, account types, equipment
+# categories, two sites, its starter chart, a companies row each), and
+# an applied migration is history — migrate.sh refuses a changed
+# checksum — so the converge above has just put them into this fresh
+# database too. Backlog 718ac982 (design e2580840 car 3): a real
+# company's instance booted with a brewer's books and a refurb shop's
+# org chart. This step evicts them BEFORE any service starts, on the
+# first start only, and only when the tenant this instance is declared
+# to run (BOSS_TENANT_DIR, the same directory the launcher publishes)
+# is not one of the examples — an example tenant's rows are its own,
+# and its engine's prepare expects them. What is a candidate is READ
+# from the example tenants' seeds by infra/postgres/
+# example-reference-rows.sh, the one derivation the forge verb
+# retire-example-reference-rows also runs against an instance that has
+# already booted; nothing here names a row. On a fresh database nothing
+# references the rows, so every candidate goes; the SQL still judges
+# each one, so a row something already points at is kept and named.
+# THE TENANT'S OWN DECLARATIONS ARE NOT CANDIDATES (backlog 86835bf9):
+# the same directory `boot` decided on is handed to `delete-sql`, which
+# subtracts every id/code the tenant declares before judging. Measured
+# 2026-09-18: without it a fresh instance whose tenant re-declares an
+# example code (Algedonic's finance / marketing / sales / support
+# departments, under the device shop's codes) lost those rows here and
+# got them back only because the tenant publish runs after this step
+# and inserts-if-absent — self-healing for classes, locations and the
+# chart, but a record that said "evicted" about rows the tenant owns.
+# Loud and non-fatal: a failure here leaves residue the forge verb can
+# evict later, and a dead init would take the whole instance down
+# (CLAUDE.md §Diagnosis: a boot guard that refuses to start takes the
+# system of record with it).
+echo "==> [3/5] example reference rows: keep or evict (first start, by tenant)"
+DERIVE="$REPO/infra/postgres/example-reference-rows.sh"
+if decision=$(BOSS_EXAMPLES_DIR="$REPO/examples" bash "$DERIVE" boot "${BOSS_TENANT_DIR:-}"); then
+    echo "    $decision"
+    if evicted=$(BOSS_EXAMPLES_DIR="$REPO/examples" bash "$DERIVE" delete-sql "$BOSS_TENANT_DIR" | psql -X -q -At -v ON_ERROR_STOP=1); then
+        printf '%s\n' "$evicted" | sed 's/^/    /'
+        echo "    ✓ example reference rows evicted — this instance carries only what its tenant declares plus what the platform needs"
+    else
+        echo "    WARN: eviction failed (see psql above) — the example rows are still in this database; retire them with: boss ops forge retire-example-reference-rows --dry-run <namespace>" >&2
+    fi
+else
+    rc=$?
+    if [ "$rc" = 3 ]; then
+        echo "    $decision"
+    else
+        echo "    WARN: example-reference-rows.sh boot could not decide (exit $rc) — the example rows stay; see above" >&2
+    fi
+fi
+
 # ---- 4. provision the bootstrap-admin credential -----------------------------
 # The bootstrap-admin EMPLOYEE is seeded post-API by boss-services
 # (services-launcher.sh → seed-operator-baseline.sh, which reads
@@ -150,7 +221,7 @@ fi
 # the operator MUST rotate via `boss-auth set $EMAIL` after first login. The
 # file lives under /var/lib/boss/auth/credentials.toml, persisted via the
 # docker volume so it survives container recreation.
-echo "==> [3/4] provisioning bootstrap-admin credential"
+echo "==> [4/5] provisioning bootstrap-admin credential"
 DEFAULT_PASSWORD="${BOSS_BOOTSTRAP_ADMIN_PASSWORD:-change-me}"
 export BOSS_AUTH_FILE="${BOSS_AUTH_FILE:-/var/lib/boss/auth/credentials.toml}"
 mkdir -p "$(dirname "$BOSS_AUTH_FILE")"
@@ -173,7 +244,7 @@ fi
 # seeds (in services-launcher.sh) run against this clock so their events land
 # on day 0. This is a direct sim_clock write because clock-api isn't up yet.
 DEMO_EPOCH="${BOSS_DEMO_EPOCH_START:-2025-04-01}"
-echo "==> [4/4] priming sim_clock to $DEMO_EPOCH for the live playground"
+echo "==> [5/5] priming sim_clock to $DEMO_EPOCH for the live playground"
 # epoch_end = epoch_start + 365 gives the playground a 12-month range; without
 # an epoch_end past epoch_start the loop is zero-length and the sim auto-pauses
 # on the first tick ('epoch complete'), leaving the demo frozen.

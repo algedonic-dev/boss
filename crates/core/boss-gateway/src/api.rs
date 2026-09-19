@@ -70,27 +70,12 @@ fn extract_session(headers: &HeaderMap, key: &[u8]) -> Option<Session> {
     Session::decode(raw, key).ok()
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct TenantMeta {
-    /// The tenant's own name for itself. The SPA chrome had
-    /// "Algedonic" / "Ales" hardcoded at three render sites, so the
-    /// used-device-shop tenant rendered a brewery's name in its top
-    /// bar. Branding is tenant data; core should not know it.
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TenantToml {
-    #[serde(default)]
-    meta: TenantMeta,
-    #[serde(default)]
-    modules: std::collections::BTreeMap<String, bool>,
-    #[serde(default)]
-    labels: std::collections::BTreeMap<String, String>,
-}
+// The file's shape lives in boss-core (`tenant_manifest`) since
+// fcc1d57b, so `boss tenant check` reads a manifest exactly the way
+// this handler does — one definition, two doors (CLAUDE.md §9a).
+// Branding is tenant data; core does not know it, which is why
+// `display_name` is optional and the SPA falls back to "BOSS".
+use boss_core::tenant_manifest::TenantToml;
 
 #[derive(Debug, Serialize)]
 pub struct TenantManifest {
@@ -113,10 +98,13 @@ pub struct TenantManifest {
 /// `/etc/boss-gateway/tenant.toml` if present, else
 /// `/opt/boss/examples/brewery/seeds/tenant.toml` (the brewery demo).
 ///
-/// Failure modes are all silent → empty manifest. The SPA defaults
-/// to "all modules enabled" when the manifest payload is empty, so a
-/// missing or unparseable file falls back to that all-enabled default
-/// rather than blanking the UI.
+/// Absent → empty manifest. The SPA defaults to "all modules
+/// enabled" when the manifest payload is empty, so a missing file
+/// falls back to that all-enabled default rather than blanking the
+/// UI. A file that exists but does not parse refused the BOOT
+/// (`load_tenant_toml`); reaching this handler with one means the
+/// file changed under the running gateway, which is logged and
+/// answered empty rather than blanking the UI mid-flight.
 pub async fn tenant_manifest() -> Response {
     Json(tenant_manifest_now()).into_response()
 }
@@ -126,7 +114,7 @@ pub async fn tenant_manifest() -> Response {
 /// paint already knows the tenant (5578e42d). One reader of
 /// tenant.toml, two doors.
 pub fn tenant_manifest_now() -> TenantManifest {
-    match load_tenant_toml() {
+    match tenant_toml_or_empty() {
         Some(parsed) => TenantManifest {
             display_name: parsed.meta.display_name,
             tenant_id: parsed.meta.tenant_id,
@@ -165,10 +153,65 @@ fn tenant_toml_path() -> Option<String> {
     None
 }
 
-fn load_tenant_toml() -> Option<TenantToml> {
-    let path = tenant_toml_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    toml::from_str(&text).ok()
+/// The manifest as parsed: `Ok(None)` when there is no file (an
+/// unnamed tenant — every reader treats that as empty), `Ok(Some)`
+/// when it parses, and `Err` naming the file and toml's own line
+/// when it EXISTS but cannot be read. The boot-time reader of
+/// `[gateway] public_reads` (main.rs) is the third door on the one
+/// parser, and the `Err` is its refusal.
+///
+/// WHY A REFUSAL AND NOT A LOG LINE (backlog 4f1ba1f9, 2026-09-18).
+/// Until this car an unparseable manifest was `None` — the gateway
+/// booted with no public reads, no modules and no labels, one log
+/// line saying so, and the instance answered as a tenant that had
+/// declared nothing. Fail-closed, but silent: a wrong target that
+/// answers instead of erroring (CLAUDE.md §Doors). This is NOT the
+/// case the boot-check rule protects (infra/lint/a-boot-check-cannot-
+/// fail-the-boot.sh — a check reads LIVE registry rows, written at
+/// runtime through the API that a refusal would take down, so it
+/// logs and starts). The manifest is the configuration the router is
+/// built from, delivered by the deploy (the image or the boss-tenant
+/// ConfigMap) with `boss tenant check` as its pre-flight, and the act
+/// that fixes it is the act that broke it: an edit to the delivered
+/// file, needing nothing the refusal keeps dark. It joins the two
+/// refusals already in this boot path with the same blast radius —
+/// the launcher's "not a tenant directory; not starting" and
+/// `PublicReads::resolve` refusing a path outside the table — rather
+/// than being the one door on the parser that shrugs. Measured
+/// 2026-09-18: the launcher's prepare stage catches the same typo
+/// (its publish runs the check and DEGRADES the pod, sim held) only
+/// on a fresh database; on a stamped instance the publish is skipped
+/// and the gateway was the only reader left, and it said nothing.
+pub(crate) fn load_tenant_toml() -> Result<Option<TenantToml>, String> {
+    let Some(path) = tenant_toml_path() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    // toml's error carries the line and column; it is not rephrased.
+    TenantToml::parse(&text)
+        .map(Some)
+        .map_err(|e| format!("{path}: {e}"))
+}
+
+/// The request-time reader: the boot already refused a file that
+/// does not parse, so an `Err` here is a file that changed under the
+/// running gateway (a ConfigMap update reaches the mount live). Say
+/// so, loudly, and answer empty — the process stays up.
+fn tenant_toml_or_empty() -> Option<TenantToml> {
+    match load_tenant_toml() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "tenant manifest unreadable at request time (it changed under the running gateway); answering an empty manifest"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,7 +232,7 @@ pub struct RevenueCategory {
 /// honest default for an unconfigured tenant.
 pub async fn revenue_categories() -> Response {
     const PREFIX: &str = "finance.revenue_category.";
-    let rows = match load_tenant_toml() {
+    let rows = match tenant_toml_or_empty() {
         Some(parsed) => parsed
             .labels
             .into_iter()
@@ -328,6 +371,37 @@ mod tests {
         assert_eq!(wholesale.label, "Wholesale beer");
     }
 
+    /// The document carries the tenant (ce68f137): what the static
+    /// server inlines into index.html is this value serialized, so the
+    /// SPA can title the tab from `display_name` before its first
+    /// fetch, and a `[modules]` block reaches it as written — the SPA
+    /// reads a missing key as off, so the block must survive intact.
+    #[tokio::test]
+    async fn the_inlined_manifest_carries_the_tenants_name_and_modules() {
+        let _serial = TENANT_TOML_LOCK.lock().await;
+        let _tmp = write_tenant_toml(
+            r#"
+[meta]
+tenant_id = "algedonic-llc"
+display_name = "Algedonic, LLC"
+
+[modules]
+finance = true
+sim = false
+"#,
+        );
+        let json = serde_json::to_string(&tenant_manifest_now()).unwrap();
+        let html = crate::static_files::inline_tenant_manifest("<head></head>", &json);
+        assert!(
+            html.contains(r#""display_name":"Algedonic, LLC""#),
+            "the inlined manifest names the tenant: {html}"
+        );
+        assert!(
+            html.contains(r#""modules":{"finance":true,"sim":false}"#),
+            "the modules block rides as written: {html}"
+        );
+    }
+
     #[tokio::test]
     async fn revenue_categories_empty_when_tenant_has_no_named_categories() {
         let _serial = TENANT_TOML_LOCK.lock().await;
@@ -346,6 +420,46 @@ shop = true
             .unwrap();
         let rows: Vec<RevenueCategory> = serde_json::from_slice(&body).unwrap();
         assert!(rows.is_empty());
+    }
+
+    /// A manifest that EXISTS but does not parse is a refusal that
+    /// names the file and toml's own line, not an empty manifest
+    /// (backlog 4f1ba1f9, 2026-09-18). Until this pin the boot read
+    /// a typo'd tenant.toml as "no [gateway] public_reads, no
+    /// [modules], no [labels]" with one log line — fail-closed but
+    /// silent, and a wrong target that answers instead of erroring.
+    /// The fixture is the demo tenant's shape with ONE bad line: the
+    /// public_reads list is opened and never closed.
+    #[tokio::test]
+    async fn a_manifest_that_exists_but_does_not_parse_is_refused_naming_the_file_and_line() {
+        let _serial = TENANT_TOML_LOCK.lock().await;
+        let tmp = write_tenant_toml(
+            "[meta]\ntenant_id = \"demo\"\n\n[gateway]\npublic_reads = [\"/api/workflows\"\n",
+        );
+        let err = match load_tenant_toml() {
+            Err(e) => e,
+            Ok(t) => panic!("a manifest with a bad line read as {t:?} instead of refusing"),
+        };
+        let path = tmp.path().display().to_string();
+        assert!(err.contains(&path), "the refusal names the file: {err}");
+        assert!(
+            err.contains("line 5"),
+            "the refusal carries toml's line for the bad one: {err}"
+        );
+    }
+
+    /// Absent is still empty: an unnamed tenant, not an error.
+    #[tokio::test]
+    async fn an_absent_manifest_is_an_empty_one() {
+        let _serial = TENANT_TOML_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "BOSS_TENANT_MANIFEST_TOML",
+                dir.path().join("no-such-tenant.toml"),
+            );
+        }
+        assert!(matches!(load_tenant_toml(), Ok(None)));
     }
 
     /// The identity read path, from the cookie the break-glass

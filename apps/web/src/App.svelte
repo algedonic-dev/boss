@@ -10,13 +10,14 @@
   import { parseRoute, type Route } from './router';
   import { goToLogin } from '@boss/web-kit/session/deadSession';
   import { loadSession } from '@boss/web-kit/session/session.svelte';
-  import { loadManifest } from '@boss/web-kit/session/manifest.svelte';
+  import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
-  import { loadClasses } from '@boss/web-kit/session/classes.svelte';
+  import { loadClasses, departments } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
-  import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
-  import { SECTION_FOR_ROUTE } from './shell/sections';
+  import { appsFor, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
+  import { SECTION_FOR_ROUTE, appForRoute } from './shell/sections';
+  import { makeSurfaceOpenRecorder, postSurfaceOpen, routePattern } from './shell/surface-opens';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
@@ -44,6 +45,7 @@
   import NewJournalEntryPage from './finance/NewJournalEntryPage.svelte';
   import HrPage from './hr/HrPage.svelte';
   import QaPage from './qa/QaPage.svelte';
+  import DepartmentJobsPage from './departments/DepartmentJobsPage.svelte';
   // SimPage retired 2026-05-03 — boss-sim-api is gone (HumanWorker
   // generator retirement step 9b). Tenant runners are CLI tools now.
   import ItKnowledgeBasePage from './it/ItKnowledgeBasePage.svelte';
@@ -60,11 +62,13 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import YardPage from './it/yard/YardPage.svelte';
+  import MapPage from './it/yard/MapPage.svelte';
   import YardStatusPage from './it/yard/YardStatusPage.svelte';
   import CrewBoardPage from './it/crew/CrewBoardPage.svelte';
   import EstatePage from './it/estate/EstatePage.svelte';
   import FleetPage from './it/monitoring/FleetPage.svelte';
   import MarshallingYardPage from './it/marshalling/MarshallingYardPage.svelte';
+  import ReceivingYardPage from './it/receiving/ReceivingYardPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
@@ -93,6 +97,8 @@
   import ViewsPage from './views/ViewsPage.svelte';
   import FeedbackTriagePage from './it/feedback/FeedbackTriagePage.svelte';
   import BacklogBoardPage from './it/backlog/BacklogBoardPage.svelte';
+  import CodebaseTrendPage from './it/metrics/CodebaseTrendPage.svelte';
+  import ProtocolDriftPage from './it/registry/ProtocolDriftPage.svelte';
   import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
@@ -100,6 +106,16 @@
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
   let route = $state<Route>(parseRoute(window.location.pathname));
+
+  // Which surfaces get opened (backlog 628f182b): one POST per
+  // client-side navigation, the route PATTERN and the time, the actor
+  // signed by the gateway from the session. Debounced against the same
+  // pattern, silent on failure — a measurement must never get in the
+  // way of the thing it measures. The initial route counts as an open.
+  const recordSurfaceOpen = makeSurfaceOpenRecorder(postSurfaceOpen);
+  $effect(() => {
+    recordSurfaceOpen(routePattern(route, window.location.pathname));
+  });
 
   // Map route.kind → tenant module-id. Routes whose module is
   // flagged false in tenant.toml render a "not enabled" notice
@@ -120,6 +136,10 @@
       case 'asset':           return { id: 'equipment', label: 'Equipment' };
       case 'shop':
       case 'shopProduct':     return { id: 'shop',      label: 'Shop' };
+      // The QA hub is written for the playground tenant (its own
+      // manifest says so beside `qa = true`); a tenant that has not
+      // listed the module gets the module-off page, not its copy.
+      case 'qa':              return { id: 'qa',       label: 'QA' };
       case 'exec':            return { id: 'exec',      label: 'Exec' };
       default:                return null;
     }
@@ -202,21 +222,37 @@
   // ROUTE_CATALOG key.
   let activeSection = $derived(SECTION_FOR_ROUTE[route.kind]);
 
-  // Which app tab is active. Derived from `activeSection` via the
-  // catalog's `app` field.
+  // Which app tab is active. Derived from the route: through
+  // `activeSection` and the catalog's `app` field for every surface
+  // with a static owner, and from the route's own code for the
+  // department jobs view, whose department is registry data
+  // (cc76f755).
   //
   // This replaced a MODEL_KINDS set of Route['kind']s maintained here
   // alongside a MODEL_ROUTES set of RouteNames in AppShell.svelte.
   // Two lists in two vocabularies answering one question, which had
   // to agree for every routed surface: miss one and the page rendered
   // with the wrong tab highlighted and the wrong sidebar, silently.
-  let perspective: AppId = $derived(appForSection(activeSection));
+  let perspective: AppId = $derived(appForRoute(route));
 
   // Both chrome render sites read this. They previously repeated the
   // prop list, and drifted: the step-focus bar shipped without
   // `searchAppKinds`, so global search silently lost its app scoping
   // on exactly the surface built for focused reading.
   let appKinds: ReadonlyArray<string> = $derived(APP_SUBJECT_KINDS[perspective] ?? []);
+
+  // The tab list is the tenant's: one tab per department its Class
+  // registry declares (loaded above with `employee`), plus Simulator
+  // only when its manifest lists the `sim` module (ce68f137).
+  let apps = $derived(appsFor(departments(), { simulator: moduleEnabled('sim') }));
+
+  // The document follows the same manifest as the wordmark: index.html
+  // ships a neutral title, and the tenant names the tab once its
+  // manifest is read — re-applied whenever it settles (ce68f137).
+  $effect(() => {
+    void manifest.value;
+    reflectTenantOnDocument();
+  });
 </script>
 
 <!-- Every route, every state: a stale tab is stale regardless of
@@ -230,10 +266,10 @@
   <!-- Outside AppShell on purpose: a full-page step surface has no
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
-  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} {apps} searchAppKinds={appKinds} />
   <StepFocusPage jobId={route.jobId} stepId={route.stepId} from={route.from} fromLabel={route.fromLabel} />
 {:else}
-  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} {apps} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
@@ -249,6 +285,10 @@
     {:else if route.kind === 'systemBacklog'}
       <ItTabs group="design" active="/it/design/backlog" />
       <BacklogBoardPage />
+    {:else if route.kind === 'systemCodebase'}
+      <!-- No ItTabs: the Codebase is its own sidebar row since feedback
+           9827c699 (David, 2026-09-14), not a tab on Design. -->
+      <CodebaseTrendPage />
     {:else if route.kind === 'authAdmin'}
       <AuthAdminPage />
     {:else if route.kind === 'me'}
@@ -279,6 +319,8 @@
         initialStatus="open"
         pageTitle="Sales pipeline"
       />
+    {:else if route.kind === 'department'}
+      <DepartmentJobsPage code={route.code} />
     {:else if route.kind === 'assets'}
       <AssetsList />
     {:else if route.kind === 'asset'}
@@ -343,7 +385,16 @@
       <ItTabs group="design" active="/it/design" />
       <DesignReviewPage />
     {:else if route.kind === 'systemYard'}
-      <YardPage />
+      <!-- The /it landing is the MAP (design 0524fc95, car 2): eight
+           region cards, each a door to a floor below. -->
+      <MapPage />
+    {:else if route.kind === 'systemYardFloor'}
+      <!-- A floor: the Train Yard itself, opened on the region's panel.
+           Keyed on the region so a card-to-card move remounts the page
+           on the new selection rather than keeping the old one. -->
+      {#key route.region}
+        <YardPage focus={route.region} />
+      {/key}
     {:else if route.kind === 'systemCrew'}
       <!-- No ItTabs: the Crew Board is its own sidebar row, not a tab on
            an existing family (backlog 04c5bbc0, David 2026-09-11). -->
@@ -356,6 +407,9 @@
     {:else if route.kind === 'systemMarshallingYard'}
       <ItTabs group="operate" active="/it/operate/marshalling" />
       <MarshallingYardPage />
+    {:else if route.kind === 'systemReceivingYard'}
+      <ItTabs group="operate" active="/it/operate/receiving" />
+      <ReceivingYardPage />
     {:else if route.kind === 'systemYardStatus'}
       <ItTabs group="operate" active="/it/operate/yard-status" />
       <YardStatusPage />
@@ -372,6 +426,9 @@
     {:else if route.kind === 'systemSubjects'}
       <ItTabs group="registry" active="/it/registry/subjects" />
       <SubjectsClassesPage />
+    {:else if route.kind === 'systemRegistryDrift'}
+      <ItTabs group="registry" active="/it/registry/drift" />
+      <ProtocolDriftPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
     {:else if route.kind === 'calendar'}
