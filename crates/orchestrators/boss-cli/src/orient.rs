@@ -327,14 +327,32 @@ fn clipped(text: &str) -> String {
 }
 
 /// The SHED listing lines: every open car at `Proven in prod`, one
-/// line each, saying which of the three places it stands in. Pure so
-/// the shape is testable; the caller prints the heading from the count.
+/// line each, saying which of the three places it stands in AND which
+/// backlog-item it is holding open. Pure so the shape is testable; the
+/// caller prints the heading from the count.
+///
+/// WHY THE ITEM IS ON THE LINE (a7837d81). A car in the shed is not
+/// only waiting — it is BLOCKING. `ship-a-change` reaches `merged` off
+/// `steps.proven.done`, so an unproven car never closes,
+/// `jobs.complete_linked_step` never fires, and the item the car
+/// carries stays open for exactly as long as the proof does. Measured
+/// 2026-09-19: twelve cars stood here, the oldest landed 58 h earlier,
+/// holding ten open backlog-items between them, and two of those items
+/// had each already cost a dispatched agent run at high effort
+/// re-deriving a fix that was on main (d7fef617, f47861a5). The shed
+/// read as a queue of chores; what it was was the residue list, and
+/// the item id is what makes that legible without a second read.
 pub(crate) fn shed_lines(cars: &[Value]) -> Vec<String> {
     cars.iter()
         .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
         .filter(|c| at_step(c) == "Proven in prod")
         .map(|c| {
             let branch = md_str(c, "branch");
+            let holds = match c.pointer("/metadata/backlog_item").and_then(Value::as_str) {
+                Some(i) => format!("{branch} (holds {})", &i[..i.len().min(8)]),
+                None => branch.to_string(),
+            };
+            let branch = holds.as_str();
             match shed_place(c) {
                 Shed::ProbePending { last: None } => {
                     format!("    {branch}: probe pending (the forge runs it on arrival)")
@@ -374,6 +392,61 @@ pub(crate) fn orphan_lines(orphans: &[String], shown: usize, all: bool) -> Vec<S
         ));
     }
     out
+}
+
+/// The forge branches the mirror's pull requests stand on, keyed to
+/// their PR: `publish/<date>` is the daily GitHub-mirror snapshot,
+/// pushed to the forge FIRST so the push mirror does not prune the PR's
+/// head (ce5339d6), and it must stay there until GitHub reports the PR
+/// merged or closed. The claim is on the open-pr step of a
+/// publish-to-github packet, which records `head = <fork>:<branch>`
+/// beside `pr_url`; the forge holds the part after the colon. Read
+/// from every packet, not only open ones — a publish packet closes on
+/// `pr-opened` the instant the head is recorded, so an open-only read
+/// would see no claim at all (01915167: the first orient after PR #239
+/// opened listed `publish/2026-09-19` as 'a forge head no packet
+/// claims' with the archive-sweep hint). Deleting the branch once the
+/// PR is merged stays with the archive sweep, which knows the forge.
+pub(crate) fn published_heads(
+    publish_packets: &[Value],
+) -> std::collections::BTreeMap<String, String> {
+    publish_packets
+        .iter()
+        .flat_map(|p| {
+            p.get("steps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|s| s.get("spec_slug").and_then(Value::as_str) == Some("open-pr"))
+        .filter_map(|s| {
+            let head = md_str(s, "head");
+            let branch = head.split_once(':').map_or(head, |(_, b)| b);
+            (!branch.is_empty()).then(|| (branch.to_string(), md_str(s, "pr_url").to_string()))
+        })
+        .collect()
+}
+
+/// The ORPHANS lane's two halves from one `git ls-remote --heads` read:
+/// the heads no packet claims, and the published heads the forge still
+/// holds, each with its PR. A published head is claimed — it is never
+/// an orphan — and it is drawn only while the forge has it, because
+/// the line says what is ON the forge, not what a packet once named.
+pub(crate) fn orphans_and_published(
+    ls_remote: &str,
+    claimed: &BTreeSet<String>,
+    published: &std::collections::BTreeMap<String, String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut all_claimed = claimed.clone();
+    all_claimed.extend(published.keys().cloned());
+    let orphans = crate::census::orphan_branches(ls_remote, &all_claimed);
+    let on_forge = ls_remote
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter_map(|r| r.strip_prefix("refs/heads/"))
+        .filter_map(|b| published.get(b).map(|pr| (b.to_string(), pr.clone())))
+        .collect();
+    (orphans, on_forge)
 }
 
 /// A stranded green that is the second half of a `boss rerail` a killed
@@ -657,6 +730,77 @@ fn trend_text(t: &Value) -> String {
     format!("{metric} {} (was {})", one("current"), one("previous"))
 }
 
+/// The BORDERS header — one line per border of the IT world map, from
+/// `GET /api/yard/borders` (design d2154293, car 2). The regions above
+/// say how much is in each place; these say what MOVES between them:
+/// the crossing rate this window against the last, how many packets
+/// stand at the border now, and the machine that moves them with how
+/// long it has been silent.
+///
+/// Pure over the payload, so the shape is testable. Every unknown
+/// prints as `?` or `—` — a border whose flow could not be computed
+/// must not read as a quiet one, which on a CLI is exactly what a 0
+/// would say.
+pub(crate) fn border_lines(map: &Value) -> Vec<String> {
+    let hours = map.get("window_hours").and_then(Value::as_i64).unwrap_or(0);
+    let mut out = vec![format!(
+        "  BORDERS — what moves between the regions over the last {hours}h (rate · waiting · machine)"
+    )];
+    let borders = map
+        .get("borders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for b in &borders {
+        let from = b.get("from").and_then(Value::as_str).unwrap_or("?");
+        let to = b.get("to").and_then(Value::as_str).unwrap_or("?");
+        let hop = format!("{from} -> {to}");
+        let state = b.get("state").and_then(Value::as_str).unwrap_or("?");
+        let state = if state == "clear" {
+            state.to_string()
+        } else {
+            state.to_uppercase()
+        };
+        // A waiting count the server could not take is `?`, never 0.
+        let waiting = match b.get("waiting") {
+            Some(Value::Number(n)) => format!("{n} waiting"),
+            _ => "? waiting".to_string(),
+        };
+        let why = b.get("why").and_then(Value::as_str).unwrap_or("");
+        out.push(format!(
+            "    {hop:<26} {:<24} {waiting:<12} {state:<9} {}  — {why}",
+            rate_text(b.get("rate").unwrap_or(&Value::Null)),
+            machine_text(b.get("machine").unwrap_or(&Value::Null)),
+        ));
+    }
+    out
+}
+
+/// `3.0/day (was 5.0/day)`, with a half nobody measured as `—`.
+fn rate_text(t: &Value) -> String {
+    let one = |key: &str| -> String {
+        match t.get(key).and_then(Value::as_f64) {
+            None => "—".to_string(),
+            Some(v) => format!("{v:.1}/day"),
+        }
+    };
+    format!("{} (was {})", one("current"), one("previous"))
+}
+
+/// `train-reconcile 4m ago` — and `SILENT 180m` when the machine has
+/// been quiet past its own declared cadence. A machine with no firing
+/// record says so rather than printing an age it does not have.
+fn machine_text(m: &Value) -> String {
+    let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+    let silent = m.get("silent").and_then(Value::as_bool);
+    let age = m.get("silent_for_minutes").and_then(Value::as_i64);
+    match (silent, age) {
+        (Some(true), Some(mins)) => format!("{name} SILENT {mins}m"),
+        (_, Some(mins)) => format!("{name} {mins}m ago"),
+        _ => format!("{name} (no firing recorded)"),
+    }
+}
+
 pub async fn run(all: bool) -> Result<()> {
     let http = reqwest::Client::new();
 
@@ -691,6 +835,21 @@ pub async fn run(all: bool) -> Result<()> {
         }
         Ok(None) => println!("  REGIONS — unavailable: the read answered nothing"),
         Err(e) => println!("  REGIONS — unavailable: {e}"),
+    }
+
+    // THE BORDERS — what moves BETWEEN those regions (design d2154293):
+    // the crossing rate, the queue standing at each border, and the
+    // machine that moves it. An older server without the read says so
+    // and the approach still prints.
+    println!();
+    match api(&http, reqwest::Method::GET, "/api/yard/borders", None).await {
+        Ok(Some(map)) => {
+            for line in border_lines(&map) {
+                println!("{line}");
+            }
+        }
+        Ok(None) => println!("  BORDERS — unavailable: the read answered nothing"),
+        Err(e) => println!("  BORDERS — unavailable: {e}"),
     }
 
     // Trains in transit.
@@ -872,13 +1031,35 @@ pub async fn run(all: bool) -> Result<()> {
             .map(|g| md_str(g, "branch").to_string())
             .filter(|b| !b.is_empty()),
     );
+    // The mirror's publish branches are claimed by publish-to-github
+    // packets, whose open-pr step records the head — see
+    // [`published_heads`] for why the read is not status=open.
+    let published = published_heads(&rows(
+        api(
+            &http,
+            reqwest::Method::GET,
+            "/api/jobs?kind=publish-to-github&limit=200",
+            None,
+        )
+        .await?,
+    ));
     match crate::git_auth::command()
         .args(["ls-remote", "--heads", "origin"])
         .output()
     {
         Ok(out) if out.status.success() => {
-            let orphans =
-                crate::census::orphan_branches(&String::from_utf8_lossy(&out.stdout), &claimed);
+            let (orphans, on_forge) =
+                orphans_and_published(&String::from_utf8_lossy(&out.stdout), &claimed, &published);
+            if !on_forge.is_empty() {
+                println!(
+                    "\n  PUBLISHED — {} forge head(s) backing a mirror pull request (stays until \
+                     GitHub reports the PR merged or closed; the archive sweep deletes it):",
+                    on_forge.len()
+                );
+                for (branch, pr_url) in &on_forge {
+                    println!("    {branch}  {pr_url}");
+                }
+            }
             if orphans.is_empty() {
                 println!("\n  ORPHANS — none: every forge head is claimed by a packet");
             } else {
@@ -1095,7 +1276,9 @@ pub async fn run(all: bool) -> Result<()> {
         println!("\n  SHED — empty: every landed car is proven");
     } else {
         println!(
-            "\n  SHED — {} landed car(s) awaiting proof (probe pending / waiting on an event / UNPROVEN):",
+            "\n  SHED — {} landed car(s) awaiting proof (probe pending / waiting on an event / \
+             UNPROVEN). Each one it names an item for is HOLDING that item open until it \
+             proves — that is where the queue's inflated open count comes from (a7837d81):",
             shed.len()
         );
         for line in &shed {
@@ -1274,6 +1457,62 @@ mod tests {
         assert_eq!(super::orphan_lines(&orphans, 12, true).len(), 5);
     }
 
+    /// A publish packet's open-pr step records the mirror PR's head as
+    /// `<fork owner>:<branch>` beside the pr_url; the forge holds the
+    /// branch under its bare name. A skipped open-pr (declined,
+    /// superseded, held) names no head and claims nothing.
+    #[test]
+    fn a_publish_packet_claims_the_branch_after_the_colon() {
+        use serde_json::json;
+        let opened = json!({"status": "closed", "steps": [{
+            "spec_slug": "open-pr", "status": "completed",
+            "metadata": {"head": "dauld:publish/2026-09-19",
+                         "pr_url": "https://github.com/algedonic-dev/boss/pull/239"}}]});
+        let skipped = json!({"status": "closed", "steps": [{
+            "spec_slug": "open-pr", "status": "skipped", "metadata": {}}]});
+        let heads = super::published_heads(&[opened, skipped]);
+        assert_eq!(
+            heads.into_iter().collect::<Vec<_>>(),
+            vec![(
+                "publish/2026-09-19".to_string(),
+                "https://github.com/algedonic-dev/boss/pull/239".to_string()
+            )]
+        );
+    }
+
+    /// One car branch, one publish branch, one true orphan: the car is
+    /// claimed, the publish head is drawn under PUBLISHED with its PR,
+    /// and only the third is an orphan (01915167: the daily mirror
+    /// snapshot read as 'a forge head no packet claims').
+    #[test]
+    fn a_published_head_is_not_an_orphan() {
+        let ls = "aaa\trefs/heads/main\n\
+                  bbb\trefs/heads/feat/claimed\n\
+                  ccc\trefs/heads/publish/2026-09-19\n\
+                  ddd\trefs/heads/docs/lost-work\n";
+        let claimed: BTreeSet<String> = ["feat/claimed".to_string()].into_iter().collect();
+        let published: std::collections::BTreeMap<String, String> = [(
+            "publish/2026-09-19".to_string(),
+            "https://github.com/algedonic-dev/boss/pull/239".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let (orphans, on_forge) = super::orphans_and_published(ls, &claimed, &published);
+        assert_eq!(orphans, vec!["docs/lost-work".to_string()]);
+        assert_eq!(
+            on_forge,
+            vec![(
+                "publish/2026-09-19".to_string(),
+                "https://github.com/algedonic-dev/boss/pull/239".to_string()
+            )]
+        );
+        // a publish head the forge no longer holds (swept after the merge)
+        // is not drawn: the line says what is ON the forge
+        let (_, gone) =
+            super::orphans_and_published("aaa\trefs/heads/main\n", &claimed, &published);
+        assert!(gone.is_empty());
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1428,6 +1667,30 @@ mod tests {
         let open = vec![("fix/landed".to_string(), "Proven in prod".to_string())];
         // Its branch was swept by the train — the normal state, not residue.
         assert!(residue_cars(&open, &heads(&[])).is_empty());
+    }
+
+    /// A shed line names the backlog-item the car is holding open, so
+    /// the residue is readable from the one verb a session runs first.
+    ///
+    /// Measured 2026-09-19 (a7837d81): twelve cars stood in the shed,
+    /// the oldest landed 58 h earlier, holding ten open backlog-items —
+    /// and two of those items had each already cost a dispatched agent
+    /// run at high effort re-deriving a landed fix. A car with no item
+    /// holds nothing open and says nothing extra.
+    #[test]
+    fn a_shed_line_names_the_item_the_unproven_car_is_holding_open() {
+        let mut holding = landed("fix/holding", json!({ "proof_probe": "bash x.sh" }));
+        holding["metadata"]["backlog_item"] = json!("f47861a5-2a86-4b8e-bb01-6491377b9499");
+        let lines = shed_lines(&[holding, landed("fix/no-item", json!({}))]);
+        assert_eq!(
+            lines[0],
+            "    fix/holding (holds f47861a5): probe pending (the forge runs it on arrival)"
+        );
+        assert!(
+            lines[1].starts_with("    fix/no-item: UNPROVEN"),
+            "{}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -1939,6 +2202,10 @@ mod tests {
                     state,
                     why: why.into(),
                     trend,
+                    // orient prints a region as a LINE — its count, its
+                    // bound and its why. The machinery (car 5) is a
+                    // drawing, so this reader takes none of it.
+                    machines: Vec::new(),
                 }
             };
         let map = Regions {
@@ -2047,6 +2314,84 @@ mod tests {
             lines[7].contains("    receiving        ?") && lines[7].contains("TROUBLED"),
             "{}",
             lines[7]
+        );
+    }
+
+    /// The BORDERS section (design d2154293, car 2): a line per border
+    /// with what crosses it, what stands at it and which machine moves
+    /// it. Every unknown reads as unknown — the CLI's version of the
+    /// rule that a rail whose flow could not be computed must not draw
+    /// as a quiet one.
+    #[test]
+    fn border_lines_print_the_rate_the_queue_and_the_machine() {
+        let map = serde_json::json!({
+            "window_hours": 24,
+            "borders": [
+                {
+                    "from": "gates", "to": "track",
+                    "crossing": "a car boarded a train",
+                    "rate": { "metric": "crossings", "unit": "per day",
+                              "current": 3.0, "previous": 5.0,
+                              "samples": 3, "previous_samples": 5 },
+                    "last_crossed": "2026-09-19T11:00:00+00:00",
+                    "waiting": 2,
+                    "holds": [{ "what": "fix/a", "why": "parked, waiting for the boarding depth" }],
+                    "machine": { "name": "train-board-on-dock-depth", "kind": "cadence",
+                                 "last_fired": "2026-09-19T09:00:00+00:00",
+                                 "silent_for_minutes": 180, "expected_every_minutes": 30,
+                                 "silent": true, "why": "its own firing in cadence_firings" },
+                    "state": "troubled",
+                    "why": "2 packets waiting and train-board-on-dock-depth silent for 180m — it declares every 30m"
+                },
+                {
+                    "from": "receiving", "to": "marshalling",
+                    "crossing": "an inbound packet triaged",
+                    "rate": { "metric": "crossings", "unit": "per day",
+                              "current": null, "previous": null,
+                              "samples": 0, "previous_samples": 0 },
+                    "last_crossed": null,
+                    "waiting": null,
+                    "holds": [],
+                    "machine": { "name": "the receiving desk", "kind": "actors",
+                                 "last_fired": null, "silent_for_minutes": null,
+                                 "expected_every_minutes": null, "silent": null,
+                                 "why": "no machine moves this hop — an actor does" },
+                    "state": "troubled",
+                    "why": "the workflow registry that names the inbound kinds could not be read"
+                }
+            ]
+        });
+        let lines = border_lines(&map);
+        assert_eq!(
+            lines.len(),
+            3,
+            "a heading and two rails:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines[0].contains("last 24h"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("gates -> track")
+                && lines[1].contains("3.0/day (was 5.0/day)")
+                && lines[1].contains("2 waiting")
+                && lines[1].contains("TROUBLED")
+                && lines[1].contains("train-board-on-dock-depth SILENT 180m"),
+            "{}",
+            lines[1]
+        );
+        // The unknown rail: no rate, no count, no firing — and not one
+        // zero anywhere on the line.
+        assert!(
+            lines[2].contains("— (was —)")
+                && lines[2].contains("? waiting")
+                && lines[2].contains("(no firing recorded)")
+                && lines[2].contains("could not be read"),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            !lines[2].contains(" 0 "),
+            "an unknown rail must not print a zero: {}",
+            lines[2]
         );
     }
 }

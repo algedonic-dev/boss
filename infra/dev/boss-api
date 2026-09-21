@@ -22,8 +22,10 @@
 # (crates/orchestrators/boss-cli/src/identity.rs, backlog 5083d6f5):
 # BOSS_ACTOR, else the actor file, else NOBODY — and nobody is loud. A
 # WRITE with no actor is refused, naming both fixes; a READ, which
-# attributes nothing, goes out marked operator:unidentified and says so
-# once on stderr. Until 2026-09-14 (backlog 416d503c) the pod copy fell
+# attributes nothing, goes out marked operator:unidentified under the
+# platform's own read role (audit-readonly — never the operator's
+# platform-admin, backlog d843abf2) and says so once on stderr. Until
+# 2026-09-14 (backlog 416d503c) the pod copy fell
 # back to a fixed id instead, so a builder pod or a fresh session with
 # no actor file wrote history as the operator's agent identity — two
 # doors to one system of record with two provenance rules.
@@ -53,9 +55,29 @@
 # refused before curl, because a 404 from the wrong port is the defect
 # this removes, not a fallback.
 #
+# WHEN NO PATH CAN ROUTE — `BOSS_SOR_SERVICE=<name>` (backlog bf1f5ad2,
+# 2026-09-19). The gateway fronts every path there is, so no prefix
+# routes to it; the machine door carries it as the one row a reader
+# reaches BY NAME (the_machine_door_carries_every_read_surface.rs,
+# NOT_PATH_ROUTED). The forge has such a reader — probe-bin/boss-gateway-read
+# — and the pod had none, so a builder rehearsing a gateway probe set
+# the host and the port table by hand and the door stopped being the
+# door. Named, the name decides the service and the path decides
+# nothing; unnamed, nothing changes. A name the table cannot place is
+# refused before curl, with or without a table: the fall-through an
+# unrouted path gets would send a gateway question to the jobs port,
+# which answers. This door still SIGNS its calls, and a signed read is
+# not a stranger's read — but the gateway strips every client
+# `x-boss-*` header at its edge (role_headers.rs: identity comes from
+# the session cookie, full stop), so what comes back is what a caller
+# with no session gets. For a RECORDED probe, use the forge's reader:
+# it sends nothing at all and prints the status alone.
+#
 # The pod-specific constants are env-overridable:
 #   BOSS_JOBS_URL            the base URL; else the line in ./sor-url
 #   BOSS_SOR_PORTS           `name=port …`; else ../forge/sor-ports.env
+#   BOSS_SOR_SERVICE         the service to read, when no path routes to
+#                              it (`gateway`); else the path decides
 #   BOSS_ACTOR               who the call signs as — the id; else the one
 #   BOSS_ACTOR_FILE            line in this file ($HOME/.config/boss/actor,
 #                              as the boss CLI reads it)
@@ -72,6 +94,34 @@ esac
 # readlink -f: the pod invokes this through a symlink, and sor-url sits
 # beside the FILE, not the link.
 HERE="$(dirname "$(readlink -f "$0")")"
+
+# IS THIS DOOR THE TREE'S DOOR? (backlog 0b36dd65, 2026-09-19.) The pod
+# reaches this file through a symlink into the operator's checkout, and
+# nothing keeps that checkout on origin/main — it was two commits behind
+# for most of one working day while every door ran from it, and the
+# routing block below was among what was missing, so a builder's read
+# came back HTTP:404 from the jobs port. A stale copy ANSWERS; it does
+# not error. So a READ says so beside its answer, where the reader can
+# judge it, and a WRITE is refused: what a write lands in the audit log
+# is immutable, and there is no reading that back under a warning. The
+# judgement is local and never fetches (door-freshness.sh says why).
+FRESHNESS_FILE="$HERE/door-freshness.sh"
+if [ -r "$FRESHNESS_FILE" ]; then
+  # shellcheck source=door-freshness.sh
+  . "$FRESHNESS_FILE"
+  if STALE=$(door_is_stale "$0"); then
+    case "$METHOD" in
+      GET)
+        echo "boss-api: WARNING — $STALE" >&2
+        ;;
+      *)
+        echo "boss-api: REFUSED $METHOD $API_PATH: a write is not signed from a door that is not the tree's, and a read still runs under a warning (BOSS_DOOR_FRESHNESS=off runs this one anyway, if you mean it). $STALE" >&2
+        exit 78
+        ;;
+    esac
+  fi
+fi
+
 SOR_URL_FILE="$HERE/sor-url"
 BASE=${BOSS_JOBS_URL:-$(head -n1 "$SOR_URL_FILE" 2>/dev/null || true)}
 [ -n "$BASE" ] || {
@@ -88,6 +138,15 @@ if [ -z "$SOR_PORTS" ] && [ -r "$SOR_PORTS_FILE" ]; then
   SOR_PORTS=$(grep -Ev '^[[:space:]]*(#|$)' "$SOR_PORTS_FILE" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//' || true)
   SOR_PORTS_FROM=$SOR_PORTS_FILE
 fi
+# A NAME, when no path can route (backlog bf1f5ad2). Blank is not a
+# name, as everywhere else here. Absent a table there is nothing to
+# place it against, and leaving on the base would send a gateway
+# question to the jobs port — refuse instead.
+NAMED_SERVICE=$(printf '%s' "${BOSS_SOR_SERVICE:-}" | tr -d '[:space:]')
+if [ -n "$NAMED_SERVICE" ] && [ -z "$SOR_PORTS" ]; then
+  echo "boss-api: refusing $METHOD $API_PATH: BOSS_SOR_SERVICE names \`$NAMED_SERVICE\`, and no port table was found (BOSS_SOR_PORTS is unset and $SOR_PORTS_FILE is not readable) — so there is nothing to place that name against. Sending it to the base would ask $NAMED_SERVICE's question of the jobs port, which answers instead of erroring." >&2
+  exit 2
+fi
 if [ -n "$SOR_PORTS" ]; then
   SOR_ROUTES="$HERE/../forge/probe-bin/sor-routes.sh"
   [ -r "$SOR_ROUTES" ] || {
@@ -96,10 +155,14 @@ if [ -n "$SOR_PORTS" ]; then
   }
   # shellcheck source=../forge/probe-bin/sor-routes.sh
   . "$SOR_ROUTES"
-  SERVICE=$(sor_service_for_path "$API_PATH")
+  if [ -n "$NAMED_SERVICE" ]; then
+    SERVICE=$NAMED_SERVICE; SERVICE_FROM="BOSS_SOR_SERVICE names it"
+  else
+    SERVICE=$(sor_service_for_path "$API_PATH"); SERVICE_FROM="the path is served by $SERVICE"
+  fi
   if [ "$SERVICE" != jobs ]; then
     PORT=$(sor_port_for_service "$SERVICE" "$SOR_PORTS") || {
-      echo "boss-api: refusing $METHOD $API_PATH: it is served by $SERVICE, and the port table names no port for it (table: '$SOR_PORTS', from $SOR_PORTS_FROM). Sending it to the jobs port would answer 404 about a surface that exists — refusing rather than guessing." >&2
+      echo "boss-api: refusing $METHOD $API_PATH: $SERVICE_FROM, and the port table names no port for $SERVICE (table: '$SOR_PORTS', from $SOR_PORTS_FROM). Sending it to the jobs port would answer 404 about a surface that exists — refusing rather than guessing." >&2
       exit 2
     }
     BASE=$(sor_base_on_port "$BASE" "$PORT")
@@ -111,11 +174,20 @@ fi
 ACTOR_FILE=${BOSS_ACTOR_FILE:-$HOME/.config/boss/actor}
 ACTOR_ID=$(printf '%s' "${BOSS_ACTOR:-}" | tr -d '[:space:]')
 [ -n "$ACTOR_ID" ] || ACTOR_ID=$(head -n1 "$ACTOR_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+# A NAMED caller gets the operator's role. Nobody-in-particular does NOT
+# (backlog d843abf2, measured 2026-09-18: an unnamed read rode the same
+# platform-admin header and saw the whole world): it reads under the
+# platform's own read role, audit-readonly at the auditor tier — the
+# one a recorded probe's reader carries — full-width on every list and
+# 403 on every write. The role's one home is boss_core::roles
+# (identity.rs reads it from there); this copy is pinned equal by
+# crates/core/boss-testing/tests/boss_api_sh.rs.
+ROLE=platform-admin; TIER=operator
 if [ -z "$ACTOR_ID" ]; then
   case "$METHOD" in
     GET)
-      ACTOR_ID=operator:unidentified
-      echo "boss-api: nothing names the actor running this command — reading as \`$ACTOR_ID\`. Writes will be refused until \`BOSS_ACTOR\` (or the actor file) names you." >&2
+      ACTOR_ID=operator:unidentified; ROLE=audit-readonly; TIER=auditor
+      echo "boss-api: nothing names the actor running this command — reading as \`$ACTOR_ID\` under the $ROLE role. Writes will be refused until \`BOSS_ACTOR\` (or the actor file) names you." >&2
       ;;
     *)
       # The CLI's refusal, with the identity THIS door used to fall back
@@ -126,7 +198,7 @@ if [ -z "$ACTOR_ID" ]; then
       ;;
   esac
 fi
-ACTOR='{"id":"'"$ACTOR_ID"'","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":null}'
+ACTOR='{"id":"'"$ACTOR_ID"'","role":"'"$ROLE"'","access_tier":"'"$TIER"'","territory_account_ids":[],"direct_report_ids":[],"department":null}'
 
 args=( -sS -X "$METHOD" -H 'Content-Type: application/json' -H "X-Boss-User: $ACTOR" -w '\n%{http_code}' )
 TOK=$(cat "${BOSS_MACHINE_TOKEN_FILE:-/etc/boss/machine-token}" 2>/dev/null || true)

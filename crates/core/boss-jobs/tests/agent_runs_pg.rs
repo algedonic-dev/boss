@@ -22,8 +22,8 @@
 use boss_core::actor::ActorId;
 use boss_core::agent::BudgetDecision;
 use boss_jobs::agent_runs::{
-    AgentRunError, AgentRunLog, NewAgentRun, PgAgentRuns, RunFilter, RunOutcome, TokenUsage,
-    rebuild_agent_runs,
+    AgentRunError, AgentRunLog, NewAgentRun, PgAgentRuns, PricingBasis, RunFilter, RunOutcome,
+    TokenUsage, rebuild_agent_runs,
 };
 use boss_testing::TestDb;
 use chrono::{TimeZone, Utc};
@@ -76,9 +76,10 @@ async fn a_total_only_run_is_stored_recorded_and_unpriced() {
     assert_eq!(held.duration_secs(), 631, "duration is derived, not stored");
     assert_eq!(
         held.usd_micros, None,
-        "the card prices the halves differently, so a total has no price"
+        "the seeded `opus-5` row declares no blend, so a bare total on it has no price"
     );
     assert_eq!(held.priced_by, None);
+    assert_eq!(held.pricing_basis(), None, "no figure, no basis");
 
     // What the columns actually hold: the total present, the split NULL
     // rather than zero. Zero would read as "no input tokens", which is
@@ -172,18 +173,59 @@ async fn the_database_refuses_half_a_split() {
     );
 }
 
-/// And a row with neither shape is still a refusal: a run that reports
-/// no tokens at all is not a record of what it cost.
+/// A run that reports NO count is a row with a NULL total — unknown,
+/// not zero, the same distinction `usd_micros` draws for an unpriced
+/// run (backlog 65c9c05a). Until 2026-09-19 the column was NOT NULL,
+/// so `boss dispatch --report` without `--tokens` wrote a 0 with a
+/// `detail.tokens_reported: false` beside it, and 13 of 42 live rows
+/// read as a measurement of zero to any query that did not know to
+/// check the flag.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_database_refuses_a_run_reporting_no_tokens_at_all() {
+async fn the_database_holds_a_run_that_reported_no_tokens_as_null() {
     let db = TestDb::new().await;
 
-    let err = insert_raw(&db, "run-nothing", None, None, None)
+    insert_raw(&db, "run-nothing", None, None, None)
         .await
-        .expect_err("no tokens is not a run");
+        .expect("a run with no count is a record of the run");
+
+    let (total, input, output): (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT total_tokens, input_tokens, output_tokens FROM agent_runs WHERE run_id = $1",
+    )
+    .bind("run-nothing")
+    .fetch_one(&db.pool)
+    .await
+    .expect("the row");
+    assert_eq!((total, input, output), (None, None, None));
+
+    // And it reads back through the adapter as the shape that means
+    // unknown, rather than as a zero the port invented.
+    let held = PgAgentRuns::new(db.pool.clone())
+        .list_runs(&RunFilter::default())
+        .await
+        .expect("lists")
+        .pop()
+        .expect("the row is there");
+    assert_eq!(held.run.tokens, TokenUsage::Unreported);
+    assert_eq!(held.run.tokens.total(), None);
+    assert_eq!(held.usd_micros, None, "no tokens is no price");
+}
+
+/// A measured split with no total is refused. The equality CHECK was
+/// total while `total_tokens` was NOT NULL; once it can be NULL the
+/// comparison evaluates to NULL for such a row, and Postgres treats a
+/// NULL CHECK as SATISFIED — so the constraint had to state the
+/// presence explicitly or the split would have lost its pin silently
+/// (backlog 65c9c05a).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_database_refuses_a_split_with_no_total_beside_it() {
+    let db = TestDb::new().await;
+
+    let err = insert_raw(&db, "run-untotalled", None, Some(10), Some(2))
+        .await
+        .expect_err("a measured split has a total, and it equals the split");
     assert!(
-        err.contains("total_tokens"),
-        "the refusal names the missing column: {err}"
+        err.contains("agent_runs_total_matches_split_check"),
+        "the refusal names the constraint: {err}"
     );
 }
 
@@ -657,4 +699,63 @@ async fn a_rebuild_of_a_pre_budget_event_holds_no_decision() {
             .await
             .expect("the rebuilt row is there");
     assert_eq!(stored, None, "no decision was made, and the row says so");
+}
+
+/// The SEEDED card is the registry, so this is the pin on the migration
+/// itself (20260920223003): `opus-5[1m]` — the model every recorded run
+/// on this pod has run on — declares an 87.5% input share, and the run
+/// shape every coding agent here actually reports is priced by it.
+///
+/// 200,000 tokens at the blend the two seeded rates weigh to
+/// ($7.50/MTok) is $1.50. Before this the same run was one of the 83
+/// unpriced rows out of 85 (backlog 6681a803).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seeded_card_declares_a_blend_and_prices_a_total_with_it() {
+    let db = TestDb::new().await;
+    let log = PgAgentRuns::new(db.pool.clone());
+
+    let share: Option<i64> =
+        sqlx::query_scalar("SELECT blended_input_share_ppm FROM agent_rate_card WHERE model = $1")
+            .bind("opus-5[1m]")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the seeded row is there");
+    assert_eq!(
+        share,
+        Some(875_000),
+        "the declared ratio, seeded not guessed"
+    );
+
+    let mut run = a_run("run-blended", TokenUsage::TotalOnly { total: 200_000 });
+    run.actor_id = ActorId::agent("claude", "opus-5[1m]");
+    let out = log.record_run(&run, &filer()).await.expect("records");
+    assert_eq!(out.run.usd_micros, Some(1_500_000));
+    assert_eq!(out.run.priced_by.as_deref(), Some("opus-5[1m]"));
+    assert_eq!(
+        out.run.pricing_basis(),
+        Some(PricingBasis::Blended),
+        "the record must say the figure rests on the declared ratio"
+    );
+
+    // And the rebuild replays that figure rather than re-pricing, so
+    // the basis it derives is the one the run was recorded with. The
+    // outbox is what a live write fills; the rebuild reads audit_log,
+    // so move the event across as the relay would.
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, kind, source, timestamp, payload) \
+         SELECT event_id, kind, source, timestamp, payload FROM event_outbox \
+         WHERE kind = 'agents.run.recorded'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("relay the event");
+    rebuild_agent_runs(&db.pool).await.expect("rebuilds");
+    let held = log
+        .list_runs(&RunFilter::default())
+        .await
+        .expect("lists")
+        .pop()
+        .expect("one run");
+    assert_eq!(held.usd_micros, Some(1_500_000));
+    assert_eq!(held.pricing_basis(), Some(PricingBasis::Blended));
 }

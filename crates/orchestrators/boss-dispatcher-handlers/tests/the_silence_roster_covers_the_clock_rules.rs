@@ -79,12 +79,14 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          as 'never fired' is the claim cf0f5e2d's first pass withdrew.",
     ),
     (
-        "recheck-failing-probes-daily",
+        "recheck-failing-probes-hourly",
         "runs `jobs.run-car-probes` scoped to cars whose probe already failed; it files \
-         a `run-car-probe` ops-request per such car, so on a day with no failing probe \
+         a `run-car-probe` ops-request per such car, so on an hour with no failing probe \
          it produces NOTHING, and that zero is the healthy reading. The packets it does \
          file are the same kind the arrival rule files, so a sweep keyed by kind could \
-         not tell the two apart either.",
+         not tell the two apart either. Hourly since a9dafed6 (2026-09-19) and still \
+         exempt for the same reason: the frequency is not what keeps it out of the \
+         roster, spawning no packet is.",
     ),
     (
         SWEEP_RULE,
@@ -121,6 +123,16 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          The packets it advances are agent-runs opened by `boss dispatch`, an operator's \
          act — a sweep keyed by kind would be watching the operator's cadence, not this \
          one's.",
+    ),
+    (
+        "an-abandoned-step-is-reclaimed-when-its-run-died",
+        "runs `jobs.reclaim_abandoned_step`, which RELEASES the step a dead agent-run was \
+         claimed for — `ready`, unassigned — a bound after the death rule above recorded \
+         the death (backlog a3397b01). It files nothing and completes nothing: it puts \
+         work back where the claim took it from, so on an hour with no dead run holding a \
+         step it produces NOTHING, and that zero is the healthy reading. The packets it \
+         touches are of every kind an agent block appears on, so there is no one kind a \
+         sweep keyed by kind could watch.",
     ),
     (
         "work-session-ends-when-silent",

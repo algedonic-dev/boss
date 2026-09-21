@@ -45,6 +45,7 @@ use boss_dispatcher_handlers::handlers::{
     jobs_complete_linked_step::JobsCompleteLinkedStep,
     jobs_complete_step::JobsCompleteStep,
     jobs_complete_step_matching::JobsCompleteStepMatching,
+    jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
     jobs_run_car_probes::JobsRunCarProbes,
     jobs_subjob_resolve::JobsSubjobResolve,
     ledger_bill_approve::LedgerBillApprove,
@@ -343,8 +344,10 @@ async fn main() -> Result<()> {
                 platform_owner.clone(),
             ));
             // The week's retros (design 3613f0af, backlog 1dffde5d):
-            // one department-retro per department the classes registry
-            // holds, read at fire time through GET /api/departments, and
+            // one department-retro per department the departments
+            // registry holds, read at fire time through
+            // GET /api/departments (backlog 80a77466 — it served the
+            // employee Class drawer until then), and
             // the platform's own protocol-retro under the same ISO-week
             // window. Needs the clock for the firing day the window is
             // judged against. Inert until a scheduled rule names it
@@ -386,7 +389,13 @@ async fn main() -> Result<()> {
             // note on the judged request why nothing was filed
             // (a1d3c762: publish-drift's --for-real by rule). Every noun
             // rides the rule row, so the next verb chain is a rule file.
-            handlers.register(OpsJudge::new(cfg.jobs_api_url.clone()));
+            // Reads the verb's EXIT before its output (53f54b3f): a
+            // measurement that did not finish chains nothing, and files
+            // an urgent packet to the platform owner instead.
+            handlers.register(OpsJudge::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A release packet's `tag` step going ready files the
             // forge's tag-release request itself — v<version> off the
             // packet, the newest closed train's merge_ref off the
@@ -430,6 +439,14 @@ async fn main() -> Result<()> {
             // Generic: kind, step, the bound and what to write ride the
             // rule row; the tick's own `_at` is the clock.
             handlers.register(JobsAgeOutStep::new(cfg.jobs_api_url.clone()));
+            // The routing half of the same judgement (a3397b01): a
+            // step whose named executor run DIED is released back to
+            // `ready` and nobody's, a bound AFTER the death was
+            // recorded — two facts, so the release is readable in the
+            // record before it happens. Generic: the run kind, its
+            // step, the value that means dead, the edge key and the
+            // second bound all ride the rule row.
+            handlers.register(JobsReclaimAbandonedStep::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints
@@ -738,6 +755,15 @@ async fn main() -> Result<()> {
             let pool_rules = pool.clone();
             let dead_letters: Arc<dyn DeadLetterSink> =
                 JobsApiDeadLetters::new(cfg.jobs_api_url.clone());
+            // Every rule firing is recorded (backlog b14afc48), through
+            // the dispatcher's own pool — the same one the log tail and
+            // the schedule cursor use. Until this landed the reactive
+            // layer was the one machine on the IT world map that could
+            // not say when it last fired, so the hop it moves could not
+            // be told stopped from quiet.
+            let firings: Arc<dyn boss_dispatcher::rules::firings::FiringSink> = Arc::new(
+                boss_dispatcher::rules::firings::PgFirings::new(pool.clone()),
+            );
             tokio::spawn(async move {
                 let mut registry = registry;
                 let mut fp = fp;
@@ -759,6 +785,10 @@ async fn main() -> Result<()> {
                         // packet-less topics and a failed write both
                         // leave a number at /api/dispatcher/health.
                         live: Some(live_rules.clone()),
+                        // Best-effort and after the settle: a firing
+                        // row that cannot be written never redelivers a
+                        // side effect that landed.
+                        firings: Some(firings.clone()),
                     });
                     let ev = {
                         let live = live_rules.clone();

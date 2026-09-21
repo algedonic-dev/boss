@@ -236,7 +236,7 @@ real failure:
 | `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | **collapsed** — the bare-metal deploy and its arrays were deleted (2026-09-18); the pin now holds the LIVE container launcher's roster to the registry, which was the unpinned copy the whole time |
 | `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed twice** — `build.rs` generated the list from the manifest, then the manifest itself was deleted and the schema directory became the definition |
 | `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently | **collapsed** — one `nav-catalog.ts` answers both questions |
-| gate.sh `PREFLIGHT_LINTS` ↔ `infra/lint/` | four cars collided on the roster's tail line in one day, one left behind by #218 | **collapsed** — the roster is the directory minus a four-entry exclusion set, read the way the consist check already read it |
+| gate.sh `PREFLIGHT_LINTS` ↔ `infra/lint/` | four cars collided on the roster's tail line in one day, one left behind by #218 | **collapsed** — the roster is the directory minus the lints that declare `# consist: skip` in their own header, read the way the consist check already read it |
 | `infra/dispatcher/rules.toml` ↔ the ratchet's `BASELINE=<n>` | two rule cars could not ride one train (07e72962): both appended to the file AND bumped the same integer | **collapsed** — one file per rule under `infra/dispatcher/rules/`, and the count is derived from the directory; the justification the baseline bump used to force is now a required `why` in each rule's own file |
 
 All three are now either collapsed to one definition or pinned by a
@@ -400,7 +400,9 @@ the tier it touches.**
 
 The `infra/lint/tier-import-audit.sh` script enforces the
 Tier-1-can't-depend-on-Tier-2 rule (orchestrators excluded);
-runs cleanly today (0 violations across 28 core crates).
+runs cleanly today (0 violations across 28 core crates; the script's
+own line says 29 because it counts crate manifests, and `boss-expr`
+carries a nested `fuzz` crate).
 
 Each domain crate has a matching `*-client` for cross-service
 HTTP calls + a `Pg*` adapter behind the `postgres` feature.
@@ -755,7 +757,27 @@ a door that stops being true is a defect worth a car.
   `infra/dev/`, pinned by a shell test in `crates/core/boss-testing/tests/`
   (`boss_api_sh`, `boss_shim_sh`, `wt_cargo_sh`, `wt_web_sh`), and
   `/work/tools/bin/<name>` is a SYMLINK to the main checkout's copy —
-  which is why the main checkout stays on `origin/main`. The pod's
+  so every door runs whatever that checkout last had. **Nothing keeps
+  it on `origin/main`**, and this document used to say it did: on
+  2026-09-19 it was two commits behind for most of the working day and
+  a builder's read came back `HTTP:404` from the wrong port (backlog
+  0b36dd65). Each door now judges its own copy first
+  (`infra/dev/door-freshness.sh`, locally, no fetch): a read WARNS,
+  naming both shas and the `git -C /work/boss merge --ff-only
+  origin/main` that repairs it, and a `boss-api` WRITE is REFUSED
+  (exit 78), because what a write lands in the log is immutable while
+  a read's warning rides beside its answer. Only a checkout that has
+  not pulled is judged stale — a branch, or a door being edited, is
+  silent — and `BOSS_DOOR_FRESHNESS=off` runs anything anyway. **That
+  fast-forward is the machine's now** (backlog 033d1fd3): the dev pod's
+  reclaim sidecar takes the checkout to the origin/main it has already
+  fetched on every hourly pass, and defers while any `gate-run` packet
+  is open, because a gate renders its runner from a tree. The operator
+  typed that command by hand four times on 2026-09-19, and a warning
+  fired four times a day is a warning nobody reads. A warning you still
+  see means the hour has not turned yet, a gate is running, or the
+  merge was refused — and a refusal is loud, on the sidecar's own
+  packet. The pod's
   system-of-record spelling is `infra/dev/sor-url`, which both
   `boss-api` and the shim read — WRITTEN from the one tree source,
   `infra/estate/estate.toml`, and held equal to it by a test (since
@@ -782,6 +804,21 @@ a door that stops being true is a defect worth a car.
   calls before finding this door at all, ~14 of them writes carrying a
   forged `emp-david` actor, so the audit log credits a human with an
   agent's work.
+
+- **Reading a service no path can route to — `BOSS_SOR_SERVICE=<name>
+  boss-api GET …`.** The same door, aimed at that service's port:
+  `gateway` means 4443 rather than the jobs API's 7900. It reaches the
+  gateway BY NAME because the gateway fronts every path there is, so no
+  prefix could route to it — the machine-door pin
+  (`the_machine_door_carries_every_read_surface.rs`, `NOT_PATH_ROUTED`)
+  forbids a path route for that reason. Unnamed, nothing changes; a name
+  the port table cannot place is refused BEFORE curl, rather than falling
+  through to the jobs port, which would answer. Dogfooded 2026-09-19:
+  `BOSS_SOR_SERVICE=gateway boss-api GET /health` returns ok, HTTP:200
+  against the live gateway. It exists because the pod had no such reader
+  (the forge did), so a builder rehearsing a gateway probe set the host
+  and the port table by hand — which is this section's own failure mode
+  (backlog `bf1f5ad2`).
 
 - **Which deployment.** The system of record is
   **`http://10.20.0.34:7900`**, and since 2026-09-15 it is the ONLY
@@ -842,10 +879,24 @@ a door that stops being true is a defect worth a car.
   REFRESHES the parked car (the fresh receipt rides it as
   `regate_receipt`) rather than filing a twin, and `boss rerail
   --finish` does the same once a green vouches for the head; and
-  **prose with backticks does not survive argv** — every `--park-*`
-  text goes through the shell, where a backtick is command substitution
-  and the phrase is replaced by nothing, silently. Single quotes, or no
-  backticks in car prose.
+  **prose with backticks does not survive argv**, and that is not a
+  `--park-*` rule — it belongs to EVERY flag that carries a sentence
+  (`boss triage --evidence`, `boss fold --change`, `boss design
+  --markdown`, `boss prove --verified`, `boss dispatch --summary`,
+  `boss job file --title`, and the six `--park-*`). Inside double
+  quotes, or unquoted, a backticked word is command substitution: the
+  shell runs it and the phrase is replaced by nothing, leaving a
+  grammatical sentence with its meaning removed. Measured, 2026-09-19:
+  a triage recorded "Ordering trap confirmed:  is required of every
+  rule", caught only because bash printed "why: command not found"
+  (backlog 2376b89e). **SINGLE-quote every prose value** — the backtick
+  then arrives intact — or pass the text through the flag's `-file`
+  twin (`--evidence-file`, `--change-file`, `--markdown-file`), where
+  no word expansion happens at all. **No verb can refuse this for
+  you**: the substitution happens before the process starts, so a
+  literal-backtick check would refuse the single-quoted spelling that
+  works and pass the double-quoted one that does not. The reasoning is
+  in `crates/orchestrators/boss-cli/src/prose.rs`, pinned by a test.
 
 - **The train's gate is the assembled tree's test — it belongs in the
   gate lane.** Since design 128b5496 (2026-09-13) the conductor files

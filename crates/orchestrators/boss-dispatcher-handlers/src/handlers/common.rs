@@ -153,6 +153,44 @@ pub fn dispatcher_reader_header() -> String {
     .to_string()
 }
 
+/// THE FLOOR under every handler that fans out over a roster read at
+/// fire time (backlog 86ebf7fc): a roster that answers ZERO rows is
+/// refused, never reported as a quiet pass.
+///
+/// WHY IT IS A REFUSAL AND NOT A WARNING. A wrong, dark or
+/// policy-narrowed read answers `total: 0` instead of erroring — the
+/// most expensive recurring shape in this codebase (CLAUDE.md §Doors,
+/// "a wrong target answers instead of erroring"). The layer below can
+/// be made honest — `GET /api/departments` refuses rather than flatten
+/// a registry error to an empty list (80a77466) — and that is only
+/// half: the consumer still has to refuse the EMPTY it is honestly
+/// handed, because the rosters this applies to are ones whose zero
+/// means the system is broken, not that the week was quiet. A warning
+/// is not a refusal: it fires into a log nobody is reading at 00:00 on
+/// a Monday, and the cadence passes with no packet anyone acts on.
+///
+/// WHAT REFUSING BUYS. `Permanent` terminates the firing at once
+/// rather than burning the redelivery budget on a roster that will
+/// answer empty identically every time, and the dead-letter is counted
+/// on the dispatcher's liveness surface, where the estate chain reads
+/// unrecorded dead-letters and files a finding (8834804a) — a packet
+/// someone acts on, which is exactly what the quiet pass never made.
+///
+/// `why_zero_is_broken` is the caller's sentence, because the floor is
+/// generic and the reason never is.
+pub(crate) fn empty_roster_refusal(
+    handler: &str,
+    roster: &str,
+    why_zero_is_broken: &str,
+) -> HandlerError {
+    HandlerError::Permanent(format!(
+        "{handler}: the {roster} roster is empty — {why_zero_is_broken}. Firing successfully \
+         over zero rows is absence treated as an answer, and it hides the fault for a whole \
+         cadence at a time, so this refuses instead: a fan-out over an empty roster is a check \
+         that is not running"
+    ))
+}
+
 /// The client every handler's production constructor uses: a plain
 /// reqwest client that carries the machine token as a default header
 /// when the process has one configured (7fcd78fa phase 1). One
@@ -319,6 +357,44 @@ pub(crate) async fn get_json(
         .map_err(|e| HandlerError::Downstream(format!("GET {url} not JSON: {e}")))
 }
 
+/// The rows of a listing, or a refusal naming the reading — the ONE
+/// place this handler crate decides what a missing `data` array means.
+///
+/// WHY THIS EXISTS (backlog 833e2d0a). The same chain —
+/// `.get("data") … .unwrap_or_default()` — turns an ERROR SHAPE into an
+/// empty list, so a dark, narrowed or restarted far side reads as
+/// "nothing to do" and the pass reports healthy. It has been cured in
+/// three handlers ONE AT A TIME, each found by accident by someone
+/// working on something else: `retro.open`'s departments (80a77466),
+/// `sensor.poll`'s sensors (6c4c432a), and its owed readings
+/// (0767c830). A grep sweep is not the cure and that is measured: in
+/// `sensor_poll.rs` alone the chain appears four times, of which one
+/// was the bug, one is safe by accident of its own truncation check
+/// and one is a different shape. So the JUDGEMENT moves here instead,
+/// and a reading that takes it cannot drift from the other readings.
+///
+/// `.filter(is_array)` rather than `as_array().to_vec()` is the
+/// load-bearing detail: `"data": null` and `"data": {}` refuse too,
+/// rather than being read as zero rows.
+///
+/// An EMPTY array is honest and stays honest — a registry may
+/// legitimately hold nothing, so this puts no floor on the count. The
+/// refusal is a `String` so the caller decides its class; at every
+/// current call site that is `HandlerError::Downstream`, because a
+/// listing with no `data` is a bad answer from the far side rather
+/// than a deterministic fault in the request, and a redelivery can
+/// succeed once the service or the policy scope is right.
+pub(crate) fn rows_or_refuse<T: serde::de::DeserializeOwned>(
+    listing: &Value,
+    what: &str,
+) -> Result<Vec<T>, String> {
+    let rows = listing
+        .get("data")
+        .filter(|d| d.is_array())
+        .ok_or_else(|| format!("{what} answered no `data` array"))?;
+    serde_json::from_value(rows.clone()).map_err(|e| format!("{what}: rows not in shape: {e}"))
+}
+
 /// Every open Job of `kind`, steps inline, paged on the list's `total`
 /// so a packet sorted past one page is still found — a capped page is
 /// a false negative that grows with the board's age.
@@ -332,13 +408,31 @@ pub(crate) async fn open_jobs_of_kind(
     kind: &str,
     rule_name: &str,
 ) -> Result<Vec<Value>, HandlerError> {
+    open_jobs(client, jobs_base, Some(kind), rule_name).await
+}
+
+/// The same walk with the kind OPTIONAL: `None` is the whole open
+/// board. A handler asking a question about claimed STEPS rather than
+/// about packets of one kind needs it — `jobs.reclaim_abandoned_step`
+/// looks for steps held by a dead executor run, and those sit on
+/// packets of every kind an agent block appears on (a3397b01).
+pub(crate) async fn open_jobs(
+    client: &reqwest::Client,
+    jobs_base: &str,
+    kind: Option<&str>,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
     const PAGE: usize = 500;
+    let kind_q = match kind {
+        Some(k) => format!("kind={k}&"),
+        None => String::new(),
+    };
     let mut rows: Vec<Value> = Vec::new();
     loop {
         let body = get_json(
             client,
             &format!(
-                "{}/api/jobs?kind={kind}&status=open&limit={PAGE}&offset={}",
+                "{}/api/jobs?{kind_q}status=open&limit={PAGE}&offset={}",
                 jobs_base.trim_end_matches('/'),
                 rows.len()
             ),
@@ -346,11 +440,11 @@ pub(crate) async fn open_jobs_of_kind(
         )
         .await?;
         let total = body.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let page: Vec<Value> = body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // A page with no `data` array is no answer, and reading it as
+        // zero rows broke the loop below on `got == 0` and returned an
+        // EMPTY BOARD to every rule that walks it (backlog 833e2d0a).
+        let page: Vec<Value> =
+            rows_or_refuse(&body, "GET /api/jobs").map_err(HandlerError::Downstream)?;
         let got = page.len();
         rows.extend(page);
         if got == 0 || rows.len() >= total {
@@ -430,6 +524,120 @@ pub(crate) fn triage_step(job: &Value) -> Option<(String, serde_json::Map<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Backlog 833e2d0a — THE JUDGEMENT LIVES ONCE. A listing with no
+    /// `data` array is no answer: an error shape, a changed contract, a
+    /// policy-narrowed read, a far side that restarted. Reading it as
+    /// zero rows makes a handler do nothing and report the pass
+    /// healthy. Three handlers were cured of exactly this one at a
+    /// time (80a77466 departments, 6c4c432a sensors, 0767c830
+    /// readings) and each was found by accident. An EMPTY array is
+    /// honest — a registry may legitimately hold nothing — so no floor
+    /// is put on the count.
+    #[test]
+    fn a_listing_with_no_data_array_refuses_and_an_empty_one_is_honest() {
+        let rows: Vec<Value> =
+            rows_or_refuse(&json!({ "data": [], "total": 0 }), "GET /api/things")
+                .expect("an empty array is honest");
+        assert!(rows.is_empty());
+
+        // `null` and an object refuse too: `as_array` alone reads both
+        // as absent, and an absence that defaults is the whole disease.
+        for dark in [
+            json!({ "total": 0 }),
+            json!({ "error": "forbidden" }),
+            json!({ "data": null }),
+            json!({ "data": {} }),
+        ] {
+            let why = rows_or_refuse::<Value>(&dark, "GET /api/things")
+                .expect_err("no `data` array is a refusal");
+            assert!(why.contains("no `data` array"), "{why}");
+            assert!(why.contains("GET /api/things"), "{why}");
+        }
+    }
+
+    /// A row out of the caller's shape is a refusal carrying the serde
+    /// error and the reading's name — never a shorter list.
+    #[test]
+    fn a_row_out_of_shape_refuses_and_names_the_reading() {
+        let ok: Vec<u64> =
+            rows_or_refuse(&json!({ "data": [1, 2] }), "GET /api/things").expect("rows");
+        assert_eq!(ok, vec![1, 2]);
+        let why = rows_or_refuse::<u64>(&json!({ "data": ["x"] }), "GET /api/things")
+            .expect_err("a row out of shape refuses");
+        assert!(why.contains("GET /api/things"), "{why}");
+        assert!(why.contains("not in shape"), "{why}");
+    }
+
+    /// The judgement AT THE CONSUMING LAYER. `open_jobs` is the board
+    /// walk almost every packet-reading rule goes through, and it held
+    /// the same chain: a page with no `data` array left `got == 0`,
+    /// which broke the paging loop and returned an EMPTY BOARD. Every
+    /// caller then found nothing to do and said so calmly — the
+    /// widest-blast-radius instance of 833e2d0a, and the fourth.
+    async fn board_from(page: Value) -> Result<Vec<Value>, HandlerError> {
+        use axum::{Json as AxJson, Router, routing::get};
+        let app = Router::new().route(
+            "/api/jobs",
+            get(move || {
+                let page = page.clone();
+                async move { AxJson(page) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        open_jobs(
+            &api_client(),
+            &format!("http://{addr}"),
+            Some("backlog-item"),
+            "a-rule",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_board_page_with_no_data_array_refuses_rather_than_reading_empty() {
+        let board = board_from(json!({ "data": [], "total": 0 }))
+            .await
+            .expect("an empty board is honest");
+        assert!(board.is_empty());
+
+        let why = board_from(json!({ "total": 3 }))
+            .await
+            .expect_err("a page with no `data` array is a refusal");
+        assert!(matches!(why, HandlerError::Downstream(_)), "{why:?}");
+        assert!(format!("{why:?}").contains("no `data` array"), "{why:?}");
+    }
+
+    /// THE FLOOR, stated once: a roster read that answers zero rows is
+    /// refused, and the refusal names the handler, the roster and why
+    /// zero means broken — the three things an operator reading a
+    /// dead-letter has to be told.
+    #[test]
+    fn an_empty_roster_is_a_permanent_refusal_that_names_the_roster() {
+        let e = empty_roster_refusal(
+            "retro.open",
+            "departments",
+            "a company with no departments is broken in a way a retro cannot fix",
+        );
+        assert!(
+            e.is_permanent(),
+            "a roster that is empty is empty identically on every redelivery"
+        );
+        let text = e.to_string();
+        assert!(text.contains("retro.open"), "{text}");
+        assert!(text.contains("departments roster is empty"), "{text}");
+        assert!(
+            text.contains("broken in a way a retro cannot fix"),
+            "the caller's reason rides the refusal: {text}"
+        );
+        assert!(
+            text.contains("a check that is not running"),
+            "the floor's own sentence, stated here and not per handler: {text}"
+        );
+    }
 
     #[test]
     fn overhead_source_id_matches_endpoint_contract() {

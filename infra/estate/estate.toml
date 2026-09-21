@@ -57,6 +57,23 @@ forge_url = "http://10.20.0.15:3000"
 forge_registry = "10.20.0.15:3000"
 forge_journal = "http://10.20.0.15:19531"
 
+# THE PUBLIC MIRROR — the read-only backup-of-source on GitHub that the
+# publish-to-github protocol feeds by pull request, and the repository
+# the website links as "Source on GitHub". The URL a person opens; the
+# clone URL is this plus `.git`, and the owner/repo slug the GitHub API
+# wants is DERIVED from it by render-sor-env.sh (BOSS_MIRROR_URL,
+# BOSS_MIRROR_SLUG) — one line, so the two cannot disagree.
+#
+# Until 2026-09-20 it was a literal in four shell scripts and declared
+# nowhere (backlog f8af6040), one copy inside a REFUSAL telling an
+# operator which remote to add — so a move would have left a script
+# naming a remote that no longer exists. It surfaced only when the
+# marked-claims check (design 59a776c5) tried to READ it as a fact: the
+# landing page's GitHub link could not be checked because nothing
+# declared what right was. Now it can, and the claim `source.repo`
+# (apps/web/src/marketing/claims.ts) points here.
+mirror_url = "https://github.com/algedonic-dev/boss"
+
 
 # THE MACHINES — the estate's nodes and their roles, declared here and
 # published on every pod start by the launcher (`boss estate declare`,
@@ -76,8 +93,11 @@ forge_journal = "http://10.20.0.15:19531"
 # on (`talos-*` participates in the cluster compare); `roles` are the
 # Classes of `node` a managed host derives its unit roster from
 # (infra/estate/roles.toml) — a code the Class registry does not hold
-# is refused by the door. An adopter replaces every row below with
-# their own machines.
+# is refused by the door. `ops-runner` names no units of its own: it
+# says this host should be ANSWERING ops-request packets, and it is
+# what lets the world map draw a runner that has gone quiet instead of
+# drawing nothing at all (backlog 49ed87b4). An adopter replaces every
+# row below with their own machines.
 #
 # The `[[node]]` tables are read by boss_jobs::estate_seed (a TOML
 # parser); the flat keys above by the shell renderer. Neither reads the
@@ -138,7 +158,7 @@ id = "forge"
 label = "Forge host"
 address = "10.20.0.15"
 role = "forge"
-roles = ["cluster-operator"]
+roles = ["cluster-operator", "ops-runner"]
 cpu = 16
 memory_gb = 30
 disk_gb = 228
@@ -149,8 +169,8 @@ id = "boss-gcp"
 label = "boss-gcp"
 address = "34.45.110.40"
 role = "bastion"
-roles = ["ml-batch-host", "off-cluster-observer", "wireguard-bastion"]
+roles = ["cluster-operator", "ml-batch-host", "off-cluster-observer", "ops-runner", "wireguard-bastion"]
 cpu = 4
 memory_gb = 15
 disk_gb = 48
-notes = "WireGuard bastion and the public edge; hosted the second, older BOSS stack until it was retired on 2026-09-15 (7912c9ae). The conductor moved into the cluster on 2026-09-04. 48GB is the smallest disk in the estate."
+notes = "WireGuard bastion and the public edge. Second cluster-operator since 2026-09-20: the only estate node that is neither the forge nor inside the cluster, so a forge window does not leave the estate with no talosctl/kubectl. Its credential is SCOPED (break-glass ServiceAccount, infra/cluster/manifests/boss-break-glass-operator.yaml), not the forge's admin kubeconfig — the public edge gets read plus roll-to-last-known-good, not cluster-admin. Hosted the second, older BOSS stack until it was retired on 2026-09-15 (7912c9ae). The conductor moved into the cluster on 2026-09-04. 48GB is the smallest disk in the estate."

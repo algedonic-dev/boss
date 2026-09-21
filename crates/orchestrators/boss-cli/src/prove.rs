@@ -50,9 +50,10 @@
 //! in `verified` stays human, because what a change MEANS is judgement.
 //! Only the evidence under it is mechanised.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use boss_jobs::probe::{CAR_CONVERGED_AT_VAR, CAR_MERGE_REF_VAR};
 use serde_json::{Value, json};
 
 /// The step this verb fills. Job step titles come from the registry, so
@@ -150,7 +151,8 @@ const KILL_AFTER_SECS: u64 = 5;
 /// `boss prove --unattended` to do: drop from root to the probe user,
 /// run in the converged checkout, under a timeout, with exactly the
 /// environment a recorded probe is promised — the system of record's
-/// address, the read-only reader's identity and port table, and
+/// address, the read-only reader's identity and port table, the car's
+/// own converged instant ([`Shell::with_car_instant`]), and
 /// `probe-bin` first on PATH — and WITHOUT the actor this verb writes
 /// as, which is a write credential handed to program text a builder
 /// wrote if it leaks.
@@ -172,7 +174,83 @@ pub(crate) struct Shell {
     pub path_prefix: Option<std::path::PathBuf>,
 }
 
+/// THE CAR'S OWN CONVERGENCE INSTANT, read off the car: the `merge_ref`
+/// the conductor wrote when its train landed. `None` when the car has
+/// not merged, or when what it carries is not an object name — which is
+/// also the guard on what this verb hands to `git`, since a car's
+/// metadata is data from the system of record, not a literal here.
+pub(crate) fn car_merge_ref(car: &Value) -> Option<&str> {
+    car.pointer("/metadata/merge_ref")
+        .and_then(Value::as_str)
+        .and_then(resolvable_merge_ref)
+}
+
+/// An abbreviated or full object name, and nothing else.
+fn resolvable_merge_ref(raw: &str) -> Option<&str> {
+    let r = raw.trim();
+    ((7..=40).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit())).then_some(r)
+}
+
+/// The commit time of `merge_ref` in the checkout at `dir`, in epoch
+/// seconds — an epoch because that is the only form that compares
+/// honestly against the system of record's UTC timestamps
+/// (`boss_jobs::probe::GIT_TIME_STRING_EVIDENCE`). `None` when the
+/// merge is not in this checkout: the car's change has not converged
+/// here, and a probe that gets no instant says NOT YET rather than
+/// inventing one.
+fn converged_at(dir: &Path, merge_ref: &str) -> Option<String> {
+    let o = std::process::Command::new("git")
+        .args([
+            // The unattended door runs as root in the probe user's
+            // checkout, and git refuses a repository owned by somebody
+            // else ("dubious ownership") by answering nonzero rather
+            // than erroring loudly — which here would silently hand
+            // over NO instant and starve the probe the other way. This
+            // one command is a read; say so rather than find out.
+            "-c",
+            &format!("safe.directory={}", dir.display()),
+            "-C",
+            &dir.display().to_string(),
+            "show",
+            "-s",
+            "--format=%ct",
+            merge_ref,
+            "--",
+        ])
+        .output()
+        .ok()?;
+    let ct = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (o.status.success() && !ct.is_empty() && ct.chars().all(|c| c.is_ascii_digit())).then_some(ct)
+}
+
 impl Shell {
+    /// THE FIXED CUTOFF A RECORDED PROBE COMPARES AGAINST (backlog
+    /// a92571a6, measured 2026-09-19). A probe asking "did my
+    /// qualifying event happen after my change landed?" had nothing
+    /// fixed to ask it of, so the idiom that grew was `git log -1
+    /// --format=%ct HEAD` — the converged checkout's CURRENT head,
+    /// which advances with every train. The car's change converged
+    /// ONCE; that instant is what the question means, it is derivable
+    /// from the `merge_ref` already on the car, and handing it over is
+    /// what makes the correct comparison available rather than merely
+    /// documented.
+    ///
+    /// Both names are STRIPPED first, so a value left in the runner's
+    /// environment can never stand in for one this door resolved.
+    pub(crate) fn with_car_instant(mut self, merge_ref: Option<&str>) -> Self {
+        self.strip.push(CAR_MERGE_REF_VAR.into());
+        self.strip.push(CAR_CONVERGED_AT_VAR.into());
+        let Some(r) = merge_ref.and_then(resolvable_merge_ref) else {
+            return self;
+        };
+        self.env.push((CAR_MERGE_REF_VAR.into(), r.to_string()));
+        let dir = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        if let Some(at) = converged_at(&dir, r) {
+            self.env.push((CAR_CONVERGED_AT_VAR.into(), at));
+        }
+        self
+    }
+
     /// The hand door's shell: as the operator, in `cwd` when given.
     pub(crate) fn here(cwd: Option<&Path>) -> Self {
         Self {
@@ -217,12 +295,6 @@ fn running_as_root() -> bool {
         .output()
         .ok()
         .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-}
-
-/// As [`execute`], but in a stated directory — what `--recheck` uses to
-/// put the probe back where it was recorded.
-pub(crate) fn execute_in(probe: &str, cwd: Option<&Path>) -> Result<Outcome> {
-    execute_with(probe, &Shell::here(cwd))
 }
 
 /// Run `probe` in `shell` and capture everything it did.
@@ -451,6 +523,21 @@ pub(crate) fn failure_diagnosis(probe: &str, o: &Outcome) -> Option<String> {
     if o.exit == 0 {
         return None;
     }
+    if let Some(evidence) = quoting_was_mangled(probe, o) {
+        return Some(format!(
+            "THE PROBE'S QUOTING WAS MANGLED, so exit {exit} is not a verdict on the claim \
+             — the shell never ran the probe that was written. {evidence}\n  \
+             A stored probe carrying `\\\"` was escaped on the way in: the backslash-quotes \
+             reach the tool as literal characters, so the words of a pattern become \
+             filenames and the guard arm meant for \"nothing to judge yet\" catches the \
+             wreckage and exits {exit}. Re-store the probe with SINGLE quotes, or pass it \
+             through `--park-probe-file`, where no word expansion happens at all. Then \
+             re-run it: this says nothing about whether the change is in production \
+             (302bc2f2 — two cars sat unprovable for days this way, hourly rechecked, \
+             while both claims were already true on main).",
+            exit = o.exit,
+        ));
+    }
     if boss_jobs::probe::asserts_its_own_negation(probe) {
         let rewritten = match boss_jobs::probe::rewrites_its_exit_status(probe) {
             Some(n) => format!(
@@ -483,6 +570,19 @@ pub(crate) fn failure_diagnosis(probe: &str, o: &Outcome) -> Option<String> {
             exit = o.exit,
         ));
     }
+    if let Some(line) = quoting_mangled_its_arguments(&o.stderr) {
+        return Some(format!(
+            "THE PROBE'S QUOTING WAS MANGLED, so exit {exit} is not a verdict on the claim \
+             — a tool was handed a filename with a quote in it, which means the argument \
+             list was split somewhere the author did not intend. The tool said:\n  {line}\n  \
+             This is the backtick trap's cousin: prose damaged between authoring and \
+             storage. SINGLE-quote the probe when you pass it, or use the flag's `-file` \
+             twin, where no word expansion happens at all. Fix the probe and re-park — a \
+             recheck re-runs damaged text forever, and every run reports the probe's own \
+             not-yet sentence, which reads exactly like an honest wait (302bc2f2).",
+            exit = o.exit,
+        ));
+    }
     if o.stdout.trim().is_empty() && o.stderr.trim().is_empty() {
         let rewritten = match boss_jobs::probe::rewrites_its_exit_status(probe) {
             Some(n) => format!(
@@ -504,6 +604,61 @@ pub(crate) fn failure_diagnosis(probe: &str, o: &Outcome) -> Option<String> {
         ));
     }
     None
+}
+
+/// WHAT A TOOL SAYS WHEN THE PROBE'S OWN QUOTING REACHED IT LITERALLY
+/// (backlog 302bc2f2). A probe stored with backslash-quotes —
+/// `grep -c \"boss step complete\"` — hands grep the pattern `"boss`
+/// and then the FILENAMES `step` and `complete"`. grep warns about
+/// each, the substitution comes back non-numeric, and the probe's own
+/// guard arm catches it and exits 75. The record then says "not yet"
+/// in the probe's own words, which is the one answer nobody re-reads.
+///
+/// Measured 2026-09-20: two shed cars sat unprovable for days this
+/// way, hourly rechecked, while BOTH claims were already true on main.
+///
+/// THE SIGNAL IS DECIDABLE AND THE OBVIOUS ONE IS NOT. "No such file
+/// or directory" alone is a false positive — a probe that greps a file
+/// production has not written yet is an HONEST not-yet, and several in
+/// the shed are exactly that. Two signals distinguish them, and either
+/// is enough:
+///
+/// 1. The probe text carries a backslash-quote AND a tool reported a
+///    lookup failure. A correctly quoted probe cannot produce both.
+/// 2. The probe's own message arrives WRAPPED IN QUOTE CHARACTERS. A
+///    working `echo 'not yet: …'` never emits them; seeing them means
+///    the echo's quotes were literal, so every other quote in that
+///    probe was too.
+const LOOKUP_FAILURE_MARKERS: [&str; 2] = ["No such file or directory", "cannot open"];
+
+/// A literal backslash followed by a quote, as it appears in a stored
+/// probe whose quoting was escaped on the way in.
+const ESCAPED_QUOTE: &str = "\\\"";
+
+/// Did the shell read this probe as something other than what it says?
+/// `None` when the probe ran as written — including every honest
+/// not-yet. See [`LOOKUP_FAILURE_MARKERS`] for why the two signals are
+/// what they are.
+pub(crate) fn quoting_was_mangled(probe: &str, o: &Outcome) -> Option<String> {
+    let lookup_failed = o
+        .stderr
+        .lines()
+        .chain(o.stdout.lines())
+        .find(|l| LOOKUP_FAILURE_MARKERS.iter().any(|m| l.contains(m)))
+        .map(str::trim);
+    let said_in_quotes = what_it_said(o).filter(|l| l.starts_with('"'));
+
+    let evidence = match (lookup_failed, &said_in_quotes) {
+        (Some(line), _) if probe.contains(ESCAPED_QUOTE) => {
+            format!("a tool could not find what it was handed:\n  {line}")
+        }
+        (_, Some(line)) => format!(
+            "the probe's own message arrived wrapped in quote characters, which a working \
+             `echo` never emits:\n  {line}"
+        ),
+        _ => return None,
+    };
+    Some(evidence)
 }
 
 /// WHAT BASH SAYS WHEN `[` OR `((` IS HANDED A NON-NUMBER (backlog
@@ -529,6 +684,51 @@ pub(crate) fn crashed_comparing_a_non_number(stderr: &str) -> Option<&str> {
         .lines()
         .map(str::trim)
         .find(|line| NUMERIC_CRASH_MARKERS.iter().any(|m| line.contains(m)))
+}
+
+/// WHAT A TOOL SAYS WHEN THE PROBE'S QUOTING WAS MANGLED (backlog
+/// 302bc2f2). Car c4c1ac17's stored probe carried backslash-escaped
+/// quotes, so `grep -c \"boss step complete\"` ran with `\"boss` as the
+/// pattern and `step` and `complete"` as FILENAMES. grep warned about
+/// each, exited 2, and the probe's own `case` arm turned that into exit
+/// 75 — the one answer nobody re-reads. The claim was already true on
+/// main; the car sat unproven for days over its own text, and the
+/// hourly recheck re-ran it forever, each run printing the same
+/// reassuring sentence.
+///
+/// THE RULE IS NARROW ON PURPOSE, and the narrowness is the whole
+/// design. "No such file or directory" ALONE is not evidence of damage:
+/// a probe that greps a file which has not landed on main yet says
+/// exactly that, and it is an honest not-yet. What is never honest is a
+/// missing operand whose NAME CARRIES A DOUBLE QUOTE — no probe reads a
+/// file called `complete"`, so the quote is the residue of an extra
+/// escaping layer between authoring and storage.
+///
+/// WHY NOT REFUSE THE TEXT AT THE DOOR INSTEAD. That was the first
+/// proposal and it is wrong, measured: of 254 stored probes, 71 carry a
+/// backslash-quote and nearly all are CORRECT — `grep -q "name =
+/// \"folded_into\""` is how sh writes a literal quote inside a quoted
+/// string. Restricting to a backslash-quote in unquoted context still
+/// flags two correct probes, both `case` patterns where `*\"x\"*` is the
+/// idiomatic way to match a literal quote. The text cannot tell the
+/// damage from the idiom; the RUN can, because only the damaged one
+/// makes a tool report a filename with a quote in it.
+///
+/// It fails toward NotProven with the cause attached, never toward a
+/// green, so the worst a false positive does is make a car look
+/// troubled — which is the direction CLAUDE.md asks this to fail.
+pub(crate) const MISSING_OPERAND_MARKERS: [&str; 3] =
+    ["No such file or directory", "cannot open", "can't open"];
+
+/// The first stderr line that names a missing operand whose name
+/// carries a double quote — the line the verdict quotes. `None` when
+/// nothing on stderr shows that shape, so an honestly-missing file
+/// keeps its not-yet.
+pub(crate) fn quoting_mangled_its_arguments(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains('"') && MISSING_OPERAND_MARKERS.iter().any(|m| line.contains(m)))
 }
 
 /// [`judge`], with the diagnosis attached when the record supports one.
@@ -656,7 +856,7 @@ pub(crate) fn not_yet_why(host: &str, said: &str) -> String {
     format!(
         "NOT YET: the probe ran on {host} and said the claim cannot be judged until \
          something happens — {said}. Not a verdict against the change; \
-         recheck-failing-probes-daily runs it again."
+         recheck-failing-probes-hourly runs it again."
     )
 }
 
@@ -906,13 +1106,28 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
     Admission { refusal, warnings }
 }
 
-/// THE THREE SHAPE WARNINGS, in the wording every door can use (the
+/// THE SIX SHAPE WARNINGS, in the wording every door can use (the
 /// prefix is the door's). All read the probe TEXT, like the two rules
 /// above them, and all are host-independent — so they are said at every
 /// door a human is standing at, `--from-car` or not. The third
 /// (0df3af1c) joined the first two for the same reason they exist: `[`
 /// exits 2 on a non-integer, so the shape fails CLOSED, and the one
-/// place its stderr has a reader is the terminal it is typed at.
+/// place its stderr has a reader is the terminal it is typed at. The
+/// fourth (a92571a6) is the same argument again: a cutoff dated from a
+/// moving HEAD answers 75 forever, never a false green.
+///
+/// THE FIFTH AND SIXTH (e7cf78c6) ARE WARNINGS ON A DIFFERENT ARGUMENT,
+/// and the difference is worth keeping in sight: a counted page and a
+/// grep for a bare name can both record a FALSE GREEN, which is the
+/// direction that made `reads_git_time_with_an_offset` a refusal. What
+/// keeps them here is decidability, not harmlessness. `limit=` is
+/// correct in most of the probes that carry it (16 of 49 measured pair
+/// it with `.total` already, and a page that is never counted is fine),
+/// and a grep for a mention is a legitimate claim the text cannot be
+/// told apart from the defect — so a refusal would fire on correct
+/// probes and earn a routine override, which is read by nobody
+/// (CLAUDE.md §Diagnosis). Both texts therefore SAY that they can fail
+/// open, because a warning is only worth what its reader does with it.
 pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
     let inverted = boss_jobs::probe::asserts_its_own_negation(probe).then(|| {
         format!(
@@ -954,7 +1169,60 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
              strands a car but never records a proof of nothing."
         )
     });
-    inverted.into_iter().chain(rewritten).chain(unguarded)
+    let moving = boss_jobs::probe::compares_against_a_moving_head(probe).map(|cmd| {
+        format!(
+            "THIS PROBE DATES ITS CUTOFF FROM A TARGET THAT MOVES — `{cmd}` reads the \
+             converged checkout's CURRENT head, which advances with every train (about 28 a \
+             day), so the claim quietly becomes 'this change worked more recently than any \
+             other change landed'. The car's change converged ONCE; an unrelated train \
+             landing afterwards is not evidence against it.\n  {evidence}\n  \
+             Date it from the car's own merge, which is fixed and handed to every recorded \
+             probe as `${var}` — absent only when the car has not converged here, which is \
+             what the guard reports:\n{recipe}\n  \
+             This is a warning, not a refusal: the shape fails CLOSED — a starved probe \
+             answers 75 (not yet), never a false green — but a car whose qualifying event \
+             is rarer than a train starves by construction, and a daily one is effectively \
+             unprovable.",
+            evidence = boss_jobs::probe::MOVING_HEAD_EVIDENCE,
+            var = CAR_CONVERGED_AT_VAR,
+            recipe = boss_jobs::probe::CAR_INSTANT_RECIPE,
+        )
+    });
+    let truncated = boss_jobs::probe::counts_a_page_it_may_not_have_read(probe).map(|token| {
+        format!(
+            "THIS PROBE COUNTS A PAGE IT MAY NOT HAVE READ — `{token}` asks the server for a \
+             PAGE, and a page answers in the same shape the whole list does: \
+             `{{\"data\":[…],\"total\":345}}` is a correct reply to a request for 300, and \
+             nothing in it says 45 rows were left behind. A count taken over that page is a \
+             count of a set the probe did not see.\n  {evidence}\n  \
+             UNLIKE THE THREE WARNINGS ABOVE, THIS SHAPE CAN FAIL OPEN: a probe that counts \
+             a page to assert an ABSENCE — no row since the cutoff matches the bad shape — \
+             records a false green when the row it wanted was in the tail. It is a warning \
+             and not a refusal only because `limit=` is right far more often than it is \
+             wrong and this is a coarse text scan, so read this one rather than skim it.",
+            evidence = boss_jobs::probe::TRUNCATED_PAGE_EVIDENCE,
+        )
+    });
+    let mention = boss_jobs::probe::greps_a_name_where_a_definition_is_meant(probe).map(|name| {
+        format!(
+            "THIS PROBE COUNTS A NAME WHERE A DEFINITION LOOKS LIKE WHAT IT MEANS — `{name}` \
+             matches every line that MENTIONS it, and the doc comment above a call site is \
+             such a line. The count is nonzero whether or not the thing was ever defined.\n  \
+             {evidence}\n  \
+             This is a warning, not a refusal, because the text cannot say which you meant: \
+             counting a mention is a legitimate claim (a call site exists, a literal is still \
+             in the config, a name was not removed). But when a definition WAS meant it fails \
+             OPEN — absent reads as present — so it is worth the ten seconds to check.",
+            evidence = boss_jobs::probe::MENTION_NOT_DEFINITION_EVIDENCE,
+        )
+    });
+    inverted
+        .into_iter()
+        .chain(rewritten)
+        .chain(unguarded)
+        .chain(moving)
+        .chain(truncated)
+        .chain(mention)
 }
 
 /// The override, resolved once: `None` when the flag was not given,
@@ -1589,7 +1857,7 @@ fn proven_metadata(
 // (infra/ops/verbs/run-car-probe.json), filed by the dispatcher rule
 // run-car-probes-on-train-arrived for every car aboard an arrived
 // train that recorded a probe at park time, and again by
-// recheck-failing-probes-daily for a car whose last run settled
+// recheck-failing-probes-hourly for a car whose last run settled
 // nothing. Until backlog 9f00a805 (consolidation H8, car 2) the verb
 // ran infra/forge/run-car-probe.sh — 482 lines of shell re-implementing
 // this file's judge, verdict and records, because the forge had no
@@ -1610,8 +1878,11 @@ fn proven_metadata(
 //     BOSS_SOR_USER (backlog 61085a9e — never this verb's own write
 //     actor, which is stripped), the reader's port table as
 //     BOSS_SOR_PORTS (design 28d2bed9, read as data from the checkout's
-//     infra/forge/sor-ports.env), and infra/forge/probe-bin first on
-//     PATH so `boss-sor-read` is the cheap thing to type;
+//     infra/forge/sor-ports.env), infra/forge/probe-bin first on
+//     PATH so `boss-sor-read` is the cheap thing to type, and the
+//     car's OWN converged instant (backlog a92571a6 — the fixed cutoff
+//     a dated claim compares against, since the checkout's HEAD moves
+//     with every train);
 //   - every outcome lands on the car: PROVEN completes `proven` with
 //     the proof record (and `proven_by`, which the yard reads); every
 //     other verdict — NOT YET, NOT RUN, NOT PROVEN — stamps
@@ -1630,27 +1901,24 @@ fn proven_metadata(
 /// (boss-policy-client::defaults) grants Read at Scope::All on every
 /// shipped resource and NO other action anywhere: verified by effect on
 /// the live deployment, a PATCH and a step PUT under it both answered
-/// 403 while every list read matched the operator's. The fact lives
-/// here and in the policy defaults, and
+/// 403 while every list read matched the operator's. The role is
+/// NAMED in `boss_core::roles` and DEFINED by the policy defaults, and
 /// `the_probes_reader_role_can_read_everything_and_write_nothing` holds
-/// them equal (CLAUDE.md §9a). The id is the one the credentials door
-/// already names for this reader (`boss_jobs::credentials`).
+/// them equal (CLAUDE.md §9a); this crate reads the name from core
+/// (`identity::READER_ROLE`) rather than spelling it again — until
+/// backlog d843abf2 (2026-09-19) it was a literal here, the second
+/// spelling the unidentified reader in identity.rs would have needed a
+/// third of. The id is the one the credentials door already names for
+/// this reader (`boss_jobs::credentials`).
 pub(crate) const READER_ACTOR: &str = "automation:run-car-probe-reader";
-pub(crate) const READER_ROLE: &str = "audit-readonly";
+pub(crate) use crate::identity::READER_ROLE;
 
 /// The `x-boss-user` header a recorded probe's reader sends —
-/// `boss-sor-read` puts it on the wire verbatim.
-pub(crate) fn reader_header(id: &str) -> String {
-    json!({
-        "id": id,
-        "role": READER_ROLE,
-        "access_tier": "auditor",
-        "territory_account_ids": [],
-        "direct_report_ids": [],
-        "department": "platform",
-    })
-    .to_string()
-}
+/// `boss-sor-read` puts it on the wire verbatim. One shape with the
+/// CLI's own unidentified read (identity.rs), because they are the
+/// same identity: a reader nobody-in-particular is, with the
+/// platform's own read role.
+pub(crate) use crate::identity::reader_header;
 
 /// The reader's port table, from `infra/forge/sor-ports.env` in the
 /// checkout the probe runs in: `name=port` lines, `#` comments and
@@ -1877,7 +2145,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         std::process::exit(REFUSED_EXIT);
     }
 
-    let shell = Shell::unattended(&base)?;
+    let shell = Shell::unattended(&base)?.with_car_instant(car_merge_ref(&car));
     println!("boss prove: {short}  $ {probe}");
     let o = execute_with(&probe, &shell)?;
     let at = now.to_rfc3339();
@@ -2065,10 +2333,15 @@ pub(crate) async fn run(
             );
         }
         println!("boss prove: re-running the recorded probe for {short}\n  $ {probe}");
-        let o = match rec.cwd.as_deref() {
-            Some(dir) if !dir.is_empty() => execute_in(&probe, Some(Path::new(dir)))?,
-            _ => execute(&probe)?,
-        };
+        // The recorded cwd, and the car's own converged instant read
+        // there — a re-run compares against the same fixed cutoff the
+        // unattended door hands over, or the claim means a different
+        // thing at each door (a92571a6).
+        let cwd = rec.cwd.as_deref().filter(|d| !d.is_empty());
+        let o = execute_with(
+            &probe,
+            &Shell::here(cwd.map(Path::new)).with_car_instant(car_merge_ref(car)),
+        )?;
         // THREE READINGS, and which record they are read against
         // decides the sentence: a PROOF that fails now has decayed; an
         // ATTEMPT was never a proof. --recheck writes nothing on any of
@@ -2189,7 +2462,10 @@ pub(crate) async fn run(
     };
 
     println!("boss prove: {short}  $ {probe}");
-    let o = execute(&probe)?;
+    let o = execute_with(
+        &probe,
+        &Shell::here(None).with_car_instant(car_merge_ref(car)),
+    )?;
     let at = now.to_rfc3339();
     match verdict(&probe, &o, expect.as_deref()) {
         Verdict::Proven => {}
@@ -2229,7 +2505,7 @@ pub(crate) async fn run(
         // change, so nothing is refused — and not a proof, so nothing
         // completes. What lands is the forge's record, from this door:
         // `proof_attempt{not_yet:true}` on the car, `proven` untouched,
-        // and the daily recheck (recheck-failing-probes-daily picks up
+        // and the hourly recheck (recheck-failing-probes-hourly picks up
         // any car carrying an attempt) runs it again. Exit 75, as the
         // probe did and as the forge does.
         Verdict::NotYet { said } => {
@@ -3483,6 +3759,87 @@ mod tests {
         assert!(e.contains("THE PROBE CRASHED"), "{e}");
     }
 
+    /// THE MEASURED c4c1ac17 STDERR (backlog 302bc2f2). Its stored probe
+    /// carried backslash-escaped quotes, so under sh `\"boss` was the
+    /// PATTERN and `step` and `complete"` were FILENAMES. grep warned
+    /// about both and exited 2, the probe's own `case` arm caught the
+    /// non-number and exited 75, and the runner read 75 as an honest
+    /// wait. `recheck-failing-probes-hourly` then re-ran a probe that
+    /// could never pass, hourly, each run producing the same reassuring
+    /// sentence. Nothing was ever judged about the claim — which was, as
+    /// it happens, already true on main.
+    const MANGLED_ARGS_STDERR: &str = "\
+ugrep: warning: step: No such file or directory\n\
+ugrep: warning: complete\": No such file or directory\n";
+
+    #[test]
+    fn a_probe_whose_quoting_was_mangled_is_not_read_as_an_honest_wait() {
+        // Exit 75 is the probe's own not-yet code, and that is the whole
+        // trap: this must NOT come back as NotYet.
+        let o = crashed(75, MANGLED_ARGS_STDERR);
+        let d = failure_diagnosis(NULL_COUNT_PROBE, &o)
+            .expect("a mangled argument list is diagnosable");
+        assert!(d.contains("QUOTING"), "the cause is named: {d}");
+        assert!(
+            d.contains("complete\": No such file or directory"),
+            "the stderr line is quoted, not pointed at: {d}"
+        );
+        assert!(!d.contains("not yet"), "a broken probe is not a wait: {d}");
+        // The verdict is the thing that mattered: 75 with a diagnosis is
+        // NotProven, so the shed renders it troubled instead of waiting.
+        assert!(
+            matches!(
+                verdict(NULL_COUNT_PROBE, &o, Some("x:ok")),
+                Verdict::NotProven(_)
+            ),
+            "exit 75 with mangled arguments must not read as NotYet"
+        );
+    }
+
+    /// Every phrasing a tool uses for a missing operand is the same
+    /// finding, not only the one measured — a fourth is a line in
+    /// `MISSING_OPERAND_MARKERS`, and this walks the list so the list is
+    /// what gets tested, at every exit code a `||` branch could turn it
+    /// into. The quote in the name is what makes each one damage rather
+    /// than a wait, so each marker is checked both ways.
+    #[test]
+    fn every_missing_operand_marker_is_damage_only_when_the_name_carries_a_quote() {
+        for marker in MISSING_OPERAND_MARKERS {
+            for exit in [1, 2, 75] {
+                let mangled = format!("grep: complete\": {marker}\n");
+                let d = failure_diagnosis(NULL_COUNT_PROBE, &crashed(exit, &mangled))
+                    .unwrap_or_else(|| panic!("{marker:?} at exit {exit} is mangled quoting"));
+                assert!(d.contains("QUOTING"), "{marker:?}: {d}");
+                let honest = format!("grep: newfile.txt: {marker}\n");
+                assert!(
+                    failure_diagnosis(NULL_COUNT_PROBE, &crashed(exit, &honest)).is_none(),
+                    "{marker:?} without a quote in the name is an honest wait"
+                );
+            }
+        }
+    }
+
+    /// The rule is narrow ON PURPOSE. A probe that greps a file which is
+    /// not on main yet is an HONEST not-yet, and its stderr says "No such
+    /// file or directory" too. What is never honest is a missing file
+    /// whose NAME carries a double quote: no probe greps such a file, so
+    /// the quote is the residue of an extra escaping layer.
+    #[test]
+    fn a_plainly_missing_file_is_still_an_honest_wait() {
+        let o = crashed(75, "grep: newfile.txt: No such file or directory\n");
+        assert!(
+            failure_diagnosis(NULL_COUNT_PROBE, &o).is_none(),
+            "a file that has simply not landed yet is not a mangled probe"
+        );
+        assert!(
+            matches!(
+                verdict(NULL_COUNT_PROBE, &o, Some("x:ok")),
+                Verdict::NotYet { .. }
+            ),
+            "and it still reads as the honest wait it is"
+        );
+    }
+
     /// Every message bash's `[` and `((` print for a non-number is a
     /// crash, not only the one measured. A fourth one is a line in
     /// `NUMERIC_CRASH_MARKERS`, and this test walks the list so the
@@ -3752,6 +4109,96 @@ mod tests {
     /// operator's machine recorded as a verdict about the claim. Now the
     /// probe runs behind the forge's own prelude here too, so a tool the
     /// PATH lacks is a finding on the record, not a red.
+    /// THE MANGLED-QUOTING CASE (backlog 302bc2f2, measured 2026-09-20).
+    /// Two shed cars carried a probe stored with LITERAL backslash-quotes,
+    /// so `grep -c \"boss step complete\"` made `step` and `complete\"`
+    /// FILENAMES. grep warned, the count came back non-numeric, the
+    /// `case` arm caught it, and the probe exited 75 with a sentence that
+    /// read exactly like an honest wait — hourly, for days, while both
+    /// claims were already TRUE on main.
+    #[test]
+    fn a_probe_whose_quoting_was_mangled_is_not_a_wait() {
+        let probe = concat!(
+            r#"n=$(echo hi | grep -c \"pub enum StepAction\" || true); "#,
+            r#"case ${n:-empty} in empty|*[!0-9]*) echo \"not yet: cannot read the file\"; "#,
+            "exit 75;; esac; echo ok"
+        );
+        let o = execute(probe).unwrap();
+        assert_eq!(o.exit, NOT_YET_EXIT, "the case arm catches it: {o:?}");
+
+        let d = failure_diagnosis(probe, &o)
+            .expect("a probe the shell could not read as written has no verdict to give");
+        assert!(d.starts_with("THE PROBE'S QUOTING WAS MANGLED"), "{d}");
+        assert!(
+            d.contains("--park-probe-file") || d.contains("single-quote"),
+            "the diagnosis names the repair: {d}"
+        );
+
+        // …and because a diagnosis exists, the not-yet arm cannot claim it.
+        assert!(
+            !matches!(verdict(probe, &o, Some("ok")), Verdict::NotYet { .. }),
+            "a mangled probe read as an honest wait is the whole defect: {o:?}"
+        );
+    }
+
+    /// THE SHED, AS IT ACTUALLY READ (backlog 302bc2f2, 2026-09-20).
+    /// These are the not-yet lines the thirteen cars awaiting proof
+    /// really recorded. Eleven are honest waits and ELEVEN OF THEM
+    /// carry a `\"` somewhere in their probe — inside a jq filter,
+    /// where it belongs — which is exactly why "the probe text contains
+    /// an escape" is the wrong detector and was my first, wrong count.
+    /// Not one of them may be diagnosed.
+    #[test]
+    fn the_honest_waits_the_shed_really_recorded_are_not_diagnosed() {
+        for said in [
+            "not yet: the newest run ed96b6e3 was dispatched before this car converged",
+            "not yet: no publish-github-pr request answered with an exit",
+            "not yet: no tenant.published in the audit tail; none lands until a publish",
+            "not yet: no build step nominated to the executor since convergence",
+            "not yet: no backlog-item filed by the rule carrying design 0e07ce64",
+            "not yet: no tag-release ops-request has been answered",
+            "not yet: no green after a red at the same head opened since convergence",
+            "not yet: no answered sweep-archive-branches request opened after convergence",
+            "not yet: no real prune since convergence",
+            "not yet: no sponsorship polled since convergence",
+            "not yet: no sponsorship packet opened since the change converged",
+        ] {
+            // A jq filter's own escaped quotes, which are correct and
+            // must not by themselves condemn the probe.
+            let probe = format!(
+                r#"row=$(printf '%s' "$body" | jq -r ".data[]|select(.k==\"x\")"); echo '{said}'; exit 75"#
+            );
+            let o = execute(&probe).unwrap();
+            assert_eq!(o.exit, NOT_YET_EXIT, "{said}");
+            assert!(
+                quoting_was_mangled(&probe, &o).is_none(),
+                "an honest wait was condemned: {said}\n{o:?}"
+            );
+            assert!(
+                matches!(verdict(&probe, &o, Some("token")), Verdict::NotYet { .. }),
+                "an honest wait must stay a wait: {said}"
+            );
+        }
+    }
+
+    /// The guard on the guard: a CORRECTLY quoted probe that says not-yet
+    /// keeps saying not-yet. Every honest wait in the shed looks like
+    /// this, and 9 of the 13 measured cars were exactly this.
+    #[test]
+    fn a_correctly_quoted_not_yet_is_still_a_wait() {
+        let probe = "echo 'not yet: no tag-release ops-request has been answered'; exit 75";
+        let o = execute(probe).unwrap();
+        assert_eq!(o.exit, NOT_YET_EXIT);
+        assert!(
+            failure_diagnosis(probe, &o).is_none(),
+            "a clean probe must not be diagnosed: {o:?}"
+        );
+        let Verdict::NotYet { said } = verdict(probe, &o, Some("token")) else {
+            panic!("an honest wait stays a wait: {o:?}")
+        };
+        assert!(said.contains("no tag-release"), "{said}");
+    }
+
     #[test]
     fn a_probe_naming_a_tool_the_path_lacks_did_not_run() {
         let stub = boss_testing::scratch::scratch_dir("prove-stub-path");
@@ -3998,6 +4445,192 @@ mod tests {
         assert_eq!(user["id"], READER_ACTOR);
         assert_eq!(user["role"], READER_ROLE);
         assert_eq!(user["access_tier"], "auditor");
+    }
+
+    /// THE CAR'S OWN CONVERGED INSTANT IS PART OF THAT PROMISE
+    /// (backlog a92571a6). A probe that needs a cutoff gets one that
+    /// does NOT move: the commit time of the car's own merge, read
+    /// from the checkout the probe runs in. A merge that is not in
+    /// this checkout hands over no instant at all — the honest not-yet
+    /// — and a ref that is not an object name is never handed to git.
+    #[test]
+    fn the_probe_is_handed_its_cars_own_converged_instant() {
+        let dir = boss_testing::scratch::scratch_dir("prove-car-instant");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", &dir.display().to_string()])
+                .args(args)
+                .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "@1700000000 +0000")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git runs");
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("f"), "x").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "-q", "-m", "landed"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let shell = Shell::here(Some(&dir)).with_car_instant(Some(&sha[..12]));
+        let at = |s: &Shell, k: &str| s.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            at(&shell, boss_jobs::probe::CAR_CONVERGED_AT_VAR).as_deref(),
+            Some("1700000000"),
+            "the merge's own commit time, in epoch seconds: {shell:?}"
+        );
+        assert_eq!(
+            at(&shell, boss_jobs::probe::CAR_MERGE_REF_VAR).as_deref(),
+            Some(&sha[..12])
+        );
+        // The probe sees it, and a stale one from the runner's own
+        // environment cannot reach it.
+        assert!(
+            shell
+                .strip
+                .iter()
+                .any(|n| n == boss_jobs::probe::CAR_CONVERGED_AT_VAR)
+        );
+        let o =
+            execute_with("printf '[%s]\\n' \"$BOSS_CAR_CONVERGED_AT\"", &shell).expect("bash runs");
+        assert!(o.stdout.contains("[1700000000]"), "{o:?}");
+
+        // A merge this checkout does not have: the ref rides, the
+        // instant does not, and the recipe's guard says not yet.
+        let absent = Shell::here(Some(&dir)).with_car_instant(Some("0123456789ab"));
+        assert_eq!(at(&absent, boss_jobs::probe::CAR_CONVERGED_AT_VAR), None);
+        assert_eq!(
+            at(&absent, boss_jobs::probe::CAR_MERGE_REF_VAR).as_deref(),
+            Some("0123456789ab")
+        );
+        // Not an object name — never handed to git, so neither rides.
+        for bad in ["--upload-pack=touch /tmp/x", "main", ""] {
+            let s = Shell::here(Some(&dir)).with_car_instant(Some(bad));
+            assert!(s.env.is_empty(), "{bad:?}: {s:?}");
+        }
+        assert!(
+            Shell::here(Some(&dir))
+                .with_car_instant(None)
+                .env
+                .is_empty()
+        );
+    }
+
+    /// AND THE CAR SAYS WHICH MERGE THAT WAS — the `merge_ref` the
+    /// conductor wrote on it, read the way every other door reads it.
+    #[test]
+    fn the_cars_merge_ref_is_read_off_its_metadata() {
+        let car = json!({"metadata": {"merge_ref": "ead63bba8aff"}});
+        assert_eq!(car_merge_ref(&car), Some("ead63bba8aff"));
+        assert_eq!(car_merge_ref(&json!({"metadata": {}})), None);
+        assert_eq!(
+            car_merge_ref(&json!({"metadata": {"merge_ref": "not-a-sha"}})),
+            None
+        );
+    }
+
+    /// THE STARVED CUTOFF IS SAID AT THE DOOR A BUILDER IS STANDING AT,
+    /// with the promised variable named (a92571a6). Car 372ac8fd's
+    /// recorded probe is the live instance.
+    #[test]
+    fn a_probe_that_dates_its_cutoff_from_head_is_warned_about() {
+        let probe = "c=$(git show HEAD:infra/cluster/dev-scratch-reclaim.sh | grep -c ls-remote); \
+                     since=$(git log -1 --format=%ct HEAD); \
+                     j=$(boss-sor-read '/api/jobs?kind=maintenance-dev-scratch-reclaim')";
+        let w: Vec<String> = shape_warnings(probe).collect();
+        let said = w
+            .iter()
+            .find(|w| w.contains("DATES ITS CUTOFF"))
+            .unwrap_or_else(|| panic!("{w:?}"));
+        assert!(
+            said.contains(boss_jobs::probe::CAR_CONVERGED_AT_VAR),
+            "{said}"
+        );
+        assert!(
+            said.contains(boss_jobs::probe::MOVING_HEAD_EVIDENCE),
+            "{said}"
+        );
+        assert!(said.contains("warning, not a refusal"), "{said}");
+        // The rewrite it names is not warned about in turn.
+        let fixed = "c=$(git show HEAD:infra/cluster/dev-scratch-reclaim.sh | grep -c ls-remote); \
+                     since=${BOSS_CAR_CONVERGED_AT}; \
+                     case ${since:-empty} in empty|*[!0-9]*) echo 'not yet'; exit 75;; esac";
+        assert!(
+            !shape_warnings(fixed).any(|w| w.contains("DATES ITS CUTOFF")),
+            "{:?}",
+            shape_warnings(fixed).collect::<Vec<_>>()
+        );
+    }
+
+    /// A LIMIT IS NOT A FILTER, SAID AT THE DOOR (e7cf78c6). Car
+    /// ead4a6ed's recorded probe is the live instance: 300 rows asked
+    /// of a list of 345, with the row it waited on in the tail.
+    #[test]
+    fn a_probe_that_counts_a_page_is_warned_about() {
+        let probe = "n=$(boss-sor-read '/api/jobs?kind=gate-run&limit=300' \
+                     | jq '[.data[] | select(.metadata.flake == true)] | length'); \
+                     [ \"$n\" -ge 1 ] && echo flake:seen";
+        let w: Vec<String> = shape_warnings(probe).collect();
+        let said = w
+            .iter()
+            .find(|w| w.contains("COUNTS A PAGE"))
+            .unwrap_or_else(|| panic!("{w:?}"));
+        assert!(said.contains("limit=300"), "{said}");
+        assert!(
+            said.contains(boss_jobs::probe::TRUNCATED_PAGE_EVIDENCE),
+            "{said}"
+        );
+        // It says which way it fails, because that is what its reader
+        // decides on.
+        assert!(said.contains("CAN FAIL OPEN"), "{said}");
+        // And the rewrite it names — one body, rows judged against the
+        // total — is not warned about in turn.
+        let fixed = "body=$(boss-sor-read '/api/jobs?kind=gate-run&limit=300'); \
+                     rows=$(printf '%s' \"$body\" | jq '.data | length'); \
+                     seen=$(printf '%s' \"$body\" | jq '.total'); \
+                     [ \"$rows\" -eq \"$seen\" ] || { echo 'not yet: the page is not the list'; exit 75; }";
+        assert!(
+            !shape_warnings(fixed).any(|w| w.contains("COUNTS A PAGE")),
+            "{:?}",
+            shape_warnings(fixed).collect::<Vec<_>>()
+        );
+    }
+
+    /// A MENTION IS NOT A DEFINITION, SAID AT THE SAME DOOR (e7cf78c6):
+    /// the bare name matched the doc comment, the count came back
+    /// nonzero, and nothing was defined.
+    #[test]
+    fn a_probe_that_greps_a_bare_name_is_warned_about() {
+        let probe = "c=$(git show HEAD:crates/core/boss-jobs/src/claims.rs \
+                     | grep -c in_flight_claims); \
+                     [ \"$c\" -ge 1 ] && echo claim:ok";
+        let w: Vec<String> = shape_warnings(probe).collect();
+        let said = w
+            .iter()
+            .find(|w| w.contains("COUNTS A NAME"))
+            .unwrap_or_else(|| panic!("{w:?}"));
+        assert!(said.contains("in_flight_claims"), "{said}");
+        assert!(
+            said.contains(boss_jobs::probe::MENTION_NOT_DEFINITION_EVIDENCE),
+            "{said}"
+        );
+        assert!(said.contains("warning, not a refusal"), "{said}");
+        // The quoted definition it names is not warned about in turn —
+        // the negative case that keeps this from warning about every
+        // grep there is.
+        let fixed = "c=$(git show HEAD:crates/core/boss-jobs/src/claims.rs \
+                     | grep -c 'pub fn in_flight_claims'); \
+                     [ \"$c\" -ge 1 ] && echo claim:ok";
+        assert!(
+            !shape_warnings(fixed).any(|w| w.contains("COUNTS A NAME")),
+            "{:?}",
+            shape_warnings(fixed).collect::<Vec<_>>()
+        );
     }
 
     /// AND THE STRIP IS REAL. The door's `env_remove` cannot be shown

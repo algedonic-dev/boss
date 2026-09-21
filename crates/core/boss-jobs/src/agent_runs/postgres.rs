@@ -69,18 +69,24 @@ pub(super) fn row_to_run(row: &sqlx::postgres::PgRow) -> Result<AgentRun, AgentR
             "agent_runs.outcome holds {outcome_str:?}, which is not success|failed|cancelled"
         ))
     })?;
-    // The split is optional and the total is not: a reporter with one
-    // number is a real reporter (see `TokenUsage`). A row that holds
-    // neither shape is a defect in whatever wrote it, and naming the
-    // row is what makes it findable.
-    let total_tokens: i64 = row.try_get("total_tokens").map_err(storage)?;
+    // Every one of the three columns is optional, and the three
+    // legal combinations are `TokenUsage`'s three shapes: a split, a
+    // bare total, or nothing at all — the row saying it holds no
+    // count, which is what NULL means here and never zero (backlog
+    // 65c9c05a). A row in no shape is a defect in whatever wrote it,
+    // and naming the row is what makes it findable. The column is
+    // wrapped in a second `Some` below because the ROW always states
+    // it: `Some(None)` is "this row says NULL", which `from_parts`
+    // reads as unreported, where a bare `None` would be a caller that
+    // never mentioned tokens and is refused.
+    let total_tokens: Option<i64> = row.try_get("total_tokens").map_err(storage)?;
     let input_tokens: Option<i64> = row.try_get("input_tokens").map_err(storage)?;
     let output_tokens: Option<i64> = row.try_get("output_tokens").map_err(storage)?;
     let run_id: String = row.try_get("run_id").map_err(storage)?;
     let tokens = TokenUsage::from_parts(
         input_tokens.map(|v| u64::try_from(v).unwrap_or(0)),
         output_tokens.map(|v| u64::try_from(v).unwrap_or(0)),
-        Some(u64::try_from(total_tokens).unwrap_or(0)),
+        Some(total_tokens.map(|v| u64::try_from(v).unwrap_or(0))),
     )
     .map_err(|e| {
         AgentRunError::Storage(format!(
@@ -150,14 +156,26 @@ fn agent_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredAgent, AgentRunErr
     })
 }
 
+/// The rate card's columns, spelled once: the recorder reads the card
+/// inside its transaction and the read endpoint reads it outside one,
+/// and a list that lived twice would drift the next time a column is
+/// added (CLAUDE.md §9a — `blended_input_share_ppm` was the next time).
+const CARD_COLUMNS: &str =
+    "model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, note, blended_input_share_ppm";
+
 fn card_row(row: &sqlx::postgres::PgRow) -> Result<RateCardRow, AgentRunError> {
     let input: i64 = row.try_get("input_usd_micros_per_mtok").map_err(storage)?;
     let output: i64 = row.try_get("output_usd_micros_per_mtok").map_err(storage)?;
+    // NULL is "this model declares no ratio", which leaves a total-only
+    // run unpriced — not a zero share, which would price every token at
+    // the output rate.
+    let share: Option<i64> = row.try_get("blended_input_share_ppm").map_err(storage)?;
     Ok(RateCardRow {
         model: row.try_get("model").map_err(storage)?,
         input_usd_micros_per_mtok: u64::try_from(input).unwrap_or(0),
         output_usd_micros_per_mtok: u64::try_from(output).unwrap_or(0),
         note: row.try_get("note").map_err(storage)?,
+        blended_input_share_ppm: share.map(|v| u64::try_from(v).unwrap_or(0)),
     })
 }
 
@@ -174,13 +192,10 @@ impl AgentRunLog for PgAgentRuns {
 
         // Price inside the transaction so the row names the card it was
         // actually priced against.
-        let card_rows = sqlx::query(
-            "SELECT model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, note \
-             FROM agent_rate_card",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage)?;
+        let card_rows = sqlx::query(&format!("SELECT {CARD_COLUMNS} FROM agent_rate_card"))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
         let card = card_rows
             .iter()
             .map(card_row)
@@ -257,11 +272,16 @@ impl AgentRunLog for PgAgentRuns {
             .bind(run.finished_at)
             .bind(run.outcome.as_str())
             .bind(run.error.as_deref())
-            // The total goes in as the ONE figure every run has; the
-            // split goes in beside it only when it was measured. The
-            // table's CHECK refuses a pair that disagrees, and the
-            // derivation here is why it never can.
-            .bind(i64::try_from(run.tokens.total()).unwrap_or(i64::MAX))
+            // The total when the run has one, NULL when it reported
+            // none; the split goes in beside it only when it was
+            // measured. The table's CHECKs refuse a pair that
+            // disagrees and a split with no total, and the derivation
+            // here is why neither can happen.
+            .bind(
+                run.tokens
+                    .total()
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+            )
             .bind(
                 run.tokens
                     .input()
@@ -343,10 +363,9 @@ impl AgentRunLog for PgAgentRuns {
     }
 
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError> {
-        let rows = sqlx::query(
-            "SELECT model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, note \
-             FROM agent_rate_card ORDER BY model",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {CARD_COLUMNS} FROM agent_rate_card ORDER BY model"
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(storage)?;

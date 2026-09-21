@@ -31,6 +31,7 @@ mod ops_request;
 mod orient;
 mod owner;
 mod park;
+mod prose;
 mod prove;
 mod publish;
 mod publish_requests;
@@ -266,6 +267,16 @@ enum Commands {
         /// refused here rather than at arrival.
         #[arg(long)]
         park_probe: Option<String>,
+        /// The probe, read from a FILE instead of argv — where no word
+        /// expansion happens at all. A probe is the one `--park-*`
+        /// value that is itself shell, so it is the one most damaged by
+        /// passing through a shell: backticks are substituted away, and
+        /// escaped quotes arrive literal, which makes a pattern's words
+        /// into filenames and exits the probe 75 saying "not yet" in
+        /// its own voice. Two cars sat unprovable for days that way
+        /// (302bc2f2) while both claims were already true on main.
+        #[arg(long, conflicts_with = "park_probe")]
+        park_probe_file: Option<std::path::PathBuf>,
         /// Auto-park: the string the probe must print for the claim to
         /// hold (`proof_expect` on the car). Required with --park-probe.
         /// Judged on the forge host, where the probe runs. Make it a
@@ -274,6 +285,10 @@ enum Commands {
         /// you mean and cannot pass on the wrong number.
         #[arg(long)]
         park_expect: Option<String>,
+        /// The expectation, read from a file — the twin of
+        /// `--park-probe-file`, for the same reason.
+        #[arg(long, conflicts_with = "park_expect")]
+        park_expect_file: Option<std::path::PathBuf>,
         /// Auto-park: for a change only an EVENT can prove (a stalled
         /// train, a red gate, an operator's cancel) — say which event
         /// and how to prove it when it fires. Recorded as `proof_event`;
@@ -406,6 +421,12 @@ enum Commands {
         /// The packet: its full uuid, 8+ characters of its id, or its
         /// branch. Omit it to print the invariants alone.
         packet: Option<String>,
+        /// Render for this profile instead of the one the step
+        /// declares — the lane's invariants and that profile's rules.
+        /// A brief is rendered FOR A PROFILE (c8faa7f3): with no
+        /// packet, or a step declaring none, it is `builder`.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Hand a protocol step to an agent, as a packet (design c87fb59b
     /// car 2): claims the step as you, opens an `agent-run` with the
@@ -426,8 +447,24 @@ enum Commands {
         from_hook: bool,
         /// The packet: its full uuid, 8+ characters of its id, or its
         /// branch. With --report, the RUN (the agent-run id `boss
-        /// dispatch` printed).
-        packet: String,
+        /// dispatch` printed). Omit it with --next, which takes the
+        /// packet from the queue instead.
+        #[arg(required_unless_present = "next")]
+        packet: Option<String>,
+        /// THE DURABLE INBOX (design 8382bbb2): take the first piece of
+        /// waiting work at --station and dispatch that, instead of a
+        /// packet named here. The queue is the record, so the work
+        /// outlives whatever put it there — a dispatch that lived in a
+        /// session orphaned fifteen runs when that session died on
+        /// 2026-09-19.
+        #[arg(long, requires = "station", conflicts_with_all = ["report", "from_hook", "step"])]
+        next: bool,
+        /// With --next: the station to pull from, e.g.
+        /// `a.platform-admin.opus-5-1m`. Named, never inferred: an
+        /// agents row's role and a station's role are two vocabularies,
+        /// and a guessed queue answers empty instead of erroring.
+        #[arg(long, requires = "next")]
+        station: Option<String>,
         /// The step's slug. Omit it when the packet is at exactly one.
         #[arg(long, conflicts_with = "report")]
         step: Option<String>,
@@ -454,9 +491,18 @@ enum Commands {
         #[arg(long, requires = "report")]
         spend_usd: Option<f64>,
         /// With --report: the token count — a total (761000) or the
-        /// input,output split (740000,21000); only a split is priced.
+        /// input,output split (740000,21000). A split is priced at the
+        /// card's two rates; a total at the model's declared blend, and
+        /// the record says which.
         #[arg(long, requires = "report")]
         tokens: Option<String>,
+        /// Dispatch anyway when a car carrying this packet's fix has
+        /// already MERGED (a7837d81). The refusal is not a guess about
+        /// the tree: it names the car, its branch and its merge. Force
+        /// it when the packet asks for more than that car carried —
+        /// and say what the rest is in the run's summary.
+        #[arg(long, conflicts_with_all = ["report", "next", "from_hook"])]
+        force: bool,
     },
     /// Where the IT department's work comes from — the input-channel
     /// mix (user-feedback vs monitoring/error-discovery), the algedonic
@@ -1136,6 +1182,15 @@ enum JobAction {
         /// Subject id (default bosspipeline; kind is always custom).
         #[arg(long)]
         subject_id: Option<String>,
+        /// Which lane this work came in through — RECORDED, not later
+        /// guessed from the title's words (c5dc81a1). Required of a
+        /// backlog-item; the refusal names the vocabulary. One of:
+        /// user-feedback, roadmap, design-resolution, review-finding,
+        /// telemetry/monitoring, pipeline-failure,
+        /// discovery-while-working, post-mortem, dependency/external,
+        /// scheduled.
+        #[arg(long, value_name = "LANE")]
+        channel: Option<String>,
     },
     /// Merge keys into a packet's metadata (null removes a key), then
     /// read it back and FAIL unless every key actually took — a 204
@@ -1364,16 +1419,33 @@ async fn main() -> Result<()> {
                 priority,
                 metadata,
                 subject_id,
-            } => job::file(&kind, &title, priority, metadata, subject_id).await,
+                channel,
+            } => job::file(&kind, &title, priority, metadata, subject_id, channel).await,
             JobAction::Patch { job, patch } => job::patch(&job, &patch).await,
         },
         Commands::Orient { all } => orient::run(all).await,
-        Commands::Brief { packet } => brief::run(packet).await,
+        Commands::Brief { packet, profile } => brief::run(packet, profile).await,
         Commands::Dispatch {
             from_hook: true,
             packet,
             ..
-        } => dispatch_hook::run(packet).await,
+        } => dispatch_hook::run(packet.unwrap_or_default()).await,
+        Commands::Dispatch {
+            next: true,
+            station,
+            model,
+            budget,
+            effort,
+            ..
+        } => {
+            dispatch::next(
+                station.expect("clap requires --station with --next"),
+                model,
+                budget,
+                effort,
+            )
+            .await
+        }
         Commands::Dispatch {
             from_hook: false,
             packet,
@@ -1385,7 +1457,10 @@ async fn main() -> Result<()> {
             summary,
             spend_usd,
             tokens,
+            force,
+            ..
         } => {
+            let packet = packet.expect("clap requires a packet without --next");
             if report {
                 dispatch::report(
                     packet,
@@ -1396,7 +1471,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
-                dispatch::run(packet, step, model, budget, effort).await
+                dispatch::run(packet, step, model, budget, effort, force).await
             }
         }
         Commands::Channels {
@@ -1498,7 +1573,9 @@ async fn main() -> Result<()> {
             park_no_item,
             park_after,
             park_probe,
+            park_probe_file,
             park_expect,
+            park_expect_file,
             park_proof_event,
             force_regate,
             stale_base_anyway,
@@ -1514,8 +1591,18 @@ async fn main() -> Result<()> {
                 partial_item: park_partial_item,
                 no_item: park_no_item,
                 boards_after: park_after,
-                probe: park_probe,
-                expect: park_expect,
+                probe: crate::prose::opt_text_or_file(
+                    "--park-probe",
+                    "--park-probe-file",
+                    park_probe,
+                    park_probe_file.as_deref(),
+                )?,
+                expect: crate::prose::opt_text_or_file(
+                    "--park-expect",
+                    "--park-expect-file",
+                    park_expect,
+                    park_expect_file.as_deref(),
+                )?,
                 proof_event: park_proof_event,
             };
             gate::run(
@@ -1796,6 +1883,53 @@ mod tests {
     #[test]
     fn command_tree_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The prose flags that carry a sentence have a shell-free twin,
+    /// and clap holds the pair exclusive and one-of. Prose through argv
+    /// has already been through word expansion, so a backticked word
+    /// inside double quotes reaches the record as a hole and no verb
+    /// can tell (backlog 2376b89e; see `crate::prose` for why the
+    /// obvious refusal points the wrong way). The file door is what
+    /// keeps the shell out of the path, as `--markdown-file` already
+    /// does for a design body.
+    #[test]
+    fn a_prose_flag_has_a_file_door() {
+        for (verb, args, text, file) in [
+            (
+                "triage",
+                vec!["boss", "triage", "abcd1234", "fixed"],
+                "--evidence",
+                "--evidence-file",
+            ),
+            (
+                "fold",
+                vec!["boss", "fold", "abcd1234"],
+                "--change",
+                "--change-file",
+            ),
+        ] {
+            // One of the pair is required.
+            assert!(
+                Cli::try_parse_from(args.clone()).is_err(),
+                "{verb} without {text} or {file} is refused"
+            );
+            // Either alone parses.
+            for flag in [text, file] {
+                let mut with = args.clone();
+                with.push(flag);
+                with.push("what was measured");
+                Cli::try_parse_from(with)
+                    .unwrap_or_else(|e| panic!("{verb} {flag} should parse: {e}"));
+            }
+            // Both together do not.
+            let mut both = args.clone();
+            both.extend([text, "inline", file, "docs/design/x.md"]);
+            assert!(
+                Cli::try_parse_from(both).is_err(),
+                "{verb} {text} and {file} are exclusive"
+            );
+        }
     }
 
     /// Every top-level verb resolves. This is the smoke contract for

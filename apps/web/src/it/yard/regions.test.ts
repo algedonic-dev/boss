@@ -37,6 +37,7 @@ const region = (over: Partial<Region> = {}): Region => ({
   state: 'clear',
   why: '3 cars parked',
   trend: trend(),
+  machines: [],
   ...over,
 });
 
@@ -69,6 +70,9 @@ describe('parseRegions — the payload, parsed once', () => {
       state: 'troubled',
       why: '1 bay holds a corpse — gate-run past its own deadline',
       trend: { metric: 'gate duration', unit: 'minutes', current: 11, previous: 9.5, samples: 20, previous_samples: 18 },
+      // A payload with no machinery list draws no glyphs — never
+      // invented idle ones (car 5, world-machines.test.ts).
+      machines: [],
     });
     // No bound on the wire (skip_serializing_if) reads as null, not 0.
     expect(m.regions[3]!.bound).toBeNull();
@@ -108,15 +112,18 @@ describe('the eight names are the server\'s, in map order', () => {
 });
 
 describe('floorHref — every card is a door to a floor that already exists', () => {
-  it('the six yard regions open the yard focused on their panel; receiving and marshalling open their own pages', () => {
+  it('every region opens the world zoomed into it — the six on their yard panel, the two queue boards on their board', () => {
     expect(floorHref('dock')).toBe('/it/yard/dock');
     expect(floorHref('gates')).toBe('/it/yard/gates');
     expect(floorHref('track')).toBe('/it/yard/track');
     expect(floorHref('shed')).toBe('/it/yard/shed');
     expect(floorHref('arrivals')).toBe('/it/yard/arrivals');
     expect(floorHref('garage')).toBe('/it/yard/garage');
-    expect(floorHref('receiving')).toBe('/it/operate/receiving');
-    expect(floorHref('marshalling')).toBe('/it/operate/marshalling');
+    // Car 4 of design d2154293: these two were the only cards that
+    // left the world. They no longer do — their board mounts under
+    // the zoomed territory, like every other floor.
+    expect(floorHref('receiving')).toBe('/it/yard/receiving');
+    expect(floorHref('marshalling')).toBe('/it/yard/marshalling');
   });
 
   it('a name this client does not know still opens the yard, never a dead link', () => {

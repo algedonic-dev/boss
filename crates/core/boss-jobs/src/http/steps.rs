@@ -5,6 +5,15 @@ use super::*;
 
 use axum::extract::Path;
 
+/// How deep the concurrency gate reads an actor's assignments when it
+/// counts its runs in flight (backlog 57c108c2). A limit is not a
+/// filter: truncation here could only UNDER-count, which under-refuses,
+/// so this sits far above any cap an `agents` row would plausibly
+/// declare — a bound of a thousand concurrent agent runs is not a
+/// bound. The query is one indexed lookup by assignee on the Pg
+/// adapter, run once per claim, and claims are rare.
+const IN_FLIGHT_SCAN_LIMIT: i64 = 1_000;
+
 /// The wire spelling of a step status, for messages the caller reads.
 /// Local rather than borrowed from the postgres adapter: an HTTP error
 /// string has no business depending on the storage layer, and the two
@@ -400,6 +409,32 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         && let Some(obj) = step.metadata.as_object_mut()
     {
         obj.insert(crate::human_only::KEY.into(), flag);
+    }
+
+    // AND SO IS THE RUN EDGE (b91a2103). `boss dispatch` writes
+    // `agent_run` onto the step it CLAIMS, and the delivery rule
+    // follows that edge from `step.done.<kind>` to land the run
+    // (dd6d44b7) — for an analyst run, which ships no car and files no
+    // gate-run, it is the ONLY thing that makes the run land. A
+    // completer that sends `metadata` without reading and merging
+    // erased it, and the failure was silent and delayed: the
+    // completion succeeded, the work was recorded correctly, and the
+    // run then died four hours later on the silence clock as though
+    // the agent had gone quiet. Losing it breaks something invisible,
+    // which is the same reason the two keys above are carried.
+    //
+    // Carried, not frozen: unlike `authority_role` this key is NOT
+    // stripped from the merge door, because a step re-claimed by a
+    // different run must name the run that now holds it — and
+    // `boss dispatch` writes the new id through that door right after
+    // the claim (the claim route itself never touches metadata), so a
+    // carried-forward value can never outlive the next dispatch. What
+    // survives here is OMISSION, nothing more.
+    if let Some(old_obj) = old.metadata.as_object()
+        && let Some(run) = old_obj.get(crate::agent_runs::EDGE_KEY).cloned()
+        && let Some(obj) = step.metadata.as_object_mut()
+    {
+        obj.insert(crate::agent_runs::EDGE_KEY.into(), run);
     }
 
     // A HUMAN-ONLY STEP REFUSES A NON-HUMAN ASSIGNEE (c17871fe). Checked
@@ -1450,14 +1485,13 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             )
                 .into_response();
         };
-        let row = match reg.get_active(station_name).await {
+        // Authored row first, then the projection — the SAME resolver
+        // the queue read uses (923b6571). A derived station was 404
+        // here and a queue there, so every `(role, model)` agent inbox
+        // rendered and could not be claimed from.
+        let row = match super::stations::station_by_name(&state, reg, station_name).await {
             Ok(s) => s,
-            Err(crate::stations::StationError::NotFound(msg)) => {
-                return (StatusCode::NOT_FOUND, msg).into_response();
-            }
-            Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
+            Err(r) => return r,
         };
         // Same binding as the queue read: "is this packet at MY
         // station" is the question a per-actor station asks, and an
@@ -1552,6 +1586,68 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
                 )
                     .into_response();
             }
+        }
+    }
+
+    // THE CONCURRENCY GATE (backlog 57c108c2, 2026-09-20). The
+    // reservation above measures the hour from `agent_runs`, which is
+    // written at FINISH — so a claimed-and-unreported run is priced at
+    // nothing and the money gate admits the next claim, and the next.
+    // A puller (`boss dispatch --next` on an interval) against the 47
+    // ready packets measured at `a.platform-admin.opus-5-1m` would
+    // have taken all 47 that way. This is the bound the money one
+    // cannot be: the actor's OPEN `agent-run` packets against its
+    // row's `max_concurrent_runs`. Under the cap nothing changes; a
+    // row declaring no cap bounds nothing, like an undeclared budget.
+    //
+    // IT COUNTED CLAIMED STEPS UNTIL c314921e, AND THE PROXY DEADLOCKED
+    // THE QUEUE. A backlog-item's `build` does not drain at the
+    // handback — it drains when its car closes, and a `ship-a-change`
+    // does not close until it is PROVEN in prod — so the bound measured
+    // the proof backlog. Measured at the jam, 2026-09-20: 7 of 6 in
+    // flight against an open-run population of ZERO, and one of the
+    // seven was a car whose own probe wanted a fresh dispatch, so the
+    // event that would have proven it was the event it forbade. The
+    // run is what the cap is named after; it is now what the cap reads.
+    // After the budget gate, because `BudgetDecision::decide` reports
+    // money before concurrency and the two doors keep that order.
+    if let Some(row) = agent_row.as_ref()
+        && crate::agent_budget::declares_an_agent_run(&old.metadata)
+        && let Some(cap) = row.max_concurrent_runs.and_then(|n| u32::try_from(n).ok())
+    {
+        // Every spelling of the actor: the registered id and the
+        // aliases that resolve to it (design 6fda05ae). The CAS
+        // rewrites an alias holder, but a step nominated before that
+        // landed still carries one, and missing those under-refuses.
+        let held_by: Vec<String> = std::iter::once(row.id.clone())
+            .chain(row.aliases.iter().cloned())
+            .collect();
+        // One read of the population itself: the open `agent-run`
+        // packets. A failed read REFUSES rather than admitting — an
+        // uncounted bound is not a bound, and the money gate above
+        // fails in the same direction.
+        let filter = JobFilter {
+            kind: Some(crate::agent_budget::RUN_KIND.to_string()),
+            status: Some(JobStatus::Open),
+            ..Default::default()
+        };
+        let open_runs = match state.jobs.list_jobs(&filter, IN_FLIGHT_SCAN_LIMIT, 0).await {
+            Ok((rows, _)) => rows,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "concurrency gate could not count {}'s runs in flight: {e}",
+                        row.id
+                    ),
+                )
+                    .into_response();
+            }
+        };
+        let in_flight = crate::agent_budget::in_flight_runs(&open_runs, &held_by);
+        let check = crate::agent_budget::Concurrency::measure(&row.id, Some(cap), in_flight);
+        if !check.decision.is_allowed() {
+            return (StatusCode::CONFLICT, Json(check.refusal_body())).into_response();
         }
     }
 

@@ -27,7 +27,6 @@ use boss_jobs::cadence::{CadenceRepository, CadenceRuleRow, InMemoryCadence};
 use boss_jobs::delivery::{DeliveryPolicyRepository, InMemoryDeliveryPolicy};
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::regions::REGIONS;
-use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{InMemoryJobs, JobsRepository};
 use boss_policy_client::types::{AccessTier, User};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
@@ -114,33 +113,26 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
         .seed(dock_station_row())
         .expect("seed the dock row");
     let state = JobsApiState {
-        jobs: jobs.clone(),
-        bus,
-        publisher: DomainPublisher::new(bus_dyn, "jobs"),
-        step_registry: Arc::new(StepRegistry::v1()),
-        policy: policy_client,
-        kind_registry: None,
-        plugin_registry: None,
-        job_edges: None,
         stations: Some(stations),
-        calendar: None,
-        subject_kinds: None,
-        subject_existence: None,
-        roster: None,
-        clock: Arc::new(boss_clock_client::FixedClockClient::new(
-            boss_clock_client::ClockNow {
-                now: t(NOW),
-                simulated: false,
-                epoch_start: None,
-                epoch_end: None,
-                paused: false,
-                restart_in_progress: false,
-                warp_factor: None,
-            },
-        )),
         cadence: Some(cadence),
         delivery: Some(delivery),
-        agent_budget: None,
+        ..JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            DomainPublisher::new(bus_dyn, "jobs"),
+            policy_client,
+            Arc::new(boss_clock_client::FixedClockClient::new(
+                boss_clock_client::ClockNow {
+                    now: t(NOW),
+                    simulated: false,
+                    epoch_start: None,
+                    epoch_end: None,
+                    paused: false,
+                    restart_in_progress: false,
+                    warp_factor: None,
+                },
+            )),
+        )
     };
     (router(state), jobs)
 }
@@ -357,4 +349,60 @@ async fn a_denied_caller_gets_an_empty_well_formed_map() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["regions"].as_array().unwrap().len(), 8);
     assert_eq!(region(&v, "track")["count"], 0);
+}
+
+/// THE HOST THAT ANSWERED NOTHING IS STILL DRAWN (backlog 49ed87b4).
+/// The runners used to be named only by the ops-requests they happened
+/// to have answered, so a host that died was drawn nowhere — and an
+/// absent glyph is indistinguishable from a runner that does not exist.
+/// This pins the read that closes it: the handler asks the ESTATE
+/// REGISTRY which hosts should have a runner, and each declared host
+/// stands in receiving whether or not it has said anything.
+#[tokio::test]
+async fn a_declared_runner_host_stands_on_the_map_with_no_request_of_its_own() {
+    let (app, jobs) = app();
+    seed(&jobs).await;
+    let node = |id: &str, roles: &[&str]| boss_jobs::port::EstateNodeInput {
+        id: id.to_string(),
+        label: id.to_string(),
+        address: "10.20.0.15".to_string(),
+        role: "forge".to_string(),
+        roles: roles.iter().map(|r| r.to_string()).collect(),
+        cpu: None,
+        memory_gb: None,
+        disk_gb: None,
+        notes: None,
+    };
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::Automation("estate-seed".into()),
+    );
+    jobs.declare_estate_nodes(
+        &[
+            node("forge", &[boss_jobs::regions::OPS_RUNNER_ROLE]),
+            node("w-1", &[]),
+        ],
+        &stamp,
+    )
+    .await
+    .expect("the declaration lands");
+
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let machines = region(&v, "receiving")["machines"].as_array().unwrap();
+    let ids: Vec<&str> = machines.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["runner:host:forge"],
+        "the declared host is drawn; a node that declares no runner is not invented"
+    );
+    assert_eq!(machines[0]["state"], "unknown");
+    assert!(
+        machines[0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("declares an ops-runner"),
+        "{}",
+        machines[0]["why"]
+    );
 }

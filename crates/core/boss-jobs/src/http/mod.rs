@@ -29,6 +29,7 @@ use crate::step_registry::StepRegistry;
 
 pub mod machine_gate;
 
+mod borders;
 mod census;
 mod jobs;
 mod kinds;
@@ -39,9 +40,11 @@ mod regions;
 mod sim_clock;
 mod stations;
 mod steps;
+pub mod tenant;
 mod terminal_report;
 mod yard;
 
+use borders::*;
 use census::*;
 use jobs::*;
 use kinds::*;
@@ -117,6 +120,14 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `/api/cadence/*` door is operator-only and a browser cannot reach
     /// it. `None` skips the predicate (tests / in-memory spike).
     pub cadence: Option<Arc<dyn crate::cadence::CadenceRepository>>,
+    /// The dispatcher's firing record (read-only here, backlog
+    /// b14afc48). The world map's borders name the machine that moves
+    /// each hop and say when it last fired; for the one hop a
+    /// dispatcher rule moves there was no record to read at all, so
+    /// the most automated border on the map could not prove it ran.
+    /// `None` → every dispatcher machine says the record could not be
+    /// read, which is the honest answer and never a quiet rail.
+    pub dispatcher_firings: Option<Arc<dyn crate::dispatcher_firings::DispatcherFiringsRepository>>,
     /// Delivery-policy registry (read-only here). Same reason as
     /// `cadence`: the yard status names the stall / red-train thresholds
     /// the conductor enforces, read from the live policy row rather than
@@ -129,6 +140,62 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// hour-window spend. `None` is a deployment without the two
     /// registries, where every claim is admitted exactly as before.
     pub agent_budget: Option<Arc<crate::agent_budget::BudgetDoor>>,
+}
+
+impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
+    /// The required ports wired, every optional one absent — the base
+    /// a test builds on (backlog 26a856d4).
+    ///
+    /// Use it as the tail of a functional-update literal and name only
+    /// the ports the test actually exercises:
+    ///
+    /// ```ignore
+    /// let state = JobsApiState {
+    ///     kind_registry: Some(kinds),
+    ///     ..JobsApiState::minimal(jobs, bus, publisher, policy, clock)
+    /// };
+    /// ```
+    ///
+    /// Why it exists: every optional dependency added to this struct
+    /// cost ~65 struct-literal edits, because each test spelled every
+    /// field. Car b14afc48 added one port and shipped 73 files, 63 of
+    /// them the one line `dispatcher_firings: None,` — which buried
+    /// the ten files that mattered. The next optional port is one line
+    /// here instead.
+    ///
+    /// The five parameters are the ports with no sensible absence:
+    /// without them the router cannot answer anything. `clock` is
+    /// among them deliberately — a defaulted wall clock would make a
+    /// test's time source implicit, and determinism is one of the five
+    /// correctness properties, not a convenience.
+    pub fn minimal(
+        jobs: Arc<R>,
+        bus: Arc<B>,
+        publisher: DomainPublisher,
+        policy: Arc<dyn PolicyClient>,
+        clock: Arc<dyn boss_clock_client::ClockClient>,
+    ) -> Self {
+        Self {
+            jobs,
+            bus,
+            publisher,
+            step_registry: Arc::new(crate::step_registry::StepRegistry::v1()),
+            policy,
+            clock,
+            kind_registry: None,
+            plugin_registry: None,
+            job_edges: None,
+            stations: None,
+            calendar: None,
+            subject_kinds: None,
+            subject_existence: None,
+            roster: None,
+            cadence: None,
+            dispatcher_firings: None,
+            delivery: None,
+            agent_budget: None,
+        }
+    }
 }
 
 /// `GET /api/jobs/job-edges` — the declared job-to-job link fields.
@@ -198,6 +265,13 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // pass as the status above so the map, the yard and `boss
         // orient` cannot disagree.
         .route("/api/yard/regions", get(yard_regions::<R, B>))
+        // The map's RAILS (design d2154293, car 2): one row per border
+        // between two regions — what crosses it and how fast, what is
+        // waiting to cross with each hold's reason, and the machine that
+        // moves it with its last-fired time. Same pass as the regions
+        // above; a border whose flow cannot be computed answers unknown,
+        // never zero.
+        .route("/api/yard/borders", get(yard_borders::<R, B>))
         .route("/api/jobs", get(list_jobs::<R, B>))
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
@@ -210,6 +284,10 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
         .route("/api/jobs/{id}/convert", post(convert_job::<R, B>))
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
+        // The instance's hosting edit level, off the tenant manifest
+        // (a479faf7): the word the dispatch door and the gate's
+        // a-car-stays-under-the-edit-level lint judge a change against.
+        .route("/api/tenant/edit-level", get(tenant::edit_level))
         // The tree's estate declaration (backlog ee368d0c): the
         // launcher publishes infra/estate/estate.toml on every start.
         .route(
@@ -491,7 +569,29 @@ pub(super) fn self_id(user: &boss_policy_client::User) -> Option<&str> {
 /// and the PUT had none, so a packet the operator closed by hand read
 /// as "no cycle time" beside its stamped neighbours (backlog
 /// a7a07ffb). A fact that lives three times gets one definition.
+///
+/// BOTH TIMING FACTS, since 2026-09-21, because collapsing `closed_at`
+/// left the column beside it un-collapsed at the very same three
+/// sites: the step-driven hooks set `closed_on` from the clock, and
+/// the status PUT took it FROM THE WIRE. A caller round-tripping a Job
+/// body — GET it, flip `status`, PUT it back — sends back the
+/// `closed_on: null` the GET handed them, and the server stored it.
+/// Measured: backlog-item ef74fc12 sat `closed` with no closing date
+/// from 2026-09-20T17:50:50Z, and the nightly conservation sweep
+/// failed on property C ("Closed jobs have closed_on") every run
+/// until it was corrected. One row in 157 closes that window, because
+/// it takes a full-body PUT — and permanent, because nothing
+/// re-derives the date afterwards.
+///
+/// The date is a BACKSTOP here, not an override: the step-driven sites
+/// anchor `closed_on` to the closing step's `completed_on` on purpose,
+/// so that a Job closed on the sim calendar dates by that calendar
+/// rather than by wall-clock. This fills the gap only when nobody
+/// upstream had a better answer, which is exactly the PUT's case.
 pub(super) fn stamp_close_instant(job: &mut Job, now: &chrono::DateTime<chrono::Utc>) {
+    if job.closed_on.is_none() {
+        job.closed_on = Some(now.date_naive());
+    }
     if let serde_json::Value::Object(map) = &mut job.metadata {
         map.entry("closed_at")
             .or_insert_with(|| serde_json::json!(now.to_rfc3339()));

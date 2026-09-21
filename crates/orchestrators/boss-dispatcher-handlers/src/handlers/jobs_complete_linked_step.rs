@@ -126,7 +126,56 @@
 //!   backlog-item naming the verb, the request and the line is filed
 //!   to the platform owner through the door every alarm handler uses.
 //!   One alert per failed request (`for_request` dedups while open).
-//!   Without the arg, v5's answer stands.
+//!
+//! ## The mode is the DEFAULT (v7, f47861a5)
+//!
+//! v6 shipped it opt-in, and opt-in covered the two rules whose author
+//! had just watched the silence — and no other. The release rule
+//! (`complete-release-tag-on-tag-release-answered`, landed the day
+//! before) names no mode, so a `tag-release` that ran and FAILED
+//! matched no answer line, wrote v5's dead-link note on both ends, and
+//! left the release packet's `tag` step `ready` with nothing on it: the
+//! measured shape of this packet on another verb, another protocol and
+//! another step. A behaviour every rule author must remember to ask for
+//! is the defect (CLAUDE.md §9a), and the default that makes a failure
+//! loud is the one to make free. So `on_failure` is now an OPT-OUT: a
+//! rule whose linked step is genuinely not troubled by its verb failing
+//! writes `on_failure = "note"` and gets v5's answer; everything else,
+//! including every rule written from here on, troubles the step it
+//! would have completed. Only a closing packet with an `execute` step
+//! recording a non-zero exit is a failure at all, so the rules that
+//! react to a car, a gate-run or a design are untouched.
+//!
+//! ## Where the edge LIVES (v7, dd6d44b7)
+//!
+//! Every version above reads the link off the closing packet's JOB
+//! metadata, which is where a car declares its `backlog_item` and
+//! where `boss gate` stamps a gate-run's `agent_run`. One shape of
+//! edge cannot live there: the one that names which agent-run is
+//! executing a particular STEP. A packet hosts a run per step — the
+//! page march dispatches `measure` and `file` on the same page-audit —
+//! so a single job-level key could not say which, and an analyst run
+//! (a measure, a draft, a judgement) ships no car and launches no
+//! gate, so neither landing rule can ever fire for it. Until this
+//! version every one of them needed a hand at the end, and roughly 94
+//! were queued behind the page march.
+//!
+//! - `link_from = "step"` — read `link` off the COMPLETING STEP's
+//!   metadata instead, which the `step.done.<kind>` payload already
+//!   carries whole (`boss-jobs`'s step-done builder puts the step's
+//!   `metadata` on the marker). `boss dispatch` writes the key there
+//!   at the claim, so the step says which run is executing it — a
+//!   fact, where the crew board's BUILDING lane used to infer one
+//!   from a branch with no gate-run behind it. Default `"job"`: every
+//!   rule authored before this names no `link_from` and is untouched.
+//!
+//! The edge is read BEFORE any request, because the rule that uses it
+//! rides `step.done.*` — every completed step in the system — and only
+//! a claimed one carries the key. Everything after that point is the
+//! same handler: the same guards in the same order, the same evidence,
+//! the same note on both ends. The evidence gains one field, the
+//! completing `step`, for the same reason the edge cannot be
+//! job-level.
 //!
 //! ## Idempotence
 //!
@@ -408,6 +457,68 @@ pub(crate) fn step_by_slug<'a>(
         .find(|s| s.get("spec_slug").and_then(|v| v.as_str()) == Some(slug))
 }
 
+/// Which side of the triggering event holds the declared edge (v7,
+/// dd6d44b7). `Job` is every rule authored before it: the link is a
+/// key on the closing packet's job metadata. `Step` is the link on the
+/// step that just completed, which is the only place an edge naming
+/// one run of several on one packet can live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkFrom {
+    Job,
+    Step,
+}
+
+/// The words a rule file spells the two sources as.
+const LINK_FROM_JOB: &str = "job";
+const LINK_FROM_STEP: &str = "step";
+
+impl LinkFrom {
+    /// Absent is `Job` — the shape every rule before v7 authored.
+    /// Anything else is rule authoring, identical on every redelivery,
+    /// so it is `Permanent` rather than a silent fall back to the job
+    /// metadata: a rule that meant `step` and mis-spelled it would
+    /// otherwise complete nothing forever and say nothing about why.
+    fn from_args(args: &[(String, Value)]) -> Result<Self, HandlerError> {
+        match arg(args, "link_from") {
+            Some(Value::String(s)) if s == LINK_FROM_STEP => Ok(Self::Step),
+            Some(Value::String(s)) if s == LINK_FROM_JOB || s.is_empty() => Ok(Self::Job),
+            Some(Value::String(s)) => Err(HandlerError::Permanent(format!(
+                "link_from {s:?} is not a source this handler knows; the two are \
+                 {LINK_FROM_JOB:?} (the closing packet's metadata, the default) and \
+                 {LINK_FROM_STEP:?} (the completing step's)"
+            ))),
+            _ => Ok(Self::Job),
+        }
+    }
+}
+
+/// PURE over a `step.done.<kind>` payload: the edge the completing
+/// step declares, trimmed, or `None` when it declares none. The
+/// marker carries the step's whole `metadata`, so this needs no read.
+fn link_on_completing_step<'a>(payload: &'a serde_json::Value, link: &str) -> Option<&'a str> {
+    payload
+        .get("metadata")?
+        .get(link)?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// `unusable_link` as a filter: the id when it can name a Job, `None`
+/// with the warning already said when it cannot. One definition, used
+/// by both edge sources — a link that cannot name a Job is a skip, not
+/// a failure, because retrying a 400 costs eight deliveries and then
+/// drops the event for every OTHER handler on it.
+fn usable_link<'a>(id: &'a str, link: &str, rule: &str) -> Option<&'a str> {
+    match unusable_link(id) {
+        Some(why) => {
+            tracing::warn!(rule = %rule, link = %link, "{why}");
+            None
+        }
+        None => Some(id),
+    }
+}
+
 /// Can this string possibly name a Job, or is following it a wasted
 /// request that ends in a dead letter?
 ///
@@ -467,8 +578,10 @@ impl Handler for JobsCompleteLinkedStep {
             _ => DEFAULT_EVIDENCE_KEY,
         };
         // Parsed before any read: a bad regex is the same on every
-        // delivery, and dying on it after the reads wastes them.
+        // delivery, and dying on it after the reads wastes them. So is
+        // a `link_from` nobody spells.
         let answer = AnswerSpec::from_args(args)?;
+        let link_from = LinkFrom::from_args(args)?;
 
         // The `jobs.job.closed` payload carries the closing Job's id;
         // a `step.done.<kind>` marker carries the same Job under
@@ -484,6 +597,25 @@ impl Handler for JobsCompleteLinkedStep {
             .and_then(|v| v.as_str())
         else {
             return Ok(());
+        };
+
+        // A STEP-SOURCED EDGE IS READ BEFORE ANY REQUEST (v7). The
+        // rule that uses it rides `step.done.*` — every completed step
+        // in the system — and only a step `boss dispatch` claimed for
+        // a run carries the key, so a packet fetch here would be a
+        // cost paid on every step done for an obligation that exists
+        // on almost none of them. The marker carries the step's whole
+        // metadata, so there is nothing to fetch.
+        let step_link = match link_from {
+            LinkFrom::Step => {
+                match link_on_completing_step(&ctx.event_payload, link)
+                    .and_then(|id| usable_link(id, link, &ctx.rule_name))
+                {
+                    Some(id) => Some(id),
+                    None => return Ok(()),
+                }
+            }
+            LinkFrom::Job => None,
         };
 
         let closing = self.get_job(closing_id, &ctx.rule_name).await?;
@@ -502,22 +634,21 @@ impl Handler for JobsCompleteLinkedStep {
         // free-text case: a car whose motivating item is named only in
         // `backlog_text` prose, or one filed against nothing at all.
         // Both ship exactly as before.
-        let Some(target_id) = closing_meta
-            .get(link)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(());
+        let target_id = match step_link {
+            Some(id) => id,
+            None => {
+                let Some(id) = closing_meta
+                    .get(link)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|id| usable_link(id, link, &ctx.rule_name))
+                else {
+                    return Ok(());
+                };
+                id
+            }
         };
-
-        // A link that cannot name a Job is a skip, not a failure —
-        // see `unusable_link`. Retrying a 400 costs eight deliveries
-        // and then drops the event for every handler on it.
-        if let Some(why) = unusable_link(target_id) {
-            tracing::warn!(rule = %ctx.rule_name, link = %link, "{why}");
-            return Ok(());
-        }
 
         let target = self.get_job(target_id, &ctx.rule_name).await?;
 
@@ -529,13 +660,13 @@ impl Handler for JobsCompleteLinkedStep {
             return Ok(());
         }
 
-        // THE FAILURE (v6, f47861a5). A verb that RAN and exited
-        // non-zero is an answered request — the outcome says the verb
-        // ran, the execute step says how it went — and a rule that
-        // asked for the failure mode gets it here, before the answer
-        // pattern is consulted: a FAILED verb has no answer line, and
-        // v5's "no line matched" note on both ends is what left the
-        // publish step ready and silent for five hours.
+        // THE FAILURE (v6, f47861a5; the default since v7). A verb that
+        // RAN and exited non-zero is an answered request — the outcome
+        // says the verb ran, the execute step says how it went — and
+        // the failure mode is read here, before the answer pattern is
+        // consulted: a FAILED verb has no answer line, and v5's "no
+        // line matched" note on both ends is what left the publish step
+        // ready and silent for five hours.
         if let (Some(OnFailure::AnnotateAndAlert), Some(failure)) =
             (answer.on_failure, verb_failure(&closing))
         {
@@ -746,23 +877,29 @@ struct Shipped {
 struct AnswerSpec {
     verb: Option<String>,
     pattern: Option<regex::Regex>,
-    /// What to do when the closing packet's verb FAILED (v6) — `None`
-    /// keeps v5's answer: a failed verb has no answer line, and the
-    /// noop note lands on both ends.
+    /// What to do when the closing packet's verb FAILED (v6) — the
+    /// DEFAULT since v7, `None` only where a rule opted out.
     on_failure: Option<OnFailure>,
 }
 
-/// The one failure mode a rule may ask for (v6, f47861a5): the verb's
-/// last FAILED line is written onto the still-open step and an urgent
-/// backlog-item is filed for it. A second mode is a new variant here
-/// and a new word in `from_args`, never a string compared elsewhere.
+/// The failure mode (v6, f47861a5): the verb's last FAILED line is
+/// written onto the still-open step and an urgent backlog-item is
+/// filed for it. A second mode is a new variant here and a new word in
+/// `from_args`, never a string compared elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnFailure {
     AnnotateAndAlert,
 }
 
-/// The word a rule file spells the mode as.
+/// The word a rule file spells the mode as — the default, so a rule
+/// says it only to be explicit.
 const ANNOTATE_AND_ALERT: &str = "annotate-and-alert";
+
+/// The word a rule spells the OPT-OUT as: keep v5's dead-link note and
+/// leave the step alone. Nothing in the tree asks for it today; it
+/// exists so a rule whose linked step is genuinely not troubled by its
+/// verb failing can say so in one word instead of by silence.
+const NOTE: &str = "note";
 
 impl AnswerSpec {
     fn from_args(args: &[(String, Value)]) -> Result<Self, HandlerError> {
@@ -778,15 +915,28 @@ impl AnswerSpec {
             }
             _ => None,
         };
+        // THE MODE IS THE DEFAULT (v7, f47861a5). v6 made it opt-in,
+        // which covered the two rules whose author had just been burned
+        // and no other: the release rule (written a day earlier) still
+        // answered a FAILED tag-release with a noop note on both ends,
+        // leaving the release packet's `tag` step `ready` and silent —
+        // the same defect the mode exists to refuse, one verb over. A
+        // behaviour every rule must remember to ask for is the defect
+        // (CLAUDE.md §9a), so the rules stop asking and a rule that
+        // does not want it says `note`.
         let on_failure = match arg(args, "on_failure") {
-            Some(Value::String(s)) if s == ANNOTATE_AND_ALERT => Some(OnFailure::AnnotateAndAlert),
-            Some(Value::String(s)) if !s.is_empty() => {
-                // Rule authoring, identical on every redelivery.
+            None => Some(OnFailure::AnnotateAndAlert),
+            Some(Value::String(s)) if s.is_empty() || s == ANNOTATE_AND_ALERT => {
+                Some(OnFailure::AnnotateAndAlert)
+            }
+            Some(Value::String(s)) if s == NOTE => None,
+            // Rule authoring, identical on every redelivery.
+            Some(other) => {
                 return Err(HandlerError::Permanent(format!(
-                    "on_failure {s:?} is not a mode this handler knows; the one mode is {ANNOTATE_AND_ALERT:?}"
+                    "on_failure {other:?} is not a mode this handler knows; the modes are \
+                     {ANNOTATE_AND_ALERT:?} (the default) and {NOTE:?}"
                 )));
             }
-            _ => None,
         };
         Ok(Self {
             verb,
@@ -990,13 +1140,44 @@ pub(crate) struct VerbFailure {
 /// failed. One alert per failed request while it is open.
 pub(crate) const FOR_REQUEST: &str = "for_request";
 
+/// How a verb says it stopped, in the order the line is looked for:
+/// the forge verbs' `fail()` prints `FAILED — …` and their `refuse()`
+/// prints `REFUSED — …`. `REFUSED` earns a pass of its own rather than
+/// riding the last-line fallback because `refuse()` prints a SECOND
+/// line after the reason — `  Nothing was written.` — which the
+/// fallback would hand the alert: true, and not a verdict (CLAUDE.md
+/// §Diagnosis, a verdict must name what failed).
+const FAILURE_MARKERS: [&str; 2] = ["FAILED", "REFUSED"];
+
+/// The one exit that is non-zero and NOT a failure (53f54b3f):
+/// EX_TEMPFAIL, the estate's `not yet`. A verb that cannot answer YET
+/// says so and exits 75 without measuring or writing anything —
+/// `publish-drift` on a checkout behind the newest converged train
+/// (infra/gcp/publish-drift.sh), `publish-github-pr`'s `not_yet`,
+/// `install.sh` with no image in the registry, `checkout-lock` that
+/// never came — and the recorded-probe contract spells the same code
+/// the same way. A not-yet claims nothing, so there is nothing to
+/// trouble a step over and nothing to alert about; it takes the path a
+/// verb with no answer line already takes. Treating it as a failure
+/// would have filed an urgent packet on every converge that moved
+/// ahead of boss-gcp's checkout, which is most of them.
+pub(crate) const NOT_YET_EXIT: &str = "75";
+
 /// PURE over the closing packet: `Some` when its `execute` step records
-/// a non-zero `exit_code` — the ops-runner's record of a verb that RAN
-/// and failed (a refusal ran nothing and carries no exit, and closes
-/// `refused`, which no answered-rule fires on). The line is the LAST
-/// one containing `FAILED` (the forge verbs' `fail()` spelling), else
-/// the last non-empty line: the runner records both streams merged and
-/// a verb says why it stopped last. c98a782f's line was the 4th of 4.
+/// a non-zero `exit_code` other than [`NOT_YET_EXIT`] — the ops-runner's
+/// record of a verb that RAN and failed (a RUNNER refusal ran nothing,
+/// carries no exit, and closes `refused`, which no answered-rule fires
+/// on). The line is the last one carrying the first marker above that
+/// appears at all, else the last non-empty line: the runner records
+/// both streams merged and a verb says why it stopped last. c98a782f's
+/// line was the 4th of 4.
+///
+/// ONE definition of "the verb failed" for the whole answered-ops-
+/// request family (CLAUDE.md §9a): `jobs.complete_linked_step` troubles
+/// the step it would have completed, `ops.judge` refuses to chain the
+/// next verb off it, and `maintenance.sweep.judge` refuses to read a
+/// verdict out of it. A second notion of failure in any of the three
+/// is the fact that lives twice.
 pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
     let meta = step_by_slug(closing, super::ops_judge::REPORT_STEP)?.get("metadata")?;
     let exit = match meta.get("exit_code")? {
@@ -1004,18 +1185,76 @@ pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
         serde_json::Value::Number(n) => n.to_string(),
         _ => return None,
     };
-    if exit.is_empty() || exit == "0" {
+    if exit.is_empty() || exit == "0" || exit == NOT_YET_EXIT {
         return None;
     }
     let output = meta.get("output").and_then(|v| v.as_str()).unwrap_or("");
     let mut lines = output.lines().map(str::trim).filter(|l| !l.is_empty());
-    let line = lines
-        .clone()
-        .rfind(|l| l.contains("FAILED"))
+    let line = FAILURE_MARKERS
+        .iter()
+        .find_map(|marker| lines.clone().rfind(|l| l.contains(marker)))
         .or_else(|| lines.next_back())
         .unwrap_or("(no output recorded)")
         .to_string();
     Some(VerbFailure { exit, line })
+}
+
+#[cfg(test)]
+mod verb_failure_tests {
+    use super::*;
+
+    /// The answered request as the ops-runner completes it: the exit on
+    /// the EXECUTE step, under `exit_code`, and nowhere else. That is
+    /// the spelling every reader here takes — `boss ops --wait` reads
+    /// it, the step surface is fed from it — and since 50fede8b it is
+    /// the only one: the request-level `metadata.exit` the runner used
+    /// to write beside it was a second spelling nothing read.
+    fn answered(exit: &str, output: &str) -> serde_json::Value {
+        json!({
+            "id": "r", "kind": "ops-request", "status": "closed",
+            "metadata": { "verb": "publish-drift" },
+            "steps": [{
+                "id": "r-execute", "spec_slug": "execute", "status": "completed",
+                "metadata": { "disposition": "answered", "exit_code": exit, "output": output },
+            }],
+        })
+    }
+
+    #[test]
+    fn a_clean_exit_is_no_failure() {
+        assert_eq!(verb_failure(&answered("0", "all good\n")), None);
+    }
+
+    /// EX_TEMPFAIL (53f54b3f). `publish-drift` on a checkout behind the
+    /// newest converged train prints `not yet: …` and exits 75 having
+    /// measured nothing and written nothing — the hand `until --check
+    /// ok` wait, as a verdict. It is not a failure: nothing to trouble
+    /// a step over, nothing to alert about, and it happens on most
+    /// converges.
+    #[test]
+    fn a_not_yet_is_no_failure() {
+        let out = "publish-drift: not yet: checkout at cb053ed6, main at 4cb3d3a7 — nothing compared, nothing published\n";
+        assert_eq!(verb_failure(&answered(NOT_YET_EXIT, out)), None);
+    }
+
+    #[test]
+    fn a_verb_that_ran_and_failed_carries_its_exit_and_its_last_failed_line() {
+        let out = "publish-github-pr: pushing\npublish-github-pr: FAILED — remote rejected\n";
+        let f = verb_failure(&answered("1", out)).expect("exit 1 is a failure");
+        assert_eq!(f.exit, "1");
+        assert_eq!(f.line, "publish-github-pr: FAILED — remote rejected");
+    }
+
+    /// The runner records 124 when it kills a verb at its timeout — the
+    /// truncated-report case the judges must never read a verdict out
+    /// of, and the one with no FAILED line of its own.
+    #[test]
+    fn a_killed_verb_is_a_failure_and_its_last_line_says_so() {
+        let out = "disk-report: reading df\n\n[ops-runner: command killed at 300s timeout]\n";
+        let f = verb_failure(&answered("124", out)).expect("exit 124 is a failure");
+        assert_eq!(f.exit, "124");
+        assert_eq!(f.line, "[ops-runner: command killed at 300s timeout]");
+    }
 }
 
 /// PURE: the urgent packet one failed verb becomes — named after the
@@ -1225,11 +1464,7 @@ impl JobsCompleteLinkedStep {
                 .map(str::to_string),
             None => None,
         };
-        Shipped {
-            car: closing_id.to_string(),
-            branch: branch.unwrap_or("(no branch recorded)").to_string(),
-            title: title.to_string(),
-            evidence: json!({
+        let mut evidence = json!({
                 "car": closing_id,
                 "title": title,
                 // The car's BRANCH, from its metadata — not its
@@ -1250,7 +1485,21 @@ impl JobsCompleteLinkedStep {
                 "train": train_id,
                 "generation": generation,
                 "by_rule": ctx.rule_name,
-            }),
+        });
+        // WHICH STEP (v7, dd6d44b7). Present on a `step.done.<kind>`
+        // marker and absent on a Job close, and written only when the
+        // event carried it — a key that would be null on every Job
+        // close says nothing, while on a step-sourced edge it is the
+        // whole point: one packet hosts a run per step, so "the work
+        // you asked for was delivered" is only true of ONE of them.
+        if let Some(step_id) = ctx.event_payload.get("step_id").and_then(|v| v.as_str()) {
+            evidence["step"] = json!(step_id);
+        }
+        Shipped {
+            car: closing_id.to_string(),
+            branch: branch.unwrap_or("(no branch recorded)").to_string(),
+            title: title.to_string(),
+            evidence,
             answer: answer.clone(),
         }
     }
@@ -2610,6 +2859,239 @@ mod tests {
         assert_eq!(deployed_generation("deployed by hand"), None);
         assert_eq!(deployed_generation("main@"), None);
     }
+    // -----------------------------------------------------------------
+    // v7 (backlog dd6d44b7) — `link_from = "step"`: the edge on the
+    // COMPLETING STEP rather than on the closing packet's job metadata.
+    // -----------------------------------------------------------------
+
+    const RUN: &str = "55555555-5555-5555-5555-555555555555";
+    const MEASURE_STEP: &str = "66666666-6666-6666-6666-666666666666";
+
+    /// The `step.done.<kind>` marker jobs-api emits, in the shape
+    /// `crates/core/boss-jobs/src/http/steps.rs` builds it: the whole
+    /// step metadata under `metadata`, the packet under `job_id`.
+    fn step_done_marker(metadata: serde_json::Value) -> serde_json::Value {
+        json!({
+            "job_id": PACKET,
+            "step_id": MEASURE_STEP,
+            "kind": "task",
+            "subject_kind": "custom",
+            "subject_id": "bosspipeline",
+            "workflow_kind": "page-audit",
+            "completed_on": "2026-09-19",
+            "metadata": metadata,
+            "notify_on_done": false,
+            "spec_slug": "measure",
+        })
+    }
+
+    /// The packet an analyst run executed a step on: open, its
+    /// `measure` step completed and carrying the run `boss dispatch`
+    /// claimed it for.
+    fn executing_packet(step_metadata: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": PACKET,
+            "kind": "page-audit",
+            "title": "Page audit — /ux/support",
+            "status": "open",
+            "subject": { "subject_kind": "custom", "id": "bosspipeline" },
+            "metadata": {},
+            "steps": [
+                { "id": MEASURE_STEP, "spec_slug": "measure", "status": "completed",
+                  "metadata": step_metadata },
+                { "id": "s-file", "spec_slug": "file", "status": "ready", "metadata": {} },
+            ],
+        })
+    }
+
+    /// The run packet the edge names, at `building`.
+    fn run(building_status: &str) -> serde_json::Value {
+        json!({
+            "id": RUN,
+            "kind": "agent-run",
+            "title": "Agent run — measure on page-audit",
+            "status": "open",
+            "subject": { "subject_kind": "custom", "id": "bosspipeline" },
+            "metadata": { "packet": PACKET, "step": "measure" },
+            "steps": [
+                { "id": "r-claimed", "spec_slug": "claimed", "status": "completed",
+                  "metadata": {} },
+                { "id": "r-briefed", "spec_slug": "briefed", "status": "completed",
+                  "metadata": {} },
+                { "id": "r-building", "spec_slug": "building", "status": building_status,
+                  "metadata": { "authority_role": "platform-admin" } },
+                { "id": "r-reported", "spec_slug": "reported", "status": "pending",
+                  "metadata": {} },
+            ],
+        })
+    }
+
+    /// The rule row `agent-run-delivers-when-its-step-is-done` carries.
+    fn delivery_args() -> Vec<(String, Value)> {
+        vec![
+            ("link".to_string(), Value::String("agent_run".into())),
+            ("link_from".to_string(), Value::String("step".into())),
+            ("steps".to_string(), Value::String("building".into())),
+            (
+                "evidence_key".to_string(),
+                Value::String("delivered".into()),
+            ),
+            (
+                "done_metadata".to_string(),
+                Value::String(r#"{"result": "delivered"}"#.into()),
+            ),
+        ]
+    }
+
+    fn step_ctx(payload: serde_json::Value) -> InvocationContext {
+        InvocationContext {
+            rule_name: "agent-run-delivers-when-its-step-is-done".into(),
+            triggering_event_id: "evt-step-done-1".into(),
+            triggering_topic: "step.done.task".into(),
+            event_payload: payload,
+        }
+    }
+
+    /// THE REACHER. An analyst run's step completes on the packet it
+    /// was dispatched to; the edge `boss dispatch` wrote at the claim
+    /// is on that STEP (one packet hosts a run per step, so a single
+    /// job-level key could not name which), and the run's `building`
+    /// lands with `result = delivered`.
+    #[tokio::test]
+    async fn a_step_sourced_edge_delivers_the_run_that_executed_it() {
+        let (base, puts, patches) = mock_jobs(vec![
+            executing_packet(json!({ "agent_run": RUN })),
+            run("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(
+            &delivery_args(),
+            &step_ctx(step_done_marker(json!({ "agent_run": RUN }))),
+        )
+        .await
+        .expect("runs");
+
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "one step completed: {puts:?}");
+        let (step_id, body) = &puts[0];
+        assert_eq!(
+            step_id, "r-building",
+            "the RUN's building step, not the packet's"
+        );
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            body["metadata"]["result"], "delivered",
+            "the analyst ending the vocabulary admits (a9c6ed5b)"
+        );
+        assert_eq!(
+            body["metadata"]["authority_role"], "platform-admin",
+            "the step's own metadata is merged, never replaced"
+        );
+        assert_eq!(
+            body["metadata"]["delivered"]["step"], MEASURE_STEP,
+            "the evidence names WHICH step delivered — one packet hosts a run per step"
+        );
+        assert_eq!(body["metadata"]["delivered"]["car"], PACKET);
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "nothing to note: the obligation acted"
+        );
+    }
+
+    /// A step nobody dispatched a run for carries no key, and the
+    /// obligation costs NOTHING — the rule is on `step.done.*`, which
+    /// fires for every completed step in the system, so a packet fetch
+    /// per step done would be a cost with no obligation behind it. The
+    /// mock serves no Jobs at all: any read would 404 and fail here.
+    #[tokio::test]
+    async fn a_step_with_no_run_reads_nothing() {
+        let (base, puts, patches) = mock_jobs(vec![]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        for metadata in [
+            json!({}),
+            json!({ "agent_run": "" }),
+            json!({ "agent_run": "  " }),
+        ] {
+            h.invoke(&delivery_args(), &step_ctx(step_done_marker(metadata)))
+                .await
+                .expect("a step with no declared edge is not this rule's business");
+        }
+        assert!(puts.lock().unwrap().is_empty());
+        assert!(patches.lock().unwrap().is_empty());
+    }
+
+    /// ORDERING. A run whose `building` some other writer already
+    /// completed — the gate-green rule, the car-merged rule, the
+    /// silence clock, a hand — is guard 2's first return, silently.
+    /// This is what makes a fourth writer safe to add.
+    #[tokio::test]
+    async fn a_run_already_landed_is_a_silent_noop() {
+        let (base, puts, patches) = mock_jobs(vec![
+            executing_packet(json!({ "agent_run": RUN })),
+            run("completed"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(
+            &delivery_args(),
+            &step_ctx(step_done_marker(json!({ "agent_run": RUN }))),
+        )
+        .await
+        .expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a completed building is never re-completed"
+        );
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "and a redelivery says nothing — a warning per redelivery is one nobody reads"
+        );
+    }
+
+    /// An 8-character prefix on the step is skipped the way one on a
+    /// car is: a 400 no redelivery fixes, and dropping the event would
+    /// take every other handler's effect on it too.
+    #[tokio::test]
+    async fn an_unusable_step_edge_is_skipped() {
+        let (base, puts, _patches) = mock_jobs(vec![]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(
+            &delivery_args(),
+            &step_ctx(step_done_marker(json!({ "agent_run": "55555555" }))),
+        )
+        .await
+        .expect("skipped, not retried");
+        assert!(puts.lock().unwrap().is_empty());
+    }
+
+    /// Rule authoring, identical on every redelivery: a `link_from`
+    /// this handler does not know is a `Permanent` refusal naming the
+    /// two it does, never a silent fall back to the job metadata.
+    #[test]
+    fn an_unknown_link_source_is_refused() {
+        let mut a = delivery_args();
+        for (k, v) in a.iter_mut() {
+            if k == "link_from" {
+                *v = Value::String("packet".into());
+            }
+        }
+        let err = LinkFrom::from_args(&a).expect_err("refused");
+        assert!(matches!(err, HandlerError::Permanent(_)), "{err:?}");
+        let why = format!("{err:?}");
+        assert!(why.contains("step") && why.contains("job"), "{why}");
+    }
+
+    /// The default is the JOB metadata — every rule authored before v7
+    /// names no `link_from` and must be untouched by it.
+    #[test]
+    fn no_link_from_is_the_job_metadata() {
+        assert!(matches!(LinkFrom::from_args(&args()), Ok(LinkFrom::Job)));
+        assert!(matches!(
+            LinkFrom::from_args(&delivery_args()),
+            Ok(LinkFrom::Step)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2836,16 +3318,24 @@ mod answer_tests {
         assert!(patches.lock().unwrap().is_empty(), "nothing to note");
     }
 
-    /// A refused run is still an ANSWERED ops-request (the runner ran
-    /// the verb; the verb said no). Its output has no read-back line,
-    /// so the step stays the founder's and both packets say why.
+    /// A verb that SUCCEEDED and printed no line the pattern matches —
+    /// its output shape moved on, and nothing was read back. The step
+    /// stays the founder's and both packets say why (v5's answer,
+    /// which a clean exit keeps: the failure mode reads the exit, and
+    /// this one is 0).
+    ///
+    /// This case used to be spelled with a `REFUSED` output and exit 0,
+    /// which the verb cannot produce — `refuse()` exits 1 like `fail()`
+    /// does, so that request's step records exit 1 and v7 troubles the
+    /// release. The refusal is pinned there, in
+    /// tests/publish_pr_answer.rs, where a mock can take the alert.
     #[tokio::test]
-    async fn a_refused_tag_release_completes_nothing_and_says_so_on_both_ends() {
-        let refused = "tag-release: forge: no tag v1.2.3 on remote forgejo\n\
-                       tag-release: REFUSED — sha e4d5d9816d34 is not the merge commit of any of the 57 closed pr-train packets read\n\
-                       tag-release:   Nothing was written.\n";
+    async fn an_answer_with_no_read_back_line_completes_nothing_and_says_so_on_both_ends() {
+        let no_line = "tag-release: forge: no tag v1.2.3 on remote forgejo\n\
+                       tag-release: converged checkout: e4d5d98 resolves to e4d5d9816d34a1b2c3d4e5f60718293a4b5c6d7e\n\
+                       tag-release: done\n";
         let (base, puts, patches) = super::tests::mock_jobs(vec![
-            tag_release_request("tag-release", refused),
+            tag_release_request("tag-release", no_line),
             release_packet("ready"),
         ])
         .await;
