@@ -56,6 +56,11 @@
 # - Polls open ops-request Jobs whose metadata.host equals HOST_ID,
 #   exactly. A packet for a host with no runner is nobody's to guess
 #   at; it sits open and visibly unanswered.
+# - READS ITS OWN QUEUE before it walks it — depth and the oldest
+#   packet's wait — on one journal line per run, and writes what each
+#   answered request waited onto that request. The walk is serial and
+#   has no per-verb fairness, so this depth is the only real bound on
+#   raising any probe cadence further (backlog 1ffb3305).
 # - Executes with a wall-clock timeout (OPS_TIMEOUT, default 30s) and
 #   an output cap (OPS_OUTPUT_CAP, default 100KB); both truncations
 #   are LOUD — a marker line in the recorded output says what was cut.
@@ -63,10 +68,11 @@
 #   `PUT .../steps/{id}` swaps `metadata` wholesale, so sending only
 #   new keys silently wipes the rest, including `authority_role`
 #   (the boss-step.sh lesson).
-# - Writes the verb's exit onto the REQUEST's metadata (`exit`) before
-#   the step completes, so the `answered` close carries it where the
-#   yard and the rules read (f47861a5). `answered` means the verb ran;
-#   `exit` says how it went.
+# - Records the verb's exit ONCE, as `exit_code` on that step.
+#   `answered` means the verb ran; `exit_code` says how it went, and
+#   every reader — `boss ops --wait`, the answered-ops-request judges,
+#   the yard — takes it from there (50fede8b; see the merge door below
+#   for the request-level copy this replaced).
 # - A per-packet problem (refusal, missing step) never kills the loop;
 #   a transport failure to the SoR fails the unit loudly, systemd
 #   records it red, and the same loud-local-failure posture as the
@@ -158,6 +164,55 @@ mine=$(printf '%s' "$jobs_json" | jq -c --arg h "$HOST_ID" '
     | map(select(.status == "open" and (.metadata.host // "") == $h))')
 n=$(printf '%s' "$mine" | jq 'length')
 
+# THE READING, TAKEN BEFORE THE WALK (backlog 1ffb3305). This loop is
+# serial and has no per-verb fairness: a latency-sensitive verb waits
+# behind whatever is ahead of it in the same run, so a converge — the
+# verb that deploys a fix — waits behind however many run-car-probes
+# are in front of it. Measured 2026-09-19: run-car-probe was 171 of
+# the last 300 ops-requests against 42 converges, and its cadence went
+# daily to hourly the same day. Today's volumes are comfortable and
+# that is the point of measuring now: the depth is the only real bound
+# on raising a probe cadence further, and a queue whose depth nobody
+# reads is one that gets discovered at its worst moment, by a converge
+# that did not deploy when it should have. Per-verb fairness or a
+# priority lane is the larger change and waits for this reading to say
+# it is needed.
+#
+# One wait per packet, computed once here and carried into the walk —
+# a request's own wait rides its metadata below, so the series is a
+# jobs-API query rather than an ssh to read this journal. `opened_at`
+# is what the filer stamps; a packet without one has NO age and says
+# so, because `date -d ''` answers midnight rather than erroring and
+# would report a fresh packet as a decades-old wait
+# (crates/core/boss-jobs/src/probe.rs carries the same trap).
+now_s=$(date -u +%s)
+waitsf="$workdir/waits"
+: > "$waitsf"
+oldest_wait="-"
+while IFS= read -r ts; do
+    [ -n "$ts" ] || continue           # jq emits "-" for an absent stamp,
+    w="-"                              # so an empty line is only the
+    if [ "$ts" != "-" ]; then          # heredoc's own trailing newline.
+        t=$(date -u -d "$ts" +%s 2>/dev/null) || t=""
+        case ${t:-empty} in
+            empty | *[!0-9]*) ;;
+            *)
+                w=$((now_s - t))
+                [ "$w" -ge 0 ] || w=0  # a clock skew is not a negative wait
+                if [ "$oldest_wait" = "-" ] || [ "$w" -gt "$oldest_wait" ]; then
+                    oldest_wait="$w"
+                fi
+                ;;
+        esac
+    fi
+    printf '%s\n' "$w" >> "$waitsf"
+done <<TS
+$(printf '%s' "$mine" | jq -r '.[] | .metadata.opened_at // "-"')
+TS
+# EVERY run, depth zero included: a gauge that appears only when it is
+# non-zero cannot be told apart from a runner that stopped.
+echo "ops-runner: queue host=$HOST_ID depth=$n oldest_wait_s=$oldest_wait"
+
 if [ "$n" -eq 0 ]; then
     echo "ops-runner: no open ops-request for $HOST_ID"
     exit 0
@@ -168,6 +223,10 @@ i=0
 while [ "$i" -lt "$n" ]; do
     job=$(printf '%s' "$mine" | jq -c ".[$i]")
     i=$((i + 1))
+    # This packet's own wait, from the pass above — one line per
+    # packet, in order, so the index IS the line number. "-" when the
+    # packet carries no `opened_at`.
+    wait_s=$(sed -n "${i}p" "$waitsf")
     job_id=$(printf '%s' "$job" | jq -r '.id')
     short=$(printf '%s' "$job_id" | cut -c1-8)
 
@@ -334,27 +393,42 @@ ARGV
     payloadf="$workdir/payload"
     printf '%s' "$merged" | jq -c '{status: "completed", metadata: .}' > "$payloadf"
 
-    # THE EXIT RIDES THE REQUEST, not only the step (backlog f47861a5,
-    # measured 2026-09-19 on c98a782f): publish-github-pr printed FAILED
-    # and exited 1, this runner recorded `exit_code: "1"` on the step,
-    # the request closed `answered` — the verb RAN, which is all the
-    # outcome names — and nothing at the request level said so, so the
-    # yard drew it like any answered request and the publish step it was
-    # filed for sat ready for five hours. The verb's exit goes onto the
-    # request's own metadata through the merge door FIRST, so the close
-    # the step completion triggers is read with the exit already on it.
-    # A refusal ran nothing and carries none. A failed merge does not
-    # withhold the answer — the step completion below still lands — but
-    # it is counted, and the unit goes red for it.
+    # THE QUEUE READING RIDES THE REQUEST (1ffb3305): the depth this
+    # run faced, and what THIS request waited before the runner reached
+    # it. Both are facts about the queue, not about the verb, so they
+    # have no home on the execute step — and riding the merge door
+    # makes the depth a question the jobs API answers, which the
+    # journal line alone does not. (n10's sibling packet adds the
+    # verb's own duration; this is the wait BEFORE it, not the run.)
+    #
+    # THE VERB'S EXIT DOES NOT RIDE HERE (backlog 50fede8b). It used to:
+    # f47861a5 added `exit` beside the step's `exit_code` so a reader of
+    # the close would see it where the outcome is. Nothing ever read the
+    # copy — `boss ops --wait`, `verb_failure` (the whole answered-ops-
+    # request judge family) and the yard's shed and signals all read
+    # `exit_code` off the execute step, and a list read carries each
+    # row's steps, so a request-level reader never had to fetch them
+    # separately. Two spellings of one fact, written by one act and held
+    # equal by nothing, is what CLAUDE.md §9a refuses: the first writer
+    # to move one without the other (a retry, a hand correction, a
+    # second runner) hands a reader a stale exit. One spelling now:
+    # `exit_code`, on the step, written by the PUT below.
+    #
+    # A refusal ran nothing and waited in no queue this run answered,
+    # so it writes nothing here. A failed merge does not withhold the
+    # answer — the step completion below still lands — but it is
+    # counted, and the unit goes red for it.
     if [ "$disp" = "answered" ]; then
         exitf="$workdir/exit"
-        jq -cn --arg rc "$rc_str" '{exit: $rc}' > "$exitf"
+        jq -cn --arg w "$wait_s" --argjson d "$n" '
+            {queue_depth: $d}
+            + (if $w == "-" then {} else {queued_s: ($w | tonumber)} end)' > "$exitf"
         if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
                 ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
                 --data-binary @"$exitf" \
                 "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
-            echo "ops-runner: PATCH exit=$rc_str failed on $short — $patch_err" >&2
+            echo "ops-runner: PATCH queue_depth=$n failed on $short — $patch_err" >&2
             failed=$((failed + 1))
         fi
     fi

@@ -135,11 +135,15 @@ const ACTOR_VARS: [&str; 2] = ["BOSS_ACTOR", "BOSS_ACTOR_FILE"];
 /// classification of its subcommands, and the split runs by flag as
 /// often as by verb — but an actor: the probe's env names none
 /// (the unattended door hands it exactly `BOSS_JOBS_URL`,
-/// `BOSS_PROBE_NOTFOUND`, [`SOR_USER_VAR`], `BOSS_SOR_PORTS` and
+/// `BOSS_PROBE_NOTFOUND`, [`SOR_USER_VAR`], `BOSS_SOR_PORTS`,
+/// [`CAR_MERGE_REF_VAR`], [`CAR_CONVERGED_AT_VAR`] and
 /// `PATH`), and the CLI refuses an unnamed WRITE by its own rule while
 /// an unnamed READ goes out signed `operator:unidentified` under the
-/// header's platform-admin role — a whole-world read, not the
-/// header-less narrowed one 61085a9e measured. So the probe's TEXT is
+/// platform's own read role — `audit-readonly`, the one [`SOR_USER_VAR`]
+/// carries, full-width on every list and 403 on every write (backlog
+/// d843abf2; until 2026-09-19 it was the operator's platform-admin
+/// header) — not the header-less narrowed one 61085a9e measured. So
+/// the probe's TEXT is
 /// the only place an actor could come from, and a text that assigns
 /// one is refused naming the variable. A mention is not an assignment:
 /// the CLI's own refusal names `BOSS_ACTOR`, and a probe may grep for
@@ -644,11 +648,26 @@ pub fn reads_git_time_with_an_offset(probe: &str) -> Option<&'static str> {
 pub const GIT_TIME_WITH_AN_OFFSET: [&str; 6] =
     ["%cI", "%ci", "%aI", "%ai", "--date=iso", "--date=rfc"];
 
+/// THE REWRITE A DATED CLAIM TAKES, as a literal so the ONE copy can be
+/// `concat!`ed into [`GIT_TIME_STRING_EVIDENCE`] as well as stand on
+/// its own as [`CAR_INSTANT_RECIPE`] (CLAUDE.md §9a: a recipe that
+/// lived in two texts would drift, and this one is what a builder
+/// copies).
+macro_rules! car_instant_recipe {
+    () => {
+        "  since=${BOSS_CAR_CONVERGED_AT}\n  \
+case ${since:-empty} in empty|*[!0-9]*) echo 'not yet: this car has not converged here'; exit 75;; esac\n  \
+seen=$(date -u -d \"$ts\" +%s)\n  \
+[ \"$seen\" -gt \"$since\" ] && echo claim:ok"
+    };
+}
+
 /// The measured evidence for [`reads_git_time_with_an_offset`], in one
 /// copy, quoted by every door that refuses on it. The doors differ in
 /// what to do instead; they must not differ on what happened
 /// (CLAUDE.md §9a).
-pub const GIT_TIME_STRING_EVIDENCE: &str = "\
+pub const GIT_TIME_STRING_EVIDENCE: &str = concat!(
+    "\
 Measured 2026-09-18 (c0ac92b8, car 746a1fac): the arrival probe compared `git log \
 --format=%cI` — the train commit's committer date, which the conductor writes with a \
 -07:00 offset (2026-09-18T07:43:00-07:00) — against the audit tail's UTC timestamps as \
@@ -657,13 +676,13 @@ before the operator's act, saw a retire that predated the fix, and answered FAIL
 not-yet was true; the car stood red in the shed until an operator re-ran it. With the \
 offsets the other way round the same compare answers PASS for an event that never \
 happened.\n\
-Compare epochs, never ISO strings with mixed offsets:\n  \
-commit=$(git log -1 --format=%ct HEAD)\n  \
+Compare epochs, never ISO strings with mixed offsets — and date the cutoff from the car's \
+own converged instant, never from a HEAD that moves with every train (a92571a6):\n  \
 ts=$(boss-sor-read '/api/...' | jq -r '... // empty')\n  \
-[ -n \"$ts\" ] || { echo 'not yet: no <event> recorded'; exit 75; }\n  \
-seen=$(date -u -d \"$ts\" +%s)\n  \
-[ \"$seen\" -gt \"$commit\" ] && echo claim:ok\n\
-The empty guard comes FIRST: `date -d ''` answers today's midnight, not an error.";
+[ -n \"$ts\" ] || { echo 'not yet: no <event> recorded'; exit 75; }\n",
+    car_instant_recipe!(),
+    "\nThe empty guard comes FIRST: `date -d ''` answers today's midnight, not an error."
+);
 
 /// The rule id a door records when an operator overrides a refusal on
 /// it. Short, stable, and greppable across recorded proofs — an
@@ -673,6 +692,302 @@ pub const UNIDENTIFIED_RULE: &str = "reads-the-sor-unidentified";
 /// The rule id for [`reads_git_time_with_an_offset`], recorded the same
 /// way when overridden.
 pub const GIT_TIME_RULE: &str = "reads-git-time-with-an-offset";
+
+/// THE CAR'S OWN CONVERGENCE INSTANT, in epoch seconds — promised to
+/// every recorded probe by the doors that run one (`boss prove`, both
+/// unattended and by hand), resolved from the car's `merge_ref` in the
+/// checkout the probe runs in. FIXED: a car converges once, and the
+/// commit time of its own merge does not move afterwards.
+///
+/// A probe that needs "did the qualifying event happen after my change
+/// landed?" compares against this and nothing else. The variable is
+/// ABSENT when the car's merge is not in this checkout — which is the
+/// honest not-yet, and the reason the recipe guards it first.
+pub const CAR_CONVERGED_AT_VAR: &str = "BOSS_CAR_CONVERGED_AT";
+
+/// The merge commit [`CAR_CONVERGED_AT_VAR`] was read from, handed over
+/// beside it so a probe can name it in its own not-yet line.
+pub const CAR_MERGE_REF_VAR: &str = "BOSS_CAR_MERGE_REF";
+
+/// WHEN A PROBE DATES ITS CUTOFF FROM A TARGET THAT MOVES — the sixth
+/// shape, and a warning rather than a refusal because it fails CLOSED:
+/// the probe answers 75 (not yet) forever, never a false green.
+///
+/// THE DEFECT (backlog a92571a6, measured 2026-09-19). A probe of the
+/// common shape asks whether its qualifying event happened after the
+/// converged checkout's HEAD — `since=$(git log -1 --format=%ct HEAD)`
+/// — and the forge's checkout converges on main after EVERY train,
+/// about 28 a day. So the goalpost advances every ~50 minutes while
+/// the car sits, and the claim silently becomes "this change worked
+/// more recently than any other change landed", which is not what
+/// proven means. Car 372ac8fd answered not-yet twice with its event
+/// having fired both times, its message moving from a 2026-09-18T18:23
+/// packet to a 2026-09-19T08:52 one because HEAD had moved further
+/// each time. Worse for anything rarer than a train: car 1e7c5a98
+/// waits on a DAILY sweep and compared against a HEAD forty minutes
+/// old, so it is not slow to prove but effectively unprovable — any
+/// car whose qualifying event is less frequent than convergence is
+/// starved by construction.
+///
+/// Returns the offending command, as written. DELIBERATELY COARSE like
+/// its siblings: a segment that runs `git`, prints an epoch (`%ct`,
+/// `%at`, `--date=unix`) and names `HEAD` as a REVISION is reported.
+/// `git show HEAD:<path>` reads a file and is left alone — the "has my
+/// change converged?" leg of the same probe, which is correct.
+pub fn compares_against_a_moving_head(probe: &str) -> Option<&str> {
+    const EPOCH_FORMATS: [&str; 3] = ["%ct", "%at", "--date=unix"];
+    probe
+        .split(['|', '&', ';', '\n', '(', ')', '`', '{', '}'])
+        .map(str::trim)
+        .find(|segment| {
+            segment.contains("git")
+                && EPOCH_FORMATS.iter().any(|f| segment.contains(f))
+                && names_head_as_a_revision(segment)
+        })
+}
+
+/// Does this segment name `HEAD` as a revision rather than as the left
+/// half of a `HEAD:<path>` file read? The word must stand alone: not
+/// followed by `:`, and not part of a longer word (`AHEAD`, `HEADER`).
+fn names_head_as_a_revision(segment: &str) -> bool {
+    segment.match_indices("HEAD").any(|(i, _)| {
+        let before = segment[..i].chars().next_back();
+        let after = segment[i + 4..].chars().next();
+        before.is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            && after.is_none_or(|c| c != ':' && !c.is_alphanumeric() && c != '_')
+    })
+}
+
+/// The measured evidence for [`compares_against_a_moving_head`], in one
+/// copy, quoted by every door that says it (CLAUDE.md §9a).
+pub const MOVING_HEAD_EVIDENCE: &str = "\
+Measured 2026-09-19 (a92571a6), running six shed cars by hand on the forge: 3 of 3 \
+residual failures shared this root cause, and the frequency of the waited-on event \
+predicted it exactly — hourly races the goalpost, daily loses it, twice-daily loses it. \
+Two different cars reported the SAME cutoff instant, 2026-09-19T16:00:56, the converged \
+HEAD of a train that had landed minutes earlier and had nothing to do with either car.";
+
+/// The promised instant, guarded the way a missing number is guarded
+/// everywhere else — because a car whose merge is not in this checkout
+/// has not converged, and NOT YET is the true answer there.
+pub const CAR_INSTANT_RECIPE: &str = car_instant_recipe!();
+
+/// The measured evidence for [`counts_a_page_it_may_not_have_read`],
+/// in one copy, quoted by every door that says it (CLAUDE.md §9a).
+pub const TRUNCATED_PAGE_EVIDENCE: &str = "\
+Measured 2026-09-20 (e7cf78c6) across every recorded probe: 49 read a list with a page \
+size, and 33 of them never ask whether they saw all of it. Car ead4a6ed asked for 300 \
+rows against a live total of 345 and the one qualifying row sat in the unread tail, so \
+the probe could have answered not-yet forever while the event it waited on had already \
+happened; the ops-runner's queue gauge (2cfb4562) reads 100 the same way, and a depth of \
+exactly 100 cannot be told from at-least-100. Neither was found by a check. Both were \
+found because somebody happened to read the two numbers next to each other.\n\
+Take ONE body and judge the page against the list before counting anything in it:\n  \
+body=$(boss-sor-read '/api/jobs?kind=gate-run&limit=300')\n  \
+rows=$(printf '%s' \"$body\" | jq '.data | length'); seen=$(printf '%s' \"$body\" | jq '.total')\n  \
+case ${rows:-empty}/${seen:-empty} in *empty*) echo 'not yet: the read answered nothing'; exit 75;; esac\n  \
+[ \"$rows\" -eq \"$seen\" ] || { echo \"not yet: read $rows of $seen — widen the page\"; exit 75; }";
+
+/// The measured evidence for
+/// [`greps_a_name_where_a_definition_is_meant`], in one copy, quoted by
+/// every door that says it (CLAUDE.md §9a).
+pub const MENTION_NOT_DEFINITION_EVIDENCE: &str = "\
+Measured 2026-09-20 (e7cf78c6): a probe counted a bare identifier in a source file to \
+prove the function it names had landed, and matched the DOC COMMENT above the call site \
+instead of the definition — a nonzero count, a green proof, and nothing defined. grep is \
+line-based and a name appears on every line that mentions it: the import, the call, the \
+comment, the test, the changelog.\n\
+Quote what makes it a definition, keyword and all — 'pub fn <name>', 'pub const <NAME>', \
+'^<name>()' for a shell function — so the one line that defines it is the only line that \
+can match.";
+
+/// WHEN A PROBE COUNTS A PAGE IT MAY NOT HAVE READ — the seventh
+/// shape, and the first that can fail OPEN as well as closed.
+///
+/// THE DEFECT (backlog e7cf78c6, measured 2026-09-20 across all 49
+/// recorded probes that read a list: 33 never ask whether they saw all
+/// of it). `{"data":[…300 rows…],"total":345}` is a CORRECT response to
+/// a page request, and it is byte-identical in shape to the whole list,
+/// so a probe that counts the rows has silently answered a smaller
+/// question. Car ead4a6ed asked for 300 against a live total of 345
+/// with its one qualifying row in the unread tail: it could have said
+/// not-yet forever about an event that had already happened. The same
+/// read in the ops-runner's queue gauge (2cfb4562) reports 100 as the
+/// depth, where a depth of exactly 100 and a depth of "at least 100"
+/// are the same sentence.
+///
+/// Returns the page-size token as written, so the warning can name it.
+/// Three conditions, all required, and each one is there to keep a
+/// correct probe quiet:
+///
+/// - a `limit=` in QUERY POSITION (after `?` or `&`), because that is
+///   the read that can be truncated;
+/// - a COUNT taken client-side (`length`, `wc -l`, `grep -c`), because
+///   counting a set is the claim a partial set breaks — a probe that
+///   reads `limit=1 … .data[0].at` takes the newest row the server
+///   ordered for it and is correct;
+/// - and no mention of `total` anywhere, because the one body that
+///   carries both numbers is the fix, and a probe that names it has
+///   either done the comparison or is about to.
+///
+/// WARNING, NOT REFUSAL — and the argument is NOT its siblings'. This
+/// shape does not always fail closed: a probe asserting an ABSENCE over
+/// a truncated page ("no row since the cutoff matches the bad shape")
+/// records a false GREEN, which is the direction that made
+/// [`reads_git_time_with_an_offset`] a refusal. What keeps it a warning
+/// is decidability: `limit=` is right far more often than it is wrong
+/// (16 of the 49 measured probes pair it with `.total` already, and a
+/// page read with no count at all is correct), the scan is a coarse
+/// text match that cannot tell an API read from a `grep` for the
+/// literal string `limit=`, and a refusal that fires on a correct probe
+/// costs a builder a re-park and teaches them to route around the door.
+/// So it is said LOUDLY, at the two doors with a human in front of them
+/// — `boss gate --park-probe` and `boss prove` — where the cost of
+/// being wrong is one line read and ignored.
+pub fn counts_a_page_it_may_not_have_read(probe: &str) -> Option<&str> {
+    if has_word(probe, "total") || !counts_the_rows(probe) {
+        return None;
+    }
+    page_size_token(probe)
+}
+
+/// Does this text reduce rows to a NUMBER? The three spellings a probe
+/// uses: jq's `length`, `wc -l` over the lines, and `grep -c` over
+/// them.
+fn counts_the_rows(probe: &str) -> bool {
+    has_word(probe, "length") || probe.contains("wc -l") || probe.contains("grep -c")
+}
+
+/// The `limit=<n>` token in query position, as written. `?`/`&` in
+/// front is what separates a page request from the word appearing in
+/// prose or in a pattern.
+fn page_size_token(probe: &str) -> Option<&str> {
+    probe.match_indices("limit=").find_map(|(i, _)| {
+        let before = probe[..i].chars().next_back()?;
+        if before != '?' && before != '&' {
+            return None;
+        }
+        let rest = &probe[i + "limit=".len()..];
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        (digits > 0).then(|| &probe[i..i + "limit=".len() + digits])
+    })
+}
+
+/// WHEN A PROBE GREPS A NAME WHERE A DEFINITION IS MEANT — the eighth
+/// shape, and the one that fails OPEN in one direction only.
+///
+/// THE DEFECT (backlog e7cf78c6, measured 2026-09-20). A probe proved a
+/// function had landed with `grep -c <name>` over the source file, and
+/// matched the DOC COMMENT that names it rather than the definition —
+/// a nonzero count, a green proof, and nothing defined. grep is
+/// line-based and a name appears on every line that mentions it: the
+/// import, the call site, the comment above it, the test, the packet id
+/// in a changelog. The count cannot tell them apart; `pub fn <name>`
+/// can.
+///
+/// Returns the bare pattern, so the warning can say which grep to
+/// quote. Conditions, each one keeping a correct probe quiet:
+///
+/// - the pipeline reads a FILE (`git show`), because a definition is a
+///   thing a file has — a `grep -c` over an API body is a different
+///   claim and is left alone;
+/// - the grep JUDGES (`-c`, `-q`, `--count`, `--quiet`), because a grep
+///   whose output a human reads is not asserting anything;
+/// - and the pattern is a bare identifier with a lowercase letter in it
+///   and either an underscore or a capital — `in_flight_claims`,
+///   `navCatalog`. A phrase is already specific (`'integer
+///   expression'`), a SCREAMING_SNAKE name is nearly always a mention
+///   check (`BOSS_JOBS_URL`), and a pattern with punctuation in it
+///   (`ls-remote`, `^fn `) is not the shape at all.
+///
+/// WARNING, NOT REFUSAL, though this one lies in the false-GREEN
+/// direction only: a mention can make an absent definition read as
+/// present, never the reverse. The reason is that the text does not say
+/// which was meant. Counting a MENTION is a legitimate probe — that a
+/// call site exists, that a literal still appears in a config, that a
+/// name was NOT removed — and no scan can tell it from the defect, so a
+/// refusal here would fire on correct probes and would have to carry an
+/// override that becomes routine, which CLAUDE.md §Diagnosis says is
+/// read by nobody. The cheap true thing is to say it where the author
+/// is standing.
+pub fn greps_a_name_where_a_definition_is_meant(probe: &str) -> Option<&str> {
+    pipelines(probe).into_iter().find_map(|segment| {
+        segment
+            .contains("git show")
+            .then(|| judging_grep_patterns(segment))?
+            .into_iter()
+            .find_map(bare_identifier)
+    })
+}
+
+/// The pipelines in a probe: the text split where one command's output
+/// STOPS feeding the next — newline, `;`, `&&`, `||` — and deliberately
+/// not at `|`, which is the thing that joins `git show` to the `grep`
+/// reading it.
+fn pipelines(probe: &str) -> Vec<&str> {
+    probe
+        .split(['\n', ';'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .map(str::trim)
+        .collect()
+}
+
+/// The pattern of each grep in this segment that judges rather than
+/// prints: one per invocation, the first word that is not a flag.
+/// `grep -e <pattern>` lands on the same word, since the value of `-e`
+/// is exactly the pattern.
+fn judging_grep_patterns(segment: &str) -> Vec<&str> {
+    let mut patterns = Vec::new();
+    let mut words = segment.split_whitespace();
+    while let Some(w) = words.next() {
+        if w.rsplit('/').next() != Some("grep") {
+            continue;
+        }
+        let mut judges = false;
+        for word in words.by_ref() {
+            match word.strip_prefix('-') {
+                Some(flags) if !word.is_empty() && word != "-" => {
+                    judges = judges
+                        || match flags.strip_prefix('-') {
+                            Some(long) => long == "count" || long == "quiet",
+                            None => flags.contains('c') || flags.contains('q'),
+                        };
+                }
+                _ => {
+                    if judges {
+                        patterns.push(word);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    patterns
+}
+
+/// Is this grep pattern a bare NAME — the thing that matches its own
+/// mentions? Quotes come off first, and a pattern whose opening quote
+/// does not close in the same word is a phrase, not a name.
+fn bare_identifier(pattern: &str) -> Option<&str> {
+    // The substitution that wraps the pipeline leaves its bracket on
+    // the last word: `c=$(git show … | grep -c in_flight_claims)`. None
+    // of the three can be part of a name, so taking them off costs
+    // nothing and reading the word without them is the whole point.
+    let pattern = pattern.trim_matches(['(', ')', '`']);
+    let name = match pattern.chars().next()? {
+        q @ ('\'' | '"') => pattern
+            .strip_prefix(q)
+            .and_then(|rest| rest.strip_suffix(q))?,
+        _ => pattern,
+    };
+    let bare = name.len() >= 3 && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    let has_lower = name.chars().any(|c| c.is_lowercase());
+    let code_shaped = name.contains('_') || name.chars().any(|c| c.is_uppercase());
+    (bare && has_lower && code_shaped).then_some(name)
+}
 
 /// The override a door records when it ran a probe its own rule
 /// refused: which rule, and the operator's stated reason. Recorded in
@@ -696,6 +1011,19 @@ mod tests {
         assert!(
             tools.contains(&"kubectl"),
             "host-absent-tools.txt lost the tool f9304366 measured: {tools:?}"
+        );
+        // And the retirement holds. `boss` came off this list on
+        // 2026-09-18 when the forge's own converge started installing
+        // the CLI from the converged image (9f00a805 car 1), and a
+        // line that outlives the absence it recorded refuses correct
+        // probes for a fact that is no longer true. The builder rules
+        // now point AT this file rather than restating it (785dc91a),
+        // so this list is the only place the answer lives.
+        assert!(
+            !tools.contains(&"boss"),
+            "host-absent-tools.txt lists boss again — if that is a real \
+             measurement it needs its own dated entry, and the builder \
+             rules that point here need revisiting with it: {tools:?}"
         );
         for t in &tools {
             assert!(
@@ -784,7 +1112,8 @@ mod tests {
     /// A PROBE PROVES, IT DOES NOT ACT. The one thing that turns the
     /// forge's `boss` into a writer is an actor: the probe's env names
     /// none (the unattended prove door hands it exactly BOSS_JOBS_URL,
-    /// BOSS_PROBE_NOTFOUND, BOSS_SOR_USER, BOSS_SOR_PORTS and PATH), and
+    /// BOSS_PROBE_NOTFOUND, BOSS_SOR_USER, BOSS_SOR_PORTS, the car's own
+    /// BOSS_CAR_MERGE_REF and BOSS_CAR_CONVERGED_AT, and PATH), and
     /// the CLI refuses an unnamed write by its own rule
     /// (boss-cli identity.rs). So the probe's TEXT is the only place an
     /// actor could come from, and a text that spells one is refused
@@ -841,6 +1170,12 @@ mod tests {
             "test -n \"$BOSS_JOBS_URL\" && echo claim-ok",
             "boss-sor-read /api/yard/status | grep -q dock_depth",
             "curl -fsS -H \"x-boss-user: $BOSS_SOR_USER\" $BOSS_JOBS_URL/api/yard/status | grep -q x",
+            // The gateway reader sends no identity BY DESIGN and prints
+            // only the status (backlog 240e03f3): the narrowed-world
+            // defect this rule refuses is the direct port's, and the
+            // gateway answers a stranger 401, loudly — which is the
+            // fact such a probe asserts.
+            "s=$(boss-gateway-read /api/jobs); case \"$s\" in 401) echo gateway-401:ok;; *) echo \"gateway answered $s\"; exit 1;; esac",
         ] {
             assert_eq!(
                 reads_the_sor_unidentified(probe),
@@ -1253,11 +1588,11 @@ echo "ONE-HOME-FOR-A-DISPATCHER-RULE""#;
     #[test]
     fn a_probe_that_compares_epochs_is_not_reported() {
         for probe in [
-            "commit=$(git log -1 --format=%ct HEAD); \
+            "since=$BOSS_CAR_CONVERGED_AT; \
              ts=$(boss-sor-read '/api/audit?kind=class.retired&limit=1' | jq -r '.data[0].at // empty'); \
              [ -n \"$ts\" ] || { echo 'not yet: no retire recorded'; exit 75; }; \
              seen=$(date -u -d \"$ts\" +%s); \
-             [ \"$seen\" -gt \"$commit\" ] && echo retire:after-landing",
+             [ \"$seen\" -gt \"$since\" ] && echo retire:after-landing",
             "git log -1 --format=%at | grep -q . && echo claim:ok",
             "git log -1 --date=unix --format=%cd | grep -q . && echo claim:ok",
             "git show HEAD:infra/gate.sh | grep -c 'integer expression' && echo claim:ok",
@@ -1275,5 +1610,183 @@ echo "ONE-HOME-FOR-A-DISPATCHER-RULE""#;
         let r = override_record(UNIDENTIFIED_RULE, "measured: the header is supplied");
         assert_eq!(r["rule"], UNIDENTIFIED_RULE);
         assert_eq!(r["reason"], "measured: the header is supplied");
+    }
+
+    /// THE STARVED CUTOFF, NAMED WHERE IT IS STILL CHEAP (backlog
+    /// a92571a6). The idiom on three live cars dates the cutoff from
+    /// the converged checkout's CURRENT HEAD, which advances with every
+    /// train. The scan names the command and leaves the shapes beside
+    /// it alone: reading a FILE at HEAD says nothing about time, and a
+    /// cutoff taken from the promised variable is the fix itself.
+    #[test]
+    fn a_cutoff_dated_from_the_moving_head_is_named() {
+        let starved = "c=$(git show HEAD:infra/cluster/dev-scratch-reclaim.sh | grep -c ls-remote); \
+                       since=$(git log -1 --format=%ct HEAD); \
+                       ts=$(boss-sor-read '/api/jobs?kind=x' | jq -r '.data[0].at // empty')";
+        assert_eq!(
+            compares_against_a_moving_head(starved),
+            Some("git log -1 --format=%ct HEAD"),
+            "{starved}"
+        );
+        for probe in [
+            "git show -s --format=%ct HEAD~1 | cat",
+            "git log -1 --date=unix --format=%cd HEAD",
+        ] {
+            assert!(compares_against_a_moving_head(probe).is_some(), "{probe}");
+        }
+        for clean in [
+            "git show HEAD:infra/gate.sh | grep -c 'integer expression' && echo claim:ok",
+            "since=$BOSS_CAR_CONVERGED_AT; git log -1 --format=%ct $BOSS_CAR_MERGE_REF",
+            "boss-sor-read /api/yard/status | jq -e '.dock_depth == 1' >/dev/null",
+        ] {
+            assert_eq!(
+                compares_against_a_moving_head(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// AND THE CORPUS DOES NOT TEACH THE SHAPE IT WARNS ABOUT. The
+    /// git-date evidence every door quotes prescribed
+    /// `commit=$(git log -1 --format=%ct HEAD)` as its rewrite until
+    /// a92571a6 — the starved idiom, recommended in the one text a
+    /// builder reads while typing a probe.
+    #[test]
+    fn the_quoted_rewrite_does_not_date_its_cutoff_from_head() {
+        assert_eq!(
+            compares_against_a_moving_head(GIT_TIME_STRING_EVIDENCE),
+            None,
+            "{GIT_TIME_STRING_EVIDENCE}"
+        );
+        assert!(
+            GIT_TIME_STRING_EVIDENCE.contains(CAR_CONVERGED_AT_VAR),
+            "the rewrite names the promised instant"
+        );
+        assert_eq!(compares_against_a_moving_head(MOVING_HEAD_EVIDENCE), None);
+    }
+
+    /// A LIMIT IS NOT A FILTER (backlog e7cf78c6, measured 2026-09-20).
+    /// The shape is a page taken with `limit=` and then COUNTED
+    /// client-side, with nothing ever asking whether the page was the
+    /// whole list.
+    #[test]
+    fn a_counted_page_with_no_total_comparison_is_named() {
+        for (probe, token) in [
+            (
+                "n=$(boss-sor-read '/api/jobs?kind=gate-run&limit=300' | jq '[.data[] | select(.metadata.flake == true)] | length'); \
+                 [ \"$n\" -ge 1 ] && echo flake:seen",
+                "limit=300",
+            ),
+            (
+                "boss-sor-read \"/api/jobs?kind=ship-a-change&status=open&limit=100\" | jq '.data | length'",
+                "limit=100",
+            ),
+            (
+                "boss-sor-read '/api/stations/loading-dock/queue?limit=50' | jq -r '.data[].id' | grep -c . ",
+                "limit=50",
+            ),
+        ] {
+            assert_eq!(
+                counts_a_page_it_may_not_have_read(probe),
+                Some(token),
+                "{probe}"
+            );
+        }
+    }
+
+    /// The rewrite the warning names — one body, rows judged against
+    /// `.total` — is clean, and so are the two shapes beside it: a page
+    /// that is never counted, and a read with no page at all.
+    #[test]
+    fn a_page_judged_against_its_total_is_not_reported() {
+        for clean in [
+            "body=$(boss-sor-read '/api/jobs?kind=gate-run&limit=300'); \
+             rows=$(printf '%s' \"$body\" | jq '.data | length'); \
+             total=$(printf '%s' \"$body\" | jq '.total'); \
+             [ \"$rows\" -eq \"$total\" ] || { echo 'not yet: the page is not the list'; exit 75; }",
+            "boss-sor-read '/api/audit?kind=class.retired&limit=1' | jq -r '.data[0].at // empty'",
+            "boss-sor-read /api/yard/status | jq -e '.dock_depth == 1' >/dev/null && echo claim:ok",
+            "git show HEAD:infra/gate.sh | grep -c 'integer expression' && echo claim:ok",
+        ] {
+            assert_eq!(
+                counts_a_page_it_may_not_have_read(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// A MENTION IS NOT A DEFINITION (backlog e7cf78c6). A bare
+    /// identifier counted in a source file matches the doc comment that
+    /// names it, so the count is nonzero whether or not the thing was
+    /// ever defined.
+    #[test]
+    fn a_bare_identifier_counted_in_a_source_file_is_named() {
+        for (probe, pattern) in [
+            (
+                "c=$(git show HEAD:crates/core/boss-jobs/src/claims.rs | grep -c in_flight_claims); \
+                 [ \"$c\" -ge 1 ] && echo claim:ok",
+                "in_flight_claims",
+            ),
+            (
+                "git show HEAD:crates/core/boss-jobs/src/claims.rs | grep -c \"in_flight_claims\" ",
+                "in_flight_claims",
+            ),
+            (
+                "git show HEAD:apps/web/src/it/nav.ts | grep -q navCatalog && echo claim:ok",
+                "navCatalog",
+            ),
+        ] {
+            assert_eq!(
+                greps_a_name_where_a_definition_is_meant(probe),
+                Some(pattern),
+                "{probe}"
+            );
+        }
+    }
+
+    /// The rewrite the warning names — the definition quoted, keyword
+    /// and all — is clean, and so is every grep beside it: a phrase, a
+    /// SCREAMING_SNAKE name (a mention check is what that usually is),
+    /// a path-shaped pattern, and a grep over something that is not a
+    /// source file at all.
+    #[test]
+    fn a_quoted_definition_is_not_reported() {
+        for clean in [
+            "git show HEAD:crates/core/boss-jobs/src/claims.rs | grep -c 'pub fn in_flight_claims'",
+            "git show HEAD:infra/gate.sh | grep -c 'integer expression' && echo claim:ok",
+            "git show HEAD:infra/ops/ops-runner.sh | grep -c BOSS_JOBS_URL",
+            "git show HEAD:infra/cluster/dev-scratch-reclaim.sh | grep -c ls-remote",
+            "boss-sor-read /api/estate/nodes | grep -c kubectl",
+        ] {
+            assert_eq!(
+                greps_a_name_where_a_definition_is_meant(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// AND NEITHER NEW SHAPE IS TAUGHT BY THE TEXT THAT WARNS ABOUT IT
+    /// — the same check the git-date evidence carries, for the same
+    /// reason: the evidence is the one text a builder reads while
+    /// typing a probe.
+    #[test]
+    fn the_new_evidence_does_not_teach_the_shapes_it_warns_about() {
+        for text in [
+            TRUNCATED_PAGE_EVIDENCE,
+            MENTION_NOT_DEFINITION_EVIDENCE,
+            GIT_TIME_STRING_EVIDENCE,
+            MOVING_HEAD_EVIDENCE,
+            CAR_INSTANT_RECIPE,
+        ] {
+            assert_eq!(counts_a_page_it_may_not_have_read(text), None, "{text}");
+            assert_eq!(
+                greps_a_name_where_a_definition_is_meant(text),
+                None,
+                "{text}"
+            );
+        }
     }
 }

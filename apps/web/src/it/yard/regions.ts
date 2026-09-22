@@ -9,11 +9,11 @@
 // own — that is what the map is for, one definition per number, where
 // yard.ts and boss orient used to hold two.
 //
-// EVERY CARD IS A DOOR. A region's floor is a surface that already
-// exists: the six yard regions open the Train Yard focused on their
+// EVERY CARD IS A DOOR, and since car 4 of design d2154293 every door
+// is a ZOOM: the six yard regions open the Train Yard focused on their
 // panel (the selection keys yard-floor.ts already speaks), receiving
-// and marshalling open their own pages. Nothing is deleted; every
-// panel is one click deeper.
+// and marshalling open their queue board under the same zoomed world.
+// Nothing is deleted; every panel is one click deeper.
 
 import { fetchRemote, type Remote } from '../../data/remote';
 
@@ -54,6 +54,28 @@ export type Trend = Readonly<{
   previous_samples: number;
 }>;
 
+/** WHAT A MACHINE IS DOING (design d2154293, car 5) — the server's
+ *  judgement, parsed, never re-derived here. A CLOSED set: an unknown
+ *  value throws rather than falling through to a glyph that reads as
+ *  calm, exactly as an unknown region state does.
+ *
+ *  `unknown` is not idle. Idle is a reading — the machine is here and
+ *  has no work — and the server states it only where presence is a
+ *  fact it holds. Everything else is "cannot tell", and the map draws
+ *  the two differently. */
+export type MachineState = 'running' | 'idle' | 'failed' | 'unknown';
+const MACHINE_STATES: ReadonlyArray<MachineState> = ['running', 'idle', 'failed', 'unknown'];
+
+export type Machine = Readonly<{
+  /** Stable within the region, so a glyph keeps its place between
+   *  reads: `gate-bay-1`, `conductor`, `station:design-review`. */
+  id: string;
+  name: string;
+  state: MachineState;
+  /** What the state was read from — the glyph's whole tooltip. */
+  why: string;
+}>;
+
 export type Region = Readonly<{
   name: string;
   /** What is here. `null` when the region could not be read — the
@@ -64,6 +86,10 @@ export type Region = Readonly<{
   state: RegionState;
   why: string;
   trend: Trend;
+  /** The machinery standing in this region. Empty for a region no
+   *  machine of ours works in, and empty on an older server — which
+   *  draws no glyphs rather than inventing idle ones. */
+  machines: ReadonlyArray<Machine>;
 }>;
 
 export type Regions = Readonly<{
@@ -93,6 +119,20 @@ function parseTrend(raw: unknown): Trend {
   };
 }
 
+function parseMachine(raw: unknown): Machine {
+  const o = asObject(raw, 'machine');
+  const state = String(o.state ?? '');
+  if (!(MACHINE_STATES as ReadonlyArray<string>).includes(state)) {
+    throw new Error(`machine ${String(o.id ?? '?')}: unknown state ${JSON.stringify(state)}`);
+  }
+  return {
+    id: String(o.id ?? ''),
+    name: String(o.name ?? ''),
+    state: state as MachineState,
+    why: String(o.why ?? ''),
+  };
+}
+
 function parseRegion(raw: unknown): Region {
   const o = asObject(raw, 'region');
   const state = String(o.state ?? '');
@@ -106,6 +146,7 @@ function parseRegion(raw: unknown): Region {
     state: state as RegionState,
     why: String(o.why ?? ''),
     trend: parseTrend(o.trend),
+    machines: Array.isArray(o.machines) ? o.machines.map(parseMachine) : [],
   };
 }
 
@@ -142,17 +183,17 @@ const YARD_SELECTION: Readonly<Record<string, string>> = {
   garage: 'garage',
 };
 
-/** The two regions whose floor is a page of its own. */
-const PAGE_FLOORS: Readonly<Record<string, string>> = {
-  receiving: '/it/operate/receiving',
-  marshalling: '/it/operate/marshalling',
-};
+/** The two regions whose floor is a queue board. Since car 4 of design
+ *  d2154293 they are zooms like every other territory: the board
+ *  mounts UNDER the zoomed world, and /it/operate/receiving and
+ *  /it/operate/marshalling — the pages they used to be — resolve to
+ *  the same route. */
+const BOARD_FLOORS: ReadonlyArray<string> = ['receiving', 'marshalling'];
 
 /** Where a card leads. A name this client does not know opens the
  *  yard itself — a door that opens somewhere, never a dead link. */
 export function floorHref(name: string): string {
-  const page = PAGE_FLOORS[name];
-  if (page !== undefined) return page;
+  if (BOARD_FLOORS.includes(name)) return `/it/yard/${name}`;
   return name in YARD_SELECTION ? `/it/yard/${name}` : '/it/yard';
 }
 

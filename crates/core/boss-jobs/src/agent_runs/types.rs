@@ -38,12 +38,26 @@
 //!    no input/output split exists anywhere for them. The schema
 //!    demanded a split, so the only ways forward were to invent one or
 //!    to record nothing. [`TokenUsage`] is the third way — the split
-//!    when it is measured, the total when it is all there is — and a
-//!    total-only run falls straight into rule 3: the card prices the
-//!    two halves at DIFFERENT rates, so a total genuinely cannot be
-//!    priced, and it reads as unpriced rather than as a blended guess.
-//!    A blend would be a fabricated number wearing a measurement's
-//!    clothes, which is the failure this whole module exists to refuse.
+//!    when it is measured, the total when it is all there is.
+//!
+//! 5. **A TOTAL IS PRICED AT A DECLARED BLEND, AND SAYS SO.** Rule 4
+//!    used to end by refusing to price a total at all: the card charges
+//!    the halves at different rates, so any blend rests on an assumed
+//!    ratio, and an assumed ratio produces a figure with a
+//!    measurement's authority and a guess's accuracy. That refusal cost
+//!    more than it saved — 98% of the runs on the record carried no
+//!    cost at all on 2026-09-20 (83 of 85), so both budget desks
+//!    enforced against a fiftieth of the spend. Design 91a9bfe7,
+//!    decided by David the same day, keeps the objection and removes
+//!    the gap: the ratio is DECLARED, per model, in the registry
+//!    ([`RateCardRow::blended_input_share_ppm`]) where a tenant can
+//!    read and change it — never hardcoded, because an assumption
+//!    nobody can see is the part that was wrong — and the record says
+//!    which basis produced the figure ([`PricingBasis`]), carried into
+//!    every roll-up so a bucket holding one blended run reports itself
+//!    as blended. A measured split always wins over the blend, and a
+//!    model whose row declares no ratio still prices a total at
+//!    nothing: undeclared is unpriced, not assumed.
 
 use std::collections::BTreeMap;
 
@@ -99,23 +113,147 @@ pub struct RateCardRow {
     /// Where the number came from, so a reader can check it.
     #[serde(default)]
     pub note: String,
+    /// The share of a bare TOTAL this model assumes was input, in parts
+    /// per million: `Some(875_000)` is "87.5% input, 12.5% output".
+    /// It is what makes a total priceable at all (see rule 5), and it
+    /// is an ASSUMPTION, which is why it is a registry column and not a
+    /// constant in this file — a tenant whose agents run a different
+    /// shape of work can read it and change it.
+    ///
+    /// A RATIO rather than a blended rate: the two rates above are the
+    /// prices, so a stored blend would be the same fact a third time
+    /// and would go stale the day a price moves (CLAUDE.md §9a).
+    /// [`RateCardRow::blended_usd_micros_per_mtok`] derives it on every
+    /// read instead.
+    ///
+    /// `None` is the honest default and the seeded state of every row
+    /// but one: no ratio declared, so a total-only run on that model
+    /// stays unpriced rather than being blended against a number nobody
+    /// measured.
+    #[serde(default)]
+    pub blended_input_share_ppm: Option<u64>,
 }
 
-/// What a run spent, in the two shapes a reporter can actually be in.
+/// Parts per million, the unit [`RateCardRow::blended_input_share_ppm`]
+/// is expressed in. Integer, for the same reason every price here is.
+const PPM: u128 = 1_000_000;
+
+impl RateCardRow {
+    /// What one million tokens cost under this row's declared
+    /// assumption: its two rates weighted by the ratio. `None` when the
+    /// row declares no ratio — there is no blend to state.
+    ///
+    /// This is the number a surface shows beside the word *blended*,
+    /// and [`price_run`] multiplies a total by this same value, so what
+    /// a reader can check by hand is what the record charged.
+    pub fn blended_usd_micros_per_mtok(&self) -> Option<u64> {
+        let share = u128::from(self.blended_input_share_ppm?).min(PPM);
+        let weighted = share * u128::from(self.input_usd_micros_per_mtok)
+            + (PPM - share) * u128::from(self.output_usd_micros_per_mtok);
+        Some(u64::try_from(rounded_div(weighted, PPM)).unwrap_or(u64::MAX))
+    }
+}
+
+/// How a recorded price was arrived at — the condition David attached
+/// to blended pricing (design 91a9bfe7, resolution *the basis*), and
+/// not an optional one: "a blended number later read as measured is the
+/// zero-means-unknown defect wearing better clothes". Three cars on
+/// 2026-09-20 removed that defect from `total_tokens`, `Cost.usd_micros`
+/// and the unpriced roll-up; a figure that cannot say what it rests on
+/// would put it straight back.
+///
+/// **DERIVED, never stored** — from the token shape the run reported
+/// and the price it carries ([`pricing_basis`]). A column would be the
+/// same fact twice (§9a) and could drift from the arithmetic it
+/// describes; deriving it also means the 83 runs already on the record
+/// need no backfill, which is the design's third resolution (*existing
+/// rows*): an unpriced run has no basis, because it has no figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingBasis {
+    /// Priced from a MEASURED input/output split at the card's two
+    /// rates. The strong form, and the one a split always wins into.
+    Split,
+    /// Priced from a bare total at the model's DECLARED blended rate.
+    /// Honest about being an estimate: the tokens are measured, the
+    /// division between them is an assumption read out of the registry.
+    Blended,
+}
+
+impl PricingBasis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PricingBasis::Split => "split",
+            PricingBasis::Blended => "blended",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "split" => Some(PricingBasis::Split),
+            "blended" => Some(PricingBasis::Blended),
+            _ => None,
+        }
+    }
+
+    /// A bucket is only as measured as its least-measured run: one
+    /// blended figure in a sum makes the sum blended. The rule the
+    /// roll-up folds with, written once here rather than at each call.
+    pub fn least_measured(self, other: PricingBasis) -> PricingBasis {
+        match (self, other) {
+            (PricingBasis::Split, PricingBasis::Split) => PricingBasis::Split,
+            _ => PricingBasis::Blended,
+        }
+    }
+}
+
+/// What basis a price rests on, derived from the two facts that decide
+/// it: the shape the reporter measured, and whether anything priced it.
+///
+/// `None` means there is no figure to describe — an unpriced run has no
+/// basis, and saying `Split` for it would describe a number that does
+/// not exist. This is the ONE definition; [`AgentRun::pricing_basis`]
+/// and the roll-up both call it.
+pub fn pricing_basis(tokens: TokenUsage, usd_micros: Option<u64>) -> Option<PricingBasis> {
+    usd_micros?;
+    match tokens {
+        TokenUsage::Split { .. } => Some(PricingBasis::Split),
+        TokenUsage::TotalOnly { .. } => Some(PricingBasis::Blended),
+        // Unreachable by construction — `price_run` prices no count at
+        // all at nothing — and `None` rather than a panic if it ever
+        // is: a library that cannot say gives no answer, not a wrong one.
+        TokenUsage::Unreported => None,
+    }
+}
+
+/// What a run spent, in the three shapes a reporter can actually be in.
 ///
 /// **The total is one fact with one definition.** For a [`Split`] it is
 /// DERIVED from the halves, so a stored total cannot drift from them
 /// (§9a); for [`TotalOnly`] it is the only thing measured. There is no
-/// third state where both are stored independently and can disagree,
-/// because this type cannot express one.
+/// state where both are stored independently and can disagree, because
+/// this type cannot express one.
 ///
 /// A `TotalOnly` run is unpriceable by construction: the rate card
 /// charges input and output at different rates. That is not a gap to
 /// paper over with an assumed ratio — an assumed ratio is a number that
 /// looks measured and is not.
 ///
+/// **[`Unreported`] is UNKNOWN, never zero** (backlog 65c9c05a,
+/// 2026-09-19). A harness that printed no usage line leaves the
+/// reporter with nothing to say, and the record has to say that. Until
+/// this variant existed, `boss dispatch --report` without `--tokens`
+/// sent `total_tokens: 0` with a `detail.tokens_reported: false`
+/// beside it, so 13 of 42 live rows read as a measurement of zero to
+/// any query that did not know to check the companion flag — an
+/// average over the column silently included 13 zeros. NULL for
+/// unknown is the distinction [`AgentRun::usd_micros`] already draws
+/// in this same table (unpriced, not free), followed here rather than
+/// a third convention invented beside it.
+///
 /// [`Split`]: TokenUsage::Split
 /// [`TotalOnly`]: TokenUsage::TotalOnly
+/// [`Unreported`]: TokenUsage::Unreported
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenUsage {
     /// Both halves measured. Priceable.
@@ -123,11 +261,15 @@ pub enum TokenUsage {
     /// One number, which is everything the reporter had. Recorded in
     /// full; priced by nothing.
     TotalOnly { total: u64 },
+    /// No count at all, stated as such: `"total_tokens": null` on the
+    /// wire and a NULL column in the row. The run is recorded in full;
+    /// what it spent is unknown, and unknown is not zero.
+    Unreported,
 }
 
 impl TokenUsage {
     /// Build from the three wire keys, refusing every combination that
-    /// is not one of the two shapes — and naming the fix, because the
+    /// is not one of the three shapes — and naming the fix, because the
     /// caller hitting this is a reporter that has to change what it
     /// sends.
     ///
@@ -135,11 +277,26 @@ impl TokenUsage {
     /// with the halves; the split stays the definition either way. That
     /// is the validate half of §9a's "derive it or pin it", for callers
     /// that send all three.
+    ///
+    /// **`total` is a DOUBLE option and the two Nones are different
+    /// facts.** `Some(None)` is a reporter that said in as many words
+    /// that it has no count — an explicit `null` on the wire, a NULL
+    /// column in the row — and records [`TokenUsage::Unreported`]. The
+    /// outer `None` is a payload that never mentioned tokens, which is
+    /// silence, and silence is refused here exactly as it is
+    /// everywhere else: a report that forgot to say is not the same
+    /// fact as one that says it does not know, and no caller should
+    /// reach the honest shape by omission (backlog 65c9c05a).
     pub fn from_parts(
         input: Option<u64>,
         output: Option<u64>,
-        total: Option<u64>,
+        total: Option<Option<u64>>,
     ) -> Result<Self, String> {
+        // The stated "no count", ahead of the shapes that carry one.
+        if let (None, None, Some(None)) = (input, output, total) {
+            return Ok(TokenUsage::Unreported);
+        }
+        let total = total.flatten();
         match (input, output, total) {
             (Some(input), Some(output), supplied) => {
                 let derived = input.saturating_add(output);
@@ -172,12 +329,16 @@ impl TokenUsage {
         }
     }
 
-    /// Every run has one. Derived for a split, so the two can never
-    /// disagree.
-    pub fn total(&self) -> u64 {
+    /// What the run spent, when anyone measured it. Derived for a
+    /// split, so the two can never disagree; `None` for
+    /// [`TokenUsage::Unreported`], which makes every caller that wants
+    /// a number decide out loud what to do without one — the whole
+    /// point of the variant.
+    pub fn total(&self) -> Option<u64> {
         match self {
-            TokenUsage::Split { input, output } => input.saturating_add(*output),
-            TokenUsage::TotalOnly { total } => *total,
+            TokenUsage::Split { input, output } => Some(input.saturating_add(*output)),
+            TokenUsage::TotalOnly { total } => Some(*total),
+            TokenUsage::Unreported => None,
         }
     }
 
@@ -185,7 +346,7 @@ impl TokenUsage {
     pub fn input(&self) -> Option<u64> {
         match self {
             TokenUsage::Split { input, .. } => Some(*input),
-            TokenUsage::TotalOnly { .. } => None,
+            TokenUsage::TotalOnly { .. } | TokenUsage::Unreported => None,
         }
     }
 
@@ -193,7 +354,7 @@ impl TokenUsage {
     pub fn output(&self) -> Option<u64> {
         match self {
             TokenUsage::Split { output, .. } => Some(*output),
-            TokenUsage::TotalOnly { .. } => None,
+            TokenUsage::TotalOnly { .. } | TokenUsage::Unreported => None,
         }
     }
 }
@@ -207,8 +368,20 @@ struct TokenFields {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
+    /// A DOUBLE option, so the deserializer can tell an explicit
+    /// `null` (`Some(None)` — no count, said out loud) from an absent
+    /// key (`None` — a payload that forgot to say). `deserialize_with`
+    /// runs only when the key is present, which is what makes the two
+    /// readable apart; a plain `Option<u64>` collapses both to `None`
+    /// (backlog 65c9c05a).
+    #[serde(default, deserialize_with = "stated_total")]
+    total_tokens: Option<Option<u64>>,
+}
+
+/// Called only when `total_tokens` IS present, so the wrapping `Some`
+/// is what marks the value as stated — `null` included.
+fn stated_total<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u64>>, D::Error> {
+    Ok(Some(Option::<u64>::deserialize(d)?))
 }
 
 impl Serialize for TokenUsage {
@@ -220,6 +393,9 @@ impl Serialize for TokenUsage {
         TokenFields {
             input_tokens: self.input(),
             output_tokens: self.output(),
+            // Always the key, and `null` as its value for an
+            // unreported run: an absent key would read as a payload
+            // that forgot to say.
             total_tokens: Some(self.total()),
         }
         .serialize(s)
@@ -387,49 +563,77 @@ impl AgentRun {
     /// field and no way to say "one number, unsplit", and putting the
     /// total in either would be a lie a later reader cannot detect.
     ///
-    /// An unpriced run that DID report a split reports its tokens with
-    /// `usd_micros: 0` — the only place zero stands in for unknown, and
-    /// only because `Cost` has no room to say otherwise. Ask
-    /// [`AgentRun::usd_micros`] when the difference matters.
+    /// An unpriced run that DID report a split carries its price
+    /// through as `None` — unpriced is not free. Until backlog
+    /// c6e2341c this wrote `usd_micros: 0`, the last place in the
+    /// system where a zero stood in for unknown, and only because
+    /// `Cost.usd_micros` was a plain integer with no room to say
+    /// otherwise; it is an `Option` now, so this method no longer has
+    /// to lie and [`AgentRun::usd_micros`] is no longer the only
+    /// reader that can tell.
+    /// What this run's price rests on — `Split` when both halves were
+    /// measured, `Blended` when a bare total was priced at the model's
+    /// declared ratio, `None` when there is no price to describe.
+    /// Derived from the record, so a rebuild replays it exactly.
+    pub fn pricing_basis(&self) -> Option<PricingBasis> {
+        pricing_basis(self.run.tokens, self.usd_micros)
+    }
+
     pub fn cost(&self) -> Option<Cost> {
         match self.run.tokens {
             TokenUsage::Split { input, output } => Some(Cost {
                 input_tokens: input,
                 output_tokens: output,
-                usd_micros: self.usd_micros.unwrap_or(0),
+                usd_micros: self.usd_micros,
             }),
-            TokenUsage::TotalOnly { .. } => None,
+            TokenUsage::TotalOnly { .. } | TokenUsage::Unreported => None,
         }
     }
 }
 
 /// Price a run against the card. `None` — unpriced, never zero — in
-/// three cases, and they are all the same case: nothing on the card
+/// four cases, and they are all the same case: nothing on the card
 /// could turn these tokens into a number.
 ///
 /// 1. The run names no model — a non-agent actor, or a registered
 ///    agent's run that was never resolved through the registry.
 /// 2. No card row covers the model.
-/// 3. **The run reported only a total.** The card charges input and
-///    output at different rates, so there is no arithmetic from one
-///    number to a price. Assuming a ratio would produce a figure with a
-///    measurement's authority and a guess's accuracy; the roll-up
-///    counts these out loud instead (`total_only_runs`).
+/// 3. **The run reported only a total and the model's row declares no
+///    blend.** The card charges input and output at different rates, so
+///    a total is priceable only under an assumed ratio; the row either
+///    declares one or it does not, and an undeclared one is not
+///    invented here (design 91a9bfe7). The roll-up counts these out
+///    loud, as before (`total_only_runs`).
+/// 4. **The run reported no count at all.** No arithmetic reaches a
+///    price from no number, declared ratio or not (`unreported_runs`).
+///
+/// A MEASURED SPLIT ALWAYS WINS: a run that reported both halves is
+/// priced at the two rates even on a model that declares a blend, and
+/// the blend is never consulted for it. That ordering is what makes
+/// [`PricingBasis`] worth recording — the weaker basis is used only
+/// where the stronger one does not exist.
 ///
 /// Integer arithmetic throughout, in `u128` so a run cannot overflow
 /// the multiply before the divide, rounded to the nearest micro-USD
 /// (half up) and saturated into `u64`.
 pub fn price_run(card: &[RateCardRow], run: &NewAgentRun) -> Option<(u64, String)> {
     let model = run.model()?;
-    let TokenUsage::Split { input, output } = run.tokens else {
-        return None;
-    };
     let row = card.iter().find(|r| r.model == model)?;
-    let micros = rounded_div(
-        u128::from(input) * u128::from(row.input_usd_micros_per_mtok)
-            + u128::from(output) * u128::from(row.output_usd_micros_per_mtok),
-        1_000_000,
-    );
+    let micros = match run.tokens {
+        TokenUsage::Split { input, output } => rounded_div(
+            u128::from(input) * u128::from(row.input_usd_micros_per_mtok)
+                + u128::from(output) * u128::from(row.output_usd_micros_per_mtok),
+            PPM,
+        ),
+        // The declared blend, through the same accessor a surface
+        // shows, so the figure a reader checks by hand is the figure
+        // charged.
+        TokenUsage::TotalOnly { total } => rounded_div(
+            u128::from(total) * u128::from(row.blended_usd_micros_per_mtok()?),
+            PPM,
+        ),
+        TokenUsage::Unreported => return None,
+    };
     Some((u64::try_from(micros).unwrap_or(u64::MAX), row.model.clone()))
 }
 
@@ -460,15 +664,16 @@ pub struct RunFilter {
 
 /// Spend for one model, or for one car.
 ///
-/// `total_tokens` always answers; the split halves are `None` the
-/// moment a total-only run joins, for the same reason `usd_micros` is
-/// — see [`RunSummary`].
+/// The split halves go `None` the moment a total-only run joins, and
+/// `total_tokens` the moment an unreported one does, for the same
+/// reason `usd_micros` does — see [`RunSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSpend {
     /// The model string, or the branch name.
     pub key: String,
     pub runs: u64,
-    pub total_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
     #[serde(default)]
     pub input_tokens: Option<u64>,
     #[serde(default)]
@@ -477,29 +682,50 @@ pub struct GroupSpend {
     pub wall_secs: i64,
     #[serde(default)]
     pub usd_micros: Option<u64>,
+    /// What `usd_micros` rests on: `Blended` the moment one blended run
+    /// joins, `None` once the figure itself is gone. Never read the
+    /// figure without it.
+    #[serde(default)]
+    pub pricing_basis: Option<PricingBasis>,
     pub unpriced_runs: u64,
     pub total_only_runs: u64,
+    pub unreported_runs: u64,
+    /// How many of the priced runs were priced at a declared blend
+    /// rather than a measured split — the basis with a size beside it.
+    pub blended_runs: u64,
 }
 
 /// The answer to "what did this cost to build".
 ///
-/// **Three fields refuse to look more complete than the set they cover.**
+/// **Four fields refuse to look more complete than the set they cover.**
 /// `usd_micros` is `Some` only when EVERY run was priced; `input_tokens`
-/// and `output_tokens` are `Some` only when every run reported a split.
-/// A partial figure that looked whole is the failure this avoids: one
-/// missing rate-card row, or one reporter with only a total, would
-/// otherwise understate the bill while reading as an answer.
+/// and `output_tokens` are `Some` only when every run reported a split;
+/// `total_tokens` only when every run reported a count at all. A
+/// partial figure that looked whole is the failure this avoids: one
+/// missing rate-card row, one reporter with only a total, or one
+/// harness that printed no usage line would otherwise understate the
+/// bill while reading as an answer.
 ///
-/// `total_tokens` always answers, because every run has one.
+/// Three counters say WHY a total went missing, because the fixes
+/// differ: `unpriced_runs` is how many could not be priced at all,
+/// `total_only_runs` is how many reported no split, and
+/// `unreported_runs` is how many reported no tokens at all (backlog
+/// 65c9c05a).
 ///
-/// Two counters say WHY a total went missing, because the fixes differ:
-/// `unpriced_runs` is how many could not be priced at all, and
-/// `total_only_runs` is how many of those reported no split to price.
+/// **And `pricing_basis` says what the figure that IS here rests on.**
+/// A sum is only as measured as its least-measured member, so one
+/// blended run makes the bucket `Blended` (design 91a9bfe7): a reader
+/// who sees a number and no basis is back to reading an estimate as a
+/// measurement, which is the defect the whole of this module's rule 3
+/// exists to refuse. `blended_runs` says how many.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub runs: u64,
-    /// Always summable — every run reports a total, derived or measured.
-    pub total_tokens: u64,
+    /// `None` once any run in the set reported no count — unknown, not
+    /// zero, and a sum that quietly treated it as zero would be the
+    /// defect this field exists to refuse.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
     /// `None` once any run in the set reported only a total.
     #[serde(default)]
     pub input_tokens: Option<u64>,
@@ -511,10 +737,24 @@ pub struct RunSummary {
     pub wall_secs: i64,
     #[serde(default)]
     pub usd_micros: Option<u64>,
+    /// What `usd_micros` rests on — see this type's doc. `None`
+    /// whenever `usd_micros` is `None`: no figure, nothing to describe.
+    #[serde(default)]
+    pub pricing_basis: Option<PricingBasis>,
     pub unpriced_runs: u64,
-    /// How many runs reported a bare total, which is why a price could
-    /// not be computed for them. A subset of `unpriced_runs`.
+    /// How many runs reported a bare total. NO LONGER a subset of
+    /// `unpriced_runs`: since design 91a9bfe7 such a run IS priced when
+    /// its model declares a blend, and the counter now says how many
+    /// figures rest on an assumed ratio rather than how many are
+    /// missing. `blended_runs` is the priced part of it; the remainder
+    /// are totals on models that declare no ratio.
     pub total_only_runs: u64,
+    /// How many runs reported no token count at all. A subset of
+    /// `unpriced_runs`, and disjoint from `total_only_runs`: the fixes
+    /// differ, so the counters do.
+    pub unreported_runs: u64,
+    /// How many runs were priced at a declared blend.
+    pub blended_runs: u64,
     pub by_model: Vec<GroupSpend>,
     pub by_branch: Vec<GroupSpend>,
 }
@@ -555,8 +795,11 @@ pub fn summarize(runs: &[AgentRun]) -> RunSummary {
         tool_calls: total.tool_calls,
         wall_secs: total.wall_secs,
         usd_micros: total.usd_micros,
+        pricing_basis: total.pricing_basis,
         unpriced_runs: total.unpriced_runs,
         total_only_runs: total.total_only_runs,
+        unreported_runs: total.unreported_runs,
+        blended_runs: total.blended_runs,
         by_model: by_model.into_values().collect(),
         by_branch: by_branch.into_values().collect(),
     }
@@ -566,23 +809,35 @@ fn blank(key: &str) -> GroupSpend {
     GroupSpend {
         key: key.to_string(),
         runs: 0,
-        total_tokens: 0,
+        total_tokens: Some(0),
         input_tokens: Some(0),
         output_tokens: Some(0),
         tool_calls: 0,
         wall_secs: 0,
         usd_micros: Some(0),
+        // The identity a fold starts from, like the measured zero
+        // beside it: an empty bucket has nothing blended in it.
+        pricing_basis: Some(PricingBasis::Split),
         unpriced_runs: 0,
         total_only_runs: 0,
+        unreported_runs: 0,
+        blended_runs: 0,
     }
 }
 
-/// Add one run into a bucket. `usd_micros` and the two split halves go
-/// to `None` and STAY `None` the moment a run joins that cannot supply
-/// them — see [`RunSummary`].
+/// Add one run into a bucket. `usd_micros`, `total_tokens` and the two
+/// split halves go to `None` and STAY `None` the moment a run joins
+/// that cannot supply them — see [`RunSummary`].
 fn fold(into: &mut GroupSpend, run: &AgentRun) {
     into.runs += 1;
-    into.total_tokens = into.total_tokens.saturating_add(run.run.tokens.total());
+    // `and_then`, not `map`: a bucket that has already met an
+    // unreported run stays unanswered, and a bucket meeting its first
+    // one stops answering. Adding zero for it would be the projection
+    // telling the same lie the column used to.
+    into.total_tokens = match run.run.tokens.total() {
+        Some(t) => into.total_tokens.map(|s| s.saturating_add(t)),
+        None => None,
+    };
     match run.run.tokens {
         TokenUsage::Split { input, output } => {
             into.input_tokens = into.input_tokens.map(|t| t.saturating_add(input));
@@ -593,6 +848,11 @@ fn fold(into: &mut GroupSpend, run: &AgentRun) {
             into.output_tokens = None;
             into.total_only_runs += 1;
         }
+        TokenUsage::Unreported => {
+            into.input_tokens = None;
+            into.output_tokens = None;
+            into.unreported_runs += 1;
+        }
     }
     into.tool_calls = into
         .tool_calls
@@ -601,9 +861,21 @@ fn fold(into: &mut GroupSpend, run: &AgentRun) {
     match run.usd_micros {
         Some(micros) => {
             into.usd_micros = into.usd_micros.map(|t| t.saturating_add(micros));
+            if let Some(basis) = run.pricing_basis() {
+                // `map`, so a bucket that has already lost its figure
+                // does not describe one, and one blended run carries
+                // the whole bucket to blended.
+                into.pricing_basis = into.pricing_basis.map(|acc| acc.least_measured(basis));
+                if basis == PricingBasis::Blended {
+                    into.blended_runs += 1;
+                }
+            }
         }
         None => {
             into.usd_micros = None;
+            // No figure, no basis: `Split` here would describe a number
+            // that is not there.
+            into.pricing_basis = None;
             into.unpriced_runs += 1;
         }
     }
@@ -627,12 +899,26 @@ mod tests {
                 input_usd_micros_per_mtok: 5_000_000,
                 output_usd_micros_per_mtok: 25_000_000,
                 note: "test".into(),
+                blended_input_share_ppm: None,
             },
             RateCardRow {
                 model: "haiku-4-5".into(),
                 input_usd_micros_per_mtok: 1_000_000,
                 output_usd_micros_per_mtok: 5_000_000,
                 note: "test".into(),
+                blended_input_share_ppm: None,
+            },
+            // The one row that declares a blend, as the migration
+            // seeds it: the model 99 of the last 100 recorded runs ran
+            // on, and the only one with measured splits behind its
+            // ratio. The two rows above declare none on purpose —
+            // undeclared is unpriced, not assumed.
+            RateCardRow {
+                model: "opus-5[1m]".into(),
+                input_usd_micros_per_mtok: 5_000_000,
+                output_usd_micros_per_mtok: 25_000_000,
+                note: "test".into(),
+                blended_input_share_ppm: Some(875_000),
             },
         ]
     }
@@ -649,7 +935,7 @@ mod tests {
 
     fn with_tokens(actor: &str, tokens: TokenUsage) -> NewAgentRun {
         NewAgentRun {
-            run_id: format!("run-{actor}-{}", tokens.total()),
+            run_id: format!("run-{actor}-{:?}", tokens.total()),
             actor_id: actor.parse().expect("ActorId::from_str is infallible"),
             started_at: "2026-09-10T01:00:00Z".parse().unwrap(),
             finished_at: "2026-09-10T01:10:00Z".parse().unwrap(),
@@ -765,6 +1051,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unpriced_split_run_reports_no_cost_rather_than_zero() {
+        // 65c9c05a closed this defect one layer down and named where it
+        // still lived: `cost()` wrote `usd_micros: 0` for a run nothing
+        // on the card could price, because `Cost.usd_micros` was a plain
+        // integer. It is an Option now, so unpriced is not free here
+        // either (backlog c6e2341c).
+        let run = recorded(
+            a_run("claude:some-model-we-never-seeded", 999, 999),
+            &card(),
+        );
+        let cost = run.cost().expect("a split run still maps onto Cost");
+        assert_eq!(cost.input_tokens, 999, "the tokens are a fact either way");
+        assert_eq!(cost.output_tokens, 999);
+        assert_eq!(cost.usd_micros, None, "unpriced is not free");
+    }
+
+    #[test]
     fn a_huge_run_saturates_rather_than_overflowing() {
         let (micros, _) =
             price_run(&card(), &a_run("claude:opus-5", u64::MAX, u64::MAX)).expect("priced");
@@ -790,7 +1093,7 @@ mod tests {
         let s = summarize(&runs);
         assert_eq!(s.runs, 2);
         assert_eq!(s.input_tokens, Some(2_000_000));
-        assert_eq!(s.total_tokens, 2_000_000);
+        assert_eq!(s.total_tokens, Some(2_000_000));
         assert_eq!(s.tool_calls, 14);
         assert_eq!(s.wall_secs, 1200);
         assert_eq!(s.usd_micros, Some(6_000_000));
@@ -849,7 +1152,7 @@ mod tests {
         let run = recorded(a_run("claude:opus-5", 1_000_000, 1_000_000), &card());
         let cost: Cost = run.cost().expect("a split run maps onto Cost");
         assert_eq!(cost.input_tokens, 1_000_000);
-        assert_eq!(cost.usd_micros, 30_000_000);
+        assert_eq!(cost.usd_micros, Some(30_000_000));
     }
 
     #[test]
@@ -913,7 +1216,7 @@ mod tests {
             input: 128_684,
             output: 14_298,
         };
-        assert_eq!(tokens.total(), 142_982);
+        assert_eq!(tokens.total(), Some(142_982));
         assert_eq!(tokens.input(), Some(128_684));
         assert_eq!(tokens.output(), Some(14_298));
     }
@@ -921,7 +1224,7 @@ mod tests {
     #[test]
     fn a_total_only_run_reports_its_total_and_no_split() {
         let tokens = TokenUsage::TotalOnly { total: 142_982 };
-        assert_eq!(tokens.total(), 142_982);
+        assert_eq!(tokens.total(), Some(142_982));
         assert_eq!(tokens.input(), None);
         assert_eq!(tokens.output(), None);
     }
@@ -938,7 +1241,7 @@ mod tests {
         );
         assert_eq!(run.priced_by, None, "nothing priced it");
         // The run is still a RECORD: tokens, tool calls and duration.
-        assert_eq!(run.run.tokens.total(), 142_982);
+        assert_eq!(run.run.tokens.total(), Some(142_982));
         assert_eq!(run.duration_secs(), 600);
     }
 
@@ -953,15 +1256,93 @@ mod tests {
     }
 
     #[test]
-    fn a_run_reporting_neither_a_total_nor_a_split_is_refused() {
-        let err = TokenUsage::from_parts(None, None, None).expect_err("neither is not a run");
+    fn a_report_that_says_it_has_no_count_records_one_rather_than_a_zero() {
+        // Backlog 65c9c05a: 13 of 42 live rows carried `total_tokens`
+        // 0 for "the harness printed no usage line", distinguishable
+        // from a genuine zero only by a companion `detail` flag. An
+        // average over the column silently included them.
+        let json = r#"{
+            "run_id": "run-silent",
+            "actor_id": "claude:opus-5",
+            "started_at": "2026-09-19T01:00:00Z",
+            "finished_at": "2026-09-19T01:10:00Z",
+            "outcome": "success",
+            "total_tokens": null
+        }"#;
+        let run: NewAgentRun = serde_json::from_str(json).expect("an explicit null is a shape");
+        assert_eq!(run.tokens, TokenUsage::Unreported);
+        assert_eq!(
+            run.tokens.total(),
+            None,
+            "unknown, not zero — the same distinction usd_micros draws"
+        );
+        let back = serde_json::to_value(&run).expect("serializes");
+        assert_explicit_null!(
+            back,
+            "total_tokens",
+            "an absent key reads as a payload that forgot to say"
+        );
+    }
+
+    #[test]
+    fn an_unreported_run_is_unpriced_and_the_roll_up_reports_no_total_at_all() {
+        let card = card();
+        let mut silent = a_total_run("claude:opus-5", 0);
+        silent.run_id = "run-silent".into();
+        silent.tokens = TokenUsage::Unreported;
+        let runs = vec![
+            recorded(a_run("claude:opus-5", 9, 1), &card),
+            recorded(silent, &card),
+        ];
+        let s = summarize(&runs);
+        assert_eq!(
+            s.total_tokens, None,
+            "a sum over a set holding an unmeasured run understates it while looking whole"
+        );
+        assert_eq!(s.unreported_runs, 1);
+        assert_eq!(s.unpriced_runs, 1, "no tokens is no price");
+        assert_eq!(
+            s.total_only_runs, 0,
+            "a bare total and no count at all are different facts with different fixes"
+        );
+        assert_eq!(runs[1].usd_micros, None);
+    }
+
+    #[test]
+    fn a_run_that_never_mentions_tokens_is_refused_where_a_stated_null_is_not() {
+        // The two Nones differ: an absent key is silence and is
+        // refused; `Some(None)` is a reporter saying it has no count
+        // and is the honest record (backlog 65c9c05a).
+        let err = TokenUsage::from_parts(None, None, None).expect_err("silence is not a run");
         assert!(err.contains("total_tokens"), "{err}");
         assert!(err.contains("input_tokens"), "{err}");
+        assert_eq!(
+            TokenUsage::from_parts(None, None, Some(None)),
+            Ok(TokenUsage::Unreported),
+            "said out loud, it is a shape"
+        );
+    }
+
+    #[test]
+    fn a_payload_that_never_mentions_tokens_is_refused_on_the_wire_too() {
+        // The wire half of the rule above: the double option is only
+        // worth having if serde can still tell the two apart after
+        // flattening, and nothing else proves that.
+        let json = r#"{
+            "run_id": "run-quiet",
+            "actor_id": "claude:opus-5",
+            "started_at": "2026-09-19T01:00:00Z",
+            "finished_at": "2026-09-19T01:10:00Z",
+            "outcome": "success"
+        }"#;
+        let err = serde_json::from_str::<NewAgentRun>(json)
+            .expect_err("a payload that says nothing about tokens is not a report");
+        assert!(err.to_string().contains("total_tokens"), "{err}");
     }
 
     #[test]
     fn half_a_split_is_refused_rather_than_completed_by_subtraction() {
-        let err = TokenUsage::from_parts(Some(10), None, Some(12))
+        let err = TokenUsage::from_parts(Some(10), None, Some(Some(12)))
             .expect_err("a half split must not be completed from the total");
         assert!(err.contains("output_tokens"), "{err}");
         let err = TokenUsage::from_parts(None, Some(2), None).expect_err("half a split");
@@ -970,7 +1351,7 @@ mod tests {
 
     #[test]
     fn a_supplied_total_that_disagrees_with_the_split_is_refused_naming_both() {
-        let err = TokenUsage::from_parts(Some(10), Some(2), Some(11))
+        let err = TokenUsage::from_parts(Some(10), Some(2), Some(Some(11)))
             .expect_err("11 is not 10 + 2, and guessing which is right is not available");
         assert!(err.contains("11"), "{err}");
         assert!(err.contains("12"), "{err}");
@@ -978,7 +1359,8 @@ mod tests {
 
     #[test]
     fn a_supplied_total_that_agrees_is_accepted_and_the_split_remains_the_definition() {
-        let tokens = TokenUsage::from_parts(Some(10), Some(2), Some(12)).expect("12 is 10 + 2");
+        let tokens =
+            TokenUsage::from_parts(Some(10), Some(2), Some(Some(12))).expect("12 is 10 + 2");
         assert_eq!(
             tokens,
             TokenUsage::Split {
@@ -1086,7 +1468,7 @@ mod tests {
         ];
         let s = summarize(&runs);
         assert_eq!(s.runs, 2);
-        assert_eq!(s.total_tokens, 361_200, "the totals still add up");
+        assert_eq!(s.total_tokens, Some(361_200), "the totals still add up");
         assert_eq!(
             s.usd_micros, None,
             "a set of total-only runs must not report a confident cost"
@@ -1113,7 +1495,7 @@ mod tests {
             recorded(only_total, &card),
         ];
         let s = summarize(&runs);
-        assert_eq!(s.total_tokens, 110);
+        assert_eq!(s.total_tokens, Some(110));
         assert_eq!(s.input_tokens, None);
         assert_eq!(s.output_tokens, None);
         assert_eq!(s.usd_micros, None);
@@ -1136,6 +1518,224 @@ mod tests {
             Some(9),
             "the split was reported, so it sums"
         );
-        assert_eq!(s.total_tokens, 10);
+        assert_eq!(s.total_tokens, Some(10));
+    }
+
+    // ----------------------------------------------------------------
+    // A total priced at a DECLARED blend, and a record that says so.
+    // Design 91a9bfe7, decided by David 2026-09-20 on the measurement
+    // that 83 of 85 recorded runs carried no cost at all, because the
+    // harness reports `<subagent_tokens>` as one number and the card
+    // prices two.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn a_declared_blend_is_derived_from_the_two_rates_it_sits_between() {
+        let row = card()
+            .into_iter()
+            .find(|r| r.model == "opus-5[1m]")
+            .expect("the fixture declares one");
+        // 87.5% at $5 + 12.5% at $25 = $7.50 per MTok, and it sits
+        // between the two rates because it is a weighting of them.
+        assert_eq!(row.blended_usd_micros_per_mtok(), Some(7_500_000));
+        let plain = card()
+            .into_iter()
+            .find(|r| r.model == "opus-5")
+            .expect("on the fixture card");
+        assert_eq!(
+            plain.blended_usd_micros_per_mtok(),
+            None,
+            "a row that declares no ratio states no blend"
+        );
+    }
+
+    #[test]
+    fn a_total_only_run_is_priced_at_the_declared_blend() {
+        // 182,068 tokens — the `<subagent_tokens>` line quoted in the
+        // packet — at $7.50 per MTok is 1,365,510 micro-USD.
+        let run = recorded(a_total_run("claude:opus-5[1m]", 182_068), &card());
+        assert_eq!(run.usd_micros, Some(1_365_510));
+        assert_eq!(run.priced_by.as_deref(), Some("opus-5[1m]"));
+        assert_eq!(
+            run.pricing_basis(),
+            Some(PricingBasis::Blended),
+            "the figure must say it rests on the declared ratio, not on a measurement"
+        );
+    }
+
+    #[test]
+    fn a_blended_figure_reports_itself_as_blended_through_a_roll_up() {
+        // The condition David attached to the whole change: a bucket
+        // holding any blended run reports itself as blended, so no
+        // reader of the sum can take it for a measurement.
+        let card = card();
+        let mut split = a_run("claude:opus-5[1m]", 1_000_000, 0);
+        split.run_id = "run-split".into();
+        let runs = vec![
+            recorded(split, &card),
+            recorded(a_total_run("claude:opus-5[1m]", 1_000_000), &card),
+        ];
+        let s = summarize(&runs);
+        assert_eq!(s.unpriced_runs, 0, "both are priced now");
+        assert_eq!(s.usd_micros, Some(5_000_000 + 7_500_000));
+        assert_eq!(
+            s.pricing_basis,
+            Some(PricingBasis::Blended),
+            "one blended run makes the sum blended"
+        );
+        assert_eq!(s.blended_runs, 1);
+        assert_eq!(s.total_only_runs, 1);
+        // And through the grouped roll-ups, which is where a surface
+        // reads a per-model or per-car figure.
+        assert_eq!(
+            s.by_model
+                .iter()
+                .map(|g| (g.key.as_str(), g.pricing_basis, g.blended_runs))
+                .collect::<Vec<_>>(),
+            vec![("opus-5[1m]", Some(PricingBasis::Blended), 1)]
+        );
+        // The wire says it too — a surface reads the basis off the JSON.
+        let json = serde_json::to_string(&s).expect("serializes");
+        assert!(json.contains("\"pricing_basis\":\"blended\""), "{json}");
+    }
+
+    #[test]
+    fn a_bucket_of_measured_splits_says_split() {
+        let s = summarize(&[recorded(a_run("claude:opus-5[1m]", 1_000_000, 0), &card())]);
+        assert_eq!(s.pricing_basis, Some(PricingBasis::Split));
+        assert_eq!(s.blended_runs, 0);
+    }
+
+    #[test]
+    fn a_measured_split_wins_over_the_blend() {
+        // Same model, same token count, both priceable. The split is
+        // priced at the two rates and reads as measured; blending it
+        // would throw away the measurement that exists.
+        let run = recorded(a_run("claude:opus-5[1m]", 875_000, 125_000), &card());
+        assert_eq!(
+            run.usd_micros,
+            Some(875_000 * 5 + 125_000 * 25),
+            "the two rates, not the blend"
+        );
+        assert_eq!(run.pricing_basis(), Some(PricingBasis::Split));
+    }
+
+    #[test]
+    fn a_total_on_a_model_that_declares_no_ratio_stays_unpriced() {
+        // Undeclared is unpriced, not assumed: the assumption lives in
+        // the registry, and a row that does not carry one is not given
+        // a neighbour's.
+        let run = recorded(a_total_run("claude:opus-5", 142_982), &card());
+        assert_eq!(run.usd_micros, None, "no declared ratio, no blend");
+        assert_eq!(run.priced_by, None);
+        assert_eq!(run.pricing_basis(), None, "no figure, no basis");
+    }
+
+    #[test]
+    fn a_run_with_no_count_is_unpriced_even_where_a_ratio_is_declared() {
+        let mut silent = a_total_run("claude:opus-5[1m]", 0);
+        silent.tokens = TokenUsage::Unreported;
+        let run = recorded(silent, &card());
+        assert_eq!(
+            run.usd_micros, None,
+            "a ratio multiplies a count; there is no count"
+        );
+        assert_eq!(run.pricing_basis(), None);
+    }
+
+    #[test]
+    fn an_unpriced_run_takes_the_buckets_basis_with_its_figure() {
+        // The grain `usd_micros` already follows: the moment the sum is
+        // gone, so is the word describing it.
+        let card = card();
+        let runs = vec![
+            recorded(a_total_run("claude:opus-5[1m]", 1_000_000), &card),
+            recorded(a_run("claude:not-on-the-card", 1, 1), &card),
+        ];
+        let s = summarize(&runs);
+        assert_eq!(s.usd_micros, None);
+        assert_eq!(
+            s.pricing_basis, None,
+            "there is no figure left for a basis to describe"
+        );
+        assert_eq!(s.blended_runs, 1, "the count of blended runs survives");
+    }
+
+    #[test]
+    fn an_already_recorded_unpriced_run_is_left_exactly_as_it_was() {
+        // Design resolution three (*existing rows*): the 83 runs on the
+        // record before this change stay unpriced. Nothing re-prices
+        // them, because pricing happens once at record time and a
+        // rebuild replays the recorded figure — and the basis is
+        // derived from that figure, so an unpriced row reads as having
+        // no basis rather than as blended, which would record assurance
+        // nobody has.
+        let old: AgentRun = serde_json::from_str(
+            r#"{
+                "run_id": "run-old",
+                "actor_id": "agent-claude",
+                "model": "opus-5[1m]",
+                "started_at": "2026-09-19T01:00:00Z",
+                "finished_at": "2026-09-19T01:10:00Z",
+                "outcome": "success",
+                "total_tokens": 182068,
+                "usd_micros": null,
+                "recorded_at": "2026-09-19T01:10:01Z"
+            }"#,
+        )
+        .expect("an existing row parses");
+        assert_eq!(old.usd_micros, None);
+        assert_eq!(old.pricing_basis(), None);
+        let s = summarize(&[old]);
+        assert_eq!(s.unpriced_runs, 1);
+        assert_eq!(s.pricing_basis, None);
+        assert_eq!(s.blended_runs, 0);
+    }
+
+    #[test]
+    fn the_basis_round_trips_its_wire_form() {
+        for b in [PricingBasis::Split, PricingBasis::Blended] {
+            assert_eq!(PricingBasis::parse(b.as_str()), Some(b));
+            assert_eq!(
+                serde_json::to_string(&b).expect("serializes"),
+                format!("\"{}\"", b.as_str())
+            );
+        }
+        assert_eq!(PricingBasis::parse("measured"), None);
+    }
+
+    #[test]
+    fn every_price_the_card_computes_agrees_with_the_basis_it_reports() {
+        // The pin for the one place these two could drift: `price_run`
+        // decides WHICH arithmetic ran, `pricing_basis` decides what
+        // the record calls it, and they are separate functions. Over
+        // every shape and every fixture row, a priced total is blended
+        // and a priced split is not.
+        let card = card();
+        for model in ["opus-5", "haiku-4-5", "opus-5[1m]", "not-on-the-card"] {
+            let actor = format!("claude:{model}");
+            for tokens in [
+                TokenUsage::Split {
+                    input: 10,
+                    output: 1,
+                },
+                TokenUsage::TotalOnly { total: 11 },
+                TokenUsage::Unreported,
+            ] {
+                let run = recorded(with_tokens(&actor, tokens), &card);
+                match (run.usd_micros, run.run.tokens) {
+                    (Some(_), TokenUsage::Split { .. }) => {
+                        assert_eq!(run.pricing_basis(), Some(PricingBasis::Split), "{model}")
+                    }
+                    (Some(_), TokenUsage::TotalOnly { .. }) => {
+                        assert_eq!(run.pricing_basis(), Some(PricingBasis::Blended), "{model}")
+                    }
+                    (Some(_), TokenUsage::Unreported) => {
+                        panic!("{model}: no count cannot produce a price")
+                    }
+                    (None, _) => assert_eq!(run.pricing_basis(), None, "{model}"),
+                }
+            }
+        }
     }
 }

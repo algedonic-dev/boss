@@ -748,20 +748,31 @@ fn a_cli_verb_signs_as_the_runners_own_account() {
     );
 }
 
-/// THE EXIT RIDES THE REQUEST, not only the step (backlog f47861a5,
-/// measured 2026-09-19 on ops-request c98a782f): publish-github-pr
-/// printed `FAILED` and exited 1, the runner completed `execute` with
-/// `exit_code: "1"`, the request closed `answered` — the verb RAN, which
-/// is what the outcome names — and nothing above the step level said
-/// so: the yard drew the request like any answered one and the publish
-/// step it was filed for sat ready for five hours. The runner now
-/// writes the verb's exit onto the request's own metadata through the
-/// merge door BEFORE completing the step, so every reader of the close
-/// (the yard, a rule's handler) sees the exit where the outcome is.
-/// The outcome stays `answered`: every judge rule keys on it, and a
-/// verb that ran and said no is an answer, not a refusal.
+/// THE VERB'S EXIT IS RECORDED ONCE, ON THE STEP (backlog 50fede8b).
+/// It used to be recorded twice under two names — `exit_code` on the
+/// execute step and `exit` on the request — written by one act and
+/// held equal by nothing, which is the fact-that-lives-twice shape
+/// CLAUDE.md §9a refuses. It was benign only while one writer wrote
+/// both; a retry, a hand correction or a second runner writing one
+/// without the other hands a reader a stale exit and a verdict on a
+/// run that did not have it. Measured 2026-09-20 before the collapse:
+/// every consumer already read the STEP — `boss ops --wait`'s verdict
+/// line, `verb_failure` for the whole answered-ops-request judge
+/// family, the yard's runner shed and signals — and no rule predicate,
+/// handler or surface read the request-level copy. The request level
+/// needs no copy to be readable, either: `GET /api/jobs?kind=ops-request`
+/// returns each row WITH its steps, which is how the yard reads the
+/// exit off `execute` from a list.
+///
+/// f47861a5's finding stands and is served by the step: a verb that
+/// ran and failed must be visible above `answered` (publish-github-pr
+/// printed `FAILED`, exited 1, and the publish step it was filed for
+/// sat ready for five hours). What reads it is the
+/// `complete-publish-pr-step-on-publish-github-pr-answered` rule, off
+/// `exit_code`. The outcome stays `answered`: every judge rule keys on
+/// it, and a verb that ran and said no is an answer, not a refusal.
 #[test]
-fn an_answered_verbs_exit_rides_the_request_metadata() {
+fn an_answered_verbs_exit_is_recorded_once_on_its_step() {
     needs_jq!();
     let root = scratch("exit-on-request");
     stub_sor(&root);
@@ -791,19 +802,180 @@ fn an_answered_verbs_exit_rides_the_request_metadata() {
     )
     .expect("the PATCH body is JSON");
     assert_eq!(
+        // What is left on this door is the queue reading (1ffb3305) —
+        // a request-level fact with no home on the step, unlike the
+        // exit. This fixture's packet carries no `opened_at`, so it
+        // has no `queued_s`. Nothing ELSE reaches the request's
+        // metadata, and in particular no second spelling of the exit.
         patch,
-        serde_json::json!({"exit": "3"}),
-        "the request carries the verb's exit, and nothing else changes: {patch}"
+        serde_json::json!({"queue_depth": 1}),
+        "the request carries the queue it waited in and nothing else — the exit lives once, on the step: {patch}"
     );
     assert!(out.contains("answered fails"), "{out}");
 
-    // A refusal ran nothing, so the request has no exit to carry.
+    // A refusal ran nothing, so there is nothing to record about it
+    // on the request at all.
     packet(&root, "not-a-verb", "[]");
     let (out, payload) = run(&root, &verbs, &[]);
     let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
     assert_eq!(md["disposition"], "refused", "{md} / {out}");
     assert!(
         !root.join("patch.json").exists(),
-        "a refusal writes no exit on the request: {out}"
+        "a refusal writes nothing on the request: {out}"
     );
+}
+
+/// A QUEUE WHOSE DEPTH NOBODY READS (backlog 1ffb3305). This runner
+/// walks up to 100 open requests SERIALLY in one oneshot with no
+/// per-verb fairness, so a latency-sensitive verb queues behind
+/// whatever is ahead of it in the same run — a converge, the verb that
+/// deploys a fix, waits behind however many run-car-probes are in
+/// front of it. Measured 2026-09-19: run-car-probe was 171 of the last
+/// 300 ops-requests against 42 converges, and its cadence went daily to
+/// hourly the same day. Today's volumes are comfortable; the serial
+/// walk is now the only real bound on raising any probe cadence
+/// further, and nothing measured it. A queue nobody reads is one that
+/// gets discovered at its worst moment, by a converge that did not
+/// deploy when it should have.
+///
+/// So the runner reads its own queue before it walks it, and the
+/// reading lands in two places on purpose: the journal line carries
+/// the gauge for EVERY run, depth zero included — a gauge that appears
+/// only when it is non-zero cannot be told apart from a runner that
+/// stopped — and each answered request carries what IT waited, so the
+/// series is a system-of-record query rather than an ssh. Per-verb
+/// fairness or a priority lane is the larger change and waits for this
+/// reading to say it is needed.
+#[test]
+fn the_runner_reads_its_own_queue_depth_and_oldest_wait() {
+    needs_jq!();
+    let root = scratch("queue-reading");
+    stub_sor(&root);
+    let ok = root.join("ok.sh");
+    write_exec(&ok, "#!/bin/sh\necho ok\n");
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "ok",
+            &format!(
+                r#"{{"about":"a verb that answers","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                ok.display()
+            ),
+        )],
+    );
+
+    // An empty queue is a reading too, and the one the runner takes
+    // most often.
+    std::fs::write(root.join("jobs.json"), r#"{"data":[]}"#).unwrap();
+    let (out, _) = run(&root, &verbs, &[]);
+    assert_eq!(
+        queue_line(&out),
+        "ops-runner: queue host=forge depth=0 oldest_wait_s=-",
+        "an empty queue still reports its depth: {out}"
+    );
+
+    // Three open requests for this host, the oldest filed 600s ago.
+    queue(&root, "ok", &[Some(120), Some(600), Some(30)]);
+    let (out, _) = run(&root, &verbs, &[]);
+    let line = queue_line(&out);
+    assert!(line.contains("depth=3"), "{line}");
+    let oldest: i64 = field(&line, "oldest_wait_s")
+        .parse()
+        .unwrap_or_else(|_| panic!("oldest_wait_s is a number: {line}"));
+    assert!(
+        (600..660).contains(&oldest),
+        "the oldest wait is the oldest packet's age, not the newest's: {line}"
+    );
+
+    // A packet nobody stamped has NO age, and the reading says so
+    // rather than answering zero: `date -d ''` answers midnight, which
+    // would report a fresh packet as a decades-old wait (the probe-time
+    // trap, crates/core/boss-jobs/src/probe.rs).
+    queue(&root, "ok", &[None]);
+    let (out, _) = run(&root, &verbs, &[]);
+    assert_eq!(
+        queue_line(&out),
+        "ops-runner: queue host=forge depth=1 oldest_wait_s=-",
+        "an unstamped packet has no age: {out}"
+    );
+
+    // And the answered request carries what IT waited, beside the exit
+    // that already rides there — so the depth series is a jobs-API
+    // query, not a journal nobody opens.
+    queue(&root, "ok", &[Some(300), Some(45)]);
+    let (out, _) = run(&root, &verbs, &[]);
+    let patch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("patch.json"))
+            .unwrap_or_else(|e| panic!("no PATCH on the request's metadata: {e}; {out}")),
+    )
+    .expect("the PATCH body is JSON");
+    assert_eq!(patch["queue_depth"], 2, "{patch} / {out}");
+    let waited = patch["queued_s"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the request records its own wait: {patch} / {out}"));
+    assert!(
+        (45..105).contains(&waited),
+        "the LAST packet walked waited its own 45s, not the queue's oldest: {patch}"
+    );
+}
+
+/// The runner's one-line queue reading, or a panic naming what it
+/// printed instead.
+fn queue_line(out: &str) -> String {
+    out.lines()
+        .find(|l| l.starts_with("ops-runner: queue "))
+        .unwrap_or_else(|| panic!("no queue reading in the run's output:\n{out}"))
+        .to_string()
+}
+
+/// `key=value` off a space-separated reading line.
+fn field(line: &str, key: &str) -> String {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        .to_string()
+}
+
+/// A queue of open ops-requests for the forge, one per entry, each
+/// carrying the `opened_at` a live request carries (`Some(age)`
+/// seconds ago) or none at all.
+fn queue(root: &Path, verb: &str, ages_s: &[Option<u64>]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rows: Vec<String> = ages_s
+        .iter()
+        .enumerate()
+        .map(|(i, age)| {
+            let opened = match age {
+                Some(a) => format!(r#","opened_at":"{}""#, iso_at(now - a)),
+                None => String::new(),
+            };
+            format!(
+                r#"{{"id":"aaaaaaaa-0000-4000-8000-00000000000{i}","status":"open","metadata":{{"host":"forge","verb":"{verb}","args":[]{opened}}},"steps":[{{"id":"s-{i}","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        root.join("jobs.json"),
+        format!(r#"{{"data":[{}]}}"#, rows.join(",")),
+    )
+    .unwrap();
+}
+
+/// The timestamp shape a live ops-request carries in `metadata.opened_at`
+/// (read off request e8248c26, 2026-09-20): RFC 3339, nanoseconds, an
+/// explicit `+00:00` offset.
+fn iso_at(epoch: u64) -> String {
+    let out = Command::new("date")
+        .args([
+            "-u",
+            "-d",
+            &format!("@{epoch}"),
+            "+%Y-%m-%dT%H:%M:%S.000000000+00:00",
+        ])
+        .output()
+        .expect("date runs");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }

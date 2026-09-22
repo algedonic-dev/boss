@@ -16,7 +16,7 @@
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
   import { appsFor, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
-  import { SECTION_FOR_ROUTE, appForRoute } from './shell/sections';
+  import { appForRoute, sectionForRoute } from './shell/sections';
   import { makeSurfaceOpenRecorder, postSurfaceOpen, routePattern } from './shell/surface-opens';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
@@ -61,14 +61,11 @@
   import DispatcherRulesPage from './dispatcher/DispatcherRulesPage.svelte';
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
-  import YardPage from './it/yard/YardPage.svelte';
   import MapPage from './it/yard/MapPage.svelte';
   import YardStatusPage from './it/yard/YardStatusPage.svelte';
   import CrewBoardPage from './it/crew/CrewBoardPage.svelte';
   import EstatePage from './it/estate/EstatePage.svelte';
   import FleetPage from './it/monitoring/FleetPage.svelte';
-  import MarshallingYardPage from './it/marshalling/MarshallingYardPage.svelte';
-  import ReceivingYardPage from './it/receiving/ReceivingYardPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
@@ -220,7 +217,7 @@
   // shell/sections.ts as a typed Record so a new route kind cannot fall
   // through silently, and sections.test.ts pins every section id to a
   // ROUTE_CATALOG key.
-  let activeSection = $derived(SECTION_FOR_ROUTE[route.kind]);
+  let activeSection = $derived(sectionForRoute(route));
 
   // Which app tab is active. Derived from the route: through
   // `activeSection` and the catalog's `app` field for every surface
@@ -384,17 +381,17 @@
     {:else if route.kind === 'systemDesign'}
       <ItTabs group="design" active="/it/design" />
       <DesignReviewPage />
-    {:else if route.kind === 'systemYard'}
-      <!-- The /it landing is the MAP (design 0524fc95, car 2): eight
-           region cards, each a door to a floor below. -->
-      <MapPage />
-    {:else if route.kind === 'systemYardFloor'}
-      <!-- A floor: the Train Yard itself, opened on the region's panel.
-           Keyed on the region so a card-to-card move remounts the page
-           on the new selection rather than keeping the old one. -->
-      {#key route.region}
-        <YardPage focus={route.region} />
-      {/key}
+    {:else if route.kind === 'systemYard' || route.kind === 'systemYardFloor'}
+      <!-- THE WORLD, and a floor is the SAME world zoomed into that
+           territory (design d2154293, car 3; the map itself is
+           0524fc95 car 2). ONE branch for both routes on purpose: two
+           `{:else if}` arms are two blocks to Svelte, so moving between
+           them tears the SVG down and builds another — the camera is
+           lost and the zoom reads as a page change, which is the thing
+           this car removed. Measured: the mocked spec holds a handle to
+           the SVG node across the click and it came back detached.
+           MapPage keys the floor's panels itself. -->
+      <MapPage region={route.kind === 'systemYardFloor' ? route.region : null} />
     {:else if route.kind === 'systemCrew'}
       <!-- No ItTabs: the Crew Board is its own sidebar row, not a tab on
            an existing family (backlog 04c5bbc0, David 2026-09-11). -->
@@ -404,12 +401,6 @@
     {:else if route.kind === 'systemFleet'}
       <ItTabs group="operate" active="/it/operate/bottlenecks" />
       <FleetPage />
-    {:else if route.kind === 'systemMarshallingYard'}
-      <ItTabs group="operate" active="/it/operate/marshalling" />
-      <MarshallingYardPage />
-    {:else if route.kind === 'systemReceivingYard'}
-      <ItTabs group="operate" active="/it/operate/receiving" />
-      <ReceivingYardPage />
     {:else if route.kind === 'systemYardStatus'}
       <ItTabs group="operate" active="/it/operate/yard-status" />
       <YardStatusPage />

@@ -99,6 +99,18 @@ async fn registry_seeds_exactly_the_declared_edges() {
         rows,
         vec![
             // '*' applies to every kind (migration 110, waiting_on).
+            //
+            // The three RELATION edges (design c0d2787a) carry no
+            // behaviour: they record that two packets are related, so
+            // the fact is resolvable and queryable instead of living
+            // in whatever metadata key the author reached for. They
+            // are '*' because a relationship is not a property of a
+            // kind. `waiting_on` stays the BLOCKING one — a wait the
+            // dispatcher clears on close — and is deliberately not
+            // duplicated by a "prerequisite" relation.
+            ("*".into(), "duplicate_of".into(), "job_id".into()),
+            ("*".into(), "occasioned_by".into(), "job_id".into()),
+            ("*".into(), "supersedes".into(), "job_id".into()),
             ("*".into(), "waiting_on".into(), "job_id".into()),
             // The feedback (or backlog item) a design decides
             // (5f0b2661) — followed on publish by
@@ -299,25 +311,13 @@ async fn the_metadata_patch_reports_an_unresolvable_edge_as_the_callers_error() 
             .allow("ceo", Action::Update, Resource::job(), Scope::All)
             .build(),
     );
-    let app = router(JobsApiState {
-        job_edges: None,
-        stations: None,
-        jobs: Arc::new(PgJobs::new(pool.clone())),
+    let app = router(JobsApiState::minimal(
+        Arc::new(PgJobs::new(pool.clone())),
         bus,
         publisher,
-        step_registry: Arc::new(boss_jobs::step_registry::StepRegistry::v1()),
         policy,
-        kind_registry: None,
-        plugin_registry: None,
-        calendar: None,
-        subject_kinds: None,
-        subject_existence: None,
-        roster: None,
-        clock: Arc::new(boss_clock_client::WallClockClient),
-        cadence: None,
-        delivery: None,
-        agent_budget: None,
-    });
+        Arc::new(boss_clock_client::WallClockClient),
+    ));
 
     let resp = TestRequest::new(
         axum::http::Method::PATCH,

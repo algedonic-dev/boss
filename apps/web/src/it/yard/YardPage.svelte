@@ -96,7 +96,7 @@
     withConverge,
   } from './yard-converge';
   import { yardAlerts, type Alert } from './yard-alerts';
-  import { floorSelection } from './regions';
+  import { fetchRegions, floorSelection, lampOf, type Regions } from './regions';
   import { yardSignals } from './yard-signals';
   import { production as productionOf } from './yard-production';
   import YardMap from './YardMap.svelte';
@@ -119,7 +119,19 @@
   // `focus` is the map's name for the region; regions.ts maps it to
   // the selection the entity deck opens on, and an unknown name falls
   // back to the track, as the bare page always has.
-  let { focus = 'track' }: Readonly<{ focus?: string }> = $props();
+  //
+  // CAR 3 (design d2154293): this page is also mounted UNDER the
+  // zoomed world, by MapPage, at /it/yard/<region>. `embedded` drops
+  // the page header, because the world above already carries one, and
+  // that is ALL it drops — everything the floor shows, this page still
+  // shows. `onfloor` hands the scene up so the zoomed territory's
+  // interior is drawn from the reads this page already makes, rather
+  // than a second copy of them.
+  let {
+    focus = 'track',
+    embedded = false,
+    onfloor = (_scene: Scene | null) => {},
+  }: Readonly<{ focus?: string; embedded?: boolean; onfloor?: (scene: Scene | null) => void }> = $props();
 
   let yard = $state<YardState | null>(null);
   let loading = $state(true);
@@ -133,6 +145,16 @@
   // bays read "no reading" — rather than a false-empty approach.
   let status = $state<Remote<YardStatus>>({ kind: 'loading' });
   const statusData = $derived(status.kind === 'ready' ? status.data : null);
+  // THE REGION'S OWN VERDICT, at the head of the floor's panel — the
+  // same /api/yard/regions read the world map drew the territory from,
+  // so clicking in cannot contradict the map (a106309c, 2026-09-19:
+  // the arrivals territory said troubled and this floor showed green
+  // sidings, because the floor rendered none of the region's state or
+  // why). Read on every tick with the rest; a failed read is said.
+  let regionsRead = $state<Remote<Regions>>({ kind: 'loading' });
+  const focusRegion = $derived(
+    regionsRead.kind === 'ready' ? (regionsRead.data.regions.find(r => r.name === focus) ?? null) : null,
+  );
   const garage = $derived(statusData?.garage ?? []);
   // Operating info for the gates (David, feedback 3771438f): the
   // capacity is the live delivery policy, the usage is now, and the
@@ -181,6 +203,12 @@
 
   // THE FLOOR: the pure scene both the map and the board draw.
   const floor = $derived<Scene | null>(yard ? sceneOf(yard, statusData, nowMs, feeds) : null);
+  // Handed up to whoever mounted this page (car 3: the world above, so
+  // the zoomed territory's interior draws the SAME wagons this floor
+  // does, from one read rather than a second copy of it).
+  $effect(() => {
+    onfloor(floor);
+  });
   const wagonById = $derived(new Map((floor?.wagons ?? []).map(w => [w.id, w])));
   // The shed and its two sidings, in the order the board reads them —
   // the inspection panel's rows.
@@ -441,16 +469,18 @@
   onMount(() => {
     let cancelled = false;
     async function tick() {
-      const [y, s, ops, health, conv] = await Promise.all([
+      const [y, s, ops, health, conv, regs] = await Promise.all([
         fetchYard(),
         fetchYardStatus(),
         fetchOpsRequests(),
         fetchHealth(),
         fetchConverges(),
+        fetchRegions(),
       ]);
       if (cancelled) return;
       if (y) yard = y;
       status = s;
+      regionsRead = regs;
       opsRequests = ops;
       converges = conv;
       const now = Date.now();
@@ -552,11 +582,13 @@
 </script>
 
 <div class="theme-exec yard-root">
-  <PageHeader
-    eyebrow="IT · Forge line"
-    title="The train yard"
-    subtitle="Gated → parked → boarded → departed → arrived → proven — every change is a wagon you can follow from the approach siding to the arrivals yard"
-  />
+  {#if !embedded}
+    <PageHeader
+      eyebrow="IT · Forge line"
+      title="The train yard"
+      subtitle="Gated → parked → boarded → departed → arrived → proven — every change is a wagon you can follow from the approach siding to the arrivals yard"
+    />
+  {/if}
 
   {#if loading}
     <div class="yard-empty">Reading the yard…</div>
@@ -584,7 +616,16 @@
       {/if}
     </div>
 
-    <!-- THE MAP -->
+    <!-- THE MAP — the region's floor in full: the sidings, the ladder,
+         the bays with their progress, the locomotives along the
+         stages. STILL DRAWN when embedded, deliberately. Car 3 zooms
+         the world into a territory and paints one plate per wagon
+         standing in it, which answers "what is moving in here" but is
+         a SUMMARY of this; re-homing these sidings and locomotives
+         inside the territory's rect is the work left before YardPage
+         can retire (design d2154293, cars 4-5). Hiding this in the
+         meantime would have taken detail off the founder's main
+         surface in the same change that added the zoom. -->
     <YardMap scene={floor} {selected} onselect={select} />
 
     <!-- THE DECK: the departure board and the entity panel -->
@@ -593,6 +634,26 @@
         <DepartureBoard scene={floor} {selected} onselect={select} {nowMs} />
       </div>
       <div class="yard-panel yard-entity" aria-live="polite">
+        {#if selected === floorSelection(focus)}
+          <!-- THE REGION'S VERDICT, first: the map's state and why for
+               the floor this page opened on, from the map's own read —
+               shown while the region's panel is what is selected. The
+               alerts strip's classes, so trouble looks like trouble. -->
+          {#if focusRegion}
+            <div
+              class="yard-alert yard-region-head {lampOf(focusRegion.state)}"
+              data-region={focusRegion.name}
+              data-state={focusRegion.state}>
+              <span class="yard-lamp-dot {lampOf(focusRegion.state)}"></span>
+              <span>{focusRegion.name} · {focusRegion.state} — {focusRegion.why}</span>
+            </div>
+          {:else if regionsRead.kind === 'failed'}
+            <div class="yard-alert yard-region-head err" data-region={focus} data-state="unread">
+              <span class="yard-lamp-dot err"></span>
+              <span>the region's state cannot be read — {regionsRead.error}</span>
+            </div>
+          {/if}
+        {/if}
         {#if sel.kind === 'car'}
           {@const w = wagonById.get(sel.id) ?? null}
           <h2 class="yard-panel-h">Entity · car</h2>
@@ -1537,6 +1598,9 @@
   .yard-alert.err { border-color: color-mix(in srgb, var(--err, #e2685c) 60%, var(--hairline, #2a3138)); }
   .yard-alert.warn { border-color: color-mix(in srgb, var(--warn, #d9a441) 55%, var(--hairline, #2a3138)); }
   .yard-alert time { color: var(--static, #7a838c); font-size: 11px; }
+  /* The region's verdict at the head of the entity panel wears the
+     alert's own look; it is a reading, not a button. */
+  .yard-region-head { cursor: default; margin-bottom: var(--s3, 12px); }
   .yard-quiet { color: var(--text-faint, #5c656e); font-size: 12.5px; padding: 6px 0; display: inline-flex; gap: var(--s2, 8px); align-items: center; }
 
   /* The small round lamps the strip, the entity panel and the board share. */

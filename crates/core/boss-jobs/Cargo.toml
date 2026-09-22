@@ -101,6 +101,10 @@ name = "delivery_policy_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "dispatcher_firings_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "estate_readers_pg"
 required-features = ["postgres"]
 
@@ -274,4 +278,12 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_claim_over_the_agents_hourly_budget_is_refused_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_claim_past_the_agents_concurrent_run_cap_is_refused_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_inbox_outlives_the_session_that_filled_it_pg"
 required-features = ["postgres"]

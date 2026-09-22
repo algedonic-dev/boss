@@ -99,7 +99,11 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let listen = std::env::var("BOSS_LISTEN").unwrap_or_else(|_| "127.0.0.1:4443".into());
+    // The port is boss-ports' `gateway` row, the same fact the LAN
+    // machine door and the probe reader's table carry (backlog
+    // 240e03f3); loopback stays the default, the manifest widens it.
+    let listen = std::env::var("BOSS_LISTEN")
+        .unwrap_or_else(|_| format!("127.0.0.1:{}", boss_ports::prod("gateway")));
     let session_key_path: std::path::PathBuf = std::env::var("BOSS_SESSION_KEY")
         .unwrap_or_else(|_| "/var/lib/boss-gateway/session.key".into())
         .into();
@@ -286,8 +290,13 @@ fn build_router(
     local_auth_state: Option<Arc<LocalAuthState>>,
     public_reads: &public_reads::PublicReads,
 ) -> axum::Router<Arc<AppState>> {
+    // `/health` is NOT here: the gateway's own liveness answer is a
+    // sessionless read like any other, so it is a row in
+    // `public_reads::PUBLIC_BY_DESIGN` with its reason, registered by
+    // `public_reads::mount` below (backlog bf1f5ad2, 2026-09-19). It
+    // sat here as a route returning a constant, which made the set of
+    // sessionless answers "that module, plus this line".
     let app = axum::Router::new()
-        .route("/health", axum::routing::get(handle_health))
         .route("/api/session", axum::routing::get(api::session))
         .route(
             "/api/tenant/manifest",
@@ -415,6 +424,26 @@ fn build_router(
             "/api/yard/status",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // The yard's REGIONS — the eight-card system map at /it (design
+        // 0524fc95 car 2, train #475). Shipped on the jobs upstream and
+        // fetched by the landing page, unrouted here: the fourth
+        // instance of the stations shape, and the one David found on
+        // his own screen (the /it landing rendered `HTTP 404`,
+        // 2026-09-19). Since then `every_api_path_the_web_fetches_is_routed`
+        // reads the bundle's fetches and refuses a fifth at the gate.
+        .route(
+            "/api/yard/regions",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The map's RAILS (design d2154293 car 2): what crosses each
+        // border, what waits at it and which machine moves it. Same
+        // upstream, same page, and routed here at the same time as the
+        // fetch that reads it — the shape above is what happens when
+        // those two are not one change.
+        .route(
+            "/api/yard/borders",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // The agent-run record — which actor built what, and what it
         // cost. `GET /api/agent-runs[?actor_id=&branch=&since=]` lists
         // the rows and `/cost` rolls them up; both live on the jobs
@@ -462,14 +491,10 @@ fn build_router(
             "/api/scheduling/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
-        // Public calendar-feed endpoint: /ics/{token}.ics. The token in
-        // the URL is the authentication — calendar clients can't carry
-        // auth cookies, so we proxy this one path without the cookie
-        // gate. Upstream (boss-jobs-api) validates the token.
-        .route(
-            "/ics/{*rest}",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS)),
-        )
+        // The calendar feed, /ics/{token}.ics, is registered by
+        // `public_reads::mount` below as a PUBLIC_BY_DESIGN row, with
+        // its reason beside it (backlog 240e03f3): every sessionless
+        // read is a row in that module, none is pinned here.
         .route(
             "/api/catalog/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CATALOG)),
@@ -669,10 +694,16 @@ fn build_router(
         // every PORTS entry. boss-observability exposes its routes
         // under different prefixes (/api/events, /api/snapshot,
         // /api/agents), so without this alias the monitoring page
-        // shows it as 'down' even when running.
+        // shows it as 'down' even when running. Session-gated like
+        // every other health path that page reads (`/api/jobs/health`
+        // rides the gated `/api/jobs/{*rest}`): it sat on the
+        // sessionless proxy until backlog 240e03f3 (2026-09-19) with
+        // nothing but that page reading it, and the page holds a
+        // session. Pinned by
+        // `the_observability_health_alias_refuses_a_sessionless_caller`.
         .route(
             "/api/observability/health",
-            axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::OBSERVABILITY)),
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
         )
         // Simulator UX — boss-simulator hosts both the /simulator SPA
         // bundle and its /simulator/api/* control+status surface. The
@@ -854,10 +885,6 @@ fn build_router(
     } else {
         app
     }
-}
-
-async fn handle_health() -> &'static str {
-    "ok"
 }
 
 /// Anything under `/api` that matched no service above is a routing
@@ -1146,6 +1173,10 @@ mod routing_tests {
             // slots and the garage entirely (the sections are
             // `{#if}`-gated on a status that never became ready).
             "/api/yard/status",
+            // The regions map (train #475): fourth instance, found on
+            // David's screen; `every_api_path_the_web_fetches_is_routed`
+            // below now derives this list from the bundle instead.
+            "/api/yard/regions",
             // The agent-run record — what each actor built and what it
             // cost. Shipped on the jobs upstream in train #294 and
             // unreachable at the human door ever since: the Crew Board
@@ -1172,6 +1203,147 @@ mod routing_tests {
                  shadowing a real service route"
             );
         }
+    }
+
+    /// Every `/api/...` path the web bundle fetches, read from
+    /// `apps/web/src` itself. Each string or template literal that opens
+    /// `/api/` yields one probe path:
+    /// - a template cut by `${…}` probes with a placeholder segment
+    ///   (`/api/jobs/${id}` → `/api/jobs/probe`);
+    /// - a literal assigned to a name (`const API_BASE = '/api/ledger'`)
+    ///   is a base every fetch suffixes, so it probes `/api/ledger/probe`;
+    /// - a literal ending in `/` is a `startsWith` prefix, not a fetch;
+    /// - a mention in a comment is prose.
+    /// Test files are fixtures, and `dev-server.ts` is the dev proxy's
+    /// own route table, not the bundle — both skipped.
+    fn api_paths_the_web_fetches() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../apps/web/src")
+            .canonicalize()
+            .expect("apps/web/src exists beside the crates");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                    continue;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let is_source = name.ends_with(".ts") || name.ends_with(".svelte");
+                let is_fixture =
+                    name.contains(".test.") || name.contains(".spec.") || name == "dev-server.ts";
+                if is_source && !is_fixture {
+                    out.push(path);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        files.sort();
+        let mut found: Vec<(String, String)> = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("readable source");
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            for (i, _) in text.match_indices("/api/") {
+                // The literal must OPEN here — the byte before is a quote
+                // or a backtick — and not inside a comment.
+                if i == 0 || !matches!(text.as_bytes()[i - 1], b'\'' | b'"' | b'`') {
+                    continue;
+                }
+                let line_start = text[..i].rfind('\n').map_or(0, |n| n + 1);
+                let before = &text[line_start..i - 1];
+                if before.contains("//") || before.trim_start().starts_with('*') {
+                    continue;
+                }
+                let rest = &text[i..];
+                let end = rest
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+                    })
+                    .unwrap_or(rest.len());
+                let mut path = rest[..end].to_string();
+                let cut_by_template = rest[end..].starts_with("${");
+                // `const API_BASE = '…'` — with the spaces; an HTML
+                // `href="…"` has none and is a fetch of exactly that path.
+                let assigned = before.ends_with(" = ");
+                if cut_by_template {
+                    if path.ends_with('/') {
+                        path.push_str("probe");
+                    }
+                } else if assigned {
+                    path.push_str("/probe");
+                } else if path.ends_with('/') {
+                    continue;
+                }
+                // The prefix of a fully dynamic path names no route.
+                if path == "/api/probe" {
+                    continue;
+                }
+                if !found.iter().any(|(p, _)| *p == path) {
+                    found.push((path, rel.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// A local-auth state with an empty credential store — enough to
+    /// mount the `/api/auth/*` routes, which `app()` leaves off.
+    fn empty_local_auth() -> Arc<LocalAuthState> {
+        let store = CredentialStore::load("/nonexistent/boss-test-credentials.toml")
+            .expect("empty credential store");
+        Arc::new(LocalAuthState {
+            store,
+            session_key: vec![0u8; 32],
+            http: reqwest::Client::new(),
+            audit: boss_gateway::audit::AuthAudit::disabled(),
+            guest_access: true,
+            oidc: None,
+            mail: boss_gateway::mail::from_env(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        })
+    }
+
+    /// The list above, derived — not remembered. `/api/stations` (#10),
+    /// `/api/yard/status` (#192), `/api/agent-runs` (#294) and
+    /// `/api/yard/regions` (#475) each shipped on the jobs upstream,
+    /// were fetched by a page, and 404'd at the human door because the
+    /// gateway's route table is the one place the path was not written
+    /// — and the REAL list above needed the same author to remember it
+    /// a second time. The fourth instance was found on David's screen
+    /// (the Train Yard's landing rendered `HTTP 404`). So the check now
+    /// reads the consumer: every `/api/...` literal in `apps/web/src`
+    /// must resolve on this router to something other than the
+    /// catch-all. A page cannot fetch a route the gateway does not have
+    /// without redding the gate.
+    #[tokio::test]
+    async fn every_api_path_the_web_fetches_is_routed() {
+        let paths = api_paths_the_web_fetches();
+        assert!(
+            paths.len() > 50,
+            "the scan found only {} paths — the web source moved or the scan broke",
+            paths.len()
+        );
+        let la = empty_local_auth();
+        let mut unrouted = Vec::new();
+        for (path, file) in &paths {
+            let (_, body) = get(app_with(Some(la.clone())), path).await;
+            if body.contains(MISS) {
+                unrouted.push(format!("{path}  (fetched by {file})"));
+            }
+        }
+        assert!(
+            unrouted.is_empty(),
+            "the web fetches {} path(s) the gateway does not route — each 404s at the \
+             human door; add the route beside its service's block in main.rs:\n  {}",
+            unrouted.len(),
+            unrouted.join("\n  ")
+        );
     }
 
     /// The four former landing-page pins, on an instance whose manifest
@@ -1288,6 +1460,89 @@ mod routing_tests {
                 "`{path}` reached the /api catch-all: {body}"
             );
         }
+    }
+
+    /// The observability health alias needs a session like every other
+    /// `/api/<service>/health` (backlog 240e03f3, the hardening
+    /// inventory's audit of the two unconditional public routes,
+    /// 2026-09-19). It was pinned public for the IT Monitoring page,
+    /// which reads it WITH a session like the other health paths it
+    /// probes (`/api/jobs/health` rides `/api/jobs/{*rest}`, gated) —
+    /// so the pin's only effect was a sessionless `{"status":"ok"}`
+    /// on every instance. Nothing else reads it: no manifest probe, no
+    /// observer, no script (grep on 2026-09-19). Same discriminator as
+    /// the snapshot: 401 before any upstream.
+    #[tokio::test]
+    async fn the_observability_health_alias_refuses_a_sessionless_caller() {
+        let (status, body) = get(app(), "/api/observability/health").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "`/api/observability/health` must be gated by the session proxy: {body}"
+        );
+        assert!(
+            !body.contains(MISS),
+            "`/api/observability/health` reached the /api catch-all: {body}"
+        );
+    }
+
+    /// The gateway's own liveness answer keeps answering a stranger,
+    /// now that the table and not this file registers it (backlog
+    /// bf1f5ad2, 2026-09-19). `boss doctor` reads it with no session
+    /// and the tunnel rotation verifies a new connector by asking for
+    /// it through the edge, so the move had to be invisible on the
+    /// wire: 200, `ok`, no session.
+    #[tokio::test]
+    async fn the_liveness_answer_is_still_ok_to_a_sessionless_caller() {
+        let (status, body) = get(app(), "/health").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, "ok", "the constant is the answer, unchanged");
+    }
+
+    /// The calendar feed is public BY DESIGN on every instance, whatever
+    /// the tenant declares (public_reads::PUBLIC_BY_DESIGN): the token
+    /// in the URL is the credential, because a calendar client cannot
+    /// hold a session cookie. The discriminator is the same as
+    /// everywhere in this module — the gated proxy answers 401 before
+    /// it forwards, the public one forwards (and, with no upstream in a
+    /// unit test, answers whatever the forward answers, never 401).
+    #[tokio::test]
+    async fn the_calendar_feed_is_public_by_design_on_an_instance_that_declares_nothing() {
+        let (status, body) = get(app(), "/ics/some-token.ics").await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "`/ics/{{token}}.ics` carries its own credential and must not meet the session gate: {body}"
+        );
+        assert!(
+            !body.contains(MISS),
+            "`/ics/some-token.ics` reached the /api catch-all: {body}"
+        );
+    }
+
+    /// EVERY SESSIONLESS READ IS A ROW. The route table in this file
+    /// registers no sessionless proxy of its own: the tenant-declared
+    /// reads and the by-design ones are both rows in public_reads.rs,
+    /// each with the reason it may be public, and that module is the
+    /// one place the hardening inventory reads to audit the door
+    /// (backlog 240e03f3). A `handle_public` written back into this
+    /// file is a door no inventory names. The needle is spelled in two
+    /// halves so this test's own text does not match it.
+    #[test]
+    fn the_route_table_registers_no_sessionless_proxy_of_its_own() {
+        let needle = concat!("proxy::handle_", "public");
+        let hits: Vec<usize> = include_str!("main.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle) && !l.trim_start().starts_with("//"))
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "main.rs registers a sessionless proxy directly at line(s) {hits:?} — every \
+             sessionless read is a row in public_reads.rs (PUBLISHABLE, declared by the \
+             tenant, or PUBLIC_BY_DESIGN, with its reason)"
+        );
     }
 
     /// Local-auth routes are registered AFTER the catch-all, on a

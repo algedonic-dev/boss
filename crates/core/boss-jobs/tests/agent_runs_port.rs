@@ -14,7 +14,7 @@ use boss_core::actor::ActorId;
 use boss_core::agent::{AgentCaps, BudgetDecision};
 use boss_jobs::agent_runs::{
     AGENT_RUN_DENIED, AGENT_RUN_RECORDED, AgentRunError, AgentRunLog, InMemoryAgentRuns,
-    NewAgentRun, RateCardRow, RunFilter, RunOutcome, TokenUsage, summarize,
+    NewAgentRun, PricingBasis, RateCardRow, RunFilter, RunOutcome, TokenUsage, summarize,
 };
 use boss_testing::assert_explicit_null;
 use chrono::{DateTime, Duration, Utc};
@@ -26,12 +26,14 @@ fn card() -> Vec<RateCardRow> {
             input_usd_micros_per_mtok: 5_000_000,
             output_usd_micros_per_mtok: 25_000_000,
             note: "Claude Opus 5 — $5.00/$25.00 per MTok".into(),
+            blended_input_share_ppm: None,
         },
         RateCardRow {
             model: "haiku-4-5".into(),
             input_usd_micros_per_mtok: 1_000_000,
             output_usd_micros_per_mtok: 5_000_000,
             note: "Claude Haiku 4.5 — $1.00/$5.00 per MTok".into(),
+            blended_input_share_ppm: None,
         },
     ]
 }
@@ -220,7 +222,7 @@ async fn what_did_the_whole_session_cost() {
 
     assert_eq!(summary.runs, 4);
     // The packet's headline number, now answerable: ~761,000 tokens.
-    assert_eq!(summary.total_tokens, 761_578);
+    assert_eq!(summary.total_tokens, Some(761_578));
     assert_eq!(summary.input_tokens, Some(685_422), "every run had a split");
     assert_eq!(summary.tool_calls, 52 + 91 + 68 + 98);
     assert_eq!(summary.wall_secs, (10 + 14 + 15 + 18) * 60);
@@ -398,7 +400,7 @@ async fn a_run_that_only_knows_its_total_is_still_a_record() {
         .expect("a total-only run is a well-formed run");
 
     assert!(out.recorded, "the run is on the record");
-    assert_eq!(out.run.run.tokens.total(), 142_982, "what it spent");
+    assert_eq!(out.run.run.tokens.total(), Some(142_982), "what it spent");
     assert_eq!(out.run.run.tokens.input(), None, "no split was measured");
     assert_eq!(out.run.model(), Some("opus-5"), "which model ran");
     assert_eq!(out.run.duration_secs(), 600, "how long it took");
@@ -409,11 +411,13 @@ async fn a_run_that_only_knows_its_total_is_still_a_record() {
         "which car it produced"
     );
     // And the one thing it cannot say, said as unknown rather than as
-    // free or as a blended guess.
+    // free. `opus-5` declares no blend on this card, so a bare total is
+    // unpriced — undeclared is unpriced, never assumed (91a9bfe7).
     assert_eq!(
         out.run.usd_micros, None,
-        "the card prices the halves differently, so a total has no price"
+        "no declared ratio, so a total has no price"
     );
+    assert_eq!(out.run.pricing_basis(), None, "no figure, no basis");
     assert_eq!(out.run.priced_by, None);
 
     // The fact still reached the log in full.
@@ -446,12 +450,21 @@ async fn a_nights_worth_of_total_only_runs_rolls_up_without_inventing_a_cost() {
     let summary = summarize(&log.list_runs(&RunFilter::default()).await.expect("lists"));
 
     assert_eq!(summary.runs, 3);
-    assert_eq!(summary.total_tokens, 633_285, "the tokens are all recorded");
+    assert_eq!(
+        summary.total_tokens,
+        Some(633_285),
+        "the tokens are all recorded"
+    );
     assert_eq!(summary.tool_calls, 52 + 91 + 85);
     assert_eq!(summary.wall_secs, (10 + 14 + 18) * 60);
     assert_eq!(
         summary.usd_micros, None,
-        "a set of total-only runs must not answer with a confident number"
+        "a set of total-only runs on a model that declares no blend must not answer with a \
+         confident number"
+    );
+    assert_eq!(
+        summary.pricing_basis, None,
+        "no figure, nothing to describe"
     );
     assert_eq!(summary.unpriced_runs, 3);
     assert_eq!(
@@ -468,7 +481,7 @@ async fn a_nights_worth_of_total_only_runs_rolls_up_without_inventing_a_cost() {
         summary
             .by_branch
             .iter()
-            .all(|g| g.usd_micros.is_none() && g.total_tokens > 0),
+            .all(|g| g.usd_micros.is_none() && g.total_tokens > Some(0)),
         "each car reports its tokens and declines to report a price"
     );
 }
@@ -490,7 +503,7 @@ async fn a_mixed_night_keeps_every_token_and_refuses_a_partial_bill() {
 
     let summary = summarize(&log.list_runs(&RunFilter::default()).await.expect("lists"));
     assert_eq!(summary.runs, 2);
-    assert_eq!(summary.total_tokens, 1_142_982);
+    assert_eq!(summary.total_tokens, Some(1_142_982));
     assert_eq!(summary.usd_micros, None);
     assert_eq!(summary.unpriced_runs, 1);
     assert_eq!(summary.total_only_runs, 1);
@@ -839,4 +852,54 @@ async fn a_run_that_started_while_the_cap_was_full_of_flights_is_refused() {
     log.record_run(&registered_at("run-after", 1, 11), &filer())
         .await
         .expect("nothing in flight at 01:11");
+}
+
+/// The gap design 91a9bfe7 closed, exercised through the port: the
+/// shape every coding agent on this pod actually reports — one number —
+/// recorded, PRICED at the model's declared blend, and saying through
+/// the roll-up that the figure is blended and not measured. Without
+/// that last part this is an estimate wearing a measurement's clothes,
+/// which is the condition David attached to the whole change.
+#[tokio::test]
+async fn a_total_only_run_on_a_model_that_declares_a_blend_is_priced_and_says_so() {
+    let log = InMemoryAgentRuns::new(vec![RateCardRow {
+        model: "opus-5[1m]".into(),
+        input_usd_micros_per_mtok: 5_000_000,
+        output_usd_micros_per_mtok: 25_000_000,
+        note: "Claude Opus 5, 1M context".into(),
+        // 87.5% input, as the migration seeds it from nine measured
+        // splits: a $7.50/MTok blend.
+        blended_input_share_ppm: Some(875_000),
+    }]);
+
+    let mut run = measured_total_only(
+        "feat/a-total-is-priced-at-a-declared-blend",
+        200_000,
+        40,
+        12,
+    );
+    run.actor_id = ActorId::agent("claude", "opus-5[1m]");
+    let out = log.record_run(&run, &filer()).await.expect("records");
+
+    assert_eq!(
+        out.run.usd_micros,
+        Some(1_500_000),
+        "200k tokens at $7.50/MTok"
+    );
+    assert_eq!(out.run.priced_by.as_deref(), Some("opus-5[1m]"));
+    assert_eq!(out.run.pricing_basis(), Some(PricingBasis::Blended));
+
+    let summary = summarize(&log.list_runs(&RunFilter::default()).await.expect("lists"));
+    assert_eq!(summary.usd_micros, Some(1_500_000));
+    assert_eq!(
+        summary.pricing_basis,
+        Some(PricingBasis::Blended),
+        "the roll-up must carry the basis, or the figure reads as measured"
+    );
+    assert_eq!(summary.blended_runs, 1);
+    assert_eq!(summary.unpriced_runs, 0, "the run is priced now");
+    // The price reached the log too, so a rebuild replays it — and the
+    // basis with it, being derived from the same two facts.
+    let events = log.recorded_events().await;
+    assert_eq!(events[0].payload["usd_micros"], 1_500_000);
 }

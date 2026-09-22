@@ -182,6 +182,15 @@ async fn main() -> Result<()> {
             Arc<dyn boss_jobs::cadence::CadenceRepository>,
             Arc<dyn boss_jobs::cadence::CadenceRegistry>,
         ) = (cadence.clone(), cadence);
+        // The dispatcher's firing record (backlog b14afc48), read-only:
+        // the world map's borders ask every machine when it last fired,
+        // and the reactive layer — the most automated hop there is —
+        // had no record to answer from.
+        let dispatcher_firings: Arc<
+            dyn boss_jobs::dispatcher_firings::DispatcherFiringsRepository,
+        > = Arc::new(boss_jobs::dispatcher_firings::PgDispatcherFirings::new(
+            pool.clone(),
+        ));
         // The delivery pipeline's policy content, served to the train
         // conductor through the same door as everything else it reads
         // (docs/design/delivery-as-protocol.md).
@@ -207,6 +216,13 @@ async fn main() -> Result<()> {
         // poll opens are the audit fact.
         let sensors: Arc<dyn boss_jobs::sensors::Sensors> =
             Arc::new(boss_jobs::sensors::PgSensors::new(pool.clone()));
+        // What a department IS (backlog 80a77466): the `departments`
+        // table, whose id IS the code a packet carries — not the
+        // employee Class drawer, which is the set of values an
+        // employee's `department` column may take.
+        let departments: Arc<dyn boss_jobs::department::registry::DepartmentRegistry> = Arc::new(
+            boss_jobs::department::registry::PgDepartments::new(pool.clone()),
+        );
         // The agents registry (design 6fda05ae): what an agent's login
         // resolves to at this service's door, the way a human's
         // resolves at the gateway's.
@@ -235,11 +251,13 @@ async fn main() -> Result<()> {
             Some(plugin_registry),
             Some(scheduling),
             Some(cadence),
+            Some(dispatcher_firings),
             Some(delivery),
             Some(credentials),
             Some(agent_runs),
             Some(surface_opens),
             Some(sensors),
+            Some(departments),
             agents,
             calendar,
             subject_kinds,
@@ -275,11 +293,13 @@ async fn run_server<R: JobsRepository + 'static>(
         Arc<dyn boss_jobs::cadence::CadenceRepository>,
         Arc<dyn boss_jobs::cadence::CadenceRegistry>,
     )>,
+    dispatcher_firings: Option<Arc<dyn boss_jobs::dispatcher_firings::DispatcherFiringsRepository>>,
     delivery: Option<Arc<dyn boss_jobs::delivery::DeliveryPolicyRepository>>,
     credentials: Option<Arc<dyn boss_jobs::credentials::CredentialsRegistry>>,
     agent_runs: Option<Arc<dyn boss_jobs::agent_runs::AgentRunLog>>,
     surface_opens: Option<Arc<dyn boss_jobs::surface_opens::SurfaceOpens>>,
     sensors: Option<Arc<dyn boss_jobs::sensors::Sensors>>,
+    departments: Option<Arc<dyn boss_jobs::department::registry::DepartmentRegistry>>,
     agents: Arc<dyn boss_jobs::agents::AgentsRegistry>,
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
@@ -362,6 +382,7 @@ async fn run_server<R: JobsRepository + 'static>(
         // two registries the /api/agents and /api/agent-runs doors
         // serve; without a run log there is no spend to measure and
         // every claim is admitted as before.
+        dispatcher_firings,
         agent_budget: agent_runs.as_ref().map(|log| {
             Arc::new(boss_jobs::agent_budget::BudgetDoor {
                 agents: agents.clone(),
@@ -442,11 +463,12 @@ async fn run_server<R: JobsRepository + 'static>(
     app = app.merge(boss_jobs::agents::http::router(
         boss_jobs::agents::http::AgentsApiState {
             registry: agents.clone(),
-            classes: agent_classes.clone(),
+            classes: agent_classes,
         },
     ));
-    // The departments the classes registry holds, and which of the six
-    // template parts each has (design 3613f0af, backlog 1dffde5d) —
+    // The departments the departments registry holds (the table, not
+    // the employee Class drawer — backlog 80a77466), and which of the
+    // six template parts each has (design 3613f0af, backlog 1dffde5d) —
     // every part read from a live registry, never a seed. The rules
     // part reads the dispatcher's own surface (`/api/dispatcher/rules`,
     // what is FIRING); the all-in-one pod serves it on boss-ports'
@@ -457,13 +479,13 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::department::rules::ReqwestDispatcherRules::new(dispatcher_url.clone()),
     );
     info!(
-        class_backed = agent_classes.is_some(),
+        roster_backed = departments.is_some(),
         %dispatcher_url,
         "departments mounted at /api/departments (+ /<code>/readiness)"
     );
     app = app.merge(boss_jobs::department::http::router(
         boss_jobs::department::http::DepartmentsApiState {
-            classes: agent_classes,
+            departments,
             kinds: department_kinds,
             jobs: department_jobs,
             sensors: department_sensors,

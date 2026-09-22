@@ -183,6 +183,47 @@ fn the_sign_off_is_fed_by_the_test_step() {
     }
 }
 
+/// THE TWO DRAFTING PROCEDURES NAME THE COMPLETION VERB (backlog
+/// d1c03a44, 2026-09-19). `boss brief` renders the procedure, and the
+/// procedure is all an analyst reads about how to record what it
+/// found. Left silent, each of the ~94 measure/file completions is a
+/// hand-built `boss-api PUT` — and each one is an opportunity for the
+/// three failures `boss step complete` refuses: an undeclared name
+/// stored as an annotation and answered 204, a wholesale `metadata`
+/// replace that deletes the step's own `procedure` and `agent` block,
+/// and a 204 read as evidence.
+///
+/// `measure` names the FILE door as well, because its three required
+/// fields are whole markdown documents: a document through argv is a
+/// quoting fight, and a backtick inside it is command substitution
+/// (backlog 2376b89e).
+#[test]
+fn the_drafting_procedures_name_the_completion_verb() {
+    let wf = bundled("page-audit");
+    for slug in ["measure", "file"] {
+        let procedure = step(&wf, slug).metadata_defaults["procedure"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{slug}` carries a procedure"));
+        assert!(
+            procedure.contains("boss step complete"),
+            "`{slug}` names the completion verb"
+        );
+        assert!(
+            procedure.contains(&format!("--step {slug}")),
+            "`{slug}` names its own slug in the call"
+        );
+    }
+    let measure = step(&wf, "measure").metadata_defaults["procedure"]
+        .as_str()
+        .expect("measure carries a procedure");
+    for field in ["controls_md", "needs_md", "gaps_md"] {
+        assert!(
+            measure.contains(&format!("--field-file {field}=")),
+            "measure passes `{field}` through the file door"
+        );
+    }
+}
+
 /// `styled` is the deferral, recorded by name: a marker the machine
 /// completes when the review approves (or the revision lands), feeding
 /// the ONE happy terminal. Two terminals off one decision would race;
@@ -256,5 +297,45 @@ fn a_materialised_audit_is_born_in_the_platform_admin_queue() {
             .unwrap_or_else(|| panic!("`{slug}` materialised"));
         assert_eq!(s.assignee_id, None, "`{slug}` is a marker, nobody's");
         assert!(s.metadata.get("authority_role").is_none());
+    }
+}
+
+/// Each of the four drafting steps declares HOW an agent runs it —
+/// the block the dispatch door refuses a step without (backlog
+/// 4a1b307c). All 47 page-audit packets opened on 2026-09-19 sat at
+/// `measure`, every one undispatchable: `human_only = false` said "an
+/// agent may do this" and the row said nothing about which agent, at
+/// what effort, under what spend.
+///
+/// THE SETTINGS THEMSELVES live in the bundle-wide roster
+/// (`platform_bundle_agent_blocks.rs`) and the reasoning for each
+/// lives beside its step in the TOML — three efforts across these
+/// four, because car e720dd00 made the declared effort select the
+/// definition the step actually runs under. This test asserts only
+/// that the four declare, so it cannot drift from that roster.
+#[test]
+fn the_four_agent_workable_steps_declare_how_an_agent_runs_them() {
+    let wf = bundled("page-audit");
+    for slug in ["measure", "file", "test", "revise"] {
+        assert!(
+            step(&wf, slug).agent.is_some(),
+            "`{slug}` is agent-workable and declares an agent block"
+        );
+    }
+}
+
+/// The founder's step is NOT an agent's, and neither is a marker. A
+/// block on `review` would hand the executor lane a sign-off the
+/// design reserved for David ("the agent drafts; David decides at
+/// `review`", design 0e07ce64), and a block on a marker would write
+/// four agent keys onto a step the machine completes on its own.
+#[test]
+fn the_sign_off_and_the_markers_declare_no_agent() {
+    let wf = bundled("page-audit");
+    for slug in ["opened", "review", "styled", "audited", "withdrawn"] {
+        assert!(
+            step(&wf, slug).agent.is_none(),
+            "`{slug}` is not an agent's step and declares no agent block"
+        );
     }
 }

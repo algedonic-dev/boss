@@ -969,9 +969,14 @@ impl ParkIntent {
     /// text, unattended on the forge, nothing there reads a warning. So
     /// the same findings `boss prove`'s `admit` says are said here,
     /// from the one definition in `boss_jobs::probe`. They WARN rather
-    /// than refuse, for the reason argued at that door: every shape fails
-    /// closed, so the worst it does is strand a car, and every detector
-    /// is a coarse text scan a false refusal would be too expensive for.
+    /// than refuse, for the reason argued at that door: every detector is
+    /// a coarse text scan a false refusal would be too expensive for.
+    /// FOUR of the six also fail closed, so the worst they do is strand
+    /// a car; the two added by e7cf78c6 — a counted page, a grep for a
+    /// bare name — can record a FALSE GREEN, and warn anyway only
+    /// because the text cannot tell them from the correct probes that
+    /// share their shape. Their wording says so, since that is what a
+    /// reader decides on.
     pub fn probe_warnings(&self) -> Vec<String> {
         match &self.probe {
             None => Vec::new(),
@@ -1032,12 +1037,13 @@ impl ParkIntent {
                  The forge runs a recorded probe with NO actor in its env, on purpose: the \
                  CLI there refuses an unnamed write by its own rule, and that refusal is \
                  what keeps a probe a read. A `boss` READ needs no actor — it goes out \
-                 signed operator:unidentified under the CLI's own platform-admin header, \
-                 which reads the whole world (one stderr line says so). Drop the \
-                 assignment; if the claim needs a write to be observed, it is not a probe \
-                 but an event — record the car as --park-proof-event.\n\n\
+                 signed operator:unidentified under the platform's own read role, \
+                 {reader_role}, the same one the probe's reader carries (one stderr line \
+                 says so). Drop the assignment; if the claim needs a write to be observed, \
+                 it is not a probe but an event — record the car as --park-proof-event.\n\n\
                  The rule is stated with the forge's tool list, \
-                 infra/forge/host-absent-tools.txt (the `boss` block)."
+                 infra/forge/host-absent-tools.txt (the `boss` block).",
+                reader_role = identity::READER_ROLE
             );
         }
         if let Some(probe) = &self.probe
@@ -1318,8 +1324,11 @@ impl ParkIntent {
 pub(crate) const AGENT_RUN_ENV: &str = "BOSS_AGENT_RUN";
 
 /// The key the run's id rides under on the gate-run — the `link` the
-/// landing rule's `jobs.complete_linked_step` follows.
-pub(crate) const AGENT_RUN_KEY: &str = "agent_run";
+/// landing rule's `jobs.complete_linked_step` follows. Defined ONCE,
+/// in core, because the step PUT now carries the same key forward
+/// (backlog b91a2103) and a second spelling here could drift from the
+/// one the server protects (CLAUDE.md §9a — collapse, do not pin).
+pub(crate) const AGENT_RUN_KEY: &str = boss_jobs::agent_runs::EDGE_KEY;
 
 /// The merging PATCH that records the run, or `None` when nothing
 /// names one. A blank value is nothing: an `export BOSS_AGENT_RUN=`
@@ -1673,9 +1682,9 @@ pub(crate) fn prior_runs_query(branch: &str, sha: &str) -> String {
     )
 }
 
-/// THE RED THIS LAUNCH RE-GATES, if any: the newest closed gate-run at
-/// the same branch and sha, judged `failed` or `lost` —
-/// `boss_jobs::flake::prior_red`, the one definition. Backlog
+/// WHAT THIS LAUNCH RE-GATES, if anything: the newest closed gate-run
+/// at the same branch and sha, when it was not green —
+/// `boss_jobs::flake::prior`, the one definition. Backlog
 /// 36cc4913: 4 of 11 red gates in two days were not the branch's
 /// fault, and each was recorded exactly like an author's red, so the
 /// flakiest check was a memory. A re-gate at an UNCHANGED head is the
@@ -1685,17 +1694,24 @@ pub(crate) fn prior_runs_query(branch: &str, sha: &str) -> String {
 /// verdict: a green stamps `flake_of` (the auto-park handler, which
 /// reads every green), a red stamps nothing.
 ///
+/// A PRIOR THAT REFUSED IS NOT A RED AND STAMPS NOTHING (backlog
+/// bd4e8fb1). It judged nothing about the branch, so there is no red to
+/// call a flake — the receipt says which it was, and `flake::prior`
+/// reads it. Gate-run 924b4cbe recorded `failed` over an edit-level
+/// lint that could not reach the registry; counted as a red, the green
+/// behind it would have put that lint's name in the FLAKES tally.
+///
 /// Never an automatic retry: a retry hides the flake; a named re-gate
 /// records it. BEST EFFORT: an unreadable record is `None` with a note,
 /// never a refusal — this is a stamp, not a gate condition, and a dark
 /// SoR must not stop a launch that `wait_for_verdict` is built to
 /// survive.
-async fn observe_prior_red(
+async fn observe_prior(
     http: &reqwest::Client,
     base: &str,
     branch: &str,
     sha: &str,
-) -> Option<boss_jobs::flake::PriorRed> {
+) -> Option<boss_jobs::flake::Prior> {
     match api_at(
         http,
         base,
@@ -1705,7 +1721,7 @@ async fn observe_prior_red(
     )
     .await
     {
-        Ok(body) => boss_jobs::flake::prior_red(&rows(body), branch, sha),
+        Ok(body) => boss_jobs::flake::prior(&rows(body), branch, sha),
         Err(e) => {
             eprintln!(
                 "boss gate: could not read earlier gate-runs at this head ({e:#}) — the gate \
@@ -2377,13 +2393,28 @@ pub async fn run(
         for d in &done.dropped {
             println!("boss gate: {}", d.line());
         }
+        // The move is stated in the past tense ONLY when the forge was
+        // re-read and holds it (18909a43): a push git accepted is an
+        // answer, not an effect, and this line once said "04ca1ae7 →
+        // 64ecfe32 (pushed with a lease)" of a branch that still read
+        // 04ca1ae7. A branch that did NOT end at the replayed head no
+        // longer reaches here at all — `rebase_onto_main` retries and
+        // then refuses — so the only remaining doubt is a forge that
+        // could not be re-read, and that doubt is printed.
         println!(
             "boss gate: --rebase replayed {} commit(s) of {branch} onto origin/main — {} → {} \
-             (pushed with a lease on the old head; your own worktree still has the old head: \
-             `git fetch origin && git reset --hard origin/{branch}` there when you are done)",
+             ({}; your own worktree still has the old head: `git fetch origin && git reset --hard \
+             origin/{branch}` there when you are done)",
             done.replayed,
             &done.old_head[..8.min(done.old_head.len())],
-            &done.new_head[..8.min(done.new_head.len())]
+            &done.new_head[..8.min(done.new_head.len())],
+            if done.confirmed {
+                "pushed with a lease on the old head and read back: the forge's branch holds it"
+            } else {
+                "pushed with a lease on the old head, but the forge could NOT be re-read to \
+                 confirm the branch holds it — check with `git ls-remote origin` before trusting \
+                 this line"
+            }
         );
         base_obs = crate::freshness::observe(std::path::Path::new("."), branch);
         // The packet records the head that is GATED — the replayed one.
@@ -2400,15 +2431,24 @@ pub async fn run(
     // here, AFTER the sha is final (a `--rebase` moves it, and a moved
     // head is the author's fix, not a re-gate), and before the packet,
     // so the operator reads the line beside the launch. See
-    // `observe_prior_red`.
-    let prior_red = if dry {
+    // `observe_prior`.
+    let prior = if dry {
         None
     } else {
-        observe_prior_red(&http, &jobs_base()?, branch, &sha).await
+        observe_prior(&http, &jobs_base()?, branch, &sha).await
     };
-    if let Some(p) = &prior_red {
-        println!("{}", boss_jobs::flake::launch_line(&sha, p));
-    }
+    // A REFUSAL SAYS SO AND STAMPS NOTHING; only a red carries forward.
+    let prior_red = match &prior {
+        Some(boss_jobs::flake::Prior::Red(p)) => {
+            println!("{}", boss_jobs::flake::launch_line(&sha, p));
+            Some(p)
+        }
+        Some(boss_jobs::flake::Prior::Refused { id, why }) => {
+            println!("{}", boss_jobs::flake::refusal_line(&sha, id, why));
+            None
+        }
+        None => None,
+    };
 
     // EVERY REFUSAL IS DECIDED HERE, BEFORE A PACKET EXISTS (fd217c65).
     // The bound, the queue cap, the legacy-workspace law and an
@@ -2531,7 +2571,7 @@ pub async fn run(
     // PATCH, best effort, a record and not an instruction. What acts on
     // it is the green verdict — `jobs.auto-park` reads `regate_of` off
     // the gate-run and stamps `flake_of` (backlog 36cc4913).
-    if let Some(p) = prior_red.as_ref().filter(|_| !dry)
+    if let Some(p) = prior_red.filter(|_| !dry)
         && let Err(e) = api(
             &http,
             reqwest::Method::PATCH,
@@ -3017,17 +3057,27 @@ fn red_verdict_detail(body: &Value) -> Option<String> {
         })
         .unwrap_or_default();
     let mut lines = if fails.is_empty() {
-        receipt
-            .get("checks")
-            .and_then(Value::as_array)
-            .map(|cs| {
-                cs.iter()
-                    .filter(|c| c.get("result").and_then(Value::as_str) != Some("pass"))
-                    .filter_map(|c| c.get("name").and_then(Value::as_str))
-                    .map(|n| format!("{n}: failed (this receipt names no test)"))
-                    .collect()
-            })
+        // THE ONE PREDICATE (backlog 873c5746). This branch used to
+        // carry its own `result != "pass"` filter, which counted a
+        // REFUSED entry as a failure — and a refused check answered
+        // nothing, so the name it carries is the lint's rather than
+        // the branch's. It was safe only by adjacency: the whole-
+        // verdict refusal returns above, so the duplicate never saw
+        // one. A receipt whose verdict is `failed` while a single
+        // check is `refused` reaches here and is exactly the case the
+        // adjacency does not cover.
+        //
+        // `fails` is still PREFERRED over this (the branch above):
+        // the two fields carry different things — `fails` holds the
+        // detail lines naming the test and the assertion, `checks`
+        // holds only a check name — and a console line wants the one
+        // that says WHAT failed. So the collapse is of the predicate,
+        // not of the precedence.
+        boss_jobs::flake::failing_checks(&receipt)
             .unwrap_or_default()
+            .into_iter()
+            .map(|n| format!("{n}: failed (this receipt names no test)"))
+            .collect()
     } else {
         fails
     };
@@ -4160,9 +4210,9 @@ mod tests {
         );
         // The rewrite it names is admitted.
         p.probe = Some(
-            "commit=$(git log -1 --format=%ct HEAD); last=$(boss-sor-read /api/audit | jq -r '.data[0].at // empty'); \
+            "since=$BOSS_CAR_CONVERGED_AT; last=$(boss-sor-read /api/audit | jq -r '.data[0].at // empty'); \
              [ -n \"$last\" ] || { echo 'not yet: no retire'; exit 75; }; \
-             [ \"$(date -u -d \"$last\" +%s)\" -gt \"$commit\" ] && echo retire:after-landing"
+             [ \"$(date -u -d \"$last\" +%s)\" -gt \"$since\" ] && echo retire:after-landing"
                 .into(),
         );
         p.require_complete().expect("epochs compare");
@@ -6123,6 +6173,38 @@ kind: Job\n\
             .is_none(),
             "nothing to read must stay silent rather than invent a cause"
         );
+
+        // A REFUSED CHECK IS NOT A FAILING CHECK (backlog 873c5746,
+        // and the rule boss_jobs::flake::REFUSED exists for). A lint
+        // that exited LINT_CANNOT_ANSWER is rewritten to
+        // `result: refused` precisely so a reader counting failures
+        // does not count it — and the name it carries is the lint's,
+        // not the branch's, so printing it accuses the wrong thing.
+        //
+        // This reaches the CHECKS fallback, which is the branch a
+        // whole-verdict refusal returns above: the verdict here is
+        // `failed`, not `refused`, so the early return does not fire.
+        // That adjacency is what made the duplicated predicate safe,
+        // and it is exactly one edit away from not being.
+        let mixed = json!({
+            "steps": [{
+                "spec_slug": "record-verdict",
+                "metadata": {"receipt":
+                    "{\"verdict\":\"failed\",\"checks\":[\
+                      {\"name\":\"clippy\",\"result\":\"fail\"},\
+                      {\"name\":\"audit-ordering\",\"result\":\"refused\"}]}"}
+            }]
+        });
+        let detail = red_verdict_detail(&mixed).expect("the real failure is still named");
+        assert!(
+            detail.contains("clippy"),
+            "the check that actually failed is named: {detail}"
+        );
+        assert!(
+            !detail.contains("audit-ordering"),
+            "a refused check must not be reported as a failure — it answered \
+             nothing, and its name is the lint's rather than the branch's: {detail}"
+        );
     }
 
     /// A REFUSAL LEADS WITH ITS REASON. Since 2026-09-18 a pre-flight
@@ -6399,6 +6481,18 @@ mod signing_tests {
             "an unnamed read must say so; head was:\n{head}"
         );
         assert!(!head.contains(crate::identity::CONDUCTOR), "{head}");
+        // Backlog d843abf2: and it arrives under the platform's own
+        // READ role, not the operator's — the header a stray shell or
+        // a forge probe reads with must not be a whole-world one.
+        assert!(
+            head.contains(&format!(r#""role":"{}""#, crate::identity::READER_ROLE)),
+            "an unnamed read must carry {}; head was:\n{head}",
+            crate::identity::READER_ROLE
+        );
+        assert!(
+            !head.contains("platform-admin"),
+            "an unnamed read must not carry the operator's role; head was:\n{head}"
+        );
     }
 }
 
@@ -6414,6 +6508,21 @@ mod regate_tests {
             "steps": [{ "spec_slug": "record-verdict", "metadata": {
                 "verdict": "failed",
                 "receipt": "{\"verdict\":\"failed\",\"checks\":[{\"name\":\"test\",\"result\":\"FAIL\",\"seconds\":9}]}"
+            }}]
+        })
+        .to_string()
+    }
+
+    /// A run the gate REFUSED before any check ran — the packet says
+    /// `failed` (the protocol's only word for it) while the receipt says
+    /// `refused` and carries the reason. Gate-run 924b4cbe's shape.
+    fn refused_run(id: &str, branch: &str, sha: &str) -> String {
+        json!({
+            "id": id, "kind": "gate-run", "status": "closed", "opened_on": "2026-09-19",
+            "metadata": { "branch": branch, "sha": sha, "opened_at": "2026-09-19T17:24:26Z" },
+            "steps": [{ "spec_slug": "record-verdict", "metadata": {
+                "verdict": "failed",
+                "receipt": "{\"verdict\":\"refused\",\"refused_because\":\"pre-flight lint a-car-stays-under-the-edit-level could not answer (exit 3): the edit-level endpoint answered HTTP 000\",\"checks\":[{\"name\":\"a-car-stays-under-the-edit-level\",\"result\":\"refused\",\"seconds\":0}]}"
             }}]
         })
         .to_string()
@@ -6447,9 +6556,11 @@ mod regate_tests {
     async fn a_prior_red_at_the_same_head_is_read_off_the_record() {
         let (base, stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "abc123"))).await;
         let http = reqwest::Client::new();
-        let prior = observe_prior_red(&http, &base, "fix/x", "abc123")
-            .await
-            .expect("a closed red at the same head is the prior");
+        let Some(boss_jobs::flake::Prior::Red(prior)) =
+            observe_prior(&http, &base, "fix/x", "abc123").await
+        else {
+            panic!("a closed red at the same head is the prior")
+        };
         assert_eq!(prior.id, "aaaa1111-0000");
         assert_eq!(prior.failed, vec!["test".to_string()]);
         let head = stub.await.unwrap().expect("the stub read a request");
@@ -6464,6 +6575,25 @@ mod regate_tests {
         );
     }
 
+    /// A PRIOR THAT REFUSED IS NOT A RED (backlog bd4e8fb1, measured on
+    /// gate-run 924b4cbe). The packet's verdict word is `failed` — the
+    /// gate-run protocol has no other — and the receipt beside it says
+    /// `refused` with the reason. The receipt wins here, so nothing is
+    /// stamped and the flake tally never learns the lint's name.
+    #[tokio::test]
+    async fn a_prior_that_refused_is_read_as_a_refusal_and_stamps_nothing() {
+        let (base, _stub) =
+            one_request(page(refused_run("bbbb2222-0000", "fix/x", "abc123"))).await;
+        let http = reqwest::Client::new();
+        let Some(boss_jobs::flake::Prior::Refused { id, why }) =
+            observe_prior(&http, &base, "fix/x", "abc123").await
+        else {
+            panic!("a receipt that says refused is a refusal, whatever the packet's word is")
+        };
+        assert_eq!(id, "bbbb2222-0000");
+        assert!(why.contains("a-car-stays-under-the-edit-level"), "{why}");
+    }
+
     /// A moved head is the author's fix, not a re-gate. The stub hands
     /// back a red at ANOTHER sha — what a server that ignored the
     /// `metadata=` parameter would do — and nothing is stamped.
@@ -6472,7 +6602,7 @@ mod regate_tests {
         let (base, _stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "def456"))).await;
         let http = reqwest::Client::new();
         assert!(
-            observe_prior_red(&http, &base, "fix/x", "abc123")
+            observe_prior(&http, &base, "fix/x", "abc123")
                 .await
                 .is_none()
         );
@@ -6484,7 +6614,7 @@ mod regate_tests {
     async fn an_unreachable_record_stamps_nothing_and_refuses_nothing() {
         let http = reqwest::Client::new();
         assert!(
-            observe_prior_red(&http, "http://127.0.0.1:9", "fix/x", "abc123")
+            observe_prior(&http, "http://127.0.0.1:9", "fix/x", "abc123")
                 .await
                 .is_none()
         );
