@@ -1728,7 +1728,7 @@ pub enum TenantAction {
     Init {
         /// The tenant_id: lowercase letters, digits and hyphens.
         name: String,
-        /// Directory to write into (default: ./<name>).
+        /// Directory to write into (default: `./<name>`).
         #[arg(long)]
         into: Option<PathBuf>,
     },
@@ -1770,6 +1770,15 @@ pub enum TenantAction {
         /// each service's own localhost port).
         #[arg(long)]
         gateway: Option<String>,
+        /// Read through the LAN machine door instead: ONE host, each
+        /// service on its own `boss_ports` port
+        /// (`infra/cluster/manifests/boss-jobs-internal.yaml`). Give
+        /// the address the estate spells as BOSS_JOBS_URL. This is the
+        /// off-cluster route — `--gateway` cannot be, because the
+        /// gateway signs its own identity from a session and answers a
+        /// sessionless reader 401.
+        #[arg(long, conflicts_with = "gateway")]
+        door: Option<String>,
         /// The tenant whose rows to export (default: the directory's
         /// own `[meta] tenant_id`; required when the directory has no
         /// manifest yet).
@@ -1898,6 +1907,7 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::Tenant(TenantAction::Export {
             dir,
             gateway,
+            door,
             tenant,
         }) => {
             let Some(tenant_id) = tenant
@@ -1911,8 +1921,18 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                     dir.display()
                 );
             };
-            let bases = crate::tenant_publish::Bases::resolve(gateway.as_deref());
-            println!("{}", bases.describe(gateway.as_deref()));
+            let (bases, routing) = match door.as_deref() {
+                Some(d) => (
+                    crate::tenant_publish::Bases::on_door(d)?,
+                    format!("routing: each service's own port on the machine door {d}"),
+                ),
+                None => {
+                    let bases = crate::tenant_publish::Bases::resolve(gateway.as_deref());
+                    let line = bases.describe(gateway.as_deref());
+                    (bases, line)
+                }
+            };
+            println!("{routing}");
             // The doors are blocking reqwest, like publish's.
             let snap = tokio::task::spawn_blocking({
                 let tenant_id = tenant_id.clone();
@@ -2677,7 +2697,10 @@ terminal = { outcome = "sponsored" }
         assert_eq!(seed.tax_kind.len(), 5);
         assert_eq!(seed.sales_tax_rate.len(), 27);
         let codes: Vec<String> = seed.account_codes().into_iter().collect();
-        assert_eq!(codes, ["2150", "2300", "2310", "2320", "6500"]);
+        // 6550 joined the five when the per-production kind took the
+        // expense account its accruals debit (backlog c0b83e13): the
+        // row is the one definition of both of a kind's accounts.
+        assert_eq!(codes, ["2150", "2300", "2310", "2320", "6500", "6550"]);
         let r = check(&boss_testing::repo_root().join("examples/brewery"));
         let row = status_of(&r, "seeds/tax.toml").unwrap();
         assert_eq!(row.status, Status::Ok, "{row:?}");

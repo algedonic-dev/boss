@@ -15,6 +15,12 @@
 //! completing, with every noun in the rule's args so the NEXT verb chain
 //! is a rule file and not a handler.
 //!
+//! One half of that measurement has since been repaired: `jobs.spawn`
+//! CAN pass an args list as of 4d53fae2 (2026-09-22), because the DSL
+//! gained a list literal. What is still missing here is the reading —
+//! `jobs.job.closed` carries no step output — so this handler's reason
+//! to exist is the verdict line, not the args.
+//!
 //! ## The rule's args
 //!
 //! - `verb` — which answered ops-request this rule judges.
@@ -94,6 +100,7 @@ use super::jobs_complete_linked_step::{FOR_REQUEST, VerbFailure, step_by_slug, v
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::{self, Value};
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
+use boss_jobs::channels::InputChannel;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -284,6 +291,7 @@ pub(crate) fn chain_refused_alert_body(
         "status": "open",
         "tags": [],
         "metadata": {
+            "input_channel": super::common::lane_label(InputChannel::PipelineFailure),
             "area": "platform",
             FOR_REQUEST: judged_id,
             "verb": j.verb,

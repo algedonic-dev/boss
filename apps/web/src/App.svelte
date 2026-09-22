@@ -12,11 +12,12 @@
   import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
-  import { loadClasses, departments } from '@boss/web-kit/session/classes.svelte';
+  import { loadClasses } from '@boss/web-kit/session/classes.svelte';
+  import { loadDepartments, departments } from '@boss/web-kit/session/departments.svelte';
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
-  import { appsFor, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
-  import { appForRoute, sectionForRoute } from './shell/sections';
+  import { appsFor, APP_SUBJECT_KINDS, ROUTE_CATALOG, type AppId } from './shell/nav-catalog';
+  import { appForRoute, moduleForRoute, sectionForRoute } from './shell/sections';
   import { makeSurfaceOpenRecorder, postSurfaceOpen, routePattern } from './shell/surface-opens';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
@@ -114,36 +115,16 @@
     recordSurfaceOpen(routePattern(route, window.location.pathname));
   });
 
-  // Map route.kind → tenant module-id. Routes whose module is
-  // flagged false in tenant.toml render a "not enabled" notice
-  // instead of an empty/broken page. Routes not listed here are
-  // always-on (jobs, people, finance, etc. — never gated).
-  function routeRequiredModule(kind: Route['kind']): { id: string; label: string } | null {
-    switch (kind) {
-      case 'support':
-      case 'service':
-      case 'shipping':
-      case 'shipmentDetail':  return { id: 'shipping',  label: 'Shipments' };
-      case 'calendar':        return { id: 'calendar',  label: 'Release calendar' };
-      case 'marketingAssets':
-      case 'marketingAsset':  return { id: 'marketing-assets', label: 'Marketing assets' };
-      case 'catalog':
-      case 'device':
-      case 'assets':
-      case 'asset':           return { id: 'equipment', label: 'Equipment' };
-      case 'shop':
-      case 'shopProduct':     return { id: 'shop',      label: 'Shop' };
-      // The QA hub is written for the playground tenant (its own
-      // manifest says so beside `qa = true`); a tenant that has not
-      // listed the module gets the module-off page, not its copy.
-      case 'qa':              return { id: 'qa',       label: 'QA' };
-      case 'exec':            return { id: 'exec',      label: 'Exec' };
-      default:                return null;
-    }
-  }
-
+  // Routes whose tenant module is not listed `true` in tenant.toml
+  // render a "not enabled" notice instead of an empty/broken page.
+  // Which module that is comes from the nav catalog — the same field
+  // that hides the surface's sidebar row — via `moduleForRoute`. This
+  // used to be a second, hand-written switch here, and it disagreed
+  // with the catalog: /ux/support was gated on 'shipping' (backlog
+  // f9b43965). A surface without a `module` in the catalog is
+  // always-on, as it always was.
   let blockedModule = $derived.by(() => {
-    const req = routeRequiredModule(route.kind);
+    const req = moduleForRoute(route);
     if (req && !moduleEnabled(req.id)) return req;
     return null;
   });
@@ -206,6 +187,7 @@
     loadManifest();
     loadStepTypeRegistry();
     loadClasses('employee');
+    loadDepartments();
     const onPop = () => {
       route = parseRoute(window.location.pathname);
     };
@@ -305,14 +287,24 @@
     {:else if route.kind === 'jobDetail'}
       <JobDetailPage jobId={route.jobId} />
     {:else if route.kind === 'service'}
+      <!-- Both queues filter by DEPARTMENT, and the code comes from
+           the route's own catalog entry. They filtered on a hardcoded
+           workflow kind until 2026-09-22 — `field-service` and `sale`,
+           both authored only in a tenant's seed bundle — so each
+           rendered its title and then, correctly and permanently, "No
+           jobs match" (backlog 423a531d). A department runs several
+           protocols (Sales: receive-a-sponsorship AND
+           receive-an-inquiry), so no single kind could have been right
+           either; the server resolves the department to the kinds
+           whose workflow row declares it. -->
       <JobsListPage
-        initialKind="field-service"
+        initialDepartment={ROUTE_CATALOG.service.department ?? ''}
         initialStatus="open"
         pageTitle="Service queue"
       />
     {:else if route.kind === 'sales'}
       <JobsListPage
-        initialKind="sale"
+        initialDepartment={ROUTE_CATALOG.sales.department ?? ''}
         initialStatus="open"
         pageTitle="Sales pipeline"
       />

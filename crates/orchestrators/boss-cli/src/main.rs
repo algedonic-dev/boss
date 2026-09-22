@@ -36,6 +36,7 @@ mod prove;
 mod publish;
 mod publish_requests;
 mod queue;
+mod reach;
 mod receipt;
 mod rerail;
 mod running;
@@ -138,7 +139,7 @@ enum Commands {
     Ops {
         /// Estate node id the request is for (forge, boss-gcp).
         host: String,
-        /// A verb name — a file infra/ops/verbs/<verb>.json.
+        /// A verb name — a file `infra/ops/verbs/<verb>.json`.
         verb: String,
         /// Positional args, one per param the verb declares.
         args: Vec<String>,
@@ -148,6 +149,20 @@ enum Commands {
         /// Validate and show what would be filed, without filing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Can THIS host open a TCP connection to `<ipv4>:<port>`? The
+    /// `reach` ops verb's one definition (backlog 9f00a805 car 3).
+    ///
+    /// One connect under a 4 s deadline, nothing sent, nothing read,
+    /// nothing mutated; one line out, exit 0 only when open. It was
+    /// `infra/forge/reach.sh` — bash and `/dev/tcp` — until the forge
+    /// had a `boss` binary to run instead (car 1 of the same item).
+    Reach {
+        /// A dotted IPv4 quad. Never a hostname: this host does not
+        /// resolve a name on a packet's behalf.
+        ip: String,
+        /// 1..=65535.
+        port: String,
     },
     /// Launch a gate for a branch — files or reuses the gate-run
     /// packet, renders the runner Job, and creates it.
@@ -163,7 +178,7 @@ enum Commands {
     Gate {
         /// Branch to gate.
         branch: String,
-        /// Gate mode: "auto" (or "--auto"), or "-p <crate>". Empty = full.
+        /// Gate mode: "auto" (or "--auto"), or "-p `<crate>`". Empty = full.
         ///
         /// Checked before the cluster is touched — an unknown mode is a
         /// refusal here, not a red gate forty minutes from now.
@@ -230,6 +245,23 @@ enum Commands {
         /// a forgotten one.
         #[arg(long, value_name = "REASON")]
         park_no_item: Option<String>,
+        /// Auto-park: the DESIGN whose plan this car builds. The item is
+        /// read off the design's `answers` edge and stamped as the
+        /// closing `backlog_item`, so the item closes when the car
+        /// lands — exactly as --park-backlog-item does, without the
+        /// builder having to go and find the item.
+        ///
+        /// A design's builder has the design in hand, not the item whose
+        /// triage routed to it. Measured 2026-09-19 (de6f28d6): cars
+        /// 2ef08389 and 6ca4cb63 were parked --park-no-item naming their
+        /// designs, and the items those designs answered sat at `build
+        /// (ready)` after the change landed in #472 and #474 until an
+        /// operator completed them by hand.
+        ///
+        /// For a plan of SEVERAL cars, only the last one closes the
+        /// item: name the item with --park-partial-item on the others.
+        #[arg(long, value_name = "DESIGN")]
+        park_design: Option<String>,
         /// Auto-park: the CAR this one must land BEHIND. The dock will not
         /// board this car until that one has landed, and says so by name
         /// on every board attempt until it does.
@@ -441,7 +473,7 @@ enum Commands {
         /// run — dispatch the packet the prompt names with the prompt as
         /// its brief (the run section comes back on stdout as the
         /// tool's updatedInput), link a run the prompt already carries,
-        /// or count an untracked run. <PACKET> is then the work-session
+        /// or count an untracked run. `<PACKET>` is then the work-session
         /// packet the run belongs to, or `-` for none.
         #[arg(long)]
         from_hook: bool,
@@ -478,7 +510,7 @@ enum Commands {
         #[arg(long, conflicts_with = "report")]
         effort: Option<String>,
         /// The other end of the run: record the builder's handback on
-        /// the run named by <PACKET>, complete its `reported` step when
+        /// the run named by `<PACKET>`, complete its `reported` step when
         /// the green has opened it, and write the finish to agent_runs.
         #[arg(long, requires = "summary")]
         report: bool,
@@ -625,9 +657,13 @@ enum Commands {
         /// (`--park-probe` / `--park-expect` on `boss gate`, copied to
         /// the car's `proof_probe` / `proof_expect`) instead of one
         /// given here. `--verified` defaults to the car's summary.
-        /// Runs HERE, on this box — the arrival rule runs the same text
-        /// on the forge host, so a probe can pass one place and be
-        /// unrunnable in the other (f9304366).
+        /// Runs HERE, on this box — as you, with no timeout — but in
+        /// the environment the forge's own door builds: the sanctioned
+        /// reader first on PATH and the read-scoped identity and port
+        /// table exported, so the two doors run one text one way
+        /// (18fee481). A probe that names a tool this machine has and
+        /// the forge does not can still pass here and be unrunnable
+        /// there (f9304366); that mismatch is named, not refused.
         #[arg(long, conflicts_with_all = ["probe", "expect", "exit_only"])]
         from_car: bool,
         /// The machine's door: what the forge's ops-runner runs for a
@@ -1078,7 +1114,7 @@ enum WorkflowAction {
         kind: String,
         /// The spec to publish: a JSON file, a workflow bundle file
         /// (`*.toml`), a single kind file
-        /// (infra/platform/workflows/<kind>.toml), or the bundle
+        /// (`infra/platform/workflows/<kind>.toml`), or the bundle
         /// directory itself (infra/platform/workflows) — the `kind`
         /// row is taken from it, one definition for seed and publish.
         spec: std::path::PathBuf,
@@ -1399,6 +1435,7 @@ async fn main() -> Result<()> {
             wait,
             dry_run,
         } => ops_request::run(host, verb, args, wait, dry_run).await,
+        Commands::Reach { ip, port } => reach::run(&ip, &port),
         Commands::Cadence { action } => match action {
             CadenceAction::Retire { name } => cadence::retire(&name).await,
             CadenceAction::Publish { file } => cadence::publish(&file).await,
@@ -1571,6 +1608,7 @@ async fn main() -> Result<()> {
             park_backlog_item,
             park_partial_item,
             park_no_item,
+            park_design,
             park_after,
             park_probe,
             park_probe_file,
@@ -1590,6 +1628,7 @@ async fn main() -> Result<()> {
                 backlog_item: park_backlog_item,
                 partial_item: park_partial_item,
                 no_item: park_no_item,
+                design: park_design,
                 boards_after: park_after,
                 probe: crate::prose::opt_text_or_file(
                     "--park-probe",

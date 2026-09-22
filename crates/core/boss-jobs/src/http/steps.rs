@@ -278,10 +278,119 @@ async fn dispatch_workflow_publish(
         })
 }
 
+/// What a step DEMANDS and what a request can actually PRODUCE.
+///
+/// ONE JUDGEMENT, CALLED FROM EVERY PATH THAT COMPLETES A STEP
+/// (backlog 148549c5). This used to live only inside
+/// `post_step_sign_off`, which made the control OPT-IN: a step reaches
+/// that path only when it also declares a required sign-off role, and
+/// everything else completes through the ordinary PUT below. Measured
+/// on packet d5efbb3c, 2026-09-22 — the first presence-assured step in
+/// the system was completed by a status flip with no ceremony, no
+/// stamp and no refusal, and the host then ran the verb it was gating.
+///
+/// `assurance_required` is a property of the STEP, so the answer must
+/// not depend on which door the caller used. §9a: one definition.
+///
+/// `Presence` is producible exactly one way — the gateway verified a
+/// WebAuthn assertion over `sha256(shape_hash || ":" || nonce)` and
+/// swapped the ticket for an `x-boss-presence` header, which the edge
+/// strips from every inbound request, so its presence here means the
+/// gateway itself vouched. The binding is re-checked against the
+/// step's CURRENT shape: a stale hash means the content moved after
+/// the ceremony, and an approval must not survive an edit it never saw.
+pub(super) struct Assured {
+    pub required: boss_core::job::Assurance,
+    pub produced: boss_core::job::Assurance,
+    pub presence_nonce: Option<String>,
+    /// What to tell a caller that fell short, or "" when it did not.
+    pub detail: &'static str,
+}
+
+impl Assured {
+    pub fn falls_short(&self) -> bool {
+        self.required > self.produced
+    }
+
+    /// The refusal both doors return, in one shape so a caller cannot
+    /// tell which door it knocked on.
+    pub fn refusal(&self) -> Response {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "step requires stronger assurance than this request carries",
+                "required": self.required,
+                "produced": self.produced,
+                "detail": format!(
+                    "this step requires proof of presence — a passkey assertion bound \
+                     to the step's shape hash.{}",
+                    self.detail
+                ),
+            })),
+        )
+            .into_response()
+    }
+}
+
+pub(super) fn judge_assurance(
+    floor: boss_core::job::Assurance,
+    step: &boss_core::job::Step,
+    step_id_str: &str,
+    user_id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Assured {
+    // The step's own requirement wins when it is stronger than the
+    // kind's floor; a Workflow may raise, never lower.
+    let required = step.assurance_required.unwrap_or_default().max(floor);
+    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
+    let claim = headers
+        .get("x-boss-presence")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let (produced, presence_nonce, detail) = match &claim {
+        Some(p)
+            if p["step_id"] == step_id_str
+                && p["shape_hash"] == shape.as_str()
+                && p["employee_id"] == user_id =>
+        {
+            (
+                boss_core::job::Assurance::Presence,
+                p["nonce"].as_str().map(String::from),
+                "",
+            )
+        }
+        Some(_) => (
+            boss_core::job::Assurance::Session,
+            None,
+            " A presence ticket WAS presented but did not match: either the step's \
+             content changed after the ceremony (stale shape hash — re-run it against \
+             the current content) or it was minted for a different step or actor.",
+        ),
+        None => (
+            boss_core::job::Assurance::Session,
+            None,
+            " Complete the passkey ceremony for this step \
+             (POST /api/auth/passkey/assert/begin, then .../finish) and retry with \
+             the issued ticket.",
+        ),
+    };
+    Assured {
+        required,
+        produced,
+        presence_nonce,
+        detail,
+    }
+}
+
 pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    // The presence claim rides here, exactly as it does on the sign-off
+    // door: `x-boss-presence`, stamped by the gateway and stripped from
+    // every inbound request, so this handler can judge the same way
+    // (backlog 148549c5).
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -329,6 +438,20 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // Same containment rule as the metadata PATCH and the claim route,
+    // which have carried it all along — this handler did not, and it is
+    // the most-used write of the three (packet 730ea77e). The step is
+    // found by its OWN id, so without this the path's job id is
+    // decorative: a fabricated one was accepted live on 2026-09-21, the
+    // step flipped on the real packet, and the caller got 204. What it
+    // costs is below this line, not here — `parent_job` reads
+    // `.ok().flatten()`, so a job id naming nothing becomes `None`, the
+    // event's subject and workflow fall back to empty strings, and the
+    // `if let Some(job)` at the foot skips BOTH the re-evaluator and the
+    // terminal close. The packet is left wedged with no error anywhere.
+    if old.job_id != job_id {
+        return (StatusCode::NOT_FOUND, "step not on this job").into_response();
+    }
 
     // The parent packet, fetched ONCE: the event stamp inherits its
     // partition, the step.done / step.assigned markers read
@@ -532,6 +655,36 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // value win.
     let is_flipping_to_done =
         old.status != StepStatus::Completed && step.status == StepStatus::Completed;
+
+    // THE ASSURANCE GUARD, on the path that completes almost every step
+    // in the system (backlog 148549c5). It used to live only in the
+    // sign-off endpoint, which made the control OPT-IN — a step reaches
+    // that door only when it also declares a required sign-off role.
+    // Measured live on packet d5efbb3c: the first presence-assured step
+    // was completed by a status flip, with `sign_offs: []` and no
+    // ceremony, and the host then ran the verb it was gating.
+    //
+    // SCOPED TO LEAVING THE OPEN STATES, not to every write. A metadata
+    // write to a step that stays ready needs no ceremony — the plan is
+    // put onto an approve step that way before anyone signs it, and
+    // refusing that would make a guarded step unusable rather than
+    // guarded. A SKIP counts: `ready_when` predicates read
+    // `steps.x.done`, which a skipped step satisfies, so skipping is
+    // completing by another name.
+    let is_leaving_open = !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && matches!(step.status, StepStatus::Completed | StepStatus::Skipped);
+    if is_leaving_open {
+        let floor = state
+            .step_registry
+            .get(&step.kind)
+            .map(|t| t.assurance_floor)
+            .unwrap_or_default();
+        let assured = judge_assurance(floor, &old, &step_id_str, &user.id, &headers);
+        if assured.falls_short() {
+            return assured.refusal();
+        }
+    }
+
     if is_flipping_to_done && step.completed_on.is_none() {
         step.completed_on = Some(boss_clock_client::now_from(&state.clock).await.date_naive());
     }
@@ -656,7 +809,36 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             from = status_word(old.status),
             "abort-from-any-state: aborted terminal completing past its blockers",
         );
-    } else if is_flipping_to_done && !step.blocked_by.is_empty() {
+    } else if is_flipping_to_done
+        && !step.blocked_by.is_empty()
+        // A STEP THE ENGINE HAS ALREADY OPENED IS NOT BLOCKED.
+        //
+        // `blocked_by` is a predicate-derived denormalised edge list
+        // FOR DAG RENDERING (CLAUDE.md §Steps), and it cannot express a
+        // disjunction: it lists every step the predicate REFERENCES,
+        // not the ones its truth actually required. So a `ready_when`
+        // of the shape `A OR B` lists both, and completing the step
+        // while only A holds was refused as "unresolved blockers".
+        //
+        // Measured 2026-09-22: the ops-request protocol gated `execute`
+        // on `steps.filed.done AND (NOT job.metadata.requires_approval
+        // OR steps.approve.done)`. With the flag absent the engine made
+        // execute READY on the `NOT` arm, and this guard refused the
+        // runner's completion over the pending approve step — 16
+        // requests jammed on the forge, the oldest 68 minutes,
+        // including a converge; `PUT failed … 409` once a minute for
+        // over an hour, answered=0.
+        //
+        // TWO READINGS OF ONE EDGE, AND THE PREDICATE IS THE AUTHORITY.
+        // The engine evaluates it; this list only draws it. Where they
+        // disagreed the drawing was winning.
+        //
+        // THE GUARD KEEPS ITS REAL JOB, which is a step completed OUT
+        // OF ORDER — one the engine has never opened. That is still
+        // refused below, and `a_pending_step_with_an_unresolved_blocker
+        // _is_still_refused` holds it.
+        && !matches!(old.status, StepStatus::Ready | StepStatus::Active)
+    {
         match state.jobs.resolve_blockers(&step.blocked_by).await {
             Ok(statuses) => {
                 // Missing blockers (returned-length < asked-length) are
@@ -1520,8 +1702,25 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             )
                 .into_response();
         }
+        // THE ROLE HALF, OVER BOTH VOCABULARIES (backlog 4b103f0f).
+        // A station's `capability.roles` is whatever the step's role
+        // selector spelled, and that is two vocabularies: a PLATFORM
+        // role (`platform-admin`, which every named CLI caller asserts
+        // about itself) or a Class code under `(employee, role)`
+        // (`engineering-agent`, which the agents registry holds and
+        // the dispatcher's roster nominates on). Judging only
+        // `user.role` read one of them, so an agent routed here by the
+        // role it HOLDS was refused by the role it ASSERTS — and the
+        // registry's `role` was read by nothing at the claim although
+        // the migration that added it says a role audience resolves to
+        // its holders, agents included (20260918022311). Both
+        // spellings, in the order they are decided: the request's
+        // first, the row's second.
+        let held_roles: Vec<&str> = std::iter::once(user.role.as_str())
+            .chain(agent_row.as_ref().and_then(|a| a.role.as_deref()))
+            .collect();
         if let Some(capability) = &row.capability
-            && !capability.allows_role(&user.role)
+            && !capability.admits_roles(&held_roles)
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -1529,6 +1728,10 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
                     "error": "role not admitted by station capability",
                     "station": station_name,
                     "role": user.role,
+                    // Every spelling the door compared, not only the
+                    // asserted one: a verdict an operator has to go
+                    // re-derive is not a verdict.
+                    "actor_roles": held_roles,
                     "allowed_roles": capability.roles,
                 })),
             )
@@ -1765,75 +1968,21 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, reason).into_response();
     }
 
-    // ASSURANCE: what this step demands, and what we can actually
-    // produce. The step's own requirement wins when it is stronger
-    // than the kind's floor; a Workflow may raise, never lower.
+    // ASSURANCE — the SAME judgement the ordinary step write makes, so
+    // the answer cannot depend on which door the caller used (§9a,
+    // backlog 148549c5).
     let floor = state
         .step_registry
         .get(&step.kind)
         .map(|t| t.assurance_floor)
         .unwrap_or_default();
-    let required = step.assurance_required.unwrap_or_default().max(floor);
-
-    // NO BYPASS, which is the point David settled in Q3: "an assurance
-    // level with a bypass is a comment, not a control." A stamp's
-    // assurance is what the server VERIFIED, never what the caller
-    // asked for. `Presence` is producible exactly one way: the
-    // gateway's passkey ceremony verified a WebAuthn assertion over
-    // sha256(shape_hash || ":" || nonce) and swapped the resulting
-    // ticket for an `x-boss-presence` header — a header the edge
-    // strips from every inbound request, so its presence here means
-    // the gateway itself vouched. We still re-check the binding
-    // against the step's CURRENT shape: a stale hash means the
-    // content moved after the ceremony, and the stamp must not
-    // survive an edit it never saw.
-    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
-    let presence_claim = headers
-        .get("x-boss-presence")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    let (produced, presence_nonce, presence_detail) = match &presence_claim {
-        Some(p)
-            if p["step_id"] == step_id_str.as_str()
-                && p["shape_hash"] == shape.as_str()
-                && p["employee_id"] == user.id.as_str() =>
-        {
-            (
-                boss_core::job::Assurance::Presence,
-                p["nonce"].as_str().map(String::from),
-                "",
-            )
-        }
-        Some(_) => (
-            boss_core::job::Assurance::Session,
-            None,
-            " A presence ticket WAS presented but did not match: either the step's \
-             content changed after the ceremony (stale shape hash — re-run it against \
-             the current content) or it was minted for a different step or actor.",
-        ),
-        None => (
-            boss_core::job::Assurance::Session,
-            None,
-            " Complete the passkey ceremony for this step \
-             (POST /api/auth/passkey/assert/begin, then .../finish) and retry with \
-             the issued ticket.",
-        ),
-    };
-    if required > produced {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "step requires stronger assurance than this request carries",
-                "required": required,
-                "produced": produced,
-                "detail": format!(
-                    "this step requires proof of presence — a passkey assertion bound \
-                     to the step's shape hash.{presence_detail}"
-                ),
-            })),
-        )
-            .into_response();
+    let assured = judge_assurance(floor, &step, &step_id_str, &user.id, &headers);
+    let produced = assured.produced;
+    let presence_nonce = assured.presence_nonce.clone();
+    if assured.falls_short() {
+        return assured.refusal();
     }
+    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
     if step
         .sign_offs
         .iter()
@@ -2145,6 +2294,29 @@ pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: Event
             "kind": step.kind,
             "subject_kind": subject_kind,
             "subject_id": subject_id,
+            // `workflow_kind` and `spec_slug` are hoisted to the
+            // payload root, and BOTH always present, exactly as
+            // `step.done.<kind>` hoists them and for the same reason:
+            // the dispatcher expr binder resolves flat top-level
+            // identifiers only, and an absent identifier is a
+            // PredicateFailed → Retry → dead-letter storm, not a quiet
+            // false.
+            //
+            // They are WHICH packet and WHICH step of it. The shared
+            // `step.ready.task` topic carries every task step on the
+            // board, so without these a "when this kind's step X
+            // becomes ready" rule had no `when` it could write and had
+            // to fetch the Job in a handler — which is what
+            // `ops.file_tag_release` and `maintenance.chore.file_reds`
+            // were written to do (backlog 4d53fae2, left by the
+            // builder of 89c95245).
+            //
+            // `workflow_kind` is "" only when the parent Job could not
+            // be read, like the subject fields above; `spec_slug` is
+            // "" for a step that has none (ad-hoc, or materialized
+            // before the column existed).
+            "workflow_kind": job.kind,
+            "spec_slug": step.spec_slug.clone().unwrap_or_default(),
             // A step assigned BEFORE it became ready notifies its
             // assignee, not the role's on-call member — the handler
             // prefers a named assignee when the payload carries one.

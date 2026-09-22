@@ -449,13 +449,13 @@ fn parse_instant(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 ///
 /// EVERY REFUSAL IS A VALUE COMPUTED HERE, from observations taken
 /// before any packet is filed — the whole of part 1 of fd217c65. The
-/// alternative fix, a `refused` terminal on the gate-run, needs a new
-/// workflow version: the protocol's `verdict` field is the closed enum
-/// `green|failed|lost` and each terminal is an `outcome` step keyed on
-/// it. That is a registry change to record a state that should not be
-/// recorded at all — a refusal is not an outcome of a run, it is the
-/// absence of one. So: no packet until there is a Job to attach it to,
-/// or a place in line for a live process to hold.
+/// gate-run now HAS a `refused` terminal (ff5b9634), and that is the
+/// right home for a run that launched and then declined — but not for
+/// this one, and the distinction is the whole reason no packet is filed
+/// here: a refusal decided before any Job exists is not an outcome of a
+/// run, it is the absence of one, and a packet recording it would be a
+/// gate-run that never ran a gate. So: no packet until there is a Job
+/// to attach it to, or a place in line for a live process to hold.
 #[derive(Debug)]
 pub(crate) enum Admission {
     /// A slot is free: file the packet and create the Job.
@@ -875,6 +875,12 @@ pub struct ParkIntent {
     pub partial_item: Option<String>,
     /// Why this car answers no item at all.
     pub no_item: Option<String>,
+    /// The DESIGN whose plan this car builds — how a design's car names
+    /// its item, since the builder has the design in hand and the item
+    /// is one edge away (`design-doc.answers`). Resolved to
+    /// `backlog_item` at launch and never stamped itself, so nothing
+    /// downstream learns a new word (backlog de6f28d6).
+    pub design: Option<String>,
     /// The car this one must land BEHIND — `--park-after`. Written on the
     /// car as the declared `boards_after` job edge, which the conductor's
     /// boarding filter reads (`boss_jobs::car::BOARDS_AFTER`).
@@ -905,16 +911,13 @@ pub use boss_jobs::probe::{
 /// The gate-run key each proof flag stamps. The auto-park handler
 /// reads these and writes the car's `proof_*` keys
 /// (`boss_jobs::car::PROOF_*`).
-pub const PARK_PROBE: &str = "park_probe";
-pub const PARK_EXPECT: &str = "park_expect";
-pub const PARK_PROOF_EVENT: &str = "park_proof_event";
+pub use boss_jobs::car::{PARK_EXPECT, PARK_PROBE, PARK_PROOF_EVENT};
 
 /// The gate-run keys the two non-closing item answers stamp. The
 /// auto-park handler copies them onto the car as
 /// `boss_jobs::car::PARTIAL_ITEM` / `NO_ITEM_REASON` — NEVER as
 /// `backlog_item`, which is the one key the arrival rule follows.
-pub const PARK_NO_ITEM: &str = "park_no_item";
-pub const PARK_PARTIAL_ITEM: &str = "park_partial_item";
+pub use boss_jobs::car::{PARK_NO_ITEM, PARK_PARTIAL_ITEM};
 
 /// The gate-run key `--park-after` stamps. The auto-park handler copies
 /// it onto the car as the declared `boss_jobs::car::BOARDS_AFTER` edge,
@@ -931,7 +934,9 @@ pub const PARK_PARTIAL_ITEM: &str = "park_partial_item";
 /// Borrowed from core rather than spelled here: the reader is a
 /// dispatcher handler in a crate this one cannot import, and a key that
 /// agreed by coincidence would be a hold nothing enforces (§9a).
-pub use boss_jobs::car::PARK_BOARDS_AFTER;
+pub use boss_jobs::car::{
+    PARK_BACKLOG_ITEM, PARK_BOARDS_AFTER, PARK_EXCLUDES, PARK_SUMMARY, PARK_TEST, PARK_VERIFIED,
+};
 
 impl ParkIntent {
     /// True when no `--park-*` flag was given: a plain gate.
@@ -943,6 +948,7 @@ impl ParkIntent {
             && self.backlog_item.is_none()
             && self.partial_item.is_none()
             && self.no_item.is_none()
+            && self.design.is_none()
             && self.boards_after.is_none()
             && self.probe.is_none()
             && self.expect.is_none()
@@ -1114,8 +1120,8 @@ impl ParkIntent {
     }
 
     /// WHICH ITEM DOES THIS CAR FIX — refuse park intent that does not
-    /// say. Exactly one of three answers, and the refusal is syntactic:
-    /// it reads the flags given, never the branch name or the diff.
+    /// say. Exactly one answer, and the refusal is syntactic: it reads
+    /// the flags given, never the branch name or the diff.
     ///
     /// THE GAP (e1325456, measured 2026-09-10). The edge that closes a
     /// backlog item when its fix lands was optional, so it was omitted:
@@ -1132,7 +1138,7 @@ impl ParkIntent {
     /// close by themselves, with no operator action, while eight others
     /// were closed by hand.
     ///
-    /// WHY THREE ANSWERS AND NOT ONE. A refusal that admitted only
+    /// WHY MORE THAN ONE ANSWER. A refusal that admitted only
     /// `--park-backlog-item` would pressure a builder into linking an
     /// item that should not be linked, and the failure mode would flip
     /// from residue a human notices to a silent premature close:
@@ -1145,6 +1151,11 @@ impl ParkIntent {
     ///   rule follows, so the item stays open for its other pieces.
     /// - `--park-no-item <reason>` — no item, and which kind of item-less
     ///   car this is.
+    /// - `--park-design <id>` — this car builds that DESIGN's plan; the
+    ///   item is the one the design's `answers` edge names, read at
+    ///   launch and stamped as `backlog_item`. Not a fourth SEMANTICS:
+    ///   the same closing edge, named through the packet the builder
+    ///   actually has in hand (de6f28d6).
     ///
     /// THE COST OF THE REFUSAL is seconds at the builder's terminal, and
     /// the thing it prevents costs a future session a read — the same
@@ -1164,6 +1175,7 @@ impl ParkIntent {
             ("--park-backlog-item", self.backlog_item.is_some()),
             ("--park-partial-item", self.partial_item.is_some()),
             ("--park-no-item", self.no_item.is_some()),
+            ("--park-design", self.design.is_some()),
         ]
         .into_iter()
         .filter(|(_, g)| *g)
@@ -1177,7 +1189,9 @@ impl ParkIntent {
                  --park-partial-item <id>    this car is ONE PIECE of that item — the edge is \
                  recorded, the item stays open\n  \
                  --park-no-item \"<reason>\"   this car answers no item — say which kind (asked \
-                 for in conversation, found while building something else)\n\n\
+                 for in conversation, found while building something else)\n  \
+                 --park-design <id>          this car builds that DESIGN's plan — the item is \
+                 the one the design answers, read off the design and closed like the first\n\n\
                  Measured 2026-09-10 (e1325456): 13 of 19 open cars named no item, so the \
                  arrival rule had nothing to route and each item stayed open after its fix was \
                  live in production — the residue CLAUDE.md §Engineering Session Startup step 4 \
@@ -1187,7 +1201,8 @@ impl ParkIntent {
             many => anyhow::bail!(
                 "{} together — pass exactly one. Which one decides whether the item CLOSES \
                  when this car lands, so there is nothing to rank: a car is an item's build, \
-                 or one piece of it, or answers no item.",
+                 or one piece of it, or answers no item. --park-design is the FIRST of those, \
+                 named through the design, so it never rides beside another.",
                 many.join(" and ")
             ),
         }
@@ -1215,6 +1230,20 @@ impl ParkIntent {
                 );
             }
         }
+        // A blank design has its OWN refusal, because it fails a step
+        // earlier than a blank item: there is no packet to read the
+        // `answers` edge off, so the car would launch having answered
+        // the item question with nothing.
+        if let Some(design) = &self.design
+            && design.trim().is_empty()
+        {
+            anyhow::bail!(
+                "--park-design names no design: there is no packet to read the answered item \
+                 off, so this car would launch having answered the item question with \
+                 nothing. Give the design-doc's id, or name the item directly with \
+                 --park-backlog-item <id>."
+            );
+        }
         // The ordering edge gets its own refusal, because a blank one
         // fails DIFFERENTLY from a blank item: the ref check reads `''`
         // as "no claim to check" (104), so the car would be filed with a
@@ -1234,8 +1263,8 @@ impl ParkIntent {
     }
 
     /// Every packet id a park intent names, with the flag that named it:
-    /// the item this car closes or is a piece of, and the car it boards
-    /// behind. Each is a reference the auto-park handler will write as a
+    /// the item this car closes or is a piece of, the design whose plan
+    /// it builds, and the car it boards behind. Each is a reference the auto-park handler will write as a
     /// job edge ON GREEN — an hour after this terminal, where a bad id is
     /// a refused edge on a dispatcher run and not a word to the builder.
     /// So the launcher resolves them now: `unresolvable` returns the ones
@@ -1250,6 +1279,7 @@ impl ParkIntent {
         match flag {
             "--park-backlog-item" => self.backlog_item = Some(full),
             "--park-partial-item" => self.partial_item = Some(full),
+            "--park-design" => self.design = Some(full),
             "--park-after" => self.boards_after = Some(full),
             _ => {}
         }
@@ -1259,6 +1289,7 @@ impl ParkIntent {
         [
             ("--park-backlog-item", self.backlog_item.as_deref()),
             ("--park-partial-item", self.partial_item.as_deref()),
+            ("--park-design", self.design.as_deref()),
             ("--park-after", self.boards_after.as_deref()),
         ]
         .into_iter()
@@ -1284,11 +1315,11 @@ impl ParkIntent {
                 m.insert(k.to_string(), json!(v));
             }
         };
-        put("park_summary", &self.summary);
-        put("park_excludes", &self.excludes);
-        put("park_test", &self.test);
-        put("park_verified", &self.verified);
-        put("park_backlog_item", &self.backlog_item);
+        put(PARK_SUMMARY, &self.summary);
+        put(PARK_EXCLUDES, &self.excludes);
+        put(PARK_TEST, &self.test);
+        put(PARK_VERIFIED, &self.verified);
+        put(PARK_BACKLOG_ITEM, &self.backlog_item);
         put(PARK_PARTIAL_ITEM, &self.partial_item);
         put(PARK_NO_ITEM, &self.no_item);
         put(PARK_BOARDS_AFTER, &self.boards_after);
@@ -1319,6 +1350,58 @@ impl ParkIntent {
     }
 }
 
+/// THE ITEM A DESIGN'S CAR CLOSES — read off the design, not typed
+/// (backlog de6f28d6).
+///
+/// A design's plan is built by cars, and the builder of one has the
+/// DESIGN in hand, not the item that routed to it. So the two cars
+/// measured on 2026-09-19 (2ef08389 for design 0524fc95, 6ca4cb63 for
+/// 01c3cc3f) were parked `--park-no-item` naming the design, and the
+/// items those designs answered — e38693d2 and ba429e7f — stayed at
+/// `build (ready)` after the change landed in #472 and #474, with no
+/// open car naming them. An operator completed both build steps by
+/// hand. Nothing was missing from the record: `design-doc.answers` is a
+/// declared, ref-checked job edge (migration
+/// 20260915023329-a-design-doc-names-the-feedback-it-answers) pointing
+/// at exactly that packet. It was never read at park time.
+///
+/// ONE RESOLUTION, NO NEW RULE. This returns the item, the launcher
+/// stamps it as `park_backlog_item`, and the merged rule
+/// (`complete-feedback-branch-on-car-merged`) closes it the way it
+/// closes every other linked item. The alternative — the design's
+/// `Settled` step completing the answered item once every car in its
+/// plan merged — needs a second rule, a notion of "every car in the
+/// plan" that nothing records, and fires at a moment no car owns.
+///
+/// SINGULAR, because the edge is. `design-doc.answers` is declared
+/// `job_id`, not `job_id_list`, and measured 2026-09-22 across all 46
+/// design-doc packets: 18 carry one id, 28 carry none, none carries a
+/// list. A design answers at most one packet, so this returns at most
+/// one item and the flag needs no iteration.
+pub fn item_a_design_answers(given: &str, packet: &Value) -> Result<String> {
+    let job = packet.get("data").unwrap_or(packet);
+    match job.get("kind").and_then(Value::as_str) {
+        Some("design-doc") => {}
+        Some(other) => bail!(
+            "--park-design {given} is a {other} packet, not a design-doc. The flag names the \
+             DESIGN whose plan this car builds; to name the item itself, pass \
+             --park-backlog-item {given}."
+        ),
+        None => bail!("--park-design {given}: the system of record answered a packet with no kind"),
+    }
+    match crate::design::answers_edge(job) {
+        Some(item) => Ok(item.to_string()),
+        // 28 of 46 designs are in this shape, so it is the ordinary
+        // answer and not a malformed packet: say which flag takes over.
+        None => bail!(
+            "--park-design {given} answers no packet: it was filed without --answers, so \
+             nothing ties its plan to a backlog item and there is no item for this car to \
+             close. Name the item with --park-backlog-item <id>, or say \
+             --park-no-item \"<reason>\"."
+        ),
+    }
+}
+
 /// The env var a dispatched builder exports so the gate it launches
 /// names the run that launched it (`boss dispatch` prints the id).
 pub(crate) const AGENT_RUN_ENV: &str = "BOSS_AGENT_RUN";
@@ -1343,6 +1426,41 @@ pub(crate) const AGENT_RUN_KEY: &str = boss_jobs::agent_runs::EDGE_KEY;
 /// `boss dispatch:` line prints. The shape here is the handler's own
 /// (`jobs_complete_linked_step::unusable_link`), and the refusal is
 /// raised before any packet is filed.
+/// The warning a park-intent gate leaves when NO run claims it.
+///
+/// WHY (backlog c8703bee). A gate carrying `--park-*` flags is an
+/// agent's car by construction — a hand gate does not park one. When
+/// `BOSS_AGENT_RUN` is unset, the gate-run records `agent_run` none,
+/// `agent-run-lands-on-gate-green` has no edge to follow, and the run
+/// sits at `building` until the silence rule ages it out as **died** —
+/// recording successful work as a failure and losing its cost from the
+/// table the claim door reads. Measured on three runs (25b148a2,
+/// f9d658dc, c6d8060a): all three built cars whose gates went green,
+/// all three gate-runs carry `agent_run` none. One builder said so in
+/// its own handback; the other two would have died silently.
+///
+/// A MALFORMED export is already refused above. ABSENCE was silent,
+/// which is the harder half: nothing distinguishes "hand gate, no run
+/// exists" from "dispatched run whose id never reached the shell".
+///
+/// A WARNING, NOT A REFUSAL. Hand-gating a car with park flags is
+/// legitimate — an operator repairing someone else's work does exactly
+/// that — and the refusal one function down already says "or unset it
+/// for a hand gate". So this says what will happen and lets it happen.
+pub(crate) fn no_run_warning(has_park_intent: bool, run: Option<&Value>) -> Option<String> {
+    if !has_park_intent || run.is_some() {
+        return None;
+    }
+    Some(format!(
+        "boss gate: WARNING — this gate parks a car and no run claims it \
+         ({AGENT_RUN_ENV} is unset). The gate-run will record `{AGENT_RUN_KEY}` none, so \
+         a dispatched run cannot land on the green and ages into `died` at the silence \
+         bound — successful work recorded as a failure (backlog c8703bee). If you were \
+         dispatched, the id is in the `== THE RUN ==` section of your prompt; export it \
+         and gate again. If you are hand-gating, this is expected and nothing is wrong."
+    ))
+}
+
 pub(crate) fn agent_run_patch(env: Option<String>) -> Result<Option<Value>> {
     let Some(id) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
         return Ok(None);
@@ -1732,6 +1850,42 @@ async fn observe_prior(
     }
 }
 
+/// The verdict word that belongs on the step BESIDE a receipt.
+///
+/// THE RECEIPT DECIDES, the same way the runner decides (backlog
+/// c67bdbae): `gate.sh` writes `verdict: refused` when it declined to
+/// judge at all, and a step that says something else beside it makes
+/// the packet contradict itself in one write. Until the protocol had
+/// the word this verb could only write `lost` — true of the verdict's
+/// fate, silent about the refusal, and indistinguishable from a runner
+/// that died without saying anything (backlog ff5b9634).
+///
+/// A word the protocol does not declare — no receipt, a receipt that
+/// would not parse, a verdict from some later tree — reads as `lost`:
+/// the conservative answer for a run whose record cannot be read, and
+/// never a guess the field validator would refuse.
+fn step_verdict(receipt: &Value) -> &'static str {
+    match receipt.get("verdict").and_then(Value::as_str) {
+        Some("green") => "green",
+        Some("failed") => "failed",
+        Some("refused") => "refused",
+        _ => "lost",
+    }
+}
+
+/// The `record-verdict` step's metadata for a receipt: the receipt
+/// itself as the JSON string `boss receipt` reads, and the one verdict
+/// word it names. Both refusal paths in this verb write through here so
+/// the two halves of the record cannot disagree — the failure mode
+/// measured on gate-run d14b0768, where the uploaded receipt said
+/// `refused` and the verdict beside it said something else.
+fn verdict_metadata(receipt: &Value) -> Result<Value> {
+    Ok(json!({
+        "verdict": step_verdict(receipt),
+        "receipt": serde_json::to_string(receipt)?,
+    }))
+}
+
 async fn close_refused(http: &reqwest::Client, packet: &str, reason: &str) {
     let result = async {
         let job = api(
@@ -1752,19 +1906,26 @@ async fn close_refused(http: &reqwest::Client, packet: &str, reason: &str) {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("gate-run {packet} has no verdict step"))?
             .to_string();
-        let receipt = serde_json::to_string(&json!({
-            "verdict": "lost",
+        // A LAUNCH REFUSED IS A REFUSAL, not silence: something
+        // declined out loud, with a reason, and no check ever ran. It
+        // was filed as `lost` only because the verdict enum had no
+        // other word until ff5b9634; `lost` means the environment died
+        // before saying anything, which is a different fact and reads
+        // as a dead runner to everyone downstream.
+        let receipt = json!({
+            "verdict": "refused",
             "head": "",
             "mode": "",
-            "fails": [format!("launch refused before any Job was created: {reason}")],
-        }))?;
+            "fails": [],
+            "refused_because": format!("launch refused before any Job was created: {reason}"),
+        });
         api(
             http,
             reqwest::Method::PUT,
             &format!("/api/jobs/{packet}/steps/{step_id}"),
             Some(json!({
                 "status": "completed",
-                "metadata": { "verdict": "lost", "receipt": receipt },
+                "metadata": verdict_metadata(&receipt)?,
             })),
         )
         .await?;
@@ -1773,7 +1934,7 @@ async fn close_refused(http: &reqwest::Client, packet: &str, reason: &str) {
     .await;
     match result {
         Ok(()) => println!(
-            "boss gate: refused launch closed its own packet ({} lost)",
+            "boss gate: refused launch closed its own packet ({} refused)",
             &packet[..8.min(packet.len())]
         ),
         Err(e) => eprintln!(
@@ -2209,6 +2370,9 @@ pub async fn run(
     // malformed export is refused here rather than stamped and skipped
     // an hour later in a journal nobody reads.
     let agent_run = agent_run_patch(std::env::var(AGENT_RUN_ENV).ok())?;
+    if let Some(w) = no_run_warning(!park.is_empty(), agent_run.as_ref()) {
+        eprintln!("{w}");
+    }
     let http = reqwest::Client::new();
     // EVERY PACKET THE PARK INTENT NAMES MUST EXIST, checked here at the
     // terminal. The auto-park handler writes these as job edges on
@@ -2279,6 +2443,26 @@ pub async fn run(
                  rather than typing it; an id is a sha.",
                 lines.join("\n")
             );
+        }
+        // A DESIGN'S CAR RESOLVES TO ITS ITEM HERE — after the design is
+        // known to exist, before anything is filed. The design is an
+        // INPUT to the item question, not an answer of its own, so it
+        // leaves as `backlog_item` and no rule, handler or gate-run key
+        // learns a new word (de6f28d6).
+        if let Some(design) = park.design.clone() {
+            let packet = api(
+                &http,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{design}"),
+                None,
+            )
+            .await
+            .with_context(|| format!("reading design {design} for --park-design"))?
+            .ok_or_else(|| anyhow::anyhow!("--park-design {design}: the SoR answered nothing"))?;
+            let item = item_a_design_answers(&design, &packet)?;
+            println!("boss gate: --park-design {design} answers item {item}");
+            park.design = None;
+            park.backlog_item = Some(item);
         }
     }
     // The concurrency bound: env override > delivery policy > compiled.
@@ -3314,20 +3498,22 @@ async fn record_refusal(http: &reqwest::Client, packet: &str, receipt: &Value) {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("gate-run {packet} has no verdict step"))?
             .to_string();
-        // The step's `verdict` is the closed enum green|failed|lost
-        // (gate-run.toml); `lost` is "the environment died", the same
-        // word `close_refused` uses for a launch that never made a Job.
-        // The refusal itself rides the receipt — `verdict: refused`,
-        // `refused_because` — exactly as gate.sh writes a headroom
-        // refusal, so `red_verdict_detail` and the train's strike rule
-        // read both the same way.
+        // THE STEP SAYS WHAT THE RECEIPT SAYS. `verdict` is the
+        // gate-run protocol's enum, and since ff5b9634 it carries
+        // `refused` — so this no longer has to file an out-loud
+        // refusal as `lost`, which meant "the environment died"
+        // and read to every consumer as a dead runner. The refusal
+        // still rides the receipt too (`verdict: refused`,
+        // `refused_because`), exactly as gate.sh writes a headroom
+        // refusal, so `red_verdict_detail` and the train's strike
+        // rule read both the same way.
         api(
             http,
             reqwest::Method::PUT,
             &format!("/api/jobs/{packet}/steps/{step_id}"),
             Some(json!({
                 "status": "completed",
-                "metadata": { "verdict": "lost", "receipt": serde_json::to_string(receipt)? },
+                "metadata": verdict_metadata(receipt)?,
             })),
         )
         .await?;
@@ -3985,6 +4171,12 @@ mod tests {
             backlog_item: Some("7c9e376d".into()),
             partial_item: Some("cf0f5e2d".into()),
             no_item: Some("asked in chat".into()),
+            // Stamps NOTHING — `--park-design` is resolved to
+            // `backlog_item` at launch and never reaches the gate-run
+            // under a key of its own, so there is no key for
+            // `clear_patch` to clear either (de6f28d6). It is set here
+            // only to keep this literal exhaustive.
+            design: Some("0524fc95".into()),
             boards_after: Some("a1b2c3d4".into()),
             probe: Some("true".into()),
             expect: Some("x".into()),
@@ -4597,6 +4789,119 @@ mod tests {
         p.backlog_item = Some("7c9e376d".into());
         assert!(p.require_complete().is_ok());
         assert_eq!(p.metadata_patch()["park_backlog_item"], "7c9e376d");
+    }
+
+    /// A DESIGN'S CAR NAMES ITS ITEM THROUGH THE DESIGN (de6f28d6).
+    ///
+    /// Measured 2026-09-19: cars 2ef08389 and 6ca4cb63 built the plans of
+    /// designs 0524fc95 and 01c3cc3f and were parked `--park-no-item`
+    /// naming the design, because the design is what the builder had in
+    /// hand. The items those designs answered (e38693d2, ba429e7f) sat at
+    /// `build (ready)` after the change landed (#472, #474) with no open
+    /// car naming them, and an operator completed both by hand. Nothing
+    /// was missing from the record: `design-doc.answers` is a declared,
+    /// ref-checked job edge naming exactly that item. It was simply never
+    /// read at park time.
+    #[test]
+    fn a_design_resolves_to_the_item_its_answers_edge_names() {
+        let design = json!({
+            "id": "0524fc95-0000-0000-0000-000000000000",
+            "kind": "design-doc",
+            "metadata": {"answers": "e38693d2-b0fc-4bea-ac06-101059ccf586"},
+        });
+        assert_eq!(
+            item_a_design_answers("0524fc95", &design).unwrap(),
+            "e38693d2-b0fc-4bea-ac06-101059ccf586"
+        );
+        // The jobs API wraps a single Job in `data`; the same read
+        // answers either shape, as the resolution loop above does.
+        assert_eq!(
+            item_a_design_answers("0524fc95", &json!({"data": design})).unwrap(),
+            "e38693d2-b0fc-4bea-ac06-101059ccf586"
+        );
+    }
+
+    /// A design filed WITHOUT `--answers` ties its plan to no item, and
+    /// the refusal says which flag to reach for instead. Measured
+    /// 2026-09-22: 28 of the 46 design-doc packets carry no `answers`, so
+    /// this is the common shape, not the odd one.
+    #[test]
+    fn a_design_that_answers_nothing_is_refused_naming_the_two_escapes() {
+        let e = item_a_design_answers(
+            "acedf981",
+            &json!({"kind": "design-doc", "metadata": {"title": "x"}}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("acedf981"), "name the design: {e}");
+        assert!(e.contains("--park-backlog-item"), "{e}");
+        assert!(e.contains("--park-no-item"), "{e}");
+    }
+
+    /// `--park-design` names a DESIGN. Pointed at the item itself it
+    /// would read `answers` off a backlog-item, find none, and refuse for
+    /// the wrong reason — so the kind is checked first and the refusal
+    /// names the flag that takes the id given.
+    #[test]
+    fn a_park_design_pointed_at_a_non_design_is_refused_by_kind() {
+        let e = item_a_design_answers("e38693d2", &json!({"kind": "backlog-item", "metadata": {}}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("backlog-item"), "name the kind it found: {e}");
+        assert!(e.contains("--park-backlog-item"), "{e}");
+    }
+
+    /// `--park-design` ANSWERS THE ITEM QUESTION. It is not a fourth kind
+    /// of answer: it is how a design's car names the item, resolved to
+    /// `backlog_item` at launch. So the syntactic check admits it alone,
+    /// and refuses it beside an answer that would name a different item.
+    #[test]
+    fn a_design_is_an_item_answer_and_never_rides_beside_another() {
+        let mut p = park_full();
+        p.design = Some("0524fc95".into());
+        p.require_item_answer()
+            .expect("a design answers the question");
+        assert_eq!(
+            p.named_refs(),
+            vec![("--park-design", "0524fc95")],
+            "the design is resolved against the SoR like every other id a park names"
+        );
+        p.backlog_item = Some("e38693d2".into());
+        let e = p.require_item_answer().unwrap_err().to_string();
+        assert!(e.contains("--park-design"), "{e}");
+        assert!(e.contains("--park-backlog-item"), "{e}");
+        let mut blank = park_full();
+        blank.design = Some("  ".into());
+        let e = blank.require_item_answer().unwrap_err().to_string();
+        assert!(e.contains("--park-design names no design"), "{e}");
+    }
+
+    /// The design is an INPUT, not a key on the gate-run: it resolves to
+    /// `park_backlog_item`, which is the one key the arrival rule
+    /// follows, so no rule and no handler learns a new word. A design
+    /// left unresolved must therefore stamp nothing at all rather than a
+    /// key nothing reads.
+    #[test]
+    fn a_design_stamps_no_key_of_its_own() {
+        let mut p = park_full();
+        p.design = Some("0524fc95".into());
+        assert!(!p.is_empty(), "a lone --park-design is park intent");
+        let m = p.metadata_patch();
+        assert!(m.get("park_design").is_none(), "{m}");
+        assert!(
+            m.get(PARK_BACKLOG_ITEM).is_none(),
+            "nothing resolved yet: {m}"
+        );
+        p.set_named_ref(
+            "--park-design",
+            "0524fc95-0000-0000-0000-000000000000".into(),
+        );
+        p.backlog_item = Some("e38693d2-b0fc-4bea-ac06-101059ccf586".into());
+        p.design = None;
+        assert_eq!(
+            p.metadata_patch()[PARK_BACKLOG_ITEM],
+            "e38693d2-b0fc-4bea-ac06-101059ccf586"
+        );
     }
 
     /// WHICH ITEM DOES THIS CAR FIX — the question auto-park used to let
@@ -5908,6 +6213,45 @@ kind: Job\n\
         assert_eq!(reusable_packet(&open, "fix/x", "deadbeef"), None);
     }
 
+    /// A REFUSAL REACHES THE STEP AS A REFUSAL (backlog ff5b9634). Both
+    /// refusal paths in this verb — the pod that never started its
+    /// containers, and the launch refused before any Job existed —
+    /// wrote `lost` beside a receipt that said `refused`, because the
+    /// protocol's verdict enum had no other word. It has one now, so
+    /// the step takes the receipt's word rather than a second reading
+    /// of the situation (§9a: the fact lives once, on the receipt).
+    #[test]
+    fn the_step_takes_the_refusal_word_off_the_receipt() {
+        assert_eq!(
+            step_verdict(&unstarted_receipt(9, &PodStart::default())),
+            "refused",
+            "the pod-never-started receipt says refused; the step beside it must agree"
+        );
+        assert_eq!(step_verdict(&json!({"verdict": "green"})), "green");
+        assert_eq!(step_verdict(&json!({"verdict": "failed"})), "failed");
+        // Unreadable is not a guess: no receipt, no verdict, or a word
+        // this tree does not know all read as `lost` — the one verdict
+        // that claims nothing and that the field validator accepts.
+        assert_eq!(step_verdict(&json!({})), "lost");
+        assert_eq!(step_verdict(&json!({"verdict": "sideways"})), "lost");
+        assert_eq!(step_verdict(&json!(null)), "lost");
+    }
+
+    /// …and both refusal paths write that word through ONE shape, so
+    /// the verdict and the receipt beside it cannot disagree. The
+    /// receipt rides as a JSON string, the encoding `boss receipt`
+    /// reads.
+    #[test]
+    fn a_refusal_and_its_receipt_are_written_as_one_metadata() {
+        let receipt = json!({"verdict": "refused", "head": "", "mode": "", "fails": [],
+                             "refused_because": "the disk floor refused"});
+        let md = verdict_metadata(&receipt).expect("a receipt serializes");
+        assert_eq!(md["verdict"], "refused");
+        let carried: Value = serde_json::from_str(md["receipt"].as_str().expect("a JSON string"))
+            .expect("the receipt rides as a JSON string");
+        assert_eq!(carried, receipt, "the receipt is copied, not retyped");
+    }
+
     /// The receipt is a JSON string on the record-verdict step — the
     /// encoding run.sh writes and `boss receipt` reads.
     #[test]
@@ -6338,6 +6682,53 @@ mod agent_run_tests {
         assert_eq!(agent_run_patch(Some("  ".into())).unwrap(), None);
         assert_eq!(agent_run_patch(None).unwrap(), None);
         assert_eq!(AGENT_RUN_ENV, "BOSS_AGENT_RUN");
+    }
+
+    /// A gate that parks a car and has no run says so (backlog
+    /// c8703bee): three runs built green cars whose gate-runs carry
+    /// `agent_run` none, so the landing rule had no edge to follow and
+    /// each would have aged into `died` — successful work recorded as a
+    /// failure.
+    #[test]
+    fn a_park_intent_with_no_run_warns_and_says_what_will_happen() {
+        let w = no_run_warning(true, None).expect("a parked car with no run is warned about");
+        assert!(
+            w.contains("BOSS_AGENT_RUN"),
+            "the warning names the export that is missing: {w}"
+        );
+        assert!(
+            w.contains("died"),
+            "and the consequence, which is the part nobody would guess: {w}"
+        );
+        assert!(
+            w.contains("hand-gating"),
+            "and that a hand gate is legitimate, so the warning is not read as a fault: {w}"
+        );
+    }
+
+    /// THE TWO CONTROLS, and both are needed. A gate with a run is
+    /// fine; a gate with no park intent is a hand gate and was never
+    /// going to land a run. Without these the warning would fire on
+    /// every `boss gate` an operator runs, which is how a warning
+    /// becomes noise and then becomes unread.
+    #[test]
+    fn a_run_or_no_park_intent_is_not_warned_about() {
+        let run = json!({ AGENT_RUN_KEY: "5b1d2c3e-0000-4000-8000-000000000001" });
+        assert_eq!(
+            no_run_warning(true, Some(&run)),
+            None,
+            "a parked car whose run claims it is exactly right"
+        );
+        assert_eq!(
+            no_run_warning(false, None),
+            None,
+            "a bare gate parks nothing, so no run was ever going to land on it"
+        );
+        assert_eq!(
+            no_run_warning(false, Some(&run)),
+            None,
+            "and a run without a park intent is not this defect either"
+        );
     }
 
     /// A prefix, a branch, or anything the landing handler would skip

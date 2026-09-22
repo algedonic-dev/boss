@@ -585,6 +585,122 @@ impl Conductor {
     // own `skip_reason`. An operator's `boss train cancel` still fills
     // the same terminal with its `--reason`, on its own path.
 
+    /// Log a refused board, and file ONE packet when the refusal is the
+    /// kind that will not clear itself.
+    ///
+    /// WHY THIS EXISTS (backlog 6baabd43). From 04:27Z to 13:49Z on
+    /// 2026-09-19 no train departed. The conductor never stopped and
+    /// never failed: every minute it took its lock, ran preflight,
+    /// evaluated all three parked cars and logged in full — naming the
+    /// branches and the conflicting files. Nine and a half hours of
+    /// perfect diagnosis with zero reach, while the yard rendered
+    /// `3 cars parked — a train is due`, which is what it says two
+    /// minutes after a healthy departure.
+    ///
+    /// NOT EVERY NON-DEPARTURE. `refusal_persists` is the split, and it
+    /// is the whole design: an idle dock, a car waiting on a
+    /// predecessor in flight, a host short of disk — all clear
+    /// themselves, and alarming on them is how a check becomes noise
+    /// and then becomes unread. Only the three that repeat identically
+    /// until a person acts get a packet.
+    ///
+    /// NO TIMER, because none is needed: the conductor returns early on
+    /// `BOARDING HELD — track occupied`, so a refusal reaching here has
+    /// already proven the track is clear. A persistent refusal with an
+    /// empty track is a stopped pipeline by construction.
+    ///
+    /// DEDUPLICATED BY THE PACKET ITSELF. While one is open no twin is
+    /// filed, so the alarm does not become the thing it is warning
+    /// about — and closing it is what re-arms it.
+    async fn record_no_departure(&self, refusal: &NoDeparture) -> Result<()> {
+        let line = no_departure_line(refusal);
+        log(&line);
+        if !crate::train::boarding::refusal_persists(refusal) || self.cfg.dry {
+            return Ok(());
+        }
+        let open = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=user-feedback&status=open&limit=100",
+                None,
+            )
+            .await?,
+        )?;
+        let already = open.iter().find(|j| {
+            j.get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with("Boarding stalled:"))
+        });
+        if let Some(alarm) = already {
+            return self.escalate_boarding_stall(alarm, &line).await;
+        }
+        log("boarding stalled on a refusal that will not clear itself — filing a packet");
+        let owner = self.owner_for_filing().await;
+        self.api(
+            Method::POST,
+            "/api/jobs",
+            Some(crate::train::stranded::no_departure_alarm_body(
+                &line,
+                &owner,
+                Utc::now(),
+            )),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Grow the number on an alarm nobody has read yet.
+    ///
+    /// WHY (backlog 94896e74). The dedup above is right and stays: while
+    /// the packet is open no twin is filed, and closing it re-arms the
+    /// alarm. But "already filed" was also "nothing further happens",
+    /// and on 2026-09-22 that meant a packet filed at 07:01Z sat
+    /// unchanged while the identical refusal fired ~420 more times until
+    /// 14:21Z. The packet was already `priority: urgent` at filing, so
+    /// there is no priority left to raise; what an operator is owed is
+    /// the WAIT, on the packet, growing. `stall_escalation` is the
+    /// decision — a finite three-rung ladder, so a stall of any length
+    /// costs at most three writes and the escalation can never become
+    /// the flood it warns about.
+    ///
+    /// An alarm from before this stamp existed carries no
+    /// `stalled_since`; it is stamped here and judged from the next
+    /// window, rather than having a duration invented for it from a
+    /// date-level `opened_on`.
+    async fn escalate_boarding_stall(&self, alarm: &Value, line: &str) -> Result<()> {
+        let jid = job_id(alarm)?.to_string();
+        let now = Utc::now();
+        if metadata_map(alarm).get("stalled_since").is_none() {
+            self.merge_job_metadata(&jid, vec![("stalled_since", json!(now.to_rfc3339()))])
+                .await?;
+            return Ok(());
+        }
+        let Some(escalation) = stall_escalation(alarm, now) else {
+            return Ok(());
+        };
+        log(format!(
+            "boarding stalled {} minutes and still refusing — escalating packet {} to {} of {}",
+            escalation.minutes,
+            id8(&jid),
+            escalation.level,
+            STALL_ESCALATION_MINS.len()
+        ));
+        self.merge_job_metadata(
+            &jid,
+            vec![
+                ("escalation_level", json!(escalation.level)),
+                ("stalled_minutes", json!(escalation.minutes)),
+                ("escalated_at", json!(now.to_rfc3339())),
+                (
+                    "message",
+                    json!(stall_escalation_message(&escalation, line)),
+                ),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Settle gate-runs whose runner died without reporting: complete
     /// `record-verdict` as `lost`, the terminal the workflow already
     /// provides for exactly this. NOT green and NOT failed — the checks
@@ -2674,7 +2790,8 @@ impl Conductor {
                 // condition itself — a host short of disk — is already
                 // a packet: the estate observer files and refreshes one
                 // for the host, and it does not arrive once a minute.
-                log(no_departure_line(&NoDeparture::HostShort { reason }));
+                self.record_no_departure(&NoDeparture::HostShort { reason })
+                    .await?;
                 return Ok(());
             }
             host_readiness::Readiness::Unverifiable { reason } => {
@@ -2703,7 +2820,8 @@ impl Conductor {
             // full of cars the ordering filter held — and whether this
             // window is self-clearing or waiting on a person is precisely
             // what an operator reads the line to learn.
-            log(no_departure_line(&empty_dock_refusal(&left_behind)));
+            self.record_no_departure(&empty_dock_refusal(&left_behind))
+                .await?;
             return Ok(());
         }
 
@@ -2797,13 +2915,25 @@ impl Conductor {
                 // the yard renders and the line the operator greps
                 // must never tell different stories.
                 let reason = skip_reason_conflict(&conflicted, self.policy.skip_reason_file_budget);
-                log(format!("{branch}: {reason} — left for the next train"));
+                let skips = next_skip_count(&j);
+                log(format!(
+                    "{branch}: {reason} — left for the next train (refused {skips}x in a row)"
+                ));
                 left_behind.push(json!({
                     "car_id_short": id8(job_id(&j)?),
                     "reason": reason.as_str(),
                 }));
-                self.merge_job_metadata(job_id(&j)?, vec![("skip_reason", json!(reason))])
-                    .await?;
+                // The COUNT rides with the reason (backlog 94896e74). One
+                // skip is routine — 39% of trains carry one and depart —
+                // so the reason alone says nothing about whether this car
+                // is having a bad window or has been refused all morning.
+                // Cleared with `skip_reason` on boarding, so it counts
+                // CONSECUTIVE skips.
+                self.merge_job_metadata(
+                    job_id(&j)?,
+                    vec![("skip_reason", json!(reason)), ("skips", json!(skips))],
+                )
+                .await?;
                 skipped.push((j, branch));
             }
         }
@@ -2815,9 +2945,10 @@ impl Conductor {
             .join(", ");
 
         if boarded.is_empty() {
-            log(no_departure_line(&NoDeparture::AllConflicted {
+            self.record_no_departure(&NoDeparture::AllConflicted {
                 branches: skipped_names.clone(),
-            }));
+            })
+            .await?;
             return Ok(());
         }
 
@@ -2904,10 +3035,11 @@ impl Conductor {
                 )
                 .await?;
             }
-            log(no_departure_line(&NoDeparture::ConsistRefused {
+            self.record_no_departure(&NoDeparture::ConsistRefused {
                 reason: format!("consist check refused — {reason}"),
                 cars: boarded.len(),
-            }));
+            })
+            .await?;
             return Ok(());
         }
         // "0 cheap lint(s) clean" was the line a could-not-list
@@ -3110,7 +3242,10 @@ impl Conductor {
             // outlive the skip — the key is REMOVED (Null), not left
             // behind as "". `consist_refusal` — the lint output a
             // refused consist leaves on the car it blocked — comes off
-            // in the same write, for the same reason.
+            // in the same write, for the same reason. So does `skips`,
+            // and that is what makes the count CONSECUTIVE: a car that
+            // rides a train carries no history of refusals into its
+            // next window (94896e74).
             //
             // `boarded_head` rides here too, and lives on the CAR
             // rather than in a second list on the train: the sweep
@@ -3124,6 +3259,7 @@ impl Conductor {
                     ("train", json!(train_id.as_str())),
                     ("boarded_head", json!(head.as_str())),
                     ("skip_reason", Value::Null),
+                    ("skips", Value::Null),
                     ("consist_refusal", Value::Null),
                 ],
             )

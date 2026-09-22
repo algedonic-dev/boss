@@ -157,6 +157,55 @@ fn held_dock_cars(cars: &[Value]) -> Vec<(String, String)> {
     out
 }
 
+/// How many consecutive boardings must have refused a car before this
+/// verb calls it troubled.
+///
+/// A SKIP IS ROUTINE AND MUST NOT PRINT (backlog 94896e74). Measured
+/// 2026-09-22: 52 of 132 trains (39%) carried a skipped branch and
+/// departed anyway, and one branch was skipped 23 consecutive times and
+/// landed fine. A line on every skip is a line on a normal occurrence,
+/// which is how a surface becomes noise and then becomes unread. Five
+/// consecutive refusals is hours of a car not landing while trains keep
+/// leaving without it — the repetition the packet is about, not the
+/// event.
+const TROUBLED_SKIPS: u64 = 5;
+
+/// Cars standing on the dock that boarding has refused over and over —
+/// branch, how many consecutive windows refused it, and the reason the
+/// last one gave.
+///
+/// The conductor has always recorded both facts ON the car
+/// (`skip_reason`, and `skips` since 94896e74) and cleared them the
+/// moment it boards, so this is a read of the packets orient has
+/// already fetched — no second call, no copy of the conductor's
+/// judgement. Deepest first: the car nobody can land is the one the
+/// operator is deciding about.
+fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
+    let mut out: Vec<(String, u64, String)> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .filter_map(|c| {
+            let skips = c
+                .get("metadata")
+                .and_then(|m| m.get("skips"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (skips >= TROUBLED_SKIPS).then(|| {
+                let reason = md_str(c, "skip_reason");
+                let reason = if reason.is_empty() {
+                    "no reason recorded".to_string()
+                } else {
+                    reason.to_string()
+                };
+                (md_str(c, "branch").to_string(), skips, reason)
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// The two gate-run reads behind the STRANDED and HELD GREENS lanes,
 /// composed here so the test that pins their shape reads the strings
 /// the server will.
@@ -226,7 +275,7 @@ fn held_greens(gate_runs: &[Value], car_branches: &BTreeSet<String>) -> Vec<(Str
 ///
 /// A TROUBLED PACKET MUST LOOK TROUBLED (CLAUDE.md §Diagnosis; 76d41004).
 /// This verb used to list every queued run in one lane as "since
-/// <stamp>", so a run whose waiter had been dead for ten minutes —
+/// `<stamp>`", so a run whose waiter had been dead for ten minutes —
 /// with no Job, and nothing left that would ever launch it — rendered
 /// exactly like a run two minutes from its slot. Measured 2026-09-10
 /// 22:41–22:51Z; the yard's queued lane still reads the same way.
@@ -661,7 +710,7 @@ pub(crate) fn my_work_section(
     out
 }
 
-/// The REGIONS header — the IT system map's eight KPI cards, one line
+/// The REGIONS header — the IT system map's KPI cards, one line
 /// each, from `GET /api/yard/regions` (design 0524fc95, car 1). The
 /// server owns these numbers now: the count, the clear/busy/troubled
 /// state and the trend are ONE definition in `boss_jobs::regions`, the
@@ -790,8 +839,27 @@ fn rate_text(t: &Value) -> String {
 /// `train-reconcile 4m ago` — and `SILENT 180m` when the machine has
 /// been quiet past its own declared cadence. A machine with no firing
 /// record says so rather than printing an age it does not have.
+///
+/// EXCEPT WHERE THERE IS NO MACHINE. A border of kind `actors` is
+/// crossed by a person or an agent, so there is no rule to fire and
+/// "(no firing recorded)" is not a finding — it is the only sentence
+/// that could ever be true there, and it reads exactly like a dead
+/// automation. It sat on `receiving -> marshalling`, the most
+/// backed-up border in the yard, which is the pairing most likely to
+/// send a reader hunting for a rule that does not exist (beec1130).
+/// §Diagnosis says a troubled packet must look troubled; the inverse
+/// holds too, or the phrase stops carrying weight on the borders where
+/// it IS a finding.
+///
+/// The `kind` is the one definition this and the rail both read —
+/// `MachineKind` in boss-jobs/src/borders.rs — so the two surfaces
+/// branch on the same fact rather than on a phrase copied between
+/// them.
 fn machine_text(m: &Value) -> String {
     let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+    if m.get("kind").and_then(Value::as_str) == Some("actors") {
+        return format!("{name} (worked by actors)");
+    }
     let silent = m.get("silent").and_then(Value::as_bool);
     let age = m.get("silent_for_minutes").and_then(Value::as_i64);
     match (silent, age) {
@@ -1165,6 +1233,24 @@ pub async fn run(all: bool) -> Result<()> {
         );
         for (branch, reason) in &held {
             println!("    {branch}  —  {reason}");
+        }
+    }
+
+    // SKIPPED REPEATEDLY — a car the assembled tree keeps refusing.
+    // Nothing prints for a healthy dock: one skip is routine and a line
+    // on every one of them is noise on a normal occurrence. What has no
+    // surface at all is REPETITION, and that is what cost seven hours on
+    // 2026-09-22 (backlog 94896e74) — the conductor named the conflict
+    // every window and no read an operator runs carried the count.
+    let troubled = troubled_dock_cars(&cars);
+    if !troubled.is_empty() {
+        println!(
+            "  SKIPPED REPEATEDLY — {} car(s) refused {TROUBLED_SKIPS}+ consecutive \
+             boardings (repair: boss rerail <car>, which stops for you on a real conflict):",
+            troubled.len()
+        );
+        for (branch, skips, reason) in &troubled {
+            println!("    {branch}  —  skipped {skips}x  —  {reason}");
         }
     }
 
@@ -1995,6 +2081,87 @@ mod tests {
         assert!(held_dock_cars(&[boarded, closed]).is_empty());
     }
 
+    // ---- SKIPPED REPEATEDLY (94896e74) ---------------------------------
+
+    fn skipped_car(branch: &str, status: &str, review: &str, skips: Value, reason: &str) -> Value {
+        let mut c = car(branch, status, review, json!({}));
+        c["metadata"] = json!({ "branch": branch, "skips": skips, "skip_reason": reason });
+        c
+    }
+
+    /// ONE SKIP IS ROUTINE. 39% of trains carry a skipped branch and
+    /// depart anyway, so a car refused once — or four times — prints
+    /// nothing. A line on a normal occurrence is how a surface becomes
+    /// noise and then becomes unread, which is the defect this lane
+    /// exists to fix, not to repeat.
+    #[test]
+    fn a_dock_whose_cars_are_skipped_now_and_then_says_nothing() {
+        let cars = vec![
+            skipped_car("fix/a", "open", "ready", json!(1), "conflict: a.rs"),
+            skipped_car("fix/b", "open", "ready", json!(4), "conflict: b.rs"),
+            car("fix/clean", "open", "ready", json!({})),
+        ];
+        assert!(troubled_dock_cars(&cars).is_empty());
+    }
+
+    /// REPETITION IS THE SIGNAL. At the threshold the car is named with
+    /// its count and the reason the last window gave — the two facts the
+    /// conductor already recorded and no read carried.
+    #[test]
+    fn a_car_refused_over_and_over_is_named_with_its_count_and_reason() {
+        let cars = vec![
+            skipped_car("fix/a", "open", "ready", json!(5), "conflict: steps.rs"),
+            skipped_car("fix/deep", "open", "ready", json!(23), "conflict: a.rs"),
+        ];
+        assert_eq!(
+            troubled_dock_cars(&cars),
+            vec![
+                ("fix/deep".to_string(), 23, "conflict: a.rs".to_string()),
+                ("fix/a".to_string(), 5, "conflict: steps.rs".to_string()),
+            ],
+            "deepest first: the car nobody can land is the one being decided about"
+        );
+    }
+
+    /// Only a car still AT the dock can be refused there. A boarded car
+    /// has its `skips` cleared in the same write that stamps the train,
+    /// but a stale stamp on a car that left must not paint trouble
+    /// either — the dock predicate answers that, not the stamp.
+    #[test]
+    fn a_car_that_left_the_dock_is_not_troubled_on_it() {
+        let cars = vec![
+            skipped_car(
+                "fix/boarded",
+                "open",
+                "completed",
+                json!(9),
+                "conflict: a.rs",
+            ),
+            skipped_car("fix/closed", "closed", "ready", json!(9), "conflict: a.rs"),
+        ];
+        assert!(troubled_dock_cars(&cars).is_empty());
+    }
+
+    /// A MALFORMED COUNT IS NOT A STALL, and a missing reason is not a
+    /// blank line. Neither may invent trouble, and neither may hide a
+    /// car that has one.
+    #[test]
+    fn a_count_that_is_not_a_count_paints_nothing_and_a_missing_reason_says_so() {
+        for stamp in [json!("many"), json!(-9), json!(null), json!(9.5)] {
+            let cars = vec![skipped_car("fix/a", "open", "ready", stamp.clone(), "x")];
+            assert!(
+                troubled_dock_cars(&cars).is_empty(),
+                "{stamp} is not a count of anything"
+            );
+        }
+        let cars = vec![skipped_car("fix/a", "open", "ready", json!(7), "")];
+        assert_eq!(
+            troubled_dock_cars(&cars),
+            vec![("fix/a".to_string(), 7, "no reason recorded".to_string())],
+            "seven refusals are still seven refusals with no reason on the car"
+        );
+    }
+
     // ---- MY WORK (65a89769) --------------------------------------------
 
     fn agents() -> Vec<Value> {
@@ -2183,7 +2350,7 @@ mod tests {
     /// the SERVER's own types, so a renamed field on `boss_jobs::regions`
     /// breaks this before it can print `?` at an operator.
     #[test]
-    fn the_regions_header_prints_the_servers_eight_cards() {
+    fn the_regions_header_prints_the_servers_cards() {
         use boss_jobs::regions::{Region, RegionState, Regions, Trend};
         let trend = |metric: &str, unit: &str, cur: Option<f64>, prev: Option<f64>| Trend {
             metric: metric.into(),
@@ -2281,7 +2448,7 @@ mod tests {
         assert_eq!(
             lines.len(),
             9,
-            "a heading and eight cards:\n{}",
+            "a heading and a card per region:\n{}",
             lines.join("\n")
         );
         assert!(lines[0].contains("last 24h"), "{}", lines[0]);
@@ -2314,6 +2481,73 @@ mod tests {
             lines[7].contains("    receiving        ?") && lines[7].contains("TROUBLED"),
             "{}",
             lines[7]
+        );
+    }
+
+    /// AN ACTOR-WORKED BORDER MUST NOT READ AS A DEAD RULE.
+    ///
+    /// `receiving -> marshalling` has `machine_kind: Actors` — a person
+    /// or an agent does the crossing, there is no rule to fire — and it
+    /// printed "(no firing recorded)", the phrase this surface uses for
+    /// a machine that should have fired and did not. On the most
+    /// backed-up border in the yard (217 standing, the oldest four days
+    /// past the triage band) that is the pairing most likely to send a
+    /// reader hunting for a broken automation that does not exist
+    /// (beec1130).
+    ///
+    /// §Diagnosis says a troubled packet must look troubled. The
+    /// inverse is load-bearing too: a healthy mechanism that looks
+    /// broken spends someone's attention on a non-problem, and teaches
+    /// them to discount the phrase on the borders where it is a real
+    /// finding.
+    #[test]
+    fn an_actor_worked_border_says_who_works_it_rather_than_that_nothing_fired() {
+        let map = serde_json::json!({
+            "window_hours": 24,
+            "borders": [
+                {
+                    "from": "receiving", "to": "marshalling",
+                    "rate": { "current": 58.0, "previous": 87.0 },
+                    "waiting": 217, "state": "BUSY", "holds": [],
+                    "machine": {
+                        "name": "the receiving desk", "kind": "actors",
+                        "last_fired": null, "silent_for_minutes": null,
+                        "expected_every_minutes": null, "silent": null,
+                        "why": "no machine moves this hop — an actor does; \
+                                the last crossing is the stamp"
+                    }
+                },
+                {
+                    "from": "gates", "to": "track",
+                    "rate": { "current": 3.0, "previous": 5.0 },
+                    "waiting": 0, "state": "clear", "holds": [],
+                    "machine": {
+                        "name": "train-board-on-dock-depth", "kind": "cadence",
+                        "last_fired": null, "silent_for_minutes": null,
+                        "expected_every_minutes": 30, "silent": null,
+                        "why": "the cadence firing record could not be read"
+                    }
+                }
+            ]
+        });
+        let lines = border_lines(&map);
+        let actors = &lines[1];
+        assert!(
+            actors.contains("worked by actors"),
+            "the actor-worked rail must name who works it:\n{actors}"
+        );
+        assert!(
+            !actors.contains("no firing recorded"),
+            "an actor-worked rail must not report a firing it could never have:\n{actors}"
+        );
+        // THE CONTROL, on the same map: a machine that really does fire
+        // and has no record must STILL say so. Without it, a change
+        // that dropped the phrase everywhere would pass the two
+        // assertions above.
+        let cadence = &lines[2];
+        assert!(
+            cadence.contains("(no firing recorded)"),
+            "a cadence rule with no firing record is a finding and must keep saying so:\n{cadence}"
         );
     }
 
@@ -2352,10 +2586,18 @@ mod tests {
                     "last_crossed": null,
                     "waiting": null,
                     "holds": [],
-                    "machine": { "name": "the receiving desk", "kind": "actors",
+                    // A CADENCE RULE whose firing record could not be
+                    // read — which is what this rail is for. It used to
+                    // be `kind: actors`, and that made the
+                    // "(no firing recorded)" assertion below test the
+                    // wrong thing: an actor-worked hop has no rule to
+                    // fire, so the phrase was never a finding there
+                    // (beec1130). The unknown-record case needs a
+                    // machine that really does fire.
+                    "machine": { "name": "train-reconcile", "kind": "cadence",
                                  "last_fired": null, "silent_for_minutes": null,
-                                 "expected_every_minutes": null, "silent": null,
-                                 "why": "no machine moves this hop — an actor does" },
+                                 "expected_every_minutes": 10, "silent": null,
+                                 "why": "the cadence firing record could not be read" },
                     "state": "troubled",
                     "why": "the workflow registry that names the inbound kinds could not be read"
                 }

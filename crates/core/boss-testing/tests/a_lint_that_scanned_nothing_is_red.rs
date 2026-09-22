@@ -200,6 +200,122 @@ fn run_lint(root: &Path, rel: &str) -> (i32, String, String) {
     )
 }
 
+/// How a lint's OWN verdict on the tree is reported by the sweep below.
+///
+/// WHY THIS IS NOT INLINE (backlog c68104cf, 2026-09-22). The sweep runs
+/// every roster lint, so it is where ANY lint's finding surfaces when a
+/// builder runs this crate's suite — and the two failures it can report
+/// are different in kind. "Printed no scanned count" is about this
+/// file's rule. "Exited 1" is the lint's own verdict about a line
+/// somewhere in the tree, usually a line the builder just wrote, and
+/// nothing to do with scanning at all. The builder of 3d18b741 edited a
+/// comment in one lint and watched a test named
+/// `every_preflight_lint_scans_something…` go red; the whole cost of
+/// that packet was the distance between those two sentences. The
+/// message is the thing that closes it, so it is a function with a test.
+fn lint_reported_a_finding(name: &str, code: i32, stdout_tail: &str, stderr_tail: &str) -> String {
+    format!(
+        "{name}: exited {code} — this is {name}'s OWN verdict on the tree, not a \
+         scanning-count failure and nothing to do with this test's rule. Read its \
+         output below and fix what it names; the file it reports is very likely one \
+         you just edited, even though you did not edit {name} itself. To see only \
+         this: bash infra/lint/{name}.sh\n  stdout:\n{stdout_tail}\n  stderr:\n{stderr_tail}"
+    )
+}
+
+#[test]
+fn a_lints_own_verdict_is_not_reported_as_a_scanning_failure() {
+    let msg = lint_reported_a_finding("api-path-bypass-smell", 1, "  [shell-dml] x.sh:3:#", "");
+    assert!(
+        msg.contains("OWN verdict") && msg.contains("not a scanning-count failure"),
+        "a lint that exited nonzero found something; saying it did not prove it \
+         looked at anything is a wrong verdict:\n{msg}"
+    );
+    assert!(
+        msg.contains("bash infra/lint/api-path-bypass-smell.sh"),
+        "the message hands back the one command that reproduces it alone:\n{msg}"
+    );
+}
+
+/// What one roster lint's exit status means to the sweep below.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The lint read the tree and the tree is clean.
+    Clean,
+    /// The lint read the tree and found a violation — the BRANCH's.
+    Finding,
+    /// The lint never read what it judges — the MACHINE's, and no
+    /// author can fix it by editing code.
+    CannotAnswer,
+}
+
+/// A REFUSAL IS NOT A FINDING, AND THIS SWEEP IS NOT ITS READER
+/// (backlog 2dc742c1, 2026-09-22).
+///
+/// `infra/lint/lib/git-answer.sh` gives the lints a third exit —
+/// `LINT_CANNOT_ANSWER`, read here from that one definition — and the
+/// sibling test below pins that a live-reading lint which cannot reach
+/// its registry uses it. The sweep judged every nonzero status the same
+/// way, so a registry answering HTTP 000 for the ~30 s this test runs
+/// made `the-live-protocols-are-the-authored-protocols` and
+/// `the-live-rules-are-the-authored-rules` exit 3 and redded the gate —
+/// on a check the gate's own pre-flight had already recorded as a pass,
+/// against a branch that had changed nothing either lint judges.
+/// MEASURED over the last 120 gate-runs: 3 of the 14 failed/refused
+/// runs carry this test in their receipt's `fails_excerpt`, one branch
+/// twice an hour apart (9e02228b, 0f8ed7c4, then a1664c7e), and a bare
+/// re-gate went green with no code change. CLAUDE.md §Diagnosis: "an
+/// infrastructure refusal is not a consist failure… recorded as a plain
+/// CI failure it strikes every car aboard."
+///
+/// WHY IT IS DROPPED HERE RATHER THAN RE-ROUTED. A refusal has exactly
+/// one lane — `GATE_REFUSAL` / `write_receipt "refused"` / exit 2, in
+/// gate.sh's `check_lint`, which `train_gate::standing` reads as
+/// `Standing::Refused` and relaunches, striking no car — and a cargo
+/// test cannot reach it: its whole vocabulary is pass and fail, so
+/// anything this sweep does with an exit 3 other than ignore it
+/// manufactures a consist failure out of a machine fault. Nothing is
+/// lost by ignoring it: the gate runs the SAME lint through
+/// `check_lint` minutes earlier in the same run, which IS the reader
+/// that can refuse. Nor is it dropped silently: every lint that could
+/// not answer is named on this run's stderr (which cargo shows under
+/// `--nocapture`, and inside the failure block otherwise) and in BOTH
+/// of the sweep's assertion messages, so no red from this test is ever
+/// read as a verdict on a lint that did not participate. What this test
+/// rules on is its own rule — did a scanner prove it looked at
+/// something — and a lint that could not answer has nothing to prove it
+/// against, which is why it is also not judged for a missing `scanned`
+/// line: the sibling below pins that it must print none.
+fn outcome(code: i32, cannot_answer: i32) -> Outcome {
+    match code {
+        0 => Outcome::Clean,
+        c if c == cannot_answer => Outcome::CannotAnswer,
+        _ => Outcome::Finding,
+    }
+}
+
+#[test]
+fn a_lint_that_could_not_answer_is_neither_clean_nor_a_finding() {
+    let n: i32 = cannot_answer(&repo_root()).parse().expect("a number");
+    assert_eq!(outcome(0, n), Outcome::Clean);
+    assert_eq!(
+        outcome(1, n),
+        Outcome::Finding,
+        "exit 1 is the lint's verdict on the BRANCH and stays red"
+    );
+    assert_eq!(
+        outcome(n, n),
+        Outcome::CannotAnswer,
+        "exit {n} is LINT_CANNOT_ANSWER — a fact about the machine, not the branch; \
+         counting it as a finding is what redded three gates in the measured window"
+    );
+    assert_eq!(
+        outcome(2, n),
+        Outcome::Finding,
+        "only the ONE documented status is a refusal; an unexpected code is still a red"
+    );
+}
+
 /// Every roster lint is a scanner that printed a positive count, or is
 /// listed above with a reason; and every listed name is still a lint.
 #[test]
@@ -233,7 +349,15 @@ fn every_preflight_lint_scans_something_or_says_why_it_is_not_a_scanner() {
         .iter()
         .filter(|(name, _)| !NOT_SCANNERS.iter().any(|(n, _)| *n == name.as_str()))
         .collect();
+    // Two different failures, kept apart so neither is described as the
+    // other (backlog c68104cf): `verdicts` are lints that found something
+    // in the tree, `failures` are lints that broke this file's rule.
+    let mut verdicts = Vec::new();
     let mut failures = Vec::new();
+    // The third outcome, kept and reported but never a failure: see
+    // `outcome` above for why a cargo test must not judge a refusal.
+    let cannot = cannot_answer(&root).parse().expect("a number");
+    let mut unanswered = Vec::new();
     for chunk in scanners.chunks(6) {
         let handles: Vec<_> = chunk
             .iter()
@@ -256,13 +380,28 @@ fn every_preflight_lint_scans_something_or_says_why_it_is_not_a_scanner() {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            if code != 0 {
-                failures.push(format!(
-                    "{name}: exited {code} on the tree\n  stdout:\n{}\n  stderr:\n{}",
-                    tail(&stdout),
-                    tail(&stderr)
-                ));
-                continue;
+            match outcome(code, cannot) {
+                Outcome::CannotAnswer => {
+                    unanswered.push(format!(
+                        "{name}: {}",
+                        tail(&stderr)
+                            .lines()
+                            .find(|l| l.contains("CANNOT ANSWER"))
+                            .unwrap_or("(no CANNOT ANSWER line on stderr)")
+                            .trim()
+                    ));
+                    continue;
+                }
+                Outcome::Finding => {
+                    verdicts.push(lint_reported_a_finding(
+                        &name,
+                        code,
+                        &tail(&stdout),
+                        &tail(&stderr),
+                    ));
+                    continue;
+                }
+                Outcome::Clean => {}
             }
             match scanned_count(&format!("{stdout}\n{stderr}")) {
                 Some(n) if n > 0 => {}
@@ -280,12 +419,45 @@ fn every_preflight_lint_scans_something_or_says_why_it_is_not_a_scanner() {
             }
         }
     }
+    // What this run did NOT judge, said rather than swallowed: a lint
+    // that could not answer is no failure here, but a reader must not
+    // take this test's green for a verdict on it either. It rides both
+    // messages below and the run's own stderr, so it is in the record
+    // whichever way this test ends.
+    let not_judged = if unanswered.is_empty() {
+        String::new()
+    } else {
+        for line in &unanswered {
+            eprintln!("a-lint-that-scanned-nothing: NOT JUDGED HERE — {line}");
+        }
+        format!(
+            "\n\n{} of {} lint(s) could not answer and were NOT judged by this test \
+             (an infrastructure refusal, exit {cannot}; gate.sh's check_lint is the reader \
+             that can refuse a run over it):\n{}",
+            unanswered.len(),
+            scanners.len(),
+            unanswered.join("\n")
+        )
+    };
+    // Reported first and separately: a lint's own finding is the one a
+    // reader can act on, and it is the one they did not come here for.
+    assert!(
+        verdicts.is_empty(),
+        "{} of {} pre-flight lints REPORTED A FINDING on this tree (each exited \
+         nonzero). This test runs every roster lint, which is why their verdicts \
+         surface here; none of the below is about scanned counts:\n\n{}{}",
+        verdicts.len(),
+        scanners.len(),
+        verdicts.join("\n\n"),
+        not_judged
+    );
     assert!(
         failures.is_empty(),
-        "{} of {} scanning lints did not prove they looked at anything:\n\n{}",
+        "{} of {} scanning lints did not prove they looked at anything:\n\n{}{}",
         failures.len(),
         scanners.len(),
-        failures.join("\n\n")
+        failures.join("\n\n"),
+        not_judged
     );
 }
 

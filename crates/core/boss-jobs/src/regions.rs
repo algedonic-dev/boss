@@ -29,17 +29,20 @@
 //! — never an empty region that reads as "nothing here". A trend with
 //! no samples is `null`, never zero.
 
-use boss_core::job::{Job, Step, StepStatus};
+use boss_core::job::{Job, JobStatus, Step, StepStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::registry::WorkflowSpec;
 use crate::yard::{ConductorHealth, Reading, YardStatus};
 
-/// The eight regions, in map order. The count and the order are the
-/// decision (0524fc95 Q2); a reader that finds a ninth name has an
-/// older or newer server than it expects.
-pub const REGIONS: [&str; 8] = [
+/// The nine regions, in map order. The count and the order are the
+/// decision (0524fc95 Q2); a reader that finds a tenth name has an
+/// older or newer server than it expects. `shop-floor` is the ninth
+/// (backlog 94c6ffd0): the region UPSTREAM of the dock, where a car is
+/// still being built — appended rather than inserted, so the names a
+/// client already knows keep their place.
+pub const REGIONS: [&str; 9] = [
     "dock",
     "gates",
     "track",
@@ -48,6 +51,7 @@ pub const REGIONS: [&str; 8] = [
     "garage",
     "receiving",
     "marshalling",
+    "shop-floor",
 ];
 
 /// The trend window when the caller names none: a day, the shortest
@@ -214,6 +218,34 @@ pub struct StationReading {
 /// which hosts SHOULD have a runner.
 pub const OPS_RUNNER_ROLE: &str = "ops-runner";
 
+/// THE CREWS' PACKET KIND (design 511fa7d4 car 2b). One open
+/// `work-session` is one crew standing on the shop floor: the
+/// SessionStart hook files it and the prompt hook heartbeats it.
+pub const SESSION_KIND: &str = "work-session";
+
+/// Silent this long and a crew is drawn IDLE rather than at work — the
+/// crew board's own `IDLE_AFTER_MS` (`apps/web/src/it/crew/crew.ts`),
+/// ported here so the map and the board stop calling a session
+/// "working" at the same moment, and pinned equal by `crew.test.ts`
+/// (CLAUDE.md §9a). The session's own silence rule ends it at six
+/// hours; this is only where the floor stops crediting it with work.
+pub const CREW_IDLE_HOURS: i64 = 1;
+
+/// THE FLOOR'S BOUND: how many runs may be in flight at once, summed
+/// over the agents registry's `max_concurrent_runs`. `None` when ANY
+/// row declares no cap — an agent without one is unbounded
+/// (`agent_budget`'s own rule), so a total that ignored it would draw
+/// a bound the claim door does not enforce — and `None` for an empty
+/// registry, which bounds nothing either.
+pub fn run_capacity(rows: &[crate::agents::AgentRow]) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    rows.iter()
+        .map(|r| r.max_concurrent_runs.and_then(|n| usize::try_from(n).ok()))
+        .sum()
+}
+
 /// A host the registry expects an ops-runner on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerHost {
@@ -278,6 +310,20 @@ pub struct RegionInputs<'a> {
     /// evidence a runner machine is read from. `None` when the
     /// ops-request rows could not be read at all.
     pub ops_requests: Option<&'a [(Job, Vec<Step>)]>,
+    /// THE SHOP FLOOR'S RUNS (backlog 94c6ffd0): `agent-run` packets
+    /// open, plus those closed within two windows. Steps ride the OPEN
+    /// ones only — a finished-but-unreported run is a `building` done
+    /// over a `reported` still open — while the trend reads its two
+    /// instants off the metadata. `None` when the read failed, which
+    /// is a troubled floor and never a quiet one.
+    pub agent_runs: Option<&'a [(Job, Vec<Step>)]>,
+    /// The crews: open [`SESSION_KIND`] packets, rows only. `None` on a
+    /// failed read — one unknown machine, never a floor with nobody
+    /// standing on it.
+    pub sessions: Option<&'a [Job]>,
+    /// [`run_capacity`] over the agents registry, or `None` where no
+    /// bound is declared or the registry could not be read.
+    pub run_capacity: Option<usize>,
     /// The hosts the ESTATE REGISTRY says should be answering
     /// ops-requests — [`runner_hosts_of`] over `/api/estate/nodes`.
     /// `None` when the registry could not be read, which is one
@@ -938,8 +984,79 @@ fn host_runner_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
 
 /// The machinery of one region, by name. A region this answers nothing
 /// for has no machine of ours in it — which is a fact, not a gap.
+/// THE CREWS ON THE FLOOR — one machine per open session (design
+/// 511fa7d4 car 2b, backlog 94c6ffd0). A crew is the only machinery on
+/// the map that is mostly a HUMAN or an agent's own session rather than
+/// a loop of ours, and it is read the same way: `running` while the
+/// heartbeat is fresh, `idle` past [`CREW_IDLE_HOURS`] of silence, and
+/// `unknown` where nothing measured it.
+///
+/// A session that has never prompted is UNKNOWN, not idle. Idle is a
+/// reading — "it is here and it has no work" — and the only thing that
+/// can take it is the heartbeat the prompt hook writes. Before the
+/// first prompt there is no such reading, and a confident idle would
+/// say the operator walked away when nothing asked.
+fn crew_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
+    let Some(sessions) = inputs.sessions else {
+        return vec![machine(
+            "crews".to_string(),
+            "crews",
+            MachineState::Unknown,
+            "the work-session packets could not be read".to_string(),
+        )];
+    };
+    let runs_of = |id: &str| {
+        inputs
+            .agent_runs
+            .unwrap_or(&[])
+            .iter()
+            .filter(|(j, _)| j.status == JobStatus::Open)
+            .filter(|(j, _)| md_str(&j.metadata, "session") == id)
+            .count()
+    };
+    sessions
+        .iter()
+        .map(|s| {
+            let id = s.id.to_string();
+            let name = {
+                let actor = md_str(&s.metadata, "actor");
+                if actor.is_empty() {
+                    s.title.clone()
+                } else {
+                    actor.to_string()
+                }
+            };
+            let working = plural(runs_of(&id), "run in flight", "runs in flight");
+            let (state, why) = match meta_instant(&s.metadata, "last_active_at") {
+                None => (
+                    MachineState::Unknown,
+                    format!(
+                        "no heartbeat on the packet — nothing says whether anyone is here; {working}"
+                    ),
+                ),
+                Some(beat) => {
+                    let silent = (inputs.now - beat).num_minutes().max(0);
+                    if silent > CREW_IDLE_HOURS * 60 {
+                        (
+                            MachineState::Idle,
+                            format!("silent for {silent} min; {working}"),
+                        )
+                    } else {
+                        (
+                            MachineState::Running,
+                            format!("last prompt {silent} min ago; {working}"),
+                        )
+                    }
+                }
+            };
+            machine(format!("session:{id}"), &name, state, why)
+        })
+        .collect()
+}
+
 fn machines_of(name: &str, inputs: &RegionInputs<'_>) -> Vec<Machine> {
     let mut out = match name {
+        "shop-floor" => crew_machines(inputs),
         "gates" => gate_bays(inputs),
         "track" => vec![conductor_machine(inputs.conductor)],
         "marshalling" => station_machines(inputs),
@@ -959,7 +1076,8 @@ fn machines_of(name: &str, inputs: &RegionInputs<'_>) -> Vec<Machine> {
 // The regions.
 // ---------------------------------------------------------------------
 
-/// The map. Pure: rows in, eight cards out, in [`REGIONS`] order.
+/// The map. Pure: rows in, one card per [`REGIONS`] name out, in that
+/// order.
 pub fn regions(inputs: &RegionInputs<'_>) -> Regions {
     let w = Windows::of(inputs.now, inputs.window_hours);
     let regions = [
@@ -971,6 +1089,7 @@ pub fn regions(inputs: &RegionInputs<'_>) -> Regions {
         garage(inputs, &w),
         receiving(inputs, &w),
         marshalling(inputs, &w),
+        shop_floor(inputs, &w),
     ]
     .into_iter()
     .map(|r| {
@@ -1239,6 +1358,34 @@ pub(crate) fn released_awaiting_repair<'a>(
         .collect()
 }
 
+/// How long a landed car may stand unproven before the shed says so.
+///
+/// WHY A BOUND AT ALL (backlog 488d42e6). The shed troubled itself only
+/// for a car with NO way to settle (`Unproven`) or a FAILING probe. A
+/// car whose probe answers `not yet` — early, not wrong — was never
+/// troubled however long it said so, and `not yet` is by far the
+/// commonest place a car stops. Measured 2026-09-22: nine cars standing
+/// at `proven`, every one `merged = true`, aged 9.0h to **105.7h**, and
+/// the shed read `9 landed cars awaiting proof` — the same words it
+/// prints ten minutes after a landing. The packet measured 58.3h as the
+/// worst case two days earlier, so the age roughly doubled while the
+/// COUNT fell from twelve to nine: proofs drain, just slower than they
+/// accumulate. That is a rate to be seen, not a queue to be chased.
+///
+/// WHY 24 HOURS. Most probes are rechecked hourly and most of the
+/// events they wait on happen daily, so a car that has not settled
+/// inside a day is waiting on something that is not coming on its own.
+/// It is a threshold for LOOKING, not a deadline: the car is still
+/// correct, still landed, still retrying.
+///
+/// THE CLOCK IS THE CAR'S OWN `opened_at`, not a landing time, because
+/// no landing time is recorded on the car — `merged` is a boolean and
+/// the `merged` STEP cannot complete until `proven` does, which is the
+/// very thing being waited for. So this over-reports by however long
+/// the car took to build and land, and the wording says "open" rather
+/// than "landed" for that reason.
+pub const PROOF_STALE_HOURS: i64 = 24;
+
 /// THE SHED: landed cars awaiting proof — open cars whose live step is
 /// `proven`. Troubled when one is UNPROVEN (no probe, no event: nothing
 /// mechanical can settle it) or its probe is FAILING; busy while any
@@ -1265,6 +1412,43 @@ fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         .filter_map(|(_, s)| step_done_at(find_step(s, "proven", "Proven in production")));
     let (cur, prev) = count_split(w, proven);
     let trend = rate_trend("proven", w, cur, prev);
+    // STALE: awaiting proof for longer than a day, whatever its place.
+    // Collected over every awaiting car rather than only the `not yet`
+    // ones, so an old car is named even when its place would otherwise
+    // read as healthy progress.
+    let mut stale: Vec<(i64, &str)> = Vec::new();
+    // Of the stale ones, how many have NEVER had their probe run. A
+    // probe that ran and said `not yet` is the world answering; a probe
+    // with no attempt on record is us not asking. Same age, opposite
+    // meaning, and until 2026-09-22 the same sentence.
+    let mut never_probed = 0usize;
+    for (j, _) in &awaiting {
+        let branch = j
+            .metadata
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or(j.title.as_str());
+        let Some(opened) = j
+            .metadata
+            .get("opened_at")
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        else {
+            continue;
+        };
+        let hours = (inputs.now - opened.with_timezone(&chrono::Utc)).num_hours();
+        if hours >= PROOF_STALE_HOURS {
+            stale.push((hours, branch));
+            if matches!(
+                shed_place(&j.metadata),
+                ShedPlace::ProbePending { last: None }
+            ) {
+                never_probed += 1;
+            }
+        }
+    }
+    stale.sort_by_key(|(hours, _)| std::cmp::Reverse(*hours));
+
     let n = awaiting.len();
     let (state, why) = if !unproven.is_empty() {
         (
@@ -1275,6 +1459,29 @@ fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         (
             RegionState::Troubled,
             format!("probe FAILING: {}", failing.join(", ")),
+        )
+    } else if let Some((oldest, branch)) = stale.first().copied() {
+        // The age is the finding, so it leads — and the oldest car is
+        // named, because "9 awaiting proof" sends a reader to a list
+        // while "105h, fix/x" sends them to a car.
+        // WHOSE MOVE IS IT. The age says something is stuck; this says
+        // whether anyone here can unstick it. Never a fourth state —
+        // a stale proof is worth a look either way — but a reader who
+        // sees "told not yet" knows to go look at the WORLD, and one
+        // who sees "never probed" knows to go run something.
+        let whose = if never_probed == 0 {
+            "every one asked and was told not yet — waiting on the world, not on us".to_string()
+        } else if never_probed == stale.len() {
+            format!("{never_probed} never probed — nothing has run their proof, which is on us")
+        } else {
+            format!("{never_probed} never probed — on us; the rest asked and were told not yet")
+        };
+        (
+            RegionState::Troubled,
+            format!(
+                "{} of {n} open past {PROOF_STALE_HOURS}h — oldest {oldest}h, {branch} — {whose}",
+                stale.len()
+            ),
         )
     } else if n > 0 {
         (
@@ -1382,6 +1589,37 @@ fn arrivals(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
 /// no car claims is a fix about to be rebuilt blind, and "we do not
 /// know" is not a verdict. Busy when the rest holds anything — a hold
 /// is deliberate and a red is being worked. The trend is reds per day.
+/// Is a repair already aimed at this branch?
+///
+/// WHY (backlog aae1515e; David, 2026-09-21: "the Garage has been
+/// flashing troubled all day, and it is either too long to have not
+/// addressed or we need to have some indication that the fix is in
+/// transit"). BOTH halves were true that day, and the second caused the
+/// first. The garage went troubled at 08:50Z on a gate-run recorded
+/// `lost`; at 18:0xZ the branch was still on the forge and nothing had
+/// moved it in nine hours. The surface was ACCURATE the whole time —
+/// and it rendered identically at minute five and at hour nine, which
+/// is why nine hours passed.
+///
+/// A troubled region can be cleared only by the fix landing, so a long
+/// repair is indistinguishable from total neglect. §Diagnosis already
+/// says a troubled packet must look troubled; the corollary is that a
+/// troubled thing BEING REPAIRED must look different from one nobody
+/// has touched, or the colour stops carrying information and the reader
+/// learns to discount it — the same decay as a permanently-red check.
+///
+/// THE PREDICATE IS CHEAP AND EXACT for this region: a lost or
+/// never-judged gate-run whose BRANCH has a newer gate-run still open
+/// is under repair. Nothing is inferred — the newer run is the repair,
+/// and it is in the same list the region already reads.
+fn under_repair(gate_runs: &[Job], branch: &str, packet_id: &str) -> bool {
+    gate_runs.iter().any(|r| {
+        r.status == boss_core::job::JobStatus::Open
+            && r.id.to_string() != packet_id
+            && r.metadata.get("branch").and_then(Value::as_str) == Some(branch)
+    })
+}
+
 fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let s = inputs.status;
     let held = s.held_cars.len() + s.held.len();
@@ -1396,6 +1634,17 @@ fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         .filter_map(closed_at);
     let (cur, prev) = count_split(w, reds);
     let trend = rate_trend("reds", w, cur, prev);
+    // How many of the troubled members already have a newer gate-run
+    // open on their branch — a repair in flight (aae1515e).
+    let repairing = s
+        .stranded
+        .iter()
+        .filter(|g| under_repair(inputs.gate_runs, &g.branch, &g.packet_id))
+        .count()
+        + s.limbo
+            .iter()
+            .filter(|l| under_repair(inputs.gate_runs, &l.branch, &l.packet_id))
+            .count();
     let (state, why) = if stranded > 0 || limbo > 0 {
         let mut parts = Vec::new();
         if stranded > 0 {
@@ -1409,6 +1658,20 @@ fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
                 "{} never judged",
                 plural(limbo, "gate-run", "gate-runs")
             ));
+        }
+        // STILL TROUBLED, ANNOTATED — deliberately not a fourth state.
+        // A new value in the state vocabulary forces every consumer to
+        // handle it (the yard, the world map, orient, any alarm keyed on
+        // `troubled`), and one that does not becomes WRONG rather than
+        // merely incomplete. The reader's question is "is anyone on it",
+        // and a sentence answers that without moving the colour.
+        if repairing > 0 {
+            parts.push(format!(
+                "{repairing} of {} under repair — a newer gate-run is open on that branch",
+                stranded + limbo
+            ));
+        } else {
+            parts.push("nothing aimed at any of them".to_string());
         }
         (RegionState::Troubled, parts.join("; "))
     } else if count > 0 {
@@ -1578,6 +1841,103 @@ fn marshalling(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     region("marshalling", Some(n), None, state, why, trend)
 }
 
+/// THE SHOP FLOOR: what is being BUILT — the runs in flight, with the
+/// sessions that dispatched them standing in the region as crews
+/// (design 511fa7d4 car 2b, backlog 94c6ffd0). It is the region
+/// UPSTREAM OF THE DOCK, and the map had no such place until now: the
+/// world began where a car was already finished, and the interval an
+/// actor spends building one was rows on a board somewhere else.
+///
+/// The count is the runs IN FLIGHT against [`run_capacity`], because
+/// that pair is the fact an operator needs before queueing more work —
+/// a floor at its cap refuses the next dispatch. Troubled is the
+/// failure the cap makes expensive: a run whose `building` step is
+/// done while its `reported` step is still open has FINISHED and is
+/// still holding a slot, which is invisible from every count of "runs
+/// in flight" that does not read the steps. The trend is the build
+/// duration — a run's own open-to-close, for the runs that closed in
+/// each window.
+fn shop_floor(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
+    let Some(runs) = inputs.agent_runs else {
+        return region(
+            "shop-floor",
+            None,
+            inputs.run_capacity,
+            RegionState::Troubled,
+            "the agent-run packets could not be read".to_string(),
+            duration_trend("build duration", "minutes", Vec::new(), Vec::new()),
+        );
+    };
+    let durations = runs.iter().filter_map(|(j, _)| {
+        let opened = opened_at(j)?;
+        let closed = closed_at(j)?;
+        let d = (closed - opened).num_seconds();
+        (d > 0).then_some((closed, d))
+    });
+    let (cur, prev) = split(w, durations);
+    let trend = duration_trend("build duration", "minutes", cur, prev);
+
+    let in_flight: Vec<&(Job, Vec<Step>)> = runs
+        .iter()
+        .filter(|(j, _)| j.status == JobStatus::Open)
+        .collect();
+    // Finished, and still holding its slot: `building` completed, the
+    // handback never recorded. The run's own step is the only place
+    // this shows — the packet is open and looks like work in progress.
+    let unreported = in_flight
+        .iter()
+        .filter(|(_, steps)| {
+            step_done_at(find_step(steps, "building", "Building")).is_some()
+                && step_done_at(find_step(steps, "reported", "Report recorded")).is_none()
+        })
+        .count();
+    // A crew count is only stated where the sessions were READ: an
+    // unread session list is not a floor with nobody on it, and the
+    // clause is left off rather than printed as a zero.
+    let crews = inputs
+        .sessions
+        .map(|s| plural(s.len(), "crew on the floor", "crews on the floor"));
+    let count = in_flight.len();
+    let at_cap = inputs.run_capacity.is_some_and(|cap| count >= cap);
+    let (state, why) = if unreported > 0 {
+        (
+            RegionState::Troubled,
+            format!(
+                "{} finished and not reported — each holds a slot until the handback lands",
+                plural(unreported, "run", "runs")
+            ),
+        )
+    } else if at_cap {
+        (
+            RegionState::Busy,
+            format!(
+                "{} — at the cap, the next dispatch is refused",
+                plural(count, "run in flight", "runs in flight")
+            ),
+        )
+    } else {
+        (
+            RegionState::Clear,
+            [
+                Some(plural(count, "run in flight", "runs in flight")),
+                crews,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<String>>()
+            .join(", "),
+        )
+    };
+    region(
+        "shop-floor",
+        Some(count),
+        inputs.run_capacity,
+        state,
+        why,
+        trend,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,6 +2012,9 @@ mod tests {
             conductor: None,
             ops_requests: Some(&[]),
             runner_hosts: Some(&[]),
+            agent_runs: Some(&[]),
+            sessions: Some(&[]),
+            run_capacity: None,
             now: t(NOW),
             window_hours: 24,
         }
@@ -1674,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_yard_answers_eight_clear_regions_in_map_order() {
+    fn an_empty_yard_answers_a_clear_card_for_every_region_in_map_order() {
         let status = empty_status();
         let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[])));
         let names: Vec<&str> = out.regions.iter().map(|r| r.name.as_str()).collect();
@@ -2105,6 +2468,262 @@ mod tests {
         );
     }
 
+    /// A STALE PROOF IS EITHER ON US OR ON THE WORLD, and the shed said
+    /// neither.
+    ///
+    /// Measured 2026-09-22, an hour after the staleness signal above
+    /// shipped: the shed read "8 of 12 open past 24h — oldest 108h" and
+    /// three rechecks of the oldest cars each came back "not yet: no
+    /// real prune since convergence", "not yet: no sponsorship packet
+    /// opened since the change converged", "not yet: no answered
+    /// sweep-archive-branches request". Those cars are HEALTHY and
+    /// blocked on a qualifying event the world has not produced — the
+    /// probe asked and was answered. A car whose probe has never been
+    /// run is the opposite, and the same sentence covered both.
+    ///
+    /// Reporting them identically is the decay CLAUDE.md names under
+    /// "a check nobody reads": a colour that fires on a state nobody
+    /// can act on teaches the reader to discount it. The distinction
+    /// already exists in the type — `ShedPlace::ProbeNotYet` versus a
+    /// `ProbePending` with no attempt recorded — and only the stale
+    /// branch threw it away.
+    #[test]
+    fn a_stale_proof_says_whether_it_waits_on_us_or_on_the_world() {
+        // NOW is 2026-09-19T12:00:00Z; both cars are two days old, so
+        // age cannot be what separates them.
+        let aged = |branch: &str, attempt: Value| {
+            let mut md = json!({
+                "branch": branch,
+                "merged": true,
+                "opened_at": "2026-09-17T10:00:00Z",
+                "proof_probe": "true",
+            });
+            if !attempt.is_null() {
+                md["proof_attempt"] = attempt;
+            }
+            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-17T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+
+        // ON THE WORLD: the probe ran and was told not yet.
+        let asked = vec![aged("feat/asked", json!({ "not_yet": true, "exit": 75 }))];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &asked,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let shed = by_name(&out, "shed");
+        assert_eq!(
+            shed.state,
+            RegionState::Troubled,
+            "still troubled — a car stuck two days is worth a look either way: {}",
+            shed.why
+        );
+        assert!(
+            shed.why.contains("told not yet"),
+            "but it says the probe asked and the world answered: {}",
+            shed.why
+        );
+        assert!(
+            !shed.why.contains("never"),
+            "and does not accuse anyone of neglecting it: {}",
+            shed.why
+        );
+
+        // ON US, same age, same everything else: no attempt recorded,
+        // so nothing has ever run this car's probe. THE CONTROL — it is
+        // what stops the clause reading as always-waiting-on-the-world.
+        let never = vec![aged("feat/never", Value::Null)];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &never,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let shed = by_name(&out, "shed");
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(
+            shed.why.contains("never probed"),
+            "the same age with no attempt on record reads as on us: {}",
+            shed.why
+        );
+
+        // MIXED: the count has to survive both being present, or the
+        // commonest real shed (a few of each) gets one of the two
+        // sentences and the other half goes unmentioned.
+        let both = vec![
+            aged("feat/asked", json!({ "not_yet": true, "exit": 75 })),
+            aged("feat/never", Value::Null),
+        ];
+        let out = regions(&inputs(&status, &[], &[], &both, &[], Some(&[]), Some(&[])));
+        let shed = by_name(&out, "shed");
+        assert!(
+            shed.why.contains("1 never probed"),
+            "names how many are on us, alongside the rest: {}",
+            shed.why
+        );
+    }
+
+    /// A car awaiting proof PAST A DAY troubles the shed, even when its
+    /// probe is answering `not yet` — early, not wrong, and the
+    /// commonest place a car stops (backlog 488d42e6).
+    ///
+    /// Measured 2026-09-22: nine cars at `proven`, every one merged,
+    /// aged 9.0h to 105.7h, and the shed said `9 landed cars awaiting
+    /// proof` — the words it prints ten minutes after a landing. The
+    /// age had roughly doubled since the packet was filed while the
+    /// COUNT fell, so the rate was the finding and nothing showed it.
+    #[test]
+    fn a_car_awaiting_proof_past_a_day_troubles_the_shed() {
+        // NOW is 2026-09-19T12:00:00Z.
+        let aged = |branch: &str, opened: &str| {
+            let j = job(
+                "ship-a-change",
+                branch,
+                JobStatus::Open,
+                json!({
+                    "branch": branch,
+                    "merged": true,
+                    "opened_at": opened,
+                    "proof_probe": "true",
+                    // `not yet` — the place that was never troubled.
+                    "proof_attempt": { "not_yet": true, "exit": 75 },
+                }),
+            );
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-17T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+
+        // FRESH: landed this morning, still working. Must stay busy, or
+        // the signal fires on every landing and stops meaning anything.
+        let fresh = vec![aged("fix/fresh", "2026-09-19T06:00:00Z")];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &fresh,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let shed = by_name(&out, "shed");
+        assert_eq!(
+            shed.state,
+            RegionState::Busy,
+            "a car six hours old is working, not troubled: {}",
+            shed.why
+        );
+
+        // STALE: two days at `not yet`.
+        let stale = vec![
+            aged("fix/fresh", "2026-09-19T06:00:00Z"),
+            aged("feat/two-days", "2026-09-17T10:00:00Z"),
+        ];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &stale,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let shed = by_name(&out, "shed");
+        assert_eq!(
+            shed.state,
+            RegionState::Troubled,
+            "a car past {PROOF_STALE_HOURS}h must trouble the shed: {}",
+            shed.why
+        );
+        assert!(
+            shed.why.contains("feat/two-days"),
+            "and NAME the oldest — a count sends a reader to a list, a branch sends them \
+             to a car: {}",
+            shed.why
+        );
+        assert!(
+            shed.why.contains("50h"),
+            "carrying its age, which is the finding: {}",
+            shed.why
+        );
+        assert!(
+            !shed.why.contains("fix/fresh"),
+            "and not the fresh one, which is not the problem: {}",
+            shed.why
+        );
+
+        // A CAR WITH NO `opened_at` IS SKIPPED, not treated as
+        // infinitely old. An absent timestamp is not evidence of age,
+        // and reading it as one would trouble the shed for a missing
+        // field — the zero-means-unknown defect, in a region card.
+        let no_clock = {
+            let j = job(
+                "ship-a-change",
+                "fix/no-clock",
+                JobStatus::Open,
+                json!({
+                    "branch": "fix/no-clock",
+                    "merged": true,
+                    "proof_probe": "true",
+                    "proof_attempt": { "not_yet": true, "exit": 75 },
+                }),
+            );
+            let st = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-17T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            vec![(j, st)]
+        };
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &no_clock,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let shed = by_name(&out, "shed");
+        assert_eq!(
+            shed.state,
+            RegionState::Busy,
+            "a car with no opened_at has no age, so it is busy — never troubled for a \
+             field it does not carry: {}",
+            shed.why
+        );
+    }
+
     /// The dock wait: the car's gate stamp to its train's collect
     /// stamp, medianed over the cars that boarded in each window.
     #[test]
@@ -2265,6 +2884,96 @@ mod tests {
         assert_eq!(garage.count, Some(1));
         assert_eq!(garage.state, RegionState::Troubled);
         assert!(garage.why.contains("never became a car"), "{}", garage.why);
+        assert!(
+            garage.why.contains("nothing aimed at any of them"),
+            "and with no newer gate-run on that branch, says nobody is on it — which is \
+             the fact nine hours of flashing never carried (aae1515e): {}",
+            garage.why
+        );
+    }
+
+    /// A REPAIR IN FLIGHT LOOKS DIFFERENT FROM NEGLECT (backlog
+    /// aae1515e; David, 2026-09-21: "it is either too long to have not
+    /// addressed or we need to have some indication that the fix is in
+    /// transit").
+    ///
+    /// The garage went troubled at 08:50Z on a lost gate-run and read
+    /// identically at minute five and at hour nine, so nine hours
+    /// passed. Still TROUBLED here — deliberately not a fourth state,
+    /// which would force every consumer to learn a new value — but the
+    /// sentence now answers the reader's actual question.
+    #[test]
+    fn a_stranded_green_with_a_newer_gate_run_says_a_repair_is_in_flight() {
+        let run = job(
+            "gate-run",
+            "fix/lost",
+            JobStatus::Closed,
+            json!({ "branch": "fix/lost", "opened_at": "2026-09-19T09:00:00Z", "closed_at": "2026-09-19T09:30:00Z", "outcome": "completed" }),
+        );
+        let mut verdict = step(
+            &run,
+            "record-verdict",
+            StepStatus::Completed,
+            Some("2026-09-19T09:30:00Z"),
+        );
+        verdict.metadata = json!({ "verdict": "green" });
+        let runs = vec![(run.clone(), vec![verdict])];
+        let status = build_status_for(
+            YardInputs {
+                gate_runs: &runs,
+                now: Some(t(NOW)),
+                ..Default::default()
+            },
+            Reading::Read,
+            BoardingReadings::default(),
+        );
+        assert_eq!(status.stranded.len(), 1);
+
+        // The repair: a SECOND, still-open gate-run on the same branch.
+        let repair = job(
+            "gate-run",
+            "fix/lost",
+            JobStatus::Open,
+            json!({ "branch": "fix/lost", "opened_at": "2026-09-19T11:00:00Z" }),
+        );
+        let rows = vec![run.clone(), repair];
+        let out = regions(&inputs(&status, &[], &[], &[], &rows, Some(&[]), Some(&[])));
+        let garage = by_name(&out, "garage");
+        assert_eq!(
+            garage.state,
+            RegionState::Troubled,
+            "a repair in flight does not make it well — the green is still stranded"
+        );
+        assert!(
+            garage.why.contains("under repair"),
+            "but it says someone is on it: {}",
+            garage.why
+        );
+        assert!(
+            !garage.why.contains("nothing aimed"),
+            "and drops the sentence that would send a reader to look: {}",
+            garage.why
+        );
+
+        // THE CONTROL, on the same fixture: without the newer run it
+        // reads as neglect again. Without this the annotation could be
+        // unconditional and nobody would notice.
+        let alone = vec![run];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &[],
+            &alone,
+            Some(&[]),
+            Some(&[]),
+        ));
+        let garage = by_name(&out, "garage");
+        assert!(
+            garage.why.contains("nothing aimed at any of them"),
+            "the same stranded green with no repair reads as nobody on it: {}",
+            garage.why
+        );
     }
 
     /// Receiving: the age bands from `receiving.ts`, and arrivals per
@@ -2957,5 +3666,202 @@ mod tests {
                 label: "forge label".to_string()
             }]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // THE SHOP FLOOR (backlog 94c6ffd0) — the region upstream of the
+    // dock, where a car is still being built.
+    // -----------------------------------------------------------------
+
+    fn run(open: bool, opened: &str, closed: Option<&str>) -> Job {
+        let mut md = json!({ "opened_at": opened, "agent": "agent-claude" });
+        if let Some(c) = closed {
+            md["closed_at"] = json!(c);
+        }
+        job(
+            crate::agent_budget::RUN_KIND,
+            "a run",
+            if open {
+                JobStatus::Open
+            } else {
+                JobStatus::Closed
+            },
+            md,
+        )
+    }
+
+    fn session(actor: &str, last_active: Option<&str>) -> Job {
+        let mut md = json!({ "actor": actor, "started_at": "2026-09-19T06:00:00Z" });
+        if let Some(t) = last_active {
+            md["last_active_at"] = json!(t);
+        }
+        job(SESSION_KIND, "a session", JobStatus::Open, md)
+    }
+
+    fn floor<'a>(
+        base: RegionInputs<'a>,
+        runs: &'a [(Job, Vec<Step>)],
+        sessions: &'a [Job],
+        capacity: Option<usize>,
+    ) -> RegionInputs<'a> {
+        RegionInputs {
+            agent_runs: Some(runs),
+            sessions: Some(sessions),
+            run_capacity: capacity,
+            ..base
+        }
+    }
+
+    #[test]
+    fn the_shop_floor_counts_the_runs_in_flight_against_the_registrys_capacity() {
+        let status = empty_status();
+        let runs = vec![
+            (run(true, "2026-09-19T11:00:00Z", None), Vec::new()),
+            (run(true, "2026-09-19T11:30:00Z", None), Vec::new()),
+            // Closed inside the window: not in flight — the trend's
+            // sample instead.
+            (
+                run(false, "2026-09-19T08:00:00Z", Some("2026-09-19T09:00:00Z")),
+                Vec::new(),
+            ),
+        ];
+        let sessions = Vec::new();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&floor(base, &runs, &sessions, Some(6)));
+        let f = by_name(&r, "shop-floor");
+        assert_eq!(f.count, Some(2), "two runs are in flight");
+        assert!(
+            f.why.contains("0 crews on the floor"),
+            "a READ session list of none is a real zero: {}",
+            f.why
+        );
+        assert_eq!(f.bound, Some(6));
+        assert_eq!(f.state, RegionState::Clear, "{}", f.why);
+        assert_eq!(f.trend.metric, "build duration");
+        assert_eq!(f.trend.unit, "minutes");
+        assert_eq!(f.trend.current, Some(60.0), "the one run that closed");
+    }
+
+    #[test]
+    fn a_floor_at_the_registrys_capacity_is_busy_because_the_next_dispatch_is_refused() {
+        let status = empty_status();
+        let runs: Vec<(Job, Vec<Step>)> = (0..2)
+            .map(|_| (run(true, "2026-09-19T11:00:00Z", None), Vec::new()))
+            .collect();
+        let sessions = Vec::new();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&floor(base, &runs, &sessions, Some(2)));
+        let f = by_name(&r, "shop-floor");
+        assert_eq!(f.state, RegionState::Busy, "{}", f.why);
+        assert!(f.why.contains("at the cap"), "{}", f.why);
+    }
+
+    /// A run that finished and never reported still holds its slot —
+    /// the failure the cap makes expensive, and the one an operator
+    /// needs to see from world scale.
+    #[test]
+    fn a_finished_but_unreported_run_troubles_the_shop_floor() {
+        let status = empty_status();
+        let j = run(true, "2026-09-19T09:00:00Z", None);
+        let steps = vec![
+            step(
+                &j,
+                "building",
+                StepStatus::Completed,
+                Some("2026-09-19T10:00:00Z"),
+            ),
+            step(&j, "reported", StepStatus::Ready, None),
+        ];
+        let runs = vec![(j, steps)];
+        let sessions = Vec::new();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&floor(base, &runs, &sessions, Some(6)));
+        let f = by_name(&r, "shop-floor");
+        assert_eq!(f.state, RegionState::Troubled, "{}", f.why);
+        assert!(
+            f.why.contains("holds a slot") && f.why.contains("not reported"),
+            "the why names the failure and its cost: {}",
+            f.why
+        );
+    }
+
+    /// An unread floor is troubled, never an empty one: a map that drew
+    /// nobody building would read as a quiet shop rather than an unread
+    /// one (the rule every region here keeps).
+    #[test]
+    fn an_unread_run_list_is_a_troubled_floor_and_never_a_quiet_one() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&RegionInputs {
+            agent_runs: None,
+            sessions: None,
+            run_capacity: None,
+            ..base
+        });
+        let f = by_name(&r, "shop-floor");
+        assert_eq!(f.count, None);
+        assert!(
+            !f.why.contains("crew"),
+            "an unread session list states no crew count at all: {}",
+            f.why
+        );
+        assert_eq!(f.state, RegionState::Troubled);
+        assert!(f.why.contains("could not be read"), "{}", f.why);
+        // And the crews: one unknown machine naming the failed read,
+        // never a floor with nobody standing on it.
+        let m = machines_in(&r, "shop-floor");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].state, MachineState::Unknown);
+    }
+
+    /// The crews ARE the sessions (design 511fa7d4 car 2b). Idle is a
+    /// reading, taken only where the packet declares a heartbeat; a
+    /// session that has never prompted is unknown, not idle.
+    #[test]
+    fn the_crews_are_the_sessions_and_silence_is_read_only_from_a_heartbeat() {
+        let status = empty_status();
+        let sessions = vec![
+            session("emp-david", Some("2026-09-19T11:55:00Z")),
+            session("claude@algedonic.dev", Some("2026-09-19T06:30:00Z")),
+            session("emp-quiet", None),
+        ];
+        let at_work = sessions[0].id.to_string();
+        let silent = sessions[1].id.to_string();
+        let never = sessions[2].id.to_string();
+        let runs = Vec::new();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&floor(base, &runs, &sessions, None));
+        assert_eq!(
+            machine_state(&r, "shop-floor", &format!("session:{at_work}")),
+            MachineState::Running
+        );
+        assert_eq!(
+            machine_state(&r, "shop-floor", &format!("session:{silent}")),
+            MachineState::Idle
+        );
+        assert_eq!(
+            machine_state(&r, "shop-floor", &format!("session:{never}")),
+            MachineState::Unknown,
+            "a session that never prompted is not idle — nothing measured it"
+        );
+    }
+
+    /// The bound is the registry's, and an agent with no declared cap is
+    /// unbounded — so the total is, too (the claim door's own rule).
+    #[test]
+    fn the_run_capacity_is_the_registrys_sum_and_an_undeclared_cap_is_unbounded() {
+        let row = |cap: Option<i32>| crate::agents::AgentRow {
+            id: "agent-claude".to_string(),
+            display_name: "Claude".to_string(),
+            default_model: "opus-5".to_string(),
+            role: None,
+            department: None,
+            hourly_budget_usd_micros: None,
+            max_concurrent_runs: cap,
+            aliases: vec![],
+        };
+        assert_eq!(run_capacity(&[row(Some(6)), row(Some(2))]), Some(8));
+        assert_eq!(run_capacity(&[row(Some(6)), row(None)]), None);
+        assert_eq!(run_capacity(&[]), None);
     }
 }
