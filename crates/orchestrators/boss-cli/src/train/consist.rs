@@ -144,7 +144,7 @@ pub(crate) fn files_named_in(output: &str, budget: usize) -> Vec<String> {
 /// renders and the line the operator greps must never tell different
 /// stories (the rule `skip_reason_conflict` already follows, down to
 /// the file budget: this lands on `metadata.skip_reason`, which
-/// PacketCard renders as "LEFT BEHIND — <reason>", so the reason does
+/// PacketCard renders as "LEFT BEHIND — `<reason>`", so the reason does
 /// not repeat the words the chip already says).
 ///
 /// The last clause is the point of the whole car. A car that reads
@@ -554,10 +554,10 @@ mod tests {
         boss_testing::copy_lint_libs(&root);
         // And the tree's gate.sh: the consist check asks it which lints
         // declare themselves out (`--exclusions`), so a fixture without
-        // one is a tree whose roster cannot be derived.
-        let gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../infra/gate.sh");
-        std::fs::copy(&gate, root.join("infra/gate.sh"))
-            .unwrap_or_else(|e| panic!("copy {}: {e}", gate.display()));
+        // one is a tree whose roster cannot be derived — and gate.sh
+        // REFUSES without any helper it sources, so it is carried with
+        // all of them, gate.sh being the one that says which (955c99b6).
+        boss_testing::copy_gate_sh(&root);
         for m in migrations {
             std::fs::write(schema.join(m), "-- fixture\n").expect("write migration");
         }

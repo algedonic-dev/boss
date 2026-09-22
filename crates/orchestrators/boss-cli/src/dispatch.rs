@@ -97,10 +97,14 @@
 //! declared blend when they are a total, with the basis named either
 //! way (`PricingBasis`; design 91a9bfe7). Idempotent end to end: the packet PATCH
 //! merges, a completed `reported` is left as it is, and the run row is
-//! keyed on the run's id.
+//! keyed on the run's id. That last key is INSERT-ONCE, so a second
+//! report changes no row: an identical retry says the record already
+//! there stands, and one carrying a different count is refused naming
+//! both figures, rather than printing the held row's price as though
+//! it were this command's answer ([`record_line`], backlog b4fd594e).
 
 use anyhow::{Context, Result, bail};
-use boss_jobs::agent_runs::PricingBasis;
+use boss_jobs::agent_runs::{PricingBasis, TokenUsage};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -158,6 +162,36 @@ pub(crate) fn block_in_row(row: &Value, slug: &str) -> Option<Settings> {
         model: a.model,
         budget_usd: a.budget_usd,
         effort: a.effort.as_str().to_string(),
+    })
+}
+
+/// THE reader of a step's agent settings, and the only one (backlog
+/// dacee8cc): the projection the packet carries, else the block the
+/// active Workflow row declares for that step. `row` is what the
+/// caller has in hand — `None` asks whether the step can answer alone,
+/// which is how a caller that reads the row lazily stays lazy.
+///
+/// It exists because the fallback arrived twice by repair rather than
+/// once by design, and the two copies did not agree. `boss dispatch`
+/// required all four projected keys (half a projection is none, since
+/// they are written together); `boss brief` read `agent_profile` alone,
+/// so a half-projected step briefed a human in one lane and dispatched
+/// an agent in the other. CLAUDE.md 9a: a fact that lives twice gets
+/// collapsed if it can be, and this one could.
+///
+/// The fallback is needed because the projection is copied at OPEN
+/// time, like the procedure, so every packet admitted before its kind
+/// declared an agent block has none. Measured 2026-09-22 against the
+/// live system of record: 195 open steps whose active row declares a
+/// block carry no `agent_` key — 186 page-audit, 8 backlog-item, 1
+/// user-feedback. Back-filling them is NOT the answer: an in-flight
+/// packet is pinned to the version it was admitted under, and writing
+/// v3's block onto a v1 packet would make the record state a
+/// declaration that version never made.
+pub(crate) fn settings_for(step: &Value, row: Option<&Value>) -> Option<Settings> {
+    block_on_step(step).or_else(|| {
+        let slug = step.get("spec_slug").and_then(Value::as_str)?;
+        block_in_row(row?, slug)
     })
 }
 
@@ -720,19 +754,19 @@ pub(crate) async fn dispatch_at(
         bail!("{why}");
     }
 
-    // The block: the packet's projection, else the active row's step.
-    // The row is KEPT when it is read, because the brief dates the
-    // step's procedure against the same row (794e8d61) and one
-    // dispatch should read it at most once.
-    let (block, row_already_read) = match block_on_step(step) {
+    // The block: the packet's projection, else the active row's step,
+    // both through the ONE reader `boss brief` also asks (dacee8cc).
+    // Asked first with no row in hand, so the row is read only when
+    // the step cannot answer alone. The row is KEPT when it is read,
+    // because the brief dates the step's procedure against the same
+    // row (794e8d61) and one dispatch should read it at most once.
+    let (block, row_already_read) = match settings_for(step, None) {
         Some(b) => (b, None),
         None => {
             let row = api_at(Method::GET, format!("/api/workflows/{kind}"), None)
                 .await
                 .with_context(|| format!("reading the {kind} Workflow row for its agent block"))?;
-            let block = row
-                .as_ref()
-                .and_then(|r| block_in_row(r, &slug))
+            let block = settings_for(step, row.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("{}", no_block_refusal(&kind, &slug)))?;
             (block, row)
         }
@@ -1190,6 +1224,42 @@ pub(crate) fn run_outcome(run: &Value) -> Option<&'static str> {
     }
 }
 
+/// What `--report` tells a run that has reached no terminal — and the
+/// command that ends it (backlog 2e4d7624, 2026-09-22).
+///
+/// The refusal was already correct about the CONDITION and said
+/// nothing about what to do: "once the run has landed, refused or
+/// died" is a state with no verb attached, and the verb was not
+/// discoverable — the builder who hit it on run 93bcd09c found it by
+/// reading `infra/platform/workflows/agent-run.toml`. The cost of not
+/// naming it is silent and shared: an un-terminated run keeps its slot
+/// against the agent's concurrent-run cap, and the only symptom is the
+/// NEXT dispatch refusing with 409, paid by whoever comes next rather
+/// than by the run that refused (open runs reached 7 against a cap of
+/// 6 on the day this was filed).
+///
+/// Refusing to build is a GOOD outcome — builder rule 15 — and it is
+/// the harder ending to record: a green gate writes `gated` by itself
+/// through the landing rule, while a refusal has no gate and no rule
+/// and must be written by a hand. So this hands over the door, the way
+/// the step API's 409 names `PATCH /api/jobs/{id}/metadata` as the way
+/// to annotate instead. It stays a two-step form on purpose: the
+/// terminal is written by `boss step complete`, the same verb that
+/// completes every other step in its row's declared shape, and a
+/// `--report --refused` spelling would be a second way to write it
+/// and a second thing to keep true.
+pub(crate) fn no_terminal_line(short: &str) -> String {
+    format!(
+        "boss dispatch: run {short} has no terminal yet — `{BUILDING_SLUG}` carries no \
+         `result`, so agent_runs would have to assert an outcome the packet does not hold. \
+         The report is on the packet. End the run with the outcome it reached — `boss step \
+         complete {short} --step {BUILDING_SLUG} --field result=refused` for an agent that \
+         stopped without building, or `result=delivered` for work that ships no car; a green \
+         gate writes `gated` by itself and the hourly clock writes `died`. Then run --report \
+         again and the cost is recorded with the outcome it reached"
+    )
+}
+
 /// The car the run produced, off the evidence the landing rule stamped
 /// onto `building` (backlog 65c9c05a). `jobs.complete_linked_step`
 /// writes the closing packet's own `metadata.branch` under the rule's
@@ -1302,6 +1372,141 @@ pub(crate) fn run_record(
     Ok(body)
 }
 
+/// The three token columns of a recorded row, read back as the shape
+/// the reporter was in. One derivation, from the row's own keys — a
+/// split when both halves are there, the bare total otherwise, and
+/// `None` for a row that states it holds no count.
+pub(crate) fn row_tokens(row: &Value) -> Option<Tokens> {
+    let n = |k: &str| row.get(k).and_then(Value::as_u64);
+    match (n("input_tokens"), n("output_tokens")) {
+        (Some(input), Some(output)) => Some(Tokens::Split { input, output }),
+        _ => n("total_tokens").map(Tokens::Total),
+    }
+}
+
+/// A count in the words the caller gave it, so two of them can be set
+/// side by side and the difference read without arithmetic.
+pub(crate) fn tokens_phrase(t: Option<Tokens>) -> String {
+    match t {
+        Some(Tokens::Split { input, output }) => format!("{input} in / {output} out"),
+        Some(Tokens::Total(total)) => format!("{total} total, unsplit"),
+        None => "no count at all".to_string(),
+    }
+}
+
+/// What a row's figure is and what it rests on — through the record's
+/// own rule ([`boss_jobs::agent_runs::pricing_basis`]), never a second
+/// copy of it here, so a blended figure is never printed as a measured
+/// one (design 91a9bfe7).
+fn price_phrase(priced: Option<u64>, basis: Option<PricingBasis>) -> String {
+    let dollars = |m: u64| format!("${:.4}", m as f64 / 1_000_000.0);
+    match (priced, basis) {
+        (Some(m), Some(PricingBasis::Blended)) => format!(
+            "at {} — BLENDED, not measured: a bare total priced at the model's declared \
+             input/output ratio (rate card)",
+            dollars(m)
+        ),
+        (Some(m), Some(PricingBasis::Split)) => {
+            format!("at {} (rate card, measured split)", dollars(m))
+        }
+        // Priced, but the row carries no count this build can read, so
+        // the figure is stated and the claim about it is not: naming a
+        // basis here would be guessing one.
+        (Some(m), None) => format!(
+            "at {} (rate card; basis unread — GET /api/agent-runs says which)",
+            dollars(m)
+        ),
+        (None, _) => "unpriced — nothing on the rate card could price it: no row for the model, \
+             no declared blend for a total-only count, or no count at all"
+            .to_string(),
+    }
+}
+
+/// What `POST /api/agent-runs` answered, said back in the caller's own
+/// terms. `Ok` is a line to print; `Err` is a refusal.
+///
+/// The row is insert-once on `run_id` (`ON CONFLICT (run_id) DO
+/// NOTHING`), and the POST says which it did: `recorded: false` is a
+/// second report collapsing onto the record already there. Until
+/// 2026-09-22 this verb ignored that flag and printed the HELD row's
+/// price as though it described the command just run — on run 54f43757
+/// a report carrying `--tokens 300000,17000` was answered "unpriced —
+/// a total-only token count", which was true of the first report an
+/// hour earlier and of nothing the caller had done, and the split went
+/// nowhere in silence (backlog b4fd594e).
+///
+/// Two second reports, two different facts, so two answers:
+///   - the SAME count is a retry, which is what the idempotent
+///     `run_id` is for — stated, not refused, and carrying no advice,
+///     because nothing the caller can send would move the row;
+///   - a DIFFERENT count is a correction, and nothing edits an
+///     `agent_runs` row today. It is REFUSED, naming both figures and
+///     the packet that now disagrees with the row, rather than
+///     restating the rule. A silent no-op is the one forbidden failure
+///     mode (CLAUDE.md: no evidence is not a pass); a loud refusal is
+///     not, and it leaves the operator holding a figure they can see
+///     the record does not have. Making the record TAKE the correction
+///     is a bigger change than a message — the insert-once contract,
+///     its event replay guard and the rebuilder's own `DO NOTHING` all
+///     rest on it — and it wants its own decision, not a builder's
+///     aside.
+pub(crate) fn record_line(
+    short: &str,
+    actor_id: &str,
+    out: Option<&Value>,
+    r: &Report,
+) -> std::result::Result<String, String> {
+    let row = out.and_then(|o| o.get("run"));
+    let priced = row
+        .and_then(|v| v.get("usd_micros"))
+        .and_then(Value::as_u64);
+    let held = row.and_then(row_tokens);
+    let usage = match held {
+        Some(Tokens::Split { input, output }) => TokenUsage::Split { input, output },
+        Some(Tokens::Total(total)) => TokenUsage::TotalOnly { total },
+        None => TokenUsage::Unreported,
+    };
+    let basis = boss_jobs::agent_runs::pricing_basis(usage, priced);
+    let phrase = price_phrase(priced, basis);
+
+    if out.and_then(|o| o.get("recorded")).and_then(Value::as_bool) != Some(false) {
+        let mut line =
+            format!("boss dispatch: agent_runs holds run {short} for {actor_id} {phrase}");
+        match basis {
+            Some(PricingBasis::Blended) => line.push_str(
+                ". Give --tokens IN,OUT when a split exists and it is priced at the two rates \
+                 instead",
+            ),
+            _ if priced.is_none() => line.push_str(". The run is recorded in full either way"),
+            _ => {}
+        }
+        return Ok(line);
+    }
+
+    let at = row
+        .and_then(|v| v.get("recorded_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("an earlier report");
+    if held == r.tokens {
+        return Ok(format!(
+            "boss dispatch: agent_runs already held run {short} for {actor_id} {phrase}, \
+             recorded {at}. This report carries the same count, so the row is unchanged — it is \
+             insert-once on run_id, and a retry collapses onto the record already there"
+        ));
+    }
+    Err(format!(
+        "agent_runs already holds run {short} for {actor_id} {phrase}, recorded {at} by an \
+         earlier --report, and this report did NOT change it: the row is insert-once on run_id \
+         and no verb edits one. The row holds {}; this report gave {} — the figure you just gave \
+         is the one the record does not have. The handback IS on the run packet, so the packet \
+         and the row now disagree about the same run. Read the row as first reported, not as \
+         this command's answer; correcting a recorded cost needs a record that can take a \
+         correction (backlog b4fd594e)",
+        tokens_phrase(held),
+        tokens_phrase(r.tokens),
+    ))
+}
+
 /// The report, against an explicit base — the seam the wire tests go
 /// through.
 pub(crate) async fn report_at(
@@ -1380,12 +1585,7 @@ pub(crate) async fn report_at(
     // because the row is insert-once and the guess would stick
     // (backlog 8f1de7bf).
     let Some(outcome) = run_outcome(&run) else {
-        eprintln!(
-            "boss dispatch: run {short} has no terminal yet — `{BUILDING_SLUG}` carries no \
-             `result`, so agent_runs would have to assert an outcome the packet does not hold. \
-             The report is on the packet; run --report again once the run has landed, refused \
-             or died, and the cost is recorded with the outcome it reached"
-        );
+        eprintln!("{}", no_terminal_line(short));
         return Ok(());
     };
     let login = run
@@ -1405,48 +1605,10 @@ pub(crate) async fn report_at(
     let out = api_at(Method::POST, "/api/agent-runs".to_string(), Some(record))
         .await
         .with_context(|| format!("recording run {short} in agent_runs"))?;
-    // The basis through the record's own rule, not a second copy of it
-    // here: the recorded run says what its figure rests on
-    // (`AgentRun::pricing_basis`), and a blended figure must never be
-    // printed as a measured one (design 91a9bfe7).
-    let recorded: Option<boss_jobs::agent_runs::AgentRun> = out
-        .as_ref()
-        .and_then(|o| o.get("run"))
-        .cloned()
-        .and_then(|r| serde_json::from_value(r).ok());
-    // The figure off the answer itself, so a response this CLI cannot
-    // fully parse still reports the price it was given.
-    let priced = out
-        .as_ref()
-        .and_then(|o| o.pointer("/run/usd_micros"))
-        .and_then(Value::as_u64);
-    match (priced, recorded.as_ref().and_then(|r| r.pricing_basis())) {
-        (Some(micros), Some(PricingBasis::Blended)) => eprintln!(
-            "boss dispatch: agent_runs holds run {short} for {actor_id} at ${:.4} — BLENDED, not \
-             measured: a bare total priced at the model's declared input/output ratio (rate \
-             card). Give --tokens IN,OUT when a split exists and it is priced at the two rates \
-             instead",
-            micros as f64 / 1_000_000.0
-        ),
-        (Some(micros), Some(PricingBasis::Split)) => eprintln!(
-            "boss dispatch: agent_runs holds run {short} for {actor_id} at ${:.4} (rate card, \
-             measured split)",
-            micros as f64 / 1_000_000.0
-        ),
-        // Priced, but this build could not read the run back to say on
-        // what basis. The figure is stated and the claim about it is
-        // not: naming a basis here would be guessing one.
-        (Some(micros), None) => eprintln!(
-            "boss dispatch: agent_runs holds run {short} for {actor_id} at ${:.4} (rate card; \
-             basis unread — GET /api/agent-runs says which)",
-            micros as f64 / 1_000_000.0
-        ),
-        (None, _) => eprintln!(
-            "boss dispatch: agent_runs holds run {short} for {actor_id}, unpriced — nothing on \
-             the rate card could price it: no row for the model, no declared blend for a \
-             total-only count, or no count at all. The run is recorded in full either way"
-        ),
-    }
+    eprintln!(
+        "{}",
+        record_line(short, &actor_id, out.as_ref(), report).map_err(|e| anyhow::anyhow!("{e}"))?
+    );
     Ok(())
 }
 
@@ -1684,6 +1846,21 @@ mod tests {
         });
         assert_eq!(block_in_row(&row, "build"), Some(block()));
         assert_eq!(block_in_row(&row, "triage"), None);
+
+        // ONE READER FOR BOTH HALVES (dacee8cc). `boss brief` asks the
+        // same function, so the lane a human reads before dispatching
+        // cannot differ from the lane the dispatch renders. With no row
+        // in hand it answers off the step alone — which is how the
+        // dispatch keeps its row read lazy — and a step with no
+        // projection and no row answers nothing, which is the refusal.
+        assert_eq!(settings_for(&projected, None), Some(block()));
+        assert_eq!(settings_for(&projected, Some(&row)), Some(block()));
+        assert_eq!(settings_for(&half, None), None);
+        assert_eq!(settings_for(&half, Some(&row)), Some(block()));
+        assert_eq!(
+            settings_for(&step("triage", "ready", json!({})), Some(&row)),
+            None
+        );
     }
 
     /// Overrides override only what they name, and the result is held
@@ -2217,6 +2394,49 @@ mod tests {
         }
     }
 
+    /// The refusal hands over the door (backlog 2e4d7624). A refusal
+    /// that names the condition and no command leaves the run holding
+    /// its slot against the concurrent-run cap, and the next dispatch
+    /// pays for it with a 409. Every value it names is held to the
+    /// protocol's own enum, so the door cannot name a result the
+    /// Workflow row stopped admitting (CLAUDE.md 9a).
+    #[test]
+    fn the_no_terminal_refusal_names_the_command_that_ends_the_run() {
+        let line = no_terminal_line("5b1d2c3e");
+        assert!(
+            line.contains("boss step complete 5b1d2c3e --step building --field result=refused"),
+            "the refusal must name the command that ends a refused run: {line}"
+        );
+
+        let run =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .find(|w| w.kind == RUN_KIND)
+                .expect("agent-run ships in the platform bundle");
+        let field_type = run
+            .steps
+            .iter()
+            .find(|s| s.title == BUILDING_SLUG)
+            .expect("agent-run has a `building` step")
+            .fields
+            .iter()
+            .find(|f| f.name == "result")
+            .expect("building declares `result`")
+            .field_type
+            .clone();
+        for value in ["refused", "delivered", "gated", "died"] {
+            assert!(
+                field_type.split('|').any(|v| v == value),
+                "the refusal names `{value}` and the row declares {field_type}"
+            );
+            assert!(
+                line.contains(value),
+                "the fork has a `{value}` branch the refusal does not name: {line}"
+            );
+        }
+    }
+
     #[test]
     fn the_report_rides_the_packet_and_the_step_as_their_own_fields() {
         let r = Report {
@@ -2253,6 +2473,127 @@ mod tests {
                 .get("tokens")
                 .is_none()
         );
+    }
+
+    /// A SECOND `--report` on a run already in `agent_runs` writes
+    /// nothing — the row is insert-once on `run_id` — and until
+    /// 2026-09-22 the verb never said so: it printed the price of the
+    /// row already held as though it described the command just run.
+    /// Measured on run 54f43757 (backlog b4fd594e): a report carrying
+    /// `--tokens 300000,17000` was answered "unpriced — a total-only
+    /// token count", which was true of the FIRST report an hour
+    /// earlier and of nothing the caller had done. A differing count
+    /// is a correction the record cannot take, so it is REFUSED, and
+    /// the refusal names both figures rather than the rule.
+    #[test]
+    fn a_second_report_with_a_different_count_is_refused_naming_the_row_it_did_not_change() {
+        let out = json!({
+            "recorded": false,
+            "run": {
+                "run_id": "54f43757", "usd_micros": 1_575_000,
+                "total_tokens": 210_000, "recorded_at": "2026-09-19T05:40:33Z",
+            },
+        });
+        let r = Report {
+            summary: "handback".into(),
+            spend_usd: None,
+            tokens: Some(Tokens::Split {
+                input: 300_000,
+                output: 17_000,
+            }),
+        };
+        let why = record_line("54f43757", "agent-claude", Some(&out), &r)
+            .expect_err("a differing second report is refused");
+        assert!(why.contains("210000 total"), "the row it holds: {why}");
+        assert!(
+            why.contains("300000 in / 17000 out"),
+            "the figure that is missing: {why}"
+        );
+        assert!(
+            why.contains("2026-09-19T05:40:33Z"),
+            "when it was held: {why}"
+        );
+        assert!(why.contains("insert-once"), "why nothing changed: {why}");
+        assert!(
+            !why.contains("total-only count"),
+            "the old message blamed a shape this report did not send: {why}"
+        );
+    }
+
+    /// The benign half of the same answer. A retry after a failed
+    /// report carries the SAME count — that is what the idempotent
+    /// `run_id` is for — so it is not a refusal; it is a statement
+    /// that the row already there is the record. It must not advise
+    /// `--tokens IN,OUT`: nothing this caller can send would change
+    /// the row, and advice that cannot be acted on is the restated
+    /// rule the packet named.
+    #[test]
+    fn a_retried_report_with_the_same_count_says_the_row_is_unchanged_and_advises_nothing() {
+        let out = json!({
+            "recorded": false,
+            "run": {
+                "run_id": "54f43757", "usd_micros": 1_575_000,
+                "total_tokens": 210_000, "recorded_at": "2026-09-19T05:40:33Z",
+            },
+        });
+        let r = Report {
+            summary: "handback".into(),
+            spend_usd: None,
+            tokens: Some(Tokens::Total(210_000)),
+        };
+        let line = record_line("54f43757", "agent-claude", Some(&out), &r)
+            .expect("an identical retry is not a refusal");
+        assert!(line.contains("already held"), "{line}");
+        assert!(line.contains("unchanged"), "{line}");
+        assert!(
+            !line.contains("Give --tokens"),
+            "advice that cannot be acted on: {line}"
+        );
+    }
+
+    /// The first record still says what its figure rests on, and a
+    /// blended one still asks for the split — that advice IS
+    /// actionable here, because the next report is the first one.
+    #[test]
+    fn a_first_record_names_its_basis_beside_the_figure() {
+        let split = json!({
+            "recorded": true,
+            "run": { "usd_micros": 4_200_000, "input_tokens": 740_000, "output_tokens": 21_000 },
+        });
+        let r = Report {
+            summary: "s".into(),
+            spend_usd: None,
+            tokens: Some(Tokens::Split {
+                input: 740_000,
+                output: 21_000,
+            }),
+        };
+        let line = record_line("54f43757", "agent-claude", Some(&split), &r).expect("recorded");
+        assert!(line.contains("$4.2000"), "{line}");
+        assert!(line.contains("measured split"), "{line}");
+
+        let blended = json!({
+            "recorded": true,
+            "run": { "usd_micros": 1_575_000, "total_tokens": 210_000 },
+        });
+        let r = Report {
+            summary: "s".into(),
+            spend_usd: None,
+            tokens: Some(Tokens::Total(210_000)),
+        };
+        let line = record_line("54f43757", "agent-claude", Some(&blended), &r).expect("recorded");
+        assert!(line.contains("BLENDED, not measured"), "{line}");
+        assert!(line.contains("Give --tokens IN,OUT"), "{line}");
+
+        let unpriced = json!({ "recorded": true, "run": { "total_tokens": null } });
+        let r = Report {
+            summary: "s".into(),
+            spend_usd: None,
+            tokens: None,
+        };
+        let line = record_line("54f43757", "agent-claude", Some(&unpriced), &r).expect("recorded");
+        assert!(line.contains("unpriced"), "{line}");
+        assert!(line.contains("recorded in full either way"), "{line}");
     }
 
     #[test]
@@ -3245,6 +3586,57 @@ mod wire_tests {
             !calls.iter().any(|(m, _, _)| m == "POST"),
             "nothing recorded under a CPU nobody registered"
         );
+    }
+
+    /// End to end, the operator's case on 2026-09-19: the run was
+    /// already recorded from a bare total, and a later report gave the
+    /// split. The verb exits NONZERO and says the row is unchanged —
+    /// it used to exit 0 and print the held row's price as its own
+    /// answer, so the split was dropped in silence (backlog b4fd594e).
+    #[tokio::test]
+    async fn a_second_report_carrying_a_different_count_exits_nonzero_saying_the_row_stands() {
+        let run = run_packet("completed");
+        let (base, _log) = serve(move |method, path, target, _body| match (method, path) {
+            ("GET", p) if p == format!("/api/jobs/{RUN}") => ("200 OK", run.to_string()),
+            ("PATCH", p) if p == format!("/api/jobs/{RUN}/metadata") => {
+                ("204 No Content", String::new())
+            }
+            ("GET", "/api/agents") => (
+                "200 OK",
+                json!({ "data": [{ "id": "agent-claude", "aliases": ["claude@algedonic.dev"],
+                                   "default_model": "opus-5[1m]" }], "total": 1 })
+                .to_string(),
+            ),
+            ("POST", "/api/agent-runs") => (
+                "200 OK",
+                json!({ "recorded": false, "run": { "run_id": RUN, "usd_micros": 1_575_000,
+                                                    "total_tokens": 210_000,
+                                                    "recorded_at": "2026-09-19T05:40:33Z" } })
+                .to_string(),
+            ),
+            _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+        })
+        .await;
+        let err = report_at(
+            &reqwest::Client::new(),
+            &base,
+            RUN,
+            &Report {
+                summary: "handback".into(),
+                spend_usd: None,
+                tokens: Some(Tokens::Split {
+                    input: 300_000,
+                    output: 17_000,
+                }),
+            },
+            "claude@algedonic.dev",
+            "2026-09-19T07:05:00Z".parse().unwrap(),
+        )
+        .await
+        .expect_err("a second report with a different count is refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("210000 total"), "{text}");
+        assert!(text.contains("300000 in / 17000 out"), "{text}");
     }
 
     // -----------------------------------------------------------------

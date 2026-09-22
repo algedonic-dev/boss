@@ -12,13 +12,20 @@
 // mounts.
 
 import type { Page, Route } from '@playwright/test';
+// The world's own layout, so the empty leg below cannot list a region
+// or a hop the map does not draw (backlog 94c6ffd0: both lists were
+// typed out here and went stale the day a ninth region landed).
+// world.ts is pinned to the server's REGIONS and BORDERS by
+// world.test.ts and borders.test.ts, so this is one definition deep.
+import { BORDERS, TERRITORIES } from '../../src/it/yard/world';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
-/// Every module id the SPA gates on (nav-catalog `module`, App.svelte's
-/// routeRequiredModule, the Simulator tab and DebugGear), all on — the
-/// playground tenant's manifest, in the shape the tenant contract
+/// Every module id the SPA gates on (nav-catalog `module`, which since
+/// backlog f9b43965 also answers for the route gate through
+/// `moduleForRoute`, plus the Simulator tab and DebugGear), all on —
+/// the playground tenant's manifest, in the shape the tenant contract
 /// documents.
 export const MODULES_ON: Readonly<Record<string, boolean>> = {
   calendar: true, equipment: true, exec: true, finance: true, 'marketing-assets': true,
@@ -26,10 +33,10 @@ export const MODULES_ON: Readonly<Record<string, boolean>> = {
 };
 
 /// The platform's department Classes (01-registries.sql) as `/api/classes`
-/// rows: the chrome bar derives its tabs from `(employee, *, department)`
-/// since ce68f137, so a mock with no departments is a bar with no
-/// department tabs. Shared with the chrome specs that mock no other
-/// backend.
+/// rows — the EMPLOYEE DRAWER: the values an employee's `department`
+/// column may take, which the policy flyout's scope picker reads.
+/// The chrome bar stopped deriving its tabs from these in dc5788ba;
+/// `DEPARTMENTS` below is what it reads now.
 export const DEPARTMENT_CLASSES: ReadonlyArray<Record<string, unknown>> = [
   ['it', 'IT'], ['executive', 'Executive'], ['sales', 'Sales'], ['service', 'Service'],
   ['refurb', 'Refurb'], ['qa', 'QA'], ['warehouse', 'Warehouse'], ['finance', 'Finance'],
@@ -38,6 +45,23 @@ export const DEPARTMENT_CLASSES: ReadonlyArray<Record<string, unknown>> = [
   subject_kind: 'employee', code, display_name, parent_code: null, member_attribute: 'department',
   metadata: {}, sort_order: (i + 1) * 10, retired_at: null,
 }));
+
+/// The departments registry as `GET /api/departments` serves it — the
+/// chrome bar derives its tabs from these since dc5788ba, so a mock
+/// with no departments is a bar with no department tabs. The SAME
+/// codes as the drawer above, derived rather than listed a second
+/// time: which roster answers is the point of that car, and the mock
+/// has no second org chart to tell them apart with. The endpoint has
+/// already dropped retired rows and sorted, so the wire carries
+/// neither field. Shared with the chrome specs that mock no other
+/// backend.
+export const DEPARTMENTS: ReadonlyArray<Record<string, unknown>> = DEPARTMENT_CLASSES.map((c) => ({
+  code: c.code, display_name: c.display_name, function: 'operations',
+}));
+
+/// `GET /api/departments` — the bare list, not the per-department
+/// readiness read, which the SPA does not make.
+export const DEPARTMENTS_ENDPOINT = /\/api\/departments(\?|$)/;
 
 // Persona: one employee, role ceo ⇒ every route is visible.
 const EMP = {
@@ -91,6 +115,11 @@ export const SHELL_ENDPOINTS: ReadonlyArray<RegExp> = [
   /\/api\/tenant\/manifest$/,
   /\/api\/classes(\?|$)/,
   /\/api\/subject-kinds$/,
+  // The org chart the chrome bar's tabs come from (dc5788ba). A shell
+  // read like the manifest and the Class registries beside it: a crawl
+  // whose bar has lost its department tabs is measuring a different
+  // page.
+  DEPARTMENTS_ENDPOINT,
 ];
 
 /// The endpoints whose fixture is an OBJECT, not a list. Named once,
@@ -112,6 +141,11 @@ export const SHIPMENT_DETAIL = /\/api\/shipping\/shipments\/[^/]+$/;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
   JOBS_LIVE, JOBS_SUMMARY, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
   MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL,
+  // `{data, total}`, not a list: a bare `[]` here is the shape a wrong
+  // endpoint answers, and the bar reads it as a failed roster rather
+  // than an empty one — deliberately, so the org chart cannot go
+  // missing quietly (libs/web-kit/src/nav.ts).
+  DEPARTMENTS_ENDPOINT,
 ];
 
 /// The floor under every mocked spec's backend (backlog f88e7908,
@@ -144,6 +178,9 @@ export async function installApiFloor(page: Page): Promise<void> {
   await page.route(/\/api\/auth\/(guest|oidc\/available)$/, (r) => json(r, { enabled: false }));
 
   // What the chrome asks on every mount.
+  // The departments registry — the bar's tabs (dc5788ba). An object,
+  // so the `[]` catch-all above would read as a failed roster.
+  await page.route(DEPARTMENTS_ENDPOINT, (r) => json(r, { data: DEPARTMENTS, total: DEPARTMENTS.length }));
   // The unread badge: `{ count }` (boss-messages' UnreadResponse).
   await page.route(/\/api\/messages\/unread\/[^/]+(\?|$)/, (r) => json(r, { count: 0 }));
   // The route-open record: a fire-and-forget POST the API answers 204.
@@ -171,32 +208,30 @@ export async function installApiFloor(page: Page): Promise<void> {
 
   // The IT system map's regions (design 0524fc95, car 2): the /it
   // landing reads this ONE endpoint. An empty-but-well-formed map —
-  // eight regions, each clear with a count of 0 and a trend with no
-  // samples — so the page draws eight cards and the crawl walks eight
-  // doors. Under the `[]` catch-all the page would render a failure
-  // line (a list where the map is due is a malformed read), which is
-  // right for an outage and wrong for the empty leg.
+  // one region per declared territory, each clear with a count of 0 and
+  // a trend with no samples — so the page draws every card and the
+  // crawl walks every door. Under the `[]` catch-all the page would
+  // render a failure line (a list where the map is due is a malformed
+  // read), which is right for an outage and wrong for the empty leg.
   await page.route(YARD_REGIONS, (r) =>
     json(r, {
       window_hours: 24,
       now: '2026-09-03T12:00:00Z',
-      regions: ['dock', 'gates', 'track', 'shed', 'arrivals', 'garage', 'receiving', 'marshalling'].map((name) => ({
+      regions: TERRITORIES.map(({ name }) => ({
         name, count: 0, state: 'clear', why: 'nothing here',
         trend: { metric: 'nothing measured', unit: 'per day', current: null, previous: null, samples: 0, previous_samples: 0 },
       })),
     }),
   );
   // The map's RAILS (design d2154293, car 2), for the same reason: the
-  // empty leg is eight quiet borders, not a failed read. The hops are
-  // world.ts's, which the server's table is pinned equal to.
+  // empty leg is a quiet border per declared hop, not a failed read.
+  // The hops are world.ts's, which the server's table is pinned equal
+  // to.
   await page.route(YARD_BORDERS, (r) =>
     json(r, {
       window_hours: 24,
       now: '2026-09-03T12:00:00Z',
-      borders: [
-        ['receiving', 'marshalling'], ['marshalling', 'dock'], ['dock', 'gates'], ['gates', 'track'],
-        ['track', 'arrivals'], ['arrivals', 'shed'], ['gates', 'garage'], ['track', 'garage'],
-      ].map(([from, to]) => ({
+      borders: BORDERS.map(({ from, to }) => ({
         from, to, crossing: 'nothing measured', state: 'clear', why: 'nothing waiting',
         rate: { metric: 'crossings', unit: 'per day', current: 0, previous: 0, samples: 0, previous_samples: 0 },
         last_crossed: null, waiting: 0, holds: [],

@@ -32,8 +32,9 @@
 // picture. WorldMap.svelte owns the strokes.
 
 import { AGE_THRESHOLDS, CHANNELS, ageDays, type Channel, type InboundRow } from '../receiving/receiving';
+import type { Crew } from '../crew/crew';
 import type { Siding } from '../marshalling/marshalling';
-import { INTERIOR_HEAD } from './region-contents';
+import { contentsBox } from './region-contents';
 import type { Territory } from './world';
 
 /** Which standing packets are flagged, and from which end of the
@@ -64,9 +65,13 @@ export type Deck =
   | Readonly<{ kind: 'unavailable'; why: string }>
   | Readonly<{ kind: 'ready'; region: string; platforms: ReadonlyArray<Platform> }>;
 
-/** The two regions whose interior is platforms rather than wagons in
- *  transit. The other six are region-contents.ts's INTERIOR_REGIONS. */
-export const PLATFORM_REGIONS: ReadonlyArray<string> = ['receiving', 'marshalling'];
+/** The regions whose interior is platforms rather than wagons in
+ *  transit. The other six are region-contents.ts's INTERIOR_REGIONS.
+ *  The shop floor joined them on backlog 94c6ffd0: a crew is a
+ *  platform and its runs are what stands on it — the same picture as a
+ *  queue, because a crew IS one, bounded by how much it can build at
+ *  once rather than by a WIP limit. */
+export const PLATFORM_REGIONS: ReadonlyArray<string> = ['receiving', 'marshalling', 'shop-floor'];
 
 export function hasPlatforms(region: string): boolean {
   return PLATFORM_REGIONS.includes(region);
@@ -99,6 +104,57 @@ export function marshallingPlatforms(
       note: [oldest, left].filter((p) => p !== null).join(' · '),
     };
   });
+}
+
+/** THE SHOP FLOOR: a platform per CREW — one open session — with the
+ *  runs it dispatched standing on it (design 511fa7d4 car 2b, backlog
+ *  94c6ffd0). The busiest crew leads, then the idle ones, so a floor
+ *  with someone working reads as working.
+ *
+ *  A crew whose silence could not be judged is `null`-idle upstream
+ *  and says so here rather than claiming either; and `rate` is null on
+ *  every platform, because what a crew FINISHED in the window is not
+ *  in the reads this board makes — the runs it lists are the open
+ *  ones. A `?` is the honest mark for it; a 0 would say the crew
+ *  shipped nothing.
+ *
+ *  `unlinked` is the runs no listed session claims — a hand dispatch,
+ *  or a session outside the read window. They get a platform of their
+ *  own rather than being dropped, because a run drawn nowhere is the
+ *  false-empty class. */
+export function crewPlatforms(
+  crews: ReadonlyArray<Crew>,
+  unlinked: ReadonlyArray<unknown>,
+): ReadonlyArray<Platform> {
+  const platforms = crews.map((c): Platform => {
+    const who = c.session.actor ?? c.session.title;
+    const state = c.idle === null ? 'silence not measured' : c.idle ? 'idle' : 'at work';
+    const prompts = c.session.promptCount === null ? null : `${c.session.promptCount} prompts`;
+    return {
+      name: who,
+      standing: c.runs.length,
+      bound: null,
+      rate: null,
+      flag: { from: 'tail', n: 0 },
+      note: [state, prompts, c.session.host].filter((p) => p !== null && p !== '').join(' · '),
+    };
+  });
+  const sorted = [...platforms].sort(
+    (a, b) => (b.standing ?? 0) - (a.standing ?? 0) || a.name.localeCompare(b.name),
+  );
+  return unlinked.length === 0
+    ? sorted
+    : [
+        ...sorted,
+        {
+          name: 'no session',
+          standing: unlinked.length,
+          bound: null,
+          rate: null,
+          flag: { from: 'tail', n: unlinked.length },
+          note: 'dispatched by hand, or by a session this read did not reach',
+        },
+      ];
 }
 
 /** Receiving: a platform per channel, the channels holding flagged
@@ -167,7 +223,6 @@ export type PlacedPlatform = Readonly<{
   boundX: number | null;
 }>;
 
-const EDGE = 8;
 /** A platform: a name line, then the track its packets stand on. */
 const PLATFORM_H = 24;
 const LABEL_H = 11;
@@ -186,12 +241,17 @@ export function platformLayout(
   t: Territory,
   platforms: ReadonlyArray<Platform>,
 ): Readonly<{ placed: ReadonlyArray<PlacedPlatform>; hidden: number }> {
-  const w = t.w - 2 * EDGE;
-  const head = Math.min(INTERIOR_HEAD, Math.max(24, t.h - PLATFORM_H - EDGE));
-  const rows = Math.max(1, Math.floor((t.h - head - EDGE) / PLATFORM_H));
+  // The room the region's contents may use — head off the top, edge
+  // and MACHINERY STRIP off the bottom. One definition, shared with
+  // `interiorLayout` (backlog 3a916816): this divided the same canvas
+  // without the strip's term, so a platform row and a machine glyph
+  // could be placed in the same pixels.
+  const box = contentsBox(t, PLATFORM_H);
+  const w = box.w;
+  const rows = Math.max(1, Math.floor(box.h / PLATFORM_H));
   const per = Math.max(1, Math.floor((w - RATE_W + MARK_GAP) / (MARK_W + MARK_GAP)));
   const placed = platforms.slice(0, rows).map((platform, i): PlacedPlatform => {
-    const y = t.y + head + i * PLATFORM_H;
+    const y = box.y + i * PLATFORM_H;
     const trackY = y + LABEL_H;
     const standing = platform.standing ?? 0;
     const drawn = Math.min(standing, per);
@@ -204,7 +264,7 @@ export function platformLayout(
     const perMark = drawn === 0 ? 1 : standing / drawn;
     const trackLen = drawn === 0 ? 0 : drawn * (MARK_W + MARK_GAP) - MARK_GAP;
     const marks = Array.from({ length: drawn }, (_, k): PlacedMark => ({
-      x: t.x + EDGE + k * (MARK_W + MARK_GAP),
+      x: box.x + k * (MARK_W + MARK_GAP),
       y: trackY,
       w: MARK_W,
       h: MARK_H,
@@ -216,7 +276,7 @@ export function platformLayout(
     const bound = platform.bound;
     return {
       platform,
-      x: t.x + EDGE,
+      x: box.x,
       y,
       w,
       h: PLATFORM_H,
@@ -226,7 +286,7 @@ export function platformLayout(
       perMark,
       boundX:
         bound !== null && bound > 0 && bound < standing
-          ? t.x + EDGE + (bound / standing) * trackLen
+          ? box.x + (bound / standing) * trackLen
           : null,
     };
   });

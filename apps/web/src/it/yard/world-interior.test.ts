@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'bun:test';
 import { territoryOf } from './world';
+import { regionCanvas } from './region-canvas';
+import { MACHINERY_STRIP_H, machineryStrip } from './world-machines';
+import type { Machine } from './regions';
 import {
   PLATFORM_REGIONS,
+  crewPlatforms,
   hasPlatforms,
   marshallingPlatforms,
   platformLayout,
   receivingPlatforms,
   type Platform,
 } from './world-interior';
+import type { AgentRun, Crew, Session } from '../crew/crew';
 import type { Siding } from '../marshalling/marshalling';
 import type { InboundRow } from '../receiving/receiving';
 
@@ -46,10 +51,11 @@ const byName = (platforms: ReadonlyArray<Platform>, name: string): Platform =>
   platforms.find((p) => p.name === name)!;
 
 describe('which regions have platforms', () => {
-  it('is receiving and marshalling, and nothing else', () => {
-    expect([...PLATFORM_REGIONS]).toEqual(['receiving', 'marshalling']);
+  it('is receiving, marshalling and the shop floor, and nothing else', () => {
+    expect([...PLATFORM_REGIONS]).toEqual(['receiving', 'marshalling', 'shop-floor']);
     expect(hasPlatforms('receiving')).toBe(true);
     expect(hasPlatforms('marshalling')).toBe(true);
+    expect(hasPlatforms('shop-floor')).toBe(true);
     expect(hasPlatforms('dock')).toBe(false);
     expect(hasPlatforms('nowhere')).toBe(false);
   });
@@ -251,5 +257,87 @@ describe('where the platforms go inside the outline', () => {
     expect(tail.marks.map((w) => w.flagged)).toEqual([false, false, false, false, true, true]);
     const head = platformLayout(t, [{ ...platform('a', 3), flag: { from: 'head', n: 1 } }]).placed[0]!;
     expect(head.marks.map((w) => w.flagged)).toEqual([true, false, false]);
+  });
+
+  // THE MACHINERY STRIP IS NOT THE PLATFORMS' TO USE (backlog
+  // 3a916816). `interiorLayout` subtracted it and `platformLayout` did
+  // not — world-interior.ts did not import the height at all — so the
+  // two functions dividing the same canvas disagreed about where its
+  // bottom is. Every platform region (receiving, marshalling and the
+  // shop floor) draws machinery too, so this is measured against the
+  // glyphs themselves rather than against a boundary the test restates.
+  it('reserves the machinery strip, so a platform and a machine glyph never share pixels', () => {
+    const many = Array.from({ length: 40 }, (_, i) => platform(`s${i}`, 3));
+    const machines: ReadonlyArray<Machine> = Array.from({ length: 6 }, (_, i) => ({
+      id: `m${i}`,
+      name: `machine ${i}`,
+      state: 'running',
+      why: 'at work',
+    }));
+    for (const rect of [t, regionCanvas('marshalling')]) {
+      const { placed } = platformLayout(rect, many);
+      const strip = machineryStrip(rect, machines);
+      expect(placed.length, rect.name).toBeGreaterThan(0);
+      expect(strip.placed.length, rect.name).toBe(machines.length);
+      for (const p of placed) {
+        expect(p.y + p.h, `${rect.name}/${p.platform.name}`).toBeLessThanOrEqual(
+          rect.y + rect.h - MACHINERY_STRIP_H,
+        );
+        for (const g of strip.placed) {
+          const apart = p.x + p.w <= g.x || g.x + g.w <= p.x || p.y + p.h <= g.y || g.y + g.h <= p.y;
+          expect(apart, `${rect.name}: ${p.platform.name} sits on ${g.machine.id}`).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------
+// THE SHOP FLOOR'S PLATFORMS (backlog 94c6ffd0) — a crew is a platform,
+// its open runs are what stands on it.
+// ---------------------------------------------------------------------
+
+describe('crewPlatforms — a platform per crew, the busiest first', () => {
+  const session = (over: Partial<Session> = {}): Session => ({
+    id: 's1',
+    title: 'a session',
+    actor: 'claude@algedonic.dev',
+    host: 'boss-dev',
+    cwd: '/work/boss',
+    startedAt: '2026-09-22T09:00:00Z',
+    lastActiveAt: '2026-09-22T09:30:00Z',
+    promptCount: 12,
+    untrackedRuns: 0,
+    ...over,
+  });
+  const run = (id: string): AgentRun =>
+    ({ id, title: 'a run', packet: null, step: null, agent: null, model: null,
+       budgetUsd: null, effort: null, host: null, at: 'building', openedAt: null,
+       session: null }) as AgentRun;
+
+  it('stands the runs on their crew, busiest first, and never invents a rate', () => {
+    const busy: Crew = { session: session({ id: 's1', actor: 'a@x' }), runs: [run('r1'), run('r2')], idle: false };
+    const quiet: Crew = { session: session({ id: 's2', actor: 'b@x', promptCount: 3 }), runs: [], idle: true };
+    const platforms = crewPlatforms([quiet, busy], []);
+    expect(platforms.map((p) => p.name)).toEqual(['a@x', 'b@x']);
+    expect(platforms[0]!.standing).toBe(2);
+    // What a crew FINISHED in the window is not in this read, so the
+    // rate is unknown — a 0 would say the crew shipped nothing.
+    expect(platforms[0]!.rate).toBeNull();
+    expect(platforms[0]!.note).toContain('at work');
+    expect(platforms[1]!.note).toContain('idle');
+  });
+
+  it('says so when a crew\'s silence could not be judged', () => {
+    const unknown: Crew = { session: session(), runs: [], idle: null };
+    expect(crewPlatforms([unknown], [])[0]!.note).toContain('silence not measured');
+  });
+
+  it('gives the runs no session claims a platform of their own rather than dropping them', () => {
+    const platforms = crewPlatforms([], [run('r9')]);
+    expect(platforms).toHaveLength(1);
+    expect(platforms[0]!.name).toBe('no session');
+    expect(platforms[0]!.standing).toBe(1);
+    expect(platforms[0]!.flag).toEqual({ from: 'tail', n: 1 });
   });
 });

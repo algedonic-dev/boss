@@ -30,6 +30,21 @@ title_template = "Measure the claim, choose a route"
 # page — so they are the first two steps in the bundle to say who they
 # are for in the one shape every reader derives from.
 audience = { role = "platform-admin" }
+# HOW AN ABSENCE VERDICT IS MADE, on the step that makes it (backlog
+# fac521bc). A does-not-reproduce triage on c68104cf ran the real
+# lint, used tracked fixtures, and added a CONTROL — every part of the
+# method this repo asks for — and was still wrong, because the
+# fixtures were built from the packet's prose rather than from the
+# file the packet named. Prose in a doc is read by whoever goes
+# looking; a procedure is read by whoever is doing the triage, at the
+# moment they do it, and is versioned with the protocol.
+metadata_defaults = { procedure = """Measure the claim yourself before you route it, and put the measurement in `evidence` — a route chosen off the packet's own text is the failure this step exists to refuse.
+
+AN ABSENCE VERDICT — does-not-reproduce, already-fixed, `stale` — is the most expensive one to get wrong, because a well-evidenced wrong answer is a worse record than no answer at all: the next reader trusts it. Two rules, both bought on 2026-09-21 (backlog fac521bc).
+
+REPRODUCE FROM THE FILE, NOT FROM THE PROSE. When the packet names the car, train, commit or file its finding came from, `git show <ref>:<path>` that file and reproduce in the shape it actually has. The prose is a report of the site; only the site is the site. Packet c68104cf's reported line was never the plain shell comment its triage planted: it sat inside a `python3 - <<'PY'` heredoc, and a heredoc body is classified off its OPENER, so the lexer rule the fixture was testing never applied to it. Planted in THAT shape it reproduced on the first run — and the file was named in the packet's own related-car reference, one read away.
+
+SAY WHICH SHAPE YOU TESTED. A control proves the fixture is STRONG enough to catch something; it says nothing about whether the fixture is the right SHAPE. Those are two different failure modes, and a control covers only the first — which is why adding one, the part everyone remembers to add, did not save the verdict above. So an absence verdict names the shape it planted and where that shape came from. One that states its fixture can be re-opened by anyone who notices the shape was wrong; one that only says it does not reproduce cannot.""" }
 [[workflow.step.fields]]
 name = "disposition"
 field_type = "verify|design|build|duplicate|stale|decline"
@@ -62,6 +77,16 @@ kind = "task"
 ready_when = "steps.triage.done AND steps.triage.metadata.disposition = \"verify\""
 title_template = "Re-measure the claim"
 authority_role = "platform-admin"
+# THE SAME DISPOSITION THE BUILD STEP CARRIES, and for the same reason
+# (backlog 2802ba8c). `build` has declared this since a build that
+# REFUTES its packet gained a way out. `measure` never did, so a
+# re-measurement that DISPROVED the claim had exactly one exit — the
+# `closed` terminal, which says the work was completed. A measurement
+# is the step most likely to disprove the thing that prompted it, and
+# it was the one step that could not say so.
+fields = [
+  { name = "disposition", field_type = "stale|duplicate|decline", required = false },
+]
 
 # THE DESIGN ROUTE OPENS THE DRAFT FIRST (backlog f90ca046, 2026-09-18)
 # — the same shape as user-feedback's, and for the same measured
@@ -200,7 +225,7 @@ kind = "outcome"
 # time: a Pending step is skipped only when EVERY step it references is
 # terminal, the same mechanism af28e250 used to keep `build` alive
 # across the review.
-ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"duplicate\") OR (steps.build.done AND steps.build.metadata.disposition = \"duplicate\")"
+ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"duplicate\") OR (steps.build.done AND steps.build.metadata.disposition = \"duplicate\") OR (steps.measure.done AND steps.measure.metadata.disposition = \"duplicate\")"
 title_template = "Closed as a duplicate"
 metadata_defaults = { outcome_kind = "withdrawn" }
 terminal = { outcome = "duplicate" }
@@ -208,7 +233,7 @@ terminal = { outcome = "duplicate" }
 [[workflow.step]]
 title = "stale"
 kind = "outcome"
-ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"stale\") OR (steps.build.done AND steps.build.metadata.disposition = \"stale\")"
+ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"stale\") OR (steps.build.done AND steps.build.metadata.disposition = \"stale\") OR (steps.measure.done AND steps.measure.metadata.disposition = \"stale\")"
 title_template = "Closed \u2014 the claim no longer holds"
 metadata_defaults = { outcome_kind = "withdrawn" }
 terminal = { outcome = "stale" }
@@ -216,7 +241,7 @@ terminal = { outcome = "stale" }
 [[workflow.step]]
 title = "declined"
 kind = "outcome"
-ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"decline\") OR (steps.design-review.done AND steps.design-review.metadata.verdict = \"declined\") OR (steps.build.done AND steps.build.metadata.disposition = \"decline\")"
+ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"decline\") OR (steps.measure.done AND steps.measure.metadata.disposition = \"decline\") OR (steps.design-review.done AND steps.design-review.metadata.verdict = \"declined\") OR (steps.build.done AND steps.build.metadata.disposition = \"decline\")"
 title_template = "Closed without action"
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "declined" }
@@ -252,7 +277,7 @@ kind = "outcome"
 # open. A build that built carries no disposition at all, which is
 # Absent, false against every literal, so `NOT (false OR false OR
 # false)` is true and the ordinary path is unchanged.
-ready_when = "steps.measure.done OR (steps.build.done AND NOT (steps.build.metadata.disposition = \"stale\" OR steps.build.metadata.disposition = \"duplicate\" OR steps.build.metadata.disposition = \"decline\")) OR (steps.design-review.done AND NOT (steps.design-review.metadata.verdict = \"approved\" OR steps.design-review.metadata.verdict = \"declined\"))"
+ready_when = "(steps.measure.done AND NOT (steps.measure.metadata.disposition = \"stale\" OR steps.measure.metadata.disposition = \"duplicate\" OR steps.measure.metadata.disposition = \"decline\")) OR (steps.build.done AND NOT (steps.build.metadata.disposition = \"stale\" OR steps.build.metadata.disposition = \"duplicate\" OR steps.build.metadata.disposition = \"decline\")) OR (steps.design-review.done AND NOT (steps.design-review.metadata.verdict = \"approved\" OR steps.design-review.metadata.verdict = \"declined\"))"
 title_template = "Backlog item closed"
 metadata_defaults = { outcome_kind = "completed" }
 terminal = { outcome = "completed" }

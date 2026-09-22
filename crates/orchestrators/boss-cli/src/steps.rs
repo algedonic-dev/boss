@@ -163,6 +163,34 @@ pub enum StepAction {
         #[arg(long = "field-file", value_name = "NAME=PATH")]
         field_file: Vec<String>,
     },
+    /// Hand a claimed step back to its station: `ready`, unassigned, no run named.
+    ///
+    /// The door for a step whose executor never came back and which no
+    /// rule can free — a step claimed before the run edge existed
+    /// names nobody, so `an-abandoned-step-is-reclaimed-when-its-run-died`
+    /// leaves it alone permanently and correctly (backlog e871febf).
+    /// Refuses a step nobody holds, records `--why` on the step, and
+    /// reads the packet back.
+    ///
+    /// THE OPERATOR IS THE GUARD. The clock rule releases only after a
+    /// run is recorded dead and a further bound has passed, because a
+    /// reclaim is the one move that can put two executors on one step.
+    /// This verb releases on your word and checks nothing about who
+    /// might still be building — read the run first.
+    Release {
+        /// The packet: 8+ characters of its id, or the full uuid.
+        packet: String,
+        /// The step's slug, as the Workflow row titles it (`build`, `measure`).
+        #[arg(long)]
+        step: String,
+        /// Why it is being taken back. Recorded verbatim under
+        /// `released`, and it is the only thing that tells the next
+        /// reader this step came free by a hand. SINGLE-quote it:
+        /// inside double quotes a backticked word is run by the shell
+        /// and lands as a hole (backlog 2376b89e).
+        #[arg(long)]
+        why: String,
+    },
 }
 
 pub async fn dispatch(cmd: Cmd) -> Result<()> {
@@ -209,6 +237,9 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                 let given = given_values(&field, &field_file)?;
                 complete(&wire, &packet, &step, &given).await
             }
+            StepAction::Release { packet, step, why } => {
+                release_step(&wire, &packet, &step, &why).await
+            }
         },
     }
 }
@@ -244,6 +275,53 @@ pub(crate) fn declared_fields(step: &Value) -> Vec<Field> {
             })
         })
         .collect()
+}
+
+/// The fields a step's KIND declares, on top of its row's.
+///
+/// TWO VALIDATORS HAD TO AGREE AND DID NOT (backlog b1e87213). The API
+/// judges a completion against the StepType's schema AND the row's;
+/// this verb judged it against the row alone. So `checklist` — whose
+/// kind requires an `items` array and whose three uses in the platform
+/// bundle declare it in no row at all — could not be completed through
+/// this door in either direction: the API refused the body without
+/// `items`, and the verb refused to send `items` because the row did
+/// not name it.
+///
+/// Measured cost, 2026-09-21: publish-to-github packet 7d5c9051 sat at
+/// `measure` from 2026-09-20, the daily publish rule guards on `NOT
+/// open_publish_exists`, and so one uncompletable step suppressed the
+/// public mirror's publish entirely — 455 commits behind by the time
+/// anyone reached for the door. It read as nobody having worked the
+/// packet. It was a door that could not be opened.
+///
+/// The row WINS on a name collision: a row may narrow a kind's field
+/// (a tighter enum, a required that the kind leaves optional), and the
+/// row is the more specific contract.
+pub(crate) fn with_kind_fields(row: Vec<Field>, kind_fields: Vec<Field>) -> Vec<Field> {
+    let mut out = row;
+    for f in kind_fields {
+        if !out.iter().any(|d| d.name == f.name) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// The StepType registry's fields for one kind, off `GET
+/// /api/jobs/step-types`. An unknown kind contributes nothing — the
+/// API is still the judge, and a verb that invented a contract the
+/// registry does not hold would be the defect one layer over.
+pub(crate) fn kind_fields(step_types: &Value, kind: &str) -> Vec<Field> {
+    let rows = step_types
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| step_types.as_array());
+    rows.into_iter()
+        .flatten()
+        .find(|t| t.get("kind").and_then(Value::as_str) == Some(kind))
+        .map(declared_fields)
+        .unwrap_or_default()
 }
 
 /// The values an enum field admits — `a|b|c` is the registry's enum
@@ -646,6 +724,16 @@ impl Wire {
         crate::gate::api_at_signed(&self.http, &self.base, method, path, payload, signature).await
     }
 
+    /// The StepType registry, as the API's own validator reads it.
+    /// Read fresh rather than compiled in: a kind's fields are
+    /// registry data and a second copy here would be the drift 9a is
+    /// written against.
+    async fn step_types(&self) -> Result<Value> {
+        self.call(reqwest::Method::GET, "/api/jobs/step-types", None)
+            .await?
+            .context("the step-type registry read back empty")
+    }
+
     async fn packet(&self, id: &str) -> Result<Value> {
         self.call(reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
             .await?
@@ -695,6 +783,26 @@ impl Wire {
         let car = crate::prove::find_car(&cars, given, crate::prove::Eligible::Live)?;
         let id = crate::envelope::job_id(car).context("matched a car with no id")?;
         self.packet(id).await
+    }
+
+    /// Who this wire signs as, for a record that names the hand rather
+    /// than only the write. `None` is possible in shape only: an
+    /// unnamed write is refused before it goes (`identity`).
+    pub(crate) fn caller_id(&self) -> Option<&str> {
+        self.caller.as_ref().map(|c| c.id.as_str())
+    }
+
+    /// The step's MERGE door: keys land one at a time and an explicit
+    /// null DELETES one. The only door that can clear `agent_run`,
+    /// which the PUT below carries forward on omission (b91a2103).
+    async fn patch_step_metadata(&self, job_id: &str, step_id: &str, body: Value) -> Result<()> {
+        self.call(
+            reqwest::Method::PATCH,
+            &format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+            Some(body),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn put_step(&self, job_id: &str, step_id: &str, body: Value) -> Result<()> {
@@ -747,6 +855,57 @@ fn confirm_completed(step: &Value, writes: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+/// The warning a self-closing alarm earns when a human triages it.
+///
+/// WHY (backlog 2228dea3, measured 2026-09-22). An estate alarm closes
+/// ITSELF: `estate.recover` watches the comparison series and, when the
+/// finding stops appearing, completes the alarm's TRIAGE step with
+/// disposition `stale`. Two `disk_tight:w-1` alarms closed that way on
+/// 2026-09-18.
+///
+/// A third did not, and the reason was a race nobody could see:
+///
+/// ```text
+///   14114f92  triage completed by automation:rule:estate-recover-on-comparison -> stale
+///   e1fea3b2  triage completed by agent-claude                                 -> build
+/// ```
+///
+/// Same finding, same scope, same host. Triaging it to `build` took the
+/// step the recovery acts on, so when the condition cleared — 0 of 20
+/// consecutive comparisons still carrying it — the recovery had nothing
+/// to complete, the withdrawal terminals were already skipped, and an
+/// urgent alarm sat open on the queue with its condition long gone.
+///
+/// NOTHING SAID SO, BEFORE OR AFTER, and that is the whole defect. An
+/// estate alarm is a `backlog-item`: it sits in the backlog station,
+/// `boss orient` lists it among the rest, and it has a `triage` step
+/// like everything else. Triaging it looks exactly like ordinary queue
+/// work, and doing it silently disables a mechanism that would have
+/// closed the packet for free.
+///
+/// THE PREDICATE IS THE HANDLER'S OWN. `estate_recover::finding_of`
+/// reads `metadata.estate_finding` and matches on it; so does this. Not
+/// a guess about titles or kinds — the same key, so the warning cannot
+/// disagree with the thing it is warning about (§9a).
+///
+/// A WARNING, NOT A REFUSAL. An operator may genuinely want to route an
+/// alarm — one that will not clear on its own needs a human disposition
+/// — and refusing that would leave no way to act on it at all.
+pub(crate) fn self_closing_warning(packet: &Value, disposition: &str) -> Option<String> {
+    let finding = packet
+        .get("metadata")
+        .and_then(|m| m.get("estate_finding"))
+        .and_then(Value::as_str)?;
+    if disposition == "stale" {
+        // The disposition the recovery itself uses. Taking the step to
+        // reach the same terminal is not taking anything over.
+        return None;
+    }
+    Some(format!(
+        "boss triage: WARNING — this packet is a self-closing estate alarm          (`{finding}`). `estate.recover` closes one by completing THIS step with          disposition `stale` once the finding stops appearing in the comparison series.          Triaging it `{disposition}` takes that over: the withdrawal terminals skip, and          if the condition clears later the recovery will have nothing to complete and the          alarm stays open with its cause long gone (measured on e1fea3b2, backlog          2228dea3). If the finding is live and needs a person, this is right; if you are          routing it because it appeared in the queue, let it close itself."
+    ))
+}
+
 pub(crate) async fn triage(
     wire: &Wire,
     item: &str,
@@ -769,6 +928,9 @@ pub(crate) async fn triage(
         .as_ref()
         .map(|o| crate::envelope::job_id(o).context("the original has no id"))
         .transpose()?;
+    if let Some(w) = self_closing_warning(&packet, disposition) {
+        eprintln!("{w}");
+    }
     let writes = triage_writes(step, disposition, evidence, original_id)
         .map_err(|e| anyhow!("{}: {e}", short(&packet)))?;
     let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
@@ -1052,7 +1214,17 @@ pub(crate) fn coerce(field: &Field, raw: &str) -> Result<Value, String> {
 /// answers 204 and records an annotation nobody reads. Refused here, by
 /// name, naming what the row does declare.
 pub(crate) fn field_writes(step: &Value, given: &[Given]) -> Result<Map<String, Value>, String> {
-    let declared = declared_fields(step);
+    field_writes_against(step, given, Vec::new())
+}
+
+/// [`field_writes`] with the step KIND's fields folded in — what the
+/// API actually judges against.
+pub(crate) fn field_writes_against(
+    step: &Value,
+    given: &[Given],
+    kind_fields: Vec<Field>,
+) -> Result<Map<String, Value>, String> {
+    let declared = with_kind_fields(declared_fields(step), kind_fields);
     let mut writes = Map::new();
     for g in given {
         let field = declared.iter().find(|f| f.name == g.name).ok_or_else(|| {
@@ -1103,6 +1275,61 @@ pub(crate) fn contract_check(step: &Value, metadata: &Value) -> Result<(), Strin
     )
 }
 
+/// A `draft-design` completion names a design; the DESIGN must name the
+/// packet back, or the link closes nothing.
+///
+/// THE DEFECT (backlog 2c7dd4ab, hit live 2026-09-20). "This design
+/// answers that packet" has TWO representations and only one is
+/// load-bearing:
+///
+/// 1. the declared `design-doc.answers` job edge, which
+///    `complete-feedback-design-review-on-design-review-decided`
+///    follows to complete the packet's `design-review`;
+/// 2. the `design_id` field on `draft-design`, which is what completing
+///    that step asks for.
+///
+/// Setting (2) LOOKS like linking the design. The rule cannot follow
+/// it. So a hand-linked design is decided, out of the reviewer's queue,
+/// and its packet waits forever — which is exactly what happened: David
+/// decided design `f2cdff23`, saw it leave his queue, and `6c2eba00`
+/// still read `design-review: ready` an hour later. He reasonably
+/// concluded his review had been lost. It had not; the two records
+/// simply disagreed and nothing reconciled them.
+///
+/// `boss design --answers` writes BOTH — the edge at filing, and this
+/// step's completion when the route has one. This refusal is what
+/// stops the other path from producing half of it in silence.
+pub(crate) fn design_link_check(packet_id: &str, design: &Value) -> Result<(), String> {
+    let answers = crate::design::answers_edge(design);
+    let short = &packet_id[..8.min(packet_id.len())];
+    let design_short = design
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|i| i[..8.min(i.len())].to_string())
+        .unwrap_or_else(|| "?".into());
+    match answers {
+        Some(a) if a == packet_id => Ok(()),
+        Some(other) => Err(format!(
+            "design {design_short} answers {} , not {short}. Linking it here would \
+             record a second, different claim about what this design decides — and the \
+             rule that closes a packet follows the design's OWN edge, so {short} would \
+             wait forever while the other packet closed.",
+            &other[..8.min(other.len())]
+        )),
+        None => Err(format!(
+            "design {design_short} carries no `answers` edge, so completing this step \
+             would link it in a way NOTHING follows: the rule that closes a packet's \
+             design-review reads the design's declared edge, not this field. The design \
+             would be decided and out of the reviewer's queue while {short} waited \
+             forever (backlog 2c7dd4ab).\n  \
+             File it through the door that writes both: `boss design <title> --answers \
+             {short} ...`. For a design that already exists, record the edge on it \
+             first — `PATCH /api/jobs/{design_short}/metadata` with \
+             {{\"answers\": \"{packet_id}\"}} — then complete this step."
+        )),
+    }
+}
+
 pub(crate) async fn complete(
     wire: &Wire,
     packet_ref: &str,
@@ -1111,8 +1338,33 @@ pub(crate) async fn complete(
 ) -> Result<()> {
     let packet = wire.resolve(packet_ref, None).await?;
     let step = open_step(&packet, slug).map_err(|e| anyhow!("{e}"))?;
-    let writes =
-        field_writes(step, given).map_err(|e| anyhow!("{} `{slug}`: {e}", short(&packet)))?;
+    // The kind's own fields, from the registry the API validates
+    // against. Best-effort: if the read fails the verb falls back to
+    // the row alone, which is how it behaved before — a door that
+    // cannot reach the registry should be no worse than it was, not
+    // refuse outright.
+    let kind = step.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let from_kind = match wire.step_types().await {
+        Ok(types) => kind_fields(&types, kind),
+        Err(_) => Vec::new(),
+    };
+    let writes = field_writes_against(step, given, from_kind)
+        .map_err(|e| anyhow!("{} `{slug}`: {e}", short(&packet)))?;
+    // A `draft-design` completion names a design; the design must name
+    // the packet back, or the link closes nothing (backlog 2c7dd4ab).
+    // Checked here rather than left to the rule, because the rule's
+    // silence is the whole defect: a hand-linked design is decided, out
+    // of the reviewer's queue, and its packet waits forever.
+    if slug == "draft-design"
+        && let Some(design_ref) = writes.get("design_id").and_then(Value::as_str)
+    {
+        let design = wire.resolve(design_ref, None).await?;
+        let packet_id = crate::envelope::job_id(&packet)
+            .context("the packet has no id")?
+            .to_string();
+        design_link_check(&packet_id, &design)
+            .map_err(|e| anyhow!("{} `{slug}`: {e}", short(&packet)))?;
+    }
     // Merged, not replaced — the step keeps its `procedure`, its
     // `agent` block and its audience — and the MERGED document is what
     // the registry judges, exactly as the API judges it after its own
@@ -1136,6 +1388,189 @@ pub(crate) async fn complete(
         } else {
             format!(" with {names}")
         },
+        standing(&after)
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// `boss step release` — hand a claimed step back to its station.
+//
+// WHY (backlog e871febf). The clock rule
+// `an-abandoned-step-is-reclaimed-when-its-run-died` frees a claimed
+// step by asking whether the run NAMED ON IT died — and a step that
+// carries no `agent_run` edge is, correctly, left alone forever:
+// nothing names its executor, so nothing there can tell abandoned from
+// busy. That is exactly the population the rule was written for. On
+// 2026-09-19 a session orphaned fifteen runs, twelve of them holding a
+// step that was built, gated green and never handed back; the edge
+// only began being written that day (dd6d44b7), so those steps carry
+// none. Measured on the live board 2026-09-22: of twenty claimed
+// agent-workable steps, three carry no edge and have stood since the
+// 19th. Small — which is why this is a VERB and not a sweep. A sweep
+// is a hand that leaves nothing behind; a verb is a door the next
+// operator finds when a step is stuck for a reason no rule covers.
+//
+// IT IS A HAND, AND IT SAYS SO. The clock rule records `reclaimed`
+// with the death it measured. This records `released` with the reason
+// a person gave, under a different key, because the two are different
+// claims about the record: one is evidence, the other is testimony.
+// ----------------------------------------------------------------------
+
+/// Where a hand-release's evidence lands on the freed step —
+/// deliberately not the clock rule's `reclaimed` (see the section
+/// header): a reader must be able to tell which one freed the step.
+pub(crate) const RELEASED_KEY: &str = "released";
+
+/// The status a claim moves a step from, and the one it moves back to
+/// — the pair `claim_step`'s CAS uses, so a release is a restoration
+/// rather than a new routing opinion.
+const CLAIMED_STATUS: &str = "active";
+const WAITING_STATUS: &str = "ready";
+
+/// The `slug` step, CLAIMED. A `ready` step is already where a release
+/// puts one, and a terminal step is nobody's — writing the evidence on
+/// either would record a takeover of work no one held.
+pub(crate) fn releasable<'a>(packet: &'a Value, slug: &str) -> Result<&'a Value, String> {
+    let step = crate::envelope::steps(packet)
+        .into_iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(slug))
+        .ok_or_else(|| {
+            format!(
+                "packet {} ({}) has no `{slug}` step — {}",
+                short(packet),
+                kind_of(packet),
+                standing(packet)
+            )
+        })?;
+    if status_of(step) == CLAIMED_STATUS {
+        Ok(step)
+    } else {
+        Err(format!(
+            "packet {}'s `{slug}` is {} — a release hands back a step somebody HOLDS, and \
+             nothing to release here; {}",
+            short(packet),
+            status_of(step),
+            standing(packet)
+        ))
+    }
+}
+
+/// The metadata merge body: the run edge CLEARED, and one evidence
+/// object saying who took the step back, from which run, and why.
+///
+/// THE NULL IS THE WHOLE POINT. `update_step` carries `agent_run`
+/// forward when a PUT's metadata omits it (b91a2103), so the only door
+/// that can clear the edge is `PATCH .../steps/{id}/metadata`, where an
+/// explicit null deletes the key. Leaving a dead run named on a freed
+/// step is not cosmetic: `agent-run-delivers-when-its-step-is-done`
+/// follows that edge, so a step completed later would deliver onto a
+/// run that is closed and dead.
+pub(crate) fn release_patch(step: &Value, why: &str, by: Option<&str>, at: &str) -> Value {
+    let from_run = step
+        .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut body = Map::new();
+    body.insert(boss_jobs::agent_runs::EDGE_KEY.to_string(), Value::Null);
+    body.insert(
+        RELEASED_KEY.to_string(),
+        json!({
+            "why": why.trim(),
+            "by": by.map(|b| json!(b)).unwrap_or(Value::Null),
+            "at": at,
+            "from_run": from_run,
+        }),
+    );
+    Value::Object(body)
+}
+
+/// The status write: `ready`, nobody's, and NO metadata. The PUT
+/// replaces metadata wholesale, so omitting it keeps the stored
+/// document — which the merge door has already cleared.
+pub(crate) fn release_status() -> Value {
+    json!({ "status": WAITING_STATUS, "assignee_id": Value::Null })
+}
+
+/// A 204 is a claim; the read-back is the fact. Four ways a release
+/// half-happens, each named.
+pub(crate) fn confirm_released(step: &Value, why: &str) -> Result<(), String> {
+    if status_of(step) != WAITING_STATUS {
+        return Err(format!(
+            "the API answered but the step reads back {} — it was not released",
+            status_of(step)
+        ));
+    }
+    if let Some(who) = step.get("assignee_id").and_then(Value::as_str) {
+        return Err(format!(
+            "the step reads back `{WAITING_STATUS}` but is still assigned to {who} — the \
+             station cannot hand out work somebody still holds"
+        ));
+    }
+    if let Some(run) = step
+        .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
+        .and_then(Value::as_str)
+    {
+        return Err(format!(
+            "the step still names `{}` {run} — the merge door's null did not take, and the \
+             next completion would deliver onto that run (b91a2103)",
+            boss_jobs::agent_runs::EDGE_KEY
+        ));
+    }
+    let recorded = step
+        .pointer(&format!("/metadata/{RELEASED_KEY}/why"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if recorded != why.trim() {
+        return Err(format!(
+            "the step reads back {recorded:?} as the reason — not what was sent, so the \
+             record would not say why this step came free"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn release_step(
+    wire: &Wire,
+    packet_ref: &str,
+    slug: &str,
+    why: &str,
+) -> Result<()> {
+    if why.trim().is_empty() {
+        bail!(
+            "--why is blank — the reason is the whole artifact a release leaves, and a step \
+             that came free with nothing behind it reads to the next operator exactly like \
+             the stall it was"
+        );
+    }
+    let packet = wire.resolve(packet_ref, None).await?;
+    let step = releasable(&packet, slug).map_err(|e| anyhow!("{e}"))?;
+    let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
+    let sid = step_id(step)?;
+    let held_by = holder(step);
+    // The clear FIRST: if the status write then fails, the step is
+    // still claimed and carries an annotation, which is a smaller
+    // wrong than a step handed out while a dead run is named on it.
+    // The record stamp through the one sanctioned wall source
+    // (`boss_clock_client::wall_now`), never a second Utc::now() of
+    // this module's own — the rule `no-wallclock` states.
+    let patch = release_patch(
+        step,
+        why,
+        wire.caller_id(),
+        &boss_clock_client::wall_now().to_rfc3339(),
+    );
+    wire.patch_step_metadata(jid, sid, patch).await?;
+    wire.put_step(jid, sid, release_status()).await?;
+
+    let after = wire.packet(jid).await?;
+    confirm_released(step_after(&after, sid)?, why).map_err(|e| anyhow!("{e}"))?;
+    println!(
+        "boss step release: {} \"{}\" — `{slug}` released (was held by {held_by})\n  why: {}\n  \
+         {}",
+        short(&packet),
+        title_of(&packet),
+        why.trim(),
         standing(&after)
     );
     Ok(())
@@ -1783,9 +2218,64 @@ mod tests {
                 {
                     return ("409 Conflict", r#"{"error":"step is terminal"}"#.into());
                 }
+                // THE SERVER CARRIES THE RUN EDGE FORWARD when a PUT's
+                // metadata omits it (b91a2103, pinned by
+                // `the_run_edge_survives_a_metadata_put`). Modelled
+                // here so a release that tries to clear the edge
+                // through THIS door fails the test exactly as it fails
+                // live, instead of passing against a stub that is
+                // kinder than the API.
+                let carried = step["metadata"]
+                    .get(boss_jobs::agent_runs::EDGE_KEY)
+                    .cloned();
                 if let Some(obj) = sent.as_object() {
                     for (k, v) in obj {
                         step[k] = v.clone();
+                    }
+                }
+                if let Some(run) = carried
+                    && let Some(md) = step["metadata"].as_object_mut()
+                {
+                    md.entry(boss_jobs::agent_runs::EDGE_KEY.to_string())
+                        .or_insert(run);
+                }
+                ("204 No Content", String::new())
+            }
+            // The step's MERGE door: one key at a time, an explicit
+            // null deletes.
+            ("PATCH", rest) if rest.ends_with("/metadata") && rest.contains("/steps/") => {
+                let trimmed = rest.trim_end_matches("/metadata");
+                let mut parts = trimmed.trim_start_matches('/').split('/');
+                let (jid, _, sid) = (
+                    parts.next().unwrap_or(""),
+                    parts.next(),
+                    parts.next().unwrap_or(""),
+                );
+                let sent: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                puts.lock().unwrap().push((rest.to_string(), sent.clone()));
+                if dropping {
+                    return ("204 No Content", String::new());
+                }
+                let Some(p) = packets.iter_mut().find(|p| p["id"] == jid) else {
+                    return ("404 Not Found", "no such job".into());
+                };
+                let Some(step) = p["steps"]
+                    .as_array_mut()
+                    .and_then(|s| s.iter_mut().find(|s| s["id"] == sid))
+                else {
+                    return ("404 Not Found", "step not found".into());
+                };
+                if !step["metadata"].is_object() {
+                    step["metadata"] = json!({});
+                }
+                if let (Some(md), Some(obj)) = (step["metadata"].as_object_mut(), sent.as_object())
+                {
+                    for (k, v) in obj {
+                        if v.is_null() {
+                            md.remove(k);
+                        } else {
+                            md.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 ("204 No Content", String::new())
@@ -2419,5 +2909,488 @@ mod tests {
         .await
         .expect_err("the packet does not hold it");
         assert!(err.to_string().contains("reads back as ready"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // `boss step release` — the door for a step a dead executor left
+    // claimed (backlog e871febf).
+    // ------------------------------------------------------------------
+
+    const HELD_RUN: &str = "18c1a43e-5fac-43c3-a482-d701fef18c65";
+    const HELD_JOB: &str = "bd93d2be-8de3-4033-a81d-fef50b819b37";
+    const HELD_STEP: &str = "7df63c47-b2ae-4060-bcad-7700739989fa";
+
+    /// A claimed build step in the shape the live board holds one
+    /// (packet bd93d2be, read 2026-09-22): active, held by
+    /// `agent-claude`, carrying the agent block — with or without the
+    /// run edge, which is the split this packet is about.
+    fn claimed(status: &str, edge: Option<&str>) -> Value {
+        let mut md = Map::new();
+        md.insert("agent_model".into(), json!("opus-5[1m]"));
+        md.insert("agent_profile".into(), json!("builder"));
+        md.insert("authority_role".into(), json!("platform-admin"));
+        if let Some(run) = edge {
+            md.insert(boss_jobs::agent_runs::EDGE_KEY.into(), json!(run));
+        }
+        json!({
+            "id": HELD_STEP, "spec_slug": "build", "kind": "task", "status": status,
+            "assignee_id": "agent-claude", "metadata": Value::Object(md),
+        })
+    }
+
+    fn held_packet(step: Value) -> Value {
+        json!({
+            "id": HELD_JOB, "kind": "backlog-item", "status": "open",
+            "title": "No evidence the core is stabilising",
+            "metadata": {},
+            "steps": [
+                json!({ "id": "s-triage", "spec_slug": "triage", "status": "completed", "metadata": {} }),
+                step,
+                json!({ "id": "s-closed", "spec_slug": "closed", "status": "pending", "metadata": {} }),
+            ],
+        })
+    }
+
+    /// ONLY A CLAIMED STEP IS RELEASABLE. A `ready` step is already
+    /// where a release puts one; writing the evidence anyway would
+    /// record a takeover of work nobody held.
+    #[test]
+    fn releasable_takes_the_claimed_step_and_refuses_every_other_standing() {
+        let held = held_packet(claimed("active", Some(HELD_RUN)));
+        assert_eq!(
+            releasable(&held, "build").expect("a claimed step is releasable")["id"],
+            json!(HELD_STEP)
+        );
+        let free = held_packet(claimed("ready", None));
+        let err = releasable(&free, "build").expect_err("nobody holds a ready step");
+        assert!(
+            err.contains("is ready") && err.contains("nothing to release"),
+            "the refusal says what it is instead of releasing it: {err}"
+        );
+        let err = releasable(&held, "measure").expect_err("no such step");
+        assert!(
+            err.contains("no `measure` step") && err.contains("now at"),
+            "and an unknown slug names where the packet stands: {err}"
+        );
+    }
+
+    /// THE CLEAR GOES THROUGH THE MERGE DOOR, AND IT HAS TO.
+    /// `update_step` CARRIES `agent_run` FORWARD on omission
+    /// (b91a2103, pinned by `the_run_edge_survives_a_metadata_put`),
+    /// so a PUT whose metadata simply lacks the key leaves the dead
+    /// run pinned to the step — a silent no-op. `PATCH
+    /// .../steps/{id}/metadata` deletes it on an explicit null, and is
+    /// the only door that can.
+    #[test]
+    fn the_release_patch_clears_the_edge_with_an_explicit_null_and_records_who_took_it() {
+        let body = release_patch(
+            &claimed("active", Some(HELD_RUN)),
+            "the run died and left it claimed",
+            Some("emp-david"),
+            "2026-09-22T06:00:00Z",
+        );
+        assert_eq!(
+            body[boss_jobs::agent_runs::EDGE_KEY],
+            Value::Null,
+            "an explicit null, not an omission — omission is carried forward: {body}"
+        );
+        assert_eq!(
+            body[RELEASED_KEY]["why"],
+            json!("the run died and left it claimed")
+        );
+        assert_eq!(body[RELEASED_KEY]["from_run"], json!(HELD_RUN));
+        assert_eq!(body[RELEASED_KEY]["by"], json!("emp-david"));
+        assert_eq!(body[RELEASED_KEY]["at"], json!("2026-09-22T06:00:00Z"));
+        // A step with NO edge — the population this packet measured —
+        // releases the same way, and the record says the edge was
+        // missing rather than leaving the reader to wonder.
+        let bare = release_patch(
+            &claimed("active", None),
+            "why",
+            None,
+            "2026-09-22T06:00:00Z",
+        );
+        assert_eq!(bare[RELEASED_KEY]["from_run"], Value::Null);
+        assert_eq!(
+            bare[boss_jobs::agent_runs::EDGE_KEY],
+            Value::Null,
+            "the null is unconditional: clearing an absent key is a no-op, and branching \
+             on it would be a second reading of the same fact"
+        );
+    }
+
+    /// THE STATUS WRITE CARRIES NO METADATA, so it cannot undo the
+    /// clear the PATCH just made: the PUT replaces metadata wholesale
+    /// and omitting it keeps the stored document, which by then has no
+    /// edge for the carry-forward to find.
+    #[test]
+    fn the_status_write_restores_exactly_what_the_claim_took() {
+        let body = release_status();
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["assignee_id"], Value::Null);
+        assert!(
+            body.get("metadata").is_none(),
+            "nothing but the two fields a claim changed: {body}"
+        );
+    }
+
+    /// A 204 IS A CLAIM. The read-back checks all four facts, and each
+    /// one is a way the release can half-happen.
+    #[test]
+    fn the_read_back_refuses_a_release_that_only_half_took() {
+        let mut freed = claimed("ready", None);
+        freed["assignee_id"] = Value::Null;
+        freed["metadata"][RELEASED_KEY] = json!({ "why": "the run died" });
+        confirm_released(&freed, "the run died").expect("all four facts hold");
+
+        let mut still_claimed = freed.clone();
+        still_claimed["status"] = json!("active");
+        assert!(
+            confirm_released(&still_claimed, "the run died")
+                .unwrap_err()
+                .contains("active"),
+            "a step that reads back active was not released"
+        );
+
+        let mut still_assigned = freed.clone();
+        still_assigned["assignee_id"] = json!("agent-claude");
+        assert!(
+            confirm_released(&still_assigned, "the run died")
+                .unwrap_err()
+                .contains("agent-claude"),
+            "a ready step still assigned is not handed back to the station"
+        );
+
+        let mut pinned = freed.clone();
+        pinned["metadata"][boss_jobs::agent_runs::EDGE_KEY] = json!(HELD_RUN);
+        assert!(
+            confirm_released(&pinned, "the run died")
+                .unwrap_err()
+                .contains(boss_jobs::agent_runs::EDGE_KEY),
+            "an edge that survived the clear is the b91a2103 no-op, and it is named"
+        );
+
+        let mut unrecorded = freed.clone();
+        unrecorded["metadata"][RELEASED_KEY] = json!({ "why": "something else" });
+        assert!(
+            confirm_released(&unrecorded, "the run died")
+                .unwrap_err()
+                .contains("something else"),
+            "and the reason read back must be the reason that was sent"
+        );
+    }
+
+    /// THE WHOLE VERB against the stub: one PATCH, one PUT, and the
+    /// stored step read back free — the stub models the server's own
+    /// carry-forward, so a PUT-only release fails this test exactly as
+    /// it would fail live.
+    #[tokio::test]
+    async fn step_release_hands_a_stranded_step_back_to_the_station() {
+        let s = stub(vec![held_packet(claimed("active", Some(HELD_RUN)))]).await;
+        let wire = Wire::at(s.base.clone(), named());
+        release_step(
+            &wire,
+            "bd93d2be",
+            "build",
+            "the run that claimed it died (e871febf)",
+        )
+        .await
+        .expect("released");
+
+        let puts = s.puts.lock().unwrap();
+        assert_eq!(
+            puts.len(),
+            2,
+            "one metadata PATCH, then one status PUT: {puts:?}"
+        );
+        assert!(
+            puts[0].0.ends_with("/metadata"),
+            "the clear goes first: {puts:?}"
+        );
+        assert_eq!(puts[0].1[boss_jobs::agent_runs::EDGE_KEY], Value::Null);
+        assert!(puts[1].1.get("metadata").is_none(), "{puts:?}");
+        drop(puts);
+
+        let step = s.packets.lock().unwrap()[0]["steps"][1].clone();
+        assert_eq!(step["status"], json!("ready"));
+        assert_eq!(step["assignee_id"], Value::Null);
+        assert!(
+            step["metadata"]
+                .get(boss_jobs::agent_runs::EDGE_KEY)
+                .is_none(),
+            "the dead run is no longer named: {step}"
+        );
+        assert_eq!(
+            step["metadata"][RELEASED_KEY]["why"],
+            json!("the run that claimed it died (e871febf)")
+        );
+        assert_eq!(
+            step["metadata"]["agent_model"],
+            json!("opus-5[1m]"),
+            "and the agent block rides through, so the inbox hands it out again: {step}"
+        );
+    }
+
+    /// REFUSED BEFORE ANY WRITE: a blank reason, and a step nobody
+    /// holds. The reason is the whole artifact a release leaves.
+    #[tokio::test]
+    async fn a_blank_reason_and_an_unheld_step_are_refused_before_the_first_write() {
+        let s = stub(vec![held_packet(claimed("ready", None))]).await;
+        let wire = Wire::at(s.base.clone(), named());
+        let err = release_step(&wire, "bd93d2be", "build", "   ")
+            .await
+            .expect_err("blank");
+        assert!(err.to_string().contains("--why is blank"), "{err}");
+        let err = release_step(&wire, "bd93d2be", "build", "a reason")
+            .await
+            .expect_err("nobody holds it");
+        assert!(err.to_string().contains("nothing to release"), "{err}");
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+    }
+}
+
+#[cfg(test)]
+mod kind_field_tests {
+    use super::*;
+
+    fn step_types_fixture() -> Value {
+        json!({"data": [
+            {"kind": "checklist", "fields": [
+                {"name": "items", "field_type": "array", "required": true}
+            ]},
+            {"kind": "task", "fields": []}
+        ]})
+    }
+
+    /// The defect, in one assertion: a checklist step whose row names
+    /// only its own fields still accepts `items`, because the API
+    /// requires it.
+    #[test]
+    fn a_checklist_accepts_the_items_its_kind_requires() {
+        let step = json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "spec_slug": "measure",
+            "kind": "checklist",
+            "status": "ready",
+            "fields": [
+                {"name": "commits_ahead", "field_type": "string", "required": true}
+            ]
+        });
+        let from_kind = kind_fields(&step_types_fixture(), "checklist");
+        assert_eq!(
+            from_kind.len(),
+            1,
+            "the registry declares items: {from_kind:?}"
+        );
+
+        let given = vec![
+            Given {
+                name: "commits_ahead".into(),
+                value: "455".into(),
+            },
+            Given {
+                name: "items".into(),
+                value: "[{\"label\":\"drift measured\",\"checked\":true}]".into(),
+            },
+        ];
+        let writes = field_writes_against(&step, &given, from_kind)
+            .expect("the kind's required field is accepted");
+        assert_eq!(writes["commits_ahead"], json!("455"));
+        assert!(
+            writes["items"].is_array(),
+            "an `array` field is parsed as JSON, not stored as text: {:?}",
+            writes["items"]
+        );
+    }
+
+    /// The refusal that must SURVIVE: a name neither the row nor the
+    /// kind declares is still refused. Widening the contract to the
+    /// union must not widen it to everything — that guard is why a
+    /// typo does not answer 204 and record an annotation nobody reads.
+    #[test]
+    fn a_name_neither_declares_is_still_refused() {
+        let step = json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "spec_slug": "measure",
+            "kind": "checklist",
+            "status": "ready",
+            "fields": [{"name": "commits_ahead", "field_type": "string", "required": true}]
+        });
+        let from_kind = kind_fields(&step_types_fixture(), "checklist");
+        let given = vec![Given {
+            name: "committs_ahead".into(),
+            value: "455".into(),
+        }];
+        let err =
+            field_writes_against(&step, &given, from_kind).expect_err("a typo is still refused");
+        assert!(err.contains("committs_ahead"), "{err}");
+    }
+
+    /// The row WINS on a collision: it may narrow what the kind leaves
+    /// loose, and the row is the more specific contract.
+    #[test]
+    fn the_row_wins_when_both_declare_a_name() {
+        let row = vec![Field {
+            name: "items".into(),
+            field_type: "string".into(),
+            required: false,
+        }];
+        let kind = vec![Field {
+            name: "items".into(),
+            field_type: "array".into(),
+            required: true,
+        }];
+        let merged = with_kind_fields(row, kind);
+        assert_eq!(merged.len(), 1, "no duplicate entry: {merged:?}");
+        assert_eq!(merged[0].field_type, "string", "the row's type stands");
+    }
+
+    /// A kind the registry does not know contributes nothing, rather
+    /// than the verb inventing a contract one layer above the judge.
+    #[test]
+    fn an_unknown_kind_contributes_nothing() {
+        assert!(kind_fields(&step_types_fixture(), "no-such-kind").is_empty());
+        assert!(kind_fields(&json!({}), "checklist").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod self_closing_tests {
+    use super::*;
+
+    fn alarm(finding: Option<&str>) -> Value {
+        let mut md = serde_json::Map::new();
+        if let Some(f) = finding {
+            md.insert("estate_finding".into(), json!(f));
+        }
+        json!({ "id": "e1fea3b2-2ef7-4600-b96e-2214764373ba", "metadata": Value::Object(md) })
+    }
+
+    /// THE INCIDENT: routing a self-closing alarm to `build` took the
+    /// step `estate.recover` completes, and the alarm outlived its
+    /// condition by hours with nothing saying why.
+    #[test]
+    fn routing_a_self_closing_alarm_elsewhere_warns_and_names_what_it_takes_over() {
+        let w = self_closing_warning(&alarm(Some("disk_tight:w-1")), "build")
+            .expect("a self-closing alarm routed elsewhere is warned about");
+        assert!(
+            w.contains("disk_tight:w-1"),
+            "the warning names the finding, so the reader knows which alarm: {w}"
+        );
+        assert!(
+            w.contains("estate.recover"),
+            "and the mechanism being taken over: {w}"
+        );
+        assert!(
+            w.contains("stale"),
+            "and the disposition that mechanism uses, which is what makes it checkable: {w}"
+        );
+        assert!(
+            w.contains("If the finding is live"),
+            "and says when routing it IS right, so the warning is not read as a refusal: {w}"
+        );
+    }
+
+    /// THE CONTROLS, and there are two because the warning must not
+    /// fire on ordinary triage — which is nearly every triage there is.
+    /// A warning on every packet is noise, and noise becomes unread,
+    /// which is the class this whole packet belongs to.
+    #[test]
+    fn an_ordinary_packet_is_not_warned_about() {
+        assert_eq!(
+            self_closing_warning(&alarm(None), "build"),
+            None,
+            "a packet carrying no estate_finding is not an alarm and is not the \
+             recovery's to close"
+        );
+        assert_eq!(
+            self_closing_warning(&json!({ "id": "x" }), "build"),
+            None,
+            "nor is one with no metadata at all"
+        );
+    }
+
+    /// AND THE DISPOSITION THE RECOVERY ITSELF USES IS NOT A TAKEOVER.
+    /// Reaching the same terminal by hand is the same outcome; warning
+    /// there would be telling an operator off for agreeing.
+    #[test]
+    fn closing_it_stale_by_hand_is_not_taking_anything_over() {
+        assert_eq!(
+            self_closing_warning(&alarm(Some("disk_tight:w-1")), "stale"),
+            None,
+            "`stale` is the disposition estate.recover writes — a human writing it \
+             reaches the same terminal, and nothing is lost"
+        );
+        assert!(
+            self_closing_warning(&alarm(Some("disk_tight:w-1")), "duplicate").is_some(),
+            "but any OTHER disposition skips the withdrawal terminals the recovery needs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod design_link_tests {
+    use super::*;
+
+    fn design(id: &str, answers: Option<&str>) -> Value {
+        let mut md = serde_json::Map::new();
+        if let Some(a) = answers {
+            md.insert("answers".into(), json!(a));
+        }
+        json!({ "id": id, "metadata": Value::Object(md) })
+    }
+
+    const PACKET: &str = "6c2eba00-1111-4111-8111-111111111111";
+    const OTHER: &str = "dd6d44b7-2222-4222-8222-222222222222";
+    const DESIGN: &str = "f2cdff23-3333-4333-8333-333333333333";
+
+    /// THE INCIDENT (2026-09-20): a design linked only by the step
+    /// field. The rule follows the design's OWN edge, so it never
+    /// fires, and the packet waits forever while the design leaves the
+    /// reviewer's queue. David saw exactly that and reasonably
+    /// concluded his review had been lost.
+    #[test]
+    fn a_design_carrying_no_answers_edge_is_refused_with_the_door_named() {
+        let err = design_link_check(PACKET, &design(DESIGN, None))
+            .expect_err("a design that names nobody cannot close this packet");
+        assert!(
+            err.contains("NOTHING follows"),
+            "the refusal must say the link would be one NOTHING follows: {err}"
+        );
+        assert!(
+            err.contains("boss design"),
+            "and name the door that writes both representations: {err}"
+        );
+        assert!(
+            err.contains("2c7dd4ab"),
+            "and cite the measurement, so the next reader can check it: {err}"
+        );
+    }
+
+    /// The other half of wrong: a design that answers a DIFFERENT
+    /// packet. Linking it here would record a second, contradicting
+    /// claim about what the design decides — and the other packet is
+    /// the one that would close.
+    #[test]
+    fn a_design_answering_another_packet_is_refused_and_names_it() {
+        let err = design_link_check(PACKET, &design(DESIGN, Some(OTHER)))
+            .expect_err("a design pointed elsewhere cannot close this packet");
+        assert!(
+            err.contains(&OTHER[..8]),
+            "the refusal names the packet the design actually answers: {err}"
+        );
+        assert!(
+            err.contains(&PACKET[..8]),
+            "and the one that would have waited forever: {err}"
+        );
+    }
+
+    /// THE CONTROL. The correct pairing passes — without it the two
+    /// refusals above would be satisfied by a check that refuses
+    /// everything, which would make `boss design --answers` unusable.
+    #[test]
+    fn the_matching_pair_is_accepted() {
+        design_link_check(PACKET, &design(DESIGN, Some(PACKET)))
+            .expect("a design that answers this packet links fine");
     }
 }

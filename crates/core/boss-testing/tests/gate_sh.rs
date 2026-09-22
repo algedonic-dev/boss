@@ -285,12 +285,10 @@ fn skeleton(label: &str, lints: &[(&str, &str)]) -> std::path::PathBuf {
     let dir = boss_testing::scratch_dir(label);
     let tree = dir.join("tree");
     boss_testing::create_dir(&tree.join("infra/lint/lib"));
-    // gate.sh sources the lint vocabulary (LINT_CANNOT_ANSWER) from the
-    // lib and refuses to run without it, so the skeleton carries both.
-    for rel in ["infra/gate.sh", "infra/lint/lib/git-answer.sh"] {
-        std::fs::copy(repo_root().join(rel), tree.join(rel))
-            .unwrap_or_else(|e| panic!("carry this tree's {rel} into the skeleton: {e}"));
-    }
+    // gate.sh refuses to run without any helper it sources — the lint
+    // vocabulary (LINT_CANNOT_ANSWER) and the target-dir rule (backlog
+    // 955c99b6) — so the skeleton carries the gate and all of them.
+    boss_testing::copy_gate_sh(&tree);
     boss_testing::write_file(
         &tree.join("infra/lint/workspace-declares-what-it-runs.sh"),
         "#!/usr/bin/env bash\nexit 0\n",
@@ -1370,8 +1368,8 @@ impl LevelTree {
         let _ = std::fs::remove_dir_all(&dir);
         let tree = dir.join("tree");
         boss_testing::copy_lint_libs(&tree);
+        boss_testing::copy_gate_sh(&tree);
         for rel in [
-            "infra/gate.sh",
             "infra/platform/tiers.toml",
             &format!("infra/lint/{EDIT_LEVEL_LINT}.sh"),
         ] {
@@ -1563,5 +1561,140 @@ fn the_edit_level_lint_admits_under_core_under_no_level_and_under_no_level_door(
     assert!(
         t.contains(&format!("WARNING — '{EDIT_LEVEL_LINT}' could not answer")),
         "{t}"
+    );
+}
+
+/// A MODE THE PARSER ACCEPTS MUST BE NAMED WHERE MODES ARE LISTED.
+///
+/// THE COST, paid twice (packet 410e21e2). `--lint` is `--quick` plus a
+/// clippy scoped to the crates the tree changed. Its own comment in
+/// gate.sh records why it was added on 2026-08-28: a car went red on
+/// clippy alone, costing a gate and a re-gate — about 22 minutes of
+/// cluster time — for two unused imports. On 2026-09-21 an agent spent
+/// a gate on a redundant closure, having run `--quick`, because the
+/// flag that would have caught it appeared in exactly one place a
+/// reader ever sees: the unknown-arg error, which you reach only by
+/// getting it wrong.
+///
+/// THE PAIR (CLAUDE.md §9a). The set of modes lives in the `case` block
+/// that parses them and in the usage header that advertises them. They
+/// cannot be collapsed — one is control flow, the other is the comment
+/// a reader opens the file for — so the pair is pinned, and this test
+/// names the flag that drifted.
+#[test]
+fn every_mode_the_parser_accepts_is_named_in_the_usage_header() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+
+    let parse_at = lines
+        .iter()
+        .position(|l| l.contains("while [ $# -gt 0 ]; do"))
+        .expect("infra/gate.sh no longer parses its arguments in a while loop");
+
+    // The header is everything above the parser; the flags are the arms
+    // of the `case`, read as `--name)`.
+    let (header, parser) = lines.split_at(parse_at);
+    let header = header.join("\n");
+
+    let mut missing: Vec<&str> = Vec::new();
+    let mut found = 0usize;
+    for line in parser {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("--") else {
+            continue;
+        };
+        let Some(name) = rest.split(')').next() else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+            continue;
+        }
+        found += 1;
+        let flag = &t[..name.len() + 2];
+        if !header.contains(flag) {
+            missing.push(flag);
+        }
+    }
+
+    assert!(
+        found >= 5,
+        "only {found} mode(s) were read out of the parser — the shape this test reads has \
+         changed, and a pin that matches nothing passes while proving nothing"
+    );
+    assert!(
+        missing.is_empty(),
+        "infra/gate.sh accepts {missing:?} but its usage header never names them. \
+         A mode a reader cannot find is a mode nobody runs: --lint went unnamed there \
+         and cost two gates to clippy errors it would have caught (packet 410e21e2)."
+    );
+}
+
+/// `--quick` NAMES THE MODE THAT CLOSES THE GAP IT REPORTS.
+///
+/// `--quick` ends by stating, correctly, that clippy and the suites are
+/// unproven. That is the moment a builder decides whether to push, and
+/// stating a gap while withholding the remedy is what sent a gate after
+/// a redundant closure. The line that names the gap must name `--lint`.
+#[test]
+fn the_quick_exit_names_the_mode_that_proves_clippy() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+
+    let quick_at = lines
+        .iter()
+        .position(|l| l.contains("if [ \"$QUICK\" -eq 1 ]; then"))
+        .expect("infra/gate.sh no longer has a --quick early exit");
+    let lint_at = lines
+        .iter()
+        .position(|l| l.contains("if [ \"$LINT\" -eq 1 ]; then"))
+        .expect("infra/gate.sh no longer has a --lint branch");
+    assert!(quick_at < lint_at, "the --quick branch precedes --lint");
+
+    // Only what --quick itself PRINTS, so a comment mentioning --lint
+    // somewhere in the file cannot satisfy this.
+    let printed: Vec<&&str> = lines[quick_at..lint_at]
+        .iter()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("echo ") && !t.starts_with('#')
+        })
+        .collect();
+    assert!(
+        !printed.is_empty(),
+        "the --quick branch prints nothing — this pin reads the wrong lines"
+    );
+
+    let unproven: Vec<&&&str> = printed.iter().filter(|l| l.contains("unproven")).collect();
+    assert!(
+        !unproven.is_empty(),
+        "--quick no longer says what it leaves unproven; the honest edge of its claim \
+         is the whole reason it is not a gate"
+    );
+    assert!(
+        unproven.iter().any(|l| l.contains("--lint")),
+        "--quick reports clippy as unproven without naming `--lint`, the mode that \
+         proves it in seconds (packet 410e21e2). The lines it prints: {unproven:?}"
+    );
+}
+
+/// THE DOORS LIST IS WHERE A SESSION LOOKS, so the door has to be there.
+///
+/// CLAUDE.md §Doors says a door that stops being true is a defect worth
+/// a car. "Before pushing" named only `--quick` — true, but the half
+/// that leaves clippy unproven — so every session read the cheaper door
+/// and paid for the gap at the gate.
+#[test]
+fn the_doors_list_names_the_mode_that_proves_clippy() {
+    let doc = read("CLAUDE.md");
+    let door = doc
+        .split("- **Before pushing")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n- **").next())
+        .expect("CLAUDE.md §Doors no longer carries a `Before pushing` entry");
+    assert!(
+        door.contains("--lint"),
+        "the `Before pushing` door names only the pre-flight. `infra/gate.sh --lint` is \
+         the same pre-flight plus a scoped clippy, and clippy is the red class the door \
+         exists to prevent (packet 410e21e2). The entry as written:\n{door}"
     );
 }
