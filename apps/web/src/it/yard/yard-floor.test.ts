@@ -137,9 +137,10 @@ const arrivedWith = (trainId: string, at: string, c: CarRow): TrainRow =>
     cars: [c],
   });
 
-/** A publish-dock row — the one approach lane the client still supplies
- *  (the station's queue, mapped 1:1). The verdict lanes come from the
- *  status payload's `garage` / `limbo` / `stranded` / `held` below. */
+/** A publish-request row — the one approach lane the client still
+ *  supplies (the open publish-request packets, mapped 1:1). The verdict
+ *  lanes come from the status payload's `garage` / `limbo` / `stranded`
+ *  / `held` below. */
 const publishRow = (id: string, branch: string, over: Partial<ApproachRow> = {}): ApproachRow => ({
   id,
   branch,
@@ -1511,7 +1512,9 @@ describe("journeyStops — a packet's completed steps as a journey", () => {
     expect(journeyStops(job)).toEqual([
       { lamp: 'ok', what: 'Opened', when: null, note: null },
       { lamp: 'ok', what: 'Gate', when: '2026-09-07T22:10:00Z', note: 'green · b4f3815' },
-      { lamp: 'working', what: 'Open for review', when: null, note: null },
+      // The step it stands at names its status beside its title: a
+      // perfect-tense title alone reads as done (648a68a9).
+      { lamp: 'working', what: 'Open for review', when: null, note: 'ready, not yet done' },
     ]);
   });
 

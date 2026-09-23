@@ -54,11 +54,13 @@ use boss_dispatcher_handlers::handlers::{
     ledger_tax_accrue::LedgerTaxAccrue,
     ledger_tax_remit::LedgerTaxRemit,
     messages_expire_for_job::MessagesExpireForJob,
+    messages_expire_notices::MessagesExpireNotices,
     messages_notify::MessagesNotify,
     messages_notify_job_terminal::MessagesNotifyJobTerminal,
     network_census::NetworkCensus,
     ops_file_tag_release::OpsFileTagRelease,
     ops_judge::OpsJudge,
+    ops_queue_alarm::OpsQueueAlarm,
     packaging_allocate::PackagingAllocate,
     people_hire::PeopleHire,
     people_terminate::PeopleTerminate,
@@ -396,6 +398,17 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The reader the ops-runner's queue gauge was built for
+            // (a45b38c1): every five minutes, read the open ops-request
+            // queue itself and file `ops_queue:<host>` when a host's
+            // oldest waiting request is past five of the runner's own
+            // cadences — silent (a dead or wedged runner) or not
+            // draining — and withdraw it when the queue drains. It
+            // reads the queue, not the runner, so a dead runner is seen.
+            handlers.register(OpsQueueAlarm::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A release packet's `tag` step going ready files the
             // forge's tag-release request itself — v<version> off the
             // packet, the newest closed train's merge_ref off the
@@ -603,7 +616,7 @@ async fn main() -> Result<()> {
                     platform_owner.clone(),
                 ));
             }
-            // Packaging allocation — splits a brewed batch across formats by
+            // Packaging allocation — splits a produced batch across formats by
             // demand and writes the packaged quantities, so the whole batch
             // always packages (WIP → FG, never dumped).
             handlers.register(PackagingAllocate::new(
@@ -661,15 +674,15 @@ async fn main() -> Result<()> {
             // unaware of who, if anyone, is on the other end.
             handlers.register(WebhookNotify::new(cfg.webhook_url.clone()));
             handlers.register(LedgerTaxRemit::new(cfg.ledger_api_url.clone()));
-            // Per-production excise-tax accrual (DR 6550 / CR 2320),
-            // fired on `step.done.production-produce` — the brewery's
-            // federal beer excise liability accrues at packaging time,
-            // drained quarterly by the excise-tax-filing Workflow.
+            // Per-production tax accrual (DR 6550 / CR 2320), fired by a
+            // tenant's rule when production completes — the liability
+            // accrues at production time and the tenant's filing
+            // Workflow drains it.
             handlers.register(LedgerTaxAccrue::new(cfg.ledger_api_url.clone()));
-            // A reconciled keg-return packet settles its deposit:
+            // A reconciled container-return packet settles its deposit:
             // DR 1000 / CR 2400 at the fleet-out date, DR 2400 /
             // CR 1000 refund + CR 4150 forfeiture at the return date
-            // (93f936b9, the full balance-sheet keg model).
+            // (93f936b9, the full balance-sheet deposit model).
             handlers.register(LedgerKegDepositSettle::new(
                 cfg.jobs_api_url.clone(),
                 cfg.ledger_api_url.clone(),
@@ -715,6 +728,11 @@ async fn main() -> Result<()> {
             // (David, 2026-08-14). Unread signals only — the port
             // carries why a direct never expires with the job.
             handlers.register(MessagesExpireForJob::new(cfg.messages_api_url.clone()));
+            // ...and the step notifier's own notices — directs among
+            // them — once their step ends or their job closes (backlog
+            // 0b2bac00: 83 of David's 90 direct notices pointed at
+            // completed steps).
+            handlers.register(MessagesExpireNotices::new(cfg.messages_api_url.clone()));
             let helpers = Arc::new(InventoryHelpers::new(
                 cfg.inventory_api_url.clone(),
                 cfg.jobs_api_url.clone(),
@@ -867,6 +885,9 @@ async fn main() -> Result<()> {
         live,
         pool,
         authored_rules_dir: cfg.authored_rules_dir.clone(),
+        // What the handlers registered above emit — declared beside their
+        // code, not in core (backlog ec40e269).
+        cascade: Arc::new(boss_dispatcher_handlers::cascade::cascade()),
     });
     let bind: SocketAddr = cfg
         .http_bind

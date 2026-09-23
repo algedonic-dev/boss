@@ -22,7 +22,18 @@ pub(super) async fn list_step_types<R: JobsRepository + 'static, B: EventBus + '
 // Jobs
 // ---------------------------------------------------------------------------
 
+/// The listing's query — and, by `deny_unknown_fields`, the ONE list of
+/// the parameters it accepts. Anything else is a 400 whose body names
+/// the parameter and lists these fields (axum's query rejection carries
+/// serde's "unknown field `x`, expected one of …"). Until 2026-09-23 an
+/// unknown parameter was dropped without a word, and every weekly
+/// department retro read `closed_since=<week start>` — which does not
+/// exist — and was handed the all-time list as its week (backlog
+/// 7f3e871a; the same shape as `department` before it existed,
+/// cc76f755). A filter the server cannot apply must not answer as if
+/// it had. Pinned in tests/jobs_list_refuses_an_unknown_parameter.rs.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ListJobsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
@@ -258,6 +269,14 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         j["steps"] = serde_json::to_value(&steps).unwrap_or_default();
         enriched.push(j);
     }
+    // THE ENVELOPE IS A WIRE CONTRACT TOO (backlog 10eecbbc): shell,
+    // Rust and the web read these four fields, and three of those
+    // readers DEFAULT a missing `total` to the page's length or to 0 —
+    // so dropping or reshaping it turns every truncated page into a
+    // whole list without an error anywhere. `limit` echoes the limit
+    // APPLIED (after the clamp), not the one asked for. The readers and
+    // what each assumes are listed, and held, in
+    // tests/the_list_envelope_holds_what_its_readers_assume.rs.
     Json(serde_json::json!({
         "data": enriched,
         "total": total,
@@ -516,10 +535,10 @@ pub(super) struct LaunchCalendarQuery {
     to: Option<chrono::NaiveDate>,
 }
 
-/// Launch-calendar projection per examples/used-device-shop/design/marketing-needs.md E2. Returns every
-/// open/in-flight `marketing-motion` Job with its tier-4
-/// `marketing-launch` step's date + channel, plus the Job's current
-/// tier. Frontend renders at `/calendar` (standalone) and in the exec
+/// Launch-calendar projection per examples/used-device-shop/design/marketing-needs.md E2. Returns one
+/// row per launch step (any step carrying `launch_date`) on every
+/// open/in-flight Job, with the step's date + channel and the Job's
+/// current tier — whatever the Job's kind (backlog 649b3303). Frontend renders at `/calendar` (standalone) and in the exec
 /// dashboard next-30-days panel.
 pub(super) async fn launch_calendar<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
@@ -759,6 +778,22 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .into_response();
         }
     };
+
+    // THE ADMISSION INSTANT, server-owned (backlog 6c2eba00, design
+    // f2cdff23). Stamped here and only here: the adapters keep the
+    // column out of every UPDATE, so a later PUT cannot move when the
+    // packet arrived, and a body that supplies its own value is
+    // overwritten — the same ownership `workflow_version` and the
+    // experiment arm take a few lines down.
+    //
+    // Unconditional, unlike the metadata stamp below, because the two
+    // answer different questions: `metadata.opened_at` is the precise
+    // instant behind a CLOCK-OWNED `opened_on`, and is deliberately
+    // skipped when the caller backdates the date; this field is when
+    // the packet was ADMITTED, which is now whatever date the body
+    // names. That is also what the rebuilder recovers from the create
+    // event, so live and replay read the same instant.
+    job.opened_at = Some(now);
 
     // The precise instant behind the defaulted date. `opened_on` has
     // one-day resolution by construction; the metadata stamp is what
@@ -1919,6 +1954,13 @@ pub(super) struct EstateEventsQuery {
     /// Exact-match filter on the payload's top-level `scope`, e.g.
     /// `codebase` or `kubernetes-nodes`. Absent reads every series.
     scope: Option<String>,
+    /// Only rows with `timestamp >= since` (RFC 3339).
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only rows with `timestamp < until` — the before-cursor: the
+    /// oldest timestamp on one page is the `until` of the next. An
+    /// instant that does not parse is a 400 from the extractor, never
+    /// read as absent, which would answer the newest page instead.
+    until: Option<chrono::DateTime<chrono::Utc>>,
     limit: Option<i64>,
 }
 
@@ -1947,6 +1989,18 @@ pub(super) struct EstateEventsQuery {
 /// could not be read through the one door that serves it. Asking for
 /// a scope answers about THAT scope — 50 rows of a nightly series is
 /// fifty nights, not half a day.
+///
+/// `?since=` / `?until=` do the same for TIME (backlog bf362f25). The
+/// cap had no way past it: post-mortem 3c3b202c, thirty hours after an
+/// incident, found the oldest reachable rows at 2026-09-22T20:52Z
+/// (observations) and 2026-09-23T06:50Z (comparisons), with the window
+/// it needed behind both — and the rows still in the log, which is
+/// append-only (measured through the events tail the same day: every
+/// estate row back to the log's first hour, 2026-09-16T23:58Z). The cap
+/// stays; `until=` walks past it a page at a time, and `total` counts
+/// the window so a reader compares its rows to it rather than taking a
+/// full page for the whole answer. Both are in the WHERE clause, beside
+/// the scope and before the limit.
 pub(super) async fn list_estate_observations<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(_user): CurrentUser,
@@ -1969,15 +2023,19 @@ async fn estate_events<R: JobsRepository + 'static, B: EventBus + 'static>(
     q: &EstateEventsQuery,
 ) -> Response {
     let limit = q.limit.unwrap_or(5).clamp(1, 50);
-    // The scope reaches the repository, which pushes it to the WHERE
-    // clause. Narrowing the page after it comes back would leave the
-    // slow series exactly as unreadable as it was.
-    match state
-        .jobs
-        .recent_events_by_kind(kind, q.scope.as_deref(), limit)
-        .await
-    {
-        Ok(rows) => Json(serde_json::json!({ "data": rows })).into_response(),
+    // The scope and the window reach the repository, which pushes them
+    // to the WHERE clause. Narrowing the page after it comes back would
+    // leave the slow series, and the old window, exactly as unreadable
+    // as they were.
+    let window = crate::port::EventWindow {
+        scope: q.scope.clone(),
+        since: q.since,
+        until: q.until,
+    };
+    match state.jobs.recent_events_by_kind(kind, &window, limit).await {
+        Ok(page) => {
+            Json(serde_json::json!({ "data": page.rows, "total": page.total })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

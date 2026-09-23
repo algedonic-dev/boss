@@ -164,7 +164,20 @@ pub fn step_fields(
 /// cancelled train can release the car by clearing the stamp).
 pub const REVIEW: &str = "Open for review";
 
-/// One step write a car's filer owes: which step, and the body to PUT.
+/// One step completion a car's filer owes: which step, the evidence to
+/// MERGE onto it, and the status-only body that then completes it.
+///
+/// TWO WRITES, IN THIS ORDER (backlog e39a9d2a, car 2 of its plan). This
+/// was one PUT of `{status, metadata}` built fresh, with no read. The
+/// step PUT REPLACES metadata wholesale, and the registry materializes
+/// keys onto every step at admission (`metadata_defaults`,
+/// `authority_role`, `station`, `audience`, `claimable`), so every
+/// `boss car open`, `boss park` and auto-park shed them. Now the
+/// evidence goes through the step merge door — [`StepWrite::merge_path`],
+/// one transaction against the row as it stands, so it cannot race — and
+/// then [`StepWrite::status_path`] takes a body carrying nothing to
+/// drop. Merge FIRST: a step's required-at-done fields are validated
+/// when it flips to completed, so the evidence must already be there.
 ///
 /// The step ID is read OFF the car, never assembled — the same rule the
 /// receipt lives by, for the same reason.
@@ -174,8 +187,34 @@ pub struct StepWrite {
     pub step_id: String,
     /// Its title, so a message can name what was written.
     pub title: &'static str,
-    /// `PUT /api/jobs/{car}/steps/{step_id}` body.
-    pub body: Value,
+    /// `PATCH /api/jobs/{car}/steps/{step_id}/metadata` body: top-level
+    /// keys merged into what the step already holds.
+    pub metadata: Value,
+    /// `PUT /api/jobs/{car}/steps/{step_id}` body, sent AFTER the merge:
+    /// the status alone.
+    pub status_body: Value,
+}
+
+impl StepWrite {
+    fn completing(step_id: &str, title: &'static str, metadata: Value) -> Self {
+        Self {
+            step_id: step_id.to_string(),
+            title,
+            metadata,
+            status_body: json!({"status": "completed"}),
+        }
+    }
+
+    /// The step merge door on `car_id` — the FIRST write.
+    pub fn merge_path(&self, car_id: &str) -> String {
+        format!("/api/jobs/{car_id}/steps/{}/metadata", self.step_id)
+    }
+
+    /// The step PUT on `car_id` — the SECOND write, carrying
+    /// [`StepWrite::status_body`].
+    pub fn status_path(&self, car_id: &str) -> String {
+        format!("/api/jobs/{car_id}/steps/{}", self.step_id)
+    }
 }
 
 /// PURE: the id of `(slug, title)` on this car, or `None` when the
@@ -248,14 +287,11 @@ pub fn open_writes(
         return Err(format!("the `{SCOPE_SLUG}` step on this car has no id"));
     };
     let at = stamp(now);
-    Ok(vec![StepWrite {
-        step_id: step_id.to_string(),
-        title: SCOPE,
-        body: json!({
-            "status": "completed",
-            "metadata": {"summary": summary, "excludes": excludes, "completed_at": at},
-        }),
-    }])
+    Ok(vec![StepWrite::completing(
+        step_id,
+        SCOPE,
+        json!({"summary": summary, "excludes": excludes, "completed_at": at}),
+    )])
 }
 
 /// PURE: the writes a GREEN owes a car — each of scope/build/gate that
@@ -292,11 +328,7 @@ pub fn finish_writes(
         let Some(step_id) = step.get("id").and_then(Value::as_str) else {
             return Err(format!("the `{slug}` step on this car has no id"));
         };
-        out.push(StepWrite {
-            step_id: step_id.to_string(),
-            title,
-            body: json!({"status": "completed", "metadata": metadata}),
-        });
+        out.push(StepWrite::completing(step_id, title, metadata));
     }
     Ok(out)
 }
@@ -378,6 +410,310 @@ pub fn proof_intent(
     m
 }
 
+/// THE NOT-YET STREAK (backlog adef5ddf). A car's `proof_attempt` is
+/// REPLACED on every run, so until 2026-09-23 it said what the last run
+/// answered and nothing about how long it had been answering it. `exit
+/// 75` means "early, not wrong", and a probe that can NEVER pass says
+/// exactly that too: car b8c4267f greps a literal a later car removed on
+/// 9a grounds, car 52e0287e takes the last of four matches where the
+/// call is the second. Both were counted as patiently waiting and
+/// rechecked hourly — measured over the 1812 ops-requests on record
+/// (2026-09-17 to 09-23): six open cars at 86 to 88 consecutive
+/// not-yets each, spanning 97h to 134h, and no probe run ever answered
+/// them otherwise. The exit code cannot tell starving from waiting; the
+/// length of the streak is the only signal there is, so each attempt now
+/// carries where its streak began and how many runs it holds.
+///
+/// Written by the doors that record an attempt
+/// (`boss prove`'s `attempt_json`), read by [`not_yet_streak`].
+pub const NOT_YET_SINCE: &str = "not_yet_since";
+/// How many consecutive runs of the same probe have answered not-yet,
+/// this one included. See [`NOT_YET_SINCE`].
+pub const NOT_YET_RUNS: &str = "not_yet_runs";
+
+/// Did this recorded attempt answer NOT YET? The flag the doors stamp,
+/// or a bare exit 75 on records older than the flag — one definition,
+/// read by the shed's classification and the streak both.
+pub fn attempt_said_not_yet(attempt: &Value) -> bool {
+    attempt.get("not_yet").and_then(Value::as_bool) == Some(true)
+        || attempt.get("exit").and_then(Value::as_i64) == Some(75)
+}
+
+/// Where a not-yet run's streak began and how many runs it now holds,
+/// given the car's PRIOR attempt: `(since, runs)`, for a run at `at` of
+/// `probe`. The streak continues only across not-yets of the SAME probe
+/// text — a corrected probe is the repair for a starved one, and must
+/// not inherit its four days. A prior record written before these keys
+/// existed dates the streak from its own `at`, the earliest not-yet this
+/// door can vouch for.
+pub fn carried_not_yet_streak(prior: Option<&Value>, probe: &str, at: &str) -> (String, u64) {
+    let continuing = prior.filter(|p| {
+        attempt_said_not_yet(p) && p.get("probe").and_then(Value::as_str) == Some(probe)
+    });
+    match continuing {
+        Some(p) => {
+            let since = p
+                .get(NOT_YET_SINCE)
+                .and_then(Value::as_str)
+                .or_else(|| p.get("at").and_then(Value::as_str))
+                .unwrap_or(at);
+            let runs = p
+                .get(NOT_YET_RUNS)
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+                .unwrap_or(1);
+            (since.to_string(), runs + 1)
+        }
+        None => (at.to_string(), 1),
+    }
+}
+
+/// A car's not-yet streak, read back: how many hours lie between its
+/// first and its latest not-yet, and how many runs answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotYetStreak {
+    pub hours: i64,
+    pub runs: u64,
+}
+
+/// The streak on a car's metadata, if its last run answered not-yet.
+///
+/// Measured between two RUNS, never against the clock: a recheck that
+/// stopped firing must not age a streak nobody is asking. And `None`
+/// when the car's recorded probe is no longer the text that ran, so a
+/// probe corrected by a metadata PATCH stops reading as starved at once
+/// rather than at the next hourly write.
+pub fn not_yet_streak(md: &Value) -> Option<NotYetStreak> {
+    let attempt = md.get("proof_attempt")?;
+    if !attempt_said_not_yet(attempt) {
+        return None;
+    }
+    let ran = attempt.get("probe").and_then(Value::as_str);
+    let recorded = md.get(PROOF_PROBE).and_then(Value::as_str);
+    if let (Some(ran), Some(recorded)) = (ran, recorded)
+        && ran != recorded
+    {
+        return None;
+    }
+    let instant = |k: &str| {
+        attempt
+            .get(k)
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    };
+    let last = instant("at")?;
+    let since = instant(NOT_YET_SINCE).unwrap_or(last);
+    let runs = attempt
+        .get(NOT_YET_RUNS)
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    Some(NotYetStreak {
+        hours: (last - since).num_hours(),
+        runs,
+    })
+}
+
+/// WHAT THE CAR SAYS IT WAITS ON (backlog b461341d). Duration alone
+/// cannot tell stuck from patient: the operator triage of the six cars
+/// adef5ddf's streak measured past its bound (b8c4267f, 4b05fe3e,
+/// f71a3c90, b94cb42f, 59398050, 7f01b854, 2026-09-23) found ALL SIX
+/// honestly waiting on the world — a publish failure that has not
+/// happened, a tenant publish, a red crawl, a release David has not
+/// opened, a destructive prune that is his call, a real Stripe charge —
+/// and none with a wrong probe. So about three days after that bound
+/// converged the shed would have called six honest waits "ours to read",
+/// the false signal the label exists to prevent, pointed the other way.
+///
+/// So the car SAYS what it waits on, as `{"on": <prose naming the event
+/// or the actor>, "seen": <optional shell text>}`. `seen` is a second,
+/// smaller probe, run by the same door and on the same host as the
+/// proof probe whenever that one answers not-yet, which exits 0 once the
+/// awaited event is in the record. It is what turns the declaration from
+/// a belief into something the record can contradict: a probe still
+/// saying not-yet AFTER its own declared event was seen is the true
+/// "ours to read", at any streak length. Written by `boss car waits-on`
+/// (or the metadata PATCH it wraps), read by [`starved`].
+pub const WAITS_ON: &str = "waits_on";
+/// On a not-yet `proof_attempt`: when the car's declared `seen` check
+/// first exited 0 in an unbroken run of sightings, or `null`. Carried by
+/// [`carried_seen_at`].
+pub const WAITS_ON_SEEN_AT: &str = "waits_on_seen_at";
+
+/// A car's declared wait, read back. `None` for no declaration, and for
+/// one that names nothing — a blank `on` must not silence the label by
+/// merely being present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitsOn {
+    pub on: String,
+    pub seen: Option<String>,
+}
+
+fn non_blank(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub fn waits_on(md: &Value) -> Option<WaitsOn> {
+    let w = md.get(WAITS_ON)?;
+    Some(WaitsOn {
+        on: non_blank(w.get("on"))?,
+        seen: non_blank(w.get("seen")),
+    })
+}
+
+/// The declaration in the one shape [`waits_on`] reads — what the verb
+/// PATCHes, and what an operator writing the PATCH by hand should copy.
+pub fn waits_on_value(on: &str, seen: Option<&str>) -> Value {
+    let seen = seen.map(str::trim).filter(|s| !s.is_empty());
+    json!({"on": on.trim(), "seen": seen})
+}
+
+/// A written declaration MERGED into the one the car carries (backlog
+/// e9b164a1 piece 3): each field `update` carries replaces that field,
+/// every other field `existing` declares is kept. `None` when the result
+/// names no `on` — a declaration of nothing, which neither writer may
+/// record. One definition for both writers, `boss car waits-on` and the
+/// auto-park handler's copy of `--park-waits-on`, because the object is
+/// wider than its first two fields now: an `owner` and a patience
+/// written by hand must survive a writer that re-states only `on`, and
+/// the metadata door merges top-level keys only.
+pub fn merge_waits_on(existing: Option<&Value>, update: &Value) -> Option<Value> {
+    let mut merged = existing
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merged.extend(update.as_object()?.clone());
+    let merged = Value::Object(merged);
+    waits_on(&json!({ WAITS_ON: merged.clone() }))?;
+    Some(merged)
+}
+
+/// When the declared event was first seen, for a run that `seen` it (or
+/// not): the prior attempt's sighting if it had one, else this run's
+/// instant; `None` for a run that did not see it — a sighting that stops
+/// is not a sighting.
+pub fn carried_seen_at(prior: Option<&Value>, seen: bool, at: &str) -> Option<String> {
+    if !seen {
+        return None;
+    }
+    Some(
+        prior
+            .and_then(|p| p.get(WAITS_ON_SEEN_AT))
+            .and_then(Value::as_str)
+            .unwrap_or(at)
+            .to_string(),
+    )
+}
+
+/// Why a not-yet car is ours to read rather than the world's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Starved {
+    /// No declared wait, and the probe has said not-yet without a break
+    /// past `regions::NOT_YET_STARVED_HOURS` — adef5ddf's rule, which is
+    /// all the record can say of a car that never said what it waits on.
+    Undeclared(NotYetStreak),
+    /// The car declared what it waits on, its `seen` check found that
+    /// in the record, and the probe STILL said not-yet.
+    SeenWhileNotYet { on: String, seen_at: String },
+}
+
+/// Is this car's not-yet ours to read? One definition, read by the
+/// shed and by `boss orient`. A DECLARED wait not yet seen is never
+/// starved, however long — its patience is stated, and it becomes ours
+/// the moment the record holds what it named.
+pub fn starved(md: &Value) -> Option<Starved> {
+    let streak = not_yet_streak(md)?;
+    match waits_on(md) {
+        None => (streak.hours >= crate::regions::NOT_YET_STARVED_HOURS)
+            .then_some(Starved::Undeclared(streak)),
+        Some(w) => md
+            .pointer(&format!("/proof_attempt/{WAITS_ON_SEEN_AT}"))
+            .and_then(Value::as_str)
+            .map(|seen_at| Starved::SeenWhileNotYet {
+                on: w.on,
+                seen_at: seen_at.to_string(),
+            }),
+    }
+}
+
+/// WHOSE MOVE A DECLARED WAIT IS (backlog 3881f5c9). Inside `waits_on`:
+/// `"world"` for an event nobody here can cause, or the id of the actor
+/// whose act it is. DECLARED, never inferred — `on` prose that says
+/// "David opens it" names no owner, because a reader that guessed an
+/// owner out of prose would be the mostly-sure the shed exists to
+/// refuse. No writer sets it yet (`boss car waits-on` writes only `on`
+/// and `seen`); until one does, it is written through the metadata
+/// PATCH, and a car without it reads as ours.
+pub const WAITS_ON_OWNER: &str = "owner";
+/// Inside `waits_on`, optional: how many hours from the car's opening
+/// the owner's move may take before the wait is ours again. A positive
+/// integer or nothing — patience is the car's to state, not a default.
+pub const WAITS_ON_MAX_WAIT_HOURS: &str = "max_wait_hours";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOwner {
+    World,
+    Actor(String),
+}
+
+impl std::fmt::Display for WaitOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitOwner::World => f.write_str("the world"),
+            WaitOwner::Actor(a) => f.write_str(a),
+        }
+    }
+}
+
+/// The owner a car's `waits_on` declares, or `None` for none or blank.
+pub fn wait_owner(md: &Value) -> Option<WaitOwner> {
+    let owner = non_blank(md.get(WAITS_ON)?.get(WAITS_ON_OWNER))?;
+    Some(if owner.eq_ignore_ascii_case("world") {
+        WaitOwner::World
+    } else {
+        WaitOwner::Actor(owner)
+    })
+}
+
+/// A wait that is someone else's move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWait {
+    pub owner: WaitOwner,
+    pub on: String,
+    pub max_wait_hours: Option<i64>,
+}
+
+impl OwnedWait {
+    /// Past the patience the car declared, measured on its age.
+    pub fn overdue(&self, age_hours: i64) -> bool {
+        self.max_wait_hours.is_some_and(|max| age_hours > max)
+    }
+}
+
+/// Is this car's wait someone else's move? Only when all four hold: it
+/// DECLARED the wait, something OBSERVES it (a `seen` check), it names
+/// an OWNER, and the event has not been seen while the probe says
+/// not-yet ([`starved`] is `None`). Anything short of that is ours —
+/// the shed's troubled colour means exactly that set.
+pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
+    let w = waits_on(md)?;
+    w.seen.as_ref()?;
+    if starved(md).is_some() {
+        return None;
+    }
+    Some(OwnedWait {
+        owner: wait_owner(md)?,
+        on: w.on,
+        max_wait_hours: md
+            .pointer(&format!("/{WAITS_ON}/{WAITS_ON_MAX_WAIT_HOURS}"))
+            .and_then(Value::as_i64)
+            .filter(|h| *h > 0),
+    })
+}
+
 /// THE ITEM A CAR ANSWERS, AND AUTHORISES THE CLOSE OF.
 ///
 /// The declared one-to-one job edge (`('ship-a-change', 'backlog_item',
@@ -409,6 +745,17 @@ pub const BACKLOG_ITEM: &str = "backlog_item";
 /// work outstanding. This key records the same provenance under a name
 /// NO rule reads, which is what makes it inert at arrival.
 pub const PARTIAL_ITEM: &str = "partial_item";
+
+/// EVERY OTHER ITEM A CAR ANSWERS, AND AUTHORISES THE CLOSE OF.
+///
+/// A `job_id_list` edge beside [`BACKLOG_ITEM`], followed on merge by
+/// the same arrival rule (its `also_link`), so each listed item is
+/// routed and built exactly as the primary is. `backlog_item` holds ONE
+/// id, and on 2026-09-23 two landed items stayed open that way and were
+/// dispatched to builders who rediscovered the landing: 5994de6d (its
+/// fix rode on cars filed under three other items) and cab50f4c (car
+/// c842f18b named only 3ec04168). Backlog a994f533.
+pub const ALSO_ANSWERS: &str = "also_answers";
 /// Why this car names no item at all — the answer a deliberately
 /// item-less car gives (`--park-no-item`). Item-less cars legitimately
 /// exist (a fix asked for in conversation, a defect found while
@@ -483,6 +830,11 @@ pub const PARK_EXPECT: &str = "park_expect";
 pub const PARK_PROOF_EVENT: &str = "park_proof_event";
 pub const PARK_NO_ITEM: &str = "park_no_item";
 pub const PARK_PARTIAL_ITEM: &str = "park_partial_item";
+/// `boss gate --park-waits-on` (backlog e9b164a1 piece 3): the car's
+/// declared wait as the builder states it at park — an object carrying
+/// only the [`WAITS_ON`] fields given. The auto-park handler MERGES it
+/// onto the car's `waits_on` with [`merge_waits_on`], never replaces.
+pub const PARK_WAITS_ON: &str = "park_waits_on";
 
 /// The item provenance a car carries beyond the closing edge: the item
 /// it is one piece of, or the reason it names none. Absent and blank
@@ -1801,11 +2153,11 @@ mod building_tests {
         assert_eq!(writes.len(), 1, "one write: scope");
         assert_eq!(writes[0].step_id, "s-scope");
         assert_eq!(writes[0].title, SCOPE);
-        assert_eq!(writes[0].body["status"], "completed");
-        assert_eq!(writes[0].body["metadata"]["summary"], "does a thing");
-        assert_eq!(writes[0].body["metadata"]["excludes"], "not that");
+        assert_eq!(writes[0].status_body, json!({"status": "completed"}));
+        assert_eq!(writes[0].metadata["summary"], "does a thing");
+        assert_eq!(writes[0].metadata["excludes"], "not that");
         assert_eq!(
-            writes[0].body["metadata"]["completed_at"], "2026-09-10T18:00:00Z",
+            writes[0].metadata["completed_at"], "2026-09-10T18:00:00Z",
             "the same stamp format every other writer uses"
         );
     }
@@ -1844,13 +2196,13 @@ mod building_tests {
         let titles: Vec<&str> = writes.iter().map(|w| w.title).collect();
         assert_eq!(titles, vec![BUILD, GATE], "scope is already declared");
         assert_eq!(writes[0].step_id, "s-build");
-        assert_eq!(writes[0].body["metadata"]["test"], "ran the tests");
+        assert_eq!(writes[0].metadata["test"], "ran the tests");
         assert_eq!(writes[1].step_id, "s-gate");
         assert_eq!(
-            writes[1].body["metadata"]["receipt"], GREEN,
+            writes[1].metadata["receipt"], GREEN,
             "the receipt rides verbatim, as it does on a fresh car"
         );
-        assert_eq!(writes[1].body["metadata"]["verified"], "seen working");
+        assert_eq!(writes[1].metadata["verified"], "seen working");
     }
 
     /// And the path auto-park has always taken is unchanged: a car it
@@ -1872,11 +2224,67 @@ mod building_tests {
         assert_eq!(titles, vec![SCOPE, BUILD, GATE]);
         assert_eq!(writes[0].step_id, "s-scope");
         for w in &writes {
-            assert_eq!(w.body["status"], "completed");
+            assert_eq!(w.status_body, json!({"status": "completed"}));
             assert_eq!(
-                w.body["metadata"]["completed_at"], "2026-09-10T18:30:00Z",
+                w.metadata["completed_at"], "2026-09-10T18:30:00Z",
                 "{} was filled without saying when",
                 w.title
+            );
+        }
+    }
+
+    /// NO CAR WRITE PUTS METADATA (backlog e39a9d2a, car 2 of its plan).
+    ///
+    /// The step PUT REPLACES metadata wholesale, and the registry
+    /// materializes keys onto every step at admission —
+    /// `metadata_defaults`, `authority_role`, `station`, `audience`,
+    /// `claimable` — so these writers, which build their bodies fresh with
+    /// no read, shed every one of those keys on every `boss car open`,
+    /// `boss park` and auto-park. The evidence rides the step MERGE door
+    /// (`PATCH …/steps/{id}/metadata`, one transaction against the row as
+    /// it stands, so it cannot race) and the completion is a PUT carrying
+    /// the status and nothing else to drop.
+    #[test]
+    fn every_car_write_merges_its_evidence_and_puts_only_the_status() {
+        let opened = open_writes(&fresh("f1", BRANCH), "s", "e", at("2026-09-10T18:00:00Z"))
+            .expect("a fresh car can be opened");
+        let finished = finish_writes(
+            &fresh("f1", BRANCH),
+            "s",
+            "e",
+            "t",
+            "v",
+            &receipt(),
+            at("2026-09-10T18:30:00Z"),
+        )
+        .expect("a fresh car can be finished");
+        assert!(!opened.is_empty() && finished.len() == 3);
+        for w in opened.iter().chain(&finished) {
+            assert_eq!(
+                w.status_body,
+                json!({"status": "completed"}),
+                "{}: the PUT must carry the status alone — a metadata key in it \
+                 replaces the step's stored keys wholesale",
+                w.title
+            );
+            assert!(
+                w.metadata.as_object().is_some_and(|m| !m.is_empty()),
+                "{}: the evidence rides the merge body",
+                w.title
+            );
+            assert!(
+                w.metadata.get("status").is_none(),
+                "{}: `status` on the merge door would be a metadata key named status",
+                w.title
+            );
+            assert_eq!(
+                w.merge_path("car-1"),
+                format!("/api/jobs/car-1/steps/{}/metadata", w.step_id),
+                "the merge door, addressed through the car the step is on"
+            );
+            assert_eq!(
+                w.status_path("car-1"),
+                format!("/api/jobs/car-1/steps/{}", w.step_id)
             );
         }
     }
@@ -1945,5 +2353,331 @@ mod building_tests {
             Some("s-build")
         );
         assert!(step_id_for(&json!({"steps": []}), BUILD_SLUG, BUILD).is_none());
+    }
+}
+
+#[cfg(test)]
+mod not_yet_streak_tests {
+    use super::*;
+
+    const PROBE: &str = "grep -c x f || exit 75";
+
+    fn not_yet(at: &str, since: Option<&str>, runs: Option<u64>) -> Value {
+        let mut a = json!({"at": at, "exit": 75, "not_yet": true, "probe": PROBE});
+        if let Some(s) = since {
+            a[NOT_YET_SINCE] = json!(s);
+        }
+        if let Some(n) = runs {
+            a[NOT_YET_RUNS] = json!(n);
+        }
+        a
+    }
+
+    /// The first not-yet of a streak starts it at this run.
+    #[test]
+    fn a_first_not_yet_starts_the_streak_at_this_run() {
+        let (since, runs) = carried_not_yet_streak(None, PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+    }
+
+    /// A not-yet after a not-yet of the SAME probe keeps the streak's
+    /// start and counts the run — the only way a reader can later tell
+    /// "asked once" from "asked 86 times across four days".
+    #[test]
+    fn a_not_yet_after_a_not_yet_carries_the_start_and_counts() {
+        let prior = not_yet(
+            "2026-09-23T06:00:00Z",
+            Some("2026-09-19T05:50:00Z"),
+            Some(85),
+        );
+        let (since, runs) = carried_not_yet_streak(Some(&prior), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-19T05:50:00Z", 86));
+    }
+
+    /// A record written before the streak existed still vouches for its
+    /// own run: its `at` is the earliest not-yet this door can prove, so
+    /// the streak starts there rather than at zero on every car already
+    /// standing in the shed when this lands.
+    #[test]
+    fn a_legacy_not_yet_record_dates_the_streak_from_its_own_run() {
+        let prior = not_yet("2026-09-23T06:00:00Z", None, None);
+        let (since, runs) = carried_not_yet_streak(Some(&prior), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T06:00:00Z", 2));
+    }
+
+    /// THE STREAK BELONGS TO THE PROBE TEXT. A corrected probe is the
+    /// repair for a starved one (52e0287e), and inheriting the old
+    /// probe's four days would name the repair starved on its first run.
+    /// And a run that answered anything but not-yet ends the streak.
+    #[test]
+    fn a_new_probe_or_a_different_answer_restarts_the_streak() {
+        let prior = not_yet(
+            "2026-09-23T06:00:00Z",
+            Some("2026-09-19T05:50:00Z"),
+            Some(85),
+        );
+        let (since, runs) =
+            carried_not_yet_streak(Some(&prior), "a corrected probe", "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+
+        let failed =
+            json!({"at": "2026-09-23T06:00:00Z", "exit": 1, "not_yet": false, "probe": PROBE});
+        let (since, runs) = carried_not_yet_streak(Some(&failed), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+    }
+
+    /// The reader: the streak's length is measured between its first and
+    /// its latest not-yet — two runs that happened — never against the
+    /// clock, so a recheck that stopped running cannot age a streak.
+    #[test]
+    fn the_streak_reads_back_as_hours_between_its_first_and_latest_run() {
+        let md = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", Some("2026-09-19T05:50:00Z"), Some(86)),
+        });
+        assert_eq!(
+            not_yet_streak(&md),
+            Some(NotYetStreak {
+                hours: 97,
+                runs: 86
+            })
+        );
+        // Legacy: one run vouched for, no length yet.
+        let md = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", None, None),
+        });
+        assert_eq!(
+            not_yet_streak(&md),
+            Some(NotYetStreak { hours: 0, runs: 1 })
+        );
+    }
+
+    /// No streak when the last run did not say not-yet, and none when the
+    /// car's recorded probe is no longer the one that ran — a probe
+    /// corrected by a metadata PATCH stops reading as starved at once,
+    /// not an hour later when the recheck next writes.
+    #[test]
+    fn no_streak_for_another_answer_or_a_since_replaced_probe() {
+        let failed = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": {"at": "2026-09-23T07:00:00Z", "exit": 1, "probe": PROBE},
+        });
+        assert_eq!(not_yet_streak(&failed), None);
+        let replaced = json!({
+            PROOF_PROBE: "a corrected probe",
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", Some("2026-09-19T05:50:00Z"), Some(86)),
+        });
+        assert_eq!(not_yet_streak(&replaced), None);
+        assert_eq!(not_yet_streak(&json!({})), None);
+    }
+}
+
+#[cfg(test)]
+mod waits_on_tests {
+    use super::*;
+
+    const PROBE: &str = "grep -c x f || exit 75";
+
+    /// A car at `proven` whose probe has said not-yet for `hours` straight.
+    fn waiting(hours: i64, waits: Option<Value>, seen_at: Option<&str>) -> Value {
+        let last = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z").unwrap();
+        let since = (last - chrono::Duration::hours(hours)).to_rfc3339();
+        let mut attempt = json!({
+            "at": last.to_rfc3339(), "exit": 75, "not_yet": true, "probe": PROBE,
+            NOT_YET_SINCE: since, NOT_YET_RUNS: hours + 1,
+        });
+        if let Some(s) = seen_at {
+            attempt[WAITS_ON_SEEN_AT] = json!(s);
+        }
+        let mut md = json!({PROOF_PROBE: PROBE, "proof_attempt": attempt});
+        if let Some(w) = waits {
+            md[WAITS_ON] = w;
+        }
+        md
+    }
+
+    /// THE WRITER MERGES, IT DOES NOT REPLACE (backlog e9b164a1 piece 3).
+    /// Until this, `boss car waits-on` PATCHed the whole object, so a
+    /// re-statement of `on` or `seen` dropped an `owner` an operator had
+    /// added by hand — and a wait without an owner reads as ours. Each
+    /// field the update carries replaces that field; every other field
+    /// the car already declares is kept; a result naming no `on` declares
+    /// nothing and is `None`.
+    #[test]
+    fn a_written_declaration_merges_into_the_one_the_car_carries() {
+        let owned = json!({"on": "a release", "seen": "true", WAITS_ON_OWNER: "emp-david"});
+        let got = merge_waits_on(
+            Some(&owned),
+            &json!({"on": "a tagged release", "seen": "exit 0"}),
+        );
+        assert_eq!(
+            got,
+            Some(json!({"on": "a tagged release", "seen": "exit 0", WAITS_ON_OWNER: "emp-david"}))
+        );
+        // An owner and a patience added to a declaration keep its on/seen.
+        let got = merge_waits_on(
+            Some(&waits_on_value("a Stripe charge", Some("true"))),
+            &json!({WAITS_ON_OWNER: "world", WAITS_ON_MAX_WAIT_HOURS: 336}),
+        )
+        .unwrap();
+        let md = json!({ WAITS_ON: got });
+        assert_eq!(wait_owner(&md), Some(WaitOwner::World));
+        assert_eq!(waits_on(&md).unwrap().seen.as_deref(), Some("true"));
+        assert_eq!(md[WAITS_ON][WAITS_ON_MAX_WAIT_HOURS], 336);
+        // Nothing to merge into and no `on`: nothing is declared.
+        assert_eq!(
+            merge_waits_on(None, &json!({WAITS_ON_OWNER: "world"})),
+            None
+        );
+        // A non-object recorded by hand is replaced, not merged into.
+        assert_eq!(
+            merge_waits_on(Some(&json!("prose only")), &json!({"on": "x"})),
+            Some(json!({"on": "x"}))
+        );
+    }
+
+    /// UNDECLARED: exactly adef5ddf's rule — past the bound it is ours to
+    /// read, under it nobody's business yet.
+    #[test]
+    fn an_undeclared_wait_is_starved_only_past_the_bound() {
+        assert!(matches!(
+            starved(&waiting(97, None, None)),
+            Some(Starved::Undeclared(NotYetStreak { hours: 97, .. }))
+        ));
+        assert_eq!(starved(&waiting(40, None, None)), None);
+    }
+
+    /// DECLARED AND NOT SEEN: the car said what it waits on and the
+    /// record does not hold it yet, so however long the streak, the move
+    /// is the world's (the six cars b461341d triaged, at 97h to 134h).
+    #[test]
+    fn a_declared_wait_not_yet_seen_is_never_starved() {
+        let w = waits_on_value("a Stripe sponsorship charge", None);
+        assert_eq!(starved(&waiting(134, Some(w), None)), None);
+    }
+
+    /// DECLARED AND SEEN, PROBE STILL NOT YET: the event the car named
+    /// is in the record and the probe still cannot see it — the true
+    /// "ours to read", at any streak length.
+    #[test]
+    fn a_declared_wait_seen_while_the_probe_says_not_yet_is_ours_at_once() {
+        let w = waits_on_value("a red crawl", Some("true"));
+        let md = waiting(3, Some(w), Some("2026-09-26T11:00:00Z"));
+        assert_eq!(
+            starved(&md),
+            Some(Starved::SeenWhileNotYet {
+                on: "a red crawl".into(),
+                seen_at: "2026-09-26T11:00:00Z".into(),
+            })
+        );
+    }
+
+    /// A declaration must name something: a blank `on` is no declaration,
+    /// so it cannot silence the label by being present.
+    #[test]
+    fn a_blank_or_malformed_declaration_is_no_declaration() {
+        assert_eq!(waits_on(&json!({WAITS_ON: {"on": "  "}})), None);
+        assert_eq!(waits_on(&json!({WAITS_ON: "prose only"})), None);
+        assert!(starved(&waiting(97, Some(json!({"on": ""})), None)).is_some());
+        assert_eq!(
+            waits_on(&json!({WAITS_ON: waits_on_value("x", Some(" "))})),
+            Some(WaitsOn {
+                on: "x".into(),
+                seen: None
+            })
+        );
+    }
+
+    /// The first run that saw the event dates the sighting; later runs
+    /// that still see it keep that date, and a run that does not see it
+    /// clears it.
+    #[test]
+    fn a_sighting_is_dated_from_the_first_run_that_saw_it() {
+        let prior = json!({WAITS_ON_SEEN_AT: "2026-09-26T09:00:00Z"});
+        assert_eq!(
+            carried_seen_at(Some(&prior), true, "2026-09-26T10:00:00Z").as_deref(),
+            Some("2026-09-26T09:00:00Z")
+        );
+        assert_eq!(
+            carried_seen_at(None, true, "2026-09-26T10:00:00Z").as_deref(),
+            Some("2026-09-26T10:00:00Z")
+        );
+        assert_eq!(carried_seen_at(Some(&prior), false, "x"), None);
+    }
+
+    /// A declared wait with its owner and optional patience added.
+    fn owned(on: &str, seen: Option<&str>, owner: Value, max: Value) -> Value {
+        let mut w = waits_on_value(on, seen);
+        w[WAITS_ON_OWNER] = owner;
+        w[WAITS_ON_MAX_WAIT_HOURS] = max;
+        w
+    }
+
+    /// THE OWNER IS READ, NEVER INFERRED (backlog 3881f5c9): `world`
+    /// (any case) is the world, any other non-blank string is the actor
+    /// named, and a blank or missing owner is no owner — the `on` prose
+    /// saying "David opens it" does not make David the owner.
+    #[test]
+    fn a_wait_owner_is_the_declared_field_and_nothing_else() {
+        let md =
+            |owner: Value| json!({WAITS_ON: owned("an event", Some("true"), owner, Value::Null)});
+        assert_eq!(wait_owner(&md(json!(" World "))), Some(WaitOwner::World));
+        assert_eq!(
+            wait_owner(&md(json!("emp-david"))),
+            Some(WaitOwner::Actor("emp-david".into()))
+        );
+        assert_eq!(wait_owner(&md(json!("  "))), None);
+        assert_eq!(wait_owner(&md(Value::Null)), None);
+        let prose = json!({WAITS_ON: waits_on_value("a release (David opens it)", Some("true"))});
+        assert_eq!(wait_owner(&prose), None);
+    }
+
+    /// OBSERVED, OWNED, NOT SEEN: someone else's move, and only that.
+    /// Every one of the three missing — the owner, the `seen` check, or
+    /// the event still unseen — leaves the wait ours.
+    #[test]
+    fn an_owned_wait_is_only_a_declared_observed_owned_unseen_one() {
+        let w = owned("a Stripe charge", Some("true"), json!("world"), json!(336));
+        let md = waiting(134, Some(w.clone()), None);
+        assert_eq!(
+            owned_wait(&md),
+            Some(OwnedWait {
+                owner: WaitOwner::World,
+                on: "a Stripe charge".into(),
+                max_wait_hours: Some(336),
+            })
+        );
+        // Seen while not yet: ours, not the owner's.
+        assert_eq!(
+            owned_wait(&waiting(3, Some(w), Some("2026-09-26T11:00:00Z"))),
+            None
+        );
+        // No `seen` check: nothing can say the event came.
+        let unobserved = owned("a Stripe charge", None, json!("world"), Value::Null);
+        assert_eq!(owned_wait(&waiting(134, Some(unobserved), None)), None);
+        // No owner.
+        let unowned = waits_on_value("a Stripe charge", Some("true"));
+        assert_eq!(owned_wait(&waiting(134, Some(unowned), None)), None);
+        // Undeclared.
+        assert_eq!(owned_wait(&waiting(134, None, None)), None);
+    }
+
+    /// PATIENCE IS OPTIONAL AND BOUNDED ONLY WHEN DECLARED: no
+    /// `max_wait_hours` is never overdue; a declared one is overdue past
+    /// it on the car's age; a zero, negative or non-numeric one is no
+    /// declaration, so it cannot turn a car overdue the hour it lands.
+    #[test]
+    fn a_declared_max_wait_bounds_the_owned_wait_and_nothing_else_does() {
+        let read = |max: Value| {
+            let w = owned("a release", Some("true"), json!("emp-david"), max);
+            owned_wait(&waiting(10, Some(w), None)).unwrap()
+        };
+        assert!(!read(Value::Null).overdue(10_000));
+        assert!(read(json!(48)).overdue(49));
+        assert!(!read(json!(48)).overdue(48));
+        assert_eq!(read(json!(0)).max_wait_hours, None);
+        assert_eq!(read(json!(-5)).max_wait_hours, None);
+        assert_eq!(read(json!("48")).max_wait_hours, None);
     }
 }

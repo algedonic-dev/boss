@@ -9,13 +9,18 @@
 //! the brewery playground's: it exists so `/ops` shows what agent
 //! oversight LOOKS like before a real boss-cybernetics is wired in.
 //!
-//! Now the generator reads the tenant from the manifest the launcher
-//! already derived for it (BOSS_TENANT_MANIFEST_TOML, from
-//! BOSS_TENANT_DIR) and writes the block only when `[meta] tenant_id`
-//! is `brewery`; absent, unreadable, or any other tenant means no
-//! block — and boss-observability treats an absent block as off. The
-//! generator is RUN here against the tree's own two tenant manifests
-//! and a stub `boss-ports-list`, so each verdict is one it reached.
+//! Now the generator finds the tenant directory from the manifest the
+//! launcher already derived for it (BOSS_TENANT_MANIFEST_TOML, from
+//! BOSS_TENANT_DIR) and writes the block only when that tenant ships a
+//! demo roster, `seeds/demo_agents.toml`, which the block names. Until
+//! 2026-09-23 the switch was `[meta] tenant_id == "brewery"` and the
+//! roster itself was a literal in the Tier 1 boss-observability crate;
+//! backlog 1c68aebc moved the agents into the brewery's bundle and made
+//! the file the switch. No manifest, an unreadable one, or a tenant
+//! with no roster means no block — and boss-observability treats an
+//! absent block as off. The generator is RUN here against the tree's
+//! own two tenant manifests and a stub `boss-ports-list`, so each
+//! verdict is one it reached.
 
 use boss_testing::{repo_root, scratch_dir, write_exec};
 use std::path::Path;
@@ -24,6 +29,7 @@ use std::process::Command;
 const GENERATOR: &str = "infra/oss-quickstart/generate-configs.sh";
 const BREWERY: &str = "examples/brewery/seeds/tenant.toml";
 const NOT_BREWERY: &str = "examples/used-device-shop/seeds/tenant.toml";
+const BREWERY_ROSTER: &str = "examples/brewery/seeds/demo_agents.toml";
 
 /// Every name the generator's `p` and `PORT[...]` lookups ask for,
 /// with made-up ports: the script refuses an unknown name (`:?`), so a
@@ -42,9 +48,9 @@ case \"${1:-}\" in
 esac
 ";
 
-/// Run the generator into a scratch ETC_DIR with the given manifest
-/// path (None: the variable unset) and return boss-observability.toml.
-fn observability_config(case: &str, manifest: Option<&Path>) -> String {
+/// Run the generator into a scratch ETC_DIR with exactly the given
+/// environment (plus PATH and ETC_DIR) and return that ETC_DIR.
+fn generate(case: &str, env: &[(&str, &std::ffi::OsStr)]) -> std::path::PathBuf {
     let root = scratch_dir(&format!("generate-configs-{case}"));
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -56,8 +62,8 @@ fn observability_config(case: &str, manifest: Option<&Path>) -> String {
         .env_clear()
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("ETC_DIR", &etc);
-    if let Some(m) = manifest {
-        cmd.env("BOSS_TENANT_MANIFEST_TOML", m);
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("bash runs the generator");
     assert!(
@@ -66,6 +72,17 @@ fn observability_config(case: &str, manifest: Option<&Path>) -> String {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
+    etc
+}
+
+/// Run the generator with the given manifest path (None: the variable
+/// unset) and return boss-observability.toml.
+fn observability_config(case: &str, manifest: Option<&Path>) -> String {
+    let env: Vec<(&str, &std::ffi::OsStr)> = manifest
+        .map(|m| ("BOSS_TENANT_MANIFEST_TOML", m.as_os_str()))
+        .into_iter()
+        .collect();
+    let etc = generate(case, &env);
     let path = etc.join("boss-observability.toml");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -82,6 +99,16 @@ fn observability_config(case: &str, manifest: Option<&Path>) -> String {
     text
 }
 
+/// The `[demo_agents] roster` the generated config names, if any.
+fn roster_of(text: &str) -> Option<String> {
+    let parsed: toml::Value = toml::from_str(text).ok()?;
+    parsed
+        .get("demo_agents")?
+        .get("roster")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 #[test]
 fn the_brewery_gets_the_demo_agents_block() {
     let text = observability_config("brewery", Some(&repo_root().join(BREWERY)));
@@ -89,6 +116,46 @@ fn the_brewery_gets_the_demo_agents_block() {
         text.contains("[demo_agents]"),
         "the brewery's config carries the synthetic-agent block: {text}"
     );
+    // The block names the tenant's OWN roster (backlog 1c68aebc): the
+    // agents live in examples/brewery, not in the Tier 1 crate that
+    // renders them, and the path is absolute because boss-observability
+    // resolves it from wherever it was started.
+    let roster = repo_root().join(BREWERY_ROSTER);
+    assert_eq!(
+        roster_of(&text).as_deref(),
+        Some(roster.to_str().unwrap()),
+        "{text}"
+    );
+    assert!(roster.is_file(), "{} must exist", roster.display());
+}
+
+/// The switch is the FILE, not the tenant's name (backlog 1c68aebc):
+/// any tenant that ships `seeds/demo_agents.toml` beside its manifest
+/// gets the block naming it, at either manifest spelling the contract
+/// accepts — so a second playground needs a file, never an edit to
+/// this generator.
+#[test]
+fn a_tenant_that_ships_a_roster_gets_the_block_whatever_its_name() {
+    for (case, manifest_rel) in [
+        ("lab-seeds", "seeds/tenant.toml"),
+        ("lab-root", "tenant.toml"),
+    ] {
+        let dir = scratch_dir(&format!("generate-configs-{case}"));
+        std::fs::create_dir_all(dir.join("seeds")).unwrap();
+        std::fs::write(
+            dir.join(manifest_rel),
+            "[meta]\ntenant_id = \"lab\"\nname = \"A lab\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("seeds/demo_agents.toml"), "").unwrap();
+        let text = observability_config(case, Some(&dir.join(manifest_rel)));
+        let want = dir.join("seeds/demo_agents.toml").canonicalize().unwrap();
+        assert_eq!(
+            roster_of(&text).as_deref(),
+            Some(want.to_str().unwrap()),
+            "{case}: {text}"
+        );
+    }
 }
 
 #[test]
@@ -115,21 +182,71 @@ fn no_manifest_means_no_demo_agents_block() {
     );
 }
 
-/// The tree's manifests are the fixtures above, so the verdicts depend
-/// on their ids reading the way this test assumes; pin both.
+/// The tree's bundles are the fixtures above, so the verdicts depend on
+/// which of them ships a roster; pin both halves.
 #[test]
-fn the_fixture_manifests_name_the_tenants_this_test_assumes() {
-    let id = |rel: &str| {
-        std::fs::read_to_string(repo_root().join(rel))
-            .unwrap()
-            .lines()
-            .find_map(|l| {
-                l.strip_prefix("tenant_id = \"")?
-                    .strip_suffix('"')
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| panic!("{rel} has no [meta] tenant_id line"))
-    };
-    assert_eq!(id(BREWERY), "brewery");
-    assert_ne!(id(NOT_BREWERY), "brewery");
+fn the_fixture_bundles_ship_the_rosters_this_test_assumes() {
+    assert!(repo_root().join(BREWERY_ROSTER).is_file());
+    let other = repo_root()
+        .join(NOT_BREWERY)
+        .with_file_name("demo_agents.toml");
+    assert!(!other.exists(), "{} must not exist", other.display());
+}
+
+// ---------------------------------------------------------------------
+// file_refs (backlog 6280be03, measured 2026-09-23 on the tree at
+// 509f165f). The content-addressed blob store was built and never
+// switched on: this generator wrote boss-content-api's config with
+// postgres_url, http_bind and nats_url only, so the service mounted its
+// 503 "unconfigured" fallback on every /api/files path and the nightly
+// files-gc no-opped. The store is on now — but ONLY where the
+// deployment names a root, because the root must be DURABLE: a default
+// path would put every attachment on the container's writable layer,
+// and the next container would restore pointers to nothing.
+
+/// Parse boss-content-api.toml from a generator run.
+fn content_config(case: &str, files_root: Option<&str>) -> toml::Value {
+    let env: Vec<(&str, &std::ffi::OsStr)> = files_root
+        .map(|r| ("BOSS_FILES_ROOT", std::ffi::OsStr::new(r)))
+        .into_iter()
+        .collect();
+    let etc = generate(case, &env);
+    let path = etc.join("boss-content-api.toml");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    toml::from_str(&text).unwrap_or_else(|e| panic!("{} is not TOML: {e}\n{text}", path.display()))
+}
+
+#[test]
+fn a_named_files_root_switches_the_file_store_on() {
+    let cfg = content_config("files-on", Some("/var/lib/boss/files"));
+    assert_eq!(
+        cfg.get("files")
+            .and_then(|f| f.get("root"))
+            .and_then(|v| v.as_str()),
+        Some("/var/lib/boss/files"),
+        "BOSS_FILES_ROOT must become the [files] root boss-content-api mounts \
+         /api/files on: {cfg:?}"
+    );
+    // With [files] set and no policy_api_url, the service falls back to
+    // PermissivePolicyClient — every caller may attach to anything. The
+    // policy engine runs in the same container on the port boss-ports
+    // assigns it (the stub table says 7100 for every solo service).
+    assert_eq!(
+        cfg.get("policy_api_url").and_then(|v| v.as_str()),
+        Some("http://127.0.0.1:7100"),
+        "a switched-on file store must be policy-checked, not permissive: {cfg:?}"
+    );
+}
+
+#[test]
+fn no_files_root_leaves_the_file_store_off() {
+    let cfg = content_config("files-off", None);
+    assert!(
+        cfg.get("files").is_none(),
+        "a deployment that names no durable root must get NO [files] block — a default path \
+         would store attachments on the container's writable layer: {cfg:?}"
+    );
+    // The rest of the service is unchanged either way.
+    assert!(cfg.get("postgres_url").is_some() && cfg.get("http_bind").is_some());
 }

@@ -24,8 +24,9 @@
 # and each fills a different way:
 #   * WORK  (/work, the ReadWriteOnce PVC): the git clone + its
 #     worktrees. Reclaim = prune stale git worktrees.
-#   * SCRATCH (/scratch, the node-local emptyDir): CARGO_TARGET_DIR.
-#     Reclaim = drop the regenerable incremental-compilation cache.
+#   * SCRATCH (/scratch, the node-local emptyDir): CARGO_TARGET_DIR and
+#     every builder's sibling target. Reclaim = the idle siblings, least
+#     recently used first, then the primary's incremental cache.
 # Each is checked against its own floor and reclaimed independently.
 #
 # AND SINCE 2026-09-18, ONE PASS THAT SPANS BOTH AND IS NOT
@@ -86,10 +87,11 @@
 # AND SINCE 2026-09-20, ONE PASS THAT MOVES THE CHECKOUT ITSELF
 # (backlog 033d1fd3): /work/boss is fast-forwarded to the origin/main it
 # has already fetched, so the pod doors symlinked into its infra/dev
-# stop answering from a copy the tree has moved past. It refuses to run
-# while any gate-run packet is open — a gate renders its runner from a
-# tree — and refuses whenever it cannot read that fact. The long form
-# is at the pass itself.
+# stop answering from a copy the tree has moved past. It defers while a
+# gate is LAUNCHING — a gate renders its runner from a tree as it starts
+# — and whenever it cannot read that fact; a deferral that outlives its
+# deadline is a problem on the packet, never a silent stall. The long
+# form is at the pass itself.
 #
 # WHAT RUNS IT. The `reclaim` sidecar in boss-dev.yaml fires it hourly
 # (the disk-floor-sweep.timer cadence: above the floor a pass is one
@@ -99,7 +101,10 @@
 #     bash /work/boss/infra/cluster/dev-scratch-reclaim.sh
 #
 # Tunables (env, with in-sidecar defaults):
-#   BOSS_SCRATCH_FLOOR_GB    free GB to keep on /scratch     (default 50)
+#   BOSS_SCRATCH_FLOOR_PCT   share of /scratch's filesystem to keep
+#                            free, as a percentage          (default 25)
+#   BOSS_LIVE_TARGET_MIN     minutes since a sibling target was touched
+#                            before the floor pass may take it (default 30)
 #   BOSS_STALE_TARGET_H      hours before a sibling target dir is dead (default 12)
 #   BOSS_WORK_FLOOR_GB       free GB to keep on /work        (default 6)
 #   BOSS_WORKTREE_MAX_AGE_H  only prune worktrees older than; also the
@@ -110,12 +115,20 @@
 #                            worktree is removable          (default 12)
 #   BOSS_WORKTREE_IDLE_H     hours of git quiet before a main/detached
 #                            worktree is removable          (default 168)
+#   BOSS_FF_LAUNCH_WINDOW_SECS  how recently a gate-run must have opened
+#                            to count as still LAUNCHING, and so as
+#                            reading the tree                (default 120)
+#   BOSS_FF_DEADLINE_SECS    how long the checkout may stay behind before
+#                            a deferral stops being a wait and becomes a
+#                            finding                        (default 7200)
 #   BOSS_JOBS_URL            the system of record the pass records on;
 #                            else the line in REPO_DIR/infra/dev/sor-url
 # Paths (env, defaulted to the boss-dev layout):
 #   REPO_DIR (/work/boss) WORKTREES_DIR (REPO_DIR/.claude/worktrees)
 #   CARGO_TARGET_DIR (/scratch/target)
 #   SCRATCH_MOUNT (/scratch) WORK_MOUNT (/work)
+#   PROC_ROOT (/proc) — the process table a worktree lock is judged
+#     against (a test fakes it)
 #   BOSS_CLI_STORE (WORK_MOUNT/tools/image-cli) — the image CLI's
 #     generations, what the shim reads; BOSS_CLI_LINK
 #     (WORK_MOUNT/tools/bin/boss-image) — the image CLI on PATH by its
@@ -124,7 +137,18 @@
 #     stubs it)
 set -euo pipefail
 
-SCRATCH_FLOOR_GB="${BOSS_SCRATCH_FLOOR_GB:-50}"
+# The scratch floor is a SHARE of the filesystem, because the line it
+# must stay ahead of is one: the kubelet evicts the pod when the node
+# fs falls below 15% free (measured on w-1 2026-09-23: 139 GiB of 929).
+# A floor in GB sat at 50 — ninety GB BELOW that line — so the kubelet
+# evicted the whole pod six times in eight days while this pass never
+# fired once. 25% keeps ~90 GiB of margin on w-1, over two hours of the
+# ~40 GB/h the builders were measured filling it at, on any node size.
+SCRATCH_FLOOR_PCT="${BOSS_SCRATCH_FLOOR_PCT:-25}"
+# A sibling target touched this recently belongs to a build in flight;
+# the floor pass never takes it (the mtime is the per-dir liveness
+# check, as in the stale-target pass).
+LIVE_TARGET_MIN="${BOSS_LIVE_TARGET_MIN:-30}"
 # Hours a SIBLING target dir may go untouched before it is a dead cache.
 # Every builder gets its own CARGO_TARGET_DIR under the scratch mount
 # (boss brief says so), and a landed branch's target outlives it by
@@ -132,7 +156,7 @@ SCRATCH_FLOOR_GB="${BOSS_SCRATCH_FLOOR_GB:-50}"
 STALE_TARGET_H="${BOSS_STALE_TARGET_H:-12}"
 WORK_FLOOR_GB="${BOSS_WORK_FLOOR_GB:-6}"
 WORKTREE_MAX_AGE_H="${BOSS_WORKTREE_MAX_AGE_H:-48}"
-# Hours of git QUIET (no commit, no HEAD, index or reflog write) before a
+# Hours of git QUIET (no commit, HEAD write or reflog entry) before a
 # worktree whose branch has LANDED — head on origin/main, no origin/
 # ref left — may go. Landed is necessary, not sufficient: a builder's
 # tree is CLEAN in the minutes between its commit and its push, and an
@@ -144,14 +168,26 @@ WORKTREE_GRACE_H="${BOSS_WORKTREE_GRACE_H:-12}"
 # A worktree on `main` or a detached HEAD has no branch for the forge
 # to have forgotten, so idleness is the whole judgement: 7 days.
 WORKTREE_IDLE_H="${BOSS_WORKTREE_IDLE_H:-168}"
+# How recently an open gate-run must have been filed for its gate to
+# still be LAUNCHING — see `gates_quiet` for why that is the whole
+# hazard. 120s against a launch that is one file read plus one POST.
+FF_LAUNCH_WINDOW_SECS="${BOSS_FF_LAUNCH_WINDOW_SECS:-120}"
+# How long the checkout may stay behind origin/main before a deferral
+# stops being "wait for the next hour" and becomes a finding. Trains
+# land roughly every 50 minutes, so two hours is at least two passes
+# and two trains — long enough that a busy afternoon is not an alarm,
+# short enough that a checkout which has stopped catching up is named
+# on the same working day.
+FF_DEADLINE_SECS="${BOSS_FF_DEADLINE_SECS:-7200}"
 
 REPO_DIR="${REPO_DIR:-/work/boss}"
 WORKTREES_DIR="${WORKTREES_DIR:-$REPO_DIR/.claude/worktrees}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/scratch/target}"
 SCRATCH_MOUNT="${SCRATCH_MOUNT:-/scratch}"
 WORK_MOUNT="${WORK_MOUNT:-/work}"
+PROC_ROOT="${PROC_ROOT:-/proc}"
 
-for name in SCRATCH_FLOOR_GB WORK_FLOOR_GB WORKTREE_MAX_AGE_H STALE_TARGET_H WORKTREE_GRACE_H WORKTREE_IDLE_H; do
+for name in SCRATCH_FLOOR_PCT LIVE_TARGET_MIN WORK_FLOOR_GB WORKTREE_MAX_AGE_H STALE_TARGET_H WORKTREE_GRACE_H WORKTREE_IDLE_H FF_LAUNCH_WINDOW_SECS FF_DEADLINE_SECS; do
     case "${!name}" in
         ''|*[!0-9]*)
             echo "dev-scratch-reclaim: $name must be a whole number, got '${!name}'" >&2
@@ -159,6 +195,10 @@ for name in SCRATCH_FLOOR_GB WORK_FLOOR_GB WORKTREE_MAX_AGE_H STALE_TARGET_H WOR
             ;;
     esac
 done
+if [ "$SCRATCH_FLOOR_PCT" -gt 100 ]; then
+    echo "dev-scratch-reclaim: SCRATCH_FLOOR_PCT is a percentage, got '$SCRATCH_FLOOR_PCT'" >&2
+    exit 64
+fi
 
 log() { echo "dev-scratch-reclaim: $*"; }
 
@@ -189,6 +229,12 @@ free_kb() {
     df -Pk "$m" | awk 'NR==2 {print $4}'
 }
 
+# The filesystem's size, in KB — the base the scratch floor's share is
+# taken of.
+size_kb() {
+    df -Pk "$1" | awk 'NR==2 {print $2}'
+}
+
 problems=0
 
 # Totals every pass leaves for the record at the end.
@@ -196,11 +242,14 @@ WT_PASS=skipped; WT_PASS_REASON=""
 WT_MAIN_SHA=""; WT_MAIN_TS=""
 WT_REMOVED=0; WT_REMOVED_MIB=0
 WT_KEPT_DIRTY=0; WT_KEPT_DIRTY_NAMES=""
+WT_KEPT_UNREFERENCED=0; WT_KEPT_UNREFERENCED_NAMES=""
 WT_KEPT_LIVE=0; WT_KEPT_RECENT=0; WT_KEPT_LOCKED=0; WT_KEPT_REFUSED=0
+WT_STALE_LOCKS=0; WT_STALE_LOCK_NAMES=""
 WT_PRUNED=0
 WT_TARGETS_REMOVED=0; WT_TARGETS_MIB=0
 FLOOR_WORKTREES_REMOVED=0
 STALE_TARGETS_RECLAIMED=0
+FLOOR_TARGETS_RECLAIMED=0; FLOOR_TARGETS_MIB=0
 INCREMENTAL_DROPPED=0
 
 # ---------------------------------------------------------------------
@@ -231,17 +280,45 @@ INCREMENTAL_DROPPED=0
 # judge. The dev container's own sessions keep the ref fresh (worktrees
 # share the object store).
 #
-# WHAT IT MUST NOT DO is move the tree under a running gate: `boss
+# WHAT IT MUST NOT DO is move the tree under a LAUNCHING gate: `boss
 # gate` renders its runner manifest from the tree at launch, which is
 # the never-stash-while-a-gate-runs hazard. The quiet is READ FROM THE
-# SYSTEM OF RECORD — an open `gate-run` packet — rather than from a
-# lock file, because the gate-runs are already in the record and a lock
-# file would be a second copy of a fact (CLAUDE.md §9a). Any open
-# gate-run defers the whole pass: the pass runs hourly and a gate takes
-# minutes, so waiting costs an hour and guessing costs a gate. An
+# SYSTEM OF RECORD — a recently-opened `gate-run` packet — rather than
+# from a lock file, because the gate-runs are already in the record and
+# a lock file would be a second copy of a fact (CLAUDE.md §9a). An
 # answer it CANNOT take — no system of record named, the API erroring,
-# a reply with no `.data` — defers too, because a safety check that did
-# not run is not a safety check.
+# a reply with no `.data`, a page that returns fewer rows than it says
+# are open — defers too, because a safety check that did not run is not
+# a safety check.
+#
+# LAUNCHING, NOT RUNNING (backlog 475fbd10, 2026-09-22). This used to
+# defer on ANY open gate-run, and at 12 builders that condition was true
+# for 251 of 300 minutes — 84% — so an hourly pass landed about one time
+# in six and the checkout sat five commits behind while every door
+# warned and every door WRITE was refused at exit 78. Raising throughput
+# had made the catch-up unreachable. The narrower condition is also the
+# truer one: `boss gate` takes everything it will ever take from a tree
+# in ONE `read_to_string` of the runner manifest — the first statement
+# of `gate::run` in crates/orchestrators/boss-cli/src/gate.rs, BEFORE
+# the gate-run packet is filed — and the runner Job itself clones from
+# the forge into a per-run emptyDir and never touches /work at all
+# (infra/gate-runner/gate-runner.yaml). So a gate-run older than
+# FF_LAUNCH_WINDOW_SECS belongs to a gate that has already rendered, and
+# holding the checkout for it buys nothing. Re-measured over the same
+# history: a 120-second launch window is occupied 15% of five hours and
+# 14% of a day, against 73% and more for "any open gate-run".
+#
+# AND THE DEFERRAL HAS AN UPPER BOUND, because a deferral that can
+# repeat forever never errors — it just stops being true, which is the
+# silent-failure class CLAUDE.md names. Past FF_DEADLINE_SECS behind,
+# a deferral is a PROBLEM: it reds the pass and rides the packet with
+# how long and what held it, the same channel git's own refusal uses.
+# HOW LONG comes from git alone — the committer time of the oldest
+# commit the checkout is missing — so nothing keeps a counter file that
+# could disagree with the two refs that decide the fast-forward. The
+# bound makes a stuck deferral LOUD; it never overrides the hazard,
+# because a gate lost to a moved tree costs more than an hour of stale
+# doors and the doors refuse a write rather than land a wrong one.
 #
 # THREE MORE THINGS IT REFUSES, each the same line door-freshness.sh
 # draws: a checkout not on `main` (somebody put it on a branch), one
@@ -266,23 +343,29 @@ FF_REASON=""
 # "quiet" and is exactly the wrong way to be wrong here.
 FF_USER='{"id":"automation:dev-scratch-reclaim","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
-# Is any gate reading a tree right now? 0 = quiet, 1 = a gate is open,
+# Is any gate LAUNCHING right now? 0 = quiet, 1 = a gate is launching,
 # 2 = could not tell — which is not quiet. Sets FF_REASON either way.
+#
+# The page is asked for more than it can plausibly need (open gate-runs
+# are bounded by the gate concurrency plus its queue) and the rows are
+# then compared against `.total`: a truncated page answers a smaller
+# question, and the runs it did not send are exactly the ones that could
+# have launched a second ago.
 gates_quiet() {
-    local here url api reply rc count
+    local here url api reply rc count total now_s cutoff at at_s launching
     here="$(dirname "$(readlink -f "$0")")"
     url="${BOSS_JOBS_URL:-$(head -n1 "$here/../dev/sor-url" 2>/dev/null || true)}"
     if [ -z "$url" ]; then
-        FF_REASON="no system of record named (BOSS_JOBS_URL unset, $here/../dev/sor-url absent), so nothing can say whether a gate is running"
+        FF_REASON="no system of record named (BOSS_JOBS_URL unset, $here/../dev/sor-url absent), so nothing can say whether a gate is launching"
         return 2
     fi
     api="$here/../boss-api-curl.sh"
     [ -x "$api" ] || api=boss-api-curl.sh
     rc=0
     reply=$("$api" -fsS -H "x-boss-user: $FF_USER" \
-        "$url/api/jobs?kind=gate-run&status=open&limit=1" 2>/dev/null) || rc=$?
+        "$url/api/jobs?kind=gate-run&status=open&limit=50" 2>/dev/null) || rc=$?
     if [ "$rc" -ne 0 ]; then
-        FF_REASON="the jobs API at $url could not say whether a gate is running (curl exit $rc)"
+        FF_REASON="the jobs API at $url could not say whether a gate is launching (curl exit $rc)"
         return 2
     fi
     count=$(printf '%s' "$reply" | jq '.data | if . == null then error("no .data") else length end' 2>/dev/null) || count=
@@ -292,15 +375,52 @@ gates_quiet() {
             return 2
             ;;
     esac
-    if [ "$count" -gt 0 ]; then
-        FF_REASON="$count open gate-run packet(s) at $url, and a gate renders its runner from a tree"
+    total=$(printf '%s' "$reply" | jq '.total // empty' 2>/dev/null) || total=
+    case ${total:-empty} in
+        empty | *[!0-9]*) total="$count" ;;
+    esac
+    if [ "$total" -gt "$count" ]; then
+        FF_REASON="the jobs API at $url reports $total open gate-run packets but returned $count — a truncated page cannot say whether one of the rest is launching"
+        return 2
+    fi
+    [ "$count" -gt 0 ] || return 0
+
+    now_s=$(date -u +%s)
+    cutoff=$((now_s - FF_LAUNCH_WINDOW_SECS))
+    launching=0
+    # `jq -r` first, into a here-doc, so a `return` below leaves this
+    # function rather than a pipeline's subshell — and so no producer is
+    # still writing when the loop stops (the SIGPIPE coin, rule 12).
+    while IFS= read -r at; do
+        # An open run with no opened_at is a shape this pass cannot
+        # judge, and an unjudgeable safety check is not a safety check.
+        [ -n "$at" ] || {
+            FF_REASON="an open gate-run at $url carries no opened_at, so nothing can say whether it is still reading a tree"
+            return 2
+        }
+        # Guarded FIRST: `date -d ''` answers midnight rather than
+        # erroring (CLAUDE.md), so an empty parse must never become a 0.
+        at_s=$(date -u -d "$at" +%s 2>/dev/null) || at_s=
+        case ${at_s:-empty} in
+            empty | *[!0-9]*)
+                FF_REASON="an open gate-run at $url carries an opened_at this pass cannot read ($at)"
+                return 2
+                ;;
+        esac
+        [ "$at_s" -lt "$cutoff" ] || launching=$((launching + 1))
+    done <<EOF
+$(printf '%s' "$reply" | jq -r '.data[].metadata.opened_at // ""')
+EOF
+
+    if [ "$launching" -gt 0 ]; then
+        FF_REASON="$launching of $count open gate-run packet(s) at $url opened within the last ${FF_LAUNCH_WINDOW_SECS}s, and a gate renders its runner from a tree as it launches"
         return 1
     fi
     return 0
 }
 
 fast_forward_checkout() {
-    local branch head main behind out rc behind_word
+    local branch head main behind out rc behind_word behind_since behind_secs
     if [ ! -d "$REPO_DIR/.git" ] && [ ! -f "$REPO_DIR/.git" ]; then
         log "fast-forward skipped: $REPO_DIR is not a git checkout"
         FF_RESULT="skipped: not a checkout"
@@ -335,20 +455,52 @@ fast_forward_checkout() {
     esac
     if [ "$behind" = 1 ]; then behind_word=commit; else behind_word=commits; fi
 
+    # HOW LONG IT HAS BEEN BEHIND, from the same two refs that decide
+    # the fast-forward: the committer time of the OLDEST commit this
+    # checkout is missing. No counter file, so nothing can disagree with
+    # git about it (CLAUDE.md §9a). `tail` drains the list rather than
+    # cutting it short, so pipefail sees no SIGPIPE.
+    behind_since=$(git -C "$REPO_DIR" log --format=%ct "$head..$main" 2>/dev/null | tail -n1) || behind_since=
+    behind_secs=
+    case ${behind_since:-empty} in
+        empty | *[!0-9]*) ;;
+        *) behind_secs=$(($(date -u +%s) - behind_since)) ;;
+    esac
+
     rc=0
     gates_quiet || rc=$?
-    case "$rc" in
-        1)
-            log "fast-forward deferred: $FF_REASON — $REPO_DIR stays ${behind} ${behind_word} behind until the next pass"
-            FF_RESULT="deferred: a gate is running"
-            return 0
-            ;;
-        2)
-            log "fast-forward deferred: $FF_REASON — a safety check that did not run is not a safety check, so the tree stays where it is" >&2
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" = 1 ]; then
+            FF_RESULT="deferred: a gate is launching"
+        else
             FF_RESULT="deferred: the gate check could not be read"
+        fi
+        # THE UPPER BOUND. Deferring is a wait until the checkout has
+        # been behind longer than a deadline; past that it is a FINDING,
+        # because a deferral that can repeat forever never errors — it
+        # just stops being true while every door warns and every door
+        # write is refused at exit 78. The tree still does not move: the
+        # bound makes the stall loud, it does not overrule the hazard.
+        if [ -n "$behind_secs" ] && [ "$behind_secs" -gt "$FF_DEADLINE_SECS" ]; then
+            FF_RESULT="$FF_RESULT, past its ${FF_DEADLINE_SECS}s deadline"
+            # Flattened for the JSON the step writer interpolates it
+            # into, the same way git's own complaint is below — at the
+            # LAST step before storage, with the full text already in
+            # the log line beside it.
+            FF_DETAIL=$(printf '%s has been behind origin/main for %s minutes (%s %s), past the %s-minute deadline: %s' \
+                "$REPO_DIR" "$((behind_secs / 60))" "$behind" "$behind_word" "$((FF_DEADLINE_SECS / 60))" "$FF_REASON" \
+                | tr -d '"\\' | tr '[:cntrl:]' ' ' | tr -s ' ' | cut -c1-400)
+            log "fast-forward DEFERRED PAST ITS DEADLINE: $FF_DETAIL — every door here answers from that tree and a write is refused at exit 78" >&2
+            problems=$((problems + 1))
             return 0
-            ;;
-    esac
+        fi
+        if [ "$rc" = 1 ]; then
+            log "fast-forward deferred: $FF_REASON — $REPO_DIR stays ${behind} ${behind_word} behind until the next pass"
+        else
+            log "fast-forward deferred: $FF_REASON — a safety check that did not run is not a safety check, so the tree stays where it is" >&2
+        fi
+        return 0
+    fi
 
     rc=0
     out=$(git -C "$REPO_DIR" merge --ff-only "$main" 2>&1) || rc=$?
@@ -419,14 +571,28 @@ fast_forward_checkout() {
 #      is not set on the pod), which keeps a worktree, never removes
 #      one: every error here is on the side of keeping;
 #   2. git has been QUIET in it for the window (1) chose — no commit,
-#      no HEAD, index or reflog write — because a builder's tree is
-#      clean for the minutes between its commit and its push;
+#      no HEAD or index write, no new reflog ENTRY (an entry's own
+#      time, never the file's mtime, which a gc rewrites in every
+#      worktree at once — backlog adce5171) — because a builder's tree
+#      is clean for the minutes between its commit and its push;
 #   3. the tree is CLEAN: `git status --porcelain` empty, untracked
 #      files included. A dirty tree is kept and NAMED with its count,
-#      in the log and on the packet, so an operator can decide.
-# Locked worktrees, the main checkout and the one this run stands in
-# are never candidates. `git worktree remove` still runs without
-# --force, a second lock on (3).
+#      in the log and on the packet, so an operator can decide. A
+#      DETACHED tree must also have its head held by some ref, or it
+#      is kept and named the same way: the checkout is the only thing
+#      naming those commits (adce5171).
+# Live-locked worktrees, the main checkout and the one this run stands
+# in are never candidates — and the lock is what keeps a RUNNING
+# agent's tree: the Claude harness locks each agent worktree with its
+# pid (`claude agent agent-<id> (pid N start T)`) for the session's
+# life. A lock is a claim by a PROCESS, so it is judged against the
+# process table (`lock_stale_why`): a harness lock whose pid is gone,
+# or started at another time than it recorded, is STALE, and the tree
+# is judged like any other — (1) to (3) all still apply — and named.
+# Only a tree about to be removed is unlocked, and it is re-locked if
+# git then refuses, so a stale lock the pass keeps stays as it was.
+# `git worktree remove` still runs without --force, a second lock on
+# (3).
 #
 # A PASS THAT CANNOT ANSWER — no refs/remotes/origin/main, git refusing
 # — removes nothing AND RECORDS IT: `worktree_pass=skipped` with the
@@ -442,19 +608,89 @@ fast_forward_checkout() {
 # costs nothing, and deleting refs is a different decision.
 
 # Newest git activity in a worktree, as epoch seconds: its HEAD
-# commit's time and the mtimes of the worktree's own HEAD, index and
-# reflog — every git command that could mean "in use" touches one of
-# those. Read BEFORE `git status`, which may itself refresh the index.
+# commit's time, the mtimes of the worktree's own HEAD and of its
+# directory, and the time of the NEWEST ENTRY in its reflog.
+#
+# The INDEX is not read (backlog e14a741c). A `git status` rewrites a
+# CLEAN tree's index to refresh its stat cache — the harness snapshots
+# every session's status as it starts, and this pass's own dirty check
+# is a status — so its mtime says someone LOOKED: measured 2026-09-23,
+# five worktrees' index files written 2026-09-21 17:11, days after
+# their last commit. What the index can hold that HEAD does not is a
+# staged change, and the dirty guard keeps that at any age; a commit,
+# checkout or reset that writes it also writes a reflog entry, read
+# below for its own time.
+#
+# The reflog is read for what it SAYS, never for its mtime (backlog
+# adce5171). Until 2026-09-23 this took the mtime of $gitdir/logs/HEAD,
+# and a repo-wide `git gc` rewrites that file in EVERY worktree at once
+# — its `reflog expire --all` copies each worktree's entries to a new
+# file whether or not one expires. Measured 2026-09-21: the pass kept
+# 373 of 397 worktrees "with git activity inside the window", and three
+# unrelated ones whose HEAD, index and directory were 73h, 80h and 101h
+# quiet all read logs/HEAD EXACTLY 32h old. Re-measured 2026-09-23: 154
+# reflogs rewritten inside four seconds at 2026-09-22 05:43:30Z, beside
+# gc's writes of info/refs and objects/info. Because the measure is a
+# MAX, one such touch reset the idle clock of the whole population, so
+# a pass could only ever remove what a window shorter than the gc
+# interval let through. Each reflog line carries the time git wrote it
+# (`<old> <new> <ident> <epoch> <tz><TAB><message>`), and an expire
+# copies lines without redating them, so the last line's epoch is the
+# last act in THIS worktree and nothing another command did to the file.
 worktree_last_activity() {
     local path="$1" gitdir f t newest
     newest=$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo 0)
     gitdir=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null || true)
-    for f in "$gitdir/HEAD" "$gitdir/index" "$gitdir/logs/HEAD" "$path"; do
+    for f in "$gitdir/HEAD" "$path"; do
         [ -e "$f" ] || continue
         t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
         [ "$t" -gt "$newest" ] && newest=$t
     done
+    t=0
+    if [ -f "$gitdir/logs/HEAD" ]; then
+        t=$(tail -n 1 "$gitdir/logs/HEAD" 2>/dev/null | cut -f1 | awk '{print $(NF-1)}')
+    fi
+    case ${t:-empty} in empty|*[!0-9]*) t=0 ;; esac
+    [ "$t" -gt "$newest" ] && newest=$t
     echo "${newest:-0}"
+}
+
+# Is the process table this pass reads the POD's? The sidecar sees the
+# dev container's processes only because the pod sets
+# shareProcessNamespace (infra/cluster/manifests/boss-dev.yaml), and
+# then pid 1 is the pod's `pause`. In a namespace of its own pid 1 is
+# the sidecar's own entrypoint, every harness pid would read as gone,
+# and every LIVE agent's lock as stale — so no lock is judged there.
+proc_view_is_pods() {
+    local c=""
+    read -r c < "$PROC_ROOT/1/comm" 2>/dev/null || return 1
+    [ "$c" = pause ]
+}
+
+# Is a worktree lock STALE? Prints why and succeeds when it is; fails —
+# keep the lock — for a live one AND for any lock it cannot judge.
+# Only the harness's shape is judged, `... (pid N start T)` with T the
+# process's start time in clock ticks since boot (field 22 of
+# /proc/<pid>/stat, world-readable where /proc/<pid>/cwd is not): pid
+# gone, or pid alive with another start, means the locker is gone —
+# measured 2026-09-23 (backlog e14a741c), two locks named pid 355 start
+# 94472290 while pid 355 had started at 95092646, and their trees were
+# kept forever. Any other reason is a human's lock and is never judged.
+# The comm field is split at its LAST `) `, since a comm may hold one.
+lock_stale_why() {
+    local reason="$1" pid start line rest now_start
+    [[ "$reason" =~ \(pid\ ([0-9]+)\ start\ ([0-9]+)\) ]] || return 1
+    pid="${BASH_REMATCH[1]}"; start="${BASH_REMATCH[2]}"
+    if [ ! -e "$PROC_ROOT/$pid" ]; then
+        echo "pid $pid is gone"
+        return 0
+    fi
+    read -r line < "$PROC_ROOT/$pid/stat" 2>/dev/null || return 1
+    rest="${line##*) }"
+    now_start=$(awk '{print $20}' <<<"$rest")
+    case ${now_start:-empty} in empty|*[!0-9]*) return 1 ;; esac
+    [ "$now_start" = "$start" ] && return 1
+    echo "pid $pid started at $now_start, not the $start the lock recorded"
 }
 
 worktree_target() { echo "$SCRATCH_MOUNT/target-$(basename "$1")"; }
@@ -513,22 +749,33 @@ reclaim_gone_worktrees() {
         WT_PRUNED=$(printf '%s\n' "$pruned" | grep -c . || true)
     fi
 
-    local self now
+    local self now judge_locks=1
     self="$(pwd -P 2>/dev/null || echo /nonexistent)"
     now=$(date +%s)
+    if ! proc_view_is_pods; then
+        judge_locks=0
+        log "worktree pass: locks not judged — $PROC_ROOT/1 is not the pod's pause, so this process table cannot say a harness pid is gone; every locked tree is kept"
+    fi
 
-    # `path<TAB>branch<TAB>locked` per worktree, `detached` standing in
-    # for a HEAD with no branch; the first block is the main worktree.
-    local first=1 path branch locked window why last idle_h dirty kb
-    while IFS=$'\t' read -r path branch locked; do
+    # `path<TAB>branch<TAB>locked<TAB>reason` per worktree, `detached`
+    # standing in for a HEAD with no branch; the first block is the main
+    # worktree.
+    local first=1 path branch locked reason stale window why last idle_h dirty kb head held
+    while IFS=$'\t' read -r path branch locked reason; do
         [ -z "$path" ] && continue
         if [ "$first" = 1 ]; then first=0; continue; fi
         [ "$path" = "$REPO_DIR" ] && continue
         case "$self" in "$path"|"$path"/*) continue ;; esac
         [ -d "$path" ] || continue
+        stale=""
         if [ "$locked" = 1 ]; then
-            WT_KEPT_LOCKED=$((WT_KEPT_LOCKED + 1))
-            continue
+            if [ "$judge_locks" = 0 ] || ! stale=$(lock_stale_why "$reason"); then
+                WT_KEPT_LOCKED=$((WT_KEPT_LOCKED + 1))
+                continue
+            fi
+            log "  $(basename "$path"): stale lock ($stale) — judged as an ordinary candidate"
+            WT_STALE_LOCKS=$((WT_STALE_LOCKS + 1))
+            WT_STALE_LOCK_NAMES="${WT_STALE_LOCK_NAMES:+$WT_STALE_LOCK_NAMES, }$(basename "$path")"
         fi
 
         case "$branch" in
@@ -563,8 +810,44 @@ reclaim_gone_worktrees() {
             continue
         fi
 
+        # A DETACHED head names its commit in two places only — the
+        # worktree's HEAD and its reflog — and `git worktree remove`
+        # deletes both, handing any commit no ref holds to the next gc.
+        # That is unpushed work, as surely as a dirty tree is uncommitted
+        # work, so it is kept and NAMED the same way (backlog adce5171).
+        # A branch needs no such check: its ref outlives the checkout.
+        # Measured 2026-09-23: of the 16 detached trees the corrected
+        # idle clock makes due, 13 sit on a ref (a forge PR ref, a
+        # branch) and 3 on none. `--count=1` stops at the first ref that
+        # holds it; a git that cannot answer reads as no ref, and keeps.
+        if [ "$branch" = detached ]; then
+            head=$(git -C "$path" rev-parse -q --verify HEAD 2>/dev/null || true)
+            held=""
+            if [ -n "$head" ]; then
+                held=$(git -C "$REPO_DIR" for-each-ref --count=1 --format='%(refname)' --contains "$head" 2>/dev/null || true)
+            fi
+            if [ -z "$held" ]; then
+                log "  kept $path (detached at ${head:0:8}, a head no ref holds: removing the checkout would leave its commits to gc; idle ${idle_h}h)"
+                WT_KEPT_UNREFERENCED=$((WT_KEPT_UNREFERENCED + 1))
+                WT_KEPT_UNREFERENCED_NAMES="${WT_KEPT_UNREFERENCED_NAMES:+$WT_KEPT_UNREFERENCED_NAMES, }$(basename "$path")"
+                continue
+            fi
+        fi
+
         kb=$(du -sk "$path" 2>/dev/null | awk '{print $1}')
+        # A stale lock comes off only here, at the removal it would
+        # refuse — and goes back on, with its own reason, if git refuses
+        # anyway, so a tree the pass keeps keeps its lock (e14a741c).
+        if [ -n "$stale" ] && ! git -C "$REPO_DIR" worktree unlock "$path" 2>/dev/null; then
+            log "  kept $path (git would not unlock its stale lock; $why, idle ${idle_h}h)"
+            WT_KEPT_REFUSED=$((WT_KEPT_REFUSED + 1))
+            continue
+        fi
         if ! git -C "$REPO_DIR" worktree remove "$path" 2>/dev/null; then
+            if [ -n "$stale" ] && ! git -C "$REPO_DIR" worktree lock --reason "$reason" "$path" 2>/dev/null; then
+                log "  could not put $path's lock back ($reason)" >&2
+                problems=$((problems + 1))
+            fi
             log "  kept $path (git refused to remove it without --force; $why, idle ${idle_h}h)"
             WT_KEPT_REFUSED=$((WT_KEPT_REFUSED + 1))
             continue
@@ -575,14 +858,14 @@ reclaim_gone_worktrees() {
         remove_worktree_target "$path"
     done < <(
         git -C "$REPO_DIR" worktree list --porcelain 2>/dev/null | awk '
-            /^worktree / { if (p != "") print p "\t" b "\t" l; p=substr($0, 10); b="detached"; l=0 }
+            /^worktree / { if (p != "") print p "\t" b "\t" l "\t" r; p=substr($0, 10); b="detached"; l=0; r="" }
             /^branch /   { b=substr($0, 8); sub("^refs/heads/", "", b) }
-            /^locked/    { l=1 }
-            END { if (p != "") print p "\t" b "\t" l }
+            /^locked/    { l=1; r=substr($0, 8) }
+            END { if (p != "") print p "\t" b "\t" l "\t" r }
         '
     )
 
-    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_DIRTY dirty, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone"
+    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_DIRTY dirty, $WT_KEPT_UNREFERENCED with a head no ref holds, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone; judged $WT_STALE_LOCKS with a stale lock"
 }
 
 # ---------------------------------------------------------------------
@@ -670,18 +953,32 @@ reclaim_work() {
 # SCRATCH: the regenerable incremental cache under CARGO_TARGET_DIR.
 # ---------------------------------------------------------------------
 reclaim_scratch() {
-    local kb gb
+    local kb gb SCRATCH_FLOOR_GB
     kb=$(free_kb "$SCRATCH_MOUNT")
     if [ -z "$kb" ]; then
         log "$SCRATCH_MOUNT not mounted — skipping build-cache reclaim"
         return 0
     fi
     gb=$((kb / 1024 / 1024))
+    SCRATCH_FLOOR_GB=$(( $(size_kb "$SCRATCH_MOUNT") / 1024 / 1024 * SCRATCH_FLOOR_PCT / 100 ))
     if [ "$gb" -ge "$SCRATCH_FLOOR_GB" ]; then
-        log "$SCRATCH_MOUNT ${gb}GB free >= ${SCRATCH_FLOOR_GB}GB floor — no build-cache reclaim"
+        log "$SCRATCH_MOUNT ${gb}GB free >= ${SCRATCH_FLOOR_GB}GB floor (${SCRATCH_FLOOR_PCT}%) — no build-cache reclaim"
         return 0
     fi
-    log "$SCRATCH_MOUNT ${gb}GB free < ${SCRATCH_FLOOR_GB}GB floor — reclaiming regenerable build cache"
+    log "$SCRATCH_MOUNT ${gb}GB free < ${SCRATCH_FLOOR_GB}GB floor (${SCRATCH_FLOOR_PCT}%) — reclaiming regenerable build cache"
+
+    # The siblings first: every builder's own target, least recently
+    # touched first, until the floor is met. They hold the bulk (the
+    # 2026-09-23 sawtooth was ~450 GB of them), each is regenerable
+    # (wt-cargo reseeds one from the primary), and each carries its own
+    # liveness in its mtime — so no build_running() guard, which would
+    # see some builder's cargo on a busy pod and defer forever.
+    reclaim_targets_to_floor "$SCRATCH_FLOOR_GB"
+    gb=$(( $(free_kb "$SCRATCH_MOUNT") / 1024 / 1024 ))
+    if [ "$gb" -ge "$SCRATCH_FLOOR_GB" ]; then
+        log "$SCRATCH_MOUNT ${gb}GB free — floor met by the sibling targets"
+        return 0
+    fi
 
     if [ ! -d "$TARGET_DIR" ]; then
         log "$TARGET_DIR does not exist — nothing to reclaim"
@@ -717,6 +1014,45 @@ reclaim_scratch() {
         log "  full rebuild's worth of cost — run \`cargo clean\` deliberately, or an operator decides." >&2
         problems=$((problems + 1))
     fi
+}
+
+# Under the floor: sibling target dirs, least recently touched first,
+# until free space reaches $1 GB. A dir touched inside LIVE_TARGET_MIN
+# is a build in flight and is never taken; the primary TARGET_DIR is
+# the incremental trim's and never removed whole.
+reclaim_targets_to_floor() {
+    local floor="$1" d kb gb n=0 mib=0 cutoff
+    cutoff="@$(( $(date +%s) - LIVE_TARGET_MIN * 60 ))"
+    while IFS=$'\t' read -r _ d; do
+        [ -n "$d" ] || continue
+        gb=$(( $(free_kb "$SCRATCH_MOUNT") / 1024 / 1024 ))
+        [ "$gb" -lt "$floor" ] || break
+        if [ -n "$(find "$d" -maxdepth 3 -newermt "$cutoff" -print -quit 2>/dev/null)" ]; then
+            log "  kept $d — touched within ${LIVE_TARGET_MIN}m, a build in flight"
+            continue
+        fi
+        kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+        if rm -rf "$d"; then
+            n=$((n + 1))
+            mib=$((mib + ${kb:-0} / 1024))
+            log "floor target reclaimed: $d ($((${kb:-0} / 1024))MiB, least recently used; ${gb}GB free < ${floor}GB floor)"
+        else
+            log "could not remove target $d" >&2
+            problems=$((problems + 1))
+        fi
+    done < <(
+        for d in "$SCRATCH_MOUNT"/*/; do
+            d="${d%/}"
+            [ -d "$d" ] || continue
+            [ "$d" = "$TARGET_DIR" ] && continue
+            [ -f "$d/CACHEDIR.TAG" ] || [ -d "$d/debug" ] || [ -d "$d/release" ] || continue
+            # The newest mtime at depth <= 3 is when a build last wrote.
+            printf '%s\t%s\n' "$(find "$d" -maxdepth 3 -printf '%T@\n' 2>/dev/null | sort -n | tail -n1)" "$d"
+        done | sort -n
+    )
+    FLOOR_TARGETS_RECLAIMED=$n
+    FLOOR_TARGETS_MIB=$mib
+    log "floor-target pass: $n sibling target(s) reclaimed (${mib}MiB), least recently used first"
 }
 
 # ---------------------------------------------------------------------
@@ -881,7 +1217,7 @@ install_tree_cli() {
 RECLAIM_KIND=maintenance-dev-scratch-reclaim
 record_pass() {
     local acted
-    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + INCREMENTAL_DROPPED))
+    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + FLOOR_TARGETS_RECLAIMED + INCREMENTAL_DROPPED))
     if [ "$acted" -eq 0 ] && [ "$problems" -eq 0 ]; then
         log "nothing reclaimed and no floor unmet — a pass that only looked files no packet"
         return 0
@@ -913,12 +1249,15 @@ record_pass() {
             "origin_main_sha=$WT_MAIN_SHA" "origin_main_ref_ts=$WT_MAIN_TS" \
             "worktrees_removed=$WT_REMOVED" "worktrees_removed_mib=$WT_REMOVED_MIB" \
             "worktrees_kept_dirty=$WT_KEPT_DIRTY" "worktrees_kept_dirty_names=$WT_KEPT_DIRTY_NAMES" \
+            "worktrees_kept_unreferenced=$WT_KEPT_UNREFERENCED" "worktrees_kept_unreferenced_names=$WT_KEPT_UNREFERENCED_NAMES" \
             "worktrees_kept_live=$WT_KEPT_LIVE" "worktrees_kept_recent=$WT_KEPT_RECENT" \
             "worktrees_kept_locked=$WT_KEPT_LOCKED" "worktrees_kept_refused=$WT_KEPT_REFUSED" \
+            "worktrees_stale_locks=$WT_STALE_LOCKS" "worktrees_stale_lock_names=$WT_STALE_LOCK_NAMES" \
             "worktrees_pruned=$WT_PRUNED" \
             "targets_removed=$WT_TARGETS_REMOVED" "targets_removed_mib=$WT_TARGETS_MIB" \
             "floor_worktrees_removed=$FLOOR_WORKTREES_REMOVED" \
             "stale_targets_reclaimed=$STALE_TARGETS_RECLAIMED" \
+            "floor_targets_reclaimed=$FLOOR_TARGETS_RECLAIMED" "floor_targets_mib=$FLOOR_TARGETS_MIB" \
             "incremental_dirs_dropped=$INCREMENTAL_DROPPED" \
             "cli_sha=$CLI_SHA" "cli_result=$CLI_RESULT" \
         || log "could not complete the $RECLAIM_KIND run step — its packet stays open for the next acting pass to complete" >&2

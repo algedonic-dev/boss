@@ -307,8 +307,10 @@ fn running_as_root() -> bool {
 pub(crate) fn execute_with(probe: &str, shell: &Shell) -> Result<Outcome> {
     let as_root = shell.user.is_some() && running_as_root();
     // The channel: a file of this process's own, named so two operators
-    // (or two rechecks) on one box never share it. It is created empty
-    // and removed after the read; the prelude opens it for append. As
+    // (or two rechecks) on one box never share it — the uid and pid by
+    // `own_temp_path` (307df975), the clock within one process. It is
+    // created empty and removed after the read; the prelude opens it
+    // for append. As
     // on the forge, the channel must not be able to take the probe down
     // with it: a temp dir that refuses the file leaves the env unset,
     // the prelude falls back to /dev/null, and the probe still runs —
@@ -317,9 +319,8 @@ pub(crate) fn execute_with(probe: &str, shell: &Shell) -> Result<Outcome> {
     // forge's `chmod 666`): it holds command names and nothing else,
     // and a channel the probe cannot append to is a channel that never
     // names the tool.
-    let channel = std::env::temp_dir().join(format!(
-        "boss-prove-notfound-{}-{}",
-        std::process::id(),
+    let channel = crate::own_temp::own_temp_path(&format!(
+        "boss-prove-notfound-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -910,6 +911,13 @@ pub(crate) fn unrunnable_why_unattended(
 /// `unrunnable` and `missing_tools` are the not-found channel's
 /// finding, from whichever door ran the prelude (46f67333). `expect` is
 /// `null` under `--exit-only`, as `proof_json` records it.
+///
+/// `prior` is the car's CURRENT `proof_attempt`, which this record
+/// replaces: a not-yet carries its streak forward from it
+/// (`boss_jobs::car::carried_not_yet_streak`, backlog adef5ddf), because
+/// the replace is the only moment the previous answer is still in hand.
+/// Anything else carries no streak — `null` and `0`, never an absent
+/// key, so the shape the yard reads is one shape.
 pub(crate) fn attempt_json(
     probe: &str,
     expect: Option<&str>,
@@ -917,8 +925,18 @@ pub(crate) fn attempt_json(
     host: &str,
     at: &str,
     why: &str,
+    prior: Option<&Value>,
 ) -> Value {
+    let not_yet = why.starts_with("NOT YET");
+    let (since, runs) = if not_yet {
+        let (s, n) = boss_jobs::car::carried_not_yet_streak(prior, probe, at);
+        (json!(s), n)
+    } else {
+        (Value::Null, 0)
+    };
     json!({
+        (boss_jobs::car::NOT_YET_SINCE): since,
+        (boss_jobs::car::NOT_YET_RUNS): runs,
         "at": at,
         "exit": o.exit,
         "stdout": clip(&o.stdout),
@@ -930,9 +948,78 @@ pub(crate) fn attempt_json(
         "unrunnable": !o.missing_tools.is_empty(),
         // The flag is the sentence's: a record whose `not_yet` and `why`
         // disagree cannot be written from here.
-        "not_yet": why.starts_with("NOT YET"),
+        "not_yet": not_yet,
         "missing_tools": o.missing_tools,
     })
+}
+
+/// THE DECLARED WAIT, OBSERVED (backlog b461341d). A not-yet from a car
+/// that declared what it waits on (`boss_jobs::car::WAITS_ON`) with a
+/// `seen` check runs that check here, with the same shell and on the
+/// same host as the probe, and stamps the attempt with what it found:
+/// `waits_on_exit` (the check's exit, `null` when it could not run) and
+/// `waits_on_seen_at` (when the event was first seen, `null` when it was
+/// not). The shed then reads "seen, and the probe STILL said not yet" as
+/// ours to read at once, and "not seen" as the world's however long.
+///
+/// A check that cannot run — refused by the door's own admission rule,
+/// or naming a tool this host lacks — is NOT a sighting: it leaves the
+/// wait the world's, which is the wrong direction for silence, so the
+/// exit rides the attempt as `null` for a reader to see, and the refusal
+/// is said on stderr at the run that met it. Anything but a not-yet, or
+/// a car with no `seen` check, is returned untouched.
+fn with_wait_observed(
+    attempt: Value,
+    car: &Value,
+    shell: &Shell,
+    prior: Option<&Value>,
+    at: &str,
+) -> Value {
+    if attempt.get("not_yet").and_then(Value::as_bool) != Some(true) {
+        return attempt;
+    }
+    let Some(seen) = car
+        .get("metadata")
+        .and_then(boss_jobs::car::waits_on)
+        .and_then(|w| w.seen)
+    else {
+        return attempt;
+    };
+    let exit = match admit(&seen, true).refusal {
+        Some(r) => {
+            eprintln!("boss prove: the declared wait's seen check is refused — {r}");
+            None
+        }
+        None => match execute_with(&seen, shell) {
+            Ok(o) if o.missing_tools.is_empty() => Some(o.exit),
+            Ok(o) => {
+                eprintln!(
+                    "boss prove: the declared wait's seen check did not run — missing {}",
+                    o.missing_tools.join(", ")
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("boss prove: the declared wait's seen check did not run — {e}");
+                None
+            }
+        },
+    };
+    stamp_wait(attempt, prior, exit, at)
+}
+
+/// The pure half of [`with_wait_observed`]: exit 0 is a sighting,
+/// dated from the first run in an unbroken line of them.
+fn stamp_wait(attempt: Value, prior: Option<&Value>, exit: Option<i32>, at: &str) -> Value {
+    let seen_at = boss_jobs::car::carried_seen_at(prior, exit == Some(0), at);
+    match attempt {
+        Value::Object(mut m) => {
+            m.insert("waits_on_exit".into(), json!(exit));
+            m.insert(boss_jobs::car::WAITS_ON_SEEN_AT.into(), json!(seen_at));
+            Value::Object(m)
+        }
+        other => other,
+    }
 }
 
 /// WHICH PROBES THIS DOOR WILL RUN (backlog 23b2dffa).
@@ -1093,6 +1180,16 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
              can run, or record it as --park-proof-event."
         ));
     }
+    if from_car && let Some(verb) = boss_jobs::probe::changes_directory(probe) {
+        warnings.push(format!(
+            "boss prove: NOTE — this car's recorded probe runs `{verb}`, and on the forge \
+             the door has already placed it in the converged checkout; a pod path there \
+             is `No such file or directory` and an exit 1 on the car (4bb6797c). It runs \
+             HERE, so proving by hand is fine; `boss gate --park-probe` refuses this text, \
+             so re-park the car with the `{verb}` dropped — `git show HEAD:<path>` reads \
+             the converged tree from where the door puts it."
+        ));
+    }
     if from_car && let Some(var) = boss_jobs::probe::names_an_actor(probe) {
         warnings.push(format!(
             "boss prove: NOTE — this car's recorded probe assigns `{var}`, which would name \
@@ -1225,6 +1322,68 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
         .chain(mention)
 }
 
+/// THE NINTH SHAPE, AND THE ONE THE TEXT CANNOT SHOW (backlog
+/// 8ac42ee5): a grep over a file whose every match is a COMMENT. It
+/// lives outside [`shape_warnings`] because it needs the tree — `read`
+/// answers a path at the revision `at` names — so each door that has a
+/// tree hands it one: `boss gate --park-probe` reads the car's own tip,
+/// where the comment that defeats a removal probe is written by the same
+/// car, and the hand door of `boss prove` reads HEAD where the probe
+/// runs, where a NOT YET that will never clear is otherwise
+/// indistinguishable from one that will.
+pub(crate) fn prose_only_warning(
+    probe: &str,
+    at: &str,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let found = boss_jobs::probe::a_grep_only_prose_answers(probe, read)?;
+    let shown: Vec<String> = found
+        .lines
+        .iter()
+        .take(3)
+        .map(|(n, text)| format!("    {}:{n}: {text}", found.path))
+        .collect();
+    let more = found.lines.len().saturating_sub(shown.len());
+    let more = if more > 0 {
+        format!("\n    … and {more} more, all comments")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "THIS PROBE'S GREP IS ANSWERED ONLY BY PROSE — `{pattern}` matches {path} at {at} on \
+         {n} line(s), and every one is a comment:\n{lines}{more}\n  \
+         Whatever the probe concludes from that count is a conclusion about a sentence. An \
+         ABSENCE assertion over it cannot pass while the comment stands — and the car that \
+         removes a thing is usually the one that writes the comment saying so — while a \
+         PRESENCE assertion passes on the mention with nothing behind it.\n  {evidence}\n  \
+         This is a warning, not a refusal: counting a mention can be the claim, and the \
+         comment test is a line-prefix scan.",
+        pattern = found.pattern,
+        path = found.path,
+        n = found.lines.len(),
+        lines = shown.join("\n"),
+        evidence = boss_jobs::probe::PROSE_ONLY_EVIDENCE,
+    ))
+}
+
+/// A reader of `<rev>:<path>` in the repository at `dir`, for
+/// [`prose_only_warning`]: `None` for anything git will not show, which
+/// the detector reads as nothing to judge.
+pub(crate) fn git_show_reader(dir: &Path, rev: &str) -> impl Fn(&str) -> Option<String> + use<> {
+    let (dir, rev) = (dir.to_path_buf(), rev.to_string());
+    move |path: &str| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["show", &format!("{rev}:{path}")])
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+}
+
 /// The override, resolved once: `None` when the flag was not given,
 /// refusing a flag given with no reason — an override with no stated
 /// reason is the silent yes the whole verb exists to end.
@@ -1238,6 +1397,16 @@ pub(crate) fn override_reason(given: Option<&str>) -> Result<Option<&str>> {
     }
 }
 
+/// WHERE A PROBE'S TREE IS OBSERVED: the directory the probe will
+/// actually run in, which is the shell's own `cwd` — the converged
+/// checkout at the unattended door, the recorded one under `--recheck`,
+/// and this process's directory at the hand door. Reading it anywhere
+/// else would answer about a tree the probe never opens, which is the
+/// class of mistake this whole area exists to refuse.
+fn probe_tree(shell: &Shell) -> crate::freshness::TreeObservation {
+    crate::freshness::observe_tree(shell.cwd.as_deref().unwrap_or_else(|| Path::new(".")))
+}
+
 /// The proof record. Serialised once, stored verbatim, re-read by
 /// `--recheck` — so its field names are a contract, not a detail.
 /// `overridden` is the one optional key: present only when the
@@ -1245,12 +1414,18 @@ pub(crate) fn override_reason(given: Option<&str>) -> Result<Option<&str>> {
 /// presence means something to whoever reads the proof back. The
 /// unattended door never writes it: it has no override, and a probe it
 /// refuses is refused on the ops-request, exit 2.
+///
+/// `tree` is taken by value rather than left to each door to remember,
+/// because a door that forgets it records a proof that cannot say what
+/// it read — the defect this closed (backlog 6f581de6). See
+/// [`crate::freshness::tree_metadata`] for what the two keys mean.
 pub(crate) fn proof_json(
     probe: &str,
     expect: Option<&str>,
     o: &Outcome,
     host: &str,
     at: &str,
+    tree: &crate::freshness::TreeObservation,
     overridden: Option<&Value>,
 ) -> Value {
     let mut p = json!({
@@ -1273,6 +1448,15 @@ pub(crate) fn proof_json(
             .unwrap_or_default(),
         "at": at,
     });
+    // WHAT IT READ, beside where it ran. `cwd` names a directory whose
+    // contents change under it; these name the revision that answered.
+    for (k, v) in crate::freshness::tree_metadata(tree)
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        p[k] = v.clone();
+    }
     if let Some(o) = overridden {
         p["overridden"] = o.clone();
     }
@@ -1355,7 +1539,7 @@ pub(crate) enum Eligible {
     Live,
     /// `--recheck` re-runs a probe already recorded on the car and
     /// writes nothing, so a finished car is a legitimate target — which
-    /// is the whole reason [`all_ship_a_change_cars`] pages over closed
+    /// is the whole reason [`crate::gate::all_cars_at`] pages over closed
     /// cars instead of filtering `status=open` at the API.
     AnyStatus,
 }
@@ -1458,56 +1642,6 @@ pub(crate) fn find_car<'a>(
             listed(&candidates)
         ),
     }
-}
-
-/// Every `ship-a-change` car, paged on `total` so the target is
-/// reachable no matter how many closed cars precede it.
-///
-/// The read used to be a single `?kind=ship-a-change&limit=200`. As
-/// closed cars accumulate they fill that one page, so a legitimately
-/// open, unproven car sorting past row 200 vanishes from [`find_car`] —
-/// a false negative that grows with the pipeline's age. A `status=open`
-/// filter would not fix it — and is why this read is the one car lookup
-/// NOT built on `gate::all_open_cars`: `--recheck` re-runs the proof on
-/// a CLOSED car, so the reader must read closed cars too and let
-/// [`find_car`] decide which statuses the caller's mode admits
-/// ([`Eligible`]). Paging on `total` keeps every car reachable, open or
-/// closed.
-async fn all_ship_a_change_cars(http: &reqwest::Client, base: &str) -> Result<Vec<Value>> {
-    const PAGE: usize = 500;
-    let mut cars: Vec<Value> = Vec::new();
-    loop {
-        let body = crate::gate::api_at(
-            http,
-            base,
-            reqwest::Method::GET,
-            &format!(
-                "/api/jobs?kind=ship-a-change&limit={PAGE}&offset={}",
-                cars.len()
-            ),
-            None,
-        )
-        .await?;
-        let total = body
-            .as_ref()
-            .and_then(|v| v.get("total"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0) as usize;
-        let got = {
-            let page = crate::gate::rows(body);
-            let n = page.len();
-            cars.extend(page);
-            n
-        };
-        // Stop when a page came back empty (offset past the data) or we
-        // have accumulated the whole population. Either guard alone
-        // terminates; both together survive a miscounted `total`.
-        if got == 0 || cars.len() >= total {
-            break;
-        }
-    }
-    Ok(cars)
 }
 
 /// The car's `proven` step, refusing unless it is actually reachable.
@@ -2193,12 +2327,18 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
 
     let shell = Shell::unattended(&base)?.with_car_instant(car_merge_ref(&car));
     println!("boss prove: {short}  $ {probe}");
+    // THE TREE THIS PROBE READS, observed where it will run — the
+    // converged checkout. Here the standing is nearly always
+    // `unreadable`, because the forge's clone need not carry a
+    // remote-tracking ref, and `tree_head` is the fact that matters:
+    // production's own revision at the moment the claim was judged.
+    let tree = probe_tree(&shell);
     let o = execute_with(&probe, &shell)?;
     let at = now.to_rfc3339();
     let here = host();
     let verdict = verdict(&probe, &o, Some(&expect));
     if let Verdict::Proven = verdict {
-        let proof = proof_json(&probe, Some(&expect), &o, &here, &at, None);
+        let proof = proof_json(&probe, Some(&expect), &o, &here, &at, &tree, None);
         let mut md = proven_metadata(&verified, &serde_json::to_string(&proof)?, None, now);
         md["proven_by"] = json!(PROVEN_BY);
         crate::gate::api(
@@ -2235,7 +2375,9 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         Verdict::NotProven(e) => e.to_string(),
         Verdict::Proven => unreachable!("handled above"),
     };
-    let attempt = attempt_json(&probe, Some(&expect), &o, &here, &at, &why);
+    let prior = car.pointer("/metadata/proof_attempt");
+    let attempt = attempt_json(&probe, Some(&expect), &o, &here, &at, &why, prior);
+    let attempt = with_wait_observed(attempt, &car, &shell, prior, &at);
     crate::gate::api(
         &http,
         reqwest::Method::PATCH,
@@ -2292,7 +2434,7 @@ pub(crate) async fn run(
     let overriding = override_reason(probe_anyway.as_deref())?;
     let http = reqwest::Client::new();
     let base = crate::gate::resolve_jobs_base(None)?;
-    let cars = all_ship_a_change_cars(&http, &base).await?;
+    let cars = crate::gate::all_cars_at(&http, &base).await?;
     // THE TREE THE PROBE'S READER COMES OUT OF (backlog 18fee481): the
     // worktree the operator is standing in, which carries
     // `infra/forge/probe-bin` by construction. Outside one there is no
@@ -2405,12 +2547,22 @@ pub(crate) async fn run(
         // unattended door hands over, or the claim means a different
         // thing at each door (a92571a6).
         let cwd = rec.cwd.as_deref().filter(|d| !d.is_empty());
-        let o = execute_with(
-            &probe,
-            &Shell::here(cwd.map(Path::new))
-                .with_probe_reader(tree.as_deref(), &base)
-                .with_car_instant(car_merge_ref(car)),
-        )?;
+        let shell = Shell::here(cwd.map(Path::new))
+            .with_probe_reader(tree.as_deref(), &base)
+            .with_car_instant(car_merge_ref(car));
+        // WHICH TREE THIS RE-RUN READS (backlog 6f581de6). A recheck
+        // records nothing, so there is no immutable fact to refuse —
+        // but its HOLDS / NO LONGER HOLDS is acted on by a human, and
+        // acting on a verdict taken off an unnamed tree is the same
+        // defect one step removed. So it is stated, never refused.
+        println!(
+            "{}",
+            crate::freshness::unrecorded_tree_note(
+                &probe_tree(&shell),
+                crate::freshness::freshness_silenced(),
+            )
+        );
+        let o = execute_with(&probe, &shell)?;
         // THREE READINGS, and which record they are read against
         // decides the sentence: a PROOF that fails now has decayed; an
         // ATTEMPT was never a proof. --recheck writes nothing on any of
@@ -2544,8 +2696,22 @@ pub(crate) async fn run(
     // forge's reading. A hand-written `--probe` is the operator's own
     // text about their own tree, and refusing it would be this verb
     // deciding what their probe meant.
+    let shell = Shell::here(None)
+        .with_probe_reader(tree.as_deref(), &base)
+        .with_car_instant(car_merge_ref(car));
+    // OBSERVED ONCE, USED TWICE: the guard below judges it, and the
+    // proof records it (backlog 6f581de6). Two readings could disagree
+    // — a train lands between them — and a proof stamped with a tree
+    // the guard did not judge is the same gap in a new place.
+    let obs = probe_tree(&shell);
+    // The shape only the tree can show, read where the probe will read
+    // it (8ac42ee5) — said BEFORE the run, so a NOT YET that follows is
+    // read beside the reason it will never clear.
+    let dir = shell.cwd.as_deref().unwrap_or_else(|| Path::new("."));
+    if let Some(w) = prose_only_warning(&probe, "HEAD", git_show_reader(dir, "HEAD")) {
+        eprintln!("boss prove: {w}");
+    }
     if from_car {
-        let obs = crate::freshness::observe_tree(tree.as_deref().unwrap_or_else(|| Path::new(".")));
         match crate::freshness::stale_tree_guard(
             &obs,
             // A `--dry` run records nothing, so it is the rehearsal the
@@ -2559,12 +2725,7 @@ pub(crate) async fn run(
     }
 
     println!("boss prove: {short}  $ {probe}");
-    let o = execute_with(
-        &probe,
-        &Shell::here(None)
-            .with_probe_reader(tree.as_deref(), &base)
-            .with_car_instant(car_merge_ref(car)),
-    )?;
+    let o = execute_with(&probe, &shell)?;
     let at = now.to_rfc3339();
     match verdict(&probe, &o, expect.as_deref()) {
         Verdict::Proven => {}
@@ -2586,7 +2747,8 @@ pub(crate) async fn run(
                 );
                 std::process::exit(UNRUNNABLE_EXIT);
             }
-            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why);
+            let prior = car.pointer("/metadata/proof_attempt");
+            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
             crate::gate::api(
                 &http,
                 reqwest::Method::PATCH,
@@ -2619,7 +2781,9 @@ pub(crate) async fn run(
                 );
                 std::process::exit(NOT_YET_EXIT);
             }
-            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why);
+            let prior = car.pointer("/metadata/proof_attempt");
+            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
+            let attempt = with_wait_observed(attempt, car, &shell, prior, &at);
             crate::gate::api(
                 &http,
                 reqwest::Method::PATCH,
@@ -2640,6 +2804,7 @@ pub(crate) async fn run(
         &o,
         &host(),
         &at,
+        &obs,
         overridden.as_ref(),
     );
     let shown = o.stdout.trim();
@@ -2733,6 +2898,13 @@ mod tests {
             stderr: String::new(),
             missing_tools: Vec::new(),
         }
+    }
+
+    /// The tree observation for a test that is not about the tree. It
+    /// is deliberately the UNREADABLE one rather than a current tree:
+    /// a fixture must not hand a proof a standing nothing measured.
+    fn no_tree() -> crate::freshness::TreeObservation {
+        crate::freshness::TreeObservation::default()
     }
 
     /// THE RULE THE VERB EXISTS TO ENFORCE: a failing probe is not proof.
@@ -2943,12 +3115,53 @@ mod tests {
             &o,
             "h",
             "2026-08-28T00:00:00Z",
+            &no_tree(),
             None,
         );
         let step = json!({"metadata": {"proof": serde_json::to_string(&p).unwrap()}});
         let rec = recorded_probe(&step).unwrap();
         assert_eq!(rec.probe, "grep -q MARKER f");
         assert_eq!(rec.expect.as_deref(), Some("MARKER"));
+    }
+
+    /// A RECORDED PROOF SAYS WHICH TREE ANSWERED IT (backlog 6f581de6).
+    /// `host` and `cwd` say WHERE it ran; a directory's contents change
+    /// under it, and a recorded probe reads the tree with `git show
+    /// HEAD:<path>` — so without the sha the artifact is incomplete in
+    /// the one dimension this verb exists to close. Provenance is the
+    /// first of the five properties, and the standing rides beside the
+    /// sha because a later reader cannot re-derive it: `origin/main`
+    /// has moved a hundred times by the time anyone reads the proof.
+    #[test]
+    fn a_recorded_proof_names_the_tree_it_read() {
+        use crate::freshness::{Base, TreeObservation};
+        let o = ok("MARKER present");
+        let tree = TreeObservation {
+            standing: Base::Behind,
+            head: "1c63ca24ffff".into(),
+            main_head: "de960a2affff".into(),
+            behind_by: 9,
+            unreadable: None,
+        };
+        let p = proof_json(
+            "grep -q MARKER f",
+            Some("MARKER"),
+            &o,
+            "h",
+            "2026-09-22T00:00:00Z",
+            &tree,
+            None,
+        );
+        assert_eq!(p["tree_head"], json!("1c63ca24ffff"));
+        assert_eq!(p["tree_standing"], json!("behind"));
+        // BESIDE the existing keys, not instead of them: these eight
+        // are what a live proof carried when this was measured, and
+        // `--recheck` reads three of them back.
+        for k in [
+            "at", "cwd", "exit", "expect", "host", "probe", "stderr", "stdout",
+        ] {
+            assert!(p.get(k).is_some(), "{k} is a contract, not a detail: {p}");
+        }
     }
 
     /// THE 932aa956 / 3f846cc5 CASE. A probe authored on the workstation
@@ -3022,6 +3235,7 @@ mod tests {
             &o,
             "somehost",
             "2026-08-29T00:00:00Z",
+            &no_tree(),
             None,
         );
         let step = json!({"metadata": {"proof": proof.to_string()}});
@@ -3351,8 +3565,24 @@ mod tests {
             stderr: String::new(),
             missing_tools: Vec::new(),
         };
-        let first = proof_json("old-probe", None, &o, "h", "2026-08-29T00:00:00Z", None);
-        let better = proof_json("better-probe", None, &o, "h", "2026-08-30T00:00:00Z", None);
+        let first = proof_json(
+            "old-probe",
+            None,
+            &o,
+            "h",
+            "2026-08-29T00:00:00Z",
+            &no_tree(),
+            None,
+        );
+        let better = proof_json(
+            "better-probe",
+            None,
+            &o,
+            "h",
+            "2026-08-30T00:00:00Z",
+            &no_tree(),
+            None,
+        );
         let step = json!({"metadata": {"proof": first.to_string()}});
         let with_reproof = json!({"metadata": {"reproof": [
             {"proof": better.to_string(), "recorded_at": "2026-08-30T00:00:00Z"}
@@ -3386,6 +3616,26 @@ mod tests {
     /// The stub honours `limit`/`offset` and reports the true `total`,
     /// so the reader is exercised across page boundaries with no
     /// `BOSS_JOBS_URL` anywhere in the environment.
+    /// A page with no `total` is refused, never read as the whole
+    /// population (backlog 10776b6c). The read counted a missing total
+    /// as 0, so one page of rows already "covered" it and the loop
+    /// stopped there — a car past page one was reported as no car, the
+    /// false negative the paging above exists to prevent.
+    #[tokio::test]
+    async fn a_car_page_without_a_total_is_refused_not_read_as_all() {
+        let (base, stub) = crate::gate::stub::one_request(
+            r#"{"data":[{"id":"00000000-0000-0000-0000-0000000000cc","status":"closed"}]}"#,
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let why = crate::gate::all_cars_at(&http, &base)
+            .await
+            .expect_err("a page without its total cannot say the read is complete")
+            .to_string();
+        stub.abort();
+        assert!(why.contains("total"), "{why}");
+    }
+
     #[tokio::test]
     async fn a_car_past_the_first_page_is_still_reachable() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3454,7 +3704,7 @@ mod tests {
 
         let base = format!("http://{addr}");
         let http = reqwest::Client::new();
-        let cars = all_ship_a_change_cars(&http, &base)
+        let cars = crate::gate::all_cars_at(&http, &base)
             .await
             .expect("paging read succeeds");
         assert_eq!(
@@ -3614,6 +3864,23 @@ mod tests {
         assert!(hand.warnings.is_empty(), "{:?}", hand.warnings);
     }
 
+    /// A car-carried probe that `cd`s is named here too (4bb6797c): on
+    /// this pod `cd /work/boss` works, so the hand run is fine and is
+    /// not refused — but the forge has no such path, so the recorded
+    /// text is what needs re-parking, and `boss gate` refuses it. A
+    /// probe typed by hand (`--probe`) is the operator's own shell and
+    /// is not this rule's business.
+    #[test]
+    fn a_car_carried_probe_that_changes_directory_is_named_but_not_refused() {
+        let probe = "cd /work/boss && git show HEAD:x | grep -q y && echo ok";
+        let a = admit(probe, true);
+        assert!(a.refusal.is_none(), "{:?}", a.refusal);
+        let w = a.warnings.first().expect("the cd is named");
+        assert!(w.contains("`cd`"), "{w}");
+        assert!(w.contains("converged checkout"), "{w}");
+        assert!(admit(probe, false).warnings.is_empty());
+    }
+
     /// A named read is not this rule's business, and a MENTION is not a
     /// read — the shared command-position scan is what keeps both legal.
     #[test]
@@ -3688,7 +3955,15 @@ mod tests {
             o.exit, 4,
             "jq -e exits 4 when its filter produces no output; `empty` produces none"
         );
-        let p = proof_json(INVERTED_FILTER, Some("claim:ok"), &o, "h", "now", None);
+        let p = proof_json(
+            INVERTED_FILTER,
+            Some("claim:ok"),
+            &o,
+            "h",
+            "now",
+            &no_tree(),
+            None,
+        );
         assert_eq!(p["exit"], 4, "the proof record carries the REAL status");
         assert!(
             p.get("stderr").is_some(),
@@ -3728,7 +4003,7 @@ mod tests {
             "jq's own diagnosis, captured: {:?}",
             o.stderr
         );
-        let p = proof_json(failing, Some("claim:ok"), &o, "h", "now", None);
+        let p = proof_json(failing, Some("claim:ok"), &o, "h", "now", &no_tree(), None);
         assert!(
             p["stderr"].as_str().unwrap().contains("maintenance-backup"),
             "and recorded: {p}"
@@ -4061,6 +4336,7 @@ ugrep: warning: complete\": No such file or directory\n";
             &ok("x"),
             "h",
             "now",
+            &no_tree(),
             Some(&ov),
         );
         assert_eq!(p["overridden"]["rule"], UNIDENTIFIED_RULE);
@@ -4068,7 +4344,7 @@ ugrep: warning: complete\": No such file or directory\n";
             p["overridden"]["reason"],
             "the identity header comes from my shell profile"
         );
-        let plain = proof_json("true", Some("x"), &ok("x"), "h", "now", None);
+        let plain = proof_json("true", Some("x"), &ok("x"), "h", "now", &no_tree(), None);
         assert!(
             plain.get("overridden").is_none(),
             "no override, no key — a reader must not read one to learn nothing"
@@ -4329,7 +4605,7 @@ ugrep: warning: complete\": No such file or directory\n";
             !why.contains("CANNOT BE READ") && !why.contains("NOT PROVEN"),
             "the two verdicts about the claim must not appear: {why}"
         );
-        let a = attempt_json(&probe, Some("pods:ok"), &o, "pod-7", "now", &why);
+        let a = attempt_json(&probe, Some("pods:ok"), &o, "pod-7", "now", &why, None);
         assert_eq!(a["unrunnable"], true);
         assert_eq!(a["missing_tools"], json!(["kubectl"]));
         assert_eq!(a["not_yet"], false);
@@ -4405,7 +4681,7 @@ ugrep: warning: complete\": No such file or directory\n";
         // A step that DOES carry a proof still wins — an attempt is the
         // record of a run that settled nothing, not a replacement.
         let proven = json!({"metadata": {"proof": proof_json(
-            "real-probe", Some("x"), &ok("x"), "h", "now", None).to_string()}});
+            "real-probe", Some("x"), &ok("x"), "h", "now", &no_tree(), None).to_string()}});
         let rec = recorded_probe_for(&car, &proven).unwrap();
         assert_eq!(rec.probe, "real-probe");
         assert_eq!(rec.source, Source::Proof);
@@ -5099,7 +5375,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stderr: String::new(),
             missing_tools: Vec::new(),
         };
-        let a = attempt_json("true", Some("x:ok"), &o, "h", "now", "NOT YET: none");
+        let a = attempt_json("true", Some("x:ok"), &o, "h", "now", "NOT YET: none", None);
         let keys: std::collections::BTreeSet<&str> =
             a.as_object().unwrap().keys().map(String::as_str).collect();
         let want: std::collections::BTreeSet<&str> = [
@@ -5114,12 +5390,63 @@ ugrep: warning: complete\": No such file or directory\n";
             "unrunnable",
             "not_yet",
             "missing_tools",
+            boss_jobs::car::NOT_YET_SINCE,
+            boss_jobs::car::NOT_YET_RUNS,
         ]
         .into_iter()
         .collect();
         assert_eq!(keys, want);
         assert_eq!(a["not_yet"], true);
         assert_eq!(a["unrunnable"], false);
+    }
+
+    /// THE ATTEMPT CARRIES ITS NOT-YET STREAK (backlog adef5ddf). Both
+    /// doors write through here, so both hand the car's PRIOR attempt in
+    /// and the record says how long this probe has been answering not
+    /// yet — the one signal that tells a starved probe from a patient
+    /// one. A run that is not a not-yet carries no streak (null, zero),
+    /// so the shape stays one shape.
+    #[test]
+    fn a_not_yet_attempt_carries_the_streak_from_the_prior_one() {
+        let o = Outcome {
+            exit: 75,
+            stdout: "not yet: none\n".into(),
+            stderr: String::new(),
+            missing_tools: Vec::new(),
+        };
+        let prior = json!({
+            "at": "2026-09-23T06:00:00Z", "exit": 75, "not_yet": true, "probe": "true",
+            "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 85,
+        });
+        let a = attempt_json(
+            "true",
+            Some("x:ok"),
+            &o,
+            "h",
+            "2026-09-23T07:00:00Z",
+            "NOT YET: none",
+            Some(&prior),
+        );
+        assert_eq!(a[boss_jobs::car::NOT_YET_SINCE], "2026-09-19T05:50:00Z");
+        assert_eq!(a[boss_jobs::car::NOT_YET_RUNS], 86);
+
+        let red = Outcome {
+            exit: 1,
+            stdout: String::new(),
+            stderr: "FAILED\n".into(),
+            missing_tools: Vec::new(),
+        };
+        let a = attempt_json(
+            "true",
+            Some("x:ok"),
+            &red,
+            "h",
+            "2026-09-23T07:00:00Z",
+            "FAILED",
+            Some(&prior),
+        );
+        assert_eq!(a[boss_jobs::car::NOT_YET_SINCE], Value::Null);
+        assert_eq!(a[boss_jobs::car::NOT_YET_RUNS], 0);
     }
 
     /// THE DID-NOT-RUN SENTENCE at the unattended door names the forge's
@@ -5147,6 +5474,46 @@ ugrep: warning: complete\": No such file or directory\n";
         assert!(
             hand.contains("This says nothing about whether the change works"),
             "{hand}"
+        );
+    }
+
+    /// THE DECLARED WAIT IS OBSERVED BY THE DOOR THAT RECORDS THE
+    /// NOT-YET (backlog b461341d): a `seen` check that exits 0 stamps a
+    /// sighting, one that does not stamps none, and a car with no
+    /// declaration — or an attempt that is not a not-yet — is untouched.
+    #[test]
+    fn a_not_yet_runs_the_cars_declared_seen_check_and_stamps_what_it_found() {
+        let o = Outcome {
+            exit: 75,
+            stdout: "not yet: none\n".into(),
+            stderr: String::new(),
+            missing_tools: Vec::new(),
+        };
+        let attempt = attempt_json("true", Some("x:ok"), &o, "h", "T1", "NOT YET: none", None);
+        let car = |seen: &str| json!({"metadata": {"waits_on": boss_jobs::car::waits_on_value("an event", Some(seen))}});
+        let shell = Shell::here(None);
+
+        let a = with_wait_observed(attempt.clone(), &car("true"), &shell, None, "T1");
+        assert_eq!(a["waits_on_exit"], 0);
+        assert_eq!(a[boss_jobs::car::WAITS_ON_SEEN_AT], "T1");
+
+        let a = with_wait_observed(attempt.clone(), &car("exit 3"), &shell, None, "T1");
+        assert_eq!(a["waits_on_exit"], 3);
+        assert_eq!(a[boss_jobs::car::WAITS_ON_SEEN_AT], Value::Null);
+
+        let undeclared = json!({"metadata": {}});
+        let a = with_wait_observed(attempt.clone(), &undeclared, &shell, None, "T1");
+        assert_eq!(a, attempt);
+
+        // A sighting keeps the date of the first run that saw it.
+        let prior = json!({(boss_jobs::car::WAITS_ON_SEEN_AT): "T0"});
+        let a = stamp_wait(attempt.clone(), Some(&prior), Some(0), "T1");
+        assert_eq!(a[boss_jobs::car::WAITS_ON_SEEN_AT], "T0");
+
+        let failed = json!({"not_yet": false, "exit": 1});
+        assert_eq!(
+            with_wait_observed(failed.clone(), &car("true"), &shell, None, "T1"),
+            failed
         );
     }
 }

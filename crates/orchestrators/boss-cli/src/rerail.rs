@@ -61,7 +61,7 @@ fn git(dir: &str, args: &[&str]) -> Result<String> {
 
 /// The car packet for `given` (branch or 8+ chars of id), plus its
 /// branch. Reads open ship-a-change packets the same way park does.
-async fn find_car(http: &reqwest::Client, given: &str) -> Result<(Value, String)> {
+pub(crate) async fn find_car(http: &reqwest::Client, given: &str) -> Result<(Value, String)> {
     // Read EVERY open car, not just page one: a rerail target opened
     // days ago sorts to the tail of `opened_on DESC`, and a bare
     // `limit=` read left it off page one and reported it "not found"
@@ -324,7 +324,7 @@ async fn finish(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("car has no id"))?;
     let head = gate::resolve_sha(new_branch);
-    let gate_runs = gate::rows(
+    let gate_runs = crate::train::rows(
         gate::api(
             http,
             reqwest::Method::GET,
@@ -332,7 +332,7 @@ async fn finish(
             None,
         )
         .await?,
-    );
+    )?;
     // Machine-copied, green-preferring, head-matched — every property
     // the by-hand transcription kept getting wrong, in one call.
     let receipt = park::receipt_for(&gate_runs, new_branch, &head)?;

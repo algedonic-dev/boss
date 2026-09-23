@@ -81,16 +81,12 @@ fn an_owner_other_than_the_caller() -> Option<String> {
 /// box: a dir left by a root run is one `remove_dir_all` a later run as
 /// another uid cannot do — and that failure was discarded, so the run
 /// carried on and died 130 lines later on an unreadable bare
-/// `PermissionDenied` from a fixture write. The pid makes the root ours,
-/// and every failure here names the path it was at.
+/// `PermissionDenied` from a fixture write. `scratch` carries the uid
+/// and the pid, so the root is ours — the pid alone left a recycled
+/// pid's leftover from another uid in reach (307df975) — and every
+/// failure here names the path it was at.
 fn scratch(case: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "delete-orphan-object-{case}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("scratch dir {}: {e}", dir.display()));
-    dir
+    boss_testing::scratch_dir(&format!("delete-orphan-object-{case}"))
 }
 
 /// Write, naming the path when it fails. A bare `unwrap()` on a write
@@ -998,7 +994,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
     write_exec(
         &bin.join("curl"),
         "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
+         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; printf 200; exit 0;; esac; done\n\
          cat \"$STUB_JOBS\"\n",
     );
     std::fs::write(

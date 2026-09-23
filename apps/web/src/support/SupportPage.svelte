@@ -21,12 +21,15 @@
   import Section from '@boss/web-kit/ui/Section.svelte';
   import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import type { Job } from '../jobs/types';
+  import type { Account as AccountRow } from '../accounts/types';
+  import TierChip from '../accounts/TierChip.svelte';
   import { shortId } from '../data/ids';
   import { href } from '../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
   import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
+  import { ACCOUNTS_LIST_URL } from '../accounts/api';
   import {
     accountHealthView,
     deviceCellMeaning,
@@ -38,11 +41,12 @@
     type ReadState,
   } from './reads';
 
-  type Account = {
-    id: string;
-    name: string;
-    tier: 'platinum' | 'gold' | 'silver';
-  };
+  // The accounts domain's own type, not a page-local copy. The copy
+  // this replaced declared tier as three literals while the live row
+  // answered tier: null, which boss-accounts allows (Option<String>;
+  // 22-accounts.sql: untiered until classified), so the Tier cell
+  // rendered empty (backlog ae7d1ce4, /ux/support page audit 9876ef0d).
+  type Account = Pick<AccountRow, 'id' | 'name' | 'tier'>;
   type Asset = {
     asset_id: string;
     account_id: string | null;
@@ -58,6 +62,7 @@
 
   let jobsPage = $state<Paged<Job> | null>(null);
   let accounts = $state<Account[]>([]);
+  let accountsPage = $state<Paged<Account> | null>(null);
   let devicesPage = $state<Paged<Asset> | null>(null);
   /// Non-null when the case-list load failed — rendered instead of
   /// the empty states, so an outage never reads as "no open cases"
@@ -80,15 +85,11 @@
     loading = true;
     (async () => {
       try {
-        const [jPaged, pResp, dPaged] = await Promise.all([
+        const [jPaged, pPaged, dPaged] = await Promise.all([
           fetchPaged<Job>('/api/jobs?department=support&limit=5000'),
-          fetch('/api/people/accounts'),
+          fetchPaged<Account>(ACCOUNTS_LIST_URL),
           fetchPaged<Asset>('/api/assets?limit=1000'),
         ]);
-        const pBody = pResp.ok ? await pResp.json() : [];
-        const accountsFailure = pResp.ok
-          ? null
-          : `/api/people/accounts: HTTP ${pResp.status}`;
         if (!cancelled) {
           // The jobs list is the page's primary dataset — its failure
           // is the page's failure. Devices/accounts enrich the rows
@@ -100,10 +101,10 @@
             jobsPage = null;
             loadFailed = jPaged.error;
           }
-          accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
-          accountsRead = accountsFailure
-            ? failedRead(accountsFailure)
-            : okRead;
+          accountsPage = pPaged.kind === 'ready' ? pPaged.page : null;
+          accounts = pPaged.kind === 'ready' ? [...pPaged.page.data] : [];
+          accountsRead =
+            pPaged.kind === 'ready' ? okRead : failedRead(pPaged.error);
           devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
           devicesRead =
             dPaged.kind === 'ready' ? okRead : failedRead(dPaged.error);
@@ -231,6 +232,8 @@
   let healthSorted = $derived(
     healthSort.sorted(accountHealthRows, {
       account: (r) => r.account.name,
+      // null (untiered) sorts before every tier ascending: web-kit's
+      // compareSortValues convention, pinned by support-untiered.mocked.spec.ts.
       tier: (r) => r.account.tier,
       open: (r) => r.openCount,
       equipment: (r) => r.deviceCount,
@@ -263,6 +266,14 @@
         : ''}. A '—' in a device column below means this page could not
       read the device, not that the case has none.
     </p>
+  {/if}
+  {#if isCapped(accountsPage)}
+    <OverflowBanner
+      showing={accounts.length}
+      total={accountsPage!.total}
+      noun="accounts loaded"
+      hint="Account Health lists only these; a case whose account is past the cap shows its id."
+    />
   {/if}
   {#if isCapped(devicesPage)}
     <OverflowBanner
@@ -342,7 +353,7 @@
                   {#if r.account}
                     {@const prac = r.account}
                     <Link to={entityHref('account', prac.id)}>
-                      {prac.name}
+                      {prac.name ?? prac.id}
                     </Link>
                   {:else}
                     —
@@ -403,10 +414,10 @@
               <tr class="data-table-row-link">
                 <td>
                   <Link to={entityHref('account', r.account.id)}>
-                    {r.account.name}
+                    {r.account.name ?? r.account.id}
                   </Link>
                 </td>
-                <td>{r.account.tier}</td>
+                <td><TierChip tier={r.account.tier} /></td>
                 <td class="num"><strong>{r.openCount}</strong></td>
                 <td class="num">{r.deviceCount}</td>
                 <td>{r.lastDate ?? '—'}</td>

@@ -94,17 +94,41 @@ impl PasskeyState {
     }
 }
 
-pub fn passkey_router(state: Arc<PasskeyState>) -> Router {
+/// Every passkey route, the one list: the gateway's `main.rs` merges
+/// this router and the tests drive it. Until backlog 3bddce66
+/// (2026-09-23) `main.rs` spelled the six routes out itself and this
+/// list lacked the credential removal, so what the tests mounted was
+/// not what production served (CLAUDE.md 9a). Generic over the outer
+/// router's state because each route carries its own.
+pub fn passkey_router<S>(state: Arc<PasskeyState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
-        .route("/api/auth/passkey/register/begin", post(register_begin))
-        .route("/api/auth/passkey/register/finish", post(register_finish))
-        .route("/api/auth/passkey/assert/begin", post(assert_begin))
-        .route("/api/auth/passkey/assert/finish", post(assert_finish))
+        .route(
+            "/api/auth/passkey/register/begin",
+            post(register_begin).with_state(state.clone()),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(register_finish).with_state(state.clone()),
+        )
+        .route(
+            "/api/auth/passkey/assert/begin",
+            post(assert_begin).with_state(state.clone()),
+        )
+        .route(
+            "/api/auth/passkey/assert/finish",
+            post(assert_finish).with_state(state.clone()),
+        )
         .route(
             "/api/auth/passkey/credentials",
-            axum::routing::get(credentials_list),
+            axum::routing::get(credentials_list).with_state(state.clone()),
         )
-        .with_state(state)
+        .route(
+            "/api/auth/passkey/credentials/{credential_id}",
+            axum::routing::delete(credentials_remove).with_state(state),
+        )
 }
 
 /// The browser-safe listing: the session's OWN passkeys, metadata
@@ -148,7 +172,10 @@ pub async fn credentials_remove(
 ) -> Response {
     let (_sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return presence_refused("credentials_remove", None, "session", r),
+    };
+    let refused = |reason: &str, r: ErrResp| {
+        presence_refused("credentials_remove", Some(&employee_id), reason, r)
     };
     let url = format!(
         "{}/api/people/{}/webauthn-credentials/{}",
@@ -156,18 +183,24 @@ pub async fn credentials_remove(
     );
     let resp = match state.request(reqwest::Method::DELETE, url).send().await {
         Ok(r) => r,
-        Err(e) => {
-            return err(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}"))
-                .into_response();
+        Err(_) => {
+            return refused(
+                "credential removal: people unreachable",
+                err(StatusCode::BAD_GATEWAY, PEOPLE_UNREACHABLE),
+            );
         }
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let reason = format!("credential removal: {}", resp.status());
     match status {
         StatusCode::NO_CONTENT => StatusCode::NO_CONTENT.into_response(),
         StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
-            (status, resp.text().await.unwrap_or_default()).into_response()
+            refused(&reason, (status, resp.text().await.unwrap_or_default()))
         }
-        _ => err(StatusCode::BAD_GATEWAY, "credential removal failed").into_response(),
+        _ => refused(
+            &reason,
+            err(StatusCode::BAD_GATEWAY, "credential removal failed"),
+        ),
     }
 }
 
@@ -288,10 +321,48 @@ fn err(status: StatusCode, msg: impl Into<String>) -> ErrResp {
     (status, msg.into())
 }
 
-/// The same refusal, already a Response — for direct returns inside
-/// handlers.
-fn err2(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, msg.into()).into_response()
+/// What the browser reads when boss-people cannot be reached. Fixed,
+/// because reqwest's error names the URL it failed on, and those URLs
+/// carry a challenge id (the consume) or a credential id (the removal)
+/// — until backlog 56126dc7 (2026-09-23) this was `people unreachable:
+/// {e}`, and since 2e893e27 and f3436d99 the browser renders it.
+const PEOPLE_UNREACHABLE: &str = "people unreachable";
+
+/// The same for boss-jobs: the step read in `assert_begin` failed on
+/// the internal jobs URL, which `jobs unreachable: {e}` printed to the
+/// browser until backlog 3bddce66 (2026-09-23).
+const JOBS_UNREACHABLE: &str = "jobs unreachable";
+
+/// A passkey ceremony refusal, written to the gateway log and then
+/// returned unchanged. Until backlog f3436d99 (2026-09-23) `assert_begin`
+/// and `assert_finish` told only the browser why they refused, so a
+/// failed presence approval could not be diagnosed from the server;
+/// enrolment (`register_begin`, `register_finish`) and
+/// `credentials_remove` stayed silent until backlog 56126dc7 the same
+/// day, and route through here too. The name predates them and stays:
+/// f3436d99's recorded probe reads this function by name.
+///
+/// `reason` is what the log carries, and it is built ONLY from fixed
+/// text, an HTTP status, or the error text webauthn-rs gives (its
+/// errors are fixed strings) — never from the refusal's own message,
+/// which can hold a reqwest error naming the URL it failed on, and the
+/// consume URL carries the challenge id. Nothing here logs a challenge
+/// id, a credential id or any credential material; the employee id is
+/// the only identifier.
+fn presence_refused(
+    ceremony: &'static str,
+    employee_id: Option<&str>,
+    reason: &str,
+    (status, msg): ErrResp,
+) -> Response {
+    tracing::warn!(
+        ceremony,
+        employee_id = employee_id.unwrap_or("none"),
+        status = status.as_u16(),
+        reason,
+        "passkey ceremony refused"
+    );
+    (status, msg).into_response()
 }
 
 /// The gateway's own service identity: the actor its server-side
@@ -339,16 +410,15 @@ impl PasskeyState {
             .request(reqwest::Method::GET, url)
             .send()
             .await
-            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}")))?;
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, PEOPLE_UNREACHABLE))?;
         if !resp.status().is_success() {
             return Err(err(StatusCode::BAD_GATEWAY, "credential lookup failed"));
         }
-        resp.json::<Vec<Value>>().await.map_err(|e| {
-            err(
-                StatusCode::BAD_GATEWAY,
-                format!("credential list malformed: {e}"),
-            )
-        })
+        // Fixed text: the decode error names the URL it read and can
+        // quote the value it choked on (backlog 3bddce66, 2026-09-23).
+        resp.json::<Vec<Value>>()
+            .await
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, "credential list malformed"))
     }
 
     /// Stored rows carry `public_key` = b64url(serde_json(Passkey)).
@@ -387,13 +457,16 @@ pub async fn register_begin(
 ) -> Response {
     let (sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return presence_refused("register_begin", None, "session", r),
+    };
+    let refused = |reason: &str, r: ErrResp| {
+        presence_refused("register_begin", Some(&employee_id), reason, r)
     };
     // Exclude already-registered credentials so an authenticator
     // cannot double-enrol.
     let rows = match state.stored_passkeys(&employee_id).await {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("stored passkeys", r),
     };
     let exclude: Option<Vec<webauthn_rs::prelude::CredentialID>> = if rows.is_empty() {
         None
@@ -415,7 +488,10 @@ pub async fn register_begin(
         .start_passkey_registration(user_uuid, &sess.username, &sess.username, exclude)
     {
         Ok(v) => v,
-        Err(e) => return err2(StatusCode::INTERNAL_SERVER_ERROR, format!("webauthn: {e}")),
+        Err(e) => {
+            let msg = format!("webauthn: {e}");
+            return refused(&msg, err(StatusCode::INTERNAL_SERVER_ERROR, msg.clone()));
+        }
     };
     // The registration state is the thing that must round-trip; the
     // challenge ledger carries it opaquely (flow=register).
@@ -440,11 +516,17 @@ pub async fn register_begin(
             "options": ccr,
         }))
         .into_response(),
-        Ok(r) => err2(
-            StatusCode::BAD_GATEWAY,
-            format!("challenge mint failed: {}", r.status()),
+        Ok(r) => refused(
+            &format!("challenge mint: {}", r.status()),
+            err(
+                StatusCode::BAD_GATEWAY,
+                format!("challenge mint failed: {}", r.status()),
+            ),
         ),
-        Err(e) => err2(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}")),
+        Err(_) => refused(
+            "challenge mint: people unreachable",
+            err(StatusCode::BAD_GATEWAY, PEOPLE_UNREACHABLE),
+        ),
     }
 }
 
@@ -463,16 +545,22 @@ pub async fn register_finish(
 ) -> Response {
     let (_sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return presence_refused("register_finish", None, "session", r),
+    };
+    let refused = |reason: &str, r: ErrResp| {
+        presence_refused("register_finish", Some(&employee_id), reason, r)
     };
     let row = match consume_challenge(&state, &body.challenge_id).await {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("challenge consume", r),
     };
     if row["flow"] != "register" || row["employee_id"] != employee_id.as_str() {
-        return err2(
-            StatusCode::FORBIDDEN,
-            "challenge was minted for someone else",
+        return refused(
+            "challenge minted for someone else",
+            err(
+                StatusCode::FORBIDDEN,
+                "challenge was minted for someone else",
+            ),
         );
     }
     let state_bytes = match row["challenge"]
@@ -481,18 +569,26 @@ pub async fn register_finish(
     {
         Some(v) => v,
         None => {
-            return err2(
-                StatusCode::BAD_GATEWAY,
-                "stored registration state unreadable",
+            return refused(
+                "stored registration state not base64url",
+                err(
+                    StatusCode::BAD_GATEWAY,
+                    "stored registration state unreadable",
+                ),
             );
         }
     };
     let reg_state: PasskeyRegistration = match serde_json::from_slice(&state_bytes) {
         Ok(v) => v,
+        // The serde error can quote the stored state; the log gets the
+        // stage only.
         Err(_) => {
-            return err2(
-                StatusCode::BAD_GATEWAY,
-                "stored registration state unreadable",
+            return refused(
+                "stored registration state not a registration",
+                err(
+                    StatusCode::BAD_GATEWAY,
+                    "stored registration state unreadable",
+                ),
             );
         }
     };
@@ -502,10 +598,8 @@ pub async fn register_finish(
     {
         Ok(v) => v,
         Err(e) => {
-            return err2(
-                StatusCode::BAD_REQUEST,
-                format!("attestation rejected: {e}"),
-            );
+            let reason = format!("attestation rejected: {e}");
+            return refused(&reason, err(StatusCode::BAD_REQUEST, reason.clone()));
         }
     };
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
@@ -532,14 +626,21 @@ pub async fn register_finish(
             Json(json!({ "credential_id": cred_id_b64 })),
         )
             .into_response(),
-        Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
-            err2(StatusCode::CONFLICT, "credential already registered")
-        }
-        Ok(r) => err2(
-            StatusCode::BAD_GATEWAY,
-            format!("credential store failed: {}", r.status()),
+        Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => refused(
+            "credential already registered",
+            err(StatusCode::CONFLICT, "credential already registered"),
         ),
-        Err(e) => err2(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}")),
+        Ok(r) => refused(
+            &format!("credential store: {}", r.status()),
+            err(
+                StatusCode::BAD_GATEWAY,
+                format!("credential store failed: {}", r.status()),
+            ),
+        ),
+        Err(_) => refused(
+            "credential store: people unreachable",
+            err(StatusCode::BAD_GATEWAY, PEOPLE_UNREACHABLE),
+        ),
     }
 }
 
@@ -560,8 +661,10 @@ pub async fn assert_begin(
 ) -> Response {
     let (sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return presence_refused("assert_begin", None, "session", r),
     };
+    let refused =
+        |reason: &str, r: ErrResp| presence_refused("assert_begin", Some(&employee_id), reason, r);
     // The step's CURRENT content is what the passkey will approve.
     let job_url = format!("{}/api/jobs/{}", state.jobs_base, body.job_id);
     let job: Value = {
@@ -580,24 +683,39 @@ pub async fn assert_begin(
             .send()
             .await;
         match resp {
+            // This refusal and the unreachable one below are fixed text
+            // since backlog 3bddce66 (2026-09-23): reqwest's errors
+            // name the internal jobs URL, and a decode error can quote
+            // the job it choked on.
             Ok(r) if r.status().is_success() => match r.json().await {
                 Ok(v) => v,
-                Err(e) => return err2(StatusCode::BAD_GATEWAY, format!("job malformed: {e}")),
+                Err(_) => {
+                    return refused(
+                        "job malformed",
+                        err(StatusCode::BAD_GATEWAY, "job malformed"),
+                    );
+                }
             },
             Ok(r) => {
-                return err2(
-                    StatusCode::BAD_GATEWAY,
-                    format!("job fetch: {}", r.status()),
+                let reason = format!("job fetch: {}", r.status());
+                return refused(&reason, err(StatusCode::BAD_GATEWAY, reason.clone()));
+            }
+            Err(_) => {
+                return refused(
+                    "jobs unreachable",
+                    err(StatusCode::BAD_GATEWAY, JOBS_UNREACHABLE),
                 );
             }
-            Err(e) => return err2(StatusCode::BAD_GATEWAY, format!("jobs unreachable: {e}")),
         }
     };
     let Some(step) = job["steps"]
         .as_array()
         .and_then(|s| s.iter().find(|s| s["id"] == body.step_id.as_str()))
     else {
-        return err2(StatusCode::NOT_FOUND, "no such step on that job");
+        return refused(
+            "no such step on that job",
+            err(StatusCode::NOT_FOUND, "no such step on that job"),
+        );
     };
     let title = step["title"].as_str().unwrap_or_default();
     let metadata = step.get("metadata").cloned().unwrap_or(Value::Null);
@@ -608,12 +726,15 @@ pub async fn assert_begin(
 
     let rows = match state.stored_passkeys(&employee_id).await {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("stored passkeys", r),
     };
     if rows.is_empty() {
-        return err2(
-            StatusCode::CONFLICT,
-            "no passkey enrolled — enrol one before approving presence-gated steps",
+        return refused(
+            "no passkey enrolled",
+            err(
+                StatusCode::CONFLICT,
+                "no passkey enrolled — enrol one before approving presence-gated steps",
+            ),
         );
     }
 
@@ -635,7 +756,14 @@ pub async fn assert_begin(
         .send()
         .await;
     if !matches!(&mint, Ok(r) if r.status().is_success()) {
-        return err2(StatusCode::BAD_GATEWAY, "challenge mint failed");
+        let reason = match &mint {
+            Ok(r) => format!("challenge mint: {}", r.status()),
+            Err(_) => "challenge mint: people unreachable".to_string(),
+        };
+        return refused(
+            &reason,
+            err(StatusCode::BAD_GATEWAY, "challenge mint failed"),
+        );
     }
 
     let allow: Vec<Value> = rows
@@ -671,16 +799,21 @@ pub async fn assert_finish(
 ) -> Response {
     let (_sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return presence_refused("assert_finish", None, "session", r),
     };
+    let refused =
+        |reason: &str, r: ErrResp| presence_refused("assert_finish", Some(&employee_id), reason, r);
     let row = match consume_challenge(&state, &body.challenge_id).await {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("challenge consume", r),
     };
     if row["flow"] != "presence" || row["employee_id"] != employee_id.as_str() {
-        return err2(
-            StatusCode::FORBIDDEN,
-            "challenge was minted for someone else",
+        return refused(
+            "challenge minted for someone else",
+            err(
+                StatusCode::FORBIDDEN,
+                "challenge was minted for someone else",
+            ),
         );
     }
     let (Some(challenge_b64), Some(step_id), Some(shape_hash), Some(nonce)) = (
@@ -689,19 +822,22 @@ pub async fn assert_finish(
         row["shape_hash"].as_str(),
         row["nonce"].as_str(),
     ) else {
-        return err2(
-            StatusCode::BAD_GATEWAY,
+        return refused(
             "challenge row missing presence binding",
+            err(
+                StatusCode::BAD_GATEWAY,
+                "challenge row missing presence binding",
+            ),
         );
     };
 
     let rows = match state.stored_passkeys(&employee_id).await {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("stored passkeys", r),
     };
     let passkeys = match PasskeyState::passkey_jsons(&rows) {
         Ok(v) => v,
-        Err(r) => return r.into_response(),
+        Err(r) => return refused("stored passkey rows", r),
     };
     // Build the crate's own AuthenticationState through serde — the
     // documented experts-only seam for a server-supplied challenge.
@@ -719,10 +855,17 @@ pub async fn assert_finish(
             }
         })) {
             Ok(v) => v,
-            Err(e) => {
-                return err2(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("authentication state rebuild failed: {e}"),
+            // The serde error can quote the value it choked on, and
+            // that value is credential material — the log gets the
+            // stage only, and since backlog 56126dc7 (2026-09-23) so
+            // does the browser, which rendered it.
+            Err(_) => {
+                return refused(
+                    "authentication state rebuild failed",
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "authentication state rebuild failed",
+                    ),
                 );
             }
         };
@@ -731,7 +874,10 @@ pub async fn assert_finish(
         .finish_passkey_authentication(&body.credential, &auth_state)
     {
         Ok(v) => v,
-        Err(e) => return err2(StatusCode::UNAUTHORIZED, format!("assertion rejected: {e}")),
+        Err(e) => {
+            let reason = format!("assertion rejected: {e}");
+            return refused(&reason, err(StatusCode::UNAUTHORIZED, reason.clone()));
+        }
     };
 
     // Advance the sign counter — clone detection lives in the crate,
@@ -776,12 +922,14 @@ async fn consume_challenge(state: &PasskeyState, id: &str) -> Result<Value, ErrR
         )
         .send()
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("people unreachable: {e}")))?;
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, PEOPLE_UNREACHABLE))?;
     match resp.status() {
+        // Fixed text: the decode error names the consume URL, which
+        // carries the challenge id (backlog 3bddce66, 2026-09-23).
         s if s.is_success() => resp
             .json()
             .await
-            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("challenge malformed: {e}"))),
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, "challenge malformed")),
         reqwest::StatusCode::GONE => Err(err(
             StatusCode::GONE,
             "challenge already spent or expired — begin again",

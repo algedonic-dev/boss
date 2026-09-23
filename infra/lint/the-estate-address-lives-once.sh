@@ -64,7 +64,6 @@ fi
 read -r -d '' ALLOWANCE <<'EOF'
 .forgejo/workflows/ci.yml	the CI workflow: job-container image tags and the checkout-by-IP the runner needs before it has a checkout (ci-checks-out-from-the-forge.sh); the reclaim job's BOSS_JOBS_URL rides solo as a gate-blind car (follow-up)
 .forgejo/workflows/install-smoke.yml	the nightly install-smoke workflow: its clone-by-IP on the forge runner (gate-blind, as ci.yml)
-bl2.json	stray scratch tracked at the repo root (audit §Headline numbers); deleted by its own car
 crates/core/boss-dispatcher/src/config.rs	the dispatcher's BOSS_FORGE_URL default, read as before (the CLI/Rust layer is out of this car: env is where units set it)
 crates/core/boss-jobs/src/credentials/http.rs	credential issuer label "forgejo (<ip>)" — registry data mirrored from the migration
 crates/core/boss-jobs/src/credentials/in_memory.rs	credential issuer label "forgejo (<ip>)" — registry data mirrored from the migration
@@ -72,14 +71,12 @@ crates/core/boss-jobs/src/probe.rs	#[cfg(test)] probe fixture inside a src file
 crates/orchestrators/boss-cli/src/cadence.rs	the CLI names the record in a refusal message (reads BOSS_JOBS_URL as before)
 crates/orchestrators/boss-cli/src/census.rs	#[cfg(test)] assertion that a refusal names the record
 crates/orchestrators/boss-cli/src/credential.rs	BOSS_TRAIN_FORGE_URL default and a refusal message (the CLI reads env as before)
-crates/orchestrators/boss-cli/src/doctor.rs	the CLI's BOSS_JOBS_URL default (reads env as before; a refusing default is a behaviour change for another car)
 crates/orchestrators/boss-cli/src/gate.rs	refusal prose plus #[cfg(test)] probe fixtures
 crates/orchestrators/boss-cli/src/git_auth.rs	BOSS_TRAIN_FORGE_URL default plus #[cfg(test)] fixtures
 crates/orchestrators/boss-cli/src/host_readiness.rs	#[cfg(test)] estate fixture
 crates/orchestrators/boss-cli/src/prove.rs	#[cfg(test)] probe fixture
 crates/orchestrators/boss-cli/src/publish.rs	#[cfg(test)] clone-URL fixture
 crates/orchestrators/boss-cli/src/queue.rs	#[cfg(test)] assertion that a refusal names the record
-crates/orchestrators/boss-cli/src/running.rs	the CLI's BOSS_JOBS_URL default (reads env as before)
 crates/orchestrators/boss-cli/src/train/forge.rs	the Forgejo adapter's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
 crates/orchestrators/boss-cli/src/train/jobs_api.rs	#[cfg(test)] fixture: the transport error a blip classifies
 crates/orchestrators/boss-cli/src/train/mod.rs	the conductor Config's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
@@ -118,10 +115,6 @@ infra/ops/verbs/mirror-base-images.json	the ops verb's prose names the registry 
 infra/oss-quickstart/Dockerfile	COPY --from a mirrored base by registry tag; a Dockerfile reads no env
 infra/platform/workflows/emergency-merge.toml	workflow prose (registry data) naming where an operator reads /api/jobs/health
 infra/platform/workflows/ship-a-change.toml	workflow prose (registry data) naming the forge for a builder
-park-car.sh	stray scratch tracked at the repo root (audit §Headline numbers); deleted by its own car
-park4.sh	stray scratch tracked at the repo root (audit §Headline numbers); deleted by its own car
-park5.sh	stray scratch tracked at the repo root (audit §Headline numbers); deleted by its own car
-train.json	stray scratch tracked at the repo root (audit §Headline numbers); deleted by its own car
 EOF
 
 # lines_with <ip> <file> — `line:text` for every line spelling the IP

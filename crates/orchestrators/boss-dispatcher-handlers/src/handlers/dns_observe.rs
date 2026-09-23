@@ -37,6 +37,15 @@
 //! READS THE ACCOUNT AGAIN so the packet records what is there, never
 //! what was sent. DRIFT is reported and alarmed, never corrected.
 //!
+//! An application declaring `short_lived_ca = true` also gets its
+//! short-lived-certificate CA: generated when the account holds none
+//! for it, and its PUBLIC key recorded on the packet as `ssh_ca` either
+//! way — the value the ssh server's `TrustedUserCAKeys` must hold. The
+//! dashboard offers only the account-wide Access-for-Infrastructure CA
+//! since 2026-09, which signs nothing `cloudflared access ssh` asks
+//! for; without the per-application CA the client is refused "bad ca
+//! application" before it reaches the server (incident 55d001b0).
+//!
 //! THE INTERLOCK. A zone record declaring `interlock = "access"` is
 //! applied — created when ABSENT (replacing whatever other type the
 //! name held), corrected when DRIFT — only once the application
@@ -83,7 +92,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::common::{
     StepEvent, api_client, dispatcher_actor_header, dispatcher_reader_header, get_json,
-    owner_for_filing, post_json, sim_origin_value, write_json,
+    owner_for_filing, post_json, row_or_refuse, rows_or_refuse, sim_origin_value, write_json,
 };
 use super::credential_issuer::{
     AccessApp, AccessAppSpec, AccessApps, AccessPolicy, AccessPolicySpec, SecretStore,
@@ -215,6 +224,11 @@ pub struct DeclaredApp {
     pub app_type: String,
     pub session_duration: String,
     pub why: String,
+    /// Generate this application's short-lived-certificate CA when the
+    /// account holds none, and record its public key (see the module
+    /// doc). Only an ssh door needs one.
+    #[serde(default)]
+    pub short_lived_ca: bool,
     #[serde(default)]
     pub policy: Vec<DeclaredPolicy>,
 }
@@ -520,14 +534,14 @@ pub struct TunnelFacts {
 
 impl TunnelFacts {
     /// Off the newest `maintenance-cluster-converge` packet's `run` step
-    /// (the listing is newest-first). A listing without one reads as
-    /// no facts — the gate then holds, never releases.
-    pub fn from_listing(listing: &Json) -> Self {
-        listing
-            .get("data")
-            .and_then(Json::as_array)
-            .into_iter()
-            .flatten()
+    /// (the listing is newest-first). A listing with no such packet
+    /// reads as no facts — the gate then holds, never releases. A
+    /// listing with no `data` array is no answer and refuses; the caller
+    /// states its own fallback (d4698bc2).
+    pub fn from_listing(listing: &Json) -> Result<Self, String> {
+        let rows: Vec<Json> = rows_or_refuse(listing, "the converge read (GET /api/jobs)")?;
+        Ok(rows
+            .iter()
             .flat_map(|j| {
                 j.get("steps")
                     .and_then(Json::as_array)
@@ -547,7 +561,7 @@ impl TunnelFacts {
                     connector: text("cloudflared"),
                 }
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 }
 
@@ -825,6 +839,9 @@ pub struct Reading {
     pub zone: Comparison,
     pub access: Vec<Json>,
     pub applied: Vec<String>,
+    /// `{domain, public_key}` for every declared short-lived CA the
+    /// account holds after this firing.
+    pub ssh_ca: Vec<Json>,
 }
 
 impl Reading {
@@ -933,6 +950,7 @@ pub fn observe_put_body(existing: &serde_json::Map<String, Json>, r: &Reading) -
     metadata.insert("verdicts".into(), Json::Array(r.zone.verdicts.clone()));
     metadata.insert("access".into(), Json::Array(r.access.clone()));
     metadata.insert("applied".into(), json!(r.applied));
+    metadata.insert("ssh_ca".into(), Json::Array(r.ssh_ca.clone()));
     metadata.insert("summary".into(), json!(r.summary()));
     metadata.insert(
         "result".into(),
@@ -1001,11 +1019,9 @@ pub fn alarm_refresh(observation_id: &str, r: &Reading) -> Json {
 /// The open packet already carrying `key`, if any, and whether the page
 /// that answered can be trusted to be complete.
 pub fn already_open(listing: &Json, key: &str) -> Result<Option<String>, String> {
-    let rows: Vec<&Json> = listing
-        .get("data")
-        .and_then(Json::as_array)
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
+    // No `data` array refuses for what it is; it was held before only
+    // by accident of the truncation check below (d4698bc2).
+    let rows: Vec<Json> = rows_or_refuse(listing, "the dedup read (GET /api/jobs)")?;
     let total = listing
         .get("total")
         .and_then(Json::as_u64)
@@ -1172,7 +1188,8 @@ impl DnsObserve {
             )));
         };
         let row = self.get(&format!("/api/credentials/{cred}")).await?;
-        let row = row.get("data").cloned().unwrap_or(row);
+        let row = row_or_refuse(row, &format!("GET /api/credentials/{cred}"))
+            .map_err(HandlerError::Downstream)?;
         let location = row
             .get("storage_location")
             .and_then(Json::as_str)
@@ -1343,6 +1360,58 @@ impl DnsObserve {
         (applied, created, refused)
     }
 
+    /// Every declared `short_lived_ca` application the account holds:
+    /// its CA read, generated when absent, and its public key returned
+    /// for the packet. An application the account does not hold is
+    /// skipped — its ABSENT or REFUSED verdict already says so. A read
+    /// or create the account refuses is a REFUSED finding, the same
+    /// rule `apply_access` follows.
+    async fn apply_short_lived_cas(
+        &self,
+        account_id: &str,
+        declared: &[DeclaredApp],
+        live: &[AccessApp],
+    ) -> (Vec<String>, Vec<Json>, Vec<Json>) {
+        let mut applied = Vec::new();
+        let mut cas = Vec::new();
+        let mut refused = Vec::new();
+        for d in declared.iter().filter(|d| d.short_lived_ca) {
+            let Some(app) = live.iter().find(|a| a.domain == d.domain) else {
+                continue;
+            };
+            let key = match self.access.short_lived_ca(account_id, &app.id).await {
+                Ok(Some(key)) => key,
+                Ok(None) => match self.access.create_short_lived_ca(account_id, &app.id).await {
+                    Ok(key) => {
+                        applied.push(format!(
+                            "Access short-lived certificate CA created on {}",
+                            d.domain
+                        ));
+                        key
+                    }
+                    Err(e) => {
+                        refused.push(refused_verdict(
+                            &d.domain,
+                            &format!("create short-lived certificate CA on {}", d.domain),
+                            &e,
+                        ));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    refused.push(refused_verdict(
+                        &d.domain,
+                        &format!("read short-lived certificate CA on {}", d.domain),
+                        &e,
+                    ));
+                    continue;
+                }
+            };
+            cas.push(json!({"domain": d.domain, "public_key": key}));
+        }
+        (applied, cas, refused)
+    }
+
     /// Execute one released zone write.
     ///
     /// The error is the account's own answer, verbatim: the caller
@@ -1443,7 +1512,10 @@ impl Handler for DnsObserve {
         let rule = ctx.rule_name.as_str();
 
         let job = self.get(&format!("/api/jobs/{}", ev.job_id)).await?;
-        let job = job.get("data").cloned().unwrap_or(job);
+        // A body that is not a job would fail the kind check below and
+        // skip this ready step without a word (backlog f2eac973).
+        let job = row_or_refuse(job, &format!("GET /api/jobs/{}", ev.job_id))
+            .map_err(HandlerError::Downstream)?;
         if job.get("kind").and_then(Json::as_str) != Some(OBSERVATION_KIND) {
             return Ok(());
         }
@@ -1512,20 +1584,32 @@ impl Handler for DnsObserve {
                 .map_err(HandlerError::Downstream)?;
             access_verdicts = compare_access(&access_decl.application, &live_apps);
         }
+        let (ca_applied, ssh_ca, ca_refused) = self
+            .apply_short_lived_cas(&info.account_id, &access_decl.application, &live_apps)
+            .await;
+        applied.extend(ca_applied);
         // What the account refused rides beside what it holds: a
         // finding on the step, in the alarm, counted as hard.
         access_verdicts.extend(refused);
+        access_verdicts.extend(ca_refused);
         // The tunnel interlock's facts: the newest converge packet's
         // ingress line and connector reading (fd75c641). Read once per
         // firing; a listing that cannot be read holds every tunnel-
         // interlocked record rather than releasing it blind.
-        let converge = self
+        // The fallback is DELIBERATE and stated here, where it is chosen:
+        // a failed read and an answer with no `data` array both yield no
+        // facts, and no facts HOLDS every tunnel-interlocked record.
+        let tunnel_facts = self
             .get(&format!(
                 "/api/jobs?kind={CONVERGE_KIND}&status=closed&limit=1"
             ))
             .await
-            .unwrap_or_else(|_| json!({"data": []}));
-        let tunnel_facts = TunnelFacts::from_listing(&converge);
+            .map_err(|e| e.to_string())
+            .and_then(|listing| TunnelFacts::from_listing(&listing))
+            .unwrap_or_else(|why| {
+                tracing::warn!(%why, "dns.observe: no converge facts; every tunnel-interlocked record holds");
+                TunnelFacts::default()
+            });
         let gate_for = |v: &Json| -> Interlock {
             let hostname = v.get("name").and_then(Json::as_str).unwrap_or_default();
             match v.get("interlock").and_then(Json::as_str) {
@@ -1575,6 +1659,7 @@ impl Handler for DnsObserve {
             zone: comparison,
             access: access_verdicts,
             applied,
+            ssh_ca,
         };
 
         // The alarm FIRST (see the module doc for why), then the step.
@@ -1672,6 +1757,7 @@ mod tests {
             zone: c,
             access: vec![],
             applied: vec![],
+            ssh_ca: vec![],
         }
     }
 
@@ -1822,6 +1908,7 @@ mod tests {
             app_type: "self_hosted".into(),
             session_duration: "24h".into(),
             why: "test".into(),
+            short_lived_ca: false,
             policy: vec![DeclaredPolicy {
                 name: policy.into(),
                 decision: "allow".into(),
@@ -1863,6 +1950,49 @@ mod tests {
             include: email_rules(emails),
             precedence: 1,
         }
+    }
+
+    /// An SSH application is the SAME vocabulary as a self_hosted one
+    /// (design 5fc71f03; backlog e4cedb46 asked whether the handler
+    /// knows only HTTP applications). `type` is a value carried
+    /// verbatim from the declaration to the comparison and to the
+    /// create body — never matched against a list of known kinds — so
+    /// the dev door needed no handler change, and this test is what
+    /// keeps that true when someone reaches for an enum.
+    #[test]
+    fn an_ssh_application_is_declared_compared_and_created_as_one() {
+        let text = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/cluster/dns/access.toml"),
+        )
+        .expect("access.toml ships beside the zone file");
+        let dec = parse_access_declaration(&text, "algedonic.dev").expect("parses for the zone");
+        let dev = dec
+            .application
+            .iter()
+            .find(|a| a.domain == "dev.algedonic.dev")
+            .expect("the dev workspace door is declared");
+        assert_eq!(dev.app_type, "ssh");
+        assert!(
+            dev.short_lived_ca,
+            "the ssh door declares its CA, or cloudflared is refused 'bad ca application'"
+        );
+
+        // ABSENT is what the first observation after this lands reads,
+        // and what makes the handler create it — with the declared
+        // type, not a default.
+        let absent = compare_access(std::slice::from_ref(dev), &[]);
+        assert_eq!(absent[0]["verdict"], json!("ABSENT"));
+        assert_eq!(absent[0]["declared"]["type"], json!("ssh"));
+
+        // And once the account holds it, the comparison MATCHes: an
+        // ssh application does not read as permanent DRIFT against a
+        // vocabulary that only knew self_hosted.
+        let live = AccessApp {
+            app_type: "ssh".into(),
+            ..live_app("dev.algedonic.dev", vec![allow("operators", &[DAVID])])
+        };
+        let matched = compare_access(std::slice::from_ref(dev), &[live]);
+        assert_eq!(matched[0]["verdict"], json!("MATCH"), "{matched:?}");
     }
 
     #[test]
@@ -2402,7 +2532,7 @@ measured = "2026-09-20: read from the IdP"
                 }}
             ]
         }]});
-        let facts = TunnelFacts::from_listing(&listing);
+        let facts = TunnelFacts::from_listing(&listing).expect("a listing");
         assert_eq!(tunnel_gate("id.algedonic.dev", &facts), TunnelGate::Routed);
         assert_eq!(
             tunnel_gate("boss.algedonic.dev", &facts),
@@ -2427,8 +2557,12 @@ measured = "2026-09-20: read from the IdP"
         );
         assert_eq!(
             TunnelFacts::from_listing(&json!({"data": []})),
-            TunnelFacts::default(),
+            Ok(TunnelFacts::default()),
             "no converge packet: no facts, and every tunnel gate holds"
+        );
+        assert!(
+            TunnelFacts::from_listing(&json!({"total": 1})).is_err(),
+            "no `data` array is no answer — the caller states the hold (d4698bc2)"
         );
         assert_eq!(
             tunnel_gate("id.algedonic.dev", &TunnelFacts::default()),
@@ -2599,32 +2733,54 @@ measured = "2026-09-20: read from the IdP"
         reads: Mutex<usize>,
         writes: Mutex<Vec<String>>,
         refuse_policies: Option<String>,
+        /// Short-lived-certificate CA public keys, by application id.
+        /// An account built `with` its applications holds a CA for each
+        /// (the dev door's, as the account reads once the observer has
+        /// run); `without_cas` holds none.
+        cas: Mutex<HashMap<String, String>>,
+        refuse_cas: Option<String>,
     }
 
     impl FakeAccess {
-        fn with(apps: Vec<AccessApp>) -> Arc<Self> {
+        fn ca_key(app_id: &str) -> String {
+            format!("ecdsa-sha2-nistp256 CA-OF-{app_id}")
+        }
+        fn build(
+            apps: Result<Vec<AccessApp>, String>,
+            refuse_policies: Option<String>,
+            cas: HashMap<String, String>,
+            refuse_cas: Option<String>,
+        ) -> Arc<Self> {
             Arc::new(Self {
-                apps: Mutex::new(Ok(apps)),
+                apps: Mutex::new(apps),
                 reads: Mutex::new(0),
                 writes: Mutex::new(vec![]),
-                refuse_policies: None,
+                refuse_policies,
+                cas: Mutex::new(cas),
+                refuse_cas,
             })
+        }
+        fn all_cas(apps: &[AccessApp]) -> HashMap<String, String> {
+            apps.iter()
+                .map(|a| (a.id.clone(), Self::ca_key(&a.id)))
+                .collect()
+        }
+        fn with(apps: Vec<AccessApp>) -> Arc<Self> {
+            let cas = Self::all_cas(&apps);
+            Self::build(Ok(apps), None, cas, None)
+        }
+        fn without_cas(apps: Vec<AccessApp>) -> Arc<Self> {
+            Self::build(Ok(apps), None, HashMap::new(), None)
+        }
+        fn refusing_cas(apps: Vec<AccessApp>, why: &str) -> Arc<Self> {
+            Self::build(Ok(apps), None, HashMap::new(), Some(why.to_string()))
         }
         fn refusing_policies(apps: Vec<AccessApp>, why: &str) -> Arc<Self> {
-            Arc::new(Self {
-                apps: Mutex::new(Ok(apps)),
-                reads: Mutex::new(0),
-                writes: Mutex::new(vec![]),
-                refuse_policies: Some(why.to_string()),
-            })
+            let cas = Self::all_cas(&apps);
+            Self::build(Ok(apps), Some(why.to_string()), cas, None)
         }
         fn dark(msg: &str) -> Arc<Self> {
-            Arc::new(Self {
-                apps: Mutex::new(Err(msg.to_string())),
-                reads: Mutex::new(0),
-                writes: Mutex::new(vec![]),
-                refuse_policies: None,
-            })
+            Self::build(Err(msg.to_string()), None, HashMap::new(), None)
         }
         fn writes(&self) -> Vec<String> {
             self.writes.lock().unwrap().clone()
@@ -2698,6 +2854,34 @@ measured = "2026-09-20: read from the IdP"
             }
             Ok(())
         }
+        async fn short_lived_ca(
+            &self,
+            account_id: &str,
+            app_id: &str,
+        ) -> Result<Option<String>, String> {
+            assert_eq!(account_id, "acct-1");
+            Ok(self.cas.lock().unwrap().get(app_id).cloned())
+        }
+        async fn create_short_lived_ca(
+            &self,
+            account_id: &str,
+            app_id: &str,
+        ) -> Result<String, String> {
+            assert_eq!(account_id, "acct-1");
+            self.writes
+                .lock()
+                .unwrap()
+                .push(format!("create ca on {app_id}"));
+            if let Some(why) = &self.refuse_cas {
+                return Err(why.clone());
+            }
+            let key = Self::ca_key(app_id);
+            self.cas
+                .lock()
+                .unwrap()
+                .insert(app_id.to_string(), key.clone());
+            Ok(key)
+        }
     }
 
     #[derive(Default)]
@@ -2769,8 +2953,10 @@ measured = "2026-09-20: read from the IdP"
     /// deleted that morning, 530 from then on (fd75c641).
     const OLD_TUNNEL_CNAME: &str = "8bb06ec8-a6d1-4796-8f51-df363798b48c.cfargotunnel.com";
     /// The converge packet's ingress line once tunnel-origins.toml routes
-    /// the IdP (the sibling car), as the runner records it.
-    const CONVERGE_ROUTES_IDP: &str = "boss.algedonic.dev → boss; playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin)";
+    /// the IdP (the sibling car) and the dev door (5fc71f03), as the
+    /// runner records it: both are declared origins, so both appear
+    /// here, and the tunnel interlock on either record reads it.
+    const CONVERGE_ROUTES_IDP: &str = "boss.algedonic.dev → boss; playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin); dev.algedonic.dev → ssh://boss-dev-ssh.boss-dev.svc.cluster.local:22 (origin)";
 
     fn converge_listing(ingress: &str) -> Json {
         json!({"data": [{
@@ -2799,6 +2985,13 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // The dev workspace's ssh door (5fc71f03), present here
+            // although it did not exist on 2026-09-16: each test below
+            // isolates ONE record's flip, and an absent interlocked
+            // record the test is not about would add a create to every
+            // write list. Its own creation is the subject of
+            // `the_dev_door_record_is_created_once_the_converge_routes_it`.
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ]
     }
 
@@ -2815,6 +3008,13 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // The dev workspace's ssh door (5fc71f03). It is absent
+            // from `as_measured` deliberately: it did not exist on
+            // 2026-09-16, so every fixture of the zone BEFORE the flip
+            // is now one record short of the declaration, and each
+            // test below that observes such a zone sees the observer
+            // create this one behind its tunnel interlock.
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ]
     }
 
@@ -2854,6 +3054,15 @@ measured = "2026-09-20: read from the IdP"
                     precedence: 1,
                 }],
             ),
+            // The dev workspace's ssh door (5fc71f03): the only
+            // application of another `type`, which is why it is here
+            // rather than only in its own test — every MATCH fixture
+            // must carry it, or the type a live read returns is one
+            // nothing compares.
+            AccessApp {
+                app_type: "ssh".into(),
+                ..live_app("dev.algedonic.dev", vec![allow("operators", &[DAVID])])
+            },
         ]
     }
 
@@ -3054,6 +3263,111 @@ measured = "2026-09-20: read from the IdP"
             .unwrap_or_else(|| panic!("no boss. verdict: {body}"))
     }
 
+    // ----- the dev door's short-lived-certificate CA (incident 55d001b0) -----
+
+    /// 2026-09-23: the account held the dev door's application and no
+    /// CA for it — the dashboard offers only the account-wide
+    /// Access-for-Infrastructure CA — so `cloudflared access ssh` was
+    /// refused "bad ca application". The observer generates it and
+    /// records the public key the pod's sshd must trust.
+    #[tokio::test]
+    async fn the_dev_door_ca_is_generated_and_its_public_key_recorded() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let access = FakeAccess::without_cas(account_as_declared());
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        assert_eq!(
+            access.writes(),
+            vec!["create ca on app-dev.algedonic.dev".to_string()],
+            "only the application that declares a CA gets one"
+        );
+        let w = writes(&captured);
+        assert_eq!(w.len(), 1, "no alarm: {w:?}");
+        let body = step_put(&w);
+        assert_eq!(body["metadata"]["result"], "match");
+        assert_eq!(
+            body["metadata"]["applied"],
+            json!(["Access short-lived certificate CA created on dev.algedonic.dev"])
+        );
+        assert_eq!(
+            body["metadata"]["ssh_ca"],
+            json!([{
+                "domain": "dev.algedonic.dev",
+                "public_key": "ecdsa-sha2-nistp256 CA-OF-app-dev.algedonic.dev",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_ca_is_recorded_and_not_generated_again() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        assert!(access.writes().is_empty(), "{:?}", access.writes());
+        let body = step_put(&writes(&captured));
+        assert_eq!(
+            body["metadata"]["ssh_ca"],
+            json!([{
+                "domain": "dev.algedonic.dev",
+                "public_key": "ecdsa-sha2-nistp256 CA-OF-app-dev.algedonic.dev",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_ca_is_a_finding_that_names_the_account_answer() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let why = "POST /accounts/acct-1/access/apps/app-dev.algedonic.dev/ca returned 403";
+        let access = FakeAccess::refusing_cas(account_as_declared(), why);
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        let w = writes(&captured);
+        assert!(
+            w.iter().any(|(p, _)| p == "POST /api/jobs"),
+            "a refused CA raises the alarm: {w:?}"
+        );
+        let body = step_put(&w);
+        assert_eq!(body["metadata"]["result"], "findings");
+        assert_eq!(body["metadata"]["ssh_ca"], json!([]));
+        let refused: Vec<&Json> = body["metadata"]["access"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["verdict"] == "REFUSED")
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            refused[0]["write"],
+            "create short-lived certificate CA on dev.algedonic.dev"
+        );
+        assert_eq!(refused[0]["error"], why);
+    }
+
     // ----- steady state -----
 
     #[tokio::test]
@@ -3089,7 +3403,7 @@ measured = "2026-09-20: read from the IdP"
             "existing step metadata rides along"
         );
         let verdicts = body["metadata"]["verdicts"].as_array().unwrap();
-        assert_eq!(verdicts.len(), 4, "boss., id., playground. and www.");
+        assert_eq!(verdicts.len(), 5, "boss., id., playground., www. and dev.");
         assert!(
             verdicts.iter().all(|v| v["verdict"] == "MATCH"),
             "{verdicts:?}"
@@ -3111,8 +3425,8 @@ measured = "2026-09-20: read from the IdP"
         let access_v = body["metadata"]["access"].as_array().unwrap();
         assert_eq!(
             access_v.len(),
-            4,
-            "boss., www., the playground and its callback bypass"
+            5,
+            "boss., www., dev., the playground and its callback bypass"
         );
         assert!(
             access_v.iter().all(|v| v["verdict"] == "MATCH"),
@@ -3122,8 +3436,8 @@ measured = "2026-09-20: read from the IdP"
         let summary = body["metadata"]["summary"].as_str().unwrap();
         assert!(
             summary.contains(
-                "4 match, 0 drift, 0 absent, 0 undeclared — every declared record matches"
-            ) && summary.contains("· access: 4 match, 0 drift, 0 absent, 0 undeclared"),
+                "5 match, 0 drift, 0 absent, 0 undeclared — every declared record matches"
+            ) && summary.contains("· access: 5 match, 0 drift, 0 absent, 0 undeclared"),
             "{summary}"
         );
     }
@@ -3175,7 +3489,7 @@ measured = "2026-09-20: read from the IdP"
             ]
         );
         assert_eq!(*zone.reads.lock().unwrap(), 2, "read back after the apply");
-        assert_eq!(zone.live().len(), 4, "no A left beside the CNAME");
+        assert_eq!(zone.live().len(), 5, "no A left beside the CNAME");
 
         let w = writes(&captured);
         assert_eq!(
@@ -3359,6 +3673,57 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(kept[0]["refused"], "x", "and the refusal is still recorded");
     }
 
+    /// The dev workspace's ssh door (design 5fc71f03; backlog
+    /// e4cedb46). Its record rides the SAME interlock the IdP's does —
+    /// applied only once the converge reports the tunnel routing it —
+    /// because a CNAME to a tunnel with no rule for the name is the
+    /// 530 of 2026-09-16, and an ssh door that answers 530 looks
+    /// exactly like an ssh door that is down.
+    #[tokio::test]
+    async fn the_dev_door_record_is_created_once_the_converge_routes_it() {
+        let without_dev: Vec<Json> = as_declared()
+            .into_iter()
+            .filter(|r| r["name"] != "dev.algedonic.dev")
+            .collect();
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(without_dev.clone());
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(jobs, zone.clone(), access, secrets(), declarations());
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+        assert_eq!(
+            zone.writes(),
+            vec![format!(
+                "create dev.algedonic.dev CNAME {} proxied=true ttl=1",
+                tunnel_cname()
+            )],
+            "the door's record created behind the tunnel interlock, nothing else touched"
+        );
+        let body = step_put(&writes(&captured));
+        let dev = body["metadata"]["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "dev.algedonic.dev")
+            .cloned()
+            .unwrap_or_else(|| panic!("no dev. verdict: {body}"));
+        assert_eq!(dev["tunnel"], "routed");
+
+        // With a converge that does not name it, nothing is written:
+        // the record waits for the route rather than answering 530.
+        let (jobs, _captured) = stub_jobs_api_with_converge(
+            "ready",
+            vec![],
+            LOCATION,
+            "boss.algedonic.dev → boss; id.algedonic.dev → https://10.20.0.31:443 (origin)",
+        )
+        .await;
+        let zone = FakeZone::with(without_dev);
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(jobs, zone.clone(), access, secrets(), declarations());
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+        assert!(zone.writes().is_empty(), "held: {:?}", zone.writes());
+    }
+
     /// The 2026-09-16 outage (fd75c641): the IdP's record pointed at
     /// the deleted tunnel. With the converge routing id. (the sibling
     /// car landed) the observer corrects the CNAME in place behind the
@@ -3377,6 +3742,9 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // Already applied, so the id. correction is the only write
+            // this test has to account for (see `as_measured`).
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ];
         let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
         let zone = FakeZone::with(stale.clone());
@@ -3493,6 +3861,12 @@ measured = "2026-09-20: read from the IdP"
         struct RefusingAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for RefusingAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 self.0.access_apps(a).await
             }
@@ -3684,6 +4058,12 @@ measured = "2026-09-20: read from the IdP"
         struct StubbornAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for StubbornAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 self.0.access_apps(a).await
             }
@@ -3766,6 +4146,12 @@ measured = "2026-09-20: read from the IdP"
         struct LaggingAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for LaggingAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 let apps = self.0.access_apps(a).await?;
                 Ok(apps

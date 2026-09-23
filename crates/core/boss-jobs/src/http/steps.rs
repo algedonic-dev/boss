@@ -552,7 +552,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // `boss dispatch` writes the new id through that door right after
     // the claim (the claim route itself never touches metadata), so a
     // carried-forward value can never outlive the next dispatch. What
-    // survives here is OMISSION, nothing more.
+    // survives here is OMISSION, nothing more. Nor can it outlive a
+    // change of holder by any other door: the claim CAS drops the edge
+    // when the step passes to someone else (9562f6df), which is where
+    // its freshness is decided — not here.
     if let Some(old_obj) = old.metadata.as_object()
         && let Some(run) = old_obj.get(crate::agent_runs::EDGE_KEY).cloned()
         && let Some(obj) = step.metadata.as_object_mut()
@@ -1634,6 +1637,22 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // reads its Subject identity.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
 
+    // The step's agent block as every gate below reads it: the packet's
+    // own projection, else its kind's ACTIVE row (backlog 51aef4dd) —
+    // the resolution the station queue made, so the door an agent
+    // claims through agrees with the queue it read. Read only when the
+    // step carries no projection; best-effort, since a registry that
+    // cannot answer leaves the step as recorded, which is how every
+    // claim was judged before. `old` itself stays as recorded: it is
+    // what the CAS writes back, and the resolution is never written.
+    let active_row = match (&state.kind_registry, &parent_job) {
+        (Some(reg), Some(job)) if crate::agent_spec::projected(&old.metadata).is_none() => {
+            reg.get_active(&job.kind).await.ok()
+        }
+        _ => None,
+    };
+    let resolved = crate::agent_spec::resolved(&old, active_row.as_ref());
+
     // The claimant's agents row, read once for the two gates below:
     // the station's model capability and the budget reservation.
     // `None` is a person or an unregistered login — neither gate
@@ -1685,7 +1704,8 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         };
         let needs_steps = bound.as_ref().is_some_and(|s| s.predicate.needs_steps());
         let steps = if needs_steps {
-            state.jobs.list_steps(&job_id).await.unwrap_or_default()
+            let steps = state.jobs.list_steps(&job_id).await.unwrap_or_default();
+            crate::agent_spec::resolved_steps(&steps, active_row.as_ref())
         } else {
             Vec::new()
         };
@@ -1772,7 +1792,8 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     if let (Some(door), Some(row), Some(budget_usd)) = (
         state.agent_budget.as_ref(),
         agent_row.as_ref(),
-        old.metadata
+        resolved
+            .metadata
             .get(crate::agent_spec::BUDGET_KEY)
             .and_then(|v| v.as_f64()),
     ) {
@@ -1815,7 +1836,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // After the budget gate, because `BudgetDecision::decide` reports
     // money before concurrency and the two doors keep that order.
     if let Some(row) = agent_row.as_ref()
-        && crate::agent_budget::declares_an_agent_run(&old.metadata)
+        && crate::agent_budget::declares_an_agent_run(&resolved.metadata)
         && let Some(cap) = row.max_concurrent_runs.and_then(|n| u32::try_from(n).ok())
     {
         // Every spelling of the actor: the registered id and the
@@ -1865,6 +1886,17 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     let mut claimed = old.clone();
     claimed.assignee_id = Some(user.id.clone());
     claimed.status = StepStatus::Active;
+    // The CAS drops the previous run's edge when the holder changes
+    // (9562f6df); the event says so too, or the log would go on naming
+    // a run the row no longer names. The claimant's aliases come from
+    // its agents row — the same holder the CAS reads as `me`.
+    let aliases = agent_row
+        .as_ref()
+        .map(|r| r.aliases.as_slice())
+        .unwrap_or_default();
+    if crate::agent_runs::claim_changes_holder(old.assignee_id.as_deref(), &user.id, aliases) {
+        claimed.metadata = crate::agent_runs::without_edge(&claimed.metadata);
+    }
 
     let mut claim_events = vec![stamp.event(
         events::STEP_UPDATED,

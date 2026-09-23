@@ -29,7 +29,8 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::car::{self, Receipt};
 
 use super::common::{
-    StepEvent, api_client, dispatcher_actor_header, get_json, owner_for_filing, write_json,
+    StepEvent, api_client, dispatcher_actor_header, get_json, owner_for_filing, rows_or_refuse,
+    write_json,
 };
 
 pub struct JobsAutoPark {
@@ -178,6 +179,30 @@ struct AutoParkInputs {
     /// aggregate a train's tiers without a checkout. Empty when the
     /// gate could not classify the diff: absent, never nulled.
     tiers: serde_json::Map<String, Value>,
+    /// THE WAIT THE BUILDER DECLARED AT PARK (backlog e9b164a1 piece 3):
+    /// the gate-run's `park_waits_on` object, as stamped. Not a ready
+    /// patch like the maps above, because a car that already exists may
+    /// carry fields the gate did not state — an `owner` added by hand —
+    /// and [`waits_on_patch`] merges into those rather than over them.
+    waits_on: Option<Value>,
+}
+
+/// PURE: the `waits_on` a park writes onto `existing` (the car's own
+/// job, or `None` for a car this green is about to file) — the gate's
+/// declaration MERGED into the car's (`car::merge_waits_on`), or nothing
+/// when the gate stated none. Absent, never nulled, like `tiers`: a
+/// re-gate with no `--park-waits-on` leaves a recorded wait alone.
+fn waits_on_patch(
+    existing: Option<&Value>,
+    inputs: &AutoParkInputs,
+) -> serde_json::Map<String, Value> {
+    let recorded = existing.and_then(|c| c.pointer(&format!("/metadata/{}", car::WAITS_ON)));
+    inputs
+        .waits_on
+        .as_ref()
+        .and_then(|stated| car::merge_waits_on(recorded, stated))
+        .map(|w| serde_json::Map::from_iter([(car::WAITS_ON.to_string(), w)]))
+        .unwrap_or_default()
 }
 
 /// PURE: what a green verdict stamps on a gate-run that re-gated a red
@@ -205,13 +230,14 @@ fn flake_stamp(gate_run: &Value, verdict_meta: &serde_json::Map<String, Value>) 
 /// `regate_*` beside the receipt that superseded the first one; and the
 /// item provenance, since a re-gate may be the run where the builder
 /// first said which item this car is a piece of.
-fn refresh_patch(inputs: &AutoParkInputs, note: &str) -> Value {
+fn refresh_patch(car: &Value, inputs: &AutoParkInputs, note: &str) -> Value {
     let mut patch = car::regate_patch(&inputs.receipt, note, inputs.delivery_channel.as_deref());
     if let Some(m) = patch.as_object_mut() {
         m.extend(inputs.proof.clone());
         m.extend(inputs.flake.clone());
         m.extend(inputs.agent_run.clone());
         m.extend(inputs.tiers.clone());
+        m.extend(waits_on_patch(Some(car), inputs));
         m.extend(car::regate_prose(
             &inputs.summary,
             &inputs.excludes,
@@ -315,6 +341,10 @@ fn auto_park_inputs(
             .unwrap_or_default(),
         agent_run: agent_run_of(md),
         tiers: car::tier_stamps(md),
+        waits_on: md
+            .get(car::PARK_WAITS_ON)
+            .filter(|w| w.is_object())
+            .cloned(),
     })
 }
 
@@ -484,6 +514,7 @@ fn adopt_patch(car: &Value, inputs: &AutoParkInputs) -> Value {
     patch.extend(inputs.flake.clone());
     patch.extend(inputs.agent_run.clone());
     patch.extend(inputs.tiers.clone());
+    patch.extend(waits_on_patch(Some(car), inputs));
     patch.extend(clear_stale_item_answer(car, inputs));
     if let Some(dc) = inputs.delivery_channel.as_deref() {
         patch.insert("delivery_channel".to_string(), json!(dc));
@@ -732,6 +763,7 @@ fn car_body_with_proof(inputs: &AutoParkInputs, owner: &str) -> Value {
         md.extend(inputs.flake.clone());
         md.extend(inputs.agent_run.clone());
         md.extend(inputs.tiers.clone());
+        md.extend(waits_on_patch(None, inputs));
     }
     body
 }
@@ -854,11 +886,12 @@ impl Handler for JobsAutoPark {
                 &ctx.rule_name,
             )
             .await?;
-            let rows: Vec<Value> = page
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            // A page with no `data` array is NO ANSWER. Read as zero
+            // cars it sent `park_action` to `File` — a twin of the car
+            // at the dock — so this read fails toward a write, and it
+            // refuses rather than guess (backlog 37fc5837).
+            let rows: Vec<Value> = rows_or_refuse(&page, "the open-car read (GET /api/jobs)")
+                .map_err(HandlerError::Downstream)?;
             let got = rows.len();
             cars.extend(rows);
             let total = page
@@ -900,17 +933,12 @@ impl Handler for JobsAutoPark {
             &ctx.rule_name,
         )
         .await?;
-        let all: Vec<Value> = cars
-            .iter()
-            .cloned()
-            .chain(
-                closed
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-            .collect();
+        // The same refusal, for the same reason: read as "nothing
+        // landed", an error-shaped body files a car for work already on
+        // main (backlog 37fc5837).
+        let landed: Vec<Value> = rows_or_refuse(&closed, "the landed-car read (GET /api/jobs)")
+            .map_err(HandlerError::Downstream)?;
+        let all: Vec<Value> = cars.iter().cloned().chain(landed).collect();
         // ONE DECISION, taken on what the SoR holds: skip (landed, or
         // aboard a train), refresh the car at the dock, finish the car a
         // builder opened, or file.
@@ -942,7 +970,7 @@ impl Handler for JobsAutoPark {
                 &inputs.receipt.head[..12.min(inputs.receipt.head.len())],
                 ev.job_id
             );
-            let patch = refresh_patch(&inputs, &note);
+            let patch = refresh_patch(parked, &inputs, &note);
             write_json(
                 &self.client,
                 reqwest::Method::PATCH,
@@ -1112,7 +1140,9 @@ impl Handler for JobsAutoPark {
         // readiness so the next is ready. A step the OPEN already
         // completed is skipped — the step API refuses a metadata write to
         // a completed step, so re-sending `scope` would 409 on every car
-        // a builder opened.
+        // a builder opened. Each is the evidence through the step merge
+        // door, THEN a status-only PUT — a PUT carrying metadata replaces
+        // the step's stored keys wholesale (backlog e39a9d2a).
         for w in car::finish_writes(
             &car,
             &inputs.summary,
@@ -1126,9 +1156,17 @@ impl Handler for JobsAutoPark {
         {
             write_json(
                 &self.client,
+                reqwest::Method::PATCH,
+                &format!("{}{}", self.base(), w.merge_path(car_id)),
+                &w.metadata,
+                &ctx.rule_name,
+            )
+            .await?;
+            write_json(
+                &self.client,
                 reqwest::Method::PUT,
-                &format!("{}/api/jobs/{}/steps/{}", self.base(), car_id, w.step_id),
-                &w.body,
+                &format!("{}{}", self.base(), w.status_path(car_id)),
+                &w.status_body,
                 &ctx.rule_name,
             )
             .await?;
@@ -1184,7 +1222,7 @@ mod tests {
             "park_expect": "ok",
         }));
         let inputs = auto_park_inputs(&gr, &green_step_meta()).expect("parks");
-        let patch = refresh_patch(&inputs, "re-gated in place");
+        let patch = refresh_patch(&json!({}), &inputs, "re-gated in place");
         assert_eq!(
             patch["regate_summary"],
             "rebuilt: now does the other thing. detail."
@@ -1210,7 +1248,7 @@ mod tests {
         // words must survive a later one that said nothing.
         let bare = gate_run(json!({ "park_summary": "only a summary." }));
         let inputs = auto_park_inputs(&bare, &green_step_meta()).expect("parks");
-        let patch = refresh_patch(&inputs, "n");
+        let patch = refresh_patch(&json!({}), &inputs, "n");
         assert_eq!(patch["regate_summary"], "only a summary.");
         assert!(patch.get("regate_test").is_none(), "{patch}");
         assert!(patch.get("regate_verified").is_none(), "{patch}");
@@ -1235,7 +1273,7 @@ mod tests {
         let body = car_body_with_proof(&inputs, "emp-owner");
         assert_eq!(body["metadata"]["flake_of"], "aaaa1111-0000");
         assert_eq!(body["metadata"]["flaky_checks"], json!(["test"]));
-        let patch = refresh_patch(&inputs, "re-gated in place");
+        let patch = refresh_patch(&json!({}), &inputs, "re-gated in place");
         assert_eq!(patch["flake_of"], "aaaa1111-0000");
         assert_eq!(patch["flaky_checks"], json!(["test"]));
     }
@@ -1263,7 +1301,11 @@ mod tests {
         let inputs = auto_park_inputs(&plain, &green_step_meta()).expect("parks");
         let body = car_body_with_proof(&inputs, "emp-owner");
         assert!(body["metadata"].get("flake_of").is_none(), "{body}");
-        assert!(refresh_patch(&inputs, "n").get("flake_of").is_none());
+        assert!(
+            refresh_patch(&json!({}), &inputs, "n")
+                .get("flake_of")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1360,7 +1402,7 @@ mod tests {
             "5b1d2c3e-0000-4000-8000-000000000001"
         );
         assert_eq!(
-            refresh_patch(&got, "n")["agent_run"],
+            refresh_patch(&json!({}), &got, "n")["agent_run"],
             "5b1d2c3e-0000-4000-8000-000000000001"
         );
         let car = json!({ "metadata": { "branch": "fix/x" } });
@@ -1385,7 +1427,11 @@ mod tests {
                     .get("agent_run")
                     .is_none()
             );
-            assert!(refresh_patch(&got, "n").get("agent_run").is_none());
+            assert!(
+                refresh_patch(&json!({}), &got, "n")
+                    .get("agent_run")
+                    .is_none()
+            );
             assert!(adopt_patch(&car, &got).get("agent_run").is_none());
         }
     }
@@ -1406,7 +1452,7 @@ mod tests {
         let car = json!({ "metadata": { "branch": "fix/x" } });
         for md in [
             car_body_with_proof(&got, "emp-owner")["metadata"].clone(),
-            refresh_patch(&got, "n"),
+            refresh_patch(&json!({}), &got, "n"),
             adopt_patch(&car, &got),
         ] {
             assert_eq!(md["software_tiers"], json!(["core", "frontend"]));
@@ -1419,11 +1465,56 @@ mod tests {
         let got = auto_park_inputs(&plain, &green_step_meta()).expect("parks");
         for md in [
             car_body_with_proof(&got, "o")["metadata"].clone(),
-            refresh_patch(&got, "n"),
+            refresh_patch(&json!({}), &got, "n"),
             adopt_patch(&car, &got),
         ] {
             assert!(md.get("software_tiers").is_none());
             assert!(md.get("software_tier").is_none());
+        }
+    }
+
+    /// THE DECLARED WAIT RIDES ONTO THE CAR, MERGED (backlog e9b164a1
+    /// piece 3). `boss gate --park-waits-on` stamps `park_waits_on`; the
+    /// car must end up carrying it as `waits_on`, the key the shed reads.
+    /// A filed car takes it as stated. A car that already exists — at the
+    /// dock for a refresh, opened at build start for an adopt — keeps any
+    /// field the gate did not state, because an `owner` added to it by
+    /// hand must not be dropped by the builder's re-gate: a wait without
+    /// an owner reads as ours. A gate-run with no wait writes nothing
+    /// and nulls nothing.
+    #[test]
+    fn the_gates_declared_wait_is_merged_onto_the_car_on_every_park_path() {
+        let stated = json!({"on": "a release", "seen": "true"});
+        let gr = gate_run(json!({
+            "park_summary": "s", "park_excludes": "e", "park_test": "t", "park_verified": "v",
+            (car::PARK_WAITS_ON): stated.clone(),
+        }));
+        let got = auto_park_inputs(&gr, &green_step_meta()).expect("parks");
+        assert_eq!(
+            car_body_with_proof(&got, "o")["metadata"][car::WAITS_ON],
+            stated
+        );
+        let car = json!({ "metadata": {
+            "branch": "fix/x",
+            (car::WAITS_ON): {"on": "an older wording", "seen": null, (car::WAITS_ON_OWNER): "emp-david"},
+        }});
+        for md in [refresh_patch(&car, &got, "n"), adopt_patch(&car, &got)] {
+            assert_eq!(
+                md[car::WAITS_ON],
+                json!({"on": "a release", "seen": "true", (car::WAITS_ON_OWNER): "emp-david"})
+            );
+        }
+
+        let plain = gate_run(json!({
+            "park_summary": "s", "park_excludes": "e", "park_test": "t", "park_verified": "v",
+        }));
+        let got = auto_park_inputs(&plain, &green_step_meta()).expect("parks");
+        for md in [
+            car_body_with_proof(&got, "o")["metadata"].clone(),
+            refresh_patch(&car, &got, "n"),
+            adopt_patch(&car, &got),
+        ] {
+            assert!(md.get(car::WAITS_ON).is_none(), "{md}");
         }
     }
 
@@ -2170,6 +2261,7 @@ mod building_car_tests {
             flake: serde_json::Map::new(),
             agent_run: serde_json::Map::new(),
             tiers: serde_json::Map::new(),
+            waits_on: None,
         };
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-10T18:30:00Z")
             .unwrap()
@@ -2186,7 +2278,7 @@ mod building_car_tests {
         .expect("an opened car can be finished");
         let ids: Vec<&str> = writes.iter().map(|w| w.step_id.as_str()).collect();
         assert_eq!(ids, vec!["s-build", "s-gate"], "scope is already declared");
-        assert_eq!(writes[1].body["metadata"]["receipt"], inputs.receipt.raw);
+        assert_eq!(writes[1].metadata["receipt"], inputs.receipt.raw);
 
         // The proof intent and the channel ride the JOB, not a step, so
         // an adopted car carries what a freshly filed one would.
@@ -2230,6 +2322,7 @@ mod building_car_tests {
             flake: serde_json::Map::new(),
             agent_run: serde_json::Map::new(),
             tiers: serde_json::Map::new(),
+            waits_on: None,
         };
         let patch = adopt_patch(&building(), &inputs);
         assert_eq!(
@@ -2285,6 +2378,7 @@ mod building_car_tests {
             flake: serde_json::Map::new(),
             agent_run: serde_json::Map::new(),
             tiers: serde_json::Map::new(),
+            waits_on: None,
         };
         let patch = adopt_patch(&opened, &inputs);
         assert_explicit_null!(
@@ -2354,6 +2448,7 @@ mod building_car_tests {
             flake: serde_json::Map::new(),
             agent_run: serde_json::Map::new(),
             tiers: serde_json::Map::new(),
+            waits_on: None,
         };
 
         // ONE PIECE, stated at open and confirmed at the gate.
@@ -2428,6 +2523,7 @@ mod building_car_tests {
                 flake: serde_json::Map::new(),
                 agent_run: serde_json::Map::new(),
                 tiers: serde_json::Map::new(),
+                waits_on: None,
             }
         };
         let opened = |key: &str, value: &str| {
@@ -2502,6 +2598,7 @@ mod building_car_tests {
                 flake: serde_json::Map::new(),
                 agent_run: serde_json::Map::new(),
                 tiers: serde_json::Map::new(),
+                waits_on: None,
             }
         };
         // The gate names the closing edge too: agreement, not conflict.
@@ -2554,6 +2651,7 @@ mod building_car_tests {
             flake: serde_json::Map::new(),
             agent_run: serde_json::Map::new(),
             tiers: serde_json::Map::new(),
+            waits_on: None,
         };
         let patch = adopt_patch(&building(), &inputs);
         assert!(
@@ -2624,5 +2722,100 @@ mod building_car_tests {
             }
             other => panic!("the rerailed building car is the one to finish: {other:?}"),
         }
+    }
+}
+
+/// AN ERROR-SHAPED LISTING NEVER PARKS (backlog 37fc5837). Both car
+/// reads here fail TOWARD A WRITE: read as "no cars", a body with no
+/// `data` array sends `park_action` to `File`, which is a twin of a car
+/// already at the dock, or a car for work that has already landed.
+/// Driven end to end, so each test fails on its own read site.
+#[cfg(test)]
+mod no_data_array_tests {
+    use super::*;
+    use crate::handlers::listing_stub::{
+        assert_refused_by_name, empty_listing, no_data_array, serve,
+    };
+
+    const GATE_RUN: &str = "0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+
+    fn green_gate_run() -> Value {
+        json!({
+            "id": GATE_RUN,
+            "kind": "gate-run",
+            "metadata": {
+                "branch": "fix/x",
+                "sha": "abc",
+                "park_summary": "does a thing.",
+                "park_excludes": "not that",
+                "park_test": "ran it",
+                "park_verified": "seen",
+            },
+        })
+    }
+
+    fn green_verdict() -> InvocationContext {
+        InvocationContext {
+            rule_name: "jobs.auto-park".into(),
+            triggering_event_id: "evt-green-1".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_payload: json!({
+                "job_id": GATE_RUN,
+                "step_id": "s-verdict",
+                "kind": "gate-verdict",
+                "metadata": {
+                    "verdict": "green",
+                    "receipt": "{\"verdict\":\"green\",\"head\":\"deadbeef\",\"mode\":\"full\",\"fails\":[]}",
+                },
+            }),
+        }
+    }
+
+    fn handler(base: String) -> Arc<JobsAutoPark> {
+        JobsAutoPark::new(
+            base,
+            "http://unused",
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_open_car_read_with_no_data_array_refuses_and_files_nothing() {
+        let stub = serve(vec![
+            (
+                "/api/jobs/0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+                green_gate_run(),
+            ),
+            ("/api/jobs?status=open", no_data_array()),
+            ("/api/jobs?status=closed", empty_listing()),
+        ])
+        .await;
+        let res = handler(stub.base.clone())
+            .invoke(&[], &green_verdict())
+            .await;
+        assert_eq!(stub.writes(), Vec::<String>::new(), "no car filed blind");
+        assert_refused_by_name(res, "the open-car read");
+    }
+
+    #[tokio::test]
+    async fn a_landed_car_read_with_no_data_array_refuses_and_files_nothing() {
+        let stub = serve(vec![
+            (
+                "/api/jobs/0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+                green_gate_run(),
+            ),
+            ("/api/jobs?status=open", empty_listing()),
+            ("/api/jobs?status=closed", no_data_array()),
+        ])
+        .await;
+        let res = handler(stub.base.clone())
+            .invoke(&[], &green_verdict())
+            .await;
+        assert_eq!(
+            stub.writes(),
+            Vec::<String>::new(),
+            "no car filed for work that may have landed"
+        );
+        assert_refused_by_name(res, "the landed-car read");
     }
 }

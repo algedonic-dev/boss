@@ -78,6 +78,7 @@ struct JobRow {
     status: String,
     priority: String,
     opened_on: chrono::NaiveDate,
+    opened_at: Option<chrono::DateTime<chrono::Utc>>,
     due_on: Option<chrono::NaiveDate>,
     closed_on: Option<chrono::NaiveDate>,
     metadata: serde_json::Value,
@@ -149,6 +150,7 @@ fn row_to_job(r: JobRow) -> Job {
         status: parse_job_status(&r.status),
         priority: parse_priority(&r.priority),
         opened_on: r.opened_on,
+        opened_at: r.opened_at,
         due_on: r.due_on,
         closed_on: r.closed_on,
         metadata: r.metadata,
@@ -460,9 +462,9 @@ impl JobsRepository for PgJobs {
         let result = sqlx::query(
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
-                              status, priority, opened_on, due_on, closed_on, metadata, tags,
+                              status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags,
                               workflow_version, created_at, updated_at, partition, simulated)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, $18)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -475,6 +477,11 @@ impl JobsRepository for PgJobs {
         .bind(job_status_str(job.status))
         .bind(priority_str(job.priority))
         .bind(job.opened_on)
+        // The admission instant (backlog 6c2eba00). Written HERE and
+        // nowhere else: the UPDATE below leaves the column out, the
+        // same way it leaves `partition` out, so a later PUT carrying
+        // a different value cannot move when the packet arrived.
+        .bind(job.opened_at)
         .bind(job.due_on)
         .bind(job.closed_on)
         .bind(&job.metadata)
@@ -528,7 +535,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1",
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -543,7 +550,7 @@ impl JobsRepository for PgJobs {
     /// does, and the answer is deterministic on a busy day.
     async fn newest_closed_job(&self, kind: &str) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, partition \
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition \
              FROM jobs WHERE kind = $1 AND status = 'closed' \
              ORDER BY closed_on DESC NULLS LAST, opened_on DESC, created_at DESC, id LIMIT 1",
         )
@@ -582,9 +589,10 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        // `partition` (and its derived `simulated`) is deliberately
-        // absent from the SET list: a Job's origin is decided at
-        // admission and never revisited.
+        // `partition` (and its derived `simulated`) and `opened_at`
+        // are deliberately absent from the SET list: a Job's origin
+        // and the instant it was admitted are decided at admission and
+        // never revisited.
         // The storage enforces the immutability rather than trusting
         // every caller to (same rule as rebuild.rs's upsert).
         let result = sqlx::query(
@@ -669,7 +677,7 @@ impl JobsRepository for PgJobs {
                 updated_at = $4
             WHERE id = $1
             RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
-                      status, priority, opened_on, due_on, closed_on, metadata, tags, partition
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             "#,
         )
         .bind(*id.inner().as_uuid())
@@ -811,22 +819,38 @@ impl JobsRepository for PgJobs {
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &crate::port::EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError> {
+    ) -> Result<crate::port::EventPage, JobsError> {
         // The SQL lives in boss-events, which owns audit_log — this
         // crate already writes through its `record_event_in_tx`, and
         // reading through its helper keeps the table's ownership in
         // one place rather than growing a second copy of the query.
-        // `scope` travels down WITH the limit rather than being applied
-        // to the page that comes back: filtering here would leave a
-        // slow series exactly as unreadable as it was before.
-        let rows = boss_events::tail_http::recent_by_kind(&self.pool, kind, scope, limit)
-            .await
-            .map_err(JobsError::Storage)?;
-        rows.into_iter()
+        // The whole window travels down WITH the limit rather than
+        // being applied to the page that comes back: filtering here
+        // would leave a slow series, or an old window, exactly as
+        // unreadable as it was before.
+        let page = boss_events::tail_http::recent_by_kind(
+            &self.pool,
+            kind,
+            &boss_events::tail_http::KindWindow {
+                scope: window.scope.as_deref(),
+                since: window.since,
+                until: window.until,
+            },
+            limit,
+        )
+        .await
+        .map_err(JobsError::Storage)?;
+        let rows = page
+            .rows
+            .into_iter()
             .map(|r| serde_json::to_value(r).map_err(|e| JobsError::Storage(e.to_string())))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::port::EventPage {
+            rows,
+            total: page.total,
+        })
     }
 
     async fn step_flow_cube(
@@ -894,7 +918,7 @@ impl JobsRepository for PgJobs {
             UPDATE jobs SET workflow_version = $2, updated_at = $3
             WHERE id = $1
             RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
-                      status, priority, opened_on, due_on, closed_on, metadata, tags, partition
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             "#,
         )
         .bind(*id.inner().as_uuid())
@@ -962,7 +986,7 @@ impl JobsRepository for PgJobs {
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
             SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status,
-                   priority, opened_on, due_on, closed_on, metadata, tags, partition
+                   priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
               -- $13 is the terminal retention window. With it, $2 is
@@ -1366,6 +1390,17 @@ impl JobsRepository for PgJobs {
         // Directional on purpose — an alias claiming a step the
         // registered id holds is not `me`, because nothing signs as
         // the alias any more.
+        //
+        // AND A NEW HOLDER DOES NOT INHERIT THE PREVIOUS RUN'S EDGE
+        // (backlog 9562f6df). When the stored holder is not `me` —
+        // which the WHERE below admits only as NULL — the claim hands
+        // the step to a different executor, so the `agent_run` edge
+        // ($4) the last run left is dropped in the same statement. The
+        // SET reads the OLD `assignee_id`, and a holder in `me` (the
+        // claimant, or its alias being respelled) keeps the edge: a
+        // re-claim is idempotent. Same rule as
+        // `agent_runs::claim_changes_holder`, which the route uses for
+        // the event it records.
         let row = sqlx::query(
             r#"
             WITH me AS (
@@ -1373,7 +1408,15 @@ impl JobsRepository for PgJobs {
                 UNION
                 SELECT alias FROM actor_aliases WHERE actor_id = $2
             )
-            UPDATE steps SET assignee_id = $2, status = 'active', updated_at = $3
+            UPDATE steps SET
+                assignee_id = $2,
+                status = 'active',
+                updated_at = $3,
+                metadata = CASE
+                    WHEN assignee_id IS NULL OR assignee_id NOT IN (SELECT id FROM me)
+                    THEN metadata - $4::text
+                    ELSE metadata
+                END
             WHERE id = $1
               AND (
                     (status = 'ready' AND (assignee_id IS NULL OR assignee_id IN (SELECT id FROM me)))
@@ -1385,6 +1428,7 @@ impl JobsRepository for PgJobs {
         .bind(*step_id.inner().as_uuid())
         .bind(actor)
         .bind(now)
+        .bind(crate::agent_runs::EDGE_KEY)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1941,10 +1985,17 @@ impl JobsRepository for PgJobs {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Vec<LaunchCalendarRow>, JobsError> {
-        // Every open/pending/pending-sign-off marketing-motion joined
-        // to its single launch step (the one carrying launch_date). We pull the
-        // launch_date + launch_channel out of step metadata in SQL so
-        // the caller doesn't have to fetch the step rows separately.
+        // Every open/pending/pending-sign-off Job joined to each of its
+        // launch steps (the ones carrying launch_date), one row per
+        // launch step. The Job's kind is not read: a packet is on the
+        // calendar because a step carries the `launch_date` field the
+        // StepType registry declares, never because its kind is a name
+        // spelled here (backlog 649b3303 — this read filtered on a
+        // tenant Workflow kind, `marketing-motion`, in Tier 1). The join
+        // is therefore INNER: a Job with no launch step is not a launch.
+        // We pull the launch_date + launch_channel out of step metadata
+        // in SQL so the caller doesn't have to fetch the step rows
+        // separately.
         // `current_tier` mirrors the computation in
         // `jobs_tier_distribution` (min non-done sort_order; -1 when
         // everything is terminal).
@@ -1999,10 +2050,9 @@ impl JobsRepository for PgJobs {
                    l.launch_date,
                    l.launch_channel
             FROM jobs j
-            LEFT JOIN launches l ON l.job_id = j.id
+            JOIN launches l      ON l.job_id = j.id
             LEFT JOIN tiers t    ON t.job_id = j.id
-            WHERE j.kind = 'marketing-motion'
-              AND j.status NOT IN ('closed','cancelled')
+            WHERE j.status NOT IN ('closed','cancelled')
               AND (
                 l.launch_date IS NULL
                 OR l.launch_date BETWEEN $1 AND $2

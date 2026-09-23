@@ -197,11 +197,18 @@ async fn main() -> Result<()> {
     // but does not parse is refused here too, naming the file and
     // toml's line (api.rs `load_tenant_toml`, backlog 4f1ba1f9): the
     // configuration the router is built from, not a boot check.
-    let declared = api::load_tenant_toml()
+    let manifest = api::load_tenant_toml()
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("reading the tenant manifest")?
-        .map(|t| t.gateway.public_reads)
-        .unwrap_or_default();
+        .context("reading the tenant manifest")?;
+    // How many modules are on, said once at boot (design 1054c099;
+    // backlog fa77e3d7): prod ran with `modules = {}` — every
+    // module-gated surface off — and no line anywhere said so. Zero is
+    // legitimate, so it warns rather than refuses.
+    match api::modules_boot_line(manifest.as_ref()) {
+        (0, line) => tracing::warn!("{line}"),
+        (_, line) => tracing::info!("{line}"),
+    }
+    let declared = manifest.map(|t| t.gateway.public_reads).unwrap_or_default();
     let public_reads = public_reads::PublicReads::resolve(&declared)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("resolving [gateway] public_reads from the tenant manifest")?;
@@ -773,39 +780,13 @@ fn build_router(
     if let Some(la) = local_auth_state {
         // Passkey ceremony (docs/design/presence.md, packet 7218c3f1):
         // best-effort mount — a malformed BOSS_PUBLIC_URL must degrade
-        // to "no passkey routes", never crash the front door.
+        // to "no passkey routes", never crash the front door. The route
+        // list is `passkey_router`'s, the one the tests drive; it was
+        // spelled out here as well until backlog 3bddce66 (2026-09-23).
         let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
-            Ok(pk) => {
-                let pk = std::sync::Arc::new(pk);
-                app.route(
-                    "/api/auth/passkey/register/begin",
-                    axum::routing::post(boss_gateway::passkey::register_begin)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/register/finish",
-                    axum::routing::post(boss_gateway::passkey::register_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/begin",
-                    axum::routing::post(boss_gateway::passkey::assert_begin).with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/finish",
-                    axum::routing::post(boss_gateway::passkey::assert_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials",
-                    axum::routing::get(boss_gateway::passkey::credentials_list)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials/{credential_id}",
-                    axum::routing::delete(boss_gateway::passkey::credentials_remove).with_state(pk),
-                )
-            }
+            Ok(pk) => app.merge(boss_gateway::passkey::passkey_router(std::sync::Arc::new(
+                pk,
+            ))),
             Err(e) => {
                 tracing::warn!(error = %e, "passkey ceremony not mounted");
                 app

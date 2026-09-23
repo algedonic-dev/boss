@@ -72,7 +72,9 @@ Beer is the namesake and cybernetics is first among the three
 lineages, but **VSM vocabulary does not appear in BOSS code**. It used
 to, in exactly two crates — `boss-cybernetics` (whose own header read
 "Per-VM Cybernetics coordinator (VSM S2/S3)") and
-`boss-observability` — and both retire under design 8382bbb2. The
+`boss-observability` — and both retire under design 8382bbb2:
+`boss-cybernetics` retired on 2026-09-23 (below), and
+`boss-observability` retires in its own car. The
 mapping is recorded here so the correspondence outlives the code that
 carried the words, because a reader arriving from Beer must be able to
 find it and a reader arriving from the code must not have to learn a
@@ -92,19 +94,36 @@ S4-ish work and `boss-policy` does S5-ish work, but neither
 correspondence is tight enough to assert, and a mapping asserted
 loosely is the decoration this section exists to prevent.
 
-**Four of `boss-cybernetics`' five stated responsibilities already
-live elsewhere**, which is why it retires rather than being rebuilt:
-budget caps before dispatch, one-at-a-time dispatch and chaining on
-completion are all enforced at the claim door and by dispatcher rules;
-lifecycle telemetry is the audit log plus `agent_runs`. **The fifth is
-a real gap, not a translation**: its per-agent durable inbox has no
-successor yet, and the decision (8382bbb2) is that it lands as a
-**station** plus the existing `agent-run` kind rather than as a second
-coordinator — a station is already the systems word for a queue that
-holds work until there is capability, and that keeps one budget gate
-rather than two implementations of one rule. **Neither crate is
-deleted before that inbox exists**: retiring the old mechanism before
-the new one is live is how a capability is lost by accident.
+**`boss-cybernetics` is retired as SUPERSEDED-BY, not deleted as
+dead** (2026-09-23, backlog 467175e7, design 8382bbb2). Its design was
+right and was overtaken: every responsibility it stated now has an
+owner elsewhere, and the reason it goes is **coherence and one owner
+per rule** — two implementations of one budget gate, one dispatch door
+and one queue are two places for the same rule to drift. It is **not**
+a line-count win, and recording it as one would misrepresent why it
+went. What superseded what, so the record answers the question
+directly:
+
+| `boss-cybernetics` responsibility | superseded by |
+|---|---|
+| budget caps before dispatch | `boss-jobs/src/agent_budget.rs` — the claim door reserves the step's budget against the actor's hour, before the CAS |
+| one-at-a-time dispatch | `boss dispatch` — one `agent-run` packet per step, bounded by `agents.max_concurrent_runs` at the claim |
+| lifecycle telemetry | `agent_runs` plus the run packet's terminals |
+| chaining on completion | the `agent-run` workflow's terminals and the dispatcher rules firing off them |
+| the per-agent durable inbox | a **station** (923b6571), pulled through the same claim door by `boss dispatch --next --station` |
+
+The inbox was **the real gap, not a translation**, and the ordering
+this decision set was held: the crate did not leave the tree until the
+station inbox (923b6571), this mapping (6872efd4) and the reclaim of
+work a dead executor had claimed (a3397b01) had all landed, because
+retiring the old mechanism before the new one is live is how a
+capability is lost by accident. The inbox's caller is the operator's
+session: David decided on 2026-09-23 that running `boss dispatch
+--next` by hand counts as the runner having run (the session is the
+CPU, 57c108c2), so no headless runner stands in for the old loop. Its
+config (`infra/cybernetics/`) and its systemd unit left with it.
+`boss-observability`'s cross-VM view is superseded by a region of the
+IT world map and retires in a separate car under the same design.
 
 *Algedonic* signals keep their Beer meaning throughout: rules firing
 on threshold events, routed past the normal reporting line because
@@ -251,6 +270,25 @@ metadata is checked **at done, not at create**;
 (top-level fields replace wholesale; clients merge metadata keys).
 The Jobs list takes exactly one subject filter — `?subject_id=` —
 and the Job's subject column is `subject_id`.
+
+**A Job carries the instant it was admitted, not only the day**
+(design `f2cdff23`, David 2026-09-20, all three questions accepted as
+proposed; landed as backlog `6c2eba00`). `opened_on` is a date, and
+every surface that asks how long something has waited — the
+ops-runner's `oldest_wait_s`, dock wait and gate duration on the
+region map, the overdue alarms, the silence sweep that settles a dead
+agent run — needs the instant, which was `metadata.opened_at`: a
+convention the doors followed and a raw `POST` did not, and a missing
+stamp read as decades old rather than unknown. Decided: (1)
+**`opened_at` is a column**, server-stamped at admission and kept out
+of every UPDATE the way `partition` is; (2) **the back-fill is a
+projection of the log** — each packet's own `jobs.job.created` event,
+the derivation the rebuilder also applies — and a packet whose create
+event the log does not hold keeps `NULL`, because an instant nobody
+observed is worse than none; (3) **admission grows no create-time
+check** for declared-required fields as part of this — validators
+still run at done, and a server-stamped field needs none. The metadata
+stamp is still written for the readers already on it.
 
 The brewery's `wholesale-keg-order` is the worked example of
 agent-gated fulfillment: an `availability-gate` reads finished-goods
@@ -1046,6 +1084,26 @@ recorded before a run starts) sequence after the run is a recorded
 fact. Car 1 (registry + alias + resolution, window open) building
 2026-09-15.
 
+**A run reported as a bare total is priced at a declared blend, and
+says so** (design `91a9bfe7`, David 2026-09-20: "The blended rate for
+the cost of runs sounds fine"; all three questions accepted as
+proposed). Measured: 2 of 85 recorded runs carried any cost, because
+only an input/output split was priced and the harness that runs a
+dispatched builder reports one total — so both budget desks enforced
+their caps against about a fiftieth of the spend. Decided: (1) **the
+assumed input share is a per-model column on `agent_rate_card`**
+(`blended_input_share_ppm`), declared rather than hardcoded, NULL
+meaning undeclared and therefore unpriced; one row carries it,
+`opus-5[1m]` at 875,000 ppm, the only model with measured splits behind
+it; (2) **every figure names its basis** — `split` or `blended`,
+derived from the run's own token shape rather than stored — carried
+into every roll-up, where a bucket holding one blended run reports
+itself blended, the same rule that already makes a bucket with an
+unreported run answer `None`; a measured split always wins; (3) **the
+83 runs recorded before it stay unpriced** — marking them blended would
+record an assurance nobody has, so the series starts where the pricing
+does.
+
 ## Calendar
 
 Reservations store **UTC**; `strength` defaults `hard` for
@@ -1273,6 +1331,33 @@ car. Tooling stays mocked Playwright — hermetic, gated, already in
 the image; "more thorough" is more assertions per page, not a
 different tool.
 
+**What the website says is checked against what the record holds;
+whether it works is a reading with a threshold named first** (design
+`59a776c5`, 2026-09-20). Correct and effective are two protocols with
+two kinds of evidence. **Correct is a check:** a claim is marked in the
+page source (`data-claim="<id>"`) and a registry
+(`apps/web/src/marketing/claims.ts`) says which row answers it — David:
+"Marked claims are fine to start, let's go with that." The limit is
+accepted in the open: an UNMARKED claim is invisible to the check, so
+the checker's report carries the marked count and a prose fingerprint —
+the decidable stand-in for a coverage denominator nothing can know,
+since words that moved while the claim set did not are the prompt to
+mark what was added — and a claim whose row cannot be read is a
+refusal, never a green. The scope is www only, a site being a row so a
+second is data. The design decided a daily `check-the-claims` protocol
+plus a run on every publish, a disagreement FILING rather than paging —
+a price included, until one instance says a louder arm was wanted. The
+caller that shipped first is a gate test instead
+(`the-landing-page-claims.test.ts`, backlog `e1524f57`), where a
+disagreement reds the gate: every source kind today is a fact of the
+tree and can only drift through a commit, so the cadence arrives with
+the first `registry` source kind, which reads live data and moves
+without one. **Effective is `measure-the-page`**, already
+decided by the department template (`3613f0af`): visits by page and by
+week, and nothing else until that sensor has produced a decision, with
+the step requiring the reader to write down what the number would have
+to say to change anything BEFORE taking the reading — not yet built.
+
 ## OSS posture & tier boundaries
 
 Two install paths: single-VM bare metal (`infra/oss-quickstart/`)
@@ -1281,7 +1366,7 @@ topologies return as opt-in blueprints under `infra/blueprints/`.
 Crates split into **Tier 1 — core state-machine OS**
 (`crates/core/`, 27 crates: the four primitives' services, policy,
 gateway, dispatcher, clock, expression DSL, taxonomy registries,
-calendar, content, docs, ML stack, cybernetics, testing, ports,
+calendar, content, docs, ML stack, testing, ports,
 plus `*-client` crates) and **Tier 2 — company-modeling layer**
 (`crates/modules/`, 16 crates: people, accounts, commerce,
 inventory, shipping, ledger, products, messages, catalog, assets,
@@ -1297,6 +1382,30 @@ answer is a Workflow (`docs/design/seed-vs-emergent-state.md`,
 enforced by `seed-bypass-smell.sh`); the canonical demo world is
 **built live, not migrated**: the install starts the sim and it
 generates 365 simulated days of events against the live API.
+
+**Four languages: Rust for systems, Svelte for the frontend, Python for
+scripting, containers for deployment — and a fence around the third**
+(design `9b4d8ccd`, David 2026-09-20, all four questions accepted as
+proposed). Measured that day: 234 shell files, 51,806 lines, against two
+Python files — shell was already the scripting language, and `python3`
+was already a declared forge requirement. Decided: (1) **new scripting
+is Python where the work is structured data** — the lints first, where a
+1,422-line bash lint is the argument and the startup objection measured
+0.56 s across all 88; **never for the forge's shell twins**, which
+retire by deletion as the `boss` CLI reaches the forge (§Consolidation)
+rather than by translation; **rarely for glue** that drives systemd,
+`talosctl` and docker, where an interpreter on the recovery path is a
+cost when the system is unhealthy; (2) **the fence is four rules**: no
+`.py` under `crates/`; **stdlib only**, the load-bearing one — no
+`requirements.txt`, no venv, no `pip` in any image, because a script
+that needs a package manager is a program; never imported, only
+invoked; and never on the runtime execution path of a cluster service
+— Python may do a job and exit, never become a component; (3) **no
+migration**: existing shell stays until it is touched for another
+reason; (4) **enforcement is a lint measured like any other** — the
+directory and no-pip rules are near-free greps, the never-imported
+rule needs a parse. No such lint exists yet, so today the fence is a
+written rule and is unchecked, stated here rather than implied.
 
 **A real instance carries only what its tenant declares plus what the
 platform needs; example data reaches an instance only through its
@@ -1462,6 +1571,22 @@ small ingress that validates the webhook secret and stages with
 `forge.push`, `forge.check.completed` and `forge.merge` born
 declared in the event-kind registry.
 
+**The forge is also the cluster's image source, so its downtime is the
+cluster's restart window** (design `ccce1191`, 2026-09-20). Thirteen
+manifests pull from the forge's registry, the system of record's
+postgres among them — pulled from the forge rather than docker.io
+because a database that cannot re-pull its image cannot restart. While
+the forge is off, running pods keep running and anything that must
+restart waits in `ImagePullBackOff`. So a forge window is quiesced (no
+trains, gates, converge or deploy) and never overlaps a cluster node
+being down; with etcd quorum at two of three and Longhorn at three
+replicas, nodes go one at a time. Where postgres sits during a
+control-plane window was not reached, and waits for a window that wants
+one. The
+window it was written for took the forge alone (David: "Let's do
+forge only then"), and the extra disk was left to a judgement at the
+box, because the measurement that night was headroom, not a repair.
+
 **Maintenance stops being invisible work.** The department's
 recurring labor — backup, audit integrity, ledger replay checks,
 views catchup, GC, purges — ran as systemd timers outside the Job
@@ -1511,6 +1636,36 @@ which is that guarantee made legible at the point of work. The pool,
 the lease, the `service-instance` kind and the `build` step's record
 of its workspace are decided and **not built**: the dev session is one
 Deployment on the build node, allocated by hand.
+
+**The dev door is an Access SSH application** (design `5fc71f03`, David
+2026-09-18, all three as proposed; backlog `e4cedb46`). That one
+Deployment answered only on a MetalLB VIP on the LAN, so from anywhere
+else the way in was a jump through the boss-gcp WireGuard bastion —
+which `/it/estate` had to spell out in three forms, because `ssh://`
+cannot carry a `ProxyJump` — authorised by one long-lived ed25519 key
+an operator had loaded into a Secret by hand. It is now
+`dev.algedonic.dev`: a CNAME to the tunnel, a route on the in-cluster
+connector to the pod's own ssh Service, and a Cloudflare Access
+application in front of it, all four declared in the same files every
+other public name uses. What that buys is not convenience but the
+credential: **Access issues a certificate for the session**, which the
+pod's sshd accepts through `TrustedUserCAKeys`, so nothing long-lived
+sits on either side of the door.
+
+Two things fell out of the measurement. The pod ran **Dropbear rather
+than OpenSSH for one capability** — sshd's preauth privsep child
+chroots, Dropbear does not, and in 2026-08-30 the cheaper door won.
+Dropbear cannot verify a certificate against a CA at all, so the swap
+back costs exactly `SYS_CHROOT` and the history stays in the manifest
+beside the capability list, which is the only place a reader would ask.
+And **the Access declaration needed no new vocabulary**: `type` is a
+value the handler carries from the declaration to the comparison to the
+create body, never matched against a list of known kinds, so `type =
+"ssh"` is declared, compared and applied by the same four fields
+`self_hosted` uses — pinned now, so the next reach for an enum goes
+red. The short-lived-certificate CA is not a field: Cloudflare generates
+one per application, and reading its public key into the Secret the
+manifest names is a root ceremony, done once.
 
 **The train is tested where the seed is** (design `128b5496`, David
 2026-09-12, all three questions accepted as proposed; cars landed
@@ -1626,6 +1781,35 @@ question of *how the operator's own terminal should carry the
 credentials* is not decided: David's answer asked what professionals
 do and whether a small standalone management tool should ship for
 terminals like the Mac, and that stays open on the packet.
+
+**A credential the estate can mint is delivered by the machine, never
+carried by a person; the line is derivability, not sensitivity**
+(design `835c0c9c`, David 2026-09-20, all three questions accepted as
+proposed). Root material — an admin kubeconfig, a
+talosconfig, the credential broker's own root tokens — cannot be
+minted from anything the estate holds, so placing it stays David's
+act, as above. A scoped credential is minted FROM that material, so
+its path is the credential broker
+(`infra/cluster/manifests/boss-credential-broker.yaml`), which exists
+because a hand-placement walkthrough leaked the dev pod's forge token
+on 2026-09-02 — the ceremony was the vulnerability. The first case the
+broker's Secret-and-mount pattern cannot reach is boss-gcp's scoped
+break-glass kubeconfig (`boss-break-glass-operator.yaml`): an
+off-cluster host cannot read a Secret without the credential being
+delivered. Decided: (1) **push, don't pull** — a bounded ops verb on the
+forge, which holds admin and already reaches boss-gcp, mints the
+kubeconfig and deposits it over a forced-command key scoped to
+`/etc/boss-ops/`, the shape `boss-backup` already uses for the nightly
+dump, so the value never enters a packet, a transcript or a person;
+(2) **verify by effect in both directions** — the credential CAN read
+nodes and CANNOT read secrets — and refuse the deposit when the
+negative fails, because a break-glass credential broader than its
+declaration is worse than none; (3) **a host declares the credential
+set it is expected to hold** (`BOSS_OPS_CREDENTIALS=kubeconfig` on
+boss-gcp), since a talosconfig has no scoped form and a full one on the
+public edge is the unbounded grant the scoping exists to avoid — so
+the converge reports the truth about that host rather than a
+permanently red absence. The delivery verb is not yet built.
 
 **The knobs outside the tree become declared settings** (design
 `16115a17`, David 2026-09-12; all four questions accepted as proposed).
@@ -2018,6 +2202,31 @@ went ready with no design filed — an empty decision, 4f6019d7 again) —
 `boss design --answers <packet>` files the design, writes the review's
 question, and completes the draft with the `design_id`, and the publish
 rule closes the review exactly as before.
+
+**Design error gets two instruments: the brief carries prior art, and a
+packet's proposed FIX is verified, not only its claim** (design
+`0d02cda0`, David 2026-09-21, all three questions accepted as
+proposed; answers backlog `3c779ca8`). Measured over 2026-09-20/21: the
+protocol refused a mechanical error nine times, each refusal naming its
+reason, while five design errors went through — one reached David (a
+scoped credential designed as a hand-placement, the broker that retires
+that ceremony never found) and four were caught only by the operator
+searching first, a habit rather than a mechanism. Decided: (1) **`boss
+brief` derives prior art** the way it derives invariants — what has
+already been decided about the packet's area, matched on its `area` and
+title terms — and is **informational first**, printing the match count
+and the sources searched even when empty, because a fuzzy match needs a
+precision number before it can earn a refusal; (2) **the corpus is**
+closed design-doc resolutions, this document's headings,
+`infra/dispatcher/rules/` names and CLAUDE.md §Doors — deliberately not
+the open backlog, which would match nearly everything; the acceptance
+test is that "credential" surfaces the broker; (3) **"verify the
+proposed fix, not only the claim" goes in both** CLAUDE.md's startup
+step 4 and `builder-rules.md`, since three packets that night were
+right that something was wrong and wrong about the remedy, and a
+builder reads a packet's fix shape as an instruction. Not yet built.
+Design error in genuinely new territory, with no prior art and no
+proposal to check, is out of reach of both by construction.
 
 ## Agent memory and the record
 

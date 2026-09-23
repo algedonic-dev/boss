@@ -329,7 +329,6 @@ const SERVICE_UNITS: &[&str] = &[
     "boss-messages-api",
     "boss-shipping-api",
     "boss-observability",
-    "boss-cybernetics",
 ];
 
 /// Probe each registered boss-* systemd service. Classification and
@@ -391,8 +390,21 @@ async fn check_install_services() -> Check {
 /// cluster instead of grepping.
 async fn check_step_plugins_mount() -> Check {
     let label = "step plugins";
-    let base =
-        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| "http://10.20.0.34:7900".to_string());
+    // No default (backlog 10776b6c): this check defaulted to a literal
+    // address when BOSS_JOBS_URL was unset — the one CLI read still
+    // doing what `resolve_jobs_base` refuses everywhere else (aa783636),
+    // allowed by the address lint as "a behaviour change for another
+    // car" that was never filed. Unset now fails the check, naming why.
+    let base = match crate::gate::resolve_jobs_base(None) {
+        Ok(base) => base,
+        Err(e) => {
+            return Check {
+                label,
+                passed: false,
+                detail: format!("unknown, not clean — {e}"),
+            };
+        }
+    };
     let get = |path: String| {
         let url = format!("{base}{path}");
         async move {
@@ -412,7 +424,12 @@ async fn check_step_plugins_mount() -> Check {
     };
     let (plugins, workflows) = tokio::join!(
         get("/api/jobs/step-plugins".into()),
-        get("/api/workflows?limit=500".into())
+        // No `limit`: the door takes none (`ListKindsQuery` is
+        // `category` only) and answers every active workflow, so the
+        // `limit=500` this read carried was a cap it never had. The
+        // comparison below refuses a short page if one ever comes
+        // (backlog 6cf47547).
+        get("/api/workflows".into())
     );
     let (Some(plugins), Some(workflows)) = (plugins, workflows) else {
         return Check {
@@ -421,7 +438,16 @@ async fn check_step_plugins_mount() -> Check {
             detail: "could not read the registries — unknown, not clean".into(),
         };
     };
-    let orphans = orphaned_plugin_kinds(&plugins, &workflows);
+    let orphans = match orphaned_plugin_kinds(&plugins, &workflows) {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            return Check {
+                label,
+                passed: false,
+                detail: format!("could not read the registries ({e:#}) — unknown, not clean"),
+            };
+        }
+    };
     Check {
         passed: orphans.is_empty(),
         label,
@@ -441,19 +467,23 @@ async fn check_step_plugins_mount() -> Check {
 
 /// The comparison, pure — which registered plugin kinds no active
 /// workflow declares a step of.
+///
+/// Either registry answering something that is not a list REFUSES
+/// (backlog 7b7e0529). It used to read as zero rows, and zero
+/// WORKFLOWS is the worst reading this check can make: no step mounts
+/// anything, so every active plugin was reported orphaned — a loud false
+/// alarm of exactly the kind that gets a check muted. The one rows
+/// helper decides the shape, so this cannot disagree with the verbs.
 pub(crate) fn orphaned_plugin_kinds(
     plugins: &serde_json::Value,
     workflows: &serde_json::Value,
-) -> Vec<String> {
-    let rows = |v: &serde_json::Value| -> Vec<serde_json::Value> {
-        v.get("data")
-            .and_then(|d| d.as_array())
-            .or_else(|| v.as_array())
-            .cloned()
-            .unwrap_or_default()
+) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    let rows = |v: &serde_json::Value, what: &str| {
+        crate::train::every_row(Some(v.clone())).with_context(|| format!("the {what} registry"))
     };
     let active = |v: &serde_json::Value| v.get("status").and_then(|s| s.as_str()) == Some("active");
-    let used: std::collections::BTreeSet<String> = rows(workflows)
+    let used: std::collections::BTreeSet<String> = rows(workflows, "workflows")?
         .iter()
         .filter(|w| active(w))
         .flat_map(|w| {
@@ -464,7 +494,7 @@ pub(crate) fn orphaned_plugin_kinds(
         })
         .filter_map(|s| s.get("kind").and_then(|k| k.as_str()).map(str::to_string))
         .collect();
-    let mut orphans: Vec<String> = rows(plugins)
+    let mut orphans: Vec<String> = rows(plugins, "step-plugins")?
         .iter()
         .filter(|p| active(p))
         .filter_map(|p| p.get("kind").and_then(|k| k.as_str()).map(str::to_string))
@@ -472,7 +502,7 @@ pub(crate) fn orphaned_plugin_kinds(
         .collect();
     orphans.sort();
     orphans.dedup();
-    orphans
+    Ok(orphans)
 }
 
 pub async fn run_install() -> Result<()> {
@@ -519,7 +549,9 @@ mod tests {
     /// e0cebcff, the observed shape: `boss doctor` on boss-gcp said
     /// "9/10 active — boss-cybernetics not running. Check journalctl"
     /// and journalctl returned nothing, because systemd had no unit
-    /// file at all. A never-installed unit must be reported as absent
+    /// file at all. (That unit has since retired with its crate,
+    /// backlog 467175e7; the tests below use another unit as their
+    /// example, since the classification never depended on which.) A never-installed unit must be reported as absent
     /// with its own remedy, not as a crashed one.
     #[test]
     fn a_never_installed_unit_is_absent_not_crashed() {
@@ -529,12 +561,12 @@ mod tests {
         );
         let c = services_check_from_states(&[
             ("boss-jobs".into(), UnitState::Active),
-            ("boss-cybernetics".into(), UnitState::NotInstalled),
+            ("boss-shipping-api".into(), UnitState::NotInstalled),
         ]);
         assert!(!c.passed);
         assert!(
             c.detail
-                .contains("boss-cybernetics not installed on this host"),
+                .contains("boss-shipping-api not installed on this host"),
             "absent unit must be named as absent: {}",
             c.detail
         );
@@ -572,7 +604,7 @@ mod tests {
         let c = services_check_from_states(&[
             ("boss-jobs".into(), UnitState::Active),
             ("boss-gateway".into(), UnitState::Inactive),
-            ("boss-cybernetics".into(), UnitState::NotInstalled),
+            ("boss-shipping-api".into(), UnitState::NotInstalled),
         ]);
         assert!(c.detail.starts_with("1/3 active"), "{}", c.detail);
         assert!(c.detail.contains("journalctl"), "{}", c.detail);
@@ -620,7 +652,7 @@ mod tests {
             {"status": "active", "steps": [{"kind": "task"}, {"kind": "review-design"}]}
         ]);
         assert_eq!(
-            orphaned_plugin_kinds(&plugins, &workflows),
+            orphaned_plugin_kinds(&plugins, &workflows).unwrap(),
             vec!["scope-declaration".to_string()]
         );
     }
@@ -637,7 +669,7 @@ mod tests {
             {"status": "retired", "steps": [{"kind": "incident-review"}]}
         ]);
         assert_eq!(
-            orphaned_plugin_kinds(&plugins, &workflows),
+            orphaned_plugin_kinds(&plugins, &workflows).unwrap(),
             vec!["incident-review".to_string()]
         );
     }
@@ -649,7 +681,11 @@ mod tests {
     fn a_retired_plugin_is_not_reported() {
         let plugins = json!([{"kind": "marketing-brief", "status": "retired"}]);
         let workflows = json!([{"status": "active", "steps": [{"kind": "task"}]}]);
-        assert!(orphaned_plugin_kinds(&plugins, &workflows).is_empty());
+        assert!(
+            orphaned_plugin_kinds(&plugins, &workflows)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Both list shapes the API uses — a bare array, or wrapped in
@@ -659,6 +695,36 @@ mod tests {
     fn both_envelope_shapes_are_read() {
         let bare = json!([{"kind": "checklist", "status": "active"}]);
         let wrapped = json!({"data": [{"status": "active", "steps": [{"kind": "checklist"}]}]});
-        assert!(orphaned_plugin_kinds(&bare, &wrapped).is_empty());
+        assert!(orphaned_plugin_kinds(&bare, &wrapped).unwrap().is_empty());
+    }
+
+    /// A REGISTRY THAT DID NOT ANSWER A LIST IS NOT AN EMPTY ONE
+    /// (backlog 7b7e0529). Read as zero workflows, an error envelope made
+    /// every active plugin "orphaned" — so the check must refuse, and
+    /// name which registry it could not read.
+    #[test]
+    fn an_unreadable_registry_refuses_rather_than_orphaning_everything() {
+        let plugins = json!([{"kind": "checklist", "status": "active"}]);
+        let why = orphaned_plugin_kinds(&plugins, &json!({"error": "bad gateway"}))
+            .expect_err("an error envelope is not zero workflows");
+        assert!(format!("{why:#}").contains("workflows"), "{why:#}");
+        let why = orphaned_plugin_kinds(&json!({}), &json!([]))
+            .expect_err("nor is a body with no rows zero plugins");
+        assert!(format!("{why:#}").contains("step-plugins"), "{why:#}");
+    }
+
+    /// A PAGE OF WORKFLOWS IS NOT THE REGISTRY (backlog 6cf47547). A
+    /// short page reads as fewer workflows, so every plugin mounted only
+    /// by an unread one is named orphaned — the false alarm that gets a
+    /// check muted. A body whose `total` counts more rows than it
+    /// carries refuses, naming the registry, rather than judging a page.
+    #[test]
+    fn a_short_page_of_workflows_refuses_rather_than_orphaning_the_rest() {
+        let plugins = json!([{"kind": "checklist", "status": "active"}]);
+        let page = json!({"data": [{"status": "active", "steps": []}], "total": 2});
+        let why = orphaned_plugin_kinds(&plugins, &page)
+            .expect_err("one workflow of two is a page, not the registry");
+        let why = format!("{why:#}");
+        assert!(why.contains("workflows") && why.contains("1 of 2"), "{why}");
     }
 }
