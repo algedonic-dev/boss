@@ -52,7 +52,12 @@
 //! them. Nothing in this module names a finding class: the raiser's
 //! vocabulary is the recovery vocabulary.
 //!
-//! THE CLOSE IS THE TRIAGE STEP, completed with `disposition = stale`
+//! THE CLOSE IS THE STEP THE PACKET IS WAITING ON — `triage`, or, once
+//! a person has routed the alarm, the ready `build`/`measure` it was
+//! routed to; where the machine may not complete that step it writes a
+//! RECOVERED note on the packet instead, and withdraws the note if the
+//! finding comes back (backlog a2d8bad3, `common::retraction`). The
+//! step is completed with `disposition = stale`
 //! — the backlog-item terminal titled "Closed — the claim no longer
 //! holds", and what all three hand-closes chose — plus `evidence`
 //! naming the finding, the host, and the N clean comparisons with
@@ -79,7 +84,10 @@ use serde_json::{Map, Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{TRIAGE_SLUG, api_client, get_json, triage_step, write_json};
+use super::common::{
+    RECOVERED_AT, Retraction, api_client, get_json, recovery_note, relapse_patch, retraction,
+    rows_or_refuse, write_json,
+};
 use super::estate_alarm::{DEDUP_PAGE, PERSIST_N, hard_finding_keys};
 
 /// Stamped on the triage completion this handler writes, so
@@ -114,8 +122,10 @@ pub(super) struct Recovery {
     pub key: String,
     pub scope: String,
     pub host: Option<String>,
-    pub step_id: String,
-    pub step_metadata: Map<String, Value>,
+    /// Where the alarm withdraws — its triage step, the build or
+    /// measure a person routed it to, or a note on the packet
+    /// (`common::retraction`, backlog a2d8bad3).
+    pub retraction: Retraction,
     /// The instants of the N clean comparisons, newest first.
     pub clean_at: Vec<DateTime<Utc>>,
 }
@@ -171,7 +181,9 @@ fn instant(row: &Value) -> Option<DateTime<Utc>> {
 /// observed after the alarm's `opened_at` must exist and must ALL lack
 /// the alarm's key. Fewer than `n` such rows is not enough evidence;
 /// an alarm without `opened_at` or without a `triage` step cannot be
-/// judged and is left alone.
+/// judged and is left alone. An alarm the machine may only ANNOTATE,
+/// and already has, is left alone too: this fires on every comparison,
+/// and a packet told once is told.
 pub(super) fn recovered(
     open_jobs: &[Value],
     rows: &[Value],
@@ -212,47 +224,72 @@ pub(super) fn recovered(
             {
                 return None;
             }
-            let (step_id, step_metadata) = triage_step(alarm)?;
+            let retraction = retraction(alarm)?;
+            if matches!(retraction, Retraction::Annotate { .. }) && already_told(alarm) {
+                return None;
+            }
             Some(Recovery {
                 job_id: alarm.get("id")?.as_str()?.to_string(),
                 key: key.to_string(),
                 scope: scope.to_string(),
                 host: host.map(str::to_string),
-                step_id,
-                step_metadata,
+                retraction,
                 clean_at: since.into_iter().map(|(_, t)| t).collect(),
             })
         })
         .collect()
 }
 
-/// The triage completion that closes one recovered alarm: the step's
-/// existing keys carried through (PUT replaces metadata wholesale),
-/// the two fields the backlog-item workflow requires at done
-/// (`disposition`, `evidence`), and the machine's stamps.
-pub(super) fn clear_step_body(r: &Recovery, n: usize) -> Value {
-    let mut metadata = r.step_metadata.clone();
-    let instants: Vec<String> = r.clean_at.iter().map(DateTime::to_rfc3339).collect();
-    let host = r.host.as_deref().unwrap_or(&r.scope);
+/// Does this open alarm already carry a recovery note?
+fn already_told(alarm: &Value) -> bool {
+    alarm
+        .get("metadata")
+        .and_then(|m| m.get(RECOVERED_AT))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// The step completion that closes one recovered alarm — at `triage`,
+/// or at the `build`/`measure` a person routed it to: the step's
+/// existing keys carried through (PUT replaces metadata wholesale), the
+/// fields the backlog-item workflow requires at done (`disposition`,
+/// and `evidence` on triage), and the machine's stamps.
+pub(super) fn clear_step_body(r: &Recovery, existing: &Map<String, Value>, n: usize) -> Value {
+    let mut metadata = existing.clone();
     metadata.insert("disposition".into(), json!("stale"));
-    metadata.insert(
-        "evidence".into(),
-        json!(format!(
-            "estate.recover read the recorded `{scope}` series back: the finding \
-             `{key}` on `{host}` has been absent from {n} consecutive comparisons \
-             observed after this alarm was raised, at {instants}. The condition \
-             has recovered, so the claim this alarm carried no longer holds. \
-             Closed by machine from the record, not by judgement (backlog \
-             ef421cd3: three of these were read off the record and typed in by \
-             hand). The series rides /api/estate/comparisons?scope={scope}.",
-            scope = r.scope,
-            key = r.key,
-            instants = instants.join(", "),
-        )),
-    );
+    metadata.insert("evidence".into(), json!(evidence(r, n)));
     metadata.insert("cleared_by".into(), json!(CLEARED_BY));
     metadata.insert("recovered_at".into(), json!(recovered_at(r)));
     json!({"status": "completed", "metadata": metadata})
+}
+
+/// The merge that tells a routed alarm it has recovered when the
+/// machine may not close it ([`Retraction::Annotate`], a2d8bad3).
+pub(super) fn note_patch(r: &Recovery, n: usize, why_open: &str) -> Value {
+    Value::Object(recovery_note(
+        &evidence(r, n),
+        CLEARED_BY,
+        &recovered_at(r),
+        why_open,
+    ))
+}
+
+/// What the record shows: the finding, its host, and the N clean
+/// comparisons with their instants.
+fn evidence(r: &Recovery, n: usize) -> String {
+    let instants: Vec<String> = r.clean_at.iter().map(DateTime::to_rfc3339).collect();
+    let host = r.host.as_deref().unwrap_or(&r.scope);
+    format!(
+        "estate.recover read the recorded `{scope}` series back: the finding \
+         `{key}` on `{host}` has been absent from {n} consecutive comparisons \
+         observed after this alarm was raised, at {instants}. The condition \
+         has recovered, so the claim this alarm carried no longer holds. \
+         Closed by machine from the record, not by judgement (backlog \
+         ef421cd3: three of these were read off the record and typed in by \
+         hand). The series rides /api/estate/comparisons?scope={scope}.",
+        scope = r.scope,
+        key = r.key,
+        instants = instants.join(", "),
+    )
 }
 
 /// When the record showed the recovery: the newest clean comparison's
@@ -307,11 +344,12 @@ impl Handler for EstateRecover {
             &ctx.rule_name,
         )
         .await?;
-        let open_rows: Vec<Value> = listing
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // A listing with no `data` array is no answer. Read as zero
+        // rows it found no alarm on the series, returned healthy, and
+        // every recovered alarm stayed open with nothing saying why
+        // (backlog d4698bc2).
+        let open_rows: Vec<Value> = rows_or_refuse(&listing, "the open-alarm read (GET /api/jobs)")
+            .map_err(HandlerError::Downstream)?;
         // A truncated page is not a safety problem here the way it is
         // for the raiser's dedup: every close is judged on the series,
         // not on a packet's absence, and an alarm beyond the page is
@@ -332,11 +370,41 @@ impl Handler for EstateRecover {
         // A finding the triggering comparison still carries cannot be
         // absent from the newest N — no series read needed to know.
         let present = hard_finding_keys(comparison);
-        if alarms
-            .iter()
-            .all(|a| finding_key(a).is_some_and(|k| present.contains(k)))
-        {
-            return Ok(());
+        let is_present = |a: &Value| finding_key(a).is_some_and(|k| present.contains(k));
+
+        // Best-effort writes: every alarm that could close does, and
+        // whatever failed is one aggregated error at the end so the
+        // firing is redelivered. The judgement is idempotent under
+        // redelivery — a closed packet is no longer open.
+        let mut errors: Vec<String> = Vec::new();
+
+        // A routed alarm told RECOVERED whose finding is back must stop
+        // saying so (a2d8bad3): the note is withdrawn on the first
+        // reading that carries the finding again.
+        for a in alarms.iter().filter(|a| already_told(a) && is_present(a)) {
+            let (Some(id), Some(key)) = (a.get("id").and_then(Value::as_str), finding_key(a))
+            else {
+                continue;
+            };
+            if let Err(e) = write_json(
+                &self.client,
+                reqwest::Method::PATCH,
+                &format!("{}/api/jobs/{id}/metadata", self.base()),
+                &relapse_patch(),
+                &ctx.rule_name,
+            )
+            .await
+            {
+                errors.push(format!(
+                    "withdrawing the recovery note on the alarm for {key} failed: {e}"
+                ));
+                continue;
+            }
+            tracing::info!(finding = %key, packet = %id, "estate.recover: the finding is back; withdrew the recovery note");
+        }
+
+        if alarms.iter().all(|a| is_present(a)) {
+            return finish(errors);
         }
 
         // The recorded series IS the state, read exactly as the raiser
@@ -350,30 +418,54 @@ impl Handler for EstateRecover {
             &ctx.rule_name,
         )
         .await?;
-        let rows: Vec<Value> = recent
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // No series is not "too few readings yet": read as zero rows it
+        // left the alarm open as if the evidence were still arriving
+        // (d4698bc2).
+        let rows: Vec<Value> = rows_or_refuse(
+            &recent,
+            &format!("the comparisons read (GET /api/estate/comparisons?scope={scope})"),
+        )
+        .map_err(HandlerError::Downstream)?;
 
-        // Best-effort writes: every alarm that could close does, and
-        // whatever failed is one aggregated error at the end so the
-        // firing is redelivered. The judgement is idempotent under
-        // redelivery — a closed packet is no longer open.
-        let mut errors: Vec<String> = Vec::new();
         for r in recovered(&open_rows, &rows, scope, host, PERSIST_N) {
             let key = &r.key;
+            let (slug, step_id, existing) = match &r.retraction {
+                Retraction::Complete {
+                    slug,
+                    step_id,
+                    metadata,
+                } => (slug, step_id, metadata),
+                // A route the machine may not complete: tell the packet.
+                Retraction::Annotate { why_open } => {
+                    if let Err(e) = write_json(
+                        &self.client,
+                        reqwest::Method::PATCH,
+                        &format!("{}/api/jobs/{}/metadata", self.base(), r.job_id),
+                        &note_patch(&r, PERSIST_N, why_open),
+                        &ctx.rule_name,
+                    )
+                    .await
+                    {
+                        errors.push(format!(
+                            "recovery note on the routed alarm for {key} failed: {e}"
+                        ));
+                        continue;
+                    }
+                    tracing::info!(finding = %key, packet = %r.job_id, why_open = %why_open, "estate.recover: the finding has recovered; told the routed alarm");
+                    continue;
+                }
+            };
             if let Err(e) = write_json(
                 &self.client,
                 reqwest::Method::PUT,
-                &format!("{}/api/jobs/{}/steps/{}", self.base(), r.job_id, r.step_id),
-                &clear_step_body(&r, PERSIST_N),
+                &format!("{}/api/jobs/{}/steps/{step_id}", self.base(), r.job_id),
+                &clear_step_body(&r, existing, PERSIST_N),
                 &ctx.rule_name,
             )
             .await
             {
                 errors.push(format!(
-                    "close of the alarm for {key} (its `{TRIAGE_SLUG}` step) failed; others still closed: {e}"
+                    "close of the alarm for {key} (its `{slug}` step) failed; others still closed: {e}"
                 ));
                 continue;
             }
@@ -399,15 +491,21 @@ impl Handler for EstateRecover {
             );
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(HandlerError::Downstream(format!(
-                "estate.recover: {} write(s) failed this pass (every alarm that could close did; the rest retry): {}",
-                errors.len(),
-                errors.join(" | ")
-            )))
-        }
+        finish(errors)
+    }
+}
+
+/// One aggregated exit: every alarm that could close did; any write
+/// that failed NAKs the firing for redelivery.
+fn finish(errors: Vec<String>) -> Result<(), HandlerError> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(HandlerError::Downstream(format!(
+            "estate.recover: {} write(s) failed this pass (every alarm that could close did; the rest retry): {}",
+            errors.len(),
+            errors.join(" | ")
+        )))
     }
 }
 
@@ -512,12 +610,21 @@ mod tests {
         assert_eq!(r.job_id, "fdd10ec8");
         assert_eq!(r.key, KEY);
         assert_eq!(r.host.as_deref(), Some("boss-gcp"));
+        let Retraction::Complete {
+            slug,
+            step_id,
+            metadata,
+        } = &r.retraction
+        else {
+            panic!("an untriaged alarm closes at its triage step");
+        };
         assert_eq!(
-            r.step_id, "fdd10ec8-triage",
+            (slug.as_str(), step_id.as_str()),
+            ("triage", "fdd10ec8-triage"),
             "the close is the triage step, addressed by id"
         );
         assert_eq!(
-            r.step_metadata.get("authority_role"),
+            metadata.get("authority_role"),
             Some(&json!("platform-admin")),
             "the step's existing metadata rides back so the PUT does not drop it"
         );
@@ -735,16 +842,23 @@ mod tests {
         assert!(series_alarms(&open, "host", Some("boss-gcp")).is_empty());
     }
 
-    fn a_recovery() -> Recovery {
+    fn triage_metadata() -> Map<String, Value> {
         let mut step_metadata = Map::new();
         step_metadata.insert("authority_role".into(), json!("platform-admin"));
+        step_metadata
+    }
+
+    fn a_recovery() -> Recovery {
         Recovery {
             job_id: "fdd10ec8".into(),
             key: KEY.into(),
             scope: "host-units".into(),
             host: Some("boss-gcp".into()),
-            step_id: "fdd10ec8-triage".into(),
-            step_metadata,
+            retraction: Retraction::Complete {
+                slug: "triage".into(),
+                step_id: "fdd10ec8-triage".into(),
+                metadata: triage_metadata(),
+            },
             clean_at: vec![at(45), at(40), at(35)],
         }
     }
@@ -755,7 +869,7 @@ mod tests {
         // `disposition` (enum, required) and `evidence` (string,
         // required) at done. `stale` is the terminal the three hand
         // closes chose — "the claim no longer holds".
-        let body = clear_step_body(&a_recovery(), 3);
+        let body = clear_step_body(&a_recovery(), &triage_metadata(), 3);
         assert_eq!(body["status"], "completed");
         let m = &body["metadata"];
         assert_eq!(m["disposition"], "stale");
@@ -795,6 +909,8 @@ mod tests {
 
     // ----- the writes, witnessed against a stub jobs API -----
 
+    use crate::handlers::listing_stub::{step_is_terminal, terminal_step_refusal};
+    use axum::response::IntoResponse;
     use axum::{Json, Router, extract::Path, extract::Query, routing::get};
     use std::sync::Mutex;
 
@@ -807,6 +923,7 @@ mod tests {
         let puts: Writes = Arc::new(Mutex::new(Vec::new()));
         let patches: Writes = Arc::new(Mutex::new(Vec::new()));
         let total = open.len();
+        let open_for_puts = open.clone();
         let open = Arc::new(open);
         let rows = Arc::new(rows);
         let app = Router::new()
@@ -837,11 +954,21 @@ mod tests {
             .route("/api/jobs/{id}/steps/{step_id}", {
                 let puts = puts.clone();
                 axum::routing::put(
-                    move |Path((_id, step_id)): Path<(String, String)>, Json(body): Json<Value>| {
+                    move |Path((id, step_id)): Path<(String, String)>, Json(body): Json<Value>| {
                         let puts = puts.clone();
+                        let finished = step_is_terminal(&open_for_puts, &id, &step_id);
                         async move {
+                            // A step a person already answered is
+                            // refused as the real step API refuses it
+                            // (d4698bc2) — this stub used to accept it.
+                            if finished {
+                                puts.lock()
+                                    .unwrap()
+                                    .push((format!("{step_id} (409)"), body));
+                                return terminal_step_refusal(&step_id);
+                            }
                             puts.lock().unwrap().push((step_id, body));
-                            axum::http::StatusCode::NO_CONTENT
+                            axum::http::StatusCode::NO_CONTENT.into_response()
                         }
                     },
                 )
@@ -907,6 +1034,113 @@ mod tests {
         assert_eq!(patches[0].1["recovered_at"], at(45).to_rfc3339());
     }
 
+    /// The alarm after a person triaged it: `triage` completed with
+    /// `disposition`, and the routed step at `status`.
+    fn routed(id: &str, disposition: &str, slug: &str, status: &str) -> Value {
+        let mut a = alarm(id, KEY, "host-units", Some("boss-gcp"), "open");
+        a["steps"][1]["status"] = json!("completed");
+        a["steps"][1]["metadata"]["disposition"] = json!(disposition);
+        a["steps"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": format!("{id}-{slug}"), "spec_slug": slug, "status": status,
+                         "metadata": {"authority_role": "platform-admin", "agent_profile": "builder"}}));
+        a
+    }
+
+    fn clean_series() -> (Value, Vec<Value>) {
+        let clean = units_row("boss-gcp", &[], at(45));
+        let rows = vec![
+            clean.clone(),
+            units_row("boss-gcp", &[], at(40)),
+            units_row("boss-gcp", &[], at(35)),
+            units_row("boss-gcp", &[UNIT], at(-5)),
+        ];
+        (clean, rows)
+    }
+
+    /// Backlog a2d8bad3 — the estate shape of a6a4ae18: e1fea3b2
+    /// (disk_tight:w-1) and c6c797cd were triaged to `build`, and the
+    /// machine's only exit was the triage step a person had already
+    /// completed. Now it withdraws at the ready build step, stamped, so
+    /// the raiser reads it as a machine clear and re-raises a relapse.
+    #[tokio::test]
+    async fn a_recovered_alarm_routed_to_build_closes_at_its_build_step() {
+        let (clean, rows) = clean_series();
+        let (base, puts, patches) =
+            stub(vec![routed("e1fea3b2", "build", "build", "ready")], rows).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await
+            .expect("both writes answered");
+        let puts = puts.lock().unwrap();
+        assert_eq!(puts.len(), 1, "one step completion");
+        assert_eq!(puts[0].0, "e1fea3b2-build", "the step the packet waits on");
+        assert_eq!(puts[0].1["metadata"]["disposition"], "stale");
+        assert_eq!(puts[0].1["metadata"]["cleared_by"], CLEARED_BY);
+        assert_eq!(puts[0].1["metadata"]["agent_profile"], "builder");
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].1["recovered_at"], at(45).to_rfc3339());
+    }
+
+    /// A route the machine may not complete — the design route here —
+    /// is TOLD: no step write, one packet note saying RECOVERED and why
+    /// it is still open.
+    #[tokio::test]
+    async fn a_recovered_alarm_routed_to_design_is_told_not_closed() {
+        let (clean, rows) = clean_series();
+        let (base, puts, patches) =
+            stub(vec![routed("d1", "design", "draft-design", "ready")], rows).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await
+            .expect("the note answered");
+        assert!(puts.lock().unwrap().is_empty(), "no step completed");
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "one note");
+        assert_eq!(patches[0].0, "d1");
+        assert_eq!(patches[0].1["recovered_at"], at(45).to_rfc3339());
+        assert_eq!(patches[0].1["recovered_by"], CLEARED_BY);
+        let text = patches[0].1["recovery"].as_str().expect("a sentence");
+        assert!(text.contains(KEY), "{text}");
+        assert!(text.contains("`design`"), "{text}");
+    }
+
+    /// The comparison fires every few minutes: a packet already told is
+    /// not told again on every tick.
+    #[test]
+    fn an_alarm_already_told_it_recovered_is_not_told_again() {
+        let (_, rows) = clean_series();
+        let mut a = routed("d1", "design", "draft-design", "ready");
+        assert_eq!(
+            recovered(&[a.clone()], &rows, "host-units", Some("boss-gcp"), 3).len(),
+            1
+        );
+        a["metadata"]["recovered_at"] = json!(at(45).to_rfc3339());
+        assert!(recovered(&[a], &rows, "host-units", Some("boss-gcp"), 3).is_empty());
+    }
+
+    /// And a packet told RECOVERED whose finding is back must stop
+    /// saying so — a troubled packet must look troubled.
+    #[tokio::test]
+    async fn a_relapse_withdraws_the_recovery_note() {
+        let sick = units_row("boss-gcp", &[UNIT], at(60));
+        let mut a = routed("d1", "design", "draft-design", "ready");
+        a["metadata"]["recovered_at"] = json!(at(45).to_rfc3339());
+        a["metadata"]["recovery"] = json!("RECOVERED — ...");
+        let (base, puts, patches) = stub(vec![a], vec![sick.clone()]).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&sick).clone()))
+            .await
+            .expect("the withdrawal answered");
+        assert!(puts.lock().unwrap().is_empty());
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "one withdrawal");
+        assert_eq!(patches[0].0, "d1");
+        assert_eq!(patches[0].1, super::super::common::relapse_patch());
+    }
+
     #[tokio::test]
     async fn a_still_present_finding_writes_nothing() {
         let sick = units_row("boss-gcp", &[UNIT], at(45));
@@ -932,6 +1166,63 @@ mod tests {
 
         assert!(puts.lock().unwrap().is_empty());
         assert!(patches.lock().unwrap().is_empty());
+    }
+
+    /// Backlog d4698bc2: an open-alarm listing with no `data` array read
+    /// as "no alarms on this series", so the pass returned healthy and
+    /// every recovered alarm stayed open with nothing saying why. It
+    /// now refuses by name and the firing is redelivered.
+    #[tokio::test]
+    async fn an_open_alarm_read_with_no_data_array_refuses_and_writes_nothing() {
+        use crate::handlers::listing_stub::{assert_refused_by_name, no_data_array, serve};
+        let (clean, _) = clean_series();
+        let stub = serve(vec![("/api/jobs", no_data_array())]).await;
+        let res = EstateRecover::new(&stub.base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await;
+        assert_eq!(stub.writes(), Vec::<String>::new());
+        assert_refused_by_name(res, "the open-alarm read");
+    }
+
+    /// And the series itself: a comparisons read with no `data` array
+    /// read as zero rows — too few to judge, so the alarm silently
+    /// stayed open. No series is not "not enough evidence yet".
+    #[tokio::test]
+    async fn a_comparisons_read_with_no_data_array_refuses_and_writes_nothing() {
+        use crate::handlers::listing_stub::{assert_refused_by_name, no_data_array, serve};
+        let (clean, _) = clean_series();
+        let open = alarm("fdd10ec8", KEY, "host-units", Some("boss-gcp"), "open");
+        let stub = serve(vec![
+            ("/api/jobs", json!({ "data": [open], "total": 1 })),
+            ("/api/estate/comparisons", no_data_array()),
+        ])
+        .await;
+        let res = EstateRecover::new(&stub.base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await;
+        assert_eq!(stub.writes(), Vec::<String>::new());
+        assert_refused_by_name(res, "the comparisons read");
+    }
+
+    /// The stub answers a close aimed at a step a person already
+    /// answered the way the real step API does — 409, recorded — so a
+    /// handler that regressed to writing the completed triage fails
+    /// here instead of on every live pass (backlog d4698bc2; the
+    /// regression itself was a2d8bad3).
+    #[tokio::test]
+    async fn the_stub_refuses_a_write_to_a_finished_step_as_the_step_api_does() {
+        let (_, rows) = clean_series();
+        let (base, puts, _) = stub(vec![routed("e1fea3b2", "build", "build", "ready")], rows).await;
+        let answer = reqwest::Client::new()
+            .put(format!("{base}/api/jobs/e1fea3b2/steps/e1fea3b2-triage"))
+            .json(&json!({ "status": "completed" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), 409);
+        let puts = puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, "e1fea3b2-triage (409)");
     }
 
     #[tokio::test]

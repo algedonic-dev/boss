@@ -72,7 +72,8 @@ Beer is the namesake and cybernetics is first among the three
 lineages, but **VSM vocabulary does not appear in BOSS code**. It used
 to, in exactly two crates — `boss-cybernetics` (whose own header read
 "Per-VM Cybernetics coordinator (VSM S2/S3)") and
-`boss-observability` — and both retire under design 8382bbb2. The
+`boss-observability` — and both retired under design 8382bbb2 on
+2026-09-23, each in its own car (below). The
 mapping is recorded here so the correspondence outlives the code that
 carried the words, because a reader arriving from Beer must be able to
 find it and a reader arriving from the code must not have to learn a
@@ -92,19 +93,81 @@ S4-ish work and `boss-policy` does S5-ish work, but neither
 correspondence is tight enough to assert, and a mapping asserted
 loosely is the decoration this section exists to prevent.
 
-**Four of `boss-cybernetics`' five stated responsibilities already
-live elsewhere**, which is why it retires rather than being rebuilt:
-budget caps before dispatch, one-at-a-time dispatch and chaining on
-completion are all enforced at the claim door and by dispatcher rules;
-lifecycle telemetry is the audit log plus `agent_runs`. **The fifth is
-a real gap, not a translation**: its per-agent durable inbox has no
-successor yet, and the decision (8382bbb2) is that it lands as a
-**station** plus the existing `agent-run` kind rather than as a second
-coordinator — a station is already the systems word for a queue that
-holds work until there is capability, and that keeps one budget gate
-rather than two implementations of one rule. **Neither crate is
-deleted before that inbox exists**: retiring the old mechanism before
-the new one is live is how a capability is lost by accident.
+**`boss-cybernetics` is retired as SUPERSEDED-BY, not deleted as
+dead** (2026-09-23, backlog 467175e7, design 8382bbb2). Its design was
+right and was overtaken: every responsibility it stated now has an
+owner elsewhere, and the reason it goes is **coherence and one owner
+per rule** — two implementations of one budget gate, one dispatch door
+and one queue are two places for the same rule to drift. It is **not**
+a line-count win, and recording it as one would misrepresent why it
+went. What superseded what, so the record answers the question
+directly:
+
+| `boss-cybernetics` responsibility | superseded by |
+|---|---|
+| budget caps before dispatch | `boss-jobs/src/agent_budget.rs` — the claim door reserves the step's budget against the actor's hour, before the CAS |
+| one-at-a-time dispatch | `boss dispatch` — one `agent-run` packet per step, bounded by `agents.max_concurrent_runs` at the claim |
+| lifecycle telemetry | `agent_runs` plus the run packet's terminals |
+| chaining on completion | the `agent-run` workflow's terminals and the dispatcher rules firing off them |
+| the per-agent durable inbox | a **station** (923b6571), pulled through the same claim door by `boss dispatch --next --station` |
+
+The inbox was **the real gap, not a translation**, and the ordering
+this decision set was held: the crate did not leave the tree until the
+station inbox (923b6571), this mapping (6872efd4) and the reclaim of
+work a dead executor had claimed (a3397b01) had all landed, because
+retiring the old mechanism before the new one is live is how a
+capability is lost by accident. The inbox's caller is the operator's
+session: David decided on 2026-09-23 that running `boss dispatch
+--next` by hand counts as the runner having run (the session is the
+CPU, 57c108c2), so no headless runner stands in for the old loop. Its
+config (`infra/cybernetics/`) and its systemd unit left with it.
+
+**`boss-observability` is retired as SUPERSEDED-BY, not deleted as
+dead** (2026-09-23, backlog 467175e7, design 8382bbb2 — the second car,
+which closed the item). It was the read side of the same design: a
+cross-VM rollup of each `boss-cybernetics` coordinator, fanned out to
+browsers. The reason is the same one, **coherence and one owner per
+rule** — a second, parallel read of agent state beside the one the
+claim door writes is two answers to one question. It is also
+**not** a line-count win. What superseded what:
+
+| `boss-observability` responsibility | superseded by |
+|---|---|
+| the cross-VM view (`/api/snapshot`, `/api/vms/*`) | a region of the IT world map (5082a08b) — the map reads the system's own regions (`/api/yard/regions`) rather than a per-VM rollup |
+| per-agent runs, queues and costs (`/api/agents`, `/api/runs`, `/api/costs`) | `/api/agent-runs` and `/api/agent-runs/cost` on the jobs API, the record the claim door writes |
+| its health alias (`/api/observability/health`) | each service's own `/api/<service>/health` |
+| the `cybernetics.>` SSE fan-out | nothing, deliberately: its only publisher was `boss-cybernetics`, retired above |
+| the playground's synthetic agents (`[demo_agents]`, the brewery's `seeds/demo_agents.toml`) | nothing, deliberately: they existed so a dashboard could show what oversight looks like before real agents ran, and real agents now run and are recorded |
+
+Removed with it: the `observability` row (7880) in `boss-ports`, and so
+its line in the container launcher and its block in the config
+generator; the gateway's three routes and its proxy target; the
+brewery's demo roster and its entry in the tenant contract; and its
+bare-metal config and setup (`infra/observability/`).
+
+**An unattended cadence will start work; until it lands, the session is
+the only supply** (design `9e1de851`, David 2026-09-22; three questions
+accepted as proposed, eligibility widened). Measured over 5.5 days and
+132 trains: gate launches fell to zero for six hours every night, 07Z to
+12Z, and five of the six longest gaps between trains ended between
+13:55Z and 14:21Z — when the operator woke, not when a machine
+recovered. Of 61 dispatcher rules, four manage an agent run's lifecycle
+and none starts one; all 125 runs on record were filed by an operator
+session. A skipped car becomes a total stop only when it is the last one
+on the dock, which is the overnight condition, so the seven-hour stall of
+2026-09-22 was downstream of supply rather than a separate fault.
+Decided: a cadence rule dispatching ready steps (1) **up to a
+concurrency starting at three**, half the observed session peak, raised
+on a reading; (2) **until a per-night USD ceiling declared in the rule
+row**, where it stops and files one packet saying so — never a silent
+stop, which would look exactly like the failure it fixes; (3) **from any
+queue the actor has policy to work** (David: "Any queue that the actor
+has policy to work should be available to be worked overnight too");
+(4) **with the bound read from the agents registry and enforced server
+side**, never a second copy in the rule row (§9a). The claim door
+already judges `agents.max_concurrent_runs` (backlog `57c108c2`); the
+cadence itself is not built, which is why the paragraph above records
+the session as the CPU.
 
 *Algedonic* signals keep their Beer meaning throughout: rules firing
 on threshold events, routed past the normal reporting line because
@@ -203,6 +266,82 @@ account types, asset models, departments all land in the one
 right; the Composite primitive is heterogeneous and laws-checked
 via proptest at the trait boundary.
 
+**A person who writes to us is a contact, found by the address they
+wrote from** (design `5548d85f`, 2026-09-21; David answered two
+questions and delegated two). Measured: `accounts` has no email column,
+and `account_facts` is a projection that answers what happened to an
+account, never which account an address is — so `receive-a-sponsorship`'s
+rule "customer id or email already on an account: use that account"
+describes a lookup the schema cannot perform, and every sponsorship so
+far has landed on `acct-anonymous-sponsor`. A support inbox makes the
+gap load-bearing: an address that finds nobody makes every thread an
+orphan and the second email from a customer a stranger. Decided:
+(1) **contact first**, which neither offered option was — the PERSON is
+primary, handles attach to the contact (`(kind, value) -> contact_id`,
+unique on `(kind, value)`), a contact MAY point at an organisation when
+known rather than guessed, and `accounts` is untouched and becomes the
+organisation half; "contact" because it names the relationship, the word
+a CRM reader already knows (David: "contact works"); (2) **handles are
+additive and never reassigned by a protocol** — anyone can put any
+address in a From header, so letting inbound mail repoint a handle makes
+takeover a matter of sending an email; a wrong handle is corrected by a
+human act with a record; (3) the anonymous-counterparty rule is
+**dissolved, not answered** — mail always carries an address, so a real
+message gets a contact keyed on it; (4) **the tables land as their own
+car, then `receive-a-sponsorship`'s reconciliation is repointed as its
+own small car** right after, because a sponsor is a person who may
+belong to an organisation and that repoint re-models a live revenue
+path. Identification comes after triage, never at receipt, so spam
+provisions nothing. Not yet built.
+
+**The employee Class drawer stays one drawer, told apart by axis; only
+the departments move out, onto the tenant's own roster** (design
+`3dff7577`, David 2026-09-23, all three questions accepted as proposed;
+it amends the four-kind split design `32f18167` signed off on
+2026-09-19, carried by backlog `a45ab09d`). Measured live that day: the
+drawer holds 22 `employee` Classes on four axes (role 7, department 9,
+status 3, employment_type 3), and every row already names its axis in
+`member_attribute` — the explicit axis the split was weighing. What was
+broken was the readers, which asked only whether `(employee, code)`
+existed, so `role=terminated` or `department=platform-admin` passed.
+Decided: (1) **role, status and employment_type stay `employee`
+Classes** told apart by `member_attribute` — four subject kinds would
+register three with no Subjects behind them and contradict
+roles-are-Classes-of-employees, and the drift the split was meant to
+stop is refused by reading the axis instead; (2) **the department
+roster is the tenant's org chart**: the 13 catalog-derived rows of the
+`department` subject kind (migration `20260919181324`) become the
+product default a tenant starts from, and a tenant adds and retires its
+own — Algedonic's engineering, product, hosting and operations exist
+today only in the drawer, with two live actors on them — which needs a
+tenant write door and a publish path before the validators move to
+department Subjects and the drawer's department Classes retire, moved
+rather than copied, with the two actors reassigned through the API so
+the log records it; (3) **a role Class's `metadata.department`
+retires with them** — a role does not belong to a department, the
+person holding it does. Landed: the axis readers — boss-people's
+employee checks (`a45ab09d`), then the agents batch door, account-team
+roles and `GET /api/classes?member_attribute=` (`ab1e6ff8`). Not built:
+the department write door, the publish path and the move; the
+`departments` table still has no write door.
+
+**The People roster holds people** (design `7aa2d1c5`, David
+2026-09-23; answers backlog `6a123f1f`, gap 12 of the `/ux/people`
+page audit). Measured: the page's "active employees" headcount was 2 —
+the founder, and `emp-audit`, the "System Audit Account" the operator
+baseline (`boss-people/src/operator_baseline.rs`) seeds as an employee
+row — while every registered agent, which claims steps and is
+capability-checked at the claim, was absent. The proposal was to show
+agents on the roster as their own kind with a split headcount; David
+answered instead: "People should just be people. Let's actually move
+the system-audit account to the same locale as agent and system
+accounts." So the employee roster is humans only, agents stay in the
+agents registry rather than joining the headcount, and `emp-audit`
+leaves the employee table for wherever agents and system accounts are
+held — an actor being a CPU in the same machine does not make it a
+person on the org chart. Not built: the audit account is still seeded
+as an employee.
+
 The system is laid out on a **three-axis information
 architecture**: *Knowledge Bases* (durable queryable state),
 *Surfaces* (operator UI), and *Work* (Jobs + Steps that change
@@ -215,7 +354,8 @@ table; aggregations rebuild on-demand + periodically.
 A **Job** is a bounded unit of coordinated work: stable identity,
 owner, subject, status, and a structured list of Steps. The
 **Workflow registry** is append-only and versioned; in-flight Jobs
-pin to the version they opened under; creation is blocked against
+pin to the version they opened under unless an actor explicitly moves
+them (the re-pin door, below); creation is blocked against
 `draft` and `retired` kinds. Adding a new workflow means adding a
 Workflow row — never a `match` branch in core code.
 
@@ -252,6 +392,93 @@ metadata is checked **at done, not at create**;
 The Jobs list takes exactly one subject filter — `?subject_id=` —
 and the Job's subject column is `subject_id`.
 
+**The step PUT will refuse a metadata body that drops a stored key; it
+will not refuse every metadata body** (design `baf738b7`, David
+2026-09-23, accepted as proposed; answers backlog `e39a9d2a`). The item
+asked the PUT to refuse any `metadata` and send every caller to the
+merge door (`PATCH …/steps/{id}/metadata`). Measured before any code:
+about 100 writers send metadata with the status flip, because the
+checks that run at done read it, so that rule was five cars and made
+completion two writes that are not atomic. Decided: **refuse only a
+body that omits a key the stored step holds** — clearing by omission is
+the actual data loss, and a stale read that would drop a concurrently
+added key is caught with it — route that caller to the merge door with
+an explicit `null`, and delete the three keys `update_step` carries by
+hand (`authority_role`, `human_only`, `agent_run`); the
+refuse-every-body plan stays unbuilt unless a two-write completion is
+wanted for its own sake. **The premise under the one-car estimate was
+false, and the rule stands with a new order** (correction recorded on
+`e39a9d2a` the same afternoon): the registry materializes
+`metadata_defaults` and the audience keys into every step, so ANY PUT
+built without a prior read omits stored keys — the gate runner's
+verdict report and `boss car open` / park among them — and landing the
+refusal first would have stopped every gate and every park. The order
+is now (1) `boss hold` / `boss release` through the merge door —
+landed (#586); (2..n) every fresh-metadata writer moved to
+read-merge-write or the merge door, the gate runner and `car.rs` first,
+each converged on its host before the next; (last) the server refusal,
+which closes the item. Until it lands, the PATCH semantics above hold,
+wipe of unmentioned keys included.
+
+**A Job carries the instant it was admitted, not only the day**
+(design `f2cdff23`, David 2026-09-20, all three questions accepted as
+proposed; landed as backlog `6c2eba00`). `opened_on` is a date, and
+every surface that asks how long something has waited — the
+ops-runner's `oldest_wait_s`, dock wait and gate duration on the
+region map, the overdue alarms, the silence sweep that settles a dead
+agent run — needs the instant, which was `metadata.opened_at`: a
+convention the doors followed and a raw `POST` did not, and a missing
+stamp read as decades old rather than unknown. Decided: (1)
+**`opened_at` is a column**, server-stamped at admission and kept out
+of every UPDATE the way `partition` is; (2) **the back-fill is a
+projection of the log** — each packet's own `jobs.job.created` event,
+the derivation the rebuilder also applies — and a packet whose create
+event the log does not hold keeps `NULL`, because an instant nobody
+observed is worse than none; (3) **admission grows no create-time
+check** for declared-required fields as part of this — validators
+still run at done, and a server-stamped field needs none. The metadata
+stamp is still written for the readers already on it.
+
+**A packet stays on its admission version unless an actor moves it, and
+the move is on the record** (design `7cf202a9`, David 2026-09-23, all
+five questions accepted as proposed; answers backlog `4347a1af`). The
+item said the re-pin machinery had no door; measured, it had one —
+`POST /api/jobs/{id}/convert`, landed in train #150 on 2026-08-30,
+gated on the ordinary job-write permission, answering 409 with the
+obstacles when `convertibility_for_packet` is not automatic and
+otherwise updating `jobs.workflow_version` under a plain `job.updated`.
+No CLI verb calls it, no test covers it, and no open packet carries a
+re-pin's signature. It also moves less than it reports: a step's
+`procedure` is projected into the step row at materialisation, so
+converting page-audit `c0d2caf0` from v1 to v3 would answer
+`converted: true` while its `measure` and `file` steps kept v1's text —
+the only thing that changed between those versions — and a target that
+inserts a step (backlog-item v1 → v7 adds `draft-design`) would walk the
+packet to a step no row holds. 112 of 296 open packets were pinned
+behind their kind's active version that evening. Decided: (1) **the
+guarantee, restated so the code can hold it** — a packet stays on its
+admission version unless an actor explicitly moves it; a move is
+refused when it would retroactively demand evidence or strand a step;
+the move is on the record — with `/convert` the one door and a CLI twin,
+`boss job convert <packet> [--to vN] [--dry-run]`, whose dry run
+returns the verdict without writing; (2) **a re-pin re-projects the
+target's step defaults, procedure included, onto every step not yet
+completed, materialises any step the target inserts, and leaves
+completed steps with the text they ran under** — and until that lands
+the door refuses any move whose target changes a pending step's
+procedure or inserts a step; (3) **a `job.repinned` event** (from, to,
+actor, steps re-projected, steps inserted) plus a `repins` list appended
+to the packet's metadata, so admitted-at-v3 and moved-to-v3 read
+differently without diffing `job.updated` payloads; (4) **authority
+narrows to `platform-admin`**, the role that owns the Workflow registry,
+from any job writer; (5) **never automatic, never on publish** — a
+cohort move (the 47 page-audits on v1) is the per-packet door run in a
+loop by an operator after a dry run, each packet its own event,
+revisited once moves have been counted. Not yet built: on main the
+route still admits any job writer, refuses no changed procedure and
+emits a plain `job.updated`, so the guarantee above is decided and the
+door does not yet hold it.
+
 The brewery's `wholesale-keg-order` is the worked example of
 agent-gated fulfillment: an `availability-gate` reads finished-goods
 for the order's lines and forks fulfill|backorder — an order the cooler
@@ -261,6 +488,57 @@ then a human `pull-and-stage` pick precedes delivery and billing. The
 gate is the release valve that bounds open WIP the way human
 stock-judgment does in a real brewery; finished-goods / COGS draw on the
 billing line items.
+
+**Support's `receive-a-message` is the first protocol of a department
+that is not IT** (design `bffc0aba`, David 2026-09-21, all four
+questions accepted as proposed; the first of the six first protocols in
+the order `3613f0af` set). Measured that day: 116 of 126 open
+backlog-items named no department, and about five were genuinely non-IT.
+The loop adds two ends to standing machinery — the sensor cadence, one
+packet per reading, `sensor_unreadable` filing an urgent deduped packet
+for a source that refuses — namely a mail source adapter idempotent by
+`Message-ID` and the protocol row. The mailbox is a dedicated Agent B
+account on Proton Mail Business, `support@algedonic.dev` routed to it
+with no forward to a human, and Proton has no plain IMAP, so inbound
+needs Proton Bridge. Decided: (1) **Bridge runs on boss-gcp**, installed
+by its converge with the keyring login a one-time human act — and before
+building, establish whether a logged-out Bridge can answer politely with
+an EMPTY mailbox; if it can, the adapter asserts reachability separately
+from message count, or a dead daemon reads as a quiet inbox; (2) **the
+body lives on the packet**, and the inbox message carries a subject and
+a pointer until replies land; (3) v1's terminal was **answered in BOSS**,
+superseded the same day by the send loop below; (4) **a spam terminal
+reached by a disposition at the first step**, and no automatic
+classifier on day one, because a wrong auto-close loses a real customer.
+Landed: a sensor may carry a `selector` naming one stream within its
+source, so two inboxes on one mailbox open two protocols
+(`20260921034443-a-sensor-selects-within-its-source.sql`). The adapter,
+the Bridge host and the protocol row are not built; the tenant's
+`support` module is on (design `1054c099`).
+
+**Agent B sends nothing without the founder's passkey on the words**
+(design `3a89774d`, David 2026-09-21: "I do not want any outbound email
+sent by this protocol, or more broadly Agent B, without my sign off by
+pressing a UI button on a gating step"). No new control is needed:
+`assurance_required = "presence"` on a `sign-off` is enforced with no
+bypass, and the stamp is re-checked against the step's CURRENT shape, so
+an edit after approving voids the approval. The protocol is `received`
+→ `triage` (real or spam) → `draft` (agent) → `approve` (sign-off,
+presence; the founder reads and edits HERE, so what he signs is what he
+ended with, and there is no revise loop) → `sent` (agent; apart from
+`approve` so a failed send never reads as a withheld approval) →
+`answered` | `spam`. Decided: (1) **the transport does not refuse a
+send on its own** — the requirement is scoped to this protocol and the
+ones Agent B will help run, the way the conductor runs the yard, so a
+code path that never enters a step is not closed by it, knowingly;
+(2) **presence on every outbound** for this protocol ("passkey entry is
+as fast as touching my fingerprint"); (3) **the agent drafts**, fetching
+from the record to support the draft rather than writing words alone;
+(4) **a failed send leaves `sent` open and loud**, the sensor's shape,
+and the approval stays valid because the words did not change — the
+packet must never reach `answered` when nothing left the building. Not
+yet built; the send needs an SMTP submission transport behind
+`MailTransport`, beside the log and HTTP-API ones.
 
 **Workflows bootstrap through Jobs.** The system-owned
 `workflow-design` kind authors new Workflows inside a Job (draft
@@ -333,6 +611,35 @@ graph and are deliberately out of scope. It generalizes into a
 **header registry** carrying name, value shape, edge-ness
 (resolution + `on_missing`), and which protocol reads the header;
 `authority_role`'s triple duty gets named and split as it lands.
+
+**A relationship between packets is a declared fact, not a trigger's
+precondition** (design `c0d2787a`, David 2026-09-21, all five questions
+accepted as proposed). Measured that afternoon: six packets filed in one
+session recorded how they related four ways — `prerequisite_for`,
+`prerequisite`, `prerequisite_of`, `related` — none declared in
+`job_edges`, so none resolved, rendered in a Links panel, was ref-checked
+or could be queried; meanwhile the one declared spelling, `answers`, was
+REFUSED by `boss design --answers` because its target was a build
+disposition with no `design-review` to complete. The system permitted the
+weak spelling of the fact and forbade the strong one; the verb's guard was
+doing model work. Decided: (1) **a small typed set of relation edges**,
+declared like the others and grown on evidence, because the four
+spellings meant different things; (2) **a decision edge records and says
+what it causes** — "completes nothing" is printed, never a refusal,
+since declining a true fact loses more than a side effect that does not
+fire; (3) **stored once on the source, resolved both ways by readers** —
+a reverse copy is §9a drift; (4) **a job id in an undeclared metadata
+field is counted**, a warning first, as the measure of whether the habit
+changed; (5) **declarations stay in migrations**, because an edge changes
+what the write path refuses, which is schema. Landed: three
+behaviourless `'*'` relations — `occasioned_by`, `duplicate_of`,
+`supersedes` (`20260921162511-a-packet-relation-is-declared.sql`),
+`on_missing = abort`; the proposed prerequisite relation is deliberately
+absent, because `waiting_on` already is one and the dispatcher wakes its
+waiter when the blocker closes — two of the four freeform spellings meant
+exactly that, and would never have woken anyone. `boss design` records
+the edge and prints what it will not cause, and `boss census` reports
+undeclared job-id fields without raising.
 
 **Stations are the network's nodes, and everything about one is
 registry data** (living reference: `docs/design/stations.md`). A
@@ -444,6 +751,26 @@ legend both cite (resolved 2026-08-12; the redraw itself is not yet
 executed). The envelope model and the target shape of the parts not
 yet built are carried by `docs/design/job-packet-network.md`.
 
+**The experiments program starts at a named threshold, not now**
+(design `d8771dec`, David 2026-09-23, accepted as proposed; answers
+backlog `8af3aed1`). Measured against the system of record:
+`kind=protocol-experiment` answers 0 — the "iterated live" history in
+the workflow's header, and the experiment it cites, belong to the
+retired second stack; opening one needs no code, but a malformed split
+fails silently, so an experiment can sit open splitting nothing; and a
+before-and-after reading cannot credit a protocol change —
+`backlog-item` went v1→v7 in seven days with the same ten steps while
+its median cycle days swung 13×, so the period drives the number and
+only a concurrent split can tell. Decided: **experimentation begins at
+the first draft workflow version, on a kind with 20+ terminals a day,
+that adds, removes or reorders a step**; its author opens it as a Tier
+2 split (`boss-jobs/src/experiments.rs`) instead of publishing, and
+that experiment's first car is a verb that refuses a malformed split;
+the workflow header's second-stack history is corrected. None of it is
+built: no experiment has run on this instance, the refusing verb does
+not exist, and `infra/platform/workflows/protocol-experiment.toml`
+still says real experiments ran through it.
+
 **A step declares its audience once, and every surface derives its
 selector from that** (design `f5ebd2e1`, David 2026-09-11; three
 questions accepted as proposed, the fourth a constraint). The
@@ -476,6 +803,77 @@ until it lands, a decision that must reach a person is assigned to
 them by id, which is the one selector every surface honours today
 (2026-09-15: six operator decisions assigned that way, each with the
 ask written on the step as `context_md`).
+
+**The founder's watch list is his own assigned queue, aged, on the
+surface he already reads** (design `5877860d`, David 2026-09-21, all
+four questions accepted as proposed; built as backlog `3bc896be`).
+Measured: David routed a drive purchase (`b2d5b546`) to design review
+because `/it/design` was the one surface that showed what was waiting
+on HIM; it sat there with no `design_id`, at a step nothing could
+complete, while the work it described happened and was recorded on it —
+visible and inert, which looks handled. Decided: (1) **a per-actor
+queue** — what `boss orient`'s MY WORK already is for an agent — rather
+than a `watched_by` flag (one more thing to remember at the worst
+moment) or a derived "needs him" list (the receiving queue under another
+name, and the right SECOND step once measured); (2) **age is not
+optional**: every row carries how long it has waited, oldest first, and
+crossing a declared threshold changes how the row reads, because an
+accurate signal that never changes stops being read (learning
+`84f8f9b9`: the garage read TROUBLED identically for nine hours);
+(3) **no new page** — it renders where he already looks; (4) **assigned
+steps first, measured second** — what he routes to design without a
+design is the evidence for any wider category. Landed on My Day (`/`):
+"Yours to decide" orders actionable verdicts oldest `opened_on` first
+and bands each row by the receiving yard's own age thresholds (past 3
+days aging, past 14 stale) — one definition of old, not a second copy.
+The derived list waits on that measurement.
+
+**Stuck is a packet past its own place's bound whose next move is ours,
+counted per third and never summed** (design `cf820810`, David
+2026-09-23, all seven questions accepted as proposed; answers backlog
+`4142d821`, two of the figures for the HUD frame `c1253e50`). Not a
+composite score: each number keeps its name and its denominator and
+clicks back to the region that owns it. Measured on `/api/yard/regions`
+that evening: the delivery half already existed — every region carries
+a `trend`, this window against the previous with sample counts, and
+arrivals read 30 a day against 29 — and the shed already told stuck
+from waiting (`PROOF_STALE_HOURS = 24`; `NOT_YET_STARVED_HOURS = 72`,
+measured over 1,812 ops-requests; `waits_on` with `car::starved`;
+"troubled means ours", `3881f5c9`). The gap was the incident's
+population: three cars could not board for 9.5 hours while the dock
+said the boarding depth was met, because only the conductor reads the
+declared `boards_after` edge (`boards_after_outcome` in
+`boss-cli/src/train/boarding.rs`) and the dock region counts parked
+cars against `threshold_met` without asking whether they can board.
+Decided: (1) **stuck is past the declared bound AND the next move is
+ours**; past the bound but waiting on a declared outside owner — the
+world, an event, a named human's act — is **waiting**, shown beside
+stuck and never summed into it, the shed's rule extended to every
+region; (2) **the population is the union of five that already have
+owners**, with no new measure: receiving past the 3-day triage band,
+stations not draining or over WIP, hand-held cars and held greens
+(garage), parked cars whose `boards_after` predecessor has not landed
+(dock), and landed cars past 24 hours whose move is ours (shed), each
+count clicking through to its region; (3) **counted per third** — queue
+management, actors building, delivery — never across them, since one
+total would read 271 receiving packets plus one shed car and hide which
+half moved; (4) **the paired delivery number is arrivals per day
+against the previous window**, read from the arrivals trend, while dock
+wait and time at CI stay on their own regions; (5) **unknown is not
+zero** — a station whose flow cube is blind contributes `?` and its
+third reads `≥ n + ?` (one station, 170 standing, read that way); (6)
+**one `stuck` block on `GET /api/yard/regions`** — per third: stuck,
+waiting, oldest age, owning regions — read by the HUD and `boss orient`
+and recomputed by no client; (7) **the dock is repaired first, as its
+own car**: `boards_after_outcome` moves into `boss_jobs::car` so the
+dock and the conductor share one reading, and the dock says "N parked,
+M cannot board" and stays busy rather than claiming a train is due.
+Built (7), 2026-09-24: `boss_jobs::car::boards_after_outcome` is the
+one judgement, the regions read fetches each parked car's declared
+predecessor by id, and the dock says "N parked, M cannot board (waiting
+behind X)" — busy, or troubled when the edge can never clear. Not yet
+built: the regions read carries no `stuck` block (6), and the HUD and
+`boss orient` do not read one.
 
 ## Step types are property bundles; the alphabet is the mechanisms
 
@@ -606,6 +1004,27 @@ plus one-off queries. The handler vocabulary (`po.place`,
 …) is the adapter edge — the verbs that touch the world stay code;
 which verb fires when is data.
 
+**A product rule is never born in the SPA** (design `ff1c3615`, David
+2026-09-23, option (b) as proposed; answers backlog `7d9df2fe`, found
+by the `/it/registry/rules` page audit). The page's **+ New rule**
+created a rule with no `source` — a product rule — which the boot seed
+above retires because no file names it, so it fired until the next
+restart and then vanished with only a name in a boot log; on the live
+instance 62 of 65 active rules matched the 62 files exactly and the
+other three were `tenant:algedonic`. A warning at the button, option
+(a), was declined because it keeps a control whose product is temporary
+by design — the answer-instead-of-error shape. Landed (#586): the
+button opens a page that creates nothing and names the two durable
+paths, a file under `infra/dispatcher/rules/` carried by a car or a
+tenant's `seeds/rules.toml` published into the instance
+(`NewRuleGuide.svelte`); and the draft door refuses a product draft
+under a name no authored file declares, reading the names with the
+seed's own parser so the door and the seed cannot disagree, and
+refusing every product draft when the authored directory cannot be
+read. A new version of a rule a file does name is still accepted,
+since the seed never walks a live version back — so "live authoring is
+untouched" above now holds for rules that exist, not for new ones.
+
 Where the mechanisms live now: step side-effects are rules keyed
 `step.done.<kind>` (the old `StepType.side_effects` field and the
 step-effects runner are gone); inventory auto-restock is a rule
@@ -619,6 +1038,35 @@ The sim/system boundary **is** the HTTP API: one set of surfaces
 serves real actors, the simulator, and side-effect handlers
 identically; the simulator presents as the role-matched humans it
 assigns, with no exemptions anywhere in policy or validation.
+
+**A tenant cannot yet register a handler, and the direction to test is
+out-of-process** (design `153d49f7`, David 2026-09-23, accepted as
+proposed; answers backlog `ec40e269`). Measured (builder run
+`950597e7`, on `642c0171`): of 51 handlers, 29 are invoked by product
+rules, 21 only by the example tenants' seeds (13 brewery-only, 8 shared
+with the used-device shop) and one, `jobs.complete_step_matching`, only
+by Algedonic's own tenant rule. All of them live in
+`boss-dispatcher-handlers` and ONE binary registers them, so a
+tenant's published rules — and `boss tenant check` — resolve against a
+roster compiled into every deployment: the brewery's keg-deposit,
+excise-accrual and packaging handlers ship everywhere, and a hosted
+tenant can use only what the platform compiled in. Where tenant code
+runs is the hosting safety levels by crate tier (data-only / tenant /
+modules / full, 2026-09-18). Of three sketches — (a) a tenant links its
+own dispatcher binary, in-process but a binary per tenant, which a
+data-only tenant cannot ship; (b) out-of-process handlers, a rule
+naming one the tenant's engine serves over HTTP (`POST
+<engine>/handlers/<name>` with the event, returning its writes); (c)
+declarative handlers as data, a templated PUT/POST body, which cannot
+cover real logic such as packaging allocation — **(b) is spiked
+first**, since it runs tenant code in its own process under its own
+identity and policy, with idempotence and provenance to be held across
+the hop, and the same spike measures how many of the 21 reduce to (c).
+It is a direction to test, not a plan: no spike has run. Landed the
+same day: the cascade map of what each handler emits moved out of core
+into `boss-dispatcher-handlers/src/cascade.rs`, beside the code it
+describes, with core keeping only the type; the handlers themselves
+have nowhere else to be registered yet.
 
 **The forward direction inverts this contract: reaction becomes
 admission.** The network gets one admission edge — **Protocol**
@@ -779,6 +1227,48 @@ what makes id order ≡ commit order, which is exactly what log-tailing
 needs to never miss a row; if sustained demand ever approaches
 ~1K/sec, both reopen together.
 
+**A correction names what it corrects, and every reader is handed it**
+(design `4105b020`, David 2026-09-23, all six questions accepted as
+proposed; answers backlog `56727f95`). A completed step is frozen, and
+correctly; a damaged sentence on one could only be corrected BESIDE
+it — backlog-item `f3e091f0`'s triage evidence still reads "Ordering
+trap confirmed:  is required of every rule", its fix under a job
+metadata key, `evidence_correction`, that nothing reads. Measured across
+all 15,039 jobs: about 132 corrections under 25 key names — one batch
+key on 107 jobs, 24 hand-invented keys on 25 more, and one correction of
+a correction joined to it only by its name (gate-run `9a2576fb`,
+`verdict_correction` then `verdict_correction_withdrawn`). The server
+taught the habit: the terminal-freeze 409 in `http/steps.rs` sends a
+correcting author to "the parent job's metadata" and names no key.
+`reproof` and `regate_receipt` were already the working shape — a
+reserved key plus a reader obliged to look — without the generality.
+Decided: (1) **first-class, not a convention readers learn to find**,
+because 25 key names are the measurement of a convention authors do
+not keep; (2) **one reserved append-only list, `corrections`, in job
+metadata**, entries `{step, field, reads, should_read, why, by, at}`,
+written only through `POST /api/jobs/{id}/steps/{step_id}/corrections`
+and a `boss correct` verb with `-file` twins; the door refuses an open
+step, a field the step does not hold, and a `reads` excerpt absent from
+the stored text, emits `job.step.corrected`, and the generic metadata
+PATCH refuses the key — the step and its audit event are never touched;
+(3) **the reader is handed it, not asked to search**: the job GET
+attaches each step's entries as `step.corrections`, one shared web
+component marks the field, `boss brief` prints each correction under
+the field it corrects, and the original is never replaced in the
+render — both are shown; (4) **a correction is withdrawn only by
+appending** an entry carrying `withdraws: <index>`; (5) **separate from,
+and lighter than, `correct-the-record`**, which is for a published
+claim whose premise changed decisions, holds 0 packets (control:
+`kind=backlog-item` answered 692 on the same connection), and whose
+`applied` step will use this door when the false claim sits in a
+completed step — a damaged sentence needs a signature, not a review;
+(6) **no backfill**, since rewriting the ~132 would mean guessing a step
+and field for each; the 409 hint names the new door instead, and two
+weeks after it ships the scan is re-run with a target of zero new
+ad-hoc keys. `reproof` and `regate_receipt` stay as they are: they
+supersede by precedence, and each has its reader. Not yet built: the
+409 still sends an author to free-form job metadata.
+
 ## Finance & ledger
 
 The ledger is a dedicated crate consuming `financial_facts` via a
@@ -824,6 +1314,30 @@ door's own validation (codes unique, kinds and balances inside the
 table's CHECK constraints, a parent declared before its child); the
 collision itself is only visible at publish, because only the
 deployment knows its chart.
+
+**Algedonic's books read the ledger, and its bills get a protocol**
+(design `72ccb3b2`, David 2026-09-23, both questions accepted as
+proposed; from the `/ux/finance` page audit `3f964c57`). Finance is on
+for Algedonic (module decision `1054c099`). Measured: the ledger held
+one entry, a $1.00 sponsorship still in Cash in Transit awaiting its
+payout; revenue reaches the ledger only through packets
+(`receive-a-sponsorship`, `receive-a-payout`), yet the finance page's
+headline, AR aging, gross margin and Invoices tab read commerce
+invoices, which nothing writes, so the page could never agree with the
+ledger's income statement; and payables had no protocol — the ledger's
+bill endpoints held 0 bills, while PO Approvals and AP aging read
+inventory, which the company does not run. Decided: (1) **payables are
+a finance protocol, `receive-a-bill`**, on the ledger's own bill
+endpoints — one packet per invoice (cloud, domains, Cloudflare,
+software subscriptions, Stripe fees) posting to AP and then to cash on
+payment — and the inventory-backed PO Approvals and AP aging come off
+the page for a tenant without the warehouse module; (2) **the headline
+reads the ledger**, where packets already post revenue, because one
+source cannot disagree with itself; commerce invoices stay for tenants
+that sell goods, and hosting revenue (`8db1d6a6`) posts to the ledger
+the way sponsorships do. Not built: `receive-a-bill` exists in neither
+this tree nor the tenant's, and the page still reads commerce and
+inventory.
 
 **The tax regime is tenant data; the migration's kinds and rates are
 the brewery's.** (Backlog `7f163e58`; design `e187198f`, 2026-09-18.)
@@ -1045,6 +1559,125 @@ still arriving under an alias. Budgets (`AgentSpec` caps, a decision
 recorded before a run starts) sequence after the run is a recorded
 fact. Car 1 (registry + alias + resolution, window open) building
 2026-09-15.
+
+**A run reported as a bare total is priced at a declared blend, and
+says so** (design `91a9bfe7`, David 2026-09-20: "The blended rate for
+the cost of runs sounds fine"; all three questions accepted as
+proposed). Measured: 2 of 85 recorded runs carried any cost, because
+only an input/output split was priced and the harness that runs a
+dispatched builder reports one total — so both budget desks enforced
+their caps against about a fiftieth of the spend. Decided: (1) **the
+assumed input share is a per-model column on `agent_rate_card`**
+(`blended_input_share_ppm`), declared rather than hardcoded, NULL
+meaning undeclared and therefore unpriced; one row carries it,
+`opus-5[1m]` at 875,000 ppm, the only model with measured splits behind
+it; (2) **every figure names its basis** — `split` or `blended`,
+derived from the run's own token shape rather than stored — carried
+into every roll-up, where a bucket holding one blended run reports
+itself blended, the same rule that already makes a bucket with an
+unreported run answer `None`; a measured split always wins; (3) **the
+83 runs recorded before it stay unpriced** — marking them blended would
+record an assurance nobody has, so the series starts where the pricing
+does.
+
+**A run is priced from what it consumed, and a budget is a reading,
+not a limit** (backlog `e6b2066f`, David 2026-09-23: "the goal is the
+PLUMBING to understand costs … we do NOT want budgets to limit
+building"). Measured: the bare total the blend above priced was the
+harness's `subagent_tokens` — the run's FINAL context size, within 1%
+of its last turn on 62 of 68 runs — while its summed per-turn tokens
+were a median 48x larger, 96.8% cache reads; real spend was a median
+4.9x the recorded figure. Decided: (1) `boss dispatch --report` meters
+a run from its subagent transcript — the four counts (uncached input,
+cache write, cache read, output) of every turn's `message.usage` — and
+the typed count rides `detail` beside it; (2) `agent_rate_card` prices
+cache reads and writes as data (0.1x and 1.25x input, the 5-minute
+write rate, so a 1-hour write is a floor), basis `metered`; (3) the
+`opus-5[1m]` blend is retired, so an unmetered total is unpriced rather
+than about five times low; (4) an over-cap claim is admitted and
+`agents.claim.over_budget` rides the log beside it, and an over-cap run
+is recorded with its `budget` reading `deny` — neither refuses.
+
+**A destructive change is approved by the founder's passkey over a
+rendered plan and executed by the machine** (design `17835005`, David
+2026-09-21, all five questions accepted as proposed). The occasion was
+commissioning the forge's new disk: a second NVMe renumbered the devices,
+and the drive that looked new by number was carrying the system —
+approving "format nvme0n1" would have approved destroying it. So **the
+guard matters more than the approval**: bounded verb, machine-checked
+preconditions, plan, passkey-bound approval, recorded execution, the
+passkey last of the five. Decided: (1) **the signature binds a rendered
+plan** — the target resolved by-id, preconditions evaluated live on the
+host — never a verb call; (2) **a runner never trusts an approved
+field**: the system of record issues a short-lived single-use
+capability, host-side verification of the enrolled key being later
+hardening, and the weakness stated plainly — this trusts the SoR;
+(3) **eligible is a declared verb whose dangerous outcome machine-checked
+preconditions exclude**, however destructive; a verb that needs someone
+to eyeball which thing is meant is not eligible behind any approval —
+the line moves from who acts to who decides, and stays sharp; (4) **an
+approval is single-use, minutes long, consumed when the runner begins
+and voided by drift**; (5) `commission-a-disk` is the first verb.
+Landed: read-only planners `plan-a-disk-commission` and
+`plan-a-tenant-merge`, which evaluate exactly the write path's
+preconditions and refuse (exit 78) what cannot run; the mutating
+`commission-a-disk` and `merge-tenant-main`, each declaring
+`requires_approval` and re-checking immediately before writing; and
+ops-request's `approve` step, the first presence-assured step in the
+system — the plan rides in that step's metadata, so the WebAuthn
+assertion over its shape hash signs the plan's bytes with no second hash
+to keep in agreement, and an edit after the ceremony voids the stamp.
+The capability a runner would verify is not built, so the ops-runner
+refuses every `requires_approval` verb: the gate exists before the
+power.
+
+**Presence authorises a break-glass enrolment, and the bootstrap token
+retires** (design `03451237`, David 2026-09-22, all four questions
+accepted as proposed). Independence is a property of the ASSERT path —
+hardware key plus PIN opens the door whatever else is down — while
+enrolment is an administrative act done while things work: the founder's
+software passkey may AUTHORISE administering the emergency credential and
+may never BE it, and the refusal of synced and unattested authenticators
+stays exactly as strict. Today `enroll_gate` admits a break-glass session
+or the bootstrap token while nothing is enrolled, and that
+zero-credentials condition, which exists only to bound a shared secret,
+forces a repair (two keys bound to a retired relying-party id,
+`1c4c100a`) to empty the store first and open a window with no emergency
+door at all. Decided: (1) **one authorisation packet per key**, its step
+naming label, relying-party id and deployment, stamped with
+`assurance_required = "presence"`, the gateway re-computing the shape
+hash against the step's current content before it enrols — the
+mechanism `17835005` settled, pointed at a second subject; (2) **who may
+authorise is a named list of employee ids on the gateway**, starting
+with David, not a role — a role is registry data, and would make
+enrolment depend on whoever can write a policy row; (3) **single-use by
+record**: the gateway writes the credential id and instant onto the step
+and refuses a step already carrying one, naming it; (4) **the token
+retires**, and with it the zero-credentials window. Not yet built.
+
+**One bootstrap, at the identity layer** (design `af6dfcdb`, David
+2026-09-22: "a 1-time password for the admin's initial passkey
+enrollment and then real security takes over from there"; all four
+questions accepted as proposed). Retiring the break-glass token left a
+fresh instance no way in; the answer moves the bootstrap down, from an
+emergency credential to an identity, so the system has exactly one.
+Measured: `infra/oss-quickstart/init.sh` sets the bootstrap admin's
+password from `BOSS_BOOTSTRAP_ADMIN_PASSWORD`, defaulting to the literal
+`change-me`, prints it and asks for a rotation nothing forces or
+notices — a standing default credential on a public quickstart.
+Decided: (1) **the window closes when the admin holds a passkey**, not
+by a spent flag — no state to write, nothing left armed by a crash, and a
+reader checks it with a question whose answer is obvious; (2) **the
+password is generated and printed once**, the variable kept as an
+override for scripted installs and the default removed; (3) **once the
+passkey is enrolled, the bootstrap admin's local-auth row is removed** —
+`credentials.toml` stays for deployments that never enrol a passkey —
+with the counter recorded: an adopter whose only passkey dies is locked
+out, which may argue for keeping the row until a second factor exists;
+(4) **a fresh instance reaches break-glass enrolment only through the
+admin passkey**, so a shared secret never authorises an emergency
+credential, at the cost of a window where that passkey is the only door.
+Not yet built: `init.sh` still defaults to `change-me`.
 
 ## Calendar
 
@@ -1273,15 +1906,183 @@ car. Tooling stays mocked Playwright — hermetic, gated, already in
 the image; "more thorough" is more assertions per page, not a
 different tool.
 
+**A department with no protocol is stood down on this instance, not
+given pages** (design `36b79159`, David 2026-09-23, accepted as
+proposed). The march kept meeting one fact. Maintenance (audit
+`015c3935`) had 0 protocols, 0 sensors and 0 rules — its 26
+`maintenance-*` rows are IT housekeeping that shares the word, and its
+pages sit behind the `equipment` module that `1054c099` turns off for
+Algedonic; People (audit `0c0265a3`) had 0 protocols and a roster of
+the founder and a system account. Each had a weekly retro with nothing
+to retrospect and pages drawing only the demo's shape, and neither is
+among the six first protocols (`86f32b7d`). Decided: **such a
+department is stood down on this instance** — no weekly retro and no
+sidebar pages until a protocol exists (modules-off already covers
+Maintenance); People gets a protocol only when a second person joins;
+and each remaining audit records "no protocol: stood down" instead of
+re-raising it. Not built: the `retro.open` handler behind
+`department-retros-weekly` still opens one retro per row of the
+`departments` table, and no stood-down marker exists for it or the
+sidebar to read.
+
+**Algedonic, LLC keeps its at-scale surfaces, lightly used, to dogfood
+them** (design `922f37be`, 2026-09-23; the proposal to turn
+`/watchlist` off here was declined). Measured by the `/watchlist` audit
+(`08b0c4f8`): no sales protocol produces or reads a churn score, the
+accounts directory holds one account (the shared Anonymous Sponsor),
+and the nightly batch that scores had fed nothing since the second
+stack retired (`9599babc`). David, recorded verbatim by the operator
+because the review box was clearing his entry (`fec57f5f`): "I wanted
+to keep watchlist and other 'at scale' needs in Algedonic, LLC even
+when it is overkill as a means to dogfood our software development. I
+want to scale really smoothly, so it is okay investing in protocols
+that may be very lightly used until we have real scale. But the
+playground instance and simulator are going to be where we really
+pressure test modules and behaviors that are relevant for companies
+with physical operations and more people than Algedonic, LLC." So
+light use is not a reason to take a surface off the company's own
+instance; the line is physical operations and headcount, which the
+playground and the simulator carry. It differs in kind from the
+stand-down above: a department with no protocol at all has nothing to
+dogfood. Nothing to build; the batch fix landed on its own (#586).
+
+**The look is one light theme, Transit, and the map's colours are the
+first to route through it** (design `dea94998`, David 2026-09-23: "I
+like where we are going with option 2, the route map / transit
+option"; answers backlog `42f66fb3`). The direction set that day: one
+LIGHT-only theme for the BOSS instance and as the company's overall
+tone, flowing into www.algedonic.dev and the GitHub presence — themes
+compared side by side first, specifics after — and every UI and
+styling car waits on it while back-end work does not. The boards were
+compared as a claude.ai Artifact linked from the packet, the gap
+exhibits (§Design docs, `26a89f11`) exist to close. Landed (#586,
+`42f66fb3`): the groundwork, not the look — the world map (`MapPage`,
+`WorldMap`, `RegionMap`) reads only a `--map-*` block in
+`apps/web/src/styles.css`, with no fallback and every value still
+today's colour, pinned by `it/yard/map-palette.test.ts` so a retired
+token fails the test rather than repainting in silence. Not built: the
+palette itself (Enamel, below), and the rest of the SPA and www on it;
+the SPA still paints the dark theme.
+
+**Its parts are Enamel — Transit taken to station signage — with
+comfortable rows** (design `a4df741a`, David 2026-09-24; board: "I
+like Enamel. Let's start there."; density: "Let's do comfortable rows.
+We are here all the time, so we want it easy on the eyes."). Round 2
+drew the parts every page is built from — buttons, state pills, a
+packet's progress line, a form with a validation error, the three
+honest states (loading, empty, failed), a table at two densities, the
+spacing scale, and a composed `/it/design/audits` — twice, from
+identical HTML so that only the tokens differed: Transit as drawn
+(pill buttons, tinted pills, one blue) and Enamel. Decided: (1)
+**Enamel is where the look starts**, on the Transit palette: night ink
+`#0E1B2E` on white, `#0F6E9F` for action and progress, Overpass and
+Overpass Mono; corners squared to 4px (3px on fields and chips);
+buttons uppercase and tracked in 2px frames; keyboard focus an amber
+ring, the one amber outside a state; headers and table heads as enamel
+bands, white on night ink; **states as solid plates that always carry
+their word** — clear `#0B6B4F`, busy `#F2C230` under ink, troubled
+`#C8283D`, pending dashed, ready solid blue, completed solid ink; and
+**every department owns a line colour, run as a rail down the left of
+its pages** — identity, never state, which is why no plate is read by
+colour alone. A failed read is a red rail on the same device, so it
+reads as "this line is down" and never as an empty list. (2)
+**Comfortable rows are the default** (the boards' 12px cell padding
+against compact's 5px). The proposal kept compact for working lists —
+queues, the yard, the audit log — and the answer names no such
+exception; read here as comfortable there too, since those are the
+pages the operator is on all the time. The spacing scale is the app's
+existing `--s1`–`--s7`, unchanged, with 72 for page gutters only.
+"Start there" makes Enamel a starting point rather than a frozen spec:
+the board named its own risks, loudness on dense pages and four
+department lines plus three states to keep apart, and its line colours
+(IT `#0F6E9F`, Brewing `#B98A00`, Finance `#0B6B4F`, People `#7A3E9D`)
+and the BOSS mark are sketches, not finished identity — Finance's
+sketch is exactly the clear plate's green. The boards were again a
+linked claude.ai Artifact, so the values are written here rather than
+left behind the link. Not built, any of it: `apps/web/src/styles.css`
+still paints the dark Space Grotesk system; the item the doc named to
+build these tokens (`42f66fb3`) closed on 2026-09-23 on the map's
+`--map-*` groundwork alone, and no open item carries them; and every
+page audit's `styled` step is still the marker the machine skips
+(`infra/platform/workflows/page-audit.toml`), so applying the look per
+route waits on a new version of that kind.
+
+**One map per floor: the region map draws its own slice of the yard,
+and YardPage retires** (design `fe77a1d2`, David 2026-09-23, all three
+questions accepted as proposed; answers backlog `c0565f48`, finishing
+the consolidation design `d2154293` decided on 2026-09-19 — "let's
+have this become THE surface"). Measured: `/it/yard/<region>` already
+swapped to the region's own map (`ca37478f`), but for the six floor
+regions `MapPage` still mounted `<YardPage focus={region} embedded>`
+beneath it, and embedded YardPage still drew `YardMap` — the WHOLE
+six-region floor — so `/it/yard/dock` showed the dock's wagons twice, a
+plate and then a wagon, with five other regions underneath. Two facts
+set the order: the region map's plates cannot be clicked, so every
+selection that drives the entity panel and its verbs comes from
+`YardMap` or the departure board; and `YardMap`'s drawing already
+splits on region lines through the total `STATION_REGION` record in
+`region-contents.ts`. The platform regions (receiving, marshalling,
+shop floor) were already the end state — a region map, then that
+region's working panels. Decided: (1) **each floor region draws only
+its own slice**, so a wagon crossing from the dock to the track leaves
+one map and appears on the next rather than sliding across one floor;
+the crossing stays visible at the world level, where the borders carry
+it, and the departure board still lists every wagon — a whole-floor
+seventh view is the second page the consolidation removes; (2) **three
+cars, and no detail leaves before its replacement is on screen**: split
+`YardMap` into one pure layout function per region, keyed through
+`STATION_REGION`, with no change on screen and a test that the six
+slices' union draws what `YardMap` draws today; then `RegionMap` draws
+its slice with `selected` and `onselect`, so every wagon, bay and
+locomotive selects into the entity panel, and embedded YardPage stops
+drawing `YardMap` in that same car; then the deck (alerts, departure
+board, entity panel and verbs, production and signals) moves into a
+`FloorDeck` that `MapPage` mounts, the source-reading tests repoint, and
+`YardPage.svelte` is deleted, every route unchanged (`/it/yard` still
+resolves to the track). The last two both edit `MapPage`, so they ride
+one after the other; (3) **built now in the `--map-*` tokens**, not held
+for the Transit reskin above, which chooses how the map looks rather
+than what it shows and will then restyle one map per region instead of
+two. Not yet built: `YardPage.svelte` still draws `YardMap` when
+embedded ("STILL DRAWN when embedded, deliberately"), and no
+per-region layout function exists.
+
+**What the website says is checked against what the record holds;
+whether it works is a reading with a threshold named first** (design
+`59a776c5`, 2026-09-20). Correct and effective are two protocols with
+two kinds of evidence. **Correct is a check:** a claim is marked in the
+page source (`data-claim="<id>"`) and a registry
+(`apps/web/src/marketing/claims.ts`) says which row answers it — David:
+"Marked claims are fine to start, let's go with that." The limit is
+accepted in the open: an UNMARKED claim is invisible to the check, so
+the checker's report carries the marked count and a prose fingerprint —
+the decidable stand-in for a coverage denominator nothing can know,
+since words that moved while the claim set did not are the prompt to
+mark what was added — and a claim whose row cannot be read is a
+refusal, never a green. The scope is www only, a site being a row so a
+second is data. The design decided a daily `check-the-claims` protocol
+plus a run on every publish, a disagreement FILING rather than paging —
+a price included, until one instance says a louder arm was wanted. The
+caller that shipped first is a gate test instead
+(`the-landing-page-claims.test.ts`, backlog `e1524f57`), where a
+disagreement reds the gate: every source kind today is a fact of the
+tree and can only drift through a commit, so the cadence arrives with
+the first `registry` source kind, which reads live data and moves
+without one. **Effective is `measure-the-page`**, already
+decided by the department template (`3613f0af`): visits by page and by
+week, and nothing else until that sensor has produced a decision, with
+the step requiring the reader to write down what the number would have
+to say to change anything BEFORE taking the reading — not yet built.
+
 ## OSS posture & tier boundaries
 
 Two install paths: single-VM bare metal (`infra/oss-quickstart/`)
 and Docker compose. File-backed auth is for evaluation; HA
 topologies return as opt-in blueprints under `infra/blueprints/`.
 Crates split into **Tier 1 — core state-machine OS**
-(`crates/core/`, 27 crates: the four primitives' services, policy,
+(`crates/core/`, 26 crates: the four primitives' services, policy,
 gateway, dispatcher, clock, expression DSL, taxonomy registries,
-calendar, content, docs, ML stack, cybernetics, testing, ports,
+calendar, content, docs, ML stack, testing, ports,
 plus `*-client` crates) and **Tier 2 — company-modeling layer**
 (`crates/modules/`, 16 crates: people, accounts, commerce,
 inventory, shipping, ledger, products, messages, catalog, assets,
@@ -1297,6 +2098,30 @@ answer is a Workflow (`docs/design/seed-vs-emergent-state.md`,
 enforced by `seed-bypass-smell.sh`); the canonical demo world is
 **built live, not migrated**: the install starts the sim and it
 generates 365 simulated days of events against the live API.
+
+**Four languages: Rust for systems, Svelte for the frontend, Python for
+scripting, containers for deployment — and a fence around the third**
+(design `9b4d8ccd`, David 2026-09-20, all four questions accepted as
+proposed). Measured that day: 234 shell files, 51,806 lines, against two
+Python files — shell was already the scripting language, and `python3`
+was already a declared forge requirement. Decided: (1) **new scripting
+is Python where the work is structured data** — the lints first, where a
+1,422-line bash lint is the argument and the startup objection measured
+0.56 s across all 88; **never for the forge's shell twins**, which
+retire by deletion as the `boss` CLI reaches the forge (§Consolidation)
+rather than by translation; **rarely for glue** that drives systemd,
+`talosctl` and docker, where an interpreter on the recovery path is a
+cost when the system is unhealthy; (2) **the fence is four rules**: no
+`.py` under `crates/`; **stdlib only**, the load-bearing one — no
+`requirements.txt`, no venv, no `pip` in any image, because a script
+that needs a package manager is a program; never imported, only
+invoked; and never on the runtime execution path of a cluster service
+— Python may do a job and exit, never become a component; (3) **no
+migration**: existing shell stays until it is touched for another
+reason; (4) **enforcement is a lint measured like any other** — the
+directory and no-pip rules are near-free greps, the never-imported
+rule needs a parse. No such lint exists yet, so today the fence is a
+written rule and is unchecked, stated here rather than implied.
 
 **A real instance carries only what its tenant declares plus what the
 platform needs; example data reaches an instance only through its
@@ -1382,6 +2207,30 @@ the stamp and the export verb follow. The rule is stated for tenants in
 `docs/tenant-contract.md` ("The instance is the truth; `--take`
 overwrites by decision").
 
+**A module is on only when its tenant lists it `true`, and an instance
+says how many at boot** (design `1054c099`, David 2026-09-22). Measured:
+the company's own gateway answered `"modules":{}`, and under the contract
+the brewery's `tenant.toml` states (a missing key is off, the same as
+`false`) all ten module-gated surfaces had been off since the
+declaration existed. It went unseen while the nav catalog and the route
+switch disagreed about which module gated which route, and surfaced when
+car `f9b43965` made them one fact: a missing declaration is not an
+error, it is a confident empty answer. The declaration lives in the
+tenant repo that `infra/cluster/instances.toml` names, so which modules
+the company runs is a business statement, not a car. Decided: Algedonic
+runs `finance`, `exec` and `support` (support "as that is our email
+inbound for now"); `calendar` only once dated work is modelled as Jobs
+with a `release_date`, since an empty surface is worse than a hidden
+one; the six physical-operations modules are WRITTEN `false` with the
+reason rather than left missing; prod's absent `edit_level` is
+confirmed intended. The platform half: **an instance states its module
+count at boot** — a tenant running only jobs, people and messages is
+legitimate, so a refusal would be wrong, but silence let ten surfaces go
+missing. Landed: the services launcher and the gateway each print one
+line (`modules on: <n> of <m> declared`, naming both sides), and the live
+manifest reads exec, finance and support on and every other declared
+module off.
+
 ## Deployment, the forge, and the cluster
 
 **Deployment is modeled on how networks patch** (living reference:
@@ -1462,6 +2311,22 @@ small ingress that validates the webhook secret and stages with
 `forge.push`, `forge.check.completed` and `forge.merge` born
 declared in the event-kind registry.
 
+**The forge is also the cluster's image source, so its downtime is the
+cluster's restart window** (design `ccce1191`, 2026-09-20). Thirteen
+manifests pull from the forge's registry, the system of record's
+postgres among them — pulled from the forge rather than docker.io
+because a database that cannot re-pull its image cannot restart. While
+the forge is off, running pods keep running and anything that must
+restart waits in `ImagePullBackOff`. So a forge window is quiesced (no
+trains, gates, converge or deploy) and never overlaps a cluster node
+being down; with etcd quorum at two of three and Longhorn at three
+replicas, nodes go one at a time. Where postgres sits during a
+control-plane window was not reached, and waits for a window that wants
+one. The
+window it was written for took the forge alone (David: "Let's do
+forge only then"), and the extra disk was left to a judgement at the
+box, because the measurement that night was headroom, not a repair.
+
 **Maintenance stops being invisible work.** The department's
 recurring labor — backup, audit integrity, ledger replay checks,
 views catchup, GC, purges — ran as systemd timers outside the Job
@@ -1487,6 +2352,25 @@ identity and a consumer of intent, never the host of either: moving
 the company is copying its log and its rules, and everything else
 regenerates.
 
+**Retiring a unit will mean masking it, because disabling is not
+retiring** (design `7b230ddf`, David 2026-09-23, accepted as proposed;
+answers backlog `9599babc`). Measured through `boss ops boss-gcp
+journal-tail` (ops-request `5acce6ec`): `boss-ml-api`, stopped and
+disabled by `retire-second-stack` on 2026-09-15, had been running on
+boss-gcp since 2026-09-20 as one process — the kept
+`boss-ml-inference-batch.service` declared `Requires=boss-ml-api.service`,
+and systemd starts a required unit whether or not it is enabled, so the
+02:30 batch revived it and it served the batch nightly against the
+retired stack's database while no prediction reached the system of
+record. The class: any kept unit that `Requires=` or `Wants=` a retired
+one brings it back. Landed (#586, `9599babc`): the batch reaches the
+cluster's ML API through the machine door, its `Requires=` is gone, and
+its packet carries the prediction count, a zero night failing loudly.
+Decided, not built: after that car converges, `retire-second-stack` is
+re-run for `boss-ml-api`, and the verb changes to **mask** what it
+retires (`systemctl mask`) and to refuse to retire a unit a kept unit
+still `Requires` — still a bounded verb, still David's to file.
+
 **A workspace declares what it guarantees; that is the half that has
 shipped.** Allocation was decided first (`2d43cbcb`, 2026-08-16): a dev
 node is a **`service-instance` Subject**, the pool a StatefulSet whose
@@ -1511,6 +2395,36 @@ which is that guarantee made legible at the point of work. The pool,
 the lease, the `service-instance` kind and the `build` step's record
 of its workspace are decided and **not built**: the dev session is one
 Deployment on the build node, allocated by hand.
+
+**The dev door is an Access SSH application** (design `5fc71f03`, David
+2026-09-18, all three as proposed; backlog `e4cedb46`). That one
+Deployment answered only on a MetalLB VIP on the LAN, so from anywhere
+else the way in was a jump through the boss-gcp WireGuard bastion —
+which `/it/estate` had to spell out in three forms, because `ssh://`
+cannot carry a `ProxyJump` — authorised by one long-lived ed25519 key
+an operator had loaded into a Secret by hand. It is now
+`dev.algedonic.dev`: a CNAME to the tunnel, a route on the in-cluster
+connector to the pod's own ssh Service, and a Cloudflare Access
+application in front of it, all four declared in the same files every
+other public name uses. What that buys is not convenience but the
+credential: **Access issues a certificate for the session**, which the
+pod's sshd accepts through `TrustedUserCAKeys`, so nothing long-lived
+sits on either side of the door.
+
+Two things fell out of the measurement. The pod ran **Dropbear rather
+than OpenSSH for one capability** — sshd's preauth privsep child
+chroots, Dropbear does not, and in 2026-08-30 the cheaper door won.
+Dropbear cannot verify a certificate against a CA at all, so the swap
+back costs exactly `SYS_CHROOT` and the history stays in the manifest
+beside the capability list, which is the only place a reader would ask.
+And **the Access declaration needed no new vocabulary**: `type` is a
+value the handler carries from the declaration to the comparison to the
+create body, never matched against a list of known kinds, so `type =
+"ssh"` is declared, compared and applied by the same four fields
+`self_hosted` uses — pinned now, so the next reach for an enum goes
+red. The short-lived-certificate CA is not a field: Cloudflare generates
+one per application, and reading its public key into the Secret the
+manifest names is a root ceremony, done once.
 
 **The train is tested where the seed is** (design `128b5496`, David
 2026-09-12, all three questions accepted as proposed; cars landed
@@ -1599,6 +2513,29 @@ held for a David-timed restart) and 4-wide niced cargo for `agent-*`
 worktrees (`infra/dev/wt-cargo`), which took the throttling from
 2,177 periods to ~350 over the next ten hours.
 
+**Upgrading Claude Code is a bounded ops verb that David or the agent
+may run** (design `773236fc`, David 2026-09-22, all three questions
+accepted as proposed). Sometimes a new model is blocked on the upgrade,
+so it is a precondition for working rather than housekeeping. Measured:
+`/work/home/.local/bin/claude` is a symlink into self-contained binaries
+under `versions/` on the persistent `/work` PVC — an upgrade is one
+symlink flip, rollback is pointing it at a NAMED version already on disk
+with no network, a running session keeps the binary it exec'd, and a
+pod roll loses nothing. Decided: a verb `upgrade-claude-code` under
+`infra/ops/verbs/` that resolves the target to a concrete version and
+records it (never "latest", which names nothing), records the version it
+leaves as the rollback target, defers while a `gate-run` is launching,
+proves itself by `claude --version` or re-points to the recorded version
+and reports failed, and prunes; (1) **the agent files and runs it** —
+bounded, offline-reversible and unable to touch work in flight, so
+gating it on David gates a model on his being at his desk; he keeps the
+UI entry; (2) **the target is per request**, recorded on the packet,
+never pinned in the tree, which would make every upgrade a car and a
+converge; (3) **three versions are kept**. Upgrading at pod start is
+rejected: it makes the pipeline's tool whatever the registry served at
+boot, with no receipt and no named rollback. Not yet built; the dev pod's
+manifest only installs the tool when it is absent.
+
 **Cluster management runs on an internal host; the workstation is a
 terminal** (design `1bc4b4ed`, David 2026-09-12: "I would rather one of
 the internalized systems be where commands run"). Measured: every
@@ -1626,6 +2563,59 @@ question of *how the operator's own terminal should carry the
 credentials* is not decided: David's answer asked what professionals
 do and whether a small standalone management tool should ship for
 terminals like the Mac, and that stays open on the packet.
+
+**A credential the estate can mint is delivered by the machine, never
+carried by a person; the line is derivability, not sensitivity**
+(design `835c0c9c`, David 2026-09-20, all three questions accepted as
+proposed). Root material — an admin kubeconfig, a
+talosconfig, the credential broker's own root tokens — cannot be
+minted from anything the estate holds, so placing it stays David's
+act, as above. A scoped credential is minted FROM that material, so
+its path is the credential broker
+(`infra/cluster/manifests/boss-credential-broker.yaml`), which exists
+because a hand-placement walkthrough leaked the dev pod's forge token
+on 2026-09-02 — the ceremony was the vulnerability. The first case the
+broker's Secret-and-mount pattern cannot reach is boss-gcp's scoped
+break-glass kubeconfig (`boss-break-glass-operator.yaml`): an
+off-cluster host cannot read a Secret without the credential being
+delivered. Decided: (1) **push, don't pull** — a bounded ops verb on the
+forge, which holds admin and already reaches boss-gcp, mints the
+kubeconfig and deposits it over a forced-command key scoped to
+`/etc/boss-ops/`, the shape `boss-backup` already uses for the nightly
+dump, so the value never enters a packet, a transcript or a person;
+(2) **verify by effect in both directions** — the credential CAN read
+nodes and CANNOT read secrets — and refuse the deposit when the
+negative fails, because a break-glass credential broader than its
+declaration is worse than none; (3) **a host declares the credential
+set it is expected to hold** (`BOSS_OPS_CREDENTIALS=kubeconfig` on
+boss-gcp), since a talosconfig has no scoped form and a full one on the
+public edge is the unbounded grant the scoping exists to avoid — so
+the converge reports the truth about that host rather than a
+permanently red absence. The delivery verb is not yet built.
+
+**Agent B's mailbox: BOSS holds the operational pair, the founder holds
+the account** (design `0ec5e1d2`, David 2026-09-21, all three questions
+accepted as proposed). The keyvault already exists — the credentials
+registry holds knowledge and never values, values live in k8s Secrets
+read only to send them, the broker mints, verifies by effect and
+revokes — so the question was what goes in it. Agent B has four secrets
+and they are not one risk: the Proton account password (the whole
+mailbox, including changing its recovery address), the MFA seed, the
+Bridge IMAP password (one Bridge install, localhost only) and the SMTP
+submission token (send as Agent B, nothing more). Decided: (1) **BOSS
+holds the IMAP password and the submission token; David holds the
+account password and the MFA seed**, and neither of his ever enters the
+registry, the tree or a transcript — an agent holding the account
+password can take the mailbox, which no protocol step needs; the same
+scoped-not-root split as the break-glass kubeconfig above; (2) **both
+BOSS-held secrets are registry-declared and broker-rotated**, the shape
+of `stripe-restricted-read`, never hand-placed; (3) **MFA goes on now**,
+its cost accepted knowingly: Bridge keeps its session in the host
+keyring, so a session that dies at 03:00 stops the mail sensor —
+`sensor_unreadable` makes that loud, and recovery needs David. Not yet
+built: the credentials registry holds no Agent B row. Whether the
+founder-held pair belongs on the one-stick recovery kit (`c1bb822e`) is
+that kit's question.
 
 **The knobs outside the tree become declared settings** (design
 `16115a17`, David 2026-09-12; all four questions accepted as proposed).
@@ -1924,6 +2914,41 @@ the packet is authored and the file, where one exists, is a generated
 artifact. This is the rule the rest of the system already lives by;
 design docs were the one place it was inverted.
 
+**A proposal whose substance is visual rides inside the packet as an
+exhibit, not behind a link** (design `26a89f11`, David 2026-09-23, all
+five questions accepted as proposed; from his question that day about
+richer renderings "so we don't need to go to the claude.ai links"). A
+palette, a layout or a diagram was rendered as a claude.ai Artifact and
+linked, which put what was approved outside the record and mutable,
+behind a second door, and out of `boss brief`'s sight. **HTML as the
+doc's source was rejected**: packet prose is untrusted — any actor can
+write step metadata — and the review surface
+(`infra/step-plugins/review-design.js`) runs in the reviewer's
+authenticated session, which is why it renders prose through web-kit's
+escape-first `renderMarkdown`; and the record is text that agents,
+search and this fold read. Decided: a design packet keeps its markdown
+and questions and may also carry **`exhibits = [{anchor, title, html |
+file_ref}]`**. (1) **The bytes** live inline in step metadata up to a
+size bound (proposed 256 KB), frozen when the step completes, and in
+`file_refs` above it, content-addressed and rebuilt from
+`content.file.attached`; the build first measures whether `file_refs`
+is on, and ships inline-only if it is not. (2) **An exhibit may run
+script and nothing else**: `<iframe sandbox="allow-scripts">` without
+`allow-same-origin`, loaded by `srcdoc`, under CSP `default-src 'none'`
+with inline style and script only — no network, forms, top navigation
+or fetched assets; one that needs live data is a page, not an exhibit.
+(3) **Any actor who may author a design packet may attach one**,
+agents included — the sandbox is the protection, not the author list —
+with the attaching actor recorded. (4) **A question may bind exhibits**
+by anchor and renders beside them; validation refuses an anchor the
+packet does not carry. (5) **It is proven** when the visual redesign is
+reviewed in `/it/design` with no claude.ai link. Authoring is `boss
+design --exhibit anchor|title|path.html`, read with no shell between;
+where an exhibit cannot render (a terminal, `boss brief`) it is listed
+by anchor, title, size and hash, never dropped. Not built, and not yet
+proven: both rounds of theme boards (`dea94998`, `a4df741a`) were
+decided from a linked Artifact.
+
 **The legacy corpus is translated once, not indexed forever.** All 52
 markdown docs become packets and the directory stops being read;
 leaving it as a parallel source recreates the two-sources problem the
@@ -2018,6 +3043,31 @@ went ready with no design filed — an empty decision, 4f6019d7 again) —
 `boss design --answers <packet>` files the design, writes the review's
 question, and completes the draft with the `design_id`, and the publish
 rule closes the review exactly as before.
+
+**Design error gets two instruments: the brief carries prior art, and a
+packet's proposed FIX is verified, not only its claim** (design
+`0d02cda0`, David 2026-09-21, all three questions accepted as
+proposed; answers backlog `3c779ca8`). Measured over 2026-09-20/21: the
+protocol refused a mechanical error nine times, each refusal naming its
+reason, while five design errors went through — one reached David (a
+scoped credential designed as a hand-placement, the broker that retires
+that ceremony never found) and four were caught only by the operator
+searching first, a habit rather than a mechanism. Decided: (1) **`boss
+brief` derives prior art** the way it derives invariants — what has
+already been decided about the packet's area, matched on its `area` and
+title terms — and is **informational first**, printing the match count
+and the sources searched even when empty, because a fuzzy match needs a
+precision number before it can earn a refusal; (2) **the corpus is**
+closed design-doc resolutions, this document's headings,
+`infra/dispatcher/rules/` names and CLAUDE.md §Doors — deliberately not
+the open backlog, which would match nearly everything; the acceptance
+test is that "credential" surfaces the broker; (3) **"verify the
+proposed fix, not only the claim" goes in both** CLAUDE.md's startup
+step 4 and `builder-rules.md`, since three packets that night were
+right that something was wrong and wrong about the remedy, and a
+builder reads a packet's fix shape as an instruction. Not yet built.
+Design error in genuinely new territory, with no prior art and no
+proposal to check, is out of reach of both by construction.
 
 ## Agent memory and the record
 

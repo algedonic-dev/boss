@@ -173,7 +173,8 @@ pub struct LaunchCalendarRow {
     /// Min sort_order of any non-done step = current tier. Null means
     /// every step is terminal but the Job isn't closed yet.
     pub current_tier: Option<i32>,
-    /// `launch_date` from the tier-4 `marketing-launch` step's metadata.
+    /// `launch_date` from the launch step's metadata (the step carrying
+    /// the field — `marketing-launch` declares it).
     /// Null when the step exists but the date hasn't been set yet.
     pub launch_date: Option<chrono::NaiveDate>,
     /// Channel label from the launch step ("email" / "webinar" / etc.).
@@ -587,6 +588,26 @@ pub struct EstateBatchOutcome {
     pub roles_inserted: usize,
 }
 
+/// Which rows of one event kind [`JobsRepository::recent_events_by_kind`]
+/// reads: an exact payload `scope`, and a half-open `[since, until)`
+/// window on the event's timestamp — every filter applied where the
+/// limit is. All absent reads the whole kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventWindow {
+    pub scope: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One page of an event series, newest first, as the raw rows
+/// `{event_id, timestamp, source, kind, payload}`, and how many rows
+/// its WINDOW holds — so `rows.len() < total` says there is more.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventPage {
+    pub rows: Vec<serde_json::Value>,
+    pub total: i64,
+}
+
 /// The fact one declaration leaves: `node.declared`, once per node the
 /// batch changed (its row inserted, or a role landed on it), carrying
 /// the declaration, what landed, and `declared_by` from the stamp.
@@ -804,12 +825,19 @@ pub trait JobsRepository: Send + Sync {
     /// This is the same rule `TailQuery::simulated` states in
     /// boss-events: a filter has to be where the LIMIT is applied, or
     /// it does not really filter.
+    ///
+    /// The window's `since` (inclusive) and `until` (exclusive) obey the
+    /// same rule, in time rather than cadence (backlog bf362f25): a
+    /// post-mortem thirty hours on could not reach the rows it needed
+    /// through a reader that only ever served the newest page. The
+    /// page's `total` counts the whole window, so a caller compares its
+    /// rows against it instead of mistaking a full page for the answer.
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError>;
+    ) -> Result<EventPage, JobsError>;
 
     /// The station flow cube over `[since, now]` — how many
     /// obligations of each `(job kind, step kind, spec slug, authority
@@ -857,8 +885,9 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// So conversion gets its own door, and the door is narrow: it
     /// changes exactly one column, and the caller is expected to have
-    /// asked [`crate::protocol_conversion::convertibility_for_packet`]
-    /// first. Widening `update_job` instead would have let any PUT
+    /// asked [`crate::protocol_conversion::convertibility_for_repin`]
+    /// first — which refuses, besides an unsafe move, any change this
+    /// one column cannot carry onto the step rows (1e973965). Widening `update_job` instead would have let any PUT
     /// re-pin a packet by accident, which is the failure this shape
     /// exists to prevent (bfc74b3a).
     async fn repin_workflow_version_at(
@@ -932,6 +961,25 @@ pub trait JobsRepository: Send + Sync {
     /// else is `ClaimConflict` naming the holder. Like
     /// `append_sign_off`, this write path owns its fields — the
     /// generic step UPDATE racing a claim cannot un-decide it.
+    ///
+    /// WHO COUNTS AS "THE CURRENT HOLDER" IS ADAPTER-SCOPED (backlog
+    /// 28dcc735). The Postgres adapter reads the claimant's aliases
+    /// from `actor_aliases` inside the claim transaction, admits a
+    /// holder spelled by any of them, and rewrites `assignee_id` to
+    /// the claimant's registered id (backlog d7fef617: steps nominated
+    /// with an agent's login refused the agent's own claim). It is
+    /// directional: an alias claiming a step the registered id holds
+    /// is refused. Pinned by
+    /// `tests/step_claim_admits_an_aliased_holder_pg.rs`.
+    ///
+    /// The in-memory adapter does NOT implement this: it has no alias
+    /// source and compares spellings exactly, so a port-level test
+    /// cannot catch a regression of the alias admission. Deliberately
+    /// so — an alias store there would be a second identity registry
+    /// to keep in step with the table. Pinned by
+    /// `in_memory::tests::an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source`.
+    /// A new adapter must decide which of the two it is and say so
+    /// here.
     async fn claim_step_at(
         &self,
         step_id: &StepId,
@@ -1203,12 +1251,14 @@ pub trait JobsRepository: Send + Sync {
     ) -> Result<Vec<(String, i32, i64)>, JobsError>;
 
     /// Projection backing the launch-calendar surface and the exec
-    /// next-30-days panel per examples/used-device-shop/design/marketing-needs.md E2. Returns every
-    /// open/in-flight `marketing-motion` Job joined to its tier-4
-    /// `marketing-launch` step so the caller can render a forward
-    /// calendar. `from` / `to` bound the launch_date window; Jobs
-    /// whose launch step has no date yet are returned with `launch_date
-    /// = None` so the UI can bucket them under "unscheduled".
+    /// next-30-days panel per examples/used-device-shop/design/marketing-needs.md E2. Returns one
+    /// row per launch step — any step carrying the `launch_date` field
+    /// (the StepType registry declares it on `marketing-launch`) — on
+    /// every open/in-flight Job, whatever the Job's kind, so the caller
+    /// can render a forward calendar. No kind is named here (backlog
+    /// 649b3303). `from` / `to` bound the launch_date window; launch
+    /// steps with no date yet are returned with `launch_date = None` so
+    /// the UI can bucket them under "unscheduled".
     async fn list_launch_calendar(
         &self,
         from: chrono::NaiveDate,

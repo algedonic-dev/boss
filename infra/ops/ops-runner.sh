@@ -60,7 +60,10 @@
 #   packet's wait — on one journal line per run, and writes what each
 #   answered request waited onto that request. The walk is serial and
 #   has no per-verb fairness, so this depth is the only real bound on
-#   raising any probe cadence further (backlog 1ffb3305).
+#   raising any probe cadence further (backlog 1ffb3305). The depth is
+#   the server's `total` for this host, and a reading that could not
+#   see the whole queue prints `>=` and `truncated:` instead of passing
+#   a page off as the count (2cfb4562).
 # - Executes with a wall-clock timeout (OPS_TIMEOUT, default 30s) and
 #   an output cap (OPS_OUTPUT_CAP, default 100KB); both truncations
 #   are LOUD — a marker line in the recorded output says what was cut.
@@ -82,6 +85,11 @@
 #   records it red, and the same loud-local-failure posture as the
 #   estate observers applies (3ddd8333: silent-on-curl-failure does
 #   not get a second landing).
+# - A completion the SERVER REFUSES is written onto the request as
+#   `completion_refused` (status, the server's words, first/last,
+#   count, whether the verb ran), so a jammed packet names its own
+#   cause (post-mortem 3c3b202c: two hours of 409s that only a journal
+#   ever saw, and only as a number).
 # - No maintenance-wrap packet pair, deliberately: this fires every
 #   minute, and a packet per firing would drown the board. Its
 #   product IS packets — the ops-requests it answers — and its
@@ -155,18 +163,61 @@ fi
 ACTOR="${BOSS_OPS_ACTOR:-automation:ops-runner}"
 BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
 
+# A LIMIT IS NOT A FILTER (backlog 2cfb4562). This read was
+# `?kind=ops-request&status=open&limit=100` — every host's open
+# requests, one page, with the `total` the API answers beside the rows
+# thrown away — so above 100 the walk silently skipped the tail and the
+# gauge below printed the page as the whole queue: a queue stuck at 400
+# read 100 forever, and no threshold above 100 could ever be crossed.
+# Now the SERVER narrows to this host (`metadata` containment, the
+# host url-encoded by jq, never spliced), the page is the API's own
+# ceiling (MAX_LIMIT in crates/core/boss-jobs/src/http/mod.rs — if the
+# two ever disagree, the comparison below says so loudly rather than
+# the page passing for the queue), and the rows are held against
+# `total` before anything reads them as a count.
+host_doc=$(jq -rn --arg h "$HOST_ID" '{host: $h} | tojson | @uri')
+QUEUE_PAGE=1000
 if ! jobs_json=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
-        "$BASE/api/jobs?kind=ops-request&status=open&limit=100" 2>&1); then
+        "$BASE/api/jobs?kind=ops-request&status=open&metadata=$host_doc&limit=$QUEUE_PAGE" 2>&1); then
     echo "ops-runner: jobs-api unreachable at $BASE — $jobs_json" >&2
     exit 1
 fi
 
 # Envelope ({"data": [...]}) or bare array; keep open rows for THIS
-# host only.
+# host only — the server was asked to narrow, and this still checks.
 mine=$(printf '%s' "$jobs_json" | jq -c --arg h "$HOST_ID" '
     (if type == "object" and has("data") then .data else . end)
     | map(select(.status == "open" and (.metadata.host // "") == $h))')
 n=$(printf '%s' "$mine" | jq 'length')
+
+# THE DEPTH IS EXACT ONLY WHEN THE SERVER'S COUNT VOUCHES FOR IT. Three
+# ways it cannot: no numeric `total` (a bare array, an older shape), a
+# page that held fewer rows than `total`, or a row on the page for
+# ANOTHER host — the evidence the containment filter was not applied,
+# and then `total` is every host's (a wrong target answers instead of
+# erroring, CLAUDE.md §Doors). The first and third leave only a lower
+# bound; the second knows the depth but read part of it, and the list
+# is newest first, so the oldest packets are exactly the ones unread.
+# `truncated` names which, and the gauge prints `>=` in place of `=` so
+# no reader parsing `depth=` can take a lower bound for the count.
+depth="$n"; depth_exact=true; truncated=""
+total=$(printf '%s' "$jobs_json" | jq -r '
+    if type == "object" and (.total | type) == "number" then .total else "" end')
+rows=$(printf '%s' "$jobs_json" | jq '
+    (if type == "object" and has("data") then .data else . end) | length')
+if [ "$rows" -ne "$n" ]; then
+    depth_exact=false
+    truncated="the list was not narrowed to host $HOST_ID ($rows rows, $n for it) — its total is not this host's"
+else
+    case ${total:-empty} in
+        empty | *[!0-9]*)
+            depth_exact=false
+            truncated="the list carried no total, so how much it did not hold is unknown" ;;
+        *)
+            depth="$total"
+            [ "$n" -ge "$total" ] || truncated="read $n of $total open — the walk takes the rest on later runs" ;;
+    esac
+fi
 
 # THE READING, TAKEN BEFORE THE WALK (backlog 1ffb3305). This loop is
 # serial and has no per-verb fairness: a latency-sensitive verb waits
@@ -214,15 +265,22 @@ done <<TS
 $(printf '%s' "$mine" | jq -r '.[] | .metadata.opened_at // "-"')
 TS
 # EVERY run, depth zero included: a gauge that appears only when it is
-# non-zero cannot be told apart from a runner that stopped.
-echo "ops-runner: queue host=$HOST_ID depth=$n oldest_wait_s=$oldest_wait"
+# non-zero cannot be told apart from a runner that stopped. A reading
+# that could not see the whole queue says so on the same line (above).
+if [ -z "$truncated" ]; then
+    echo "ops-runner: queue host=$HOST_ID depth=$depth oldest_wait_s=$oldest_wait"
+elif [ "$depth_exact" = true ]; then
+    echo "ops-runner: queue host=$HOST_ID depth=$depth oldest_wait_s>=$oldest_wait truncated: $truncated"
+else
+    echo "ops-runner: queue host=$HOST_ID depth>=$depth oldest_wait_s>=$oldest_wait truncated: $truncated"
+fi
 
 if [ "$n" -eq 0 ]; then
     echo "ops-runner: no open ops-request for $HOST_ID"
     exit 0
 fi
 
-answered=0; refused=0; skipped=0; failed=0
+answered=0; refused=0; skipped=0; failed=0; held=0
 i=0
 while [ "$i" -lt "$n" ]; do
     job=$(printf '%s' "$mine" | jq -c ".[$i]")
@@ -256,6 +314,27 @@ while [ "$i" -lt "$n" ]; do
             ;;
     esac
     step_id=$(printf '%s' "$step" | jq -r '.id')
+
+    # HELD AFTER A REFUSED COMPLETION (backlog 865d37df, post-mortem
+    # 3c3b202c). The verb runs BEFORE its completion PUT, so a refused
+    # PUT used to leave the step ready and the next pass ran the verb
+    # again — every open verb ~120 times on 2026-09-22. Harmless for a
+    # read; not for a destructive verb, which is what ops-request v2
+    # exists to carry. So a request whose refusal says the verb RAN is
+    # never run again by this loop: at most once matters more than
+    # eventually completed. Clearing `completion_refused` on the request
+    # (a PATCH setting it to null) is the explicit act that releases it.
+    # A refusal that ran nothing (a refused verb's own answer) stays
+    # retryable, because retrying it repeats nothing.
+    held_why=$(printf '%s' "$job" | jq -r '
+        .metadata.completion_refused // empty
+        | select(.verb_ran == true)
+        | "HTTP \(.http // "?"): \((.reason // "") | .[0:300])"')
+    if [ -n "$held_why" ]; then
+        echo "ops-runner: $short held after a refused completion — its verb already ran and will not run again until completion_refused is cleared: $held_why" >&2
+        held=$((held + 1))
+        continue
+    fi
 
     verb=$(printf '%s' "$job" | jq -r '.metadata.verb // ""')
     args=$(printf '%s' "$job" | jq -c '.metadata.args // []')
@@ -452,28 +531,79 @@ ARGV
     # counted, and the unit goes red for it.
     if [ "$disp" = "answered" ]; then
         exitf="$workdir/exit"
-        jq -cn --arg w "$wait_s" --argjson d "$n" '
-            {queue_depth: $d}
+        # A lower bound rides under its own key, never as `queue_depth`
+        # — a reader of that key takes it as the count (2cfb4562).
+        jq -cn --arg w "$wait_s" --argjson d "$depth" --arg exact "$depth_exact" '
+            (if $exact == "true" then {queue_depth: $d} else {queue_depth_at_least: $d} end)
             + (if $w == "-" then {} else {queued_s: ($w | tonumber)} end)' > "$exitf"
         if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
                 ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
                 --data-binary @"$exitf" \
                 "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
-            echo "ops-runner: PATCH queue_depth=$n failed on $short — $patch_err" >&2
+            echo "ops-runner: PATCH queue_depth=$depth failed on $short — $patch_err" >&2
             failed=$((failed + 1))
         fi
     fi
 
-    if ! put_err=$(curl -fsS -X PUT -H "content-type: application/json" \
+    # A REFUSED COMPLETION SAYS WHY, ON THE REQUEST (post-mortem
+    # 3c3b202c). This PUT was `curl -f`, which throws the response body
+    # away. On 2026-09-22 00:50-02:54 UTC the server refused every
+    # completion on both hosts with a 409 whose body named the blocker
+    # (`step has unresolved blockers`, the ops-request v2 `approve`
+    # step; fixed in bd0f3369). The journal held "409" and nothing else,
+    # the red unit had no reader, and the verbs re-ran once a minute for
+    # two hours. So the status and the server's words are kept. A
+    # refusal (the server answered, and not 2xx) is also written onto
+    # the request through the metadata door, which kept working all
+    # night: the packet then says why it is stuck. A transport failure
+    # (no answer at all) has no words to keep and no door to write
+    # through, so it stays a journal line and a red unit, as before.
+    putbodyf="$workdir/put-body"
+    : > "$putbodyf"
+    put_code=$(curl -sS -o "$putbodyf" -w '%{http_code}' -X PUT \
+            -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
             ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
             --data-binary @"$payloadf" \
-            "$BASE/api/jobs/$job_id/steps/$step_id" 2>&1 >/dev/null); then
-        echo "ops-runner: PUT failed on $short — $put_err" >&2
-        failed=$((failed + 1))
-        continue
-    fi
+            "$BASE/api/jobs/$job_id/steps/$step_id" 2>"$workdir/put-err") || put_code=""
+    case "${put_code:-000}" in
+        2??) ;;
+        000)
+            echo "ops-runner: PUT failed on $short — $(cat "$workdir/put-err")" >&2
+            failed=$((failed + 1))
+            continue
+            ;;
+        *)
+            said=$(head -c 2000 "$putbodyf" | tr '\n' ' ')
+            echo "ops-runner: PUT refused on $short — HTTP $put_code: $said" >&2
+            # Accumulates from what the request already carries: how long
+            # a request has been jammed, and how often its verb re-ran,
+            # is the number a reader wants. `verb_ran` because a refused
+            # answer is re-run on the next pass (harmless for a read,
+            # not for a destructive verb).
+            refusedf="$workdir/refused"
+            printf '%s' "$job" | jq -c --arg code "$put_code" --rawfile body "$putbodyf" \
+                --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg d "$disp" '
+                (.metadata.completion_refused // {}) as $prev
+                | {completion_refused: {
+                    http: ($code | tonumber),
+                    reason: ($body | .[0:2000]),
+                    first_at: ($prev.first_at // $at),
+                    last_at: $at,
+                    count: (($prev.count // 0) + 1),
+                    verb_ran: ($d == "answered")}}' > "$refusedf"
+            if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+                    -H "x-boss-user: $BOSS_USER" \
+                    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                    --data-binary @"$refusedf" \
+                    "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
+                echo "ops-runner: could not record the refusal on $short — $patch_err" >&2
+            fi
+            failed=$((failed + 1))
+            continue
+            ;;
+    esac
 
     if [ "$disp" = "answered" ]; then
         echo "ops-runner: answered $verb on $short (exit $rc_str, ${size}B, ${dur_ms:--}ms)"
@@ -484,5 +614,5 @@ ARGV
     fi
 done
 
-echo "ops-runner: $HOST_ID answered=$answered refused=$refused skipped=$skipped failed=$failed"
+echo "ops-runner: $HOST_ID answered=$answered refused=$refused skipped=$skipped failed=$failed held=$held"
 [ "$failed" -eq 0 ] || exit 1

@@ -50,7 +50,24 @@
 
 set -u
 
-cd "$(dirname "$0")/.."
+# THE TREE CHECKED IS THE TREE THIS SCRIPT LIVES IN, so a caller standing
+# in a different git tree is refused rather than told its tree is clean
+# (backlog 67adb415). Measured 2026-09-22: `bash /work/boss/infra/gate.sh
+# --lint` from a builder's worktree asked every git question of the main
+# checkout, found no change, skipped clippy, and printed "clippy saw the
+# crates this tree changed". Only a caller git can place in ANOTHER tree
+# is refused: outside any repository, or where git cannot answer (the
+# gate's uid on a root-owned checkout), nothing is judged and the run
+# goes on as before.
+_gate_tree=$(cd "$(dirname "$0")/.." && pwd -P)
+if _caller_tree=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) \
+    && _caller_tree=$(cd "$_caller_tree" && pwd -P) \
+    && [ "$_caller_tree" != "$_gate_tree" ]; then
+    echo "gate.sh: refusing — this script checks the tree it lives in ($_gate_tree), and you ran it from $_caller_tree. To check that tree, run it from there: (cd $_caller_tree && bash infra/gate.sh $*)" >&2
+    exit 2
+fi
+
+cd "$_gate_tree"
 
 # The lint vocabulary, read from its one definition: `LINT_CANNOT_ANSWER`
 # (exit 3) is a lint saying "the machine could not answer", and
@@ -826,6 +843,17 @@ schema_crates() {
     if [ -n "$(schema_paths)" ]; then printf '%s\n' "${GATE_SCHEMA_READERS}"; fi
 }
 
+# Did this change move the schema at all — the question the receipt,
+# the `-p` refusal and `--auto` each ask. Defined HERE, above every
+# caller: bash defines a function when execution reaches it, and until
+# 2026-09-23 it sat below the `-p` refusal that calls it, so that path
+# printed `schema_touched: command not found` and dropped the line
+# saying the schema widened the scope (backlog d8637703; pinned by
+# gate_sh.rs `every_gate_function_is_defined_above_its_first_top_level_caller`).
+schema_touched() {
+    if [ -n "$(changed_paths | schema_paths)" ]; then echo yes; else echo no; fi
+}
+
 # The derived half of the map: which crates read the paths on stdin.
 input_crates() {
     awk -v idx="${GATE_FILE_INPUTS}" '
@@ -849,7 +877,26 @@ path_map() {
     { printf '%s\n' "$paths" | path_shapes
       printf '%s\n' "$paths" | input_crates
       printf '%s\n' "$paths" | schema_crates
-    } | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+    } | tr ' ' '\n' | sed '/^$/d' | sort -u | live_crates | tr '\n' ' '
+}
+
+# A DELETED CRATE IS NOT A SCOPE. The first shape in `path_shapes` reads
+# the crate name off `crates/<tier>/<name>/…`, and a car that retires a
+# crate changes every file under it — so until 2026-09-23 the map named
+# the crate the car had just removed, and `--lint` ran `cargo clippy -p
+# boss-cybernetics`, which cargo refuses ("did not match any packages")
+# before checking anything (backlog 467175e7, car A). `--auto` would
+# have handed the gate the same impossible `-p`. The files are gone, so
+# there is nothing of that crate left to compile; what the retirement
+# can break lives in the crates that still exist, and those are named by
+# their own paths. `[ -f ]` is a builtin, so the filter costs no process.
+live_crates() {
+    local name manifest
+    while read -r name; do
+        for manifest in crates/*/"$name"/Cargo.toml; do
+            if [ -f "$manifest" ]; then printf '%s\n' "$name"; break; fi
+        done
+    done
 }
 
 path_shapes() {
@@ -936,6 +983,13 @@ scope_self_test() {
     # The tier segment must not be mistaken for the crate name.
     _case "tier is not the crate" "boss-people" "crates/modules/boss-people/src/http.rs"
     _case "a crate's root files count" "boss-jobs" "crates/core/boss-jobs/Cargo.toml"
+    # A retired crate's files are all in the diff and none are in the
+    # tree; cargo cannot build a `-p` for it (467175e7). A fictional
+    # name, so the answer is the filter's alone.
+    _case "a deleted crate implies no crate" "" \
+        "crates/core/boss-zz-retired/src/lib.rs" "crates/core/boss-zz-retired/Cargo.toml"
+    _case "a deleted crate beside a live one implies the live one" "boss-cli" \
+        "crates/core/boss-zz-retired/src/lib.rs" "crates/orchestrators/boss-cli/src/doctor.rs"
     # Everything outside those two trees implies nothing to scope —
     # the lints already run repo-wide.
     # gate.sh and ci.yml are READ by boss-testing's gate_sh.rs, so a
@@ -987,8 +1041,9 @@ scope_self_test() {
     # load this exact file, so a shape change there reddens the sim.
     # boss-testing since 2026-09-17 (backlog b03f38de):
     # generate_configs_sh.rs runs the config generator against this
-    # manifest and asserts the brewery's id is what turns [demo_agents]
-    # on, so an id change there must run that test too.
+    # manifest (the [demo_agents] switch it read retired with
+    # boss-observability, 467175e7), so a manifest change there must
+    # run that test too.
     _case "a tenant manifest implies the sim that parses it" "boss-brewery-engine boss-sim boss-testing" \
         "examples/brewery/seeds/tenant.toml"
     # A bundle edit beside a boss-jobs edit must name boss-jobs ONCE:
@@ -1034,8 +1089,16 @@ scope_self_test() {
     # and infra/lint/*. Editing one of these scoped to NO crate, so the
     # only test that runs the script never ran on the car that changed it.
     _case "a script boss-testing executes implies boss-testing" "boss-testing" \
-        "infra/ops/ops-runner.sh" "infra/forge/checkout-lock.sh" \
+        "infra/forge/checkout-lock.sh" \
         "infra/maintenance/forge-token-audit.py" "infra/prep-github-publish.sh"
+    # ops-runner.sh left the case above on 2026-09-23 because the answer
+    # for it CHANGED, and changed correctly (backlog 10eecbbc): boss-jobs'
+    # the_list_envelope_holds_what_its_readers_assume.rs now reads it to
+    # hold the jobs-list reader it names (`QUEUE_PAGE=1000`), so editing
+    # the runner can redden boss-jobs as well as boss-testing's tests that
+    # execute it. Derived, not listed — this case is the record of it.
+    _case "a script two crates read implies both" "boss-jobs boss-testing" \
+        "infra/ops/ops-runner.sh"
     _case "docs outside design/ imply no crate" "" "docs/invariants/x.toml" "README.md"
     # …unless a crate READS it. gate_sh.rs asserts this runbook tells a
     # developer to set core.hooksPath, so editing the runbook can redden
@@ -1202,10 +1265,9 @@ fi
 # change to every crate that stands up the schema (`schema_readers`),
 # so a migration-only car derives a scope like any other and the
 # fixture runs unscoped ahead of it as before. What remains here is the
-# question the receipt asks: did the schema move at all.
-schema_touched() {
-    if [ -n "$(changed_paths | schema_paths)" ]; then echo yes; else echo no; fi
-}
+# question the receipt asks: did the schema move at all — `schema_touched`,
+# defined beside `schema_paths` above, because the `-p` refusal asks it
+# too and runs first.
 
 # Which ref is "the trunk" for deriving a branch's own commits. The
 # remote-tracking main this repo actually uses, with the local branch
@@ -1979,7 +2041,27 @@ fi
 # STILL NOT A GATE. The build and the test suites remain unproven, and
 # a DB-backed test cannot run here at all. This narrows the red-gate
 # classes by one; it does not replace the gate.
+#
+# THE SCOPE SELF-TEST RUNS HERE TOO, first, because it is the gate's
+# first act on `--auto` and needs no build. Until 2026-09-23 it ran only
+# on the gate's own paths, so a stale case in it passed `--lint` twice
+# and then red gate-run 1f412b9e before any check ran, leaving no
+# receipt (backlog d8637703). It exits 2 naming the case, as the gate
+# does — and ahead of `crates_from_paths`, the map it checks, because
+# the clippy scope below is derived from that map.
+#
+# ONLY WHERE THERE IS A WORKSPACE for the map to name. The self-test
+# checks its cases against this tree's crates and `cargo metadata`, so on
+# a tree with no Cargo.toml — the synthetic trees boss-testing drives
+# this script in — every case fails for want of a crate, not for a stale
+# map. It says so rather than skipping in silence; the repo always has
+# one, so here the check always runs.
 if [ "$LINT" -eq 1 ]; then
+    if [ -f Cargo.toml ]; then
+        scope_self_test
+    else
+        echo "pre-flight: no Cargo.toml here — no workspace for the scope self-test to check the path map against"
+    fi
     refuse_untracked_files
     run_preflight
     LINT_CRATES=$(crates_from_paths)

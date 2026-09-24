@@ -41,6 +41,9 @@ struct State {
     /// The estate as declared through `declare_estate_nodes` — empty
     /// until a test declares one, exactly as a fresh database is.
     estate: Vec<crate::port::EstateNode>,
+    /// Packets whose steps read fails, set by
+    /// [`InMemoryJobs::fail_steps_read`].
+    unreadable_steps: BTreeSet<String>,
 }
 
 impl InMemoryJobs {
@@ -52,6 +55,19 @@ impl InMemoryJobs {
     /// in-memory analogue of the Pg adapter's in-tx recording).
     pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
         self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Make every later `list_steps` of this packet fail with a
+    /// storage error — the in-memory stand-in for a steps read the
+    /// database could not answer. It exists so a reader's handling of
+    /// that failure is testable: until 2026-09-23 the station queue and
+    /// load answered it with `unwrap_or_default()`, which read as "this
+    /// packet has no steps" and dropped it from every station whose
+    /// predicate reads step state (backlog c11e9d3c).
+    pub fn fail_steps_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_steps.insert(job_key(job_id));
+        }
     }
 
     fn record_all(&self, events: &[boss_core::event::Event]) {
@@ -293,12 +309,13 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
-            // Mirror the Pg adapter: the partition is decided at
-            // admission and immutable — an update carries no
-            // authority over it. The storage enforces this rather
-            // than trusting every caller to.
+            // Mirror the Pg adapter: the partition and the admission
+            // instant are decided at admission and immutable — an
+            // update carries no authority over either. The storage
+            // enforces this rather than trusting every caller to.
             let mut next = job.clone();
             next.partition = existing.partition;
+            next.opened_at = existing.opened_at;
             state.jobs.insert(key, next);
         }
         self.record_all(events);
@@ -415,28 +432,35 @@ impl JobsRepository for InMemoryJobs {
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &crate::port::EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError> {
+    ) -> Result<crate::port::EventPage, JobsError> {
         // `recorded` is append-order, so newest-first is a reverse —
         // the same ordering contract the Pg impl gets from
         // `ORDER BY timestamp DESC`.
         //
-        // ORDER MATTERS: both filters run BEFORE `take`, mirroring a
+        // ORDER MATTERS: every filter runs BEFORE `take`, mirroring a
         // WHERE clause preceding its LIMIT. Taking first and filtering
-        // after would reproduce the very defect this argument exists to
+        // after would reproduce the very defect these arguments exist to
         // fix, and would do it only in this adapter — a divergence the
         // Pg pairing test in estate_readers_pg.rs is there to catch.
-        let rows = self
+        // `total` is counted over the same filtered set, before `take`.
+        let matched: Vec<boss_core::event::Event> = self
             .recorded_events()
             .into_iter()
             .rev()
             .filter(|e| e.kind == kind)
             .filter(|e| {
-                scope.is_none_or(|want| {
+                window.scope.as_deref().is_none_or(|want| {
                     e.payload.get("scope").and_then(|s| s.as_str()) == Some(want)
                 })
             })
+            .filter(|e| window.since.is_none_or(|since| e.timestamp >= since))
+            .filter(|e| window.until.is_none_or(|until| e.timestamp < until))
+            .collect();
+        let total = matched.len() as i64;
+        let rows = matched
+            .into_iter()
             .take(limit.max(0) as usize)
             .map(|e| {
                 serde_json::json!({
@@ -448,7 +472,7 @@ impl JobsRepository for InMemoryJobs {
                 })
             })
             .collect();
-        Ok(rows)
+        Ok(crate::port::EventPage { rows, total })
     }
 
     async fn step_flow_cube(
@@ -727,6 +751,9 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*step_id));
             };
+            // Exact spelling only: no alias admission here, unlike the
+            // Pg adapter — the port doc on `claim_step_at` states the
+            // gap (backlog 28dcc735).
             let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
             let claimable = existing.status == StepStatus::Ready
                 && (existing.assignee_id.is_none() || held_by_actor);
@@ -736,6 +763,13 @@ impl JobsRepository for InMemoryJobs {
                     holder: existing.assignee_id.clone(),
                     status: format!("{:?}", existing.status).to_lowercase(),
                 });
+            }
+            // A new holder does not inherit the previous run's edge
+            // (9562f6df). No alias table here, so the holder is `actor`
+            // exactly — the Pg adapter admits its aliases too.
+            if crate::agent_runs::claim_changes_holder(existing.assignee_id.as_deref(), actor, &[])
+            {
+                existing.metadata = crate::agent_runs::without_edge(&existing.metadata);
             }
             existing.assignee_id = Some(actor.to_string());
             existing.status = StepStatus::Active;
@@ -778,6 +812,11 @@ impl JobsRepository for InMemoryJobs {
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError> {
         let state = self.inner.lock().expect("poisoned");
         let job_key = job_id.to_string();
+        if state.unreadable_steps.contains(&job_key) {
+            return Err(JobsError::Storage(format!(
+                "steps of job {job_key} unreadable (injected by fail_steps_read)"
+            )));
+        }
         let mut steps: Vec<Step> = state
             .steps
             .values()
@@ -946,73 +985,73 @@ impl JobsRepository for InMemoryJobs {
         use boss_core::primitives::Subject as _;
         let state = self.inner.lock().expect("poisoned");
         let mut out = Vec::new();
+        // The Job's kind is not read: a packet is on the calendar
+        // because a step carries the `launch_date` field the StepType
+        // registry declares — one row per such step — never because its
+        // kind is a name spelled here (backlog 649b3303: this read
+        // filtered on a tenant Workflow kind (`marketing-motion`) in
+        // Tier 1). One row per launch step is what PgJobs' join answers;
+        // this fold used to keep whichever launch step the HashMap
+        // visited last, so the two adapters disagreed on a packet with
+        // two. `the_launch_calendar_reads_a_property_not_a_kind.rs` runs
+        // one contract against both.
         for job in state.jobs.values() {
-            if job.kind != "marketing-motion" {
-                continue;
-            }
             if matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) {
                 continue;
             }
+            let steps: Vec<&Step> = state
+                .steps
+                .values()
+                .filter(|s| s.job_id == job.id)
+                .collect();
 
             // Tier = min sort_order of any non-done step, or -1.
-            let (tier, launch_step) = state.steps.values().filter(|s| s.job_id == job.id).fold(
-                (None::<i32>, None::<&Step>),
-                |(tier, launch), s| {
-                    let new_tier = if matches!(
-                        s.status,
-                        StepStatus::Pending | StepStatus::Ready | StepStatus::Active,
-                    ) {
-                        Some(tier.map_or(s.sort_order, |t| t.min(s.sort_order)))
-                    } else {
-                        tier
-                    };
-                    // property, not kind: the launch step is whichever
-                    // step carries launch_date (no-step-kind-match rule)
-                    let new_launch = if s.metadata.get("launch_date").is_some() {
-                        Some(s)
-                    } else {
-                        launch
-                    };
-                    (new_tier, new_launch)
-                },
+            let current_tier = Some(
+                steps
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.status,
+                            StepStatus::Pending | StepStatus::Ready | StepStatus::Active,
+                        )
+                    })
+                    .map(|s| s.sort_order)
+                    .min()
+                    .unwrap_or(-1),
             );
-            let current_tier = Some(tier.unwrap_or(-1));
 
-            let (launch_date, launch_channel) = match launch_step {
-                Some(s) => {
-                    let d = s
-                        .metadata
-                        .get("launch_date")
-                        .and_then(|v| v.as_str())
-                        .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok());
-                    let c = s
-                        .metadata
-                        .get("launch_channel")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (d, c)
-                }
-                None => (None, None),
+            // property, not kind: a launch step is any step carrying
+            // launch_date (no-step-kind-match rule). An empty string
+            // reads as absent, as NULLIF does in PgJobs.
+            let text = |s: &Step, key: &str| {
+                s.metadata
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
             };
-
-            if let Some(d) = launch_date
-                && (d < from || d > to)
+            for s in steps
+                .iter()
+                .filter(|s| s.metadata.get("launch_date").is_some())
             {
-                continue;
+                let launch_date = text(s, "launch_date")
+                    .and_then(|v| chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d").ok());
+                if let Some(d) = launch_date
+                    && (d < from || d > to)
+                {
+                    continue;
+                }
+                out.push(LaunchCalendarRow {
+                    job_id: job.id,
+                    title: job.title.clone(),
+                    owner_id: Some(job.owner_id.clone()),
+                    subject_id: Some(job.subject.id().to_string()),
+                    status: job.status,
+                    current_tier,
+                    launch_date,
+                    launch_channel: text(s, "launch_channel"),
+                });
             }
-
-            let subject_id = Some(job.subject.id().to_string());
-
-            out.push(LaunchCalendarRow {
-                job_id: job.id,
-                title: job.title.clone(),
-                owner_id: Some(job.owner_id.clone()),
-                subject_id,
-                status: job.status,
-                current_tier,
-                launch_date,
-                launch_channel,
-            });
         }
         out.sort_by(|a, b| {
             a.launch_date
@@ -1944,5 +1983,71 @@ mod tests {
         let (rows, _) = repo.list_jobs(&only_open, 100, 0).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, open.id);
+    }
+
+    /// THE IN-MEMORY CLAIM HAS NO ALIAS NOTION, AND SAYS SO (backlog
+    /// 28dcc735). The Pg claim admits a holder spelled by any alias of
+    /// the claimant (`actor_aliases`, backlog d7fef617); this adapter
+    /// has no alias source and compares spellings exactly. Giving it
+    /// one would mint a second identity registry to keep in step with
+    /// the table, so the port doc states the rule as adapter-scoped
+    /// instead, and this test pins the gap the doc names: the day this
+    /// adapter learns aliases, this fails and the port doc changes
+    /// with it.
+    #[tokio::test]
+    async fn an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source() {
+        let repo = InMemoryJobs::default();
+        let job = make_job("backlog-item");
+        repo.create_job(&job).await.unwrap();
+        let mut step =
+            Step::new(job.id, "task", "Build it", 0).with_assignee("claude@algedonic.dev");
+        step.status = StepStatus::Ready;
+        repo.add_step(&step).await.unwrap();
+
+        let refused = repo
+            .claim_step_at(&step.id, "agent-claude", Utc::now(), &[])
+            .await;
+        match refused {
+            Err(JobsError::ClaimConflict { holder, status }) => {
+                assert_eq!(holder.as_deref(), Some("claude@algedonic.dev"));
+                assert_eq!(status, "ready");
+            }
+            other => panic!("the in-memory claim must refuse an aliased holder, got {other:?}"),
+        }
+    }
+
+    /// The port doc is the contract a THIRD adapter is written against,
+    /// so the alias rule the Pg adapter enforces must be in it, scoped
+    /// to that adapter, with both pins named (backlog 28dcc735: until
+    /// then it described neither adapter fully). `include_str!` of the
+    /// Pg test makes a renamed or deleted pin a compile error here
+    /// rather than a dangling name in prose.
+    #[test]
+    fn the_port_doc_states_the_alias_rule_and_names_both_pins() {
+        const PORT: &str = include_str!("port.rs");
+        const PG_PIN: &str = include_str!("../tests/step_claim_admits_an_aliased_holder_pg.rs");
+        let end = PORT
+            .find("    async fn claim_step_at(")
+            .expect("the port declares claim_step_at");
+        let doc: Vec<&str> = PORT[..end]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect();
+        let doc = doc.into_iter().rev().collect::<Vec<_>>().join("\n");
+        for needle in [
+            "actor_aliases",
+            "step_claim_admits_an_aliased_holder_pg",
+            "an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "the claim_step_at port doc must name {needle}; it reads:\n{doc}"
+            );
+        }
+        assert!(
+            PG_PIN.contains("fn a_claim_as_the_registered_id_takes_a_step_held_by_its_alias"),
+            "the Pg pin the port doc names must still hold the admission test"
+        );
     }
 }

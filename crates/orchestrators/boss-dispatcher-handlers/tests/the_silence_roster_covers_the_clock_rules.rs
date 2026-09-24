@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 
 use boss_dispatcher::rules::registry::{RawRegistry, parse_raw_path};
 use boss_dispatcher_handlers::handlers::cadence_roster::{
-    ClockCadence, Guard, NotACadence, clock_cadences,
+    ClockCadence, Guard, NotACadence, clock_cadences, unreadable_guard_repair,
 };
 use boss_dispatcher_handlers::handlers::cadence_silence::declarations;
 use boss_testing::dispatcher_rules_dir;
@@ -113,6 +113,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          the rule, so a sweep keyed by kind could not name it. A sensor it cannot read is \
          its own loud packet (`sensor_unreadable:<id>`), which is the failure this sweep \
          would otherwise be for.",
+    ),
+    (
+        "ops-runner-queue-watched-every-5-minutes",
+        "runs `ops.queue.alarm`, which reads the open ops-request queue and files the \
+         `ops_queue:<host>` estate alarm only when a host's oldest waiting request has waited \
+         past five runner cadences (backlog a45b38c1). On a healthy day it produces NOTHING, \
+         and that zero is the healthy reading; what it would file is an alarm keyed by host, \
+         not a packet of a kind a sweep could count. It is itself the watch on a cadence — \
+         the runner's — that no packet reports.",
     ),
     (
         "agent-run-dies-when-building-is-silent",
@@ -298,13 +307,12 @@ fn every_derived_cadence_has_a_readable_guard_or_none_at_all() {
     );
     for c in &cadences {
         if let Some(Guard::Unreadable(src)) = &c.guard {
-            panic!(
-                "clock rule `{}` guards on `{src}`, a shape `cadence_roster::parse_guard` does \
-                 not read. The sweep would call its silence UNEXPLAINED and never name the \
-                 packet holding it, which is the whole finding of cf0f5e2d. Teach the parser \
-                 the shape.",
-                c.rule
-            );
+            // The message is the roster module's own (fbcac8b4): an
+            // author meeting this refusal needs BOTH repairs, and the
+            // one this test used to name alone — teach the parser — is
+            // the unreachable one when the guard is a condition rather
+            // than a dedup question.
+            panic!("{}", unreadable_guard_repair(&c.rule, src));
         }
     }
 }

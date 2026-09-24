@@ -58,6 +58,15 @@
 //!    as blended. A measured split always wins over the blend, and a
 //!    model whose row declares no ratio still prices a total at
 //!    nothing: undeclared is unpriced, not assumed.
+//!
+//! 6. **A ROW THAT CANNOT BE CORRECTED IS MARKED, NEVER BACKFILLED.**
+//!    This log is insert-once, so the rows written before the run
+//!    recorded its effort and its real terminal cannot be repaired by
+//!    re-reporting them. Reconstructing them from the run packets would
+//!    hand a guess a measurement's authority; [`EffortEra`] leaves the
+//!    record exactly as it is and derives which era a run belongs to,
+//!    and the roll-up counts the excluded eras out loud beside the
+//!    unpriced ones (backlog fd5ce137).
 
 use std::collections::BTreeMap;
 
@@ -67,9 +76,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// How a run ended. Narrower than `boss_core::agent::Outcome`, which
-/// carries a response body and a `Cost` the caller would be asserting;
-/// this is the terminal state alone, with the tokens reported beside it.
+/// How a run ended: the terminal state alone, with the tokens reported
+/// beside it rather than inside it — a response body and a `Cost` here
+/// would be the caller asserting what the record measures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -132,6 +141,18 @@ pub struct RateCardRow {
     /// measured.
     #[serde(default)]
     pub blended_input_share_ppm: Option<u64>,
+    /// What a million prompt tokens READ FROM THE CACHE cost, and what
+    /// a million WRITTEN TO IT cost (backlog e6b2066f) — the two rates
+    /// a [`TokenUsage::Metered`] run needs beyond the two above. Prices
+    /// as data, like the others, so a changed multiplier is a
+    /// migration and never a constant here. `None` on a row that
+    /// declares none, which leaves a metered run on that model
+    /// unpriced: pricing three of four counts would read as the whole
+    /// bill.
+    #[serde(default)]
+    pub cache_read_usd_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    pub cache_write_usd_micros_per_mtok: Option<u64>,
 }
 
 /// Parts per million, the unit [`RateCardRow::blended_input_share_ppm`]
@@ -178,6 +199,12 @@ pub enum PricingBasis {
     /// Honest about being an estimate: the tokens are measured, the
     /// division between them is an assumption read out of the registry.
     Blended,
+    /// Priced from the run's four MEASURED counts — uncached input,
+    /// cache writes, cache reads, output — each at its own rate
+    /// (backlog e6b2066f). The strongest basis: a `Split` carries no
+    /// cache counts, and cache reads were a median 96.8% of what a
+    /// dispatched run processed.
+    Metered,
 }
 
 impl PricingBasis {
@@ -185,6 +212,7 @@ impl PricingBasis {
         match self {
             PricingBasis::Split => "split",
             PricingBasis::Blended => "blended",
+            PricingBasis::Metered => "metered",
         }
     }
 
@@ -192,17 +220,29 @@ impl PricingBasis {
         match s {
             "split" => Some(PricingBasis::Split),
             "blended" => Some(PricingBasis::Blended),
+            "metered" => Some(PricingBasis::Metered),
             _ => None,
         }
     }
 
+    /// How measured a basis is: metered over split over blended.
+    fn rank(self) -> u8 {
+        match self {
+            PricingBasis::Blended => 0,
+            PricingBasis::Split => 1,
+            PricingBasis::Metered => 2,
+        }
+    }
+
     /// A bucket is only as measured as its least-measured run: one
-    /// blended figure in a sum makes the sum blended. The rule the
-    /// roll-up folds with, written once here rather than at each call.
+    /// blended figure in a sum makes the sum blended, one split among
+    /// metered runs makes it split. The rule the roll-up folds with,
+    /// written once here rather than at each call.
     pub fn least_measured(self, other: PricingBasis) -> PricingBasis {
-        match (self, other) {
-            (PricingBasis::Split, PricingBasis::Split) => PricingBasis::Split,
-            _ => PricingBasis::Blended,
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
         }
     }
 }
@@ -218,6 +258,7 @@ pub fn pricing_basis(tokens: TokenUsage, usd_micros: Option<u64>) -> Option<Pric
     usd_micros?;
     match tokens {
         TokenUsage::Split { .. } => Some(PricingBasis::Split),
+        TokenUsage::Metered { .. } => Some(PricingBasis::Metered),
         TokenUsage::TotalOnly { .. } => Some(PricingBasis::Blended),
         // Unreachable by construction — `price_run` prices no count at
         // all at nothing — and `None` rather than a panic if it ever
@@ -225,6 +266,104 @@ pub fn pricing_basis(tokens: TokenUsage, usd_micros: Option<u64>) -> Option<Pric
         TokenUsage::Unreported => None,
     }
 }
+
+/// Which effort era a run belongs to — the answer to backlog fd5ce137,
+/// and a DERIVED one.
+///
+/// `agent_runs` is insert-once (`ON CONFLICT (run_id) DO NOTHING`, the
+/// same guard the replay and the rebuilder pass through), so a run
+/// already on the record cannot be corrected by re-reporting it. The
+/// packet offered two ways out — backfill the era from the run packets,
+/// or mark it — and the choice made here is MARK, for the reason
+/// CLAUDE.md gives: a reconstructed figure carries a measurement's
+/// authority and a guess's accuracy, which is the defect the original
+/// one was. Nothing is written to the 28 rows; they mark themselves,
+/// and this is the one place that reads the mark.
+///
+/// Two boundaries, not one, because the era failed in two different
+/// ways (measured on the live table, 2026-09-22, 142 rows):
+///   - Before the effort was RECORDED at all — 28 rows, every one of
+///     them declaring no effort, $33.88 of the $102.71 the record
+///     holds, including a single row reading $23.00 against roughly
+///     $1.50 of real spend. Those rows need no boundary instant: the
+///     absent key is the evidence.
+///   - Between that and the effort being APPLIED — 5 rows labelled
+///     `high` that ran at the session default. This is the worse half,
+///     because it LOOKS like data, and the row holds nothing that
+///     distinguishes it. Only [`EFFORT_APPLIED_FROM_SHA`] does, which
+///     is why the boundary is written down here rather than remembered
+///     — a caveat in someone's head is exactly the mostly-sure failure
+///     an effort-vs-reliability series exists to avoid.
+///
+/// Only [`EffortEra::Applied`] runs belong in a comparison of effort
+/// against reliability or cost. The roll-up counts the other two out
+/// loud ([`RunSummary::effort_unrecorded_runs`],
+/// [`RunSummary::effort_unapplied_runs`]) for the same reason it counts
+/// unpriced runs: a reader who can see the excluded set cannot silently
+/// average over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortEra {
+    /// The run declares no effort — it was recorded before anything
+    /// wrote one down.
+    Unrecorded,
+    /// The run declares an effort that was never applied to the CPU
+    /// that ran: a label, not a setting.
+    Unapplied,
+    /// The declared effort selected the agent definition that ran. The
+    /// only era a series may read.
+    Applied,
+}
+
+impl EffortEra {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EffortEra::Unrecorded => "unrecorded",
+            EffortEra::Unapplied => "unapplied",
+            EffortEra::Applied => "applied",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "unrecorded" => Some(EffortEra::Unrecorded),
+            "unapplied" => Some(EffortEra::Unapplied),
+            "applied" => Some(EffortEra::Applied),
+            _ => None,
+        }
+    }
+}
+
+/// The car that made a run RECORD the effort it was dispatched at
+/// (backlog 8f1de7bf), as a merge sha on `main`. Corroborating, not
+/// load-bearing: the rows before it declare no effort and so identify
+/// themselves. Measured 2026-09-22, the last effortless row was
+/// recorded at 2026-09-19T16:30:24Z and this landed at 16:40:59Z.
+pub const EFFORT_RECORDED_FROM_SHA: &str = "28937f2d5a557967903b263e5d53b38054dc2b34";
+
+/// The car that made a run's declared effort SELECT the agent
+/// definition it runs as (backlog e720dd00), as a merge sha on `main`.
+/// This boundary IS load-bearing — see [`EffortEra`].
+pub const EFFORT_APPLIED_FROM_SHA: &str = "d0a307d8f9b8193c2b08f5619828df0dd8fb4915";
+
+/// That sha's commit time, as epoch seconds — `2026-09-19T17:30:03Z`,
+/// pinned by a test that spells the instant back out. Epoch rather than
+/// an RFC3339 string so no parse can fail in library code, and a const
+/// rather than a lookup because the boundary is a historical fact that
+/// cannot move.
+pub const EFFORT_APPLIED_FROM_EPOCH_SECS: i64 = 1_789_839_003;
+
+/// [`EFFORT_APPLIED_FROM_EPOCH_SECS`] as an instant. `UNIX_EPOCH` is
+/// unreachable — the constant is in range — and is the no-panic answer
+/// rather than an `expect` in library code.
+pub fn effort_applied_from() -> DateTime<Utc> {
+    DateTime::from_timestamp(EFFORT_APPLIED_FROM_EPOCH_SECS, 0).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+/// The key a dispatched run's effort rides under in `detail`, written
+/// by `boss dispatch`'s `run_record`. One spelling, here, because the
+/// writer and this reader must agree (CLAUDE.md §9a).
+pub const EFFORT_KEY: &str = "effort";
 
 /// [`TokenUsage`] is `boss_core`'s: the shape a reporter measured is
 /// what the port value [`Cost`] carries too, and one definition
@@ -389,6 +528,29 @@ impl AgentRun {
         pricing_basis(self.run.tokens, self.usd_micros)
     }
 
+    /// The effort this run was dispatched at, as its reporter declared
+    /// it — `detail.effort`, the one key `run_record` writes it under.
+    /// `None` for a run recorded before anything wrote one, and for an
+    /// explicit null, which says the same thing.
+    pub fn declared_effort(&self) -> Option<&str> {
+        self.run
+            .detail
+            .get(EFFORT_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Which effort era this run belongs to — see [`EffortEra`]. Read
+    /// off the row's own evidence first (a run that declared nothing
+    /// has no label that could have been applied) and only then off the
+    /// boundary instant.
+    pub fn effort_era(&self) -> EffortEra {
+        match self.declared_effort() {
+            None => EffortEra::Unrecorded,
+            Some(_) if self.recorded_at < effort_applied_from() => EffortEra::Unapplied,
+            Some(_) => EffortEra::Applied,
+        }
+    }
+
     /// The run as a `boss_core::agent::Cost` — every run, in whatever
     /// shape its reporter was in.
     ///
@@ -411,6 +573,38 @@ impl AgentRun {
             tokens: self.run.tokens,
             usd_micros: self.usd_micros,
         }
+    }
+}
+
+/// ONE run as the jobs API serves it: the row, plus the basis its
+/// figure rests on, derived on the way out (backlog 93fdb119).
+///
+/// The roll-ups ([`RunSummary`], [`GroupSpend`]) carried
+/// `pricing_basis` from the day the blend landed (design 91a9bfe7) and
+/// a single run's JSON carried none, so a per-row surface — a run list,
+/// `boss dispatch --report` reading its POST's answer — could tell a
+/// blended figure from a measured one only by re-deriving the rule
+/// client-side: a second copy of a server judgement, free to drift.
+/// The basis stays DERIVED, never stored, for the reason
+/// [`PricingBasis`] gives; this type is where the derivation meets the
+/// wire, through [`AgentRun::pricing_basis`], the one rule.
+///
+/// The key is always present, `null` included: `null` means no figure
+/// to describe, which a reader must be able to tell from a server too
+/// old to say. The flattened row keeps every existing key where it
+/// was, and [`AgentRun`]'s own `Deserialize` ignores the extra one, so
+/// a reader that parses rows back into `AgentRun` is unaffected.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentRunView {
+    #[serde(flatten)]
+    pub run: AgentRun,
+    pub pricing_basis: Option<PricingBasis>,
+}
+
+impl From<AgentRun> for AgentRunView {
+    fn from(run: AgentRun) -> Self {
+        let pricing_basis = run.pricing_basis();
+        AgentRunView { run, pricing_basis }
     }
 }
 
@@ -445,6 +639,21 @@ pub fn price_run(card: &[RateCardRow], run: &NewAgentRun) -> Option<(u64, String
     let micros = match run.tokens {
         TokenUsage::Split { input, output } => rounded_div(
             u128::from(input) * u128::from(row.input_usd_micros_per_mtok)
+                + u128::from(output) * u128::from(row.output_usd_micros_per_mtok),
+            PPM,
+        ),
+        // Every count at its own rate, or nothing: a row that declares
+        // no cache rate cannot price 97% of what the run processed,
+        // and three of four terms would read as the whole bill.
+        TokenUsage::Metered {
+            input,
+            cache_write,
+            cache_read,
+            output,
+        } => rounded_div(
+            u128::from(input) * u128::from(row.input_usd_micros_per_mtok)
+                + u128::from(cache_write) * u128::from(row.cache_write_usd_micros_per_mtok?)
+                + u128::from(cache_read) * u128::from(row.cache_read_usd_micros_per_mtok?)
                 + u128::from(output) * u128::from(row.output_usd_micros_per_mtok),
             PPM,
         ),
@@ -516,6 +725,12 @@ pub struct GroupSpend {
     /// How many of the priced runs were priced at a declared blend
     /// rather than a measured split — the basis with a size beside it.
     pub blended_runs: u64,
+    /// How many runs in this bucket declared no effort at all
+    /// ([`EffortEra::Unrecorded`]).
+    pub effort_unrecorded_runs: u64,
+    /// How many declared an effort that never reached the CPU
+    /// ([`EffortEra::Unapplied`]).
+    pub effort_unapplied_runs: u64,
 }
 
 /// The answer to "what did this cost to build".
@@ -578,6 +793,12 @@ pub struct RunSummary {
     pub unreported_runs: u64,
     /// How many runs were priced at a declared blend.
     pub blended_runs: u64,
+    /// How many runs declared no effort, and how many declared one that
+    /// was never applied — the two eras a series must exclude, counted
+    /// rather than silently averaged over (backlog fd5ce137). See
+    /// [`EffortEra`] for why the rows are marked and not backfilled.
+    pub effort_unrecorded_runs: u64,
+    pub effort_unapplied_runs: u64,
     pub by_model: Vec<GroupSpend>,
     pub by_branch: Vec<GroupSpend>,
 }
@@ -623,6 +844,8 @@ pub fn summarize(runs: &[AgentRun]) -> RunSummary {
         total_only_runs: total.total_only_runs,
         unreported_runs: total.unreported_runs,
         blended_runs: total.blended_runs,
+        effort_unrecorded_runs: total.effort_unrecorded_runs,
+        effort_unapplied_runs: total.effort_unapplied_runs,
         by_model: by_model.into_values().collect(),
         by_branch: by_branch.into_values().collect(),
     }
@@ -639,12 +862,15 @@ fn blank(key: &str) -> GroupSpend {
         wall_secs: 0,
         usd_micros: Some(0),
         // The identity a fold starts from, like the measured zero
-        // beside it: an empty bucket has nothing blended in it.
-        pricing_basis: Some(PricingBasis::Split),
+        // beside it: an empty bucket has nothing blended in it, so it
+        // starts at the strongest basis and each run can only lower it.
+        pricing_basis: Some(PricingBasis::Metered),
         unpriced_runs: 0,
         total_only_runs: 0,
         unreported_runs: 0,
         blended_runs: 0,
+        effort_unrecorded_runs: 0,
+        effort_unapplied_runs: 0,
     }
 }
 
@@ -653,6 +879,14 @@ fn blank(key: &str) -> GroupSpend {
 /// that cannot supply them — see [`RunSummary`].
 fn fold(into: &mut GroupSpend, run: &AgentRun) {
     into.runs += 1;
+    // Counted, never dropped: the excluded eras are part of the record
+    // and a bucket that quietly omitted them would be the same missing
+    // caveat this counter exists to publish (backlog fd5ce137).
+    match run.effort_era() {
+        EffortEra::Unrecorded => into.effort_unrecorded_runs += 1,
+        EffortEra::Unapplied => into.effort_unapplied_runs += 1,
+        EffortEra::Applied => {}
+    }
     // `and_then`, not `map`: a bucket that has already met an
     // unreported run stays unanswered, and a bucket meeting its first
     // one stops answering. Adding zero for it would be the projection
@@ -662,7 +896,9 @@ fn fold(into: &mut GroupSpend, run: &AgentRun) {
         None => None,
     };
     match run.run.tokens {
-        TokenUsage::Split { input, output } => {
+        // A metered run's halves are its uncached input and its output;
+        // its cache counts ride the row, and its total above holds them.
+        TokenUsage::Split { input, output } | TokenUsage::Metered { input, output, .. } => {
             into.input_tokens = into.input_tokens.map(|t| t.saturating_add(input));
             into.output_tokens = into.output_tokens.map(|t| t.saturating_add(output));
         }
@@ -723,6 +959,8 @@ mod tests {
                 output_usd_micros_per_mtok: 25_000_000,
                 note: "test".into(),
                 blended_input_share_ppm: None,
+                cache_read_usd_micros_per_mtok: None,
+                cache_write_usd_micros_per_mtok: None,
             },
             RateCardRow {
                 model: "haiku-4-5".into(),
@@ -730,6 +968,8 @@ mod tests {
                 output_usd_micros_per_mtok: 5_000_000,
                 note: "test".into(),
                 blended_input_share_ppm: None,
+                cache_read_usd_micros_per_mtok: None,
+                cache_write_usd_micros_per_mtok: None,
             },
             // The one row that declares a blend, as the migration
             // seeds it: the model 99 of the last 100 recorded runs ran
@@ -742,8 +982,62 @@ mod tests {
                 output_usd_micros_per_mtok: 25_000_000,
                 note: "test".into(),
                 blended_input_share_ppm: Some(875_000),
+                // The cache rates the migration seeds (backlog
+                // e6b2066f): 0.1x input to read, 1.25x to write. The
+                // two rows above carry none, which leaves a metered
+                // run on them unpriced rather than half-priced.
+                cache_read_usd_micros_per_mtok: Some(500_000),
+                cache_write_usd_micros_per_mtok: Some(6_250_000),
             },
         ]
+    }
+
+    fn metered(actor: &str) -> NewAgentRun {
+        with_tokens(
+            actor,
+            TokenUsage::Metered {
+                input: 40,
+                cache_write: 30_000,
+                cache_read: 1_470_000,
+                output: 9_000,
+            },
+        )
+    }
+
+    /// Backlog e6b2066f: every count at its own rate. 40 x $5 + 30,000
+    /// x $6.25 + 1,470,000 x $0.50 + 9,000 x $25 per MTok = $1.1477,
+    /// the shape of the operator's 2026-09-23 spot check: a run whose
+    /// harness reported ~150k tokens (its final context, $1.13 at the
+    /// $7.50 blend) processed ~1.5M.
+    #[test]
+    fn a_metered_run_is_priced_at_four_rates_and_says_so() {
+        let mut new = metered("agent-claude");
+        new.model = Some("opus-5[1m]".into());
+        let run = recorded(new, &card());
+        assert_eq!(run.usd_micros, Some(1_147_700));
+        assert_eq!(run.pricing_basis(), Some(PricingBasis::Metered));
+    }
+
+    #[test]
+    fn a_metered_run_on_a_row_without_cache_rates_is_unpriced_not_half_priced() {
+        let mut new = metered("agent-claude");
+        new.model = Some("haiku-4-5".into());
+        let run = recorded(new, &card());
+        assert_eq!(run.usd_micros, None);
+    }
+
+    #[test]
+    fn a_bucket_is_metered_only_while_every_run_in_it_is() {
+        let mut m = metered("agent-claude");
+        m.model = Some("opus-5[1m]".into());
+        let alone = summarize(&[recorded(m.clone(), &card())]);
+        assert_eq!(alone.pricing_basis, Some(PricingBasis::Metered));
+        assert_eq!(alone.total_tokens, Some(1_509_040));
+        let mut s = a_run("agent-claude", 100, 10);
+        s.run_id = "run-split".into();
+        s.model = Some("opus-5[1m]".into());
+        let mixed = summarize(&[recorded(m, &card()), recorded(s, &card())]);
+        assert_eq!(mixed.pricing_basis, Some(PricingBasis::Split));
     }
 
     fn a_run(actor: &str, input: u64, output: u64) -> NewAgentRun {
@@ -1474,6 +1768,34 @@ mod tests {
     }
 
     #[test]
+    fn a_single_runs_wire_shape_names_its_basis_and_reads_back() {
+        // Backlog 93fdb119: the row a reader gets carries the word the
+        // roll-up carries, derived by the same rule — and a reader that
+        // parses it back into `AgentRun` loses nothing and trips on
+        // nothing (the flattened token shape included).
+        let card = card();
+        for (run, want) in [
+            (
+                recorded(a_run("claude:opus-5[1m]", 875_000, 125_000), &card),
+                serde_json::json!("split"),
+            ),
+            (
+                recorded(a_total_run("claude:opus-5[1m]", 1_000_000), &card),
+                serde_json::json!("blended"),
+            ),
+            (
+                recorded(a_total_run("claude:opus-5", 142_982), &card),
+                serde_json::Value::Null,
+            ),
+        ] {
+            let wire = serde_json::to_value(AgentRunView::from(run.clone())).expect("serializes");
+            assert_eq!(wire["pricing_basis"], want, "{wire}");
+            let back: AgentRun = serde_json::from_value(wire).expect("reads back");
+            assert_eq!(back, run);
+        }
+    }
+
+    #[test]
     fn a_total_on_a_model_that_declares_no_ratio_stays_unpriced() {
         // Undeclared is unpriced, not assumed: the assumption lives in
         // the registry, and a row that does not carry one is not given
@@ -1574,11 +1896,20 @@ mod tests {
                 },
                 TokenUsage::TotalOnly { total: 11 },
                 TokenUsage::Unreported,
+                TokenUsage::Metered {
+                    input: 1,
+                    cache_write: 2,
+                    cache_read: 3,
+                    output: 4,
+                },
             ] {
                 let run = recorded(with_tokens(&actor, tokens), &card);
                 match (run.usd_micros, run.run.tokens) {
                     (Some(_), TokenUsage::Split { .. }) => {
                         assert_eq!(run.pricing_basis(), Some(PricingBasis::Split), "{model}")
+                    }
+                    (Some(_), TokenUsage::Metered { .. }) => {
+                        assert_eq!(run.pricing_basis(), Some(PricingBasis::Metered), "{model}")
                     }
                     (Some(_), TokenUsage::TotalOnly { .. }) => {
                         assert_eq!(run.pricing_basis(), Some(PricingBasis::Blended), "{model}")
@@ -1590,5 +1921,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A run recorded in the era, from the fixture's `detail` up: the
+    /// declared effort (or none) and the instant the record landed are
+    /// the two facts an era is read off.
+    fn in_era(effort: Option<&str>, recorded_at: &str) -> AgentRun {
+        let mut new = a_run("claude:opus-5", 1_000, 1_000);
+        new.run_id = format!("run-{effort:?}-{recorded_at}");
+        if let Some(effort) = effort {
+            new.detail = serde_json::json!({ "effort": effort });
+        }
+        let mut run = recorded(new, &card());
+        run.recorded_at = recorded_at.parse().expect("an RFC3339 instant");
+        run
+    }
+
+    #[test]
+    fn a_run_that_declares_no_effort_is_the_unrecorded_era() {
+        // The 28 rows measured on the live table on 2026-09-22: the
+        // absent key IS the marker, so nothing has to be written to
+        // them to make them excludable.
+        let run = in_era(None, "2026-09-19T08:54:00Z");
+        assert_eq!(run.declared_effort(), None);
+        assert_eq!(run.effort_era(), EffortEra::Unrecorded);
+    }
+
+    #[test]
+    fn an_effort_label_recorded_before_it_selected_the_cpu_reads_unapplied() {
+        // The worse half: a label that looks like data and was never
+        // applied. Only the boundary instant can tell it apart.
+        let run = in_era(Some("high"), "2026-09-19T17:00:00Z");
+        assert_eq!(run.declared_effort(), Some("high"));
+        assert_eq!(run.effort_era(), EffortEra::Unapplied);
+    }
+
+    #[test]
+    fn an_effort_label_recorded_after_the_boundary_is_applied() {
+        let run = in_era(Some("high"), "2026-09-22T19:00:00Z");
+        assert_eq!(run.effort_era(), EffortEra::Applied);
+    }
+
+    #[test]
+    fn a_run_with_no_effort_after_the_boundary_is_still_unrecorded() {
+        // The row's own evidence beats the clock: a report that
+        // declared nothing has no label that could have been applied.
+        let run = in_era(None, "2026-09-22T19:00:00Z");
+        assert_eq!(run.effort_era(), EffortEra::Unrecorded);
+    }
+
+    #[test]
+    fn the_applied_boundary_is_the_instant_its_sha_landed() {
+        assert_eq!(
+            effort_applied_from().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-09-19T17:30:03Z",
+            "the commit time of {EFFORT_APPLIED_FROM_SHA}"
+        );
+    }
+
+    #[test]
+    fn a_roll_up_counts_both_excluded_eras_rather_than_averaging_over_them() {
+        let runs = vec![
+            in_era(None, "2026-09-19T08:54:00Z"),
+            in_era(Some("high"), "2026-09-19T17:00:00Z"),
+            in_era(Some("high"), "2026-09-22T19:00:00Z"),
+        ];
+        let s = summarize(&runs);
+        assert_eq!(s.runs, 3);
+        assert_eq!(s.effort_unrecorded_runs, 1);
+        assert_eq!(s.effort_unapplied_runs, 1);
+        // Per bucket too: a model's or a car's figure carries the same
+        // warning the total does.
+        let by_model = &s.by_model[0];
+        assert_eq!(by_model.key, "opus-5");
+        assert_eq!(by_model.effort_unrecorded_runs, 1);
+        assert_eq!(by_model.effort_unapplied_runs, 1);
+        // The wire spelling, pinned: `GET /api/agent-runs/cost` is
+        // where an operator reads this, and a recorded probe greps the
+        // key by name.
+        let wire = serde_json::to_value(&s).expect("a summary serializes");
+        assert_eq!(wire["effort_unrecorded_runs"], 1);
+        assert_eq!(wire["effort_unapplied_runs"], 1);
+    }
+
+    #[test]
+    fn an_empty_roll_up_excludes_nothing() {
+        let s = summarize(&[]);
+        assert_eq!(s.effort_unrecorded_runs, 0);
+        assert_eq!(s.effort_unapplied_runs, 0);
+    }
+
+    #[test]
+    fn the_era_round_trips_its_wire_form() {
+        for e in [
+            EffortEra::Unrecorded,
+            EffortEra::Unapplied,
+            EffortEra::Applied,
+        ] {
+            assert_eq!(EffortEra::parse(e.as_str()), Some(e));
+        }
+        assert_eq!(EffortEra::parse("medium-ish"), None);
     }
 }

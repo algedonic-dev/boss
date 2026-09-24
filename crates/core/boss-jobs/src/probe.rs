@@ -118,6 +118,46 @@ pub fn needs_absent_tool(probe: &str) -> Option<&'static str> {
         .find_map(|c| absent.iter().find(|a| **a == c).copied())
 }
 
+/// The builtins that move the shell somewhere else before the probe
+/// reads anything.
+const CHANGES_DIRECTORY: [&str; 2] = ["cd", "pushd"];
+
+/// A RECORDED PROBE DOES NOT `cd` — the door places it — and the verb
+/// that moves it anyway, if it spells one.
+///
+/// THE DEFECT (backlog 4bb6797c, measured 2026-09-22). Two cars in one
+/// night recorded `cd /work/boss && git show HEAD:… | grep -q …`, and
+/// both came back from the forge as exit 1 with `cd: /work/boss: No
+/// such file or directory`, reading TROUBLED in the shed with both
+/// claims true in the converged tree. `/work/boss` is the DEV POD's
+/// checkout; the unattended door runs the probe on the forge, as david,
+/// with cwd ALREADY the converged checkout of main (`BOSS_PROBE_DIR`,
+/// default `/home/david/boss`). It is the same class as
+/// [`needs_absent_tool`] — a fact of the pod the forge does not have —
+/// and it is refused at the same door for the same reason: at gate
+/// time, on the builder's terminal, instead of hours later as an exit
+/// code on a car.
+///
+/// WHY ANY `cd` AND NOT A PATH LIST. A `cd` to the forge's own checkout
+/// would run; a list of right and wrong paths would then be a second
+/// copy of `BOSS_PROBE_DIR` held by nobody (CLAUDE.md §9a), and the
+/// rule it would buy refuses nothing a correct probe needs —
+/// `git show HEAD:<path>` reads the converged tree from where the door
+/// put it, and a relative path already resolves there. Measured the
+/// same night, the population is exactly the two defects: of 19 open
+/// cars carrying a recorded probe, 2 contained a `cd` to an absolute
+/// path, both failing, and every probe a briefed builder wrote was
+/// clean — so one rule stated plainly costs no correct probe.
+///
+/// Read in command position through [`commands_invoked`], so a `cd`
+/// that is only mentioned — a grep pattern, `--format=%cd`, `echo cd` —
+/// is not a move.
+pub fn changes_directory(probe: &str) -> Option<&'static str> {
+    commands_invoked(probe)
+        .into_iter()
+        .find_map(|c| CHANGES_DIRECTORY.iter().find(|v| **v == c).copied())
+}
+
 /// The two variables the CLI reads to learn WHO is running it
 /// (boss-cli `identity.rs`: the env var, then the file the second
 /// names). Spelled here rather than imported because that crate is an
@@ -989,6 +1029,373 @@ fn bare_identifier(pattern: &str) -> Option<&str> {
     (bare && has_lower && code_shaped).then_some(name)
 }
 
+/// The measured evidence for [`a_grep_only_prose_answers`], in one
+/// copy, quoted by every door that says it (CLAUDE.md §9a).
+pub const PROSE_ONLY_EVIDENCE: &str = "\
+Measured 2026-09-20 (8ac42ee5): two cars written the same day each proved a removal by \
+counting a forbidden token in the file it was removed from and requiring 0. Both removals \
+landed, correct — and both cars read NOT YET every hour afterwards, because each car ALSO \
+added the comment recording the removal, and the comment is the one line left that names \
+the token. region-contents.ts kept zoomBoxOf and lerpBox in a two-line note saying the \
+camera was deleted; claims.ts kept api/tenant in a note saying the claim deliberately does \
+not point there. The comment did not exist when either probe was first written.\n\
+Count what only CODE can say: drop comment lines before the count \
+(grep -v -e '^ *//' -e '^ *#' | grep -c ...), or assert on the import, export or \
+definition keyword rather than on the bare word.";
+
+/// A grep in a probe whose every match, in the file it reads, is a
+/// COMMENT — the answer [`a_grep_only_prose_answers`] gives, with what
+/// a warning needs to be checkable from the warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProseOnly {
+    /// The path the probe reads, with the probe's own plain variable
+    /// assignments (`d=apps/web/src`) substituted.
+    pub path: String,
+    /// The grep pattern as grep receives it.
+    pub pattern: String,
+    /// Every matching line, 1-based, trimmed — all of them comments.
+    pub lines: Vec<(usize, String)>,
+}
+
+/// WHEN A PROBE'S GREP IS ANSWERED ONLY BY PROSE — the ninth shape,
+/// and the first a probe's TEXT cannot show: it needs the tree the
+/// probe will read, which is why `read` is handed in (path → the file's
+/// text at the revision the door is judging, `None` when unreadable).
+///
+/// THE DEFECT (backlog 8ac42ee5, measured 2026-09-20). Two cars proved
+/// a removal with `git show HEAD:<file> | grep -c <token>` and required
+/// 0. Each removal landed and was correct, and each car read NOT YET
+/// every hour afterwards: the car that deletes a thing tends to add the
+/// comment that says it was deleted, and that comment is the last line
+/// in the file naming the token. The same match defeats a PRESENCE
+/// assertion the other way — a mention in a comment reads as the thing
+/// existing — which is the e7cf78c6 shape seen from the tree rather
+/// than the text. So the question asked here is direction-free: does
+/// this grep's answer come ONLY from comments? If it does, whatever the
+/// probe concludes is a conclusion about a sentence.
+///
+/// Conditions, each one keeping a correct probe quiet:
+///
+/// - the pipeline reads a FILE with `git show <rev>:<path>`, and the
+///   path resolves — a `$var` the probe assigned plainly is substituted,
+///   anything else (`$(…)`, an env var) leaves the grep unjudged;
+/// - the grep is not `-v`, and its pattern is a literal (or a `\|` /
+///   `-E |` alternation of literals): a regex could match a code line a
+///   literal search misses, which would turn a mixed file into a false
+///   "only prose";
+/// - the file has at least one match and EVERY match is on a comment
+///   line (`//`, `/*`, `*`, `<!--`, `#` but not `#[`/`#!`) or after a
+///   trailing ` //` / ` # ` on its line — except a `///` inside the
+///   body of a clap-derived item, which is the `--help` text the binary
+///   renders, so a grep of it checks behaviour (`clap_help_lines`,
+///   backlog ab918f00).
+///
+/// Returns the first such grep. WARNING, NOT REFUSAL, for the reason
+/// its siblings give: a probe that counts a mention on purpose is
+/// legal, and the classification of a comment is a line-prefix scan
+/// that a block comment's unmarked middle lines slip past (those read
+/// as code, which only ever keeps the door quiet).
+pub fn a_grep_only_prose_answers(
+    probe: &str,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<ProseOnly> {
+    let vars = plain_assignments(probe);
+    pipelines(probe).into_iter().find_map(|segment| {
+        let words = shell_words(segment);
+        let path = shown_path(&words, &vars)?;
+        let (pattern, alternatives, fold) = literal_grep(&words)?;
+        let lines = prose_only_matches(&read(&path)?, &alternatives, fold)?;
+        Some(ProseOnly {
+            path,
+            pattern,
+            lines,
+        })
+    })
+}
+
+/// `name=value` assignments a probe makes on a line of their own, with
+/// a value the shell does not compute (no `$`, backtick, space or
+/// operator): the `d=apps/web/src` a long probe keeps its paths short
+/// with.
+fn plain_assignments(probe: &str) -> Vec<(String, String)> {
+    probe
+        .lines()
+        .filter_map(|l| {
+            let (name, value) = l.trim().split_once('=')?;
+            let is_name = !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let value = value.trim_matches(['\'', '"']);
+            let plain =
+                !value.is_empty() && !value.contains(['$', '`', ' ', ';', '(', ')', '|', '&']);
+            (is_name && plain).then(|| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// A segment's words as the shell hands them to a command: quotes
+/// removed, and a backslash inside double quotes kept unless it escapes
+/// one of the four characters bash lets it escape there — so the `\|`
+/// of a basic-regex alternation reaches grep as `\|`. An unquoted `|`
+/// or `)` ends a word, since it ends the command the word belongs to.
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                cur.extend(chars.by_ref().take_while(|&q| q != '\''));
+            }
+            '"' => {
+                started = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => match chars.peek() {
+                            Some(&n @ ('"' | '\\' | '$' | '`')) => {
+                                cur.push(n);
+                                chars.next();
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        _ => cur.push(q),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                cur.extend(chars.next());
+            }
+            c if c.is_whitespace() || c == '|' || c == ')' => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            _ => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        words.push(cur);
+    }
+    words
+}
+
+/// The `<path>` of a `git show <rev>:<path>` in these words, with the
+/// probe's plain assignments substituted; `None` when there is no such
+/// read, or a `$` survives substitution (a path this door cannot know).
+fn shown_path(words: &[String], vars: &[(String, String)]) -> Option<String> {
+    let show = words.iter().position(|w| w == "show")?;
+    let spec = words[show + 1..].iter().find(|w| !w.starts_with('-'))?;
+    let (_, path) = spec.split_once(':')?;
+    let path = vars.iter().fold(path.to_string(), |p, (name, value)| {
+        p.replace(&format!("${{{name}}}"), value)
+            .replace(&format!("${name}"), value)
+    });
+    (!path.is_empty() && !path.contains('$')).then_some(path)
+}
+
+/// The grep in these words, when it searches for LITERALS: its pattern
+/// as written, the literal alternatives that pattern means, and whether
+/// `-i` folds case. `None` for no grep, an inverted one, or a pattern
+/// with a regex character a literal search would misread.
+fn literal_grep(words: &[String]) -> Option<(String, Vec<String>, bool)> {
+    let at = words
+        .iter()
+        .position(|w| w.rsplit('/').next() == Some("grep"))?;
+    let (mut extended, mut fixed, mut fold) = (false, false, false);
+    let mut rest = words[at + 1..].iter();
+    let pattern = loop {
+        let w = rest.next()?;
+        match w.strip_prefix('-') {
+            Some("e") => break rest.next()?.clone(),
+            Some(long) if long.starts_with('-') => match long {
+                "-invert-match" => return None,
+                "-extended-regexp" => extended = true,
+                "-fixed-strings" => fixed = true,
+                "-ignore-case" => fold = true,
+                _ => {}
+            },
+            Some(flags) if !flags.is_empty() => {
+                if flags.contains('v') {
+                    return None;
+                }
+                extended |= flags.contains('E');
+                fixed |= flags.contains('F');
+                fold |= flags.contains('i');
+            }
+            _ => break w.clone(),
+        }
+    };
+    let (alternatives, special): (Vec<&str>, &[char]) = if fixed {
+        (pattern.lines().collect(), &[])
+    } else if extended {
+        (
+            pattern.split('|').collect(),
+            &[
+                '\\', '[', ']', '*', '^', '$', '.', '+', '?', '(', ')', '{', '}',
+            ],
+        )
+    } else {
+        (
+            pattern.split("\\|").collect(),
+            &['\\', '[', ']', '*', '^', '$', '.'],
+        )
+    };
+    let literal = alternatives
+        .iter()
+        .all(|a| !a.is_empty() && !a.contains(special));
+    let alternatives: Vec<String> = alternatives
+        .iter()
+        .map(|a| {
+            if fold {
+                a.to_lowercase()
+            } else {
+                a.to_string()
+            }
+        })
+        .collect();
+    literal.then_some((pattern, alternatives, fold))
+}
+
+/// Every line matching one of `alternatives`, when there is at least
+/// one and every occurrence on every one of them sits in a comment.
+fn prose_only_matches(
+    text: &str,
+    alternatives: &[String],
+    fold: bool,
+) -> Option<Vec<(usize, String)>> {
+    let help = clap_help_lines(text);
+    let mut matched = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let hay = if fold {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+        let at: Vec<usize> = alternatives
+            .iter()
+            .flat_map(|a| hay.match_indices(a.as_str()).map(|(p, _)| p))
+            .collect();
+        if at.is_empty() {
+            continue;
+        }
+        let prose_from = prose_starts_at(line).filter(|_| !help[i]);
+        if at.iter().any(|&p| prose_from.is_none_or(|from| p < from)) {
+            return None;
+        }
+        matched.push((i + 1, line.trim().to_string()));
+    }
+    (!matched.is_empty()).then_some(matched)
+}
+
+/// The derives whose item body clap renders: every `///` on a field or
+/// variant inside one is `--help` text.
+const CLAP_DERIVES: [&str; 4] = ["Parser", "Subcommand", "Args", "ValueEnum"];
+
+/// Which lines of `text` are a `///` that clap RENDERS — a doc comment
+/// inside the body of an item deriving one of [`CLAP_DERIVES`], on a
+/// field or a variant, with an `#[arg]` / `#[command]` or without one
+/// (a positional field and a subcommand variant usually carry none).
+///
+/// Backlog ab918f00, measured 2026-09-23: car 72d7bc98 proved a
+/// `boss gate --help` fix by grepping two sentences out of boss-cli's
+/// main.rs, and the gate warned it was answered only by prose — but
+/// both lines were `///` on `#[arg]` fields, the text the binary prints.
+/// A probe that greps them checks shipped behaviour, not a comment.
+///
+/// A text scan, not a Rust parser (boss-jobs carries no syn, and this
+/// feeds a warning): the body runs from the item's `{` to the brace
+/// that closes it, counting braces outside comments and string
+/// literals. The doc ABOVE the item is left as prose — above a
+/// `Subcommand` enum clap never renders it (boss-cli's own note on
+/// `Commands` is about a clippy allow), so only a `Parser`'s about text
+/// is missed, and a miss here errs toward the warning it always gave.
+fn clap_help_lines(text: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut help = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].trim_start().starts_with("#[derive(") {
+            i += 1;
+            continue;
+        }
+        // The derive list may wrap; it ends at the first `)]`.
+        let close = (i..lines.len())
+            .find(|&j| lines[j].contains(")]"))
+            .unwrap_or(i);
+        let clap = lines[i..=close].iter().any(|l| {
+            l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| CLAP_DERIVES.contains(&w))
+        });
+        i = close + 1;
+        if !clap {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut opened = false;
+        'body: while i < lines.len() {
+            let line = lines[i];
+            i += 1;
+            match prose_starts_at(line) {
+                Some(0) => {
+                    help[i - 1] = opened && line.trim_start().starts_with("///");
+                    continue;
+                }
+                from => {
+                    let mut quoted = false;
+                    let mut escaped = false;
+                    for c in line[..from.unwrap_or(line.len())].chars() {
+                        match c {
+                            _ if escaped => escaped = false,
+                            '\\' if quoted => escaped = true,
+                            '"' => quoted = !quoted,
+                            _ if quoted => {}
+                            '{' => {
+                                depth += 1;
+                                opened = true;
+                            }
+                            '}' => depth = depth.saturating_sub(1),
+                            // `struct U;` — an item with no body.
+                            ';' if !opened => break 'body,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if opened && depth == 0 {
+                break;
+            }
+        }
+    }
+    help
+}
+
+/// Where the comment on this line begins, if it has one: 0 for a line
+/// that IS a comment, or the offset of a trailing ` //` or ` # `. `#[`
+/// and `#!` open a Rust attribute and a shebang, which are code; a
+/// URL's `://` has no space before it, so it is code too.
+fn prose_starts_at(line: &str) -> Option<usize> {
+    let body = line.trim_start();
+    let whole = ["//", "/*", "*", "<!--"]
+        .iter()
+        .any(|m| body.starts_with(m))
+        || (body.starts_with('#') && !body.starts_with("#[") && !body.starts_with("#!"));
+    if whole {
+        return Some(0);
+    }
+    [" //", "\t//", " # "]
+        .iter()
+        .filter_map(|m| line.find(m))
+        .min()
+}
+
 /// The override a door records when it ran a probe its own rule
 /// refused: which rule, and the operator's stated reason. Recorded in
 /// the proof itself, because that is the record every later reader —
@@ -1106,6 +1513,52 @@ mod tests {
                 None,
                 "the forge has the CLI since 9f00a805: {probe}"
             );
+        }
+    }
+
+    /// A RECORDED PROBE DOES NOT `cd` (backlog 4bb6797c). The two
+    /// measured instances, both 2026-09-22, both failing on the forge
+    /// with `cd: /work/boss: No such file or directory` — plus the
+    /// forge's OWN checkout path, which would run but is refused all the
+    /// same: the rule is that the door places the probe, not a path
+    /// list, and a `cd` to the right path is one keystroke from the
+    /// wrong one. Every command position counts, as for an absent tool.
+    #[test]
+    fn a_probe_that_changes_directory_is_named() {
+        for (probe, verb) in [
+            (
+                "cd /work/boss && git show HEAD:apps/web/src/it/yard.ts | grep -q \"repair in flight\" && echo garage:ok",
+                "cd",
+            ),
+            (
+                "cd /work/boss\ngit show HEAD:crates/core/boss-jobs/src/shed.rs | grep -q 'waits on the world' && echo shed:ok",
+                "cd",
+            ),
+            ("cd /home/david/boss && git log -1 --format=%ct", "cd"),
+            ("(cd crates && git show HEAD:Cargo.toml) | grep -q x", "cd"),
+            (
+                "pushd /work/boss >/dev/null; git show HEAD:x | grep -q y",
+                "pushd",
+            ),
+        ] {
+            assert_eq!(changes_directory(probe), Some(verb), "{probe}");
+        }
+    }
+
+    /// And a probe that stays where the door put it is not this rule's
+    /// business — including a `cd` that is only MENTIONED, as an
+    /// argument, a grep pattern, or a git format placeholder.
+    #[test]
+    fn a_probe_that_stays_in_the_converged_checkout_is_not_named() {
+        for probe in [
+            "git show HEAD:crates/core/boss-jobs/src/probe.rs | grep -q 'pub fn changes_directory' && echo ok",
+            "grep -c '^COPY infra/estate' /home/david/boss/infra/oss-quickstart/Dockerfile",
+            "git log -1 --date=unix --format=%cd | grep -q . && echo claim:ok",
+            "git show HEAD:infra/forge/install.sh | grep -q 'cd /home/david/boss' && echo ok",
+            "echo cd",
+            "boss-sor-read /api/yard/status | jq -e '.dock_depth == 1' >/dev/null && echo ok",
+        ] {
+            assert_eq!(changes_directory(probe), None, "{probe}");
         }
     }
 
@@ -1787,6 +2240,276 @@ echo "ONE-HOME-FOR-A-DISPATCHER-RULE""#;
                 None,
                 "{text}"
             );
+        }
+    }
+
+    /// The two recorded probes backlog 8ac42ee5 measured, VERBATIM from
+    /// their cars' `proof_probe` — trimmed only of the lines that do not
+    /// read the file in question.
+    const REGION_PROBE: &str = "set -u
+d=apps/web/src/it/yard
+n=$(git show HEAD:$d/RegionMap.svelte | grep -c region-canvas || true)
+if [ \"$n\" -lt 1 ]; then echo \"not yet: this car has not converged here\"; exit 75; fi
+c=$(git show HEAD:$d/region-contents.ts | grep -c \"zoomBoxOf\\|lerpBox\\|easeInOut\\|viewBoxText\" || true)
+if [ \"$c\" -ne 0 ]; then echo \"not yet: the camera is still in the tree\"; exit 75; fi
+echo \"A REGION IS ITS OWN MAP: RegionMap draws on region-canvas and the camera is gone\"";
+
+    const CLAIMS_PROBE: &str = "set -u
+d=apps/web/src
+b=$(git show HEAD:$d/marketing/claims.ts | grep -c \"api/tenant\" || true)
+if [ \"${b:-0}\" -ne 0 ]; then echo \"not yet: the unrouted endpoint is still in the registry\"; exit 75; fi
+echo \"THE SITE CLAIMS ARE MARKED AND CHECKED\"";
+
+    /// The files as origin/main held them on 2026-09-23: the camera and
+    /// the unrouted endpoint are gone from the CODE, and each survives
+    /// only in the comment that records its absence.
+    fn tree(path: &str) -> Option<String> {
+        match path {
+            "apps/web/src/it/yard/RegionMap.svelte" => {
+                Some("<svg class=\"region-canvas\" viewBox={box}>\n".into())
+            }
+            "apps/web/src/it/yard/region-contents.ts" => Some(
+                "import { layout } from './layout';\n\
+                 // The camera is gone. It used to animate the viewBox from the\n\
+                 // whole world into a territory's rect — zoomBoxOf, lerpBox, easeInOut,\n\
+                 // viewBoxText, WORLD_BOX, ZOOM_MS — and everything drawn got larger in\n\
+                 export function regionContents() { return layout(); }\n"
+                    .into(),
+            ),
+            "apps/web/src/marketing/claims.ts" => Some(
+                "export const CLAIMS = [{\n\
+                 \x20   id: 'tenant.name',\n\
+                 \x20   // NOT the instance's own `/api/tenant/manifest` — that answers\n\
+                 \x20   reads: 'text',\n\
+                 }];\n"
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// AN ABSENCE PROBE DEFEATED BY THE COMMENT DOCUMENTING THE ABSENCE
+    /// (backlog 8ac42ee5). Both measured probes are named, with the
+    /// file (its `$d` resolved) and the comment lines that answered.
+    #[test]
+    fn a_grep_answered_only_by_a_comment_is_named_with_its_lines() {
+        let region = a_grep_only_prose_answers(REGION_PROBE, tree)
+            .expect("the region probe's camera grep is answered only by a comment");
+        assert_eq!(region.path, "apps/web/src/it/yard/region-contents.ts");
+        assert_eq!(
+            region.pattern,
+            "zoomBoxOf\\|lerpBox\\|easeInOut\\|viewBoxText"
+        );
+        assert_eq!(
+            region.lines.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![3, 4],
+            "{region:?}"
+        );
+
+        let claims = a_grep_only_prose_answers(CLAIMS_PROBE, tree)
+            .expect("the claims probe's endpoint grep is answered only by a comment");
+        assert_eq!(claims.path, "apps/web/src/marketing/claims.ts");
+        assert_eq!(claims.pattern, "api/tenant");
+        assert_eq!(claims.lines.len(), 1, "{claims:?}");
+        assert!(claims.lines[0].1.starts_with("// NOT"), "{claims:?}");
+    }
+
+    /// A match in CODE silences it, and so does no match at all: the
+    /// first is a real not-yet (or a real presence), the second is the
+    /// absence the probe asked for. A trailing comment is prose, a URL's
+    /// `//` is not, and a Rust attribute's `#[` is code.
+    #[test]
+    fn a_grep_with_any_code_match_or_no_match_is_not_named() {
+        let probe = "c=$(git show HEAD:src/a.ts | grep -c zoomBoxOf)";
+        for (file, named) in [
+            (
+                "export function zoomBoxOf() {}\n// zoomBoxOf is going\n",
+                false,
+            ),
+            ("export function other() {}\n", false),
+            ("const u = 'https://x/zoomBoxOf';\n", false),
+            ("layout(); // zoomBoxOf went here\n", true),
+            ("# zoomBoxOf retired\n", true),
+            ("#[zoomBoxOf]\nfn a() {}\n", false),
+            ("<!-- zoomBoxOf retired -->\n", true),
+            (" * zoomBoxOf retired\n", true),
+        ] {
+            let found = a_grep_only_prose_answers(probe, |_| Some(file.to_string()));
+            assert_eq!(found.is_some(), named, "{file:?} -> {found:?}");
+        }
+    }
+
+    /// What it cannot judge honestly it leaves alone: an unreadable file,
+    /// an unresolvable path, an inverted grep, a regex, and a grep over
+    /// something that is not a file read.
+    #[test]
+    fn a_grep_it_cannot_judge_is_left_alone() {
+        let comment = |_: &str| Some("// zoomBoxOf retired\n".to_string());
+        for probe in [
+            "git show HEAD:$UNSET/a.ts | grep -c zoomBoxOf",
+            "git show HEAD:a.ts | grep -vc zoomBoxOf",
+            "git show HEAD:a.ts | grep -c 'zoom.*Of'",
+            "boss-sor-read /api/jobs | grep -c zoomBoxOf",
+        ] {
+            assert_eq!(a_grep_only_prose_answers(probe, comment), None, "{probe}");
+        }
+        assert_eq!(
+            a_grep_only_prose_answers("git show HEAD:a.ts | grep -c zoomBoxOf", |_| None),
+            None,
+            "an unreadable file is not a finding"
+        );
+        // And the case-folding and -E spellings are read, not skipped.
+        assert!(
+            a_grep_only_prose_answers("git show HEAD:a.ts | grep -ci ZOOMBOXOF", comment).is_some()
+        );
+        assert!(
+            a_grep_only_prose_answers("git show HEAD:a.ts | grep -Ec 'lerpBox|zoomBoxOf'", comment)
+                .is_some()
+        );
+    }
+
+    /// Car 72d7bc98's recorded probe, VERBATIM (parked 2026-09-23 on
+    /// fix/boss-gate-help-names-every-item-answer). Its first grep reads
+    /// two sentences of `boss gate --help` out of boss-cli's main.rs.
+    const CLAP_HELP_PROBE: &str = r#"m=$(git show HEAD:crates/orchestrators/boss-cli/src/main.rs | grep -c -e '--park-no-item / --park-design (a car says' -e '--park-design is REQUIRED with any --park-')
+t=$(git show HEAD:crates/core/boss-testing/tests/builder_rules_carry_the_item_answer_choice.rs | grep -c 'fn gate_help_names_every_item_answer_wherever_it_states_the_choice()')
+case ${m:-empty}${t:-empty} in 21) echo 'gate help names all four item answers, pinned'; exit 0;; esac
+echo "not yet: help lines $m, pin $t"
+exit 75"#;
+
+    /// The Gate variant as that car left it: lines 170-231 of
+    /// crates/orchestrators/boss-cli/src/main.rs on its branch, verbatim,
+    /// inside the `#[derive(Subcommand)]` enum that holds them.
+    const CLAP_GATE_VARIANT: &str = r##"#[derive(Subcommand)]
+enum Commands {
+    /// Launch a gate for a branch — files or reuses the gate-run
+    /// packet, renders the runner Job, and creates it.
+    ///
+    /// Replaces the seven-step by-hand sequence recorded in 51ca3405.
+    /// Gates run in PARALLEL: every workspace is a per-run emptyDir
+    /// seeded from a warm target, so verdicts are independent by
+    /// construction. At the concurrency bound (BOSS_GATE_MAX_CONCURRENT,
+    /// default 3) `--wait` QUEUES — the gate-run takes a place in line
+    /// and launches when a slot frees, oldest first, so one call
+    /// replaces a hand-rolled retry loop. Without `--wait` the bound
+    /// refuses, naming the running gates and filing nothing.
+    Gate {
+        /// Branch to gate.
+        branch: String,
+        /// Gate mode: "auto" (or "--auto"), or "-p `<crate>`". Empty = full.
+        ///
+        /// Checked before the cluster is touched — an unknown mode is a
+        /// refusal here, not a red gate forty minutes from now.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Runner manifest. Defaults to infra/gate-runner/gate-runner.yaml.
+        #[arg(long)]
+        manifest: Option<std::path::PathBuf>,
+        /// Kubernetes namespace holding the gate Jobs.
+        #[arg(long, default_value = "boss-dev")]
+        namespace: String,
+        /// Poll the gate-run packet until it reports a verdict.
+        #[arg(long)]
+        wait: bool,
+        /// Show what would happen without filing or creating anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Auto-park on green: what the change does (first sentence =
+        /// title). Stamped onto the gate-run so the dispatcher files the
+        /// car when the gate goes green — no hand-park. Requires the
+        /// other three --park-* below (a car needs a full receipt) and
+        /// ONE of --park-backlog-item / --park-partial-item /
+        /// --park-no-item / --park-design (a car says which item it
+        /// fixes).
+        #[arg(long)]
+        park_summary: Option<String>,
+        /// Auto-park: what the change deliberately leaves out.
+        #[arg(long)]
+        park_excludes: Option<String>,
+        /// Auto-park: what was run, and what it proves.
+        #[arg(long)]
+        park_test: Option<String>,
+        /// Auto-park: what was observed working beyond the gate.
+        #[arg(long)]
+        park_verified: Option<String>,
+        /// Auto-park: the backlog item this change answers. This car IS
+        /// that item's build, so the arrival rule routes its triage and
+        /// COMPLETES its build when the car lands — which closes it.
+        ///
+        /// One of this, --park-partial-item, --park-no-item or
+        /// --park-design is REQUIRED with any --park-* flag. Measured
+        /// 2026-09-10 (e1325456): 13 of 19 open cars named no item, so
+        /// their items stayed open after the fix was live and an
+        /// operator closed them by hand with a worse record than the
+        /// car's own arrival.
+        #[arg(long)]
+        park_backlog_item: Option<String>,
+    },
+}
+"##;
+
+    /// A CLAP DOC COMMENT IS THE `--help` TEXT, NOT PROSE (backlog
+    /// ab918f00). Both sentences the probe greps are `///` lines on
+    /// `#[arg]` fields, which clap renders as the binary's help, so the
+    /// probe checks shipped behaviour — and the gate warned that it was
+    /// answered only by a comment.
+    #[test]
+    fn a_grep_answered_by_clap_help_text_is_not_named() {
+        let tree = |path: &str| {
+            (path == "crates/orchestrators/boss-cli/src/main.rs")
+                .then(|| CLAP_GATE_VARIANT.to_string())
+        };
+        assert_eq!(a_grep_only_prose_answers(CLAP_HELP_PROBE, tree), None);
+    }
+
+    /// And ONLY clap's: a `///` inside the body of a clap-derived item —
+    /// a field or a variant, with an attribute or without one — is
+    /// rendered; a `///` anywhere else, a plain `//` inside the item, and
+    /// the doc above a `Subcommand` enum (never rendered) stay prose.
+    #[test]
+    fn a_doc_comment_outside_a_clap_item_body_is_still_prose() {
+        let probe = "git show HEAD:src/main.rs | grep -c zoomBoxOf";
+        for (file, named) in [
+            (
+                "#[derive(Parser)]\nstruct Cli {\n    /// zoomBoxOf here\n    ip: String,\n}\n",
+                false,
+            ),
+            (
+                "#[derive(Debug, clap::Subcommand)]\nenum C {\n    /// zoomBoxOf here\n    Reach { ip: String },\n}\n",
+                false,
+            ),
+            (
+                "#[derive(\n    Debug,\n    Args,\n)]\nstruct A {\n    /// zoomBoxOf here\n    #[arg(long)]\n    ip: String,\n}\n",
+                false,
+            ),
+            (
+                "#[derive(Parser)]\nstruct Cli {\n    #[arg(default_value = \"}\")]\n    /// zoomBoxOf here\n    ip: String,\n}\n",
+                false,
+            ),
+            ("/// zoomBoxOf retired\npub fn a() {}\n", true),
+            (
+                "#[derive(Debug, Clone)]\nstruct S {\n    /// zoomBoxOf retired\n    a: u8,\n}\n",
+                true,
+            ),
+            (
+                "#[derive(Parser)]\nstruct Cli {\n    // zoomBoxOf retired\n    ip: String,\n}\n",
+                true,
+            ),
+            (
+                "/// zoomBoxOf retired\n#[derive(Subcommand)]\nenum C {\n    Doctor,\n}\n",
+                true,
+            ),
+            (
+                "#[derive(Parser)]\nstruct Cli {\n    ip: String,\n}\n/// zoomBoxOf retired\nfn b() {}\n",
+                true,
+            ),
+            (
+                "#[derive(Args)]\nstruct U;\n/// zoomBoxOf retired\nfn c() {}\n",
+                true,
+            ),
+        ] {
+            let found = a_grep_only_prose_answers(probe, |_| Some(file.to_string()));
+            assert_eq!(found.is_some(), named, "{file:?} -> {found:?}");
         }
     }
 }

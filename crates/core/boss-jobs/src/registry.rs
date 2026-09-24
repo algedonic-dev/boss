@@ -386,7 +386,16 @@ fn workflow_design_spec() -> WorkflowSpec {
             sign_offs_required: vec!["workflow-approver".into()],
             assurance_required: None,
             authority_role: Some("workflow-approver".into()),
-            metadata_defaults: serde_json::json!({ "authority_role": "workflow-approver" }),
+            // `changes_requested_completes` (backlog da322e8f,
+            // 2026-09-23): the sign-off surface completes a Request
+            // changes only where the step declares it, and
+            // `not-published` needs this step done on changes-requested.
+            // Rides through BOTH copies for the reason the note below
+            // gives.
+            metadata_defaults: serde_json::json!({
+                "authority_role": "workflow-approver",
+                "changes_requested_completes": true,
+            }),
             // 2026-08-31, cdfe2e1a: the decision must LEAVE a record
             // (workflow_lint Phase 5) — required at completion, on the
             // step itself, unlike `sign_off_context` above which
@@ -1711,7 +1720,12 @@ pub fn reevaluate(
 
 /// If the step has an `authority_role`, surface it in metadata so the
 /// sign-off gate in `boss-jobs::http::update_step` can enforce it.
-fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
+///
+/// Crate-visible because the re-pin door compares what this writes for
+/// two versions of one step (`protocol_conversion::convertibility_for_repin`,
+/// 1e973965): a key that differs is one a pending step's row would keep
+/// stale.
+pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
     let mut merged = match defaults {
         serde_json::Value::Object(_) => defaults.clone(),
         _ => serde_json::Value::Object(serde_json::Map::new()),

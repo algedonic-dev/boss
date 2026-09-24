@@ -32,6 +32,34 @@ export const MODULES_ON: Readonly<Record<string, boolean>> = {
   parts: true, qa: true, shipping: true, support: true, warehouse: true, shop: true, sim: true,
 };
 
+/// The LIVE tenant's modules, as the gateway served them on 2026-09-19
+/// (`GET /api/tenant/manifest` → `"modules":{}`): nothing listed, so
+/// every gated surface is off. MODULES_ON above is shaped so a module
+/// gate cannot be seen at all — every gate answers "on" — which is how
+/// /ux/support stayed gated on 'shipping' and labelled "Shipments" with
+/// no mocked spec able to notice (backlog 5b2f3240, gap 10 of the
+/// /ux/support audit). A spec that pins a gate installs this shape
+/// through installTenantManifest, after installSmokeMocks.
+export const MODULES_LIVE: Readonly<Record<string, boolean>> = {};
+
+/// `GET /api/tenant/manifest` with the given modules — the one place a
+/// spec says which tenant it is rendering for. Registered routes win in
+/// reverse order, so calling this after installSmokeMocks replaces the
+/// all-on manifest the crawl needs.
+export async function installTenantManifest(
+  page: Page,
+  modules: Readonly<Record<string, boolean>>,
+): Promise<void> {
+  await page.route(/\/api\/tenant\/manifest$/, (r) =>
+    json(r, {
+      display_name: 'Algedonic Ales',
+      tenant_id: 'brewery',
+      modules,
+      labels: {},
+    }),
+  );
+}
+
 /// The platform's department Classes (01-registries.sql) as `/api/classes`
 /// rows — the EMPLOYEE DRAWER: the values an employee's `department`
 /// column may take, which the policy flyout's scope picker reads.
@@ -138,9 +166,33 @@ export const GATEWAY_PERF = /\/api\/gateway\/perf$/;
 export const MARKETING_ASSET_DETAIL = /\/api\/catalog\/marketing-assets\/[^/]+$/;
 export const VIEW_RESULTS = /\/api\/views\/[^/]+\/results/;
 export const SHIPMENT_DETAIL = /\/api\/shipping\/shipments\/[^/]+$/;
+/// The audit log's size-and-growth read (boss-events AuditStats). The
+/// fixture /it/operate/audit sat in DEFERRED waiting for ("snapshot .length
+/// needs a faithful fixture"; page audit 65a273d5, gap 0398c4d0): a `[]`
+/// here paints `undefined.toLocaleString()` and the page throws.
+export const EVENTS_STATS = /\/api\/events\/stats$/;
+/// The live read's figures on 2026-09-23 21:44Z (the audit's controls_md,
+/// read 1), trimmed to two days and three kinds.
+export const AUDIT_STATS = {
+  total_rows: 384521,
+  table_bytes: 515522560,
+  oldest_at: '2026-09-16T23:54:00Z',
+  newest_at: '2026-09-23T21:44:00Z',
+  rows_last_24h: 78516,
+  rows_last_7d: 420000,
+  per_day: [
+    { day: '2026-09-22', rows: 71000 },
+    { day: '2026-09-23', rows: 73907 },
+  ],
+  top_kinds: [
+    { kind: 'jobs.step.updated', rows: 120000 },
+    { kind: 'dispatcher.rule.fired', rows: 60000 },
+    { kind: 'credential.rotate.verified', rows: 3 },
+  ],
+} as const;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
   JOBS_LIVE, JOBS_SUMMARY, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
-  MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL,
+  MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL, EVENTS_STATS,
   // `{data, total}`, not a list: a bare `[]` here is the shape a wrong
   // endpoint answers, and the bar reads it as a failed roster rather
   // than an empty one — deliberately, so the org chart cannot go
@@ -244,6 +296,10 @@ export async function installApiFloor(page: Page): Promise<void> {
   // The other object reads, empty; the detail reads, absent.
   await page.route(DISPATCHER_RULES, (r) => json(r, { rules: [], handler_emits: {}, system_edges: [] }));
   await page.route(GATEWAY_PERF, (r) => json(r, { endpoints: [], window_started_at: '2026-01-01T00:00:00Z' }));
+  await page.route(EVENTS_STATS, (r) => json(r, {
+    total_rows: 0, table_bytes: 0, oldest_at: null, newest_at: null,
+    rows_last_24h: 0, rows_last_7d: 0, per_day: [], top_kinds: [],
+  }));
   for (const detail of [WORKFLOW_DETAIL, MARKETING_ASSET_DETAIL, SHIPMENT_DETAIL, VIEW_RESULTS]) {
     await page.route(detail, (r) => json(r, 'not found', 404));
   }
@@ -327,14 +383,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // something deterministic to read. A module is on only when listed
   // true (ce68f137), so the playground persona lists every module the
   // SPA gates — the crawl has to reach the pages behind them.
-  await page.route(/\/api\/tenant\/manifest$/, (r) =>
-    json(r, {
-      display_name: 'Algedonic Ales',
-      tenant_id: 'brewery',
-      modules: MODULES_ON,
-      labels: {},
-    }),
-  );
+  await installTenantManifest(page, MODULES_ON);
   await page.route(/\/api\/views(\?|$)/, (r) =>
     json(r, [
       {

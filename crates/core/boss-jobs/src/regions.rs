@@ -36,13 +36,15 @@ use serde_json::Value;
 use crate::registry::WorkflowSpec;
 use crate::yard::{ConductorHealth, Reading, YardStatus};
 
-/// The nine regions, in map order. The count and the order are the
-/// decision (0524fc95 Q2); a reader that finds a tenth name has an
+/// The ten regions, in map order. The count and the order are the
+/// decision (0524fc95 Q2); a reader that finds an eleventh name has an
 /// older or newer server than it expects. `shop-floor` is the ninth
 /// (backlog 94c6ffd0): the region UPSTREAM of the dock, where a car is
-/// still being built — appended rather than inserted, so the names a
-/// client already knows keep their place.
-pub const REGIONS: [&str; 9] = [
+/// still being built. `publish` is the tenth (design cb38d806, backlog
+/// eee42416): the crossing OUT of the world, where what landed on main
+/// is proposed to the public GitHub mirror. Both were appended rather
+/// than inserted, so the names a client already knows keep their place.
+pub const REGIONS: [&str; 10] = [
     "dock",
     "gates",
     "track",
@@ -52,6 +54,7 @@ pub const REGIONS: [&str; 9] = [
     "receiving",
     "marshalling",
     "shop-floor",
+    "publish",
 ];
 
 /// The trend window when the caller names none: a day, the shortest
@@ -231,6 +234,198 @@ pub const SESSION_KIND: &str = "work-session";
 /// hours; this is only where the floor stops crediting it with work.
 pub const CREW_IDLE_HOURS: i64 = 1;
 
+/// THE PUBLISH PACKET'S KIND (design cb38d806). One `publish-to-github`
+/// packet is one day's measurement of the drift between the forge and
+/// the public mirror; the ones that found drift opened a pull request.
+pub const PUBLISH_KIND: &str = "publish-to-github";
+
+/// How long a mirror pull request may stand before the publish is
+/// STALLED. Design cb38d806 §4, decided by David 2026-09-19: "a stalled
+/// publish (open PR older than 24 h, or a red reading unjudged) looks
+/// troubled on the surface". The target it serves is §1 — a publish PR
+/// every day there is drift, sized like a day of trains — which a PR
+/// left standing defeats: #239 carried 1319 files in one commit because
+/// the publishes before it had never been merged, and the scan's own
+/// footnote says a change that large reads as all-new code.
+pub const STALLED_PUBLISH_HOURS: i64 = 24;
+
+/// ONE MIRROR PULL REQUEST, as the publish packet recorded it — the
+/// `open-pr` step's own fields, the `read-checks` reading, whether
+/// `judge-checks` judged it, and what GitHub last answered about the
+/// PR's state (`pr_state`). NOTHING HERE IS FETCHED FROM THE MIRROR:
+/// the readback car (backlog 321f1409) put the scan on the packet, and
+/// `publish-github-pr.sh --measure` puts the PR's state there (backlog
+/// a5d4322c), precisely so a surface could read both with no
+/// credential and no second opinion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishPr {
+    /// The pull request, as the verb recorded it.
+    pub url: String,
+    /// The snapshot commit the PR proposes.
+    pub snapshot: String,
+    /// When `open-pr` completed: the instant the PR was opened.
+    pub opened: Instant,
+    /// The scan's conclusion as the mirror spells it (`success`,
+    /// `failure`, `absent`…). EMPTY when `read-checks` has not
+    /// completed — which is not a pass, and is why [`Self::unjudged_red`]
+    /// asks for a conclusion that was actually read.
+    pub conclusion: String,
+    /// The reading's own numbers, as the step recorded them — the
+    /// region says the reading, never a symptom (design cb38d806 §4).
+    pub alerts: String,
+    pub rules: String,
+    /// `judge-checks` completed: a disposition per rule is on the
+    /// packet. A SKIPPED judge is not a judgement — the workflow skips
+    /// it only when the scan concluded `success`, which the conclusion
+    /// already says.
+    pub judged: bool,
+    /// GitHub, asked, said this PR merged.
+    pub merged: bool,
+    /// GitHub, asked, said this PR is closed — merged or not.
+    pub closed: bool,
+    /// When GitHub was last asked about this PR. EMPTY when it never
+    /// was, which is not "open": the region then says the state was
+    /// never read rather than how long the PR has been open.
+    pub state_read_at: String,
+}
+
+impl PublishPr {
+    /// Still standing as far as the record knows: GitHub has not been
+    /// read saying it closed. An UNREAD PR counts here — an unasked
+    /// question is not a pass — and the region's sentence says which of
+    /// the two it is.
+    pub fn awaiting(&self) -> bool {
+        !self.closed
+    }
+
+    /// A RED READING NOBODY JUDGED: the scan was read, it did not
+    /// conclude `success`, and no disposition was recorded. This is
+    /// design cb38d806 §2's defect exactly — "a red badge on the mirror
+    /// with no reading in the system of record is the defect" — and PR
+    /// #238 was merged over 64 unread alerts because nothing said so.
+    pub fn unjudged_red(&self) -> bool {
+        !self.conclusion.is_empty() && self.conclusion != "success" && !self.judged
+    }
+
+    /// The READING, in the words the region carries. An alarm that
+    /// reports a symptom sends a human to re-derive what the system
+    /// already recorded (CLAUDE.md §Diagnosis), so the sentence names
+    /// the conclusion and both counts the step wrote down.
+    pub fn reading(&self) -> String {
+        format!(
+            "the scan read {} — {} alert(s) over {} rule(s), no disposition recorded",
+            self.conclusion, self.alerts, self.rules
+        )
+    }
+}
+
+/// The pull requests the publish packets opened, newest first — one per
+/// packet that reached `open-pr`, with its reading and its state.
+///
+/// THE STATE IS WHAT GITHUB ANSWERED, never an inference (backlog
+/// a5d4322c). It rides the packet as `pr_state`, written by the daily
+/// `publish-github-pr.sh --measure` from GitHub's public pulls API, and
+/// is taken only when its `pr_url` is this PR's. Until 2026-09-23 the
+/// merge was inferred from a later mirror head equalling the PR's
+/// snapshot commit — true only of a fast-forward, which GitHub's merge
+/// never makes (#239 merged as merge commit b27382e5, #241 was squashed
+/// to a7061022) — so every publish PR read open forever, and on
+/// 2026-09-22 the region called #239 open for 86 hours, three days
+/// after it merged.
+pub fn publish_prs(packets: &[(Job, Vec<Step>)]) -> Vec<PublishPr> {
+    let mut prs: Vec<PublishPr> = packets
+        .iter()
+        .filter_map(|(job, steps)| {
+            let open_pr = find_step(steps, "open-pr", "open-pr")?;
+            let opened = step_done_at(Some(open_pr))?;
+            let url = md_str(&open_pr.metadata, "pr_url").to_string();
+            if url.is_empty() {
+                return None;
+            }
+            let snapshot = md_str(&open_pr.metadata, "snapshot_commit").to_string();
+            let checks = find_step(steps, "read-checks", "read-checks");
+            let judge = find_step(steps, "judge-checks", "judge-checks");
+            let read = |key: &str| {
+                checks
+                    .map(|s| md_str(&s.metadata, key).to_string())
+                    .unwrap_or_default()
+            };
+            let observed = job
+                .metadata
+                .get("pr_state")
+                .filter(|o| md_str(o, "pr_url") == url);
+            Some(PublishPr {
+                merged: observed
+                    .and_then(|o| o.get("merged"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                closed: observed.is_some_and(|o| md_str(o, "state") == "closed"),
+                state_read_at: observed
+                    .map(|o| md_str(o, "read_at").to_string())
+                    .unwrap_or_default(),
+                url,
+                snapshot,
+                opened,
+                conclusion: read("conclusion"),
+                alerts: read("alerts"),
+                rules: read("rules"),
+                judged: judge.is_some_and(|s| s.status == StepStatus::Completed),
+            })
+        })
+        .collect();
+    prs.sort_by_key(|p| std::cmp::Reverse(p.opened));
+    prs
+}
+
+/// THE HELD PACKET (backlog f49ae66d, the surface half of e1b6ddf7;
+/// design cb38d806 §4). The oldest publish packet still OPEN that has
+/// opened no pull request, held past [`STALLED_PUBLISH_HOURS`], with
+/// what it has been held for, the step it waits at and the drift the
+/// daily `--measure` wrote onto it. None when there is no such packet.
+///
+/// The PR conditions cannot see this case: a packet held before its
+/// sign-off opens no PR, and while it is open the daily cadence spawns
+/// nothing (`NOT open_publish_exists`), so a quiet region is exactly
+/// what a hold used to look like — the 2026-09-17 -> 09-18 hold skipped
+/// the week and #239 arrived as 1319 files. The drift reading on the
+/// packet (`drift_refresh`, rewritten daily by
+/// `publish-github-pr.sh --measure`) is what makes the sentence a
+/// reading rather than an age.
+fn held_publish(packets: &[(Job, Vec<Step>)], now: Instant) -> Option<String> {
+    let (job, steps, since) = packets
+        .iter()
+        .filter(|(job, steps)| {
+            job.status == JobStatus::Open
+                && step_done_at(find_step(steps, "open-pr", "open-pr")).is_none()
+        })
+        .filter_map(|(job, steps)| Some((job, steps, job.opened_at.or_else(|| opened_at(job))?)))
+        .filter(|(_, _, since)| (now - *since).num_hours() >= STALLED_PUBLISH_HOURS)
+        .min_by_key(|(_, _, since)| *since)?;
+    let waiting_at = steps
+        .iter()
+        .find(|s| matches!(s.status, StepStatus::Ready | StepStatus::Active))
+        .map(|s| s.spec_slug.clone().unwrap_or_else(|| s.title.clone()))
+        .unwrap_or_else(|| "no ready step".to_string());
+    let drift = match job.metadata.get("drift_refresh") {
+        Some(d) => format!(
+            "the drift read {} commit(s) / {} file(s) ahead of the mirror at {}",
+            md_str(d, "commits_ahead"),
+            md_str(d, "files_changed"),
+            md_str(d, "measured_at"),
+        ),
+        None => "no drift measurement is on the packet".to_string(),
+    };
+    Some(format!(
+        "the publish packet opened {} has been held {} at {waiting_at} with no pull request — past the {STALLED_PUBLISH_HOURS}h a publish may stand, and no day behind it is published; {drift}",
+        since.format("%Y-%m-%d"),
+        plural(
+            usize::try_from((now - since).num_hours()).unwrap_or(0),
+            "hour",
+            "hours"
+        ),
+    ))
+}
+
 /// THE FLOOR'S BOUND: how many runs may be in flight at once, summed
 /// over the agents registry's `max_concurrent_runs`. `None` when ANY
 /// row declares no cap — an agent without one is unbounded
@@ -321,6 +516,13 @@ pub struct RegionInputs<'a> {
     /// failed read — one unknown machine, never a floor with nobody
     /// standing on it.
     pub sessions: Option<&'a [Job]>,
+    /// THE PUBLISH REGION'S PACKETS (design cb38d806): the newest
+    /// [`PUBLISH_KIND`] packets, open and closed, with their steps. NOT
+    /// windowed — a pull request nobody merged is exactly the thing
+    /// this region exists to show, and it outlives every window; the
+    /// handler caps the page instead. `None` on a failed read, which is
+    /// a troubled region and never a mirror that reads as current.
+    pub publish_packets: Option<&'a [(Job, Vec<Step>)]>,
     /// [`run_capacity`] over the agents registry, or `None` where no
     /// bound is declared or the registry could not be read.
     pub run_capacity: Option<usize>,
@@ -329,8 +531,50 @@ pub struct RegionInputs<'a> {
     /// `None` when the registry could not be read, which is one
     /// unknown machine and never an estate with no runners in it.
     pub runner_hosts: Option<&'a [RunnerHost]>,
+    /// THE DOCK'S ORDERING EDGES (backlog 4142d821, design cf820810 Q7):
+    /// the reading of every predecessor a parked car declares
+    /// ([`crate::car::BOARDS_AFTER`]), keyed by the id it declares. Read
+    /// BY ID, not out of `cars`, because a predecessor that landed a week
+    /// ago is outside every window and still decides whether its
+    /// successor boards. [`declared_edges`] names the ids to read, so the
+    /// handler and the dock cannot disagree about the set; a declared id
+    /// with no reading here is judged unreadable, never satisfied.
+    pub predecessors: &'a [(String, crate::car::Predecessor)],
     pub now: chrono::DateTime<chrono::Utc>,
     pub window_hours: i64,
+}
+
+/// The predecessors the dock's parked cars declare, deduplicated, in dock
+/// order — the ids the handler reads for [`RegionInputs::predecessors`].
+/// A dock row whose car is not among `cars` declares nothing this pass
+/// can see, the same as a car with no edge.
+pub fn declared_edges(status: &YardStatus, cars: &[(Job, Vec<Step>)]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in status
+        .dock
+        .iter()
+        .filter_map(|d| cars.iter().find(|(j, _)| j.id.to_string() == d.id))
+        .filter_map(|(j, _)| crate::car::boards_after_of(&j.metadata))
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// A packet as the jobs API serves it — the row with its `steps` — which
+/// is the shape `crate::car`'s predicates read, so a predecessor judged
+/// here is judged exactly as the conductor judges the one it fetched.
+pub fn packet_value(job: &Job, steps: &[Step]) -> Value {
+    let mut v = serde_json::to_value(job).unwrap_or_default();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "steps".to_string(),
+            serde_json::to_value(steps).unwrap_or_default(),
+        );
+    }
+    v
 }
 
 // ---------------------------------------------------------------------
@@ -436,10 +680,7 @@ pub fn shed_place(md: &Value) -> ShedPlace {
     let event = md_str(md, crate::car::PROOF_EVENT);
     if !probe.is_empty() {
         let attempt = md.get("proof_attempt");
-        let not_yet = attempt.is_some_and(|a| {
-            a.get("not_yet").and_then(Value::as_bool) == Some(true)
-                || a.get("exit").and_then(Value::as_i64) == Some(75)
-        });
+        let not_yet = attempt.is_some_and(crate::car::attempt_said_not_yet);
         let last = attempt
             .and_then(|a| a.get("why"))
             .and_then(Value::as_str)
@@ -1090,6 +1331,7 @@ pub fn regions(inputs: &RegionInputs<'_>) -> Regions {
         receiving(inputs, &w),
         marshalling(inputs, &w),
         shop_floor(inputs, &w),
+        publish(inputs, &w),
     ]
     .into_iter()
     .map(|r| {
@@ -1124,12 +1366,70 @@ fn with_machinery(region: Region, machines: Vec<Machine>) -> Region {
     }
 }
 
-/// THE DOCK: cars parked and boardable. Busy when the boarding depth
-/// is met — a train is due — and troubled only when the dock row could
-/// not be read (an unread dock is not an empty one, 52fed017). The
-/// trend is the DOCK WAIT: how long the cars that boarded in the
+/// Each parked car that declares an ordering edge, with the conductor's
+/// OWN judgement of it — `car::boards_after_outcome`, the function the
+/// conductor boards by — so the dock and the conductor cannot disagree
+/// about whether a car can board (backlog 4142d821, design cf820810 Q7).
+/// A car that declares no edge is not listed; a declared predecessor with
+/// no reading in [`RegionInputs::predecessors`] is judged unreadable,
+/// which boards (fail-open, as the conductor is) and is said.
+pub(crate) fn dock_edges<'a>(
+    inputs: &RegionInputs<'a>,
+) -> Vec<(&'a crate::yard::DockCar, crate::car::EdgeOutcome)> {
+    use crate::car::{Predecessor, boards_after_of, boards_after_outcome};
+    let status: &'a YardStatus = inputs.status;
+    status
+        .dock
+        .iter()
+        .filter_map(|d| {
+            let (job, _) = inputs.cars.iter().find(|(j, _)| j.id.to_string() == d.id)?;
+            let declared = boards_after_of(&job.metadata)?;
+            let pred = inputs
+                .predecessors
+                .iter()
+                .find(|(id, _)| *id == declared)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| {
+                    Predecessor::Unreadable("the predecessor was not read on this pass".into())
+                });
+            Some((d, boards_after_outcome(&declared, &pred)))
+        })
+        .collect()
+}
+
+/// The predecessors the held cars wait behind, of one hold kind, each
+/// named once however many cars wait behind it.
+fn behind_of(holds: &[&crate::car::EdgeHold], kind: &str) -> Vec<String> {
+    holds
+        .iter()
+        .filter(|h| h.kind == kind)
+        .fold(Vec::new(), |mut names: Vec<String>, h| {
+            if !names.contains(&h.behind) {
+                names.push(h.behind.clone());
+            }
+            names
+        })
+}
+
+/// THE DOCK: cars parked, and whether they can board. Busy when the
+/// boarding depth is met — a train is due — and troubled when the dock
+/// row could not be read (an unread dock is not an empty one, 52fed017).
+/// The trend is the DOCK WAIT: how long the cars that boarded in the
 /// window stood on the dock first, from the car's `gate` stamp to its
 /// train's `collect` stamp.
+///
+/// A CAR THE CONDUCTOR WILL REFUSE IS NOT A TRAIN DUE (backlog 4142d821,
+/// design cf820810 Q7). Three cars once sat unable to board for nine and
+/// a half hours while this region said "the boarding depth is met, a
+/// train is due" — the sentence it says two minutes after a healthy
+/// departure — because only the conductor ever asked whether a car
+/// could board. So the parked cars' declared ordering edges are judged
+/// here by the conductor's own function ([`dock_edges`]), and while any
+/// car is held on one the region says "N parked, M cannot board (waiting
+/// behind X)" and stays busy rather than promising a train. An edge that
+/// can NEVER clear — an abandoned or missing predecessor — troubles the
+/// region: the conductor refuses it identically every window until a
+/// person acts, and a troubled thing must look troubled.
 fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let status = inputs.status;
     let boarded_at: std::collections::HashMap<String, Instant> = inputs
@@ -1164,20 +1464,71 @@ fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             trend,
         ),
         Reading::Read => {
+            use crate::car::{EDGE_HOLD_NEEDS_HUMAN, EDGE_HOLD_WAITING, EdgeOutcome};
             let depth = status.dock.len();
-            let (state, why) = if status.boarding.threshold_met == Some(true) {
+            let parked = plural(depth, "car parked", "cars parked");
+            let edges = dock_edges(inputs);
+            let holds: Vec<&crate::car::EdgeHold> = edges
+                .iter()
+                .filter_map(|(_, o)| match o {
+                    EdgeOutcome::Hold(h) => Some(h),
+                    _ => None,
+                })
+                .collect();
+            let unjudged = edges
+                .iter()
+                .filter(|(_, o)| matches!(o, EdgeOutcome::BoardUnjudged(_)))
+                .count();
+            let waiting = behind_of(&holds, EDGE_HOLD_WAITING);
+            let stuck = behind_of(&holds, EDGE_HOLD_NEEDS_HUMAN);
+            let (state, why) = if !holds.is_empty() {
+                let clauses: Vec<String> = [
+                    (!waiting.is_empty()).then(|| format!("waiting behind {}", waiting.join(", "))),
+                    (!stuck.is_empty()).then(|| {
+                        format!(
+                            "stuck behind {}, an edge that can never be satisfied — a human \
+                             must clear it",
+                            stuck.join(", ")
+                        )
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 (
-                    RegionState::Busy,
+                    if stuck.is_empty() {
+                        RegionState::Busy
+                    } else {
+                        RegionState::Troubled
+                    },
                     format!(
-                        "{} — the boarding depth is met, a train is due",
-                        plural(depth, "car parked", "cars parked")
+                        "{parked}, {} cannot board ({})",
+                        holds.len(),
+                        clauses.join("; ")
                     ),
                 )
-            } else {
+            } else if status.boarding.threshold_met == Some(true) {
                 (
-                    RegionState::Clear,
-                    plural(depth, "car parked", "cars parked"),
+                    RegionState::Busy,
+                    format!("{parked} — the boarding depth is met, a train is due"),
                 )
+            } else {
+                (RegionState::Clear, parked)
+            };
+            // Unknown is not zero: an edge nobody could judge boards (the
+            // conductor fails open on it too), and the region says so.
+            let why = if unjudged > 0 {
+                format!(
+                    "{why} · {} could not be read — the conductor boards {} anyway",
+                    plural(unjudged, "ordering edge", "ordering edges"),
+                    if unjudged == 1 {
+                        "its car"
+                    } else {
+                        "their cars"
+                    }
+                )
+            } else {
+                why
             };
             region("dock", Some(depth), bound, state, why, trend)
         }
@@ -1386,10 +1737,51 @@ pub(crate) fn released_awaiting_repair<'a>(
 /// than "landed" for that reason.
 pub const PROOF_STALE_HOURS: i64 = 24;
 
+/// How long a probe may answer `not yet` WITHOUT A BREAK before the shed
+/// stops calling it the world's move (backlog adef5ddf).
+///
+/// WHY A SECOND BOUND. [`PROOF_STALE_HOURS`] times the CAR; this times
+/// the ANSWER, read from the streak each attempt carries
+/// (`boss_jobs::car::not_yet_streak`). A probe that can never pass —
+/// b8c4267f greps a literal a later car deliberately removed, 52e0287e
+/// reads the wrong occurrence of a call — exits 75 exactly like a
+/// patient one, and the shed said "waiting on the world, not on us" of
+/// both.
+///
+/// WHY 72 HOURS, measured over the 1812 ops-requests on record
+/// (2026-09-17 to 09-23). Of 37 not-yet streaks that ended in a pass,
+/// the longest under the hourly recheck spanned 61h (a4a2118e, 46 runs)
+/// and the longest at all 75h (8c4f8ed9, a weekly Stripe event, under
+/// the old daily recheck). The six open cars still answering not-yet
+/// were at 97h to 134h. So a day would have named six of the honest
+/// waits that later passed, and three days names one (that 75h daily-
+/// recheck wait) while every stuck car clears it. Like the bound above it is a threshold for LOOKING:
+/// the probe is still rechecked hourly and may still pass. What changes
+/// is whose move the sentence says it is.
+///
+/// ONLY FOR A CAR THAT NEVER SAID WHAT IT WAITS ON (backlog b461341d):
+/// the triage of the six cars this bound measured found all six honest
+/// waits on the world, so a car declaring `waits_on` is judged by
+/// whether its declared event has been SEEN instead — see
+/// `boss_jobs::car::starved`, the one predicate the shed and orient read.
+pub const NOT_YET_STARVED_HOURS: i64 = 72;
+
 /// THE SHED: landed cars awaiting proof — open cars whose live step is
 /// `proven`. Troubled when one is UNPROVEN (no probe, no event: nothing
-/// mechanical can settle it) or its probe is FAILING; busy while any
-/// waits. The trend is cars proven per day.
+/// mechanical can settle it) or its probe is FAILING, or when a car
+/// past [`PROOF_STALE_HOURS`] waits on something that is OURS; busy
+/// while any waits and none is ours. The trend is cars proven per day.
+///
+/// TROUBLED MEANS OURS (backlog 3881f5c9). Until 2026-09-23 every stale
+/// car troubled the shed, so it read red while its own words said
+/// "waiting on the world, not on us" — six honest waits (a Stripe
+/// charge, a release David opens, his destructive prune, a tenant
+/// publish, a red crawl, a failed publish) painted exactly like a broken
+/// probe. A stale wait is someone else's move only when the car
+/// DECLARES it, something OBSERVES it, and it names the OWNER
+/// (`boss_jobs::car::owned_wait`); it stays theirs until the event is
+/// seen while the probe still says not yet, or it outlives a max wait
+/// the car itself declared.
 fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let awaiting = awaiting_proof(inputs.cars);
     let mut unproven = Vec::new();
@@ -1422,6 +1814,33 @@ fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     // with no attempt on record is us not asking. Same age, opposite
     // meaning, and until 2026-09-22 the same sentence.
     let mut never_probed = 0usize;
+    // Of the stale ones that were told not yet, those told so without a
+    // break for longer than [`NOT_YET_STARVED_HOURS`] — a probe that
+    // cannot pass looks exactly like this, so it is ours to read, not
+    // the world's to answer (adef5ddf). Longest streak first.
+    let mut starved: Vec<(crate::car::NotYetStreak, &str)> = Vec::new();
+    // Of those told not yet, the ones whose OWN declared wait is already
+    // in the record (b461341d) — the probe cannot see what the car said
+    // it was waiting for, which is ours at any streak length. A declared
+    // wait not yet seen lands in neither list: its patience is stated.
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    // Of those told not yet, the ones that DECLARED a wait with no
+    // `seen` check (e9b164a1). The declaration exempts them from the
+    // streak bound and hands the judgement to that check — so without
+    // one nothing can ever say the event arrived, and the exemption is
+    // an escape hatch that silences the label forever. Writing the
+    // check is ours, so they are counted, not folded into the world's.
+    let mut unobserved: Vec<&str> = Vec::new();
+    // WHOSE MOVE (3881f5c9): of those told not yet, the ones with NO
+    // declared wait (not yet starved — nothing on the car says whose
+    // move it is), the ones that declared and observe a wait but name no
+    // owner, the ones past the max wait they declared, and — the only
+    // ones that are not ours — those waiting on their declared owner.
+    let mut undeclared: Vec<&str> = Vec::new();
+    let mut prose_only: Vec<&str> = Vec::new();
+    let mut unowned: Vec<&str> = Vec::new();
+    let mut overdue: Vec<(crate::car::OwnedWait, i64, &str)> = Vec::new();
+    let mut theirs: Vec<(crate::car::OwnedWait, &str)> = Vec::new();
     for (j, _) in &awaiting {
         let branch = j
             .metadata
@@ -1439,15 +1858,31 @@ fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         let hours = (inputs.now - opened.with_timezone(&chrono::Utc)).num_hours();
         if hours >= PROOF_STALE_HOURS {
             stale.push((hours, branch));
-            if matches!(
-                shed_place(&j.metadata),
-                ShedPlace::ProbePending { last: None }
-            ) {
-                never_probed += 1;
+            match shed_place(&j.metadata) {
+                ShedPlace::ProbePending { last: None } => never_probed += 1,
+                // Only prose names what it waits on, and no probe runs,
+                // so no `seen` check ever runs either: nothing observes it.
+                ShedPlace::WaitingOn(_) => prose_only.push(branch),
+                _ => match crate::car::starved(&j.metadata) {
+                    Some(crate::car::Starved::Undeclared(streak)) => starved.push((streak, branch)),
+                    Some(crate::car::Starved::SeenWhileNotYet { on, .. }) => {
+                        seen.push((on, branch))
+                    }
+                    None => match crate::car::waits_on(&j.metadata) {
+                        None => undeclared.push(branch),
+                        Some(w) if w.seen.is_none() => unobserved.push(branch),
+                        Some(_) => match crate::car::owned_wait(&j.metadata) {
+                            Some(o) if o.overdue(hours) => overdue.push((o, hours, branch)),
+                            Some(o) => theirs.push((o, branch)),
+                            None => unowned.push(branch),
+                        },
+                    },
+                },
             }
         }
     }
     stale.sort_by_key(|(hours, _)| std::cmp::Reverse(*hours));
+    starved.sort_by_key(|(s, _)| std::cmp::Reverse(s.hours));
 
     let n = awaiting.len();
     let (state, why) = if !unproven.is_empty() {
@@ -1465,19 +1900,98 @@ fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         // named, because "9 awaiting proof" sends a reader to a list
         // while "105h, fix/x" sends them to a car.
         // WHOSE MOVE IS IT. The age says something is stuck; this says
-        // whether anyone here can unstick it. Never a fourth state —
-        // a stale proof is worth a look either way — but a reader who
-        // sees "told not yet" knows to go look at the WORLD, and one
-        // who sees "never probed" knows to go run something.
-        let whose = if never_probed == 0 {
-            "every one asked and was told not yet — waiting on the world, not on us".to_string()
-        } else if never_probed == stale.len() {
-            format!("{never_probed} never probed — nothing has run their proof, which is on us")
+        // whether anyone here can unstick it, and since 3881f5c9 it
+        // also decides the colour: only a declared, observed, owned
+        // wait is someone else's move, and a shed of nothing else is
+        // busy, not troubled. Every other answer is ours, each named
+        // for what there is to do — run the probe, read one that cannot
+        // pass (adef5ddf), read one blind to its own event (b461341d),
+        // write the seen check (e9b164a1), or declare whose move it is.
+        let mut ours: Vec<String> = Vec::new();
+        if never_probed > 0 {
+            ours.push(format!(
+                "{never_probed} never probed — nothing has run their proof, which is on us"
+            ));
+        }
+        if let Some((longest, branch)) = starved.first() {
+            ours.push(format!(
+                "{} told not yet without a break past {NOT_YET_STARVED_HOURS}h — longest {}h \
+                 over {} runs, {branch}; a probe that cannot pass says exactly this, so it is \
+                 ours to read, not the world's",
+                starved.len(),
+                longest.hours,
+                longest.runs
+            ));
+        }
+        if let Some((on, branch)) = seen.first() {
+            ours.push(format!(
+                "{} told not yet AFTER what they declared they wait on was seen in the record \
+                 — {branch}, waiting on {on}; the probe cannot see its own event, so it is ours \
+                 to read",
+                seen.len()
+            ));
+        }
+        if let Some(branch) = unobserved.first() {
+            ours.push(format!(
+                "{} declared a wait with no seen check — {branch}; nothing can ever say its \
+                 event arrived, so writing one is ours (boss car waits-on --seen)",
+                unobserved.len()
+            ));
+        }
+        if let Some(branch) = undeclared.first() {
+            ours.push(format!(
+                "{} told not yet with no declared wait — {branch}; saying whose move it is \
+                 is ours (boss car waits-on)",
+                undeclared.len()
+            ));
+        }
+        if let Some(branch) = prose_only.first() {
+            ours.push(format!(
+                "{} wait on an event only prose names, with no probe — {branch}; nothing \
+                 observes it, so it is ours",
+                prose_only.len()
+            ));
+        }
+        if let Some(branch) = unowned.first() {
+            ours.push(format!(
+                "{} declared no owner for their wait — {branch}; naming one (world, or the \
+                 actor whose act it is) is ours",
+                unowned.len()
+            ));
+        }
+        if let Some((o, hours, branch)) = overdue.first() {
+            ours.push(format!(
+                "{} past the max wait they declared — {branch}, waiting on {}: {}, {hours}h \
+                 against {}h; ours to read",
+                overdue.len(),
+                o.owner,
+                o.on,
+                o.max_wait_hours.unwrap_or_default()
+            ));
+        }
+        // Named one by one: a wait on the world and a wait on David's
+        // act are different errands, and "6 waiting" sends no one to
+        // either.
+        let waits = theirs
+            .iter()
+            .map(|(o, branch)| format!("waiting on {}: {} ({branch})", o.owner, o.on))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (state, whose) = if ours.is_empty() {
+            (RegionState::Busy, format!("none ours — {waits}"))
+        } else if theirs.is_empty() {
+            (RegionState::Troubled, ours.join("; "))
         } else {
-            format!("{never_probed} never probed — on us; the rest asked and were told not yet")
+            (
+                RegionState::Troubled,
+                format!(
+                    "{}; the rest wait on their declared owner — {waits}",
+                    ours.join("; ")
+                ),
+            )
         };
         (
-            RegionState::Troubled,
+            state,
             format!(
                 "{} of {n} open past {PROOF_STALE_HOURS}h — oldest {oldest}h, {branch} — {whose}",
                 stale.len()
@@ -1938,6 +2452,100 @@ fn shop_floor(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     )
 }
 
+/// THE PUBLISH REGION (design cb38d806, backlog eee42416) — the
+/// crossing OUT of the world, where what landed on main is proposed to
+/// the public mirror as a pull request and a person merges it.
+///
+/// The count is the pull requests the record shows STILL OPEN, because
+/// that is the number the design's targets are written against: one
+/// publish a day, sized like a day of trains (§1), and at most one
+/// human act per publish (§3). A PR left standing is what turns the
+/// next one into a week-scale snapshot no reader and no scan can judge.
+///
+/// The two troubled conditions are §4's, verbatim, and each carries
+/// what it read rather than that something is wrong:
+///
+///   * A RED READING NOBODY JUDGED ([`PublishPr::unjudged_red`]) — the
+///     defect §2 names. This leads, because it is the one a merge would
+///     make permanent: #238 was merged over 64 unread alerts.
+///   * A PULL REQUEST OPEN PAST [`STALLED_PUBLISH_HOURS`] — the publish
+///     has stalled on the human gate, and every day it stands makes the
+///     next diff larger.
+///   * A PACKET HELD PAST [`STALLED_PUBLISH_HOURS`] WITH NO PULL REQUEST
+///     ([`held_publish`], backlog f49ae66d) — the same stall one gate
+///     earlier, at the sign-off, where no PR exists for the two above
+///     to see. It reads last because it names a packet, not a PR.
+///
+/// The trend is publishes per day: the PRs opened in each window, which
+/// is §1's own number.
+fn publish(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
+    let Some(packets) = inputs.publish_packets else {
+        return region(
+            "publish",
+            None,
+            None,
+            RegionState::Troubled,
+            "the publish-to-github packets could not be read".to_string(),
+            rate_trend("publishes", w, 0, 0),
+        );
+    };
+    let prs = publish_prs(packets);
+    let (cur, prev) = count_split(w, prs.iter().map(|p| p.opened));
+    let trend = rate_trend("publishes", w, cur, prev);
+
+    let open: Vec<&PublishPr> = prs.iter().filter(|p| p.awaiting()).collect();
+    let unjudged = open.iter().find(|p| p.unjudged_red());
+    // Oldest first: the PR that has stood longest is the one the
+    // sentence should name.
+    let stalled = open
+        .iter()
+        .filter(|p| (inputs.now - p.opened).num_hours() >= STALLED_PUBLISH_HOURS)
+        .min_by_key(|p| p.opened);
+    let (state, why) = if let Some(p) = unjudged {
+        (
+            RegionState::Troubled,
+            format!("{} — {}", p.url, p.reading()),
+        )
+    } else if let Some(p) = stalled {
+        let age = plural(
+            usize::try_from((inputs.now - p.opened).num_hours()).unwrap_or(0),
+            "hour",
+            "hours",
+        );
+        // Openness is said only where GitHub was READ saying it
+        // (backlog a5d4322c); an unread PR is named as unread.
+        let why = if p.state_read_at.is_empty() {
+            format!(
+                "{} was opened {age} ago and its state was never read from GitHub — past the {STALLED_PUBLISH_HOURS}h a publish may stand, so it is stalled or unobserved",
+                p.url
+            )
+        } else {
+            format!(
+                "{} has been open {age} (GitHub read it open at {}) — past the {STALLED_PUBLISH_HOURS}h a publish may stand, and every day it does the next diff is larger",
+                p.url, p.state_read_at
+            )
+        };
+        (RegionState::Troubled, why)
+    } else if let Some(why) = held_publish(packets, inputs.now) {
+        (RegionState::Troubled, why)
+    } else if let Some(p) = open.first() {
+        (
+            RegionState::Busy,
+            format!(
+                "{} — {} awaiting a merge",
+                p.url,
+                plural(open.len(), "pull request", "pull requests")
+            ),
+        )
+    } else {
+        (
+            RegionState::Clear,
+            "no pull request awaiting a merge".to_string(),
+        )
+    };
+    region("publish", Some(open.len()), None, state, why, trend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,6 +2570,7 @@ mod tests {
             status,
             priority: Priority::Standard,
             opened_on: chrono::NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+            opened_at: None,
             due_on: None,
             closed_on: None,
             metadata,
@@ -2014,7 +2623,9 @@ mod tests {
             runner_hosts: Some(&[]),
             agent_runs: Some(&[]),
             sessions: Some(&[]),
+            publish_packets: Some(&[]),
             run_capacity: None,
+            predecessors: &[],
             now: t(NOW),
             window_hours: 24,
         }
@@ -2581,6 +3192,345 @@ mod tests {
         );
     }
 
+    /// A PROBE THAT HAS ANSWERED NOT-YET FOR DAYS IS NOT WAITING ON THE
+    /// WORLD (backlog adef5ddf). The split above read every told-not-yet
+    /// car as the world's move, and two of the six measured at 86+
+    /// consecutive not-yets could never pass: b8c4267f greps a literal a
+    /// later car removed, 52e0287e reads the wrong occurrence of a call.
+    /// Exit 75 cannot tell them apart from a patient probe; the length of
+    /// the streak can, so a streak past [`NOT_YET_STARVED_HOURS`] is
+    /// named as ours to read — and a short one, same car age, is not.
+    #[test]
+    fn a_not_yet_that_has_lasted_days_is_ours_to_read_not_the_worlds() {
+        // NOW is 2026-09-19T12:00:00Z; both cars opened four days ago,
+        // so the car's age cannot be what separates them — only the
+        // streak the attempt carries.
+        let aged = |branch: &str, since: &str, runs: u64| {
+            let md = json!({
+                "branch": branch,
+                "merged": true,
+                "opened_at": "2026-09-15T10:00:00Z",
+                "proof_probe": "true",
+                "proof_attempt": {
+                    "at": "2026-09-19T11:00:00Z",
+                    "not_yet": true,
+                    "exit": 75,
+                    "probe": "true",
+                    (crate::car::NOT_YET_SINCE): since,
+                    (crate::car::NOT_YET_RUNS): runs,
+                },
+            });
+            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-15T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+        let read = |cars: &[(Job, Vec<Step>)]| {
+            let out = regions(&inputs(&status, &[], &[], cars, &[], Some(&[]), Some(&[])));
+            by_name(&out, "shed").clone()
+        };
+
+        // STARVED: 96 runs across 96 hours, all not-yet.
+        let shed = read(&[aged("fix/starved", "2026-09-15T11:00:00Z", 96)]);
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(
+            !shed.why.contains("waiting on the world"),
+            "a streak of days is not the world's move: {}",
+            shed.why
+        );
+        assert!(
+            shed.why.contains("ours to read") && shed.why.contains("fix/starved"),
+            "it names the car, as ours to read: {}",
+            shed.why
+        );
+        assert!(
+            shed.why.contains("96h") && shed.why.contains("96 runs"),
+            "carrying the streak, which is the finding: {}",
+            shed.why
+        );
+
+        // THE CONTROL: same age, a six-hour streak — not starved. It
+        // declared no wait, so it is still not the world's (3881f5c9):
+        // nothing on the car says whose move it is.
+        let shed = read(&[aged("fix/patient", "2026-09-19T05:00:00Z", 7)]);
+        assert!(
+            shed.why.contains("no declared wait") && !shed.why.contains("waiting on the world"),
+            "a short undeclared streak is not starved, and not the world's either: {}",
+            shed.why
+        );
+        assert!(!shed.why.contains("ours to read"), "{}", shed.why);
+
+        // MIXED: both counts survive together.
+        let shed = read(&[
+            aged("fix/starved", "2026-09-15T11:00:00Z", 96),
+            aged("fix/patient", "2026-09-19T05:00:00Z", 7),
+        ]);
+        assert!(
+            shed.why.contains("1 told not yet without a break")
+                && shed.why.contains("1 told not yet with no declared wait"),
+            "names the starved one and the undeclared one apart: {}",
+            shed.why
+        );
+    }
+
+    /// A CAR THAT SAID WHAT IT WAITS ON IS NOT STARVED BY DURATION
+    /// (backlog b461341d). All six cars adef5ddf's streak measured were
+    /// honest waits on the world; with `waits_on` declared, a 96h streak
+    /// is the world's — until the declared event is SEEN in the record
+    /// while the probe still says not-yet, which is ours at once.
+    #[test]
+    fn a_declared_wait_is_the_worlds_until_its_event_is_seen() {
+        let car = |branch: &str, seen_at: Option<&str>| {
+            let mut attempt = json!({
+                "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
+                (crate::car::NOT_YET_RUNS): 96,
+            });
+            if let Some(s) = seen_at {
+                attempt[crate::car::WAITS_ON_SEEN_AT] = json!(s);
+            }
+            let md = json!({
+                "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
+                "proof_probe": "true", "proof_attempt": attempt,
+                (crate::car::WAITS_ON): {
+                    "on": "a real Stripe sponsorship charge", "seen": "true",
+                    (crate::car::WAITS_ON_OWNER): "world",
+                },
+            });
+            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-15T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+        let read = |cars: &[(Job, Vec<Step>)]| {
+            let out = regions(&inputs(&status, &[], &[], cars, &[], Some(&[]), Some(&[])));
+            by_name(&out, "shed").clone()
+        };
+
+        let shed = read(&[car("fix/declared", None)]);
+        assert!(
+            shed.why.contains("waiting on the world") && !shed.why.contains("ours to read"),
+            "a declared wait not yet seen is the world's, at 96h: {}",
+            shed.why
+        );
+        assert_eq!(shed.state, RegionState::Busy, "{}", shed.why);
+
+        let shed = read(&[car("fix/contradicted", Some("2026-09-19T10:00:00Z"))]);
+        assert!(
+            shed.why.contains("ours to read")
+                && shed.why.contains("fix/contradicted")
+                && shed.why.contains("a real Stripe sponsorship charge"),
+            "seen in the record, still not yet — ours, naming what it waited on: {}",
+            shed.why
+        );
+    }
+
+    /// A DECLARED WAIT WITH NO OBSERVER IS COUNTED, NOT SILENT (backlog
+    /// e9b164a1). b461341d exempts a declared wait from the streak bound
+    /// and hands its judgement to the `seen` check — so a declaration
+    /// with `seen` null has handed it to nothing, and without this count
+    /// it read exactly like an observed wait: "waiting on the world",
+    /// forever. All six cars declared on 2026-09-23 were in that shape.
+    #[test]
+    fn a_declared_wait_with_no_seen_check_is_counted_as_ours() {
+        let car = |branch: &str, seen: Option<&str>| {
+            let md = json!({
+                "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
+                "proof_probe": "true",
+                "proof_attempt": {
+                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                    (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
+                    (crate::car::NOT_YET_RUNS): 96,
+                },
+                (crate::car::WAITS_ON): {
+                    "on": "a real Stripe sponsorship charge", "seen": seen,
+                    (crate::car::WAITS_ON_OWNER): "world",
+                },
+            });
+            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-15T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+        let read = |cars: &[(Job, Vec<Step>)]| {
+            let out = regions(&inputs(&status, &[], &[], cars, &[], Some(&[]), Some(&[])));
+            by_name(&out, "shed").clone()
+        };
+
+        let shed = read(&[car("fix/unobserved", None)]);
+        assert!(
+            shed.why.contains("1 declared a wait with no seen check")
+                && shed.why.contains("fix/unobserved")
+                && !shed.why.contains("waiting on the world"),
+            "a declaration nothing observes is ours, and counted: {}",
+            shed.why
+        );
+
+        let shed = read(&[
+            car("fix/unobserved", None),
+            car("fix/observed", Some("true")),
+        ]);
+        assert!(
+            shed.why.contains("1 declared a wait with no seen check")
+                && shed.why.contains("the rest wait on their declared owner")
+                && shed.why.contains("waiting on the world"),
+            "an observed wait stays the world's beside it: {}",
+            shed.why
+        );
+
+        let shed = read(&[car("fix/observed", Some("true"))]);
+        assert!(
+            !shed.why.contains("no seen check"),
+            "an observed wait is not counted: {}",
+            shed.why
+        );
+    }
+
+    /// THE SHED'S COLOUR FOLLOWS WHOSE MOVE THE WAIT IS (backlog
+    /// 3881f5c9). Measured 2026-09-23 ~16:05Z: the shed read troubled
+    /// with the words "every one asked and was told not yet — waiting on
+    /// the world, not on us" — the region said the waits were not ours
+    /// and painted them red anyway, so red stopped meaning ours to fix.
+    /// Troubled is now only ours; a declared, observed, owned wait —
+    /// on the world or on a named actor's act — is busy and says whose,
+    /// until it runs past a max wait the car itself declared.
+    #[test]
+    fn the_shed_is_troubled_only_by_waits_that_are_ours() {
+        let car = |branch: &str, on: &str, owner: Value, max: Value| {
+            let md = json!({
+                "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
+                "proof_probe": "true",
+                "proof_attempt": {
+                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                    (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
+                    (crate::car::NOT_YET_RUNS): 96,
+                },
+                (crate::car::WAITS_ON): {
+                    "on": on, "seen": "true",
+                    (crate::car::WAITS_ON_OWNER): owner,
+                    (crate::car::WAITS_ON_MAX_WAIT_HOURS): max,
+                },
+            });
+            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let s = vec![
+                step(
+                    &j,
+                    "gate",
+                    StepStatus::Completed,
+                    Some("2026-09-15T06:00:00Z"),
+                ),
+                step(&j, "proven", StepStatus::Ready, None),
+            ];
+            (j, s)
+        };
+        let status = empty_status();
+        let read = |cars: &[(Job, Vec<Step>)]| {
+            let out = regions(&inputs(&status, &[], &[], cars, &[], Some(&[]), Some(&[])));
+            by_name(&out, "shed").clone()
+        };
+        let world = || {
+            car(
+                "feat/stripe",
+                "a Stripe charge",
+                json!("world"),
+                Value::Null,
+            )
+        };
+        let david = || {
+            car(
+                "feat/release",
+                "a cut-a-release packet",
+                json!("emp-david"),
+                Value::Null,
+            )
+        };
+
+        // THEIRS: the world's event and a named actor's act, 98h open.
+        let shed = read(&[world(), david()]);
+        assert_eq!(
+            shed.state,
+            RegionState::Busy,
+            "declared, observed, owned waits are not ours: {}",
+            shed.why
+        );
+        assert!(
+            shed.why
+                .contains("waiting on the world: a Stripe charge (feat/stripe)")
+                && shed
+                    .why
+                    .contains("waiting on emp-david: a cut-a-release packet"),
+            "and it says whose move each one is: {}",
+            shed.why
+        );
+
+        // PAST ITS OWN DECLARED PATIENCE: 98h open against a 72h max.
+        let late = car("feat/late", "a Stripe charge", json!("world"), json!(72));
+        let shed = read(&[late, david()]);
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(
+            shed.why.contains("past the max wait they declared")
+                && shed.why.contains("feat/late")
+                && shed.why.contains("the rest wait on their declared owner"),
+            "{}",
+            shed.why
+        );
+
+        // NO OWNER: the prose may name David, the field does not.
+        let unowned = car(
+            "feat/unowned",
+            "a release (David opens it)",
+            Value::Null,
+            Value::Null,
+        );
+        let shed = read(&[unowned]);
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(
+            shed.why.contains("declared no owner") && shed.why.contains("feat/unowned"),
+            "an owner is declared, never read out of prose: {}",
+            shed.why
+        );
+
+        // AN EVENT ONLY PROSE NAMES: no probe runs, so no `seen` check
+        // does either — nothing observes it (the dev-door login car,
+        // 2026-09-23, is this shape).
+        let (mut j, s) = world();
+        j.metadata = json!({
+            "branch": "feat/prose", "merged": true, "opened_at": "2026-09-15T10:00:00Z",
+            "proof_event": "David logs in through the dev door",
+        });
+        let shed = read(&[(j, s), david()]);
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(
+            shed.why.contains("only prose names") && shed.why.contains("feat/prose"),
+            "{}",
+            shed.why
+        );
+    }
+
     /// A car awaiting proof PAST A DAY troubles the shed, even when its
     /// probe is answering `not yet` — early, not wrong, and the
     /// commonest place a car stops (backlog 488d42e6).
@@ -2771,6 +3721,146 @@ mod tests {
         assert_eq!(dock.trend.current, Some(2.0));
         assert_eq!(dock.trend.previous, None);
         assert_eq!(dock.trend.samples, 2);
+    }
+
+    /// A parked car on the dock — open, review ready — with this metadata.
+    fn parked(branch: &str, extra: Value) -> (Job, Vec<Step>) {
+        let mut md = json!({ "branch": branch });
+        if let (Some(dst), Some(src)) = (md.as_object_mut(), extra.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        let j = job("ship-a-change", branch, JobStatus::Open, md);
+        let s = vec![step(&j, crate::car::REVIEW_SLUG, StepStatus::Ready, None)];
+        (j, s)
+    }
+
+    /// A status whose dock holds these cars, at the boarding depth.
+    fn dock_at_depth(cars: &[(Job, Vec<Step>)]) -> YardStatus {
+        let mut status = empty_status();
+        status.dock = cars.iter().map(|(j, _)| crate::yard::dock_car(j)).collect();
+        status.boarding.threshold_met = Some(true);
+        status
+    }
+
+    /// THE INCIDENT'S SURFACE (backlog 4142d821, design cf820810 Q7).
+    /// Three cars sat unable to board for nine and a half hours while
+    /// this region said "the boarding depth is met, a train is due" —
+    /// the sentence it says two minutes after a healthy departure —
+    /// because only the conductor ever asked whether a car could board.
+    /// A car held on its declared ordering edge is counted, named by
+    /// what it waits behind, and the region stays busy WITHOUT promising
+    /// a train.
+    #[test]
+    fn a_car_waiting_behind_its_edge_keeps_the_dock_busy_and_promises_no_train() {
+        let first = parked("fix/first-half", json!({}));
+        let pred_id = first.0.id.to_string();
+        let second = parked("fix/second-half", json!({ "boards_after": pred_id }));
+        let cars = vec![first.clone(), second];
+        let status = dock_at_depth(&cars);
+        let preds = vec![(
+            pred_id.clone(),
+            crate::car::Predecessor::Found(packet_value(&first.0, &first.1)),
+        )];
+        let mut i = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+        i.predecessors = &preds;
+        let out = regions(&i);
+        let dock = by_name(&out, "dock");
+        assert_eq!(dock.state, RegionState::Busy, "{}", dock.why);
+        assert_eq!(dock.count, Some(2), "parked is still parked");
+        let behind = format!("fix/first-half (car {})", &pred_id[..8]);
+        assert_eq!(
+            dock.why,
+            format!("2 cars parked, 1 cannot board (waiting behind {behind})")
+        );
+        assert!(
+            !dock.why.contains("a train is due"),
+            "a dock with a car the conductor will refuse must not promise a train: {}",
+            dock.why
+        );
+        assert_eq!(
+            declared_edges(&status, &cars),
+            vec![pred_id],
+            "the handler reads exactly the predecessors this region judges"
+        );
+    }
+
+    /// An edge that can NEVER clear is not a wait: the conductor refuses
+    /// the car identically every window until a person acts, so the
+    /// region says so and looks troubled (CLAUDE.md §Diagnosis: a
+    /// troubled packet must look troubled).
+    #[test]
+    fn a_car_behind_an_edge_that_can_never_clear_troubles_the_dock() {
+        let gone = "cccccccc-1111-2222-3333-444444444444".to_string();
+        let held = parked("fix/orphan", json!({ "boards_after": gone }));
+        let cars = vec![held];
+        let status = dock_at_depth(&cars);
+        let preds = vec![(gone, crate::car::Predecessor::Absent)];
+        let mut i = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+        i.predecessors = &preds;
+        let out = regions(&i);
+        let dock = by_name(&out, "dock");
+        assert_eq!(dock.state, RegionState::Troubled, "{}", dock.why);
+        assert!(
+            dock.why.starts_with("1 car parked, 1 cannot board"),
+            "{}",
+            dock.why
+        );
+        assert!(
+            dock.why.contains("car cccccccc") && dock.why.contains("a human must clear"),
+            "name what it is stuck behind, and whose move it is: {}",
+            dock.why
+        );
+    }
+
+    /// FAIL-OPEN, AS THE CONDUCTOR IS. An edge whose predecessor could
+    /// not be read boards the car, so it is not counted as held — but
+    /// the region says it could not judge it rather than staying silent.
+    /// And a dock with no edges at all reads exactly as it did.
+    #[test]
+    fn an_unread_edge_boards_as_the_conductor_boards_it_and_says_so() {
+        let pred_id = "dddddddd-1111-2222-3333-444444444444".to_string();
+        let car = parked("fix/after-a-blip", json!({ "boards_after": pred_id }));
+        let cars = vec![car];
+        let status = dock_at_depth(&cars);
+        let preds = vec![(
+            pred_id,
+            crate::car::Predecessor::Unreadable("HTTP 503".into()),
+        )];
+        let mut i = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+        i.predecessors = &preds;
+        let out = regions(&i);
+        let dock = by_name(&out, "dock");
+        assert_eq!(dock.state, RegionState::Busy, "{}", dock.why);
+        assert!(
+            dock.why
+                .starts_with("1 car parked — the boarding depth is met, a train is due"),
+            "{}",
+            dock.why
+        );
+        assert!(
+            dock.why.contains("1 ordering edge could not be read"),
+            "{}",
+            dock.why
+        );
+
+        let plain = vec![parked("fix/no-edge", json!({}))];
+        let status = dock_at_depth(&plain);
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &plain,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        assert_eq!(
+            by_name(&out, "dock").why,
+            "1 car parked — the boarding depth is met, a train is due",
+            "a car with no edge — every car but one today — reads as it always did"
+        );
     }
 
     /// The gates: a stale bay is trouble; a queue is busy; the trend is
@@ -3844,6 +4934,405 @@ mod tests {
             MachineState::Unknown,
             "a session that never prompted is not idle — nothing measured it"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The publish region (design cb38d806, backlog eee42416).
+    // -----------------------------------------------------------------
+
+    /// One publish packet as the live ones are shaped (measured against
+    /// b423d16b, 7d5c9051 and 254177e2 on 2026-09-22): the `open-pr`
+    /// step carries the PR, its snapshot and the mirror head it was
+    /// built on; `read-checks` carries the reading; `judge-checks` is
+    /// skipped when the scan concluded `success`.
+    fn publish_packet(
+        pr: &str,
+        snapshot: &str,
+        mirror_head: &str,
+        opened_at: &str,
+        reading: Option<(&str, &str, &str)>,
+        judged: bool,
+    ) -> (Job, Vec<Step>) {
+        let j = job(
+            PUBLISH_KIND,
+            "Publish to the public mirror",
+            JobStatus::Closed,
+            json!({}),
+        );
+        let mut open_pr = step(&j, "open-pr", StepStatus::Completed, Some(opened_at));
+        open_pr.metadata = json!({
+            "pr_url": pr,
+            "snapshot_commit": snapshot,
+            "mirror_head": mirror_head,
+        });
+        let mut steps = vec![open_pr];
+        if let Some((conclusion, alerts, rules)) = reading {
+            let mut checks = step(&j, "read-checks", StepStatus::Completed, Some(opened_at));
+            checks.metadata = json!({ "conclusion": conclusion, "alerts": alerts, "rules": rules });
+            steps.push(checks);
+            steps.push(step(
+                &j,
+                "judge-checks",
+                if judged {
+                    StepStatus::Completed
+                } else if conclusion == "success" {
+                    StepStatus::Skipped
+                } else {
+                    StepStatus::Ready
+                },
+                judged.then_some(opened_at),
+            ));
+        }
+        (j, steps)
+    }
+
+    fn with_publish<'a>(
+        base: RegionInputs<'a>,
+        packets: Option<&'a [(Job, Vec<Step>)]>,
+    ) -> RegionInputs<'a> {
+        RegionInputs {
+            publish_packets: packets,
+            ..base
+        }
+    }
+
+    /// §4's first troubled condition: a pull request standing past a
+    /// day. The record has the instant (`open-pr` completed) and what
+    /// GitHub answered when `--measure` asked (`pr_state`), so the
+    /// region can say STALLED from the record alone.
+    #[test]
+    fn a_mirror_pull_request_open_past_a_day_troubles_the_publish_region() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        // Opened 30 hours before NOW, and GitHub, asked, said open.
+        let packets = vec![observed(
+            publish_packet(
+                "https://mirror/pull/240",
+                "snap-240",
+                "mirror-a",
+                "2026-09-18T06:00:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+            "https://mirror/pull/240",
+            "open",
+            false,
+            "2026-09-19T00:01:08Z",
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.count, Some(1));
+        assert!(
+            p.why
+                .contains("GitHub read it open at 2026-09-19T00:01:08Z"),
+            "the why says when openness was observed: {}",
+            p.why
+        );
+        assert_eq!(p.state, RegionState::Troubled, "{}", p.why);
+        assert!(
+            p.why.contains("pull/240"),
+            "the why names the PR: {}",
+            p.why
+        );
+        assert!(
+            p.why.contains("30 hours"),
+            "the why says how long it has stood: {}",
+            p.why
+        );
+    }
+
+    /// §4's second: a red reading with no disposition. The sentence
+    /// carries THE READING — the conclusion and both counts the step
+    /// recorded — not "something is wrong with the publish" (a verdict
+    /// must name what failed).
+    #[test]
+    fn a_red_reading_nobody_judged_troubles_the_region_and_carries_the_reading() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        // Opened an hour ago: not stalled, so the trouble can only be
+        // the unjudged reading.
+        let packets = vec![publish_packet(
+            "https://mirror/pull/239",
+            "snap-239",
+            "mirror-a",
+            "2026-09-19T11:00:00Z",
+            Some(("failure", "109", "14")),
+            false,
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.state, RegionState::Troubled, "{}", p.why);
+        assert!(p.why.contains("pull/239"), "{}", p.why);
+        assert!(
+            p.why.contains("failure") && p.why.contains("109") && p.why.contains("14"),
+            "the why is the reading, not a symptom: {}",
+            p.why
+        );
+
+        // Judged, the same reading is no longer trouble: the merge now
+        // follows a disposition per rule, which is all §2 asks.
+        let judged = vec![publish_packet(
+            "https://mirror/pull/239",
+            "snap-239",
+            "mirror-a",
+            "2026-09-19T11:00:00Z",
+            Some(("failure", "109", "14")),
+            true,
+        )];
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let out = regions(&with_publish(base, Some(&judged)));
+        assert_eq!(by_name(&out, "publish").state, RegionState::Busy);
+    }
+
+    /// What `publish-github-pr.sh --measure` writes onto a publish
+    /// packet when it asks GitHub about the pull request the packet
+    /// opened (backlog a5d4322c): the PR it asked about, the state and
+    /// merge GitHub answered, and when it asked.
+    fn observed(
+        (mut j, steps): (Job, Vec<Step>),
+        pr: &str,
+        state: &str,
+        merged: bool,
+        read_at: &str,
+    ) -> (Job, Vec<Step>) {
+        j.metadata = json!({ "pr_state": {
+            "pr_url": pr, "state": state, "merged": merged, "read_at": read_at,
+        }});
+        (j, steps)
+    }
+
+    /// The merge is READ, never assumed. Measured 2026-09-22 (backlog
+    /// a5d4322c): the region called #239 open for 86 hours and itself
+    /// TROUBLED over it, while GitHub said #239 had merged three days
+    /// earlier. It had inferred the merge from a later mirror head
+    /// equalling the PR's snapshot, which a GitHub merge never makes
+    /// true — #239 merged as merge commit b27382e5 and #241 was
+    /// squashed to a7061022, neither of them the snapshot. So a later
+    /// packet built on an old one's snapshot proves nothing; what
+    /// GitHub answered does.
+    #[test]
+    fn a_pull_request_github_read_as_merged_leaves_the_count_and_clears_the_region() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![observed(
+            publish_packet(
+                "https://mirror/pull/239",
+                "snap-239",
+                "mirror-a",
+                "2026-09-15T08:00:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+            "https://mirror/pull/239",
+            "closed",
+            true,
+            "2026-09-19T00:01:08Z",
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.count, Some(0), "{}", p.why);
+        assert_eq!(p.state, RegionState::Clear, "{}", p.why);
+
+        // A PR closed WITHOUT a merge awaits nothing either.
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![observed(
+            publish_packet(
+                "https://mirror/pull/238",
+                "snap-238",
+                "mirror-a",
+                "2026-09-15T08:00:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+            "https://mirror/pull/238",
+            "closed",
+            false,
+            "2026-09-19T00:01:08Z",
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        assert_eq!(by_name(&out, "publish").count, Some(0));
+
+        // The retired inference: a later snapshot built on this one's is
+        // NOT a merge the region may claim.
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![
+            publish_packet(
+                "https://mirror/pull/240",
+                "snap-240",
+                "mirror-a",
+                "2026-09-19T11:00:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+            publish_packet(
+                "https://mirror/pull/241",
+                "snap-241",
+                "snap-240",
+                "2026-09-19T11:30:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+        ];
+        let out = regions(&with_publish(base, Some(&packets)));
+        assert_eq!(
+            by_name(&out, "publish").count,
+            Some(2),
+            "a mirror head is not GitHub's answer"
+        );
+    }
+
+    /// The sentence says only what was observed. A PR whose state was
+    /// never read from GitHub is NOT "open for N hours" — that is the
+    /// claim the region could not earn (backlog a5d4322c) — it is a PR
+    /// nobody asked about, and it still troubles the region past a day,
+    /// because an unasked question is not a pass.
+    #[test]
+    fn a_pull_request_never_read_from_github_is_not_called_open() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![publish_packet(
+            "https://mirror/pull/239",
+            "snap-239",
+            "mirror-a",
+            "2026-09-18T06:00:00Z",
+            Some(("success", "0", "0")),
+            false,
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.state, RegionState::Troubled, "{}", p.why);
+        assert!(!p.why.contains("has been open"), "{}", p.why);
+        assert!(p.why.contains("never read from GitHub"), "{}", p.why);
+
+        // A reading of ANOTHER pull request is no reading of this one.
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![observed(
+            publish_packet(
+                "https://mirror/pull/239",
+                "snap-239",
+                "mirror-a",
+                "2026-09-18T06:00:00Z",
+                Some(("success", "0", "0")),
+                false,
+            ),
+            "https://mirror/pull/238",
+            "closed",
+            true,
+            "2026-09-19T00:01:08Z",
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.count, Some(1), "{}", p.why);
+        assert!(p.why.contains("never read from GitHub"), "{}", p.why);
+    }
+
+    /// A publish packet HELD before its pull request, as the live one
+    /// was shaped on 2026-09-23 (d2967a9c): open, `open-pr` not reached,
+    /// the step it waits at `ready`, and the daily `--measure` reading
+    /// on its metadata as `drift_refresh`.
+    fn held_packet(opened_at: &str, waiting_at: &str, drift: Option<Value>) -> (Job, Vec<Step>) {
+        let mut j = job(
+            PUBLISH_KIND,
+            "Publish to the public mirror",
+            JobStatus::Open,
+            drift
+                .map(
+                    |d| json!({ "drift_refresh": d, "drift_refreshed_at": "2026-09-19T00:01:08Z" }),
+                )
+                .unwrap_or_else(|| json!({})),
+        );
+        j.opened_at = Some(t(opened_at));
+        let steps = vec![
+            step(&j, "opened", StepStatus::Completed, Some(opened_at)),
+            step(&j, waiting_at, StepStatus::Ready, None),
+            step(&j, "open-pr", StepStatus::Pending, None),
+        ];
+        (j, steps)
+    }
+
+    /// THE HELD PACKET (backlog f49ae66d, the surface half of e1b6ddf7;
+    /// design cb38d806). A packet left open before its sign-off opens no
+    /// pull request, so the two PR conditions cannot see it — and it is
+    /// the hold that cost the week of 2026-09-17 -> 09-18, because the
+    /// daily cadence spawns nothing while a packet is open. Held past a
+    /// day it is troubled, and the sentence carries the step it waits
+    /// at and the drift `--measure` wrote onto it, not a symptom.
+    #[test]
+    fn a_publish_packet_held_past_a_day_without_a_pull_request_troubles_the_region() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let packets = vec![held_packet(
+            "2026-09-17T12:00:00Z",
+            "approve",
+            Some(json!({
+                "commits_ahead": "495",
+                "files_changed": "114",
+                "has_drift": "true",
+                "measured_at": "2026-09-19T00:01:08Z",
+            })),
+        )];
+        let out = regions(&with_publish(base, Some(&packets)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.state, RegionState::Troubled, "{}", p.why);
+        assert_eq!(
+            p.count,
+            Some(0),
+            "the count is still pull requests: {}",
+            p.why
+        );
+        assert!(
+            p.why.contains("48 hours"),
+            "how long it has been held: {}",
+            p.why
+        );
+        assert!(p.why.contains("approve"), "the step it waits at: {}", p.why);
+        assert!(
+            p.why.contains("495")
+                && p.why.contains("114")
+                && p.why.contains("2026-09-19T00:01:08Z"),
+            "the dated drift reading: {}",
+            p.why
+        );
+
+        // No reading on it yet is said, never drawn as a current mirror.
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let bare = vec![held_packet("2026-09-17T12:00:00Z", "measure", None)];
+        let out = regions(&with_publish(base, Some(&bare)));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.state, RegionState::Troubled, "{}", p.why);
+        assert!(p.why.contains("no drift measurement"), "{}", p.why);
+    }
+
+    /// Today's packet, a few hours into its own measure step, is the
+    /// cadence working — not a hold. And a packet that CLOSED without a
+    /// pull request (`nothing-to-publish`, `declined`) holds nothing.
+    #[test]
+    fn a_publish_packet_inside_its_day_or_closed_does_not_trouble_the_region() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let fresh = vec![held_packet("2026-09-19T08:00:00Z", "measure", None)];
+        let out = regions(&with_publish(base, Some(&fresh)));
+        assert_eq!(by_name(&out, "publish").state, RegionState::Clear);
+
+        let (mut closed, steps) = held_packet("2026-09-15T00:00:00Z", "declined", None);
+        closed.status = JobStatus::Closed;
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let done = vec![(closed, steps)];
+        let out = regions(&with_publish(base, Some(&done)));
+        assert_eq!(by_name(&out, "publish").state, RegionState::Clear);
+    }
+
+    /// An unread publish list is troubled, never a mirror that reads as
+    /// current — the rule every region here keeps.
+    #[test]
+    fn an_unread_publish_list_is_troubled_and_never_a_current_mirror() {
+        let status = empty_status();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let out = regions(&with_publish(base, None));
+        let p = by_name(&out, "publish");
+        assert_eq!(p.count, None);
+        assert_eq!(p.state, RegionState::Troubled);
+        assert!(p.why.contains("could not be read"), "{}", p.why);
     }
 
     /// The bound is the registry's, and an agent with no declared cap is

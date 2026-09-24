@@ -19,7 +19,10 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::gate::{AbandonedPlace, abandoned_places, api, queue_order, rows};
+use crate::gate::{AbandonedPlace, abandoned_places, api, queue_order};
+// The one rows helper: a read that is not a list refuses rather than
+// printing an empty yard (backlog 7b7e0529).
+use crate::train::rows;
 
 fn md_str<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get("metadata")
@@ -43,6 +46,30 @@ fn at_step(v: &Value) -> String {
         .and_then(|s| s.get("title").and_then(Value::as_str))
         .unwrap_or("—")
         .to_string()
+}
+
+/// One IN TRANSIT line: the train, and the step it stands at with that
+/// step's status beside the title. `at_step` alone printed
+/// `at: In transit — cluster converged` for a READY step and was read as
+/// done (648a68a9); the phrase is the server's (`yard::standing_at`),
+/// so this line and the yard cannot disagree. `at_step` itself stays the
+/// bare title — the shed and the residue sweep compare it to one.
+fn in_transit_line(t: &Value) -> String {
+    let title = t.get("title").and_then(Value::as_str).unwrap_or("?");
+    let at = t
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|s| {
+            let status = s.get("status").and_then(Value::as_str)?;
+            matches!(status, "ready" | "active").then(|| {
+                let step = s.get("title").and_then(Value::as_str).unwrap_or("?");
+                boss_jobs::yard::standing_at(step, status)
+            })
+        })
+        .unwrap_or_else(|| "—".to_string());
+    format!("    {title}  at: {at}")
 }
 
 /// One GATING line for a running gate-run. A car's run is its branch. A
@@ -203,6 +230,139 @@ fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
         })
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Pairs of dock cars that cannot BOTH board — `(branch, branch, files)`,
+/// each pair once, branch-sorted.
+///
+/// THE CHECK EXISTED; THE READER DID NOT (backlog 5c567c27). On
+/// 2026-09-20 three cars, each told to stay additive and each green
+/// alone, could not board together — two touched WorldMap.svelte — and
+/// the pipeline stopped for nine and a half hours with a full dock. The
+/// packet asked for a dock-time check naming the pair when the second car
+/// parks. The conductor has computed exactly that on every reconcile tick
+/// since 12a25f3e (`preview_dock`: pairwise `git merge-tree` across the
+/// parked set, onto each car's `metadata.merge_preview.conflicts_with`)
+/// and nothing read it. A check nobody reads is a check that is not
+/// running, so this is the read — of the packets orient has already
+/// fetched, no second call and no copy of the conductor's judgement.
+///
+/// ONE TICK, BOTH AT THE DOCK. The preview is rewritten only for cars
+/// still parked-ready, so a car that boarded or is held keeps the
+/// preview of the dock it last saw (measured 2026-09-23: five cars
+/// stamped 09:50 still named a branch whose 10:10 preview no longer named
+/// them). Two previews pair only when both cars are open and parked
+/// (`boss_jobs::car::is_parked`, the dock's shared predicate) and both
+/// were measured over the SAME `anchored.parked_set` — one measurement,
+/// stale-not-wrong the moment either input moves.
+fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
+    let set_of = |c: &Value| {
+        c.pointer("/metadata/merge_preview/anchored/parked_set")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let dock: std::collections::BTreeMap<String, (String, &Value)> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .filter_map(|c| Some((md_str(c, "branch").to_string(), (set_of(c)?, c))))
+        .collect();
+    let mut out: Vec<(String, String, Vec<String>)> = dock
+        .iter()
+        .flat_map(|(branch, (set, c))| {
+            c.pointer("/metadata/merge_preview/conflicts_with")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |e| {
+                    let other = e.get("branch").and_then(Value::as_str)?;
+                    let files: Vec<String> = e
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    (branch.as_str() < other).then(|| (branch.clone(), other.to_string(), files))
+                })
+                .filter(|(_, other, _)| dock.get(other).is_some_and(|(s, _)| s == set))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Dock cars that no longer merge onto main — `(branch, files, main)`,
+/// branch-sorted, `main` the short sha the verdict was measured against.
+///
+/// THE OTHER HALF OF THE SAME PREVIEW (backlog 20d0d717). `preview_dock`
+/// writes `merge_preview.vs_main` beside `conflicts_with` on every tick,
+/// and after 5c567c27 gave the pairs a reader this half still had none:
+/// on 2026-09-23 car 5fba0bda carried `vs_main.clean=false` while this
+/// verb called it only FRESHNESS-stale — behind main, which a re-gate
+/// answers, rather than conflicting with it, which only a rerail does.
+///
+/// THE PAIRS' DISCIPLINE, FOR ONE CAR. A verdict is read only off an
+/// open, parked car whose preview was measured over the dock's CURRENT
+/// parked set — the set of the newest preview on the dock, because a
+/// change of set rewrites every parked-ready car's preview in one tick.
+/// A car carrying an older set was not in the last measurement (held,
+/// or left and back), so its verdict is stale, not wrong, and unread.
+fn conflicts_with_main(cars: &[Value]) -> Vec<(String, Vec<String>, String)> {
+    let preview = |c: &Value, key: &str| {
+        c.pointer(&format!("/metadata/merge_preview/{key}"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let dock: Vec<&Value> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .collect();
+    let Some(current) = dock
+        .iter()
+        .filter_map(|c| {
+            Some((
+                preview(c, "checked_at")?,
+                preview(c, "anchored/parked_set")?,
+            ))
+        })
+        .max()
+        .map(|(_, set)| set)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Vec<String>, String)> = dock
+        .iter()
+        .filter(|c| preview(c, "anchored/parked_set").as_ref() == Some(&current))
+        .filter(|c| {
+            c.pointer("/metadata/merge_preview/vs_main/clean")
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+        .map(|c| {
+            let files = c
+                .pointer("/metadata/merge_preview/vs_main/files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            let main: String = preview(c, "anchored/main")
+                .unwrap_or_else(|| "?".to_string())
+                .chars()
+                .take(8)
+                .collect();
+            (md_str(c, "branch").to_string(), files, main)
+        })
+        .collect();
+    out.sort();
     out
 }
 
@@ -401,24 +561,109 @@ pub(crate) fn shed_lines(cars: &[Value]) -> Vec<String> {
                 Some(i) => format!("{branch} (holds {})", &i[..i.len().min(8)]),
                 None => branch.to_string(),
             };
-            let branch = holds.as_str();
-            match shed_place(c) {
-                Shed::ProbePending { last: None } => {
-                    format!("    {branch}: probe pending (the forge runs it on arrival)")
-                }
-                Shed::ProbePending { last: Some(why) } => {
-                    format!("    {branch}: probe FAILING — {}", clipped(&why))
-                }
-                Shed::ProbeNotYet { said } => {
-                    format!("    {branch}: probe says NOT YET — {}", clipped(&said))
-                }
-                Shed::WaitingOn(ev) => format!("    {branch}: waiting on: {}", clipped(&ev)),
-                Shed::Unproven => format!(
-                    "    {branch}: UNPROVEN — no probe, no event; nothing mechanical can settle it (boss prove --probe)"
-                ),
-            }
+            format!("    {holds}: {}", shed_text(c))
         })
         .collect()
+}
+
+/// What a landed car's proof is waiting on, in one clause — the shed's
+/// line and MY WORK's carried row say it in the same words, because
+/// they are one fact read twice (bc416f60).
+fn shed_text(car: &Value) -> String {
+    match shed_place(car) {
+        Shed::ProbePending { last: None } => {
+            "probe pending (the forge runs it on arrival)".to_string()
+        }
+        Shed::ProbePending { last: Some(why) } => format!("probe FAILING — {}", clipped(&why)),
+        // A streak past the bound is named, not folded into the
+        // plain line: a probe that can never pass answers exit 75
+        // exactly like a patient one (adef5ddf). A car that
+        // DECLARED what it waits on is exempt from the bound, and
+        // named instead once its own event is seen (b461341d) —
+        // one predicate, the shed's.
+        Shed::ProbeNotYet { said } => {
+            let md = car.get("metadata").unwrap_or(&Value::Null);
+            match boss_jobs::car::starved(md) {
+                Some(boss_jobs::car::Starved::Undeclared(s)) => format!(
+                    "probe NOT YET for {}h straight ({} runs) — past {}h, \
+                     read the probe against the tree: it may never pass — {}",
+                    s.hours,
+                    s.runs,
+                    boss_jobs::regions::NOT_YET_STARVED_HOURS,
+                    clipped(&said)
+                ),
+                Some(boss_jobs::car::Starved::SeenWhileNotYet { on, seen_at }) => format!(
+                    "probe NOT YET though what it waits on ({}) was seen \
+                     in the record at {seen_at} — read the probe against the tree — {}",
+                    clipped(&on),
+                    clipped(&said)
+                ),
+                None => match boss_jobs::car::waits_on(md) {
+                    // A declaration nothing observes (e9b164a1):
+                    // exempt from the bound AND never contradicted,
+                    // so the line names the missing check.
+                    Some(w) if w.seen.is_none() => format!(
+                        "probe says NOT YET, waiting on {} — no seen check, \
+                         so nothing can say it arrived (boss car waits-on --seen) — {}",
+                        clipped(&w.on),
+                        clipped(&said)
+                    ),
+                    Some(w) => format!(
+                        "probe says NOT YET, waiting on {} — {}",
+                        clipped(&w.on),
+                        clipped(&said)
+                    ),
+                    None => format!("probe says NOT YET — {}", clipped(&said)),
+                },
+            }
+        }
+        Shed::WaitingOn(ev) => format!("waiting on: {}", clipped(&ev)),
+        Shed::Unproven => "UNPROVEN — no probe, no event; nothing mechanical can settle it \
+             (boss prove --probe)"
+            .to_string(),
+    }
+}
+
+/// The backlog-items an OPEN car already carries, keyed by item id, each
+/// with the clause MY WORK prints in place of the item's age: LANDED
+/// (at `Proven in prod` — merged, and what its proof waits on) or IN
+/// FLIGHT (the step the car stands at). A landed car wins over an
+/// in-flight one for the same item. Closed cars carry nothing: a merged
+/// car's close is what completes the item's step (the chain
+/// complete-feedback-branch-on-car-merged), so its row is gone anyway.
+///
+/// WHY (bc416f60). Measured 2026-09-22, working the queue oldest-first:
+/// six of the twelve oldest steps on the agent were build steps whose
+/// cars had merged three to five days earlier and stood in the shed,
+/// their probes honestly answering not-yet on a real-world event. The
+/// chain was correct — an item closes when its car proves — but MY
+/// WORK drew each one as an unstarted build of its filing age, first in
+/// line, and telling them apart cost a git-log grep per packet (nine
+/// of them from train #567, 2026-09-23). The car already holds the
+/// answer; this is that answer read at the queue, with no new write.
+pub(crate) fn carried_items(cars: &[Value]) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for c in cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+    {
+        let item = md_str(c, "backlog_item");
+        if item.is_empty() {
+            continue;
+        }
+        let branch = md_str(c, "branch");
+        let step = at_step(c);
+        if step == "Proven in prod" {
+            out.insert(
+                item.to_string(),
+                format!("LANDED (car {branch}), awaiting proof: {}", shed_text(c)),
+            );
+        } else {
+            out.entry(item.to_string())
+                .or_insert_with(|| format!("IN FLIGHT (car {branch} at {step})"));
+        }
+    }
+    out
 }
 
 /// The ORPHANS listing lines for a set of forge heads, bounded to
@@ -590,7 +835,21 @@ fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
 /// by workflow, groups and rows both oldest first, each group headed
 /// by its count and closed by one hint line. Pure so the shape is
 /// testable; the caller prints the section heading from the count.
-pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+///
+/// A row whose packet a car already carries (`carried`, from
+/// `carried_items`) prints what the car says in place of its age, and
+/// sorts after its group's unstarted rows: oldest-first is a rule for
+/// choosing work to START, and a carried item is not that (bc416f60).
+pub(crate) fn my_work_lines(
+    rows: &[Value],
+    carried: &std::collections::BTreeMap<String, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let carried_by = |r: &Value| {
+        r.get("job_id")
+            .and_then(Value::as_str)
+            .and_then(|j| carried.get(j))
+    };
     let mut seen = BTreeSet::new();
     let mut keyed: Vec<(Option<chrono::NaiveDate>, &Value)> = rows
         .iter()
@@ -614,6 +873,7 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
     // never mistaken for today's.
     keyed.sort_by_key(|(opened, r)| {
         (
+            carried_by(r).is_some(),
             opened.is_none(),
             *opened,
             r.get("job_id")
@@ -633,7 +893,11 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
     }
     let mut out = Vec::new();
     for (kind, rows) in groups {
-        out.push(format!("    {kind} — {}", rows.len()));
+        let held = rows.iter().filter(|(_, r)| carried_by(r).is_some()).count();
+        out.push(match held {
+            0 => format!("    {kind} — {}", rows.len()),
+            n => format!("    {kind} — {} ({n} already carried by a car)", rows.len()),
+        });
         let mut slugs: Vec<&str> = Vec::new();
         for (opened, r) in rows {
             let job = r.get("job_id").and_then(Value::as_str).unwrap_or("");
@@ -642,9 +906,6 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 .pointer("/step/spec_slug")
                 .and_then(Value::as_str)
                 .unwrap_or("?");
-            if !slugs.contains(&slug) {
-                slugs.push(slug);
-            }
             let title: String = r
                 .get("job_title")
                 .and_then(Value::as_str)
@@ -652,6 +913,18 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 .chars()
                 .take(MY_WORK_TITLE_CHARS)
                 .collect();
+            // A carried row's hint is the carried one: "build = a change
+            // to build" is exactly the misreading this line exists to stop.
+            if let Some(state) = carried_by(r) {
+                out.push(format!(
+                    "      {id8} {kind} {slug} {} — {state}",
+                    title.trim_end()
+                ));
+                continue;
+            }
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
             let age = match opened {
                 Some(d) => format!("{}d", crate::census::age_days(d, now)),
                 None => "age ?".to_string(),
@@ -661,7 +934,14 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 title.trim_end()
             ));
         }
-        let hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
+        let mut hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
+        if held > 0 {
+            hints.push(
+                "carried = its car holds the work; the item closes itself when that car \
+                 proves — do not build it again"
+                    .to_string(),
+            );
+        }
         if !hints.is_empty() {
             out.push(format!("      → {}", hints.join("; ")));
         }
@@ -677,6 +957,7 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
 pub(crate) fn my_work_section(
     identities: Option<&[String]>,
     rows: &[Value],
+    cars: &[Value],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
     let Some(ids) = identities else {
@@ -693,7 +974,8 @@ pub(crate) fn my_work_section(
         [one] => one.clone(),
         [first, rest @ ..] => format!("{first} (+ {})", rest.join(", ")),
     };
-    let lines = my_work_lines(rows, now);
+    let carried = carried_items(cars);
+    let lines = my_work_lines(rows, &carried, now);
     if lines.is_empty() {
         return vec![format!(
             "  MY WORK — nothing: no ready/active step is assigned to {who}"
@@ -703,8 +985,24 @@ pub(crate) fn my_work_section(
         .iter()
         .filter(|l| l.starts_with("      ") && !l.starts_with("      →"))
         .count();
+    // Counted by step id, as the lines are: one step read under two
+    // identities is one step.
+    let held = rows
+        .iter()
+        .filter(|r| {
+            r.get("job_id")
+                .and_then(Value::as_str)
+                .is_some_and(|j| carried.contains_key(j))
+        })
+        .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let tail = match held {
+        0 => String::new(),
+        n => format!("; {n} already carried by a car, listed last"),
+    };
     let mut out = vec![format!(
-        "  MY WORK — {count} ready/active step(s) assigned to {who} — yours to move, oldest first"
+        "  MY WORK — {count} ready/active step(s) assigned to {who} — yours to move, oldest first{tail}"
     )];
     out.extend(lines);
     out
@@ -890,6 +1188,17 @@ pub async fn run(all: bool) -> Result<()> {
         crate::built_from::freshness_line(built, main.as_deref(), ancestry)
     );
 
+    // THE MEMORY INDEX — the session's other instrument, measured
+    // against a declared budget (4ea1b28c). It sits here, beside the
+    // binary's own freshness and above every lane, because it is a
+    // statement about what this session was HANDED rather than about the
+    // yard: an agent reading a truncated index does not know it is
+    // reading one, and the harness that cut it says nothing. Loud when
+    // over, quiet-but-numbered when under, and never fatal.
+    for line in crate::memory_index::report() {
+        println!("{line}");
+    }
+
     // THE REGIONS — the map's numbers, from the server's one definition
     // (design 0524fc95). A server without the read (older than this
     // verb) says so and the approach still prints; the lanes below are
@@ -929,14 +1238,10 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    );
+    )?;
     println!("\n  IN TRANSIT — {} train(s)", trains.len());
     for t in &trains {
-        println!(
-            "    {}  at: {}",
-            t.get("title").and_then(Value::as_str).unwrap_or("?"),
-            at_step(t)
-        );
+        println!("{}", in_transit_line(t));
     }
 
     // Gates running now.
@@ -948,7 +1253,7 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    );
+    )?;
     // A QUEUED run is not gating: it is waiting for a slot and has no
     // Job at all (boss_jobs::yard::QUEUED_AT). Reporting it as GATING
     // would overstate what the node is doing by exactly the number of
@@ -1003,7 +1308,7 @@ pub async fn run(all: bool) -> Result<()> {
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_i64);
-    let gate_runs = rows(stranded_body);
+    let gate_runs = rows(stranded_body)?;
     let stranded_cut = cut_note(stranded_total, gate_runs.len());
     // Held greens: read BY THE HOLD, so a hold is seen for as long as it
     // stands, whatever gated after it.
@@ -1012,17 +1317,14 @@ pub async fn run(all: bool) -> Result<()> {
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_i64);
-    let held_runs = rows(held_body);
+    let held_runs = rows(held_body)?;
     let held_cut = cut_note(held_total, held_runs.len());
-    let cars = rows(
-        api(
-            &http,
-            reqwest::Method::GET,
-            "/api/jobs?kind=ship-a-change&limit=800",
-            None,
-        )
-        .await?,
-    );
+    // Every car, paged on `total` (backlog 10776b6c): the shed, the
+    // dock's held and troubled lanes and the stranded cross-ref all read
+    // this list, and one bare `limit=800` page would have dropped the
+    // oldest landed cars out of all four silently once the yard passed
+    // 800.
+    let cars = crate::gate::all_cars(&http).await?;
     let car_branches: BTreeSet<String> = cars
         .iter()
         .map(|c| md_str(c, "branch").to_string())
@@ -1110,7 +1412,7 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    ));
+    )?);
     match crate::git_auth::command()
         .args(["ls-remote", "--heads", "origin"])
         .output()
@@ -1204,12 +1506,11 @@ pub async fn run(all: bool) -> Result<()> {
         .and_then(|d| d.get("total"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Read once, and refused if it is not a list: "0 car(s) parked"
+    // from a dark door is the empty-yard answer (7b7e0529).
+    let dock = rows(dock)?;
     println!("\n  DOCK — {dock_total} car(s) parked");
-    for c in dock
-        .as_ref()
-        .map(|d| rows(Some(d.clone())))
-        .unwrap_or_default()
-    {
+    for c in &dock {
         println!(
             "    {}",
             c.get("title").and_then(Value::as_str).unwrap_or("?")
@@ -1254,13 +1555,45 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // CANNOT BOTH BOARD — the conductor's merge preview, read (5c567c27).
+    // Each car of a pair merges clean onto main alone; together one is
+    // left at assembly. Named at the first tick after the second parks,
+    // not nine hours later at the boarding that discovers it.
+    let pairs = unboardable_pairs(&cars);
+    if !pairs.is_empty() {
+        println!(
+            "  CANNOT BOTH BOARD — {} pair(s) of dock cars that conflict with each other \
+             (land one, then boss rerail the other onto the main it landed on; rerailing \
+             both at once recreates the conflict):",
+            pairs.len()
+        );
+        for (a, b, files) in &pairs {
+            println!("    {a}  x  {b}  —  {}", files.join(", "));
+        }
+    }
+
+    // CONFLICTS WITH MAIN — the preview's other half, read (20d0d717).
+    // Not FRESHNESS: a car behind main is repaired by a re-gate, a car
+    // that conflicts with it only by a rerail.
+    let off_main = conflicts_with_main(&cars);
+    if !off_main.is_empty() {
+        println!(
+            "  CONFLICTS WITH MAIN — {} dock car(s) that no longer merge onto main \
+             (repair: boss rerail <car>, which stops for you on a real conflict):",
+            off_main.len()
+        );
+        for (branch, files, main) in &off_main {
+            println!("    {branch}  —  {}  (as of main@{main})", files.join(", "));
+        }
+    }
+
     // MY WORK — the actor's own queue, after the dock (65a89769). One
     // read of the agents registry for the aliases, one assignments read
     // per identity; a caller nobody named is refused here and the rest
     // of the approach still prints (identity's read/write split).
     let identities = match crate::identity::caller() {
         Some(c) => {
-            let agents = rows(api(&http, reqwest::Method::GET, "/api/agents", None).await?);
+            let agents = rows(api(&http, reqwest::Method::GET, "/api/agents", None).await?)?;
             Some(my_work_identities(&c.id, &agents))
         }
         None => None,
@@ -1275,10 +1608,10 @@ pub async fn run(all: bool) -> Result<()> {
                 None,
             )
             .await?,
-        ));
+        )?);
     }
     println!();
-    for line in my_work_section(identities.as_deref(), &my_rows, now) {
+    for line in my_work_section(identities.as_deref(), &my_rows, &cars, now) {
         println!("{line}");
     }
 
@@ -1289,9 +1622,6 @@ pub async fn run(all: bool) -> Result<()> {
     // so it fetches; like ORPHANS, a failed read prints WHY and skips
     // rather than failing the verb.
     let mut fresh_targets: Vec<String> = dock
-        .as_ref()
-        .map(|d| rows(Some(d.clone())))
-        .unwrap_or_default()
         .iter()
         .map(|c| md_str(c, "branch").to_string())
         .filter(|b| !b.is_empty())
@@ -1356,6 +1686,16 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // BUNDLES (5449111c) — a versioned bundle file the live lineage has
+    // moved past. An author bumps the version FROM THE FILE, so a file
+    // behind live turns "bump the version" into a collision the seed
+    // refuses — and the gate, which reads only files, stays green. Said
+    // here, at session start, before anyone bumps; the judgement is the
+    // boot seed's own decision table, run dry against the live rows.
+    for line in crate::bundle_lineage::bundles_section(&http).await {
+        println!("{line}");
+    }
+
     // THE SHED — landed cars not yet proven, and what each waits on.
     let shed = shed_lines(&cars);
     if shed.is_empty() {
@@ -1404,6 +1744,31 @@ pub async fn run(all: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// `IN TRANSIT` printed `at: In transit — cluster converged` while
+    /// that step was READY (train 8b365d83, 2026-09-22), and was read as
+    /// "the cluster has converged" mid-incident (648a68a9). The line
+    /// carries the step's status beside its title, in the server's own
+    /// words (`boss_jobs::yard::standing_at`), so the terminal and the
+    /// yard say the same thing.
+    #[test]
+    fn a_train_in_transit_names_the_status_of_the_step_it_stands_at() {
+        use serde_json::json;
+        let train = json!({
+            "title": "PR train 2026-09-23 07:01",
+            "steps": [
+                {"title": "Yard inspection — CI verdict", "status": "completed"},
+                {"title": "DEPARTED — merged into main", "status": "ready"},
+                {"title": "Train arrived", "status": "pending"},
+            ],
+        });
+        assert_eq!(
+            super::in_transit_line(&train),
+            "    PR train 2026-09-23 07:01  at: DEPARTED — merged into main (ready, not yet done)"
+        );
+        let nowhere = json!({"title": "PR train x", "steps": []});
+        assert_eq!(super::in_transit_line(&nowhere), "    PR train x  at: —");
+    }
+
     /// A TRAIN's gate-run (128b5496) in the GATING lane is the train being
     /// tested, not a car being gated. On 2026-09-14 `boss orient` listed
     /// `train/20260914-1641` and a car branch as two indistinguishable
@@ -1686,6 +2051,91 @@ mod tests {
             json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "why": "later" } }),
         );
         assert!(matches!(shed_place(&bare), Shed::ProbeNotYet { .. }));
+    }
+
+    /// A NOT-YET THAT HAS LASTED DAYS IS NAMED AS SUCH (backlog adef5ddf):
+    /// the line carries the streak and says the probe is ours to read,
+    /// because exit 75 from a probe that can never pass reads exactly like
+    /// a patient one. A short streak keeps the plain line.
+    #[test]
+    fn a_not_yet_streak_past_the_bound_is_named_on_the_line() {
+        let streak = |since: &str, runs: u64| {
+            landed(
+                "fix/starved",
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": {
+                    "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                    "probe": "bash x.sh", "why": "NOT YET: grep found 0",
+                    "not_yet_since": since, "not_yet_runs": runs,
+                } }),
+            )
+        };
+        let line = &shed_lines(&[streak("2026-09-19T05:50:00Z", 86)])[0];
+        assert!(
+            line.contains("NOT YET for 97h straight (86 runs)") && line.contains("read the probe"),
+            "{line}"
+        );
+        let line = &shed_lines(&[streak("2026-09-23T01:00:00Z", 7)])[0];
+        assert!(
+            line.contains("probe says NOT YET — NOT YET: grep"),
+            "{line}"
+        );
+        assert!(!line.contains("straight"), "{line}");
+    }
+
+    /// A DECLARED WAIT (backlog b461341d): the same 97h streak reads as
+    /// the world's, naming what it waits on — and as ours once the
+    /// declared event was seen while the probe still said not yet.
+    #[test]
+    fn a_declared_wait_names_what_it_waits_on_and_is_ours_once_seen() {
+        let declared = |seen_at: Value| {
+            landed(
+                "fix/declared",
+                json!({ "proof_probe": "bash x.sh",
+                    "waits_on": {"on": "a cut-a-release packet David opens", "seen": "true"},
+                    "proof_attempt": {
+                    "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                    "probe": "bash x.sh", "why": "NOT YET: no tag",
+                    "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+                    "waits_on_seen_at": seen_at,
+                } }),
+            )
+        };
+        let line = &shed_lines(&[declared(Value::Null)])[0];
+        assert!(
+            line.contains("probe says NOT YET, waiting on a cut-a-release packet David opens"),
+            "{line}"
+        );
+        assert!(!line.contains("straight"), "{line}");
+        let line = &shed_lines(&[declared(json!("2026-09-23T06:00:00Z"))])[0];
+        assert!(
+            line.contains("was seen in the record at 2026-09-23T06:00:00Z"),
+            "{line}"
+        );
+        assert!(!line.contains("no seen check"), "{line}");
+    }
+
+    /// A DECLARED WAIT WITH NO OBSERVER SAYS SO (backlog e9b164a1): a
+    /// `seen` of null exempts the car from the streak bound and hands
+    /// the judgement to nothing, so the line names the missing check
+    /// and the verb that writes one, rather than reading as patience.
+    #[test]
+    fn a_declared_wait_with_no_seen_check_names_the_missing_observer() {
+        let line = &shed_lines(&[landed(
+            "fix/unobserved",
+            json!({ "proof_probe": "bash x.sh",
+                "waits_on": {"on": "a new Stripe sponsorship charge", "seen": null},
+                "proof_attempt": {
+                "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                "probe": "bash x.sh", "why": "NOT YET: no charge",
+                "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+            } }),
+        )])[0];
+        assert!(
+            line.contains("waiting on a new Stripe sponsorship charge")
+                && line.contains("no seen check")
+                && line.contains("boss car waits-on"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -2162,6 +2612,144 @@ mod tests {
         );
     }
 
+    // ---- CANNOT BOTH BOARD (5c567c27) ---------------------------------
+
+    /// A parked car carrying the conductor's merge preview as
+    /// `preview_dock` writes it: `(branch, files)` it conflicts with,
+    /// measured over the parked set `set`.
+    fn previewed(branch: &str, review: &str, set: &str, co: &[(&str, &[&str])]) -> Value {
+        let mut c = car(branch, "open", review, json!({}));
+        let co: Vec<Value> = co
+            .iter()
+            .map(|(b, f)| json!({ "branch": b, "files": f }))
+            .collect();
+        c["metadata"]["merge_preview"] = json!({
+            "vs_main": { "clean": true },
+            "conflicts_with": co,
+            "anchored": { "main": "m", "parked_set": set },
+            "checked_at": "2026-09-23T10:10:55Z",
+        });
+        c
+    }
+
+    /// THE PAIR IS NAMED ONCE, with its files. On 2026-09-20 three cars
+    /// each green alone could not board together (WorldMap.svelte in two
+    /// of them) and the pipeline stopped nine and a half hours; the
+    /// conductor's merge preview had been measuring exactly that pair on
+    /// every tick since 12a25f3e and nothing read it. A conflict is
+    /// symmetric, so both cars carry it — one line, not two.
+    #[test]
+    fn two_dock_cars_that_conflict_with_each_other_are_one_named_pair() {
+        let cars = vec![
+            previewed("fix/b", "ready", "s1", &[("fix/a", &["WorldMap.svelte"])]),
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["WorldMap.svelte"])]),
+            previewed("fix/clean", "ready", "s1", &[]),
+        ];
+        assert_eq!(
+            unboardable_pairs(&cars),
+            vec![(
+                "fix/a".to_string(),
+                "fix/b".to_string(),
+                vec!["WorldMap.svelte".to_string()],
+            )]
+        );
+    }
+
+    /// A PREVIEW IS STALE, NOT WRONG, WHEN ITS SET MOVED. The conductor
+    /// rewrites only the cars still parked-ready, so a car that boarded,
+    /// or is held, keeps the preview of the dock it last saw. Only two
+    /// previews measured over the SAME parked set (one tick) may pair,
+    /// and only two cars still at the dock — a pair with a car that has
+    /// left is a conflict nobody will meet. Measured live 2026-09-23:
+    /// five cars stamped at 09:50 still named a branch whose own 10:10
+    /// preview no longer named them.
+    #[test]
+    fn a_pair_from_another_tick_or_with_a_car_that_left_is_not_named() {
+        let cars = vec![
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["x.rs"])]),
+            previewed("fix/b", "ready", "s2", &[("fix/a", &["x.rs"])]),
+            previewed("fix/c", "ready", "s3", &[("fix/gone", &["y.rs"])]),
+            previewed("fix/gone", "completed", "s3", &[("fix/c", &["y.rs"])]),
+        ];
+        assert!(unboardable_pairs(&cars).is_empty());
+    }
+
+    /// No preview is no verdict — a car the conductor never measured
+    /// pairs with nothing, rather than reading as either side of one.
+    #[test]
+    fn a_car_without_a_preview_pairs_with_nothing() {
+        let cars = vec![
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["x.rs"])]),
+            car("fix/b", "open", "ready", json!({})),
+        ];
+        assert!(unboardable_pairs(&cars).is_empty());
+    }
+
+    // ---- CONFLICTS WITH MAIN (20d0d717) -------------------------------
+
+    /// A parked car whose preview, measured over `set` at `at`, says it no
+    /// longer merges onto main on `files`.
+    fn off_main(branch: &str, review: &str, set: &str, at: &str, files: &[&str]) -> Value {
+        let mut c = previewed(branch, review, set, &[]);
+        c["metadata"]["merge_preview"]["vs_main"] = json!({ "clean": false, "files": files });
+        c["metadata"]["merge_preview"]["anchored"]["main"] = json!("1d917084abcdef00");
+        c["metadata"]["merge_preview"]["checked_at"] = json!(at);
+        c
+    }
+
+    /// THE VERDICT THE CONDUCTOR ALREADY MEASURED IS NAMED, with its
+    /// files and the main it was measured on. Car 5fba0bda carried
+    /// `vs_main.clean=false` on 2026-09-23 while orient called it only
+    /// FRESHNESS-stale — a re-gate cannot fix a conflict with main.
+    #[test]
+    fn a_dock_car_that_conflicts_with_main_is_named_with_its_files() {
+        let cars = vec![
+            off_main(
+                "fix/my-work",
+                "ready",
+                "s1",
+                "2026-09-23T10:10:55Z",
+                &["orient.rs"],
+            ),
+            previewed("fix/clean", "ready", "s1", &[]),
+        ];
+        assert_eq!(
+            conflicts_with_main(&cars),
+            vec![(
+                "fix/my-work".to_string(),
+                vec!["orient.rs".to_string()],
+                "1d917084".to_string(),
+            )]
+        );
+    }
+
+    /// Only the dock's CURRENT measurement is read: a car whose preview
+    /// carries an older parked set (held, or measured before the dock
+    /// moved) and a car no longer at the dock are both silent — the
+    /// same rule the pairs above obey (5c567c27).
+    #[test]
+    fn a_stale_or_departed_main_conflict_is_not_named() {
+        // `previewed` stamps 10:10:55, so fix/now carries the newest set.
+        let cars = vec![
+            previewed("fix/now", "ready", "s2", &[]),
+            off_main(
+                "fix/old-set",
+                "ready",
+                "s1",
+                "2026-09-23T09:50:00Z",
+                &["a.rs"],
+            ),
+            off_main(
+                "fix/boarded",
+                "completed",
+                "s2",
+                "2026-09-23T10:10:55Z",
+                &["b.rs"],
+            ),
+        ];
+        assert!(conflicts_with_main(&cars).is_empty());
+    }
+
     // ---- MY WORK (65a89769) --------------------------------------------
 
     fn agents() -> Vec<Value> {
@@ -2262,7 +2850,7 @@ mod tests {
                 "s-inspect",
             ),
         ];
-        let lines = my_work_lines(&rows, now);
+        let lines = my_work_lines(&rows, &carried_items(&[]), now);
         let all = lines.join("\n");
         assert_eq!(
             lines.len(),
@@ -2304,7 +2892,7 @@ mod tests {
             "s-dr",
         );
         bare.as_object_mut().unwrap().remove("opened_on");
-        let l = my_work_lines(&[bare], now).join("\n");
+        let l = my_work_lines(&[bare], &carried_items(&[]), now).join("\n");
         assert!(l.contains("(age ?)"), "{l}");
         assert!(l.contains("--answers"), "{l}");
     }
@@ -2329,20 +2917,118 @@ mod tests {
             "2026-09-17",
             "s",
         )];
-        let full = my_work_section(Some(&ids), &one, now).join("\n");
+        let full = my_work_section(Some(&ids), &one, &[], now).join("\n");
         assert!(
             full.starts_with(
                 "  MY WORK — 1 ready/active step(s) assigned to claude@algedonic.dev (+ agent-claude)"
             ),
             "{full}"
         );
-        let empty = my_work_section(Some(&ids), &[], now).join("\n");
+        let empty = my_work_section(Some(&ids), &[], &[], now).join("\n");
         assert!(empty.contains("MY WORK — nothing"), "{empty}");
         assert!(empty.contains("claude@algedonic.dev"), "{empty}");
-        let refused = my_work_section(None, &[], now).join("\n");
+        let refused = my_work_section(None, &[], &[], now).join("\n");
         assert!(refused.contains("MY WORK — REFUSED"), "{refused}");
         assert!(refused.contains("BOSS_ACTOR"), "{refused}");
         assert!(refused.contains(".config/boss/actor"), "{refused}");
+    }
+
+    /// An item a car already carries is not unstarted work, and MY WORK
+    /// must not draw it as its filing age (bc416f60). Measured
+    /// 2026-09-22: of the twelve oldest steps on the agent, six were
+    /// build steps whose cars had merged days earlier and stood in the
+    /// shed, their probes honestly answering "not yet" — and they read
+    /// as 3-to-5-day-old unstarted builds, first in an oldest-first
+    /// queue. The car already says so; the queue now reads it: landed
+    /// (with what the proof waits on) or in flight (with where), listed
+    /// after the group's unstarted rows, counted in the heading.
+    #[test]
+    fn an_item_a_car_already_carries_reads_as_carried_not_as_its_age() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-22T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let landed_item = "ea67ad87-0000-4000-8000-000000000000";
+        let flight_item = "75198b15-0000-4000-8000-000000000000";
+        let fresh_item = "a12736b1-0000-4000-8000-000000000000";
+        let rows = vec![
+            asg(
+                landed_item,
+                "backlog-item",
+                "build",
+                "Old and landed",
+                "2026-09-17",
+                "s1",
+            ),
+            asg(
+                flight_item,
+                "backlog-item",
+                "build",
+                "Old and parked",
+                "2026-09-18",
+                "s2",
+            ),
+            asg(
+                fresh_item,
+                "backlog-item",
+                "build",
+                "Newer, untouched",
+                "2026-09-20",
+                "s3",
+            ),
+        ];
+        let mut shed = landed(
+            "fix/landed",
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "not_yet": true, "why": "not yet: no real prune since convergence" } }),
+        );
+        shed["metadata"]["backlog_item"] = json!(landed_item);
+        let mut parked = car("fix/parked", "open", "ready", json!({}));
+        parked["metadata"]["backlog_item"] = json!(flight_item);
+        // A closed car carries nothing: its item's step is the chain's.
+        let mut gone = landed("fix/gone", json!({}));
+        gone["status"] = json!("closed");
+        gone["metadata"]["backlog_item"] = json!(fresh_item);
+        let cars = vec![shed, parked, gone];
+
+        let carried = carried_items(&cars);
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        let lines = my_work_lines(&rows, &carried, now);
+        let all = lines.join("\n");
+        assert_eq!(
+            lines[0],
+            "    backlog-item — 3 (2 already carried by a car)"
+        );
+        // The untouched item leads, with its age; the carried follow.
+        assert_eq!(
+            lines[1],
+            "      a12736b1 backlog-item build Newer, untouched (2d)"
+        );
+        assert_eq!(
+            lines[2],
+            "      ea67ad87 backlog-item build Old and landed — LANDED (car fix/landed), \
+             awaiting proof: probe says NOT YET — not yet: no real prune since convergence"
+        );
+        assert_eq!(
+            lines[3],
+            "      75198b15 backlog-item build Old and parked — IN FLIGHT (car fix/parked at Open for review)"
+        );
+        // A carried row carries no age: its filing date is not its state.
+        assert!(!lines[2].contains("(5d)"), "{}", lines[2]);
+        assert!(all.contains("carried = "), "{all}");
+
+        // The section says how many of its count are carried.
+        let ids = vec!["claude@algedonic.dev".to_string()];
+        let section = my_work_section(Some(&ids), &rows, &cars, now).join("\n");
+        assert!(
+            section.starts_with(
+                "  MY WORK — 3 ready/active step(s) assigned to claude@algedonic.dev — \
+                 yours to move, oldest first; 2 already carried by a car, listed last"
+            ),
+            "{section}"
+        );
+        // A group with nothing carried reads exactly as before.
+        let plain = my_work_lines(&rows[2..], &carried_items(&[]), now);
+        assert_eq!(plain[0], "    backlog-item — 1");
+        assert!(!plain.join("\n").contains("carried"), "{plain:?}");
     }
 
     /// `boss orient` reads the map from the server rather than deriving

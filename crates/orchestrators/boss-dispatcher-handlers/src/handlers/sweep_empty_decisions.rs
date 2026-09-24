@@ -35,7 +35,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::common::{
-    StepEvent, api_client, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+    StepEvent, api_client, dispatcher_actor_header, dispatcher_reader_header, row_or_refuse,
+    rows_or_refuse, sim_origin_value,
 };
 use super::sweep_deploy_convergence;
 
@@ -238,12 +239,22 @@ pub(crate) fn wanted_target(
     }
 }
 
-fn data_rows(v: &Value) -> Vec<Value> {
-    v.get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .or_else(|| v.as_array().cloned())
-        .unwrap_or_default()
+/// The rows of a `GET /api/jobs` listing, or a retryable refusal naming
+/// the read. This replaced `data_rows`, which took either envelope or a
+/// bare array and read ANY other body as zero rows — so an error answer
+/// meant zero trains, zero approval kinds or zero open packets, and the
+/// sweep cleared on a read that saw nothing (backlog d4698bc2).
+fn listing_rows(v: &Value, what: &str) -> Result<Vec<Value>, HandlerError> {
+    rows_or_refuse(v, what).map_err(HandlerError::Downstream)
+}
+
+/// `/api/jobs/step-types` answers a BARE array (boss-jobs
+/// `list_step_types`), not an envelope — its own shape, judged here
+/// rather than guessed at beside the listings.
+fn step_type_rows(v: &Value) -> Result<Vec<Value>, HandlerError> {
+    v.as_array().cloned().ok_or_else(|| {
+        HandlerError::Downstream("GET /api/jobs/step-types answered no array".into())
+    })
 }
 
 #[async_trait]
@@ -268,7 +279,10 @@ impl Handler for MaintenanceSweepInspect {
         }
 
         let job = self.get(&format!("/api/jobs/{}", ev.job_id)).await?;
-        let job = job.get("data").cloned().unwrap_or(job);
+        // A body that is not a job would fail the kind check below and
+        // skip this ready step without a word (backlog f2eac973).
+        let job = row_or_refuse(job, &format!("GET /api/jobs/{}", ev.job_id))
+            .map_err(HandlerError::Downstream)?;
         if job.get("kind").and_then(Value::as_str) != Some("maintenance-sweep") {
             return Ok(());
         }
@@ -313,7 +327,8 @@ impl Handler for MaintenanceSweepInspect {
                     ))
                 })?;
             let trains = self.get("/api/jobs?kind=pr-train&limit=200").await?;
-            let insp = sweep_deploy_convergence::inspect(&data_rows(&trains), now, &actor);
+            let trains = listing_rows(&trains, "the train read (GET /api/jobs?kind=pr-train)")?;
+            let insp = sweep_deploy_convergence::inspect(&trains, now, &actor);
             return self
                 .complete(
                     ctx,
@@ -342,12 +357,13 @@ impl Handler for MaintenanceSweepInspect {
             .to_string();
 
         let step_types = self.get("/api/jobs/step-types").await?;
-        let approval = approval_kinds(&data_rows(&step_types));
+        let approval = approval_kinds(&step_type_rows(&step_types)?);
 
         // The warm packets: open Jobs whose approval steps have completed
         // are the ones still worth asking the approver about.
         let open = self.get("/api/jobs?status=open&limit=1000").await?;
-        let findings = empty_approval_decisions(&data_rows(&open), &approval, &since);
+        let open = listing_rows(&open, "the open-packet read (GET /api/jobs?status=open)")?;
+        let findings = empty_approval_decisions(&open, &approval, &since);
 
         // Complete the Inspect checklist. Its own fields are `findings`
         // and `measured`; the checklist bundle wants `items`. One item
@@ -455,6 +471,73 @@ impl MaintenanceSweepInspect {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Backlog d4698bc2: `data_rows` read an error body as zero rows —
+    /// zero trains, zero approval kinds, zero open packets — and the
+    /// sweep CLEARED with "no empty approval decisions" on a read that
+    /// saw nothing. Each of the three reads now refuses by name.
+    #[test]
+    fn a_read_that_answered_no_rows_refuses_rather_than_clearing_the_sweep() {
+        let bad = json!({ "error": "narrowed" });
+        let why = |r: Result<Vec<Value>, HandlerError>| match r {
+            Err(HandlerError::Downstream(why)) => why,
+            other => panic!("a bad answer is a retryable refusal, got {other:?}"),
+        };
+        assert!(why(listing_rows(&bad, "the open-packet read")).contains("the open-packet read"));
+        assert!(why(step_type_rows(&bad)).contains("step-types"));
+        assert_eq!(
+            listing_rows(&json!({ "data": [], "total": 0 }), "x").unwrap(),
+            Vec::<Value>::new(),
+            "an empty listing is an answer"
+        );
+        assert_eq!(
+            step_type_rows(&json!([{ "kind": "sign-off" }]))
+                .unwrap()
+                .len(),
+            1,
+            "step-types is a bare array, and that is its answer"
+        );
+    }
+
+    /// Backlog f2eac973, AT THE CONSUMING LAYER. The job read unwrapped
+    /// an envelope the jobs API never sends and fell back to the whole
+    /// body, so a 200 answer that was not a job failed the kind check
+    /// and the Inspect step was skipped with `Ok(())` — the sweep sat
+    /// ready and nothing said why. It is now a retryable refusal naming
+    /// the read.
+    #[tokio::test]
+    async fn a_job_read_that_answered_no_row_refuses_rather_than_skipping() {
+        use axum::{Json as AxJson, Router, routing::get};
+        let app = Router::new().route(
+            "/api/jobs/{id}",
+            get(|| async { AxJson(json!({ "error": "forbidden" })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let handler =
+            MaintenanceSweepInspect::with_client(reqwest::Client::new(), format!("http://{addr}"));
+        let ctx = InvocationContext {
+            rule_name: "inspect-empty-decisions-sweep-on-step-ready".into(),
+            triggering_event_id: "evt-1".into(),
+            triggering_topic: "step.ready.checklist".into(),
+            event_payload: json!({
+                "job_id": "j-sweep",
+                "step_id": "s-inspect",
+                "kind": "checklist",
+                "metadata": {},
+            }),
+        };
+        match handler.invoke(&[], &ctx).await {
+            Err(HandlerError::Downstream(why)) => {
+                assert!(why.contains("/api/jobs/j-sweep"), "{why}");
+                assert!(why.contains("no row"), "{why}");
+            }
+            other => panic!("a body that is not a job is a refusal, got {other:?}"),
+        }
+    }
 
     fn kinds() -> BTreeSet<String> {
         ["sign-off".to_string()].into_iter().collect()

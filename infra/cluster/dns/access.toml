@@ -163,3 +163,45 @@ hostname = "playground.algedonic.dev"
 redirect = "https://playground.algedonic.dev/api/auth/oidc/callback"
 registered = true
 measured = "2026-08-12: the same registration as boss.; the callback every login used from 2026-08-12 to the BOSS_PUBLIC_URL flip (198c5fe9)"
+
+# The dev workspace's ssh door (design 5fc71f03, David 2026-09-18, all
+# three as proposed; backlog e4cedb46). `type = "ssh"` is the whole
+# difference from the self_hosted applications above: on an SSH
+# application the edge terminates the connection, authenticates the
+# operator the same way, and issues a SHORT-LIVED CERTIFICATE for the
+# session, which the pod's sshd accepts through TrustedUserCAKeys
+# (infra/cluster/manifests/boss-dev.yaml). No key lives forever on
+# either side, and the bastion hop the workspace needed from outside
+# the LAN goes away with it.
+#
+# MEASURED, 2026-09-20 (the packet asked whether the handler knows only
+# HTTP applications): it does not. `type` is carried verbatim on the
+# declaration (DeclaredApp::app_type), on the read
+# (credential_issuer.rs, `text("type")`), in the MATCH/DRIFT comparison
+# and in the create body — so an ssh application is declared, compared
+# and applied by the same four-field vocabulary, with no handler change.
+# The certificate CA is `short_lived_ca`: Cloudflare keeps one per
+# application, and the observer generates it when the account holds
+# none and records its PUBLIC key on the observation packet as
+# `ssh_ca`. Copying that key into the Secret the manifest names is
+# David's root ceremony. It cannot be done from the dashboard any
+# longer: since 2026-09 it offers only the account-wide
+# Access-for-Infrastructure CA, which signs nothing `cloudflared access
+# ssh` asks for, and the client is refused "bad ca application" before
+# it reaches the pod (incident 55d001b0, 2026-09-23).
+# `enable_binding_cookie` belongs to the browser-rendered SSH flow, not
+# to the `cloudflared access ssh` one /it/estate prints, so nothing
+# here declares it; a dashboard that turns it on reads UNDECLARED on
+# this application's own vocabulary, not as DRIFT.
+[[application]]
+name = "BOSS dev"
+domain = "dev.algedonic.dev"
+type = "ssh"
+session_duration = "24h"
+short_lived_ca = true
+why = "the dev workspace's ssh door: the edge asks who you are and issues a certificate for the session, instead of a key that lives forever"
+
+[[application.policy]]
+name = "operators"
+decision = "allow"
+include.emails = ["david@algedonic.dev"]

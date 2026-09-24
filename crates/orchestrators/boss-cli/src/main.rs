@@ -2,12 +2,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod attach;
 mod brief;
 mod built_from;
+mod bundle_lineage;
 mod cadence;
 mod car;
 mod census;
 mod channels;
+mod core_changes;
 mod credential;
 mod delivery_policy;
 mod design;
@@ -25,10 +28,12 @@ mod host_readiness;
 mod identity;
 mod inspect;
 mod job;
+mod memory_index;
 mod merged;
 mod ops;
 mod ops_request;
 mod orient;
+mod own_temp;
 mod owner;
 mod park;
 mod prose;
@@ -48,6 +53,7 @@ mod tenant_publish;
 mod tenant_stamp;
 mod train;
 mod train_gate;
+mod transcript_usage;
 mod upgrade;
 mod workflow;
 
@@ -201,7 +207,8 @@ enum Commands {
         /// car when the gate goes green — no hand-park. Requires the
         /// other three --park-* below (a car needs a full receipt) and
         /// ONE of --park-backlog-item / --park-partial-item /
-        /// --park-no-item (a car says which item it fixes).
+        /// --park-no-item / --park-design (a car says which item it
+        /// fixes).
         #[arg(long)]
         park_summary: Option<String>,
         /// Auto-park: what the change deliberately leaves out.
@@ -217,11 +224,12 @@ enum Commands {
         /// that item's build, so the arrival rule routes its triage and
         /// COMPLETES its build when the car lands — which closes it.
         ///
-        /// One of this, --park-partial-item or --park-no-item is
-        /// REQUIRED with any --park-* flag. Measured 2026-09-10
-        /// (e1325456): 13 of 19 open cars named no item, so their items
-        /// stayed open after the fix was live and an operator closed
-        /// them by hand with a worse record than the car's own arrival.
+        /// One of this, --park-partial-item, --park-no-item or
+        /// --park-design is REQUIRED with any --park-* flag. Measured
+        /// 2026-09-10 (e1325456): 13 of 19 open cars named no item, so
+        /// their items stayed open after the fix was live and an
+        /// operator closed them by hand with a worse record than the
+        /// car's own arrival.
         #[arg(long)]
         park_backlog_item: Option<String>,
         /// Auto-park: the item this change is ONE PIECE of — recorded as
@@ -282,6 +290,18 @@ enum Commands {
         /// SOLO is still the solo rule's business, not this flag's.
         #[arg(long, value_name = "CAR")]
         park_after: Option<String>,
+        /// Auto-park: every OTHER item this change answers — repeatable,
+        /// one id each. Rides BESIDE --park-backlog-item (or
+        /// --park-partial-item / --park-design), never as the item
+        /// answer, and is refused beside --park-no-item, which names no
+        /// item for these to ride beside. Each listed item CLOSES when
+        /// the car lands, as the car's own item does.
+        ///
+        /// Measured 2026-09-23 (a994f533): 5994de6d and cab50f4c were
+        /// dispatched to builders after their fixes had landed on cars
+        /// naming a different item, because a car could name only one.
+        #[arg(long, value_name = "ITEM")]
+        park_also_answers: Vec<String>,
         /// Auto-park: the probe that proves this change in production,
         /// written now by the builder who knows what it does. Recorded
         /// on the car as `proof_probe` and RUN — by `boss prove <car>
@@ -328,6 +348,52 @@ enum Commands {
         /// Never with --park-probe.
         #[arg(long)]
         park_proof_event: Option<String>,
+        /// Auto-park: the event (or the actor's act) this car's probe
+        /// WAITS ON, as prose — recorded on the car as `waits_on.on`, so
+        /// a long not-yet reads as a declared wait rather than a probe
+        /// nobody reads. Needs --park-waits-on-seen and --park-probe: a
+        /// wait nothing observes silences the starved label for good
+        /// (backlog e9b164a1). Merged into any wait the car already
+        /// declares, never over it.
+        #[arg(long, value_name = "EVENT")]
+        park_waits_on: Option<String>,
+        /// The wait's observer: shell text that exits 0 once the event is
+        /// in the record, run on the forge under the probe's rules
+        /// (`waits_on.seen`). A shell text is safest in --park-file's
+        /// `[waits_on]` table, where no word expansion happens.
+        #[arg(long, value_name = "SHELL")]
+        park_waits_on_seen: Option<String>,
+        /// Whose move the wait is (`waits_on.owner`): `world`, or the id
+        /// of the actor whose act it is. Without it the shed reads the
+        /// wait as ours.
+        #[arg(long, value_name = "WORLD|ACTOR")]
+        park_waits_on_owner: Option<String>,
+        /// Hours from the car's opening the owner's move may take before
+        /// the wait is ours again (`waits_on.max_wait_hours`). Optional.
+        #[arg(long, value_name = "HOURS")]
+        park_waits_on_max_wait_hours: Option<u32>,
+        /// Auto-park: every prose text of the park in ONE TOML file, read
+        /// with no shell in the path — `summary`, `excludes`, `test`,
+        /// `verified`, `probe`, `expect`, `proof_event`, each the
+        /// `--park-*` flag of that name. Write it beside the gate script;
+        /// single-quoted TOML strings ('...' and '''...''' for a
+        /// multi-line probe) keep backticks, quotes and backslashes
+        /// exactly. A `[waits_on]` table (`on`, `seen`, `owner`,
+        /// `max_wait_hours`) carries the --park-waits-on* flags the same
+        /// way. Exclusive with every flag it carries. The item flags
+        /// (--park-backlog-item and its siblings) stay flags: they are
+        /// ids, not prose (backlog 6f1e9b99).
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = [
+                "park_summary", "park_excludes", "park_test", "park_verified",
+                "park_probe", "park_probe_file", "park_expect", "park_expect_file",
+                "park_proof_event", "park_waits_on", "park_waits_on_seen",
+                "park_waits_on_owner", "park_waits_on_max_wait_hours",
+            ]
+        )]
+        park_file: Option<std::path::PathBuf>,
         /// Gate a branch whose content ALREADY landed on main, stating
         /// why (e.g. to close a dead gate-run packet). Refused by
         /// default: a landed branch's next step is deletion, and a
@@ -449,6 +515,11 @@ enum Commands {
     /// memory and the uid one was wrong in all ten (cc9ddc5d). A brief
     /// references this instead of retyping it; nothing printed here is
     /// a sentence somebody typed about the gate.
+    ///
+    /// The commit trailer a builder's rules ask for is the dispatching
+    /// session's OWN attribution lines, supplied in
+    /// `BOSS_COMMIT_TRAILER` (one trailer per line); unset, the rules
+    /// say so rather than name a model the CLI cannot know (89d1572c).
     Brief {
         /// The packet: its full uuid, 8+ characters of its id, or its
         /// branch. Omit it to print the invariants alone.
@@ -466,7 +537,10 @@ enum Commands {
     /// Workflow row; a step declaring none is refused, naming the
     /// fix), and PRINTS the exact prompt: `boss brief`'s rendering plus
     /// the run id. The prompt is stdout and nothing else is, so
-    /// `boss dispatch <packet> > prompt.txt` is what you paste.
+    /// `boss dispatch <packet> > prompt.txt` is what you paste. Set
+    /// `BOSS_COMMIT_TRAILER` to your own session's attribution lines
+    /// and the prompt's rules carry them as the commit trailer, saying
+    /// where they came from (89d1572c).
     Dispatch {
         /// The hook's door (design 511fa7d4 car 2b): read a Claude Code
         /// PreToolUse payload on stdin and record the Agent call as a
@@ -512,12 +586,17 @@ enum Commands {
         /// The other end of the run: record the builder's handback on
         /// the run named by `<PACKET>`, complete its `reported` step when
         /// the green has opened it, and write the finish to agent_runs.
-        #[arg(long, requires = "summary")]
+        #[arg(long, requires = "handback")]
         report: bool,
         /// With --report: the handback (packet, branch, sha, gate, what
         /// changed, what it saw).
-        #[arg(long, requires = "report")]
+        #[arg(long, requires = "report", group = "handback")]
         summary: Option<String>,
+        /// With --report: the handback, read from this file — the longest
+        /// prose any verb takes, so the one most worth keeping out of the
+        /// shell (backlog 6f1e9b99). Exclusive with --summary.
+        #[arg(long, requires = "report", group = "handback")]
+        summary_file: Option<std::path::PathBuf>,
         /// With --report: what the run cost in dollars, as the session's
         /// usage line reports it.
         #[arg(long, requires = "report")]
@@ -525,9 +604,18 @@ enum Commands {
         /// With --report: the token count — a total (761000) or the
         /// input,output split (740000,21000). A split is priced at the
         /// card's two rates; a total at the model's declared blend, and
-        /// the record says which.
+        /// the record says which. SUPERSEDED whenever the run's
+        /// transcript is read (backlog e6b2066f): the report meters the
+        /// run from it and keeps this figure beside the record only for
+        /// comparison — a harness `subagent_tokens` is the run's final
+        /// context size, not what it consumed.
         #[arg(long, requires = "report")]
         tokens: Option<String>,
+        /// With --report: the run's subagent transcript, when the
+        /// report cannot find it itself (it looks for the one
+        /// `<projects>/*/*/subagents/agent-*.jsonl` naming the run).
+        #[arg(long, requires = "report")]
+        transcript: Option<std::path::PathBuf>,
         /// Dispatch anyway when a car carrying this packet's fix has
         /// already MERGED (a7837d81). The refusal is not a guess about
         /// the tree: it names the car, its branch and its merge. Force
@@ -545,8 +633,21 @@ enum Commands {
         /// Read each CLOSED train's merge commit in this checkout and
         /// stamp software_tiers on the train (idempotent: a train that
         /// carries it is skipped) instead of printing the mixes.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tiers")]
         backfill_tiers: bool,
+        /// Print ONLY the tier reading over landed trains — coverage
+        /// first, direction outward, no target ratio — the form the
+        /// platform retro quotes every week (79fdc808). Reads the system
+        /// of record alone: no git, no dock.
+        #[arg(long)]
+        tiers: bool,
+        /// Print ONLY the absolute number of core file-touches landed
+        /// per day on origin/main in this checkout — the crest signal
+        /// David chose (bd93d2be): direction down, no target, no
+        /// threshold. The platform retro quotes it beside --tiers.
+        /// Reads git alone: fetch first.
+        #[arg(long, conflicts_with_all = ["tiers", "backfill_tiers"])]
+        core_changes: bool,
         /// The window: trains closed on or after this date (YYYY-MM-DD).
         /// Default for the mix: the last 30 days; for the backfill: all.
         #[arg(long)]
@@ -592,6 +693,10 @@ enum Commands {
         #[arg(long, conflicts_with = "markdown")]
         markdown_file: Option<std::path::PathBuf>,
         /// An open question as `anchor|title|proposal`. Repeatable.
+        /// Only for strategy or priority trade-offs, trust and security
+        /// boundaries, credentials, money, and brand or voice — every
+        /// other choice the author decides from the company frame and
+        /// writes into the markdown with its reason (backlog 4f71e608).
         #[arg(long = "question")]
         questions: Vec<String>,
         /// Record it without queuing a review — for a doc that states
@@ -636,9 +741,16 @@ enum Commands {
         /// What the probe means, in prose, for a human reader.
         #[arg(long)]
         verified: Option<String>,
+        /// The meaning, read from this file — no shell between the bytes
+        /// and the proof (backlog 6f1e9b99). Exclusive with --verified.
+        #[arg(long, conflicts_with = "verified")]
+        verified_file: Option<std::path::PathBuf>,
         /// How it was checked, if that needs saying.
         #[arg(long)]
         method: Option<String>,
+        /// The method, read from this file. Exclusive with --method.
+        #[arg(long, conflicts_with = "method")]
+        method_file: Option<std::path::PathBuf>,
         /// Re-run the proof already recorded and report whether it
         /// still holds. Read-only: records nothing.
         #[arg(long)]
@@ -674,7 +786,7 @@ enum Commands {
         /// yet, 2 refused. The car is a full id; the probe runs as
         /// BOSS_PROBE_USER in BOSS_PROBE_DIR under BOSS_PROBE_TIMEOUT
         /// with the read-only reader on its PATH, never as root.
-        #[arg(long, requires = "from_car", conflicts_with_all = ["recheck", "replace", "dry_run", "verified", "method", "probe_anyway"])]
+        #[arg(long, requires = "from_car", conflicts_with_all = ["recheck", "replace", "dry_run", "verified", "verified_file", "method", "method_file", "probe_anyway"])]
         unattended: bool,
         /// Run a probe this verb REFUSES, stating why.
         ///
@@ -784,6 +896,8 @@ enum Commands {
     // no shared line at all.
     // ------------------------------------------------------------------
     #[command(flatten)]
+    Attach(attach::Cmd),
+    #[command(flatten)]
     Credential(credential::Cmd),
     #[command(flatten)]
     Merged(merged::Cmd),
@@ -856,6 +970,47 @@ enum CarAction {
         #[arg(long, value_name = "REASON")]
         no_item: Option<String>,
         /// Report what would be filed, without filing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Say what an open car's proof waits on — parked, or landed and
+    /// awaiting proof.
+    ///
+    /// Records `waits_on` on the car through the metadata PATCH. A car
+    /// that declares its wait is never named "ours to read" for the
+    /// length of its not-yet streak alone; it is named the moment its
+    /// `--seen` check finds the event in the record while the probe
+    /// still says not yet (backlog b461341d). SINGLE-quote both values.
+    ///
+    /// It MERGES into the declaration the car already carries: each flag
+    /// given replaces its field and every other field is kept, so an
+    /// owner can be added without restating the event, and restating the
+    /// event does not drop the owner (backlog e9b164a1).
+    WaitsOn {
+        /// The car: its branch, or 8+ characters of its id.
+        car: String,
+        /// The event or the actor the proof waits on, as prose. Needed
+        /// unless the car already declares one.
+        #[arg(long)]
+        on: Option<String>,
+        /// Shell text that exits 0 once that event is in the record. Run
+        /// by the door that records each not-yet, on the forge, under the
+        /// probe's rules. Without it the wait can never be contradicted.
+        #[arg(long)]
+        seen: Option<String>,
+        /// Whose move the wait is: `world` for an event nobody here can
+        /// cause, or the id of the actor whose act it is (emp-david).
+        /// Without it the shed reads the wait as ours.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Hours from the car's opening the owner's move may take before
+        /// the wait is ours again. Optional; positive.
+        #[arg(long)]
+        max_wait_hours: Option<u32>,
+        /// Remove the declaration.
+        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours"])]
+        clear: bool,
+        /// Print the PATCH body without writing it.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1207,8 +1362,12 @@ enum JobAction {
         #[arg(long)]
         kind: String,
         /// The packet's title.
-        #[arg(long)]
-        title: String,
+        #[arg(long, required_unless_present = "title_file")]
+        title: Option<String>,
+        /// The title, read from this file — no shell between the bytes
+        /// and the record (backlog 6f1e9b99). Exclusive with --title.
+        #[arg(long, conflicts_with = "title")]
+        title_file: Option<std::path::PathBuf>,
         /// standard | urgent (default standard).
         #[arg(long)]
         priority: Option<String>,
@@ -1419,6 +1578,23 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            CarAction::WaitsOn {
+                car: given,
+                on,
+                seen,
+                owner,
+                max_wait_hours,
+                clear,
+                dry_run,
+            } => {
+                let fields = car::WaitsOnFields {
+                    on,
+                    seen,
+                    owner,
+                    max_wait_hours,
+                };
+                car::waits_on(&given, &fields, clear, dry_run).await
+            }
         },
         Commands::Workflow { action } => match action {
             WorkflowAction::Publish {
@@ -1453,11 +1629,20 @@ async fn main() -> Result<()> {
             JobAction::File {
                 kind,
                 title,
+                title_file,
                 priority,
                 metadata,
                 subject_id,
                 channel,
-            } => job::file(&kind, &title, priority, metadata, subject_id, channel).await,
+            } => {
+                let title = crate::prose::text_or_file(
+                    "--title",
+                    "--title-file",
+                    title,
+                    title_file.as_deref(),
+                )?;
+                job::file(&kind, &title, priority, metadata, subject_id, channel).await
+            }
             JobAction::Patch { job, patch } => job::patch(&job, &patch).await,
         },
         Commands::Orient { all } => orient::run(all).await,
@@ -1492,8 +1677,10 @@ async fn main() -> Result<()> {
             effort,
             report,
             summary,
+            summary_file,
             spend_usd,
             tokens,
+            transcript,
             force,
             ..
         } => {
@@ -1501,9 +1688,15 @@ async fn main() -> Result<()> {
             if report {
                 dispatch::report(
                     packet,
-                    summary.unwrap_or_default(),
+                    crate::prose::text_or_file(
+                        "--summary",
+                        "--summary-file",
+                        summary,
+                        summary_file.as_deref(),
+                    )?,
                     spend_usd,
                     tokens,
+                    transcript,
                     chrono::Utc::now(),
                 )
                 .await
@@ -1513,10 +1706,16 @@ async fn main() -> Result<()> {
         }
         Commands::Channels {
             backfill_tiers,
+            tiers,
+            core_changes,
             since,
         } => {
-            if backfill_tiers {
+            if core_changes {
+                core_changes::run(since, chrono::Utc::now())
+            } else if backfill_tiers {
                 channels::backfill_tiers(since).await
+            } else if tiers {
+                channels::tiers(since, chrono::Utc::now()).await
             } else {
                 channels::run(since, chrono::Utc::now()).await
             }
@@ -1553,7 +1752,9 @@ async fn main() -> Result<()> {
             expect,
             exit_only,
             verified,
+            verified_file,
             method,
+            method_file,
             recheck,
             replace,
             dry_run,
@@ -1564,6 +1765,18 @@ async fn main() -> Result<()> {
             if unattended {
                 return prove::run_unattended(&car, chrono::Utc::now()).await;
             }
+            let verified = crate::prose::opt_text_or_file(
+                "--verified",
+                "--verified-file",
+                verified,
+                verified_file.as_deref(),
+            )?;
+            let method = crate::prose::opt_text_or_file(
+                "--method",
+                "--method-file",
+                method,
+                method_file.as_deref(),
+            )?;
             prove::run(
                 &car,
                 probe,
@@ -1610,39 +1823,61 @@ async fn main() -> Result<()> {
             park_no_item,
             park_design,
             park_after,
+            park_also_answers,
             park_probe,
             park_probe_file,
             park_expect,
             park_expect_file,
             park_proof_event,
+            park_waits_on,
+            park_waits_on_seen,
+            park_waits_on_owner,
+            park_waits_on_max_wait_hours,
+            park_file,
             force_regate,
             stale_base_anyway,
             rebase,
             hold,
         } => {
+            // clap holds --park-file exclusive with every flag it
+            // carries, so at most one side of each `or` is present.
+            let from_file = park_file
+                .as_deref()
+                .map(crate::prose::park_file)
+                .transpose()?
+                .unwrap_or_default();
             let park = gate::ParkIntent {
-                summary: park_summary,
-                excludes: park_excludes,
-                test: park_test,
-                verified: park_verified,
+                summary: park_summary.or(from_file.summary),
+                excludes: park_excludes.or(from_file.excludes),
+                test: park_test.or(from_file.test),
+                verified: park_verified.or(from_file.verified),
                 backlog_item: park_backlog_item,
                 partial_item: park_partial_item,
                 no_item: park_no_item,
                 design: park_design,
                 boards_after: park_after,
+                also_answers: park_also_answers,
                 probe: crate::prose::opt_text_or_file(
                     "--park-probe",
                     "--park-probe-file",
                     park_probe,
                     park_probe_file.as_deref(),
-                )?,
+                )?
+                .or(from_file.probe),
                 expect: crate::prose::opt_text_or_file(
                     "--park-expect",
                     "--park-expect-file",
                     park_expect,
                     park_expect_file.as_deref(),
-                )?,
-                proof_event: park_proof_event,
+                )?
+                .or(from_file.expect),
+                proof_event: park_proof_event.or(from_file.proof_event),
+                waits_on: from_file.waits_on.unwrap_or(car::WaitsOnFields {
+                    on: park_waits_on,
+                    seen: park_waits_on_seen,
+                    owner: park_waits_on_owner,
+                    max_wait_hours: park_waits_on_max_wait_hours,
+                }),
             };
             gate::run(
                 &branch,
@@ -1706,6 +1941,7 @@ async fn main() -> Result<()> {
         },
         // Per-module verbs, one arm each, ALPHABETIZED — the note on
         // `Commands` says why (84f9fbc0).
+        Commands::Attach(cmd) => attach::dispatch(cmd).await,
         Commands::Credential(cmd) => credential::dispatch(cmd).await,
         Commands::Merged(cmd) => merged::dispatch(cmd),
         Commands::Receipt(cmd) => receipt::dispatch(cmd).await,
@@ -1947,6 +2183,12 @@ mod tests {
                 "--change",
                 "--change-file",
             ),
+            (
+                "job file",
+                vec!["boss", "job", "file", "--kind", "backlog-item"],
+                "--title",
+                "--title-file",
+            ),
         ] {
             // One of the pair is required.
             assert!(
@@ -1969,6 +2211,166 @@ mod tests {
                 "{verb} {text} and {file} are exclusive"
             );
         }
+    }
+
+    /// The OPTIONAL prose flags get the same twin (backlog 6f1e9b99):
+    /// absent is still absent, either alone parses, both together are
+    /// refused. `boss prove --verified` and `--method` are sentences a
+    /// reader relies on; `boss dispatch --summary` is a builder's whole
+    /// handback, the longest prose any verb takes.
+    #[test]
+    fn an_optional_prose_flag_has_a_file_door() {
+        for (verb, args, text, file) in [
+            (
+                "prove",
+                vec!["boss", "prove", "abcd1234"],
+                "--verified",
+                "--verified-file",
+            ),
+            (
+                "prove",
+                vec!["boss", "prove", "abcd1234"],
+                "--method",
+                "--method-file",
+            ),
+            (
+                "dispatch --report",
+                vec!["boss", "dispatch", "abcd1234", "--report"],
+                "--summary",
+                "--summary-file",
+            ),
+        ] {
+            for flag in [text, file] {
+                let mut with = args.clone();
+                with.extend([flag, "what was measured"]);
+                Cli::try_parse_from(with)
+                    .unwrap_or_else(|e| panic!("{verb} {flag} should parse: {e}"));
+            }
+            let mut both = args.clone();
+            both.extend([text, "inline", file, "handback.md"]);
+            assert!(
+                Cli::try_parse_from(both).is_err(),
+                "{verb} {text} and {file} are exclusive"
+            );
+        }
+        // --report still needs a handback, and either spelling is one.
+        assert!(Cli::try_parse_from(["boss", "dispatch", "abcd1234", "--report"]).is_err());
+        // A handback file without --report means nothing and is refused.
+        assert!(
+            Cli::try_parse_from(["boss", "dispatch", "abcd1234", "--summary-file", "h.md"])
+                .is_err()
+        );
+        // The unattended door records nothing typed, so it refuses both
+        // spellings of the prose it would ignore.
+        for flag in ["--verified-file", "--method-file"] {
+            assert!(
+                Cli::try_parse_from([
+                    "boss",
+                    "prove",
+                    "abcd1234",
+                    "--from-car",
+                    "--unattended",
+                    flag,
+                    "x.md"
+                ])
+                .is_err(),
+                "--unattended with {flag}"
+            );
+        }
+    }
+
+    /// ONE FILE FOR A PARK, NOT SIX TWINS (backlog 6f1e9b99). The park
+    /// prose is one object about one car, so `--park-file` carries all
+    /// of it and conflicts with every flag it replaces — a value given
+    /// twice would be a question of which one the car records.
+    #[test]
+    fn the_park_file_replaces_the_prose_flags_it_carries() {
+        let base = [
+            "boss",
+            "gate",
+            "feat/x",
+            "--park-backlog-item",
+            "abcd1234",
+            "--park-file",
+            "park.toml",
+        ];
+        Cli::try_parse_from(base).unwrap_or_else(|e| panic!("--park-file parses: {e}"));
+        for flag in [
+            "--park-summary",
+            "--park-excludes",
+            "--park-test",
+            "--park-verified",
+            "--park-probe",
+            "--park-probe-file",
+            "--park-expect",
+            "--park-expect-file",
+            "--park-proof-event",
+            "--park-waits-on",
+            "--park-waits-on-seen",
+            "--park-waits-on-owner",
+        ] {
+            let mut with = base.to_vec();
+            with.extend([flag, "x"]);
+            assert!(
+                Cli::try_parse_from(with).is_err(),
+                "--park-file with {flag} must be refused"
+            );
+        }
+        let mut with = base.to_vec();
+        with.extend(["--park-waits-on-max-wait-hours", "48"]);
+        assert!(Cli::try_parse_from(with).is_err());
+    }
+
+    /// `boss car waits-on` MERGES (backlog e9b164a1 piece 3), so `--on`
+    /// is no longer required: an owner or a patience can be added to a
+    /// car that already declares its event. `--clear` still stands alone.
+    #[test]
+    fn the_waits_on_verb_takes_an_owner_without_restating_the_event() {
+        let ok = [
+            "boss",
+            "car",
+            "waits-on",
+            "feat/x",
+            "--owner",
+            "world",
+            "--max-wait-hours",
+            "336",
+        ];
+        Cli::try_parse_from(ok).unwrap_or_else(|e| panic!("--owner alone parses: {e}"));
+        let with_clear = [
+            "boss", "car", "waits-on", "feat/x", "--owner", "world", "--clear",
+        ];
+        assert!(Cli::try_parse_from(with_clear).is_err());
+    }
+
+    /// `boss tenant publish` takes the machine door as export does
+    /// (backlog e32a423e), and `--door` and `--gateway` are exclusive
+    /// on both: one publish has one route.
+    #[test]
+    fn tenant_publish_takes_the_machine_door_exclusive_of_the_gateway() {
+        for verb in ["publish", "export"] {
+            let base = ["boss", "tenant", verb, "dir"];
+            let mut door = base.to_vec();
+            door.extend(["--door", "http://door:7900"]);
+            Cli::try_parse_from(door.clone())
+                .unwrap_or_else(|e| panic!("tenant {verb} --door should parse: {e}"));
+            let mut both = door;
+            both.extend(["--gateway", "http://gw:8080"]);
+            assert!(
+                Cli::try_parse_from(both).is_err(),
+                "tenant {verb} --door and --gateway are exclusive"
+            );
+        }
+        Cli::try_parse_from([
+            "boss",
+            "tenant",
+            "publish",
+            "dir",
+            "--door",
+            "http://door:7900",
+            "--dry-run",
+        ])
+        .unwrap_or_else(|e| panic!("--door with --dry-run prints the plan: {e}"));
     }
 
     /// Every top-level verb resolves. This is the smoke contract for

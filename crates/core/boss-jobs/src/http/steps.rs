@@ -552,7 +552,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // `boss dispatch` writes the new id through that door right after
     // the claim (the claim route itself never touches metadata), so a
     // carried-forward value can never outlive the next dispatch. What
-    // survives here is OMISSION, nothing more.
+    // survives here is OMISSION, nothing more. Nor can it outlive a
+    // change of holder by any other door: the claim CAS drops the edge
+    // when the step passes to someone else (9562f6df), which is where
+    // its freshness is decided — not here.
     if let Some(old_obj) = old.metadata.as_object()
         && let Some(run) = old_obj.get(crate::agent_runs::EDGE_KEY).cloned()
         && let Some(obj) = step.metadata.as_object_mut()
@@ -1634,6 +1637,22 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // reads its Subject identity.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
 
+    // The step's agent block as every gate below reads it: the packet's
+    // own projection, else its kind's ACTIVE row (backlog 51aef4dd) —
+    // the resolution the station queue made, so the door an agent
+    // claims through agrees with the queue it read. Read only when the
+    // step carries no projection; best-effort, since a registry that
+    // cannot answer leaves the step as recorded, which is how every
+    // claim was judged before. `old` itself stays as recorded: it is
+    // what the CAS writes back, and the resolution is never written.
+    let active_row = match (&state.kind_registry, &parent_job) {
+        (Some(reg), Some(job)) if crate::agent_spec::projected(&old.metadata).is_none() => {
+            reg.get_active(&job.kind).await.ok()
+        }
+        _ => None,
+    };
+    let resolved = crate::agent_spec::resolved(&old, active_row.as_ref());
+
     // The claimant's agents row, read once for the two gates below:
     // the station's model capability and the budget reservation.
     // `None` is a person or an unregistered login — neither gate
@@ -1684,8 +1703,16 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             return (StatusCode::NOT_FOUND, "job not found").into_response();
         };
         let needs_steps = bound.as_ref().is_some_and(|s| s.predicate.needs_steps());
+        // A failed steps read is a 500 naming the packet, not an empty
+        // list: empty cannot match a step clause, so the claim was
+        // refused 409 "packet is not at this station" — a confident
+        // wrong answer to a question the door never read (f6c97006).
         let steps = if needs_steps {
-            state.jobs.list_steps(&job_id).await.unwrap_or_default()
+            let steps = match state.jobs.list_steps(&job_id).await {
+                Ok(steps) => steps,
+                Err(e) => return steps_unreadable(&job_id, &e),
+            };
+            crate::agent_spec::resolved_steps(&steps, active_row.as_ref())
         } else {
             Vec::new()
         };
@@ -1769,25 +1796,34 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // numbers, BEFORE the CAS, so a claim the budget does not admit
     // never enters the race. A person, an unregistered login, and a
     // row with no cap reserve nothing (see `agent_budget`).
+    //
+    // A READING, NOT A REFUSAL, since backlog e6b2066f. Once a run is
+    // priced from what it consumed — about five times the figure this
+    // gate was calibrated against — the $40 hour would have refused
+    // claims all day, and David's direction (2026-09-23) is that
+    // budgets give protocols a cost signal and do not limit building.
+    // So an over-cap reservation admits the claim and puts the reading
+    // on the log beside it (`agents.claim.over_budget`, committed with
+    // the claim), and a failed read of the hour is logged and admits
+    // too: a gate that no longer refuses must not refuse on a hiccup.
+    let mut over_budget: Option<serde_json::Value> = None;
     if let (Some(door), Some(row), Some(budget_usd)) = (
         state.agent_budget.as_ref(),
         agent_row.as_ref(),
-        old.metadata
+        resolved
+            .metadata
             .get(crate::agent_spec::BUDGET_KEY)
             .and_then(|v| v.as_f64()),
     ) {
         let now = boss_clock_client::now_from(&state.clock).await;
         match door.reserve(row, budget_usd, now).await {
             Ok(reservation) if reservation.decision.is_allowed() => {}
-            Ok(reservation) => {
-                return (StatusCode::CONFLICT, Json(reservation.refusal_body())).into_response();
-            }
+            Ok(reservation) => over_budget = Some(reservation.reading_body()),
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("budget gate could not measure the actor's hour: {e}"),
-                )
-                    .into_response();
+                tracing::warn!(
+                    actor = %row.id,
+                    "budget reading could not measure the actor's hour, claim admitted: {e}"
+                );
             }
         }
     }
@@ -1815,7 +1851,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // After the budget gate, because `BudgetDecision::decide` reports
     // money before concurrency and the two doors keep that order.
     if let Some(row) = agent_row.as_ref()
-        && crate::agent_budget::declares_an_agent_run(&old.metadata)
+        && crate::agent_budget::declares_an_agent_run(&resolved.metadata)
         && let Some(cap) = row.max_concurrent_runs.and_then(|n| u32::try_from(n).ok())
     {
         // Every spelling of the actor: the registered id and the
@@ -1865,15 +1901,42 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     let mut claimed = old.clone();
     claimed.assignee_id = Some(user.id.clone());
     claimed.status = StepStatus::Active;
+    // The CAS drops the previous run's edge when the holder changes
+    // (9562f6df); the event says so too, or the log would go on naming
+    // a run the row no longer names. The claimant's aliases come from
+    // its agents row — the same holder the CAS reads as `me`.
+    let aliases = agent_row
+        .as_ref()
+        .map(|r| r.aliases.as_slice())
+        .unwrap_or_default();
+    if crate::agent_runs::claim_changes_holder(old.assignee_id.as_deref(), &user.id, aliases) {
+        claimed.metadata = crate::agent_runs::without_edge(&claimed.metadata);
+    }
 
     let mut claim_events = vec![stamp.event(
         events::STEP_UPDATED,
         serde_json::to_value(&claimed).unwrap_or_default(),
     )];
-    // Same grammar as the PUT path: an assignment marker only when
-    // the assignee genuinely changed (a re-claim is not an
-    // assignment), payload mirroring step.ready for messages.notify.
-    if old.assignee_id.as_deref() != Some(user.id.as_str()) && !claimed.kind.is_empty() {
+    // The over-budget reading, on the log in the same commit as the
+    // claim it describes (backlog e6b2066f): which step, which actor,
+    // and every number the old refusal carried.
+    if let Some(mut reading) = over_budget {
+        if let Some(obj) = reading.as_object_mut() {
+            obj.insert("job_id".into(), serde_json::json!(job_id.to_string()));
+            obj.insert("step_id".into(), serde_json::json!(step_id.to_string()));
+        }
+        claim_events.push(stamp.event(crate::agent_budget::CLAIM_OVER_BUDGET, reading));
+    }
+    // An assignment marker only when the executor genuinely changed —
+    // the same alias-aware answer the run edge took above, so a re-claim
+    // and a respelled holder announce nothing (735ddc03). Payload
+    // mirrors step.ready for messages.notify.
+    if crate::agent_runs::assignment_marker_due(
+        old.assignee_id.as_deref(),
+        &user.id,
+        aliases,
+        &claimed.kind,
+    ) {
         let (subject_kind, subject_id) = if let Some(job) = &parent_job {
             (
                 boss_core::primitives::Subject::kind(&job.subject).to_string(),

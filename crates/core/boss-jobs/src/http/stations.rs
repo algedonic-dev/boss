@@ -5,7 +5,9 @@
 //! lists: the caller's read-scope Predicate on the `job` resource is
 //! computed once and pushed into the packet query, so a station
 //! queue can never show a caller a packet /api/jobs would hide. A
-//! denied caller gets a clean empty collection, matching list_jobs.
+//! denied caller is REFUSED (403), and a read that could not be made
+//! fails the answer (500 naming it) — neither is ever an empty 200,
+//! which is what an idle network says (backlogs 8dcd28ce, c11e9d3c).
 
 use super::*;
 
@@ -31,6 +33,62 @@ pub(super) fn stations_or_503<R: JobsRepository, B: EventBus>(
         )
             .into_response()
     })
+}
+
+/// The ACTIVE Workflow row per kind — what a step's agent block
+/// resolves against ([`crate::agent_spec::resolved`]) and what
+/// `station_reach` measures drift from.
+///
+/// Best-effort, and the degraded answer is the pre-51aef4dd one: with
+/// no registry wired, or a read that fails, nothing resolves and each
+/// station answers from the packets' own projections, as it did before
+/// — a queue that still holds everything it held, rather than a
+/// refusal that holds nothing.
+pub(super) async fn active_rows<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+) -> BTreeMap<String, crate::registry::WorkflowSpec> {
+    match &state.kind_registry {
+        Some(reg) => reg
+            .list_active(None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.kind.clone(), row))
+            .collect(),
+        None => BTreeMap::new(),
+    }
+}
+
+/// The open packets `scope` reaches, each with its steps RESOLVED
+/// against its kind's ACTIVE row — the one set every reader that
+/// counts a station's members evaluates the predicate over. The load
+/// and the yard's marshalling read (which the regions map and the
+/// borders both take) each listed and resolved their own copy until
+/// 2026-09-23, and the yard's copy never resolved: the agent station
+/// read 213 in the load and 170 on the map (backlog 6c06ef65). One
+/// definition, so the two cannot disagree again (CLAUDE.md §9a).
+///
+/// A step read that fails is an error, never an empty step list: a
+/// packet with no steps matches no step clause, so it would drop out
+/// of the count instead of failing the read.
+pub(super) async fn resolved_open_packets<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    scope: crate::port::JobScope,
+    active: &BTreeMap<String, crate::registry::WorkflowSpec>,
+) -> Result<Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>, crate::port::JobsError> {
+    let filter = JobFilter {
+        status: Some(JobStatus::Open),
+        scope,
+        ..Default::default()
+    };
+    let (jobs, _total) = state.jobs.list_jobs(&filter, MAX_LIMIT, 0).await?;
+    let mut packets = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let steps = state.jobs.list_steps(&job.id).await?;
+        let steps = crate::agent_spec::resolved_steps(&steps, active.get(&job.kind));
+        packets.push((job, steps));
+    }
+    Ok(packets)
 }
 
 fn station_err_response(err: StationError) -> Response {
@@ -59,6 +117,52 @@ fn lint_result_json(problems: &[crate::station_lint::StationLintError]) -> serde
         "ok": problems.is_empty(),
         "problems": crate::station_lint::problems_json(problems),
     })
+}
+
+/// The caller's packet-read predicate, or the refusal every station
+/// read owes a caller who may read no packets.
+///
+/// One definition for the four read surfaces, because the posture is
+/// one decision. Until 2026-09-23 each answered a denied scope with
+/// `{"data": [], "total": 0}` and a 200 — the same bytes an idle
+/// network sends — so a caller who could read nothing was told there
+/// was nothing, and a board rendered it as calm (backlog 8dcd28ce).
+/// A refused scope refuses: 403, naming the caller.
+///
+/// Refused on the TRANSLATED scope, not only `Predicate::None`: a
+/// `DepartmentIs` grant for another department also translates to
+/// [`JobScope::None`], and the queue it produced was the same empty
+/// 200 for the same reason.
+#[allow(
+    clippy::result_large_err,
+    reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
+)]
+async fn readable_predicate<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> Result<boss_policy_client::Predicate, Response> {
+    let predicate = state
+        .policy
+        .scope_predicate(user, Resource::job())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response()
+        })?;
+    match job_scope_from_predicate(user, &predicate) {
+        JobScope::None => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} (role {}) may read no packets, so no station can be evaluated for them",
+                user.id, user.role
+            ),
+        )
+            .into_response()),
+        _ => Ok(predicate),
+    }
 }
 
 /// Station authoring is a network-configuration change, so it is
@@ -155,9 +259,9 @@ pub(super) async fn station_by_name<R: JobsRepository, B: EventBus>(
 }
 
 /// `GET /api/stations` — every active station row. The registry rows
-/// themselves carry no packet data; the policy gate mirrors the job
-/// list's posture (scope predicate on the `job` resource; a caller
-/// who can see no packets sees no queues either).
+/// themselves carry no packet data; the policy gate is the one every
+/// station read shares ([`readable_predicate`]: a caller who may read
+/// no packets is refused, not shown an empty registry).
 pub(super) async fn list_stations<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -166,18 +270,8 @@ pub(super) async fn list_stations<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    if matches!(predicate, boss_policy_client::Predicate::None) {
-        return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
+    if let Err(r) = readable_predicate(&state, &user).await {
+        return r;
     }
     match effective_stations(&state, reg).await {
         Ok(rows) => {
@@ -231,57 +325,30 @@ pub(super) async fn stations_load<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+    // A caller who may read no packets is refused (403), not shown a
+    // network with every depth at zero (backlog 8dcd28ce).
+    let predicate = match readable_predicate(&state, &user).await {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
-        }
+        Err(r) => return r,
     };
-    if matches!(predicate, boss_policy_client::Predicate::None) {
-        return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
-    }
     let stations = match effective_stations(&state, reg).await {
         Ok(s) => s,
         Err(r) => return r,
     };
 
     let scope = job_scope_from_predicate(&user, &predicate);
-    let filter = JobFilter {
-        status: Some(JobStatus::Open),
-        scope,
-        ..Default::default()
-    };
-    let (jobs, _total) = match state.jobs.list_jobs(&filter, MAX_LIMIT, 0).await {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    // The ACTIVE protocol per kind, read ONCE — the second half of the
+    // omission question `station_reach` answers, and the row each
+    // packet's agent block resolves against (backlog 51aef4dd), so the
+    // depth here and the queue an agent reads count the same members.
+    let active = active_rows(&state).await;
+
     // Fetched ONCE and shared. Every constraint station matches on a
     // step, so per-station fetching would re-read the same rows 55
     // times.
-    let mut packets = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
-        packets.push((job, steps));
-    }
-
-    // The ACTIVE protocol per kind, read ONCE beside the packets — the
-    // second half of the omission question `station_reach` answers.
-    // Best-effort: a deployment with no Workflow registry wired, or a
-    // registry read that fails, reports no omission rather than
-    // refusing the whole load, because the depths above are still true.
-    let active: BTreeMap<String, crate::registry::WorkflowSpec> = match &state.kind_registry {
-        Some(reg) => reg
-            .list_active(None)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (row.kind.clone(), row))
-            .collect(),
-        None => BTreeMap::new(),
+    let packets = match resolved_open_packets(&state, scope, &active).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let today = boss_clock_client::now_from(&state.clock).await.date_naive();
@@ -369,20 +436,10 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    // Same read gate as every other station surface: an unreadable
-    // caller gets an empty collection, not a 403.
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    if matches!(predicate, boss_policy_client::Predicate::None) {
-        return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
+    // Same read gate as every other station surface: a caller who may
+    // read no packets is refused (403), never shown a calm network.
+    if let Err(r) = readable_predicate(&state, &user).await {
+        return r;
     }
     let stations = match effective_stations(&state, reg).await {
         Ok(s) => s,
@@ -468,24 +525,28 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
 
     // Bind the self placeholder ONCE, here, before any packet is
     // compared — a per-actor station is one registry row whose queue
-    // depends on who is asking. A caller with no identity (guest) gets
-    // the station's own empty queue: the envelope still describes the
-    // station truthfully, it just holds nothing.
+    // depends on who is asking. A caller with no identity is REFUSED
+    // (401): there is nobody to bind `@me` to, so there is no queue to
+    // answer with. It used to get the station's envelope with an empty
+    // `data` and a 200 — the same bytes as "you have filed nothing",
+    // a claim about the caller the server cannot make (backlog
+    // c11e9d3c). It still never falls back to the unbound row.
     let Some(spec) = row.bind_self(self_id(&user)) else {
-        return Json(evaluate_station(&row, Vec::new(), today)).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "station {name} is per-actor (@me) and this request names no actor to bind it to"
+            ),
+        )
+            .into_response();
     };
 
     // One policy path with /api/jobs: scope predicate → JobScope,
-    // pushed into the adapter query.
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+    // pushed into the adapter query — and a scope that admits nothing
+    // is refused, not evaluated into an empty queue.
+    let predicate = match readable_predicate(&state, &user).await {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
-        }
+        Err(r) => return r,
     };
     let scope = job_scope_from_predicate(&user, &predicate);
 
@@ -521,17 +582,56 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
     // surface without them can only render a list.
     let needs_steps =
         spec.predicate.needs_steps() || spec.lens.as_ref().is_some_and(|l| l.with_steps);
+    // A step clause may read the agent block, which a packet admitted
+    // before its kind declared one does not carry: resolve it against
+    // the ACTIVE row before the predicate reads it (backlog 51aef4dd —
+    // 47 page-audit packets sat three days absent from the agent
+    // station). One registry read per queue, only when steps are read.
+    let active = if needs_steps {
+        active_rows(&state).await
+    } else {
+        BTreeMap::new()
+    };
     let mut packets = Vec::with_capacity(jobs.len());
+    // The steps AS RECORDED, for a lens that draws them: the resolution
+    // decides membership, it is never shown as what the packet holds.
+    let mut recorded: BTreeMap<String, Vec<boss_core::job::Step>> = BTreeMap::new();
     for job in jobs {
         let steps = if needs_steps {
-            state.jobs.list_steps(&job.id).await.unwrap_or_default()
+            // A failed read is NOT an empty step list. Taken as one
+            // (`unwrap_or_default()`, until 2026-09-23), the step clause
+            // could not match, so the packet silently left the queue and
+            // the 200 reported one member fewer (backlog c11e9d3c). The
+            // whole answer fails instead, naming the packet.
+            let steps = match state.jobs.list_steps(&job.id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "cannot evaluate station {name} — steps of packet {} unreadable: {e}",
+                            job.id
+                        ),
+                    )
+                        .into_response();
+                }
+            };
+            let resolved = crate::agent_spec::resolved_steps(&steps, active.get(&job.kind));
+            recorded.insert(job.id.to_string(), steps);
+            resolved
         } else {
             Vec::new()
         };
         packets.push((job, steps));
     }
 
-    Json(evaluate_station(&spec, packets, today)).into_response()
+    let mut queue = evaluate_station(&spec, packets, today);
+    for (id, steps) in queue.steps.iter_mut() {
+        if let Some(as_recorded) = recorded.remove(id) {
+            *steps = as_recorded;
+        }
+    }
+    Json(queue).into_response()
 }
 
 // ---------------------------------------------------------------------------

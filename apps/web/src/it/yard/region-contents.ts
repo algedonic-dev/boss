@@ -39,8 +39,12 @@ import type { Scene, Station, Wagon } from './yard-floor';
  *  nowhere, the false-empty class). The groupings are the ones
  *  regions.ts already made when it named each region's floor panel:
  *  the gates region IS the approach — publishing, queued, in a bay, in
- *  limbo — and the cancelled siding is drawn in the arrivals yard. */
-const STATION_REGION: Readonly<Record<Station, RegionName>> = {
+ *  limbo — and the cancelled siding is drawn in the arrivals yard.
+ *
+ *  `as const` keeps each value's literal, so the record also DEFINES
+ *  the floor regions (`FloorRegion`) and which stations each one holds
+ *  (`StationOf`) — the keys floor-slices.ts lays the floor out by. */
+const STATION_REGION = {
   approach: 'gates',
   'gate-queue': 'gates',
   gate: 'gates',
@@ -53,9 +57,20 @@ const STATION_REGION: Readonly<Record<Station, RegionName>> = {
   'inspection-shed': 'shed',
   'siding-event': 'shed',
   'siding-no-probe': 'shed',
-};
+} as const satisfies Readonly<Record<Station, RegionName>>;
 
-export function regionOfStation(station: Station): RegionName {
+/** The six regions the yard's floor stands wagons in — read off
+ *  STATION_REGION's values, so a region no station maps to is not one. */
+export type FloorRegion = (typeof STATION_REGION)[Station];
+
+/** The stations a floor region holds: `StationOf<'gates'>` is
+ *  approach | gate-queue | gate | limbo. A layout keyed by it must name
+ *  every one of them and no other region's (floor-slices.ts). */
+export type StationOf<R extends FloorRegion> = {
+  [S in Station]: (typeof STATION_REGION)[S] extends R ? S : never;
+}[Station];
+
+export function regionOfStation(station: Station): FloorRegion {
   return STATION_REGION[station];
 }
 
@@ -64,7 +79,7 @@ export function regionOfStation(station: Station): RegionName {
  *  hold queues instead, and their interior is a platform deck
  *  (world-interior.ts, car 4), so they are absent here by design. */
 export const INTERIOR_REGIONS: ReadonlyArray<RegionName> = REGION_NAMES.filter((name) =>
-  Object.values(STATION_REGION).includes(name),
+  (Object.values(STATION_REGION) as ReadonlyArray<RegionName>).includes(name),
 );
 
 export function hasInterior(region: string): boolean {
@@ -134,10 +149,27 @@ export function contentsBox(
   };
 }
 
+/** Where a layout's "+N more" note is drawn: right-aligned to the
+ *  contents box, on a baseline just above its first row (backlog
+ *  ba83225e). RegionMap drew it at the canvas's bottom edge minus six —
+ *  inside the machinery strip, clear of the glyphs only because they
+ *  fill from the left. Above the box is the band the head clamp keeps
+ *  (never under 24 px), which neither the rows nor the strip can reach,
+ *  and the note has no descender, so its baseline is its lowest pixel. */
+export type NoteAt = Readonly<{ x: number; y: number }>;
+const NOTE_GAP = 4;
+
+export function overflowNoteAt(box: Readonly<{ x: number; y: number; w: number }>): NoteAt {
+  return { x: box.x + box.w, y: box.y - NOTE_GAP };
+}
+
 /** Lay the wagons out inside the territory. What does not fit is
  *  COUNTED, never dropped silently — the yard's own "+N" idiom, so a
  *  full region reads as full rather than as a tidy one. */
-export function interiorLayout(t: Territory, wagons: ReadonlyArray<Wagon>): Readonly<{ placed: ReadonlyArray<Placed>; hidden: number }> {
+export function interiorLayout(
+  t: Territory,
+  wagons: ReadonlyArray<Wagon>,
+): Readonly<{ placed: ReadonlyArray<Placed>; hidden: number; note: NoteAt }> {
   const box = contentsBox(t, PLATE_H);
   const cols = Math.max(1, Math.floor((box.w + GAP) / (PLATE_W + GAP)));
   const rows = Math.max(1, Math.floor((box.h + GAP) / (PLATE_H + GAP)));
@@ -149,5 +181,5 @@ export function interiorLayout(t: Territory, wagons: ReadonlyArray<Wagon>): Read
     w: PLATE_W,
     h: PLATE_H,
   }));
-  return { placed, hidden: Math.max(0, wagons.length - placed.length) };
+  return { placed, hidden: Math.max(0, wagons.length - placed.length), note: overflowNoteAt(box) };
 }

@@ -22,11 +22,14 @@
   import type { Asset, Job, Account } from './types';
   import type { Invoice } from '../finance/types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
+  import { fetchAccountsPage } from './api';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
+  import { okRead, readStateOf, type ReadState } from '../data/readState';
 
   type Tier = Account['tier'] | 'all';
 
   let accounts = $state<Account[]>([]);
+  let accountsPage = $state<Paged<Account> | null>(null);
   let devicesPage = $state<Paged<Asset> | null>(null);
   let jobsPage = $state<Paged<Job> | null>(null);
   let loading = $state(true);
@@ -52,6 +55,15 @@
   const supportOn = $derived(moduleEnabled('support'));
 
   let invoicesPage = $state<Paged<Invoice> | null>(null);
+  // What each secondary read did. Their `failed` arms were dropped on
+  // the floor (`dPaged.kind === 'ready' ? dPaged.page : null`), and the
+  // tenant-shaping below hides an all-zero column — so a failed read
+  // removed its column without a word, the paint of "no account has
+  // any" (backlogs 223ebcd6 and e30ee8b9). The column still goes, since
+  // there is nothing true to put in it, but the page now says why.
+  let devicesRead = $state<ReadState>(okRead);
+  let jobsRead = $state<ReadState>(okRead);
+  let invoicesRead = $state<ReadState>(okRead);
 
   let devices = $derived(devicesPage?.data ?? []);
   let jobs = $derived(jobsPage?.data ?? []);
@@ -63,8 +75,11 @@
     (async () => {
       try {
         const includeJobs = supportOn;
-        const [pResp, dPaged, jPaged, iPaged] = await Promise.all([
-          fetch('/api/people/accounts'),
+        const [pPaged, dPaged, jPaged, iPaged] = await Promise.all([
+          // The directory itself is enveloped since backlog 2d1d298e
+          // (2026-09-23) — it was an unbounded bare array, so this list
+          // could not say when it was incomplete.
+          fetchAccountsPage(),
           // `/api/assets` — `/api/assets/systems` was the fleet-era
           // path; it has no route and fell through to
           // `/api/assets/{asset_id}` → 404, so this list rendered
@@ -78,16 +93,19 @@
           // truncation if a tenant blows past it.
           fetchPaged<Invoice>('/api/commerce/invoices?limit=10000'),
         ]);
-        if (!pResp.ok) throw new Error(`accounts HTTP ${pResp.status}`);
-        const pBody = await pResp.json();
+        if (pPaged.kind === 'failed') throw new Error(pPaged.error);
         if (!cancelled) {
-          accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
+          accountsPage = pPaged.page;
+          accounts = [...pPaged.page.data];
           // Device/ticket/AR columns are secondary joins — a failed
           // side-load degrades those columns, it does not fail the
           // account list itself.
           devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
           jobsPage = jPaged && jPaged.kind === 'ready' ? jPaged.page : null;
           invoicesPage = iPaged.kind === 'ready' ? iPaged.page : null;
+          devicesRead = readStateOf(dPaged);
+          jobsRead = jPaged ? readStateOf(jPaged) : okRead;
+          invoicesRead = readStateOf(iPaged);
           loading = false;
         }
       } catch (e) {
@@ -170,6 +188,15 @@
       .join(' · ') || undefined,
   );
 
+  // Each failed secondary read, with the column it takes away.
+  let failedColumns = $derived(
+    [
+      { what: 'installed devices', read: devicesRead, column: 'Equipment' },
+      { what: 'service jobs', read: jobsRead, column: 'Open SRs' },
+      { what: 'invoices', read: invoicesRead, column: 'Open AR' },
+    ].flatMap((f) => (f.read.kind === 'failed' ? [{ ...f, error: f.read.error }] : [])),
+  );
+
   const TIERS: ReadonlyArray<'platinum' | 'gold' | 'silver'> = [
     'platinum', 'gold', 'silver',
   ];
@@ -187,6 +214,14 @@
     motif="tap"
   />
 
+  {#if isCapped(accountsPage)}
+    <OverflowBanner
+      showing={accounts.length}
+      total={accountsPage!.total}
+      noun="accounts"
+      hint="The list and its filters cover only the accounts loaded."
+    />
+  {/if}
   {#if isCapped(devicesPage)}
     <OverflowBanner
       showing={devices.length}
@@ -234,6 +269,13 @@
     </aside>
 
     <section class="list-section">
+      {#if !loading && !error}
+        {#each failedColumns as f (f.what)}
+          <p class="empty load-failed" role="alert">
+            Couldn't load {f.what} — {f.error}. The {f.column} column is not shown: its counts are unknown, not zero.
+          </p>
+        {/each}
+      {/if}
       {#if loading}
         <p class="empty">Loading…</p>
       {:else if error}

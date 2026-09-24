@@ -197,11 +197,18 @@ async fn main() -> Result<()> {
     // but does not parse is refused here too, naming the file and
     // toml's line (api.rs `load_tenant_toml`, backlog 4f1ba1f9): the
     // configuration the router is built from, not a boot check.
-    let declared = api::load_tenant_toml()
+    let manifest = api::load_tenant_toml()
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("reading the tenant manifest")?
-        .map(|t| t.gateway.public_reads)
-        .unwrap_or_default();
+        .context("reading the tenant manifest")?;
+    // How many modules are on, said once at boot (design 1054c099;
+    // backlog fa77e3d7): prod ran with `modules = {}` — every
+    // module-gated surface off — and no line anywhere said so. Zero is
+    // legitimate, so it warns rather than refuses.
+    match api::modules_boot_line(manifest.as_ref()) {
+        (0, line) => tracing::warn!("{line}"),
+        (_, line) => tracing::info!("{line}"),
+    }
+    let declared = manifest.map(|t| t.gateway.public_reads).unwrap_or_default();
     let public_reads = public_reads::PublicReads::resolve(&declared)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("resolving [gateway] public_reads from the tenant manifest")?;
@@ -689,39 +696,11 @@ fn build_router(
             "/api/calendar/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CALENDAR)),
         )
-        // Observability aggregator — /api/snapshot is the cybernetics
-        // rollup (and /api/snapshot/capabilities the startup census).
-        // Two strict matchers (no trailing path) plus a wildcard for
-        // sub-paths. Session-gated like every other read since
-        // 2026-09-17 (backlog b03f38de): it was public for the unauth
-        // landing-page mode, which no longer reads it — nothing in
-        // apps/web fetches this path — so the pin's only effect in
-        // prod was to answer anyone with the demo-agents figures and
-        // `demo_mode: true`. Pinned by
-        // `the_snapshot_refuses_a_sessionless_caller` below.
-        .route(
-            "/api/snapshot",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
-        .route(
-            "/api/snapshot/{*rest}",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
-        // The IT Monitoring page probes /api/<port-name>/health for
-        // every PORTS entry. boss-observability exposes its routes
-        // under different prefixes (/api/events, /api/snapshot,
-        // /api/agents), so without this alias the monitoring page
-        // shows it as 'down' even when running. Session-gated like
-        // every other health path that page reads (`/api/jobs/health`
-        // rides the gated `/api/jobs/{*rest}`): it sat on the
-        // sessionless proxy until backlog 240e03f3 (2026-09-19) with
-        // nothing but that page reading it, and the page holds a
-        // session. Pinned by
-        // `the_observability_health_alias_refuses_a_sessionless_caller`.
-        .route(
-            "/api/observability/health",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
+        // /api/snapshot, /api/snapshot/* and /api/observability/health
+        // proxied to boss-observability until 2026-09-23, when it
+        // retired as superseded-by (backlog 467175e7, car B); each is
+        // now a catch-all miss, pinned by
+        // `the_retired_observability_routes_are_misses` below.
         // Simulator UX — boss-simulator hosts both the /simulator SPA
         // bundle and its /simulator/api/* control+status surface. The
         // whole prefix is proxied (not stripped); the service nests its
@@ -773,39 +752,13 @@ fn build_router(
     if let Some(la) = local_auth_state {
         // Passkey ceremony (docs/design/presence.md, packet 7218c3f1):
         // best-effort mount — a malformed BOSS_PUBLIC_URL must degrade
-        // to "no passkey routes", never crash the front door.
+        // to "no passkey routes", never crash the front door. The route
+        // list is `passkey_router`'s, the one the tests drive; it was
+        // spelled out here as well until backlog 3bddce66 (2026-09-23).
         let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
-            Ok(pk) => {
-                let pk = std::sync::Arc::new(pk);
-                app.route(
-                    "/api/auth/passkey/register/begin",
-                    axum::routing::post(boss_gateway::passkey::register_begin)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/register/finish",
-                    axum::routing::post(boss_gateway::passkey::register_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/begin",
-                    axum::routing::post(boss_gateway::passkey::assert_begin).with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/finish",
-                    axum::routing::post(boss_gateway::passkey::assert_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials",
-                    axum::routing::get(boss_gateway::passkey::credentials_list)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials/{credential_id}",
-                    axum::routing::delete(boss_gateway::passkey::credentials_remove).with_state(pk),
-                )
-            }
+            Ok(pk) => app.merge(boss_gateway::passkey::passkey_router(std::sync::Arc::new(
+                pk,
+            ))),
             Err(e) => {
                 tracing::warn!(error = %e, "passkey ceremony not mounted");
                 app
@@ -1463,50 +1416,28 @@ mod routing_tests {
         }
     }
 
-    /// The observability snapshot needs a session like every other read
-    /// (backlog b03f38de, 2026-09-17). It was pinned public for the
-    /// unauth landing-page mode, which no longer reads it — no SPA
-    /// consumer is left — so the pin's only effect in prod was to hand
-    /// anyone the demo-agents figures with `demo_mode: true`. Same
-    /// discriminator as the agent-run reads: 401 before any upstream.
+    /// boss-observability retired as superseded-by (backlog 467175e7,
+    /// car B, 2026-09-23), and its three routes left with it: the
+    /// snapshot, its sub-paths, and the health alias the old IT
+    /// Monitoring page probed. Each is now an honest 404 from the /api
+    /// catch-all — a route left proxying to a service no pod starts
+    /// would answer 502 forever, which reads as an outage rather than
+    /// as a thing that does not exist. Nothing in apps/web fetches any
+    /// of them (`every_api_path_the_web_fetches_is_routed` would say).
     #[tokio::test]
-    async fn the_snapshot_refuses_a_sessionless_caller() {
-        for path in ["/api/snapshot", "/api/snapshot/capabilities"] {
+    async fn the_retired_observability_routes_are_misses() {
+        for path in [
+            "/api/snapshot",
+            "/api/snapshot/capabilities",
+            "/api/observability/health",
+        ] {
             let (status, body) = get(app(), path).await;
-            assert_eq!(
-                status,
-                StatusCode::UNAUTHORIZED,
-                "`{path}` must be gated by the session proxy: {body}"
-            );
+            assert_eq!(status, StatusCode::NOT_FOUND, "`{path}`: {body}");
             assert!(
-                !body.contains(MISS),
-                "`{path}` reached the /api catch-all: {body}"
+                body.contains(MISS),
+                "`{path}` must reach the /api catch-all, not a proxy: {body}"
             );
         }
-    }
-
-    /// The observability health alias needs a session like every other
-    /// `/api/<service>/health` (backlog 240e03f3, the hardening
-    /// inventory's audit of the two unconditional public routes,
-    /// 2026-09-19). It was pinned public for the IT Monitoring page,
-    /// which reads it WITH a session like the other health paths it
-    /// probes (`/api/jobs/health` rides `/api/jobs/{*rest}`, gated) —
-    /// so the pin's only effect was a sessionless `{"status":"ok"}`
-    /// on every instance. Nothing else reads it: no manifest probe, no
-    /// observer, no script (grep on 2026-09-19). Same discriminator as
-    /// the snapshot: 401 before any upstream.
-    #[tokio::test]
-    async fn the_observability_health_alias_refuses_a_sessionless_caller() {
-        let (status, body) = get(app(), "/api/observability/health").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "`/api/observability/health` must be gated by the session proxy: {body}"
-        );
-        assert!(
-            !body.contains(MISS),
-            "`/api/observability/health` reached the /api catch-all: {body}"
-        );
     }
 
     /// The gateway's own liveness answer keeps answering a stranger,

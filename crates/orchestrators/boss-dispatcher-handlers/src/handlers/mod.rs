@@ -47,12 +47,16 @@ pub mod ledger_keg_deposit_settle;
 pub mod ledger_payroll_run_submit;
 pub mod ledger_tax_accrue;
 pub mod ledger_tax_remit;
+#[cfg(test)]
+mod listing_stub;
 pub mod messages_expire_for_job;
+pub mod messages_expire_notices;
 pub mod messages_notify;
 pub mod messages_notify_job_terminal;
 pub mod network_census;
 pub mod ops_file_tag_release;
 pub mod ops_judge;
+pub mod ops_queue_alarm;
 pub mod packaging_allocate;
 pub mod people_hire;
 pub mod people_terminate;

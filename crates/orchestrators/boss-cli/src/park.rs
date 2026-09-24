@@ -327,7 +327,7 @@ pub(crate) async fn run(
 
     // The receipt first: refuse before anything is created, so a red
     // gate costs a line of output rather than a half-filled packet.
-    let open = crate::gate::rows(
+    let open = crate::train::rows(
         crate::gate::api(
             &http,
             reqwest::Method::GET,
@@ -335,7 +335,7 @@ pub(crate) async fn run(
             None,
         )
         .await?,
-    );
+    )?;
     let head_now = crate::gate::resolve_sha(branch);
     let receipt = receipt_for(&open, branch, &head_now)?;
     println!(
@@ -369,7 +369,7 @@ pub(crate) async fn run(
             // whichever query happened to run first.
             let mut all = Vec::new();
             for kind in ["backlog-item", "user-feedback"] {
-                all.extend(crate::gate::rows(
+                all.extend(crate::train::rows(
                     crate::gate::api(
                         &http,
                         reqwest::Method::GET,
@@ -377,7 +377,7 @@ pub(crate) async fn run(
                         None,
                     )
                     .await?,
-                ));
+                )?);
             }
             let full = resolve_job_id(&all, &given)?;
             if full != given {
@@ -549,15 +549,24 @@ pub(crate) async fn run(
     // The writes are decided in core, shared with the auto-park handler,
     // and SKIP whatever the open already completed — the step API refuses
     // a metadata write to a completed step, so re-sending `scope` would
-    // 409 on every car a builder opened.
+    // 409 on every car a builder opened. Each is the evidence through the
+    // step merge door, THEN a status-only PUT — a PUT carrying metadata
+    // replaces the step's stored keys wholesale (backlog e39a9d2a).
     for w in finish_writes(&job, summary, excludes, test, verified, &receipt, now)
         .map_err(anyhow::Error::msg)?
     {
         crate::gate::api(
             &http,
+            reqwest::Method::PATCH,
+            &w.merge_path(&car),
+            Some(w.metadata.clone()),
+        )
+        .await?;
+        crate::gate::api(
+            &http,
             reqwest::Method::PUT,
-            &format!("/api/jobs/{car}/steps/{}", w.step_id),
-            Some(w.body),
+            &w.status_path(&car),
+            Some(w.status_body),
         )
         .await?;
     }
