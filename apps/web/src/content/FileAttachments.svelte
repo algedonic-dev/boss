@@ -126,7 +126,8 @@
       this surface on.
     </p>
   {:else if error}
-    <p class="files-error">Couldn't load attachments — {error}</p>
+    <!-- The shared failure marker (sweep c3e4edcc) sets the ink. -->
+    <p class="files-error load-failed" role="alert">Couldn't load attachments — {error}</p>
   {:else if files.length === 0}
     <p class="files-empty">No attachments yet.</p>
   {:else}
@@ -188,11 +189,8 @@
   }
   .files-empty,
   .files-error {
-    color: var(--text-muted);
+    color: var(--static);
     font-size: 0.9rem;
-  }
-  .files-error {
-    color: var(--danger);
   }
   .files-list {
     list-style: none;
@@ -209,7 +207,7 @@
     padding: 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background: var(--ink);
   }
   .files-thumb img {
     width: 48px;
@@ -225,7 +223,7 @@
     align-items: center;
     justify-content: center;
     font-size: 1.5rem;
-    background: var(--surface-muted);
+    background: var(--ink-raised);
     border-radius: 4px;
     text-decoration: none;
   }
@@ -243,21 +241,21 @@
   }
   .files-sub {
     font-size: 0.8rem;
-    color: var(--text-muted);
+    color: var(--static);
     margin-top: 2px;
   }
   .files-delete {
     background: transparent;
     border: 1px solid var(--border);
-    color: var(--text-muted);
+    color: var(--static);
     padding: 4px 10px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 0.85rem;
   }
   .files-delete:hover {
-    color: var(--danger);
-    border-color: var(--danger);
+    color: var(--err);
+    border-color: var(--err);
   }
   .files-drop {
     display: flex;
@@ -267,12 +265,12 @@
     border: 2px dashed var(--border);
     border-radius: 6px;
     cursor: pointer;
-    color: var(--text-muted);
+    color: var(--static);
     transition: background-color 120ms ease, border-color 120ms ease;
   }
   .files-drop:hover,
   .files-drop-over {
-    background: var(--surface-muted);
+    background: var(--ink-raised);
     border-color: var(--accent);
     color: var(--text);
   }

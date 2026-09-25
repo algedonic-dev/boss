@@ -44,15 +44,18 @@ pub struct JobFilter {
     /// both match `kind_prefix = "refurb"`).
     pub kind_prefix: Option<String>,
     /// Keep only packets whose `kind` is IN this set — and `Some(vec![])`
-    /// keeps NOTHING. The department listing's filter (backlog
-    /// cc76f755, 2026-09-18): jobs carry no department column; the
-    /// workflow row does (`metadata.department`), so the HTTP handler
-    /// resolves a department to the kinds declaring it and asks for
-    /// exactly those. An empty set answering the unfiltered count
-    /// would be the trap the packet was filed on — measured on prod,
-    /// `?department=sales` answered 1944, the unfiltered total,
-    /// because nothing read the parameter at all.
+    /// keeps NOTHING. Born as the department listing's filter (backlog
+    /// cc76f755, 2026-09-18), which has its own field now
+    /// (`department`); the regions read's inbound kind set still asks
+    /// for exactly a set of kinds. An empty set answering the
+    /// unfiltered count would be the trap cc76f755 was filed on —
+    /// measured on prod, `?department=sales` answered 1944, the
+    /// unfiltered total, because nothing read the parameter at all.
     pub kinds: Option<Vec<String>>,
+    /// Keep only the packets IN one department — the `?department=`
+    /// listing's filter. See [`DepartmentFilter`] for which packets
+    /// that is; `None` is no filter.
+    pub department: Option<DepartmentFilter>,
     pub status: Option<JobStatus>,
     /// A retention window on TERMINAL packets: keep everything still
     /// live, plus anything closed on or after this date. Drop
@@ -136,6 +139,46 @@ pub struct JobFilter {
     pub partition: Option<Partition>,
 }
 
+/// Which packets are IN a department — `GET /api/jobs?department=`.
+///
+/// A department is declared as data in two places, and a packet is in
+/// the one its OWN `metadata.department` names, or — when it names
+/// none — the one its kind's active workflow row declares
+/// (`crate::department::carried`, the same rule for both). One packet,
+/// one department: the packet's word is the more specific, so it wins.
+///
+/// Why the packet's word counts at all (backlog 481d7939, measured
+/// 2026-09-23): the kinds every department has — `department-retro`,
+/// `page-audit`, the `backlog-item`s a page audit files — are platform
+/// rows that declare no department, because they serve all of them;
+/// each packet carries the department it is about, and its schema
+/// requires it. Joined over kinds alone, the warehouse's retro and two
+/// page-audits answered `?department=warehouse` with total 0, and the
+/// finance retro was absent from finance's view. Membership stays data
+/// — the handler resolves `declaring_kinds` from the registry and the
+/// packet carries its own word — never a list of kinds in code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepartmentFilter {
+    /// The department code asked for.
+    pub code: String,
+    /// The kinds whose ACTIVE workflow row declares `code`
+    /// (`crate::department::kinds_declaring`). Empty is a real answer —
+    /// no kind declares it — and then only packets naming it match.
+    pub declaring_kinds: Vec<String>,
+}
+
+impl DepartmentFilter {
+    /// Whether a packet of `kind` carrying `metadata` is in this
+    /// department. The Postgres adapter spells the same rule as a
+    /// `CASE` over the same two sources; each is pinned by a test.
+    pub fn keeps(&self, kind: &str, metadata: &serde_json::Value) -> bool {
+        match crate::department::carried(metadata) {
+            Some(own) => own == self.code,
+            None => self.declaring_kinds.iter().any(|k| k == kind),
+        }
+    }
+}
+
 /// The policy-scope slice applied to a listing. Mirrors the shapes
 /// of `boss_policy_client::Predicate` that translate cleanly to SQL;
 /// `DepartmentIs` is absent because Jobs don't carry a department
@@ -159,25 +202,6 @@ pub enum JobScope {
     /// `Subject::Employee { id }` — the policy convention treats
     /// an employee's account_id bucket the same as a account row.
     AccountIn(Vec<String>),
-}
-
-/// One row in the launch-calendar projection. Flat shape the frontend
-/// renders directly — the caller doesn't need to fetch the full Job.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct LaunchCalendarRow {
-    pub job_id: JobId,
-    pub title: String,
-    pub owner_id: Option<String>,
-    pub subject_id: Option<String>,
-    pub status: JobStatus,
-    /// Min sort_order of any non-done step = current tier. Null means
-    /// every step is terminal but the Job isn't closed yet.
-    pub current_tier: Option<i32>,
-    /// `launch_date` from the tier-4 `marketing-launch` step's metadata.
-    /// Null when the step exists but the date hasn't been set yet.
-    pub launch_date: Option<chrono::NaiveDate>,
-    /// Channel label from the launch step ("email" / "webinar" / etc.).
-    pub launch_channel: Option<String>,
 }
 
 /// One cohort's block in the per-kind terminal report — Tier 1 of
@@ -587,6 +611,26 @@ pub struct EstateBatchOutcome {
     pub roles_inserted: usize,
 }
 
+/// Which rows of one event kind [`JobsRepository::recent_events_by_kind`]
+/// reads: an exact payload `scope`, and a half-open `[since, until)`
+/// window on the event's timestamp — every filter applied where the
+/// limit is. All absent reads the whole kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventWindow {
+    pub scope: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One page of an event series, newest first, as the raw rows
+/// `{event_id, timestamp, source, kind, payload}`, and how many rows
+/// its WINDOW holds — so `rows.len() < total` says there is more.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventPage {
+    pub rows: Vec<serde_json::Value>,
+    pub total: i64,
+}
+
 /// The fact one declaration leaves: `node.declared`, once per node the
 /// batch changed (its row inserted, or a role landed on it), carrying
 /// the declaration, what landed, and `declared_by` from the stamp.
@@ -744,6 +788,60 @@ pub trait JobsRepository: Send + Sync {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
+    /// Close the Job, writing ONLY the fields a close owns: `status`
+    /// becomes `closed`, `closed_on` is set, and `owned`'s top-level
+    /// keys (`closed_at`, and `outcome` when the close names one) merge
+    /// into `metadata` against the row as it stands. Every other key
+    /// and every other envelope field is left exactly as the row holds
+    /// it at write time.
+    ///
+    /// It is also a compare-and-set on the status: only an OPEN row
+    /// closes. A row already Closed (another closer won), Cancelled or
+    /// Draft is left untouched and the answer is `Ok(None)` — nothing
+    /// written, nothing recorded. `Some` carries the post-close row.
+    ///
+    /// WHY (backlog 29a7ea09): the two closers of a step write — the
+    /// declared-terminal close and the all-steps-terminal catch-all —
+    /// were each GET → mutate → whole-row `update_job_at`. Measured on
+    /// car 6b23d135 at 2026-09-24T22:18:10Z: the terminal close wrote
+    /// `outcome=disproved`, then the catch-all, holding a copy read
+    /// before that write committed, wrote its whole row back and the
+    /// outcome was gone. Any key another writer merged between a
+    /// closer's read and its write was lost the same way, silently — a
+    /// conservation break in the system of record.
+    ///
+    /// Records, in the same transaction, JOB_UPDATED built from the
+    /// POST-close row (full row state, what the rebuild consumes, as
+    /// `merge_job_metadata_at`'s is) and then whatever `markers` builds
+    /// from that same row (the status-changed and closed markers).
+    async fn close_job_at(
+        &self,
+        id: &JobId,
+        closed_on: chrono::NaiveDate,
+        owned: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<Option<Job>, JobsError>;
+
+    /// Append one entry to the Job's reserved `corrections` list
+    /// (`crate::corrections`, design 4105b020), atomically against the
+    /// row as it stands, and return the post-append Job with the index
+    /// the entry landed at. A non-list under the key, or a non-object
+    /// metadata, folds to an empty list first.
+    ///
+    /// Append, never read-modify-write: two corrections landing at once
+    /// must both survive, which a caller-side GET → push → PATCH cannot
+    /// promise. Records, in the same transaction, JOB_UPDATED (full row
+    /// state, what the rebuild consumes — so it must be built from the
+    /// post-append row, as `merge_job_metadata_at`'s is) and
+    /// STEP_CORRECTED naming the step (the entry's `step`) and index.
+    async fn append_step_correction_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError>;
+
     /// Every machine the estate declares.
     ///
     /// Declaring a machine is a change to the TREE that converges
@@ -804,12 +902,19 @@ pub trait JobsRepository: Send + Sync {
     /// This is the same rule `TailQuery::simulated` states in
     /// boss-events: a filter has to be where the LIMIT is applied, or
     /// it does not really filter.
+    ///
+    /// The window's `since` (inclusive) and `until` (exclusive) obey the
+    /// same rule, in time rather than cadence (backlog bf362f25): a
+    /// post-mortem thirty hours on could not reach the rows it needed
+    /// through a reader that only ever served the newest page. The
+    /// page's `total` counts the whole window, so a caller compares its
+    /// rows against it instead of mistaking a full page for the answer.
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError>;
+    ) -> Result<EventPage, JobsError>;
 
     /// The station flow cube over `[since, now]` — how many
     /// obligations of each `(job kind, step kind, spec slug, authority
@@ -855,16 +960,29 @@ pub trait JobsRepository: Send + Sync {
     /// immutability is what makes "in-flight packets stay on the
     /// version they were admitted under" true rather than aspirational.
     ///
-    /// So conversion gets its own door, and the door is narrow: it
-    /// changes exactly one column, and the caller is expected to have
+    /// So conversion gets its own door. The caller is expected to have
     /// asked [`crate::protocol_conversion::convertibility_for_packet`]
-    /// first. Widening `update_job` instead would have let any PUT
-    /// re-pin a packet by accident, which is the failure this shape
-    /// exists to prevent (bfc74b3a).
+    /// first, and hands over what the move writes
+    /// ([`crate::repin::plan`]). Widening `update_job` instead would have
+    /// let any PUT re-pin a packet by accident, which is the failure
+    /// this shape exists to prevent (bfc74b3a).
+    ///
+    /// ONE TRANSACTION, because a move is true of the packet only whole
+    /// (design 7cf202a9 Q2/Q3; backlog 1e973965 measured the door that
+    /// moved the column alone): the pinned version, `record` appended
+    /// to the reserved `repins` list, each re-projected step row, each
+    /// inserted one — recorded as JOB_UPDATED, a STEP_UPDATED per
+    /// rewritten row and a STEP_CREATED per inserted one (the state the
+    /// rebuild replays), and the `jobs.job.repinned` marker carrying
+    /// `record`. A re-projected row that finished between the caller's
+    /// read and this write keeps everything but its `sort_order`: a
+    /// completed step keeps the text it ran under, whoever raced.
     async fn repin_workflow_version_at(
         &self,
         id: &JobId,
         to_version: i32,
+        plan: &crate::repin::RepinPlan,
+        record: &serde_json::Value,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
@@ -932,6 +1050,25 @@ pub trait JobsRepository: Send + Sync {
     /// else is `ClaimConflict` naming the holder. Like
     /// `append_sign_off`, this write path owns its fields — the
     /// generic step UPDATE racing a claim cannot un-decide it.
+    ///
+    /// WHO COUNTS AS "THE CURRENT HOLDER" IS ADAPTER-SCOPED (backlog
+    /// 28dcc735). The Postgres adapter reads the claimant's aliases
+    /// from `actor_aliases` inside the claim transaction, admits a
+    /// holder spelled by any of them, and rewrites `assignee_id` to
+    /// the claimant's registered id (backlog d7fef617: steps nominated
+    /// with an agent's login refused the agent's own claim). It is
+    /// directional: an alias claiming a step the registered id holds
+    /// is refused. Pinned by
+    /// `tests/step_claim_admits_an_aliased_holder_pg.rs`.
+    ///
+    /// The in-memory adapter does NOT implement this: it has no alias
+    /// source and compares spellings exactly, so a port-level test
+    /// cannot catch a regression of the alias admission. Deliberately
+    /// so — an alias store there would be a second identity registry
+    /// to keep in step with the table. Pinned by
+    /// `in_memory::tests::an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source`.
+    /// A new adapter must decide which of the two it is and say so
+    /// here.
     async fn claim_step_at(
         &self,
         step_id: &StepId,
@@ -1185,35 +1322,6 @@ pub trait JobsRepository: Send + Sync {
         &self,
         status: Option<JobStatus>,
     ) -> Result<Vec<(String, i64)>, JobsError>;
-
-    /// For each open Job, compute its "current tier" — the min
-    /// sort_order of any non-terminal step on the Job. Group by
-    /// `(kind, current_tier)` and return the counts. The tier number
-    /// is the step index the Job is currently working on; -1 means
-    /// every step is terminal (completed/skipped) but the Job itself
-    /// hasn't been closed yet.
-    ///
-    /// Drives the live histogram on the operating-model view so a
-    /// Workflow bar can show "how many refurbs are in Acquire vs.
-    /// Refurbish vs. Certify right now." Caller maps tier → phase
-    /// via its own Workflow-specific mapping.
-    async fn jobs_tier_distribution(
-        &self,
-        status: Option<JobStatus>,
-    ) -> Result<Vec<(String, i32, i64)>, JobsError>;
-
-    /// Projection backing the launch-calendar surface and the exec
-    /// next-30-days panel per examples/used-device-shop/design/marketing-needs.md E2. Returns every
-    /// open/in-flight `marketing-motion` Job joined to its tier-4
-    /// `marketing-launch` step so the caller can render a forward
-    /// calendar. `from` / `to` bound the launch_date window; Jobs
-    /// whose launch step has no date yet are returned with `launch_date
-    /// = None` so the UI can bucket them under "unscheduled".
-    async fn list_launch_calendar(
-        &self,
-        from: chrono::NaiveDate,
-        to: chrono::NaiveDate,
-    ) -> Result<Vec<LaunchCalendarRow>, JobsError>;
 
     // ----- Cross-job dependency resolution (D10) -----
 

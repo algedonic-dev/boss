@@ -1,107 +1,156 @@
 /* =============================================================================
-   Algedonic Ales — Design Language v1.0
+   BOSS — Enamel
    --------------------------------------------------------------------------
-   "The brand is a control system with a sense of humor. Everything reads
-   like instrumentation — monospace labels, signal green, hairline rules —
-   but the voice underneath is warm. Precision in the chrome, wit in the
-   copy."
+   Transit taken to station signage (design a4df741a, David 2026-09-24:
+   "I like Enamel. Let's start there." — and on density, "Let's do
+   comfortable rows. We are here all the time, so we want it easy on the
+   eyes."). One LIGHT theme for the product and the brand (design
+   dea94998): night ink on white, one blue for action and progress,
+   squared 4px corners, headers as enamel bands, states as solid plates
+   that always carry their word. The values are the fold's
+   (docs/architecture-decisions.md, "Its parts are Enamel") and are pinned
+   by enamel-tokens.test.ts; this block replaced the dark Space Grotesk
+   system (Design Language v1.0) as a re-skin, not a rename — the names
+   below are the ones ~120 components already read (backlog e4b58c50).
 
    Self-hosted faces, not a CDN @import. The playground is a public
    deployment: an external font host is a third-party dependency on every
-   page load and leaks visitor IPs to it. These are the same Google
-   subsets, served from our own origin.
+   page load and leaks visitor IPs to it. These ARE Google Fonts — the
+   latin + latin-ext subsets of Overpass and Overpass Mono that Google
+   Fonts' own stylesheet serves (v19 and v21), fetched once and served
+   from our own origin.
 
    Bun inlines CSS-referenced assets as base64 data: URIs and offers no
    knob to stop it (the `loader` map only governs JS imports), so these
    land inside the render-blocking stylesheet rather than as separate
-   files. That makes the payload a real cost, which is why the set is cut
-   to what an English-language console needs: latin + latin-ext for DM
-   Mono 400/500 and the Space Grotesk variable. Vietnamese and the mono
-   italic were dropped — 84KB of font in total.
-
-   If this stylesheet ever needs to shrink, moving @font-face out to its
-   own non-blocking <link> is the lever, not re-adding a CDN.
+   files. Two variable files per family keep every weight the app sets:
+   140KB of font, against the 84KB of the faces they replaced. If this
+   stylesheet ever needs to shrink, moving @font-face out to its own
+   non-blocking <link> is the lever, not re-adding a CDN.
    ========================================================================== */
 
-/* DM Mono — instrument type. 400/500 roman, 400 italic. */
+/* Overpass — voice type. One variable file per subset covers 400-900. */
 @font-face {
-  font-family: 'DM Mono'; font-style: normal; font-weight: 400; font-display: swap;
-  src: url('./assets/fonts/dmmono-400-latin.woff2') format('woff2');
+  font-family: 'Overpass'; font-style: normal; font-weight: 400 900; font-display: swap;
+  src: url('./assets/fonts/overpass-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: 'DM Mono'; font-style: normal; font-weight: 400; font-display: swap;
-  src: url('./assets/fonts/dmmono-400-latin-ext.woff2') format('woff2');
+  font-family: 'Overpass'; font-style: normal; font-weight: 400 900; font-display: swap;
+  src: url('./assets/fonts/overpass-latin-ext.woff2') format('woff2');
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
+/* Overpass Mono — instrument type. One variable file per subset covers 400-600. */
 @font-face {
-  font-family: 'DM Mono'; font-style: normal; font-weight: 500; font-display: swap;
-  src: url('./assets/fonts/dmmono-500-latin.woff2') format('woff2');
+  font-family: 'Overpass Mono'; font-style: normal; font-weight: 400 600; font-display: swap;
+  src: url('./assets/fonts/overpassmono-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: 'DM Mono'; font-style: normal; font-weight: 500; font-display: swap;
-  src: url('./assets/fonts/dmmono-500-latin-ext.woff2') format('woff2');
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-}
-/* Space Grotesk — voice type. One variable file per subset covers 400-700. */
-@font-face {
-  font-family: 'Space Grotesk'; font-style: normal; font-weight: 300 700; font-display: swap;
-  src: url('./assets/fonts/spacegrotesk-latin.woff2') format('woff2');
-  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-}
-@font-face {
-  font-family: 'Space Grotesk'; font-style: normal; font-weight: 300 700; font-display: swap;
-  src: url('./assets/fonts/spacegrotesk-latin-ext.woff2') format('woff2');
+  font-family: 'Overpass Mono'; font-style: normal; font-weight: 400 600; font-display: swap;
+  src: url('./assets/fonts/overpassmono-latin-ext.woff2') format('woff2');
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 :root {
-  /* --- Ground. Depth comes from border + background steps, never shadow. --- */
-  --void: #0d1014;      /* page background */
-  --ink: #12161c;       /* cards, panels */
-  --fog: #e8ecef;       /* primary text */
-  --signal: #5fd4a8;    /* accent, links, live states */
-  --static: #7a838c;    /* secondary text */
-  --hairline: #2a3138;  /* every border in the system */
+  /* --- Ground. The names are the dark system's, kept so every var() call
+     site re-skins without an edit; what each one MEANS is unchanged
+     (--void is the page, --ink a panel, --fog the text). Transit calls
+     the text colour "ink", which is why the map's block below is
+     prefixed rather than bare. --- */
+  --void: #FFFFFF;      /* page ground */
+  --ink: #FFFFFF;       /* cards, panels — set apart by rules, not shade */
+  --fog: #0E1B2E;       /* night ink: primary text */
+  --signal: #0F6E9F;    /* action and progress, links */
+  --static: #4F5D72;    /* secondary text */
+  --hairline: #DCE2EA;  /* every quiet rule in the system */
 
-  /* Two derived grounds the spec implies but doesn't name: a raised panel
-     (rows, nested cards) and a hover wash. Both are steps between VOID and
-     INK, so they stay inside the no-shadow rule. */
-  --ink-raised: #171c24;
-  --wash: rgba(232, 236, 239, 0.04);
+  /* A raised row or nested card, and a hover wash — both steps from the
+     white ground, so depth still comes from rules and grounds, never a
+     shadow. The signal wash marks a selection; the scrim sits behind a
+     modal. */
+  --ink-raised: #F1F3F6;
+  --wash: rgba(14, 27, 46, 0.04);
+  --signal-wash: rgba(15, 110, 159, 0.10);
+  --scrim: rgba(14, 27, 46, 0.55);
 
-  /* --- Status. Palette extension: the spec assigns SIGNAL to accent AND
-     live state and caps it at "one thing per view", which a console with
-     concurrent error/warn/ok on screen cannot honor. OK is a desaturated
-     SIGNAL so the family reads as one system.
+  /* --- Enamel bands: headers and table heads, white on night ink. --- */
+  --band: var(--fog);
+  --on-band: #FFFFFF;
+  /* The chrome bar is the widest band (backlog 7eb59678 car 2), and it
+     carries words quieter than a heading — the tabs you are not on, the
+     time's label — plus a hover ground and a frame for its two ghost
+     buttons. All are white let into the ink, so they stay one family with
+     the band: dim words 9.8:1 on it (7.9:1 on the hover ground), the rule
+     3.8:1 as a control edge. */
+  --on-band-dim: rgba(255, 255, 255, 0.74);
+  --band-raised: rgba(255, 255, 255, 0.10);
+  --band-rule: rgba(255, 255, 255, 0.40);
 
-     The rule that keeps the spec intact: SIGNAL is never used for status,
-     and status colors are never used for emphasis. --- */
-  --ok: #4fb98a;
-  --warn: #d9a441;
-  --err: #e2685c;
+  /* --- Keyboard focus: an amber ring, the one amber outside a state. A
+     focused field wears it as a halo instead, the board's --halo. --- */
+  --focus: #D9A400;
+  --halo: rgba(217, 164, 0, 0.35);
 
-  /* --- Type. Space Grotesk is voice, DM Mono is instrument. --- */
-  --font-body: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* --- States are solid PLATES that always carry their word, so none is
+     ever read by colour alone. Each plate names the ink its word is set
+     in. --- */
+  --clear: #0B6B4F;     --on-clear: #FFFFFF;
+  --busy: #F2C230;      --on-busy: var(--fog);
+  --troubled: #C8283D;  --on-troubled: #FFFFFF;
+  /* A step's lifecycle wears plates too (the fold: "pending dashed, ready
+     solid blue, completed solid ink"). Pending has no ground — it is the
+     frame of a plate not yet filled — so it needs no token of its own. */
+  --ready: var(--signal);  --on-ready: #FFFFFF;
+  --completed: var(--fog); --on-completed: #FFFFFF;
+
+  /* --- A state's WORDS on the ground: the ~400 call sites that colour
+     text, a rule or a rail by state. Clear and troubled read on white as
+     they are (6.5:1, 5.5:1). Busy's plate does not — #F2C230 is 1.6:1 as
+     text on white — so warn takes the round-2 board's warn ink, and busy
+     stays the plate and the line. Each has a wash for a tinted row. --- */
+  --ok: var(--clear);
+  --warn: #6B4A00;
+  --err: var(--troubled);
+  /* The round-2 board sets troubled's WORDS a shade deeper than its plate
+     wherever they explain rather than label: a field's error line (and the
+     failed read's words). 8.1:1 on white. */
+  --troubled-ink: #9B1C2C;
+  --ok-wash: rgba(11, 107, 79, 0.10);
+  --warn-wash: rgba(242, 194, 48, 0.22);
+  --err-wash: rgba(200, 40, 61, 0.08);
+
+  /* --- Type. Overpass is voice, Overpass Mono is instrument. --- */
+  --font-body: 'Overpass', 'Trebuchet MS', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'Overpass Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   /* Retained so the ~40 call sites still referencing a display face resolve
-     to the new voice type rather than falling back to a system serif. */
+     to the voice type rather than falling back to a system serif. */
   --font-display: var(--font-body);
 
   /* Mono is ALWAYS caps + letterspaced. These three cover the whole range
-     the spec allows (0.1em data -> 0.3em section numbers). */
+     (0.1em data -> 0.3em section numbers); buttons are tracked too. */
   --ls-label: 0.1em;
   --ls-nav: 0.14em;
   --ls-eyebrow: 0.3em;
+  --ls-button: 0.06em;
 
-  /* --- Space. 4px base. The spec's ad-hoc 72/28/14 values round onto this. --- */
+  /* --- Space. 4px base, unchanged by Enamel: --s1..--s7, with 72 for page
+     gutters only. --- */
   --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
   --s5: 24px; --s6: 32px; --s7: 48px; --s8: 72px;
 
-  /* Square corners are load-bearing in this language. Kept as a token so
-     the ~200 `border-radius` declarations still to be converted have one
-     place to land. */
-  --radius: 0;
+  /* --- Shape. Corners squared to the 4px of a pressed sign, 3px on fields
+     and chips; buttons and fields framed in 2px. --- */
+  --radius: 4px;
+  --radius-field: 3px;
+  --frame: 2px;
+
+  /* --- Density. Comfortable rows everywhere, working lists included
+     (David 2026-09-24, confirming the fold: "Yes, let's do comfortable.
+     That will also help constrain us to be smarter about what we show on
+     each page"). The board's 12px cells, 10px under a band head. --- */
+  --row-pad-y: 12px;
+  --row-pad-x: 14px;
+  --head-pad-y: 10px;
 }
 
 /* =============================================================================
@@ -125,10 +174,10 @@
   --panel: var(--ink);
   --border: var(--hairline);
   --panel-border: var(--hairline);
-  --border-strong: #3a434d;
+  --border-strong: var(--fog);  /* Enamel frames are night ink */
   --text: var(--fog);
   --text-dim: var(--static);
-  --text-faint: #5c656e;
+  --text-faint: #5E6B7F;        /* between --static and a hint; 5.4:1 on white */
   --accent: var(--signal);
   --mono: var(--font-mono);
 
@@ -137,15 +186,48 @@
   --surprise-med: var(--warn);
   --surprise-low: var(--static);
 
-  /* Brewery amber survives as the WARN hue; the creams and malts were
-     light-theme grounds and become dark equivalents so any remaining call
-     site renders legibly instead of painting a cream block on VOID. */
+  /* Brewery amber survives as the busy hue. The creams and malts were
+     light-theme grounds under the dark system, and on white they are
+     again what they say. */
   --brew-amber: var(--warn);
-  --brew-amber-soft: #e8c37a;
-  --brew-amber-bg: rgba(217, 164, 65, 0.12);
+  --brew-amber-soft: var(--busy);
+  --brew-amber-bg: var(--warn-wash);
   --brew-malt: var(--static);
   --brew-malt-dark: var(--fog);
   --brew-cream: var(--ink);
+}
+
+/* =============================================================================
+   The map — its palette in the route-map grammar
+   --------------------------------------------------------------------------
+   Design dea94998 (2026-09-23) chose board B · Transit, light only, and
+   this block was laid as its groundwork (backlog 42f66fb3): the map
+   (MapPage, WorldMap, RegionMap) reads ONLY these names and states no
+   fallback, so round 2 is an edit to this block, and a token it retires
+   fails the pin (it/yard/map-palette.test.ts) rather than letting a stale
+   hex repaint the old palette in silence. Round 2 was Enamel, and this
+   is that edit.
+
+   Prefixed because the bare Transit names collide here: this system's
+   --ink is a panel ground, where Transit's is text. A state is a LINE
+   colour with three parts — ink for its words, bg for a wash, edge for
+   the line itself (rails, outlines, lamps). The words are the legible
+   state inks; the lines are the plates. No map state wears a wash yet,
+   so every bg is transparent, which is what it shows.
+   ========================================================================== */
+:root {
+  --map-bg: var(--void);               /* the ground the map is drawn on */
+  --map-surface: var(--ink);           /* bodies on it: sheds, wagons, tokens */
+  --map-ink: var(--fog);               /* figures and names */
+  --map-muted: var(--static);          /* labels, rates, the unmeasured */
+  --map-rule: var(--hairline);         /* frames and the ties */
+  --map-rule-strong: var(--border-strong); /* rails, outlines, unlit lamps */
+  --map-accent: var(--signal);
+  --map-link: var(--signal);
+
+  --map-ok-ink: var(--ok);     --map-ok-bg: transparent;   --map-ok-edge: var(--clear);
+  --map-warn-ink: var(--warn); --map-warn-bg: transparent; --map-warn-edge: var(--busy);
+  --map-bad-ink: var(--err);   --map-bad-bg: transparent;  --map-bad-edge: var(--troubled);
 }
 
 /* =============================================================================
@@ -158,28 +240,75 @@ html, body {
   margin: 0;
   padding: 0;
   font-family: var(--font-body);
-  /* 14px base, not the spec's 16-18px. The spec sets body copy for a
-     marketing page; this is a console whose densest tables carry a dozen
-     columns. The type SCALE below is the spec's — only the base differs. */
+  /* 14px base, not a marketing page's 16-18px: this is a console whose
+     densest tables carry a dozen columns. The round-2 boards were drawn
+     at the same 14px. */
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  /* VOID is painted here, not on a wrapper: several routes render outside
-     .theme-exec, and without this they showed the browser's white behind
-     the app. The browser's default is the only palette we do not choose,
-     so the ground is stated once, unconditionally, for every surface. */
+  /* The ground is painted here, not on a wrapper: several routes render
+     outside .theme-exec, and without this they showed the browser's own
+     default behind the app. The browser's default is the only palette we
+     do not choose, so the ground is stated once, unconditionally, for
+     every surface. */
   background: var(--void);
   color: var(--fog);
 }
 
 a { color: var(--signal); }
-a:hover { color: #8ce4c2; }
+a:hover { color: var(--fog); }
 
-/* Keyboard focus. The spec is silent on it; nothing else in the system
-   uses a SIGNAL outline, so it stays unambiguous as a focus affordance. */
+/* Keyboard focus: Enamel's amber ring. Nothing else in the system is
+   amber outside a state, so it stays unambiguous as a focus affordance. */
 :focus-visible {
-  outline: 2px solid var(--signal);
+  outline: 3px solid var(--focus);
   outline-offset: 2px;
+}
+
+/* Enamel's field (backlog 6f471ff6, car 2): the round-2 board's `.field`
+   — 14px words at 9px 12px in a 2px night-ink frame squared to 3px. Before
+   this there was no shared field rule; 42 rules drew fields in 1px
+   hairlines, five of them focused in a blue outline.
+
+   Written with zero specificity (:where), so it is what a field IS unless
+   its component says otherwise: every input a person types into, every
+   select and textarea, and no box that is ticked, slid, picked or pressed.
+   The shared field classes below (.step-field, .filter-input, .ni-input
+   ...) draw no frame of their own and inherit this one.
+
+   Focus is the board's: the frame turns the action blue inside a 3px amber
+   halo, the ring every other control wears drawn as a glow around a box.
+   Invalid is read off aria-invalid, never a class, so a field cannot look
+   wrong without announcing it; its error line is .field-error, named from
+   the field by aria-describedby. It comes after focus, so a focused
+   invalid field stays red. */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"])),
+:where(select),
+:where(textarea) {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--card);
+  border: var(--frame) solid var(--border-strong);
+  border-radius: var(--radius-field);
+  padding: 9px 12px;
+}
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"])):focus,
+:where(select):focus,
+:where(textarea):focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--halo);
+}
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]))[aria-invalid="true"],
+:where(select)[aria-invalid="true"],
+:where(textarea)[aria-invalid="true"] {
+  border-color: var(--troubled);
+}
+.field-error {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--troubled-ink);
 }
 
 /* --- Instrument type utilities -------------------------------------------
@@ -236,10 +365,10 @@ a:hover { color: #8ce4c2; }
   padding-top: 44px;
 }
 
-/* The sidebar was already dark, but on the old warm-stone ramp
-   (#1c1917 / #292524 / #44403c). Against VOID those browns read as a
-   different product bolted on, so the whole chrome moves onto the
-   shared cool palette. */
+/* The sidebar paints from the shared tokens and nothing of its own: it
+   once carried a warm-stone ramp (#1c1917 / #292524 / #44403c) that read
+   as a different product bolted on, and a re-skin must reach it by the
+   same edit as every other surface. */
 .shell-sidebar {
   background: var(--ink);
   color: var(--fog);
@@ -273,7 +402,7 @@ a:hover { color: #8ce4c2; }
 }
 .shell-nav-group-label:hover { color: var(--fog); }
 .shell-nav-group-chevron { font-size: 10px; color: var(--static); width: 10px; letter-spacing: 0; }
-/* Nav is instrument type: DM Mono, caps, letterspaced — §03 assigns NAV
+/* Nav is instrument type: the mono face, caps, letterspaced — §03 assigns NAV
    to the mono face explicitly. */
 .shell-nav-item {
   display: flex; align-items: center; gap: var(--s2);
@@ -299,7 +428,7 @@ a:hover { color: #8ce4c2; }
   padding: 1px 5px;
   border-radius: 9px;
   background: var(--signal);
-  color: var(--void, #0D1014);
+  color: var(--void);
   font: 500 10px var(--font-mono);
   letter-spacing: 0;
   text-align: center;
@@ -355,6 +484,36 @@ a:hover { color: #8ce4c2; }
 }
 .shell-main { grid-column: 2; }
 
+/* THE PHONE SHELL (design 62de32ae decision 12, car G). Measured
+   2026-09-24 at 390px on /it: the page was 1246px wide. The fixed
+   sidebar's 200px column is reserved at every width, and the content
+   column is `1fr` — `minmax(auto, 1fr)` — so it grew to its widest
+   child's min-content: the world map's 900px floor plus the gutters,
+   1046px. No page could have a phone view inside that. At phone width
+   the sidebar collapses into one row of its own links under the tab
+   bar, scrolling sideways inside itself, and the content column may be
+   narrower than its content (`minmax(0, 1fr)`), so a wide map scrolls
+   in its own frame instead of widening the page. The width is
+   PHONE_QUERY in it/yard/phone-strip.ts, pinned equal by its test. */
+@media (max-width: 720px) {
+  .app-shell { grid-template-columns: minmax(0, 1fr); }
+  .shell-sidebar {
+    position: static;
+    width: auto;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: none;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .shell-nav { display: flex; align-items: center; gap: var(--s1); padding: var(--s2); overflow: visible; }
+  .shell-nav-personal, .shell-nav-group { display: flex; gap: var(--s1); margin: 0; padding: 0; border: none; }
+  .shell-nav-group-label, .shell-sidebar-footer { display: none; }
+  .shell-nav-item { white-space: nowrap; }
+  .shell-main { grid-column: 1; min-width: 0; }
+  .shell-content { padding: 0 16px 24px; }
+}
+
 /* My Day page */
 .me-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .me-stats { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -381,40 +540,6 @@ a:hover { color: #8ce4c2; }
 .me-links { display: flex; flex-direction: column; gap: 4px; }
 .me-links a { font-size: 13px; color: var(--fog); text-decoration: underline; padding: 2px 0; }
 
-/* Persona switcher (demo only). */
-.persona-switcher {
-  position: fixed;
-  bottom: 16px;
-  left: 216px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: var(--radius);
-  background: var(--ink);
-  border: 1px solid var(--hairline);
-  z-index: 30;
-  font-size: 12px;
-}
-.persona-label {
-  color: var(--static);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 10px;
-  font-weight: 600;
-}
-.persona-select {
-  border: none;
-  background: transparent;
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--fog);
-  padding: 2px 4px;
-  cursor: pointer;
-  outline: none;
-  max-width: 280px;
-}
 
 /* =============================================================================
    Theme — EXEC (editorial layout)
@@ -452,69 +577,36 @@ a:hover { color: #8ce4c2; }
     var(--s8);
 }
 
-/* Omnibox — global search in nav bar */
-.omnibox { position: relative; margin-right: 4px; }
-.omnibox-input {
-  width: 160px; padding: 4px 10px; font-size: 12px; font-family: inherit;
-  border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--void); color: var(--fog);
-  transition: width 0.2s, border-color 0.15s;
-}
-.omnibox-input:focus { width: 240px; outline: none; border-color: var(--signal); background: var(--void); }
-.omnibox-input::placeholder { color: var(--static); }
-.omnibox-dropdown {
-  position: absolute; top: calc(100% + 6px); left: 0; width: 360px;
-  background: var(--ink); border: 1px solid var(--hairline); border-radius: var(--radius);
-  z-index: 100;
-  max-height: 400px; overflow-y: auto;
-}
-.omnibox-group {
-  font-size: 11px; font-weight: 600; color: var(--static); text-transform: uppercase;
-  letter-spacing: 0.05em; padding: 10px 14px 4px;
-}
-.omnibox-result {
-  display: flex; gap: 8px; align-items: baseline; width: 100%;
-  text-align: left; padding: 6px 14px; border: none; background: none;
-  font-family: inherit; font-size: 13px; cursor: pointer;
-}
-.omnibox-result:hover, .omnibox-result-active { background: var(--wash); }
-.omnibox-result-label { font-weight: 500; white-space: nowrap; }
-.omnibox-result-detail { color: var(--static); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
+/* The page header is Enamel's title (backlog 6f471ff6, car 1): the round-2
+   board's composed page runs band -> label -> uppercase title + subtitle,
+   with no rule under it. The amber rule and the diamond eyebrow it
+   replaces were Design Language v1.0's taproom accents, and Enamel keeps
+   amber for focus alone. */
 .exec-header {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  margin-bottom: 32px;
-  padding-bottom: 18px;
-  /* Brewery accent: amber-malt rule under every page header instead
-     of a flat stone border. Subtle taproom signature without
-     touching the data tables below. */
-  border-bottom: 2px solid var(--brew-amber);
-  gap: 32px;
+  margin-bottom: var(--s6);
+  gap: var(--s6);
 }
+/* The board's small label: mono 11px caps, tracked .1em, muted. */
 .exec-eyebrow {
-  font-size: 11px;
-  font-weight: 600;
+  font: 400 11px var(--font-mono);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  /* Brewery accent: roasted-malt brown on the eyebrow ribbons so the
-     page-classification tag reads as part of the brand chrome rather
-     than another piece of muted UI text. */
-  color: var(--brew-malt);
-  margin-bottom: 6px;
+  letter-spacing: var(--ls-label);
+  color: var(--static);
+  margin-bottom: var(--s2);
 }
-.exec-eyebrow::before {
-  content: '◆ ';
-  color: var(--brew-amber);
-  margin-right: 0.15em;
-}
+/* The board's page title: Overpass 900, uppercase, tracked .01em, 26px. */
 .exec-title {
-  font-family: var(--font-display);
-  font-size: 32px;
-  font-weight: 600;
+  font-family: var(--font-body);
+  font-size: 26px;
+  font-weight: 900;
+  line-height: 1.1;
+  text-transform: uppercase;
   margin: 0;
-  letter-spacing: -0.005em;
-  color: var(--brew-malt-dark);
+  letter-spacing: 0.01em;
+  color: var(--fog);
 }
 .exec-subtitle {
   font-size: 15px;
@@ -741,9 +833,25 @@ a:hover { color: #8ce4c2; }
 
 /* A failed load is a failure, not an empty (packet 3fba9c35). Every
    surface that renders its primary dataset marks the failed state
-   with this class so an outage can never pass for "truly empty". */
-.load-failed {
-  color: var(--err);
+   with this class so an outage can never pass for "truly empty".
+   It is drawn as the round-2 board's failed read (backlog 6f471ff6,
+   car 3): a white card with an 8px troubled rail down its left, its
+   words 600 in troubled ink — "the same device as a department line,
+   so it reads as 'this line is down'". The selector outranks any ONE
+   page class on the same element, because the marker rides beside
+   them. Measured under the outage crawl on 2026-09-24, before this
+   rule: of 39 routes showing the marker, NONE drew a rail, and on 25
+   its words were not red at all but an empty's muted grey — the
+   `.theme-exec .empty` it shares a paragraph with (0-2-0), or a scoped
+   page class, won the colour back from the bare `.load-failed`. */
+:root body .load-failed {
+  background: var(--card);
+  border: 0;
+  border-left: 8px solid var(--troubled);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  color: var(--troubled-ink);
+  font-weight: 600;
   font-style: normal;
 }
 
@@ -774,30 +882,30 @@ a:hover { color: #8ce4c2; }
   color: var(--text-dim);
   margin-bottom: 8px;
 }
-.filter-input {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  font-size: 13px;
-  color: var(--text);
-  font-family: inherit;
-}
-.filter-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+/* .filter-input (web-kit SearchInput) is Enamel's field, drawn by the one
+   field rule near the top; it keeps its class as a hook and no look. */
 
-.filter-btn {
+/* Enamel's filter chip (backlog 6f471ff6, car 2): the round-2 board's
+   `.chip` — 12.5px at 5px 12px, squared to 3px, in a 2px ink frame; the
+   pressed chip is solid ink under white words. It is pressed by
+   aria-pressed, the attribute a screen reader announces, so a chip cannot
+   look chosen without saying so; the -active classes stay in the markup as
+   test hooks and draw nothing. .filter-button is the same chip under the
+   name two pages (jobs, assets) gave it. (This app's .chip is a TAG, a
+   quiet framed word, so the board's chip lives under these names.) */
+.filter-btn, .filter-button {
   text-align: left;
-  background: transparent;
-  border: none;
-  padding: 6px 10px;
-  border-radius: var(--radius);
-  font-size: 13px;
-  color: var(--text-dim);
+  background: var(--card);
+  border: var(--frame) solid var(--border-strong);
+  padding: 5px 12px;
+  border-radius: var(--radius-field);
+  font-size: 12.5px;
+  color: var(--text);
   cursor: pointer;
   font-family: inherit;
 }
-.filter-btn:hover { background: var(--wash); color: var(--text); }
-.filter-btn-active { background: var(--wash); color: var(--text); font-weight: 500; }
+.filter-btn:hover, .filter-button:hover { background: var(--wash); }
+.filter-btn[aria-pressed="true"], .filter-button[aria-pressed="true"] { background: var(--fog); color: var(--void); border-color: var(--fog); font-weight: 700; }
 
 .catalog-grid {
   display: grid;
@@ -843,9 +951,9 @@ a:hover { color: #8ce4c2; }
   text-transform: uppercase;
   letter-spacing: 0.08em;
   padding: 3px 8px;
-  background: rgba(13, 16, 20, 0.6);
+  background: var(--band);
+  color: var(--on-band);
   border-radius: var(--radius);
-  backdrop-filter: blur(4px);
 }
 .catalog-card-body { padding: 16px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
 .catalog-card-name { font-size: 15px; font-weight: 600; }
@@ -896,6 +1004,63 @@ a:hover { color: #8ce4c2; }
 }
 .chip-muted { background: transparent; color: var(--text-faint); }
 .chip-warn { background: var(--wash); color: var(--warn); border-color: var(--warn); }
+
+/* =============================================================================
+   States are plates
+   --------------------------------------------------------------------------
+   Enamel's states are solid PLATES that always carry their word (the fold,
+   "Its parts are Enamel"; backlog 7eb59678 car 2), so no state is ever
+   read by colour alone, and a plate never needs a legend. A .chip is a TAG
+   — a kind, a label, a count — and stays a quiet framed word; a state is
+   a plate. Until this car every state pill in the shared chrome was the
+   chip with a tinted word on a 4% wash: the Transit board's tinted pills,
+   the one David did not choose.
+
+   Cut like a pressed sign: squared to the chip's 3px, set in the
+   instrument face in tracked caps, and framed in its own ground, so a
+   filled plate and pending's dashed frame are the same size on a row.
+   The frame is the whole of pending — the plate not yet filled — which is
+   why it is dashed ink rather than a pale fill, and why skipped (a plate
+   that will never be filled) is the same frame gone quiet and struck.
+
+   A step's status IS one of these states (boss-core StepStatus: pending ->
+   ready -> active -> completed, + skipped), so .step-status-<s> is grouped
+   with the plate it wears here rather than painted a second time; the
+   legacy `done` / `waived` words still render on unmigrated rows.
+   enamel-tokens.test.ts pins every pairing. */
+.plate,
+.step-status {
+  display: inline-block;
+  padding: 1px 7px 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-field);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 17px;
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.plate-clear { background: var(--clear); color: var(--on-clear); border-color: var(--clear); }
+.plate-busy,
+.step-status-active { background: var(--busy); color: var(--on-busy); border-color: var(--busy); }
+.plate-troubled { background: var(--troubled); color: var(--on-troubled); border-color: var(--troubled); }
+.plate-ready,
+.step-status-ready { background: var(--ready); color: var(--on-ready); border-color: var(--ready); }
+/* The three lifecycle-only plates: nothing but a step's status wears them
+   yet, so they have no .plate-* name of their own until something does
+   (a-new-style-has-a-caller). */
+.step-status-completed,
+.step-status-done { background: var(--completed); color: var(--on-completed); border-color: var(--completed); }
+.step-status-pending { background: transparent; color: var(--fog); border-color: var(--border-strong); border-style: dashed; }
+.step-status-skipped,
+.step-status-waived { background: transparent; color: var(--static); border-color: var(--static); border-style: dashed; text-decoration: line-through; }
+/* Not a state: a value with no signal to give (StatusChip's `muted` —
+   a subject kind, a `normal` priority). A plain frame, so it cannot be
+   mistaken for pending's dashed one. */
+.plate-quiet { background: transparent; color: var(--static); border-color: var(--hairline); }
 
 /* --- Device detail page --- */
 .breadcrumb {
@@ -1022,18 +1187,24 @@ a:hover { color: #8ce4c2; }
 
 .checklist { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.8; color: var(--text); }
 
+/* Enamel's table: comfortable rows under an enamel-band head (design
+   a4df741a — comfortable everywhere, working lists included). */
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td {
   text-align: left;
-  padding: 8px 12px;
+  padding: var(--row-pad-y) var(--row-pad-x);
   border-bottom: 1px solid var(--border);
 }
 .data-table th {
-  font-size: 10px;
+  padding-block: var(--head-pad-y);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
+  letter-spacing: 0.09em;
+  background: var(--band);
+  color: var(--on-band);
+  border-bottom: 0;
 }
 .data-table td.mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1062,7 +1233,7 @@ a:hover { color: #8ce4c2; }
 .chip-provenance-hand-set { background: var(--wash); color: var(--warn); border-color: var(--warn); }
 .chip-provenance-data-derived { background: var(--wash); color: var(--static); border-color: var(--hairline); }
 
-/* Kanban summary for refurbishment board */
+/* Kanban summary — the Assets list's phase rail */
 .kanban {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -1077,11 +1248,6 @@ a:hover { color: #8ce4c2; }
   padding: 16px 18px;
   border-top: 3px solid var(--stage-color, var(--static));
 }
-.kanban-col[data-stage="intake"] { --stage-color: var(--static); }
-.kanban-col[data-stage="triage"] { --stage-color: var(--signal); }
-.kanban-col[data-stage="refurb"] { --stage-color: var(--fog); }
-.kanban-col[data-stage="qa"] { --stage-color: var(--warn); }
-.kanban-col[data-stage="ready"] { --stage-color: var(--ok); }
 .kanban-head {
   display: flex;
   align-items: baseline;
@@ -1221,9 +1387,8 @@ a:hover { color: #8ce4c2; }
   padding: 12px;
 }
 .shop-card-category {
-  background: rgba(13, 16, 20, 0.6);
-  backdrop-filter: blur(4px);
-  color: var(--fog);
+  background: var(--band);
+  color: var(--on-band);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1302,8 +1467,6 @@ a:hover { color: #8ce4c2; }
 .shop-quote-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; margin-bottom: 16px; }
 .shop-quote-field { display: flex; flex-direction: column; gap: 4px; }
 .shop-quote-field label { font-size: 12px; font-weight: 500; color: var(--static); }
-.shop-quote-field input, .shop-quote-field select, .shop-quote-field textarea {
-  padding: 8px 12px; border: 1px solid var(--hairline); border-radius: var(--radius); font-size: 14px; font-family: inherit; }
 .shop-quote-field textarea { resize: vertical; }
 .shop-quote-field-wide { grid-column: 1 / -1; }
 .shop-quote-actions { display: flex; gap: 8px; }
@@ -1331,7 +1494,6 @@ a:hover { color: #8ce4c2; }
 .provider-config h5 { font-size: 12px; font-weight: 600; color: var(--static); text-transform: uppercase; letter-spacing: 0.05em; margin: 12px 0 8px; }
 .provider-config-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .provider-config-row label { font-size: 13px; min-width: 120px; color: var(--static); }
-.provider-config-input { flex: 1; padding: 5px 10px; border: 1px solid var(--hairline); border-radius: var(--radius); font-size: 13px; background: var(--void); color: var(--fog); }
 .provider-config-actions { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
 .provider-config-actions .at-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .provider-coming-soon { font-size: 11px; font-style: italic; color: var(--static); margin-left: 4px; }
@@ -1377,8 +1539,6 @@ a:hover { color: #8ce4c2; }
 .chip-model-training { background: var(--wash); color: var(--warn); }
 .chip-model-stale { background: var(--wash); color: var(--err); }
 .cto-toolbox-filters { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-.cto-filter-chip { cursor: pointer; font-size: 12px; padding: 3px 10px; border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--wash); color: var(--static); transition: all 0.15s; }
-.cto-filter-chip.active { background: var(--fog); color: var(--void); border-color: var(--fog); }
 .cto-script-count { font-size: 12px; color: var(--static); margin-left: auto; }
 .cto-scripts { display: flex; flex-direction: column; gap: 8px; }
 .cto-script-card { padding: 12px 14px; border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--ink-raised); cursor: pointer; transition: border-color 0.15s; }
@@ -1389,8 +1549,6 @@ a:hover { color: #8ce4c2; }
 .cto-script-desc { font-size: 12px; color: var(--static); line-height: 1.4; }
 .cto-script-details { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
 .cto-script-details code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: var(--radius); }
-.cto-run-btn { margin-top: 8px; padding: 5px 14px; font-size: 12px; font-weight: 600; background: var(--fog); color: var(--void); border: none; border-radius: var(--radius); cursor: pointer; }
-.cto-run-btn:hover { background: var(--static); }
 .cto-planned-label { display: inline-block; margin-top: 8px; font-size: 11px; color: var(--static); font-style: italic; }
 .chip-scraper { background: var(--wash); color: var(--fog); }
 .chip-monitor { background: var(--wash); color: var(--warn); }
@@ -1405,7 +1563,7 @@ a:hover { color: #8ce4c2; }
 .cto-demo-desc { font-size: 12px; color: var(--static); line-height: 1.4; margin-bottom: 8px; }
 .cto-demo-personas { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
 .cto-demo-player { position: relative; }
-.cto-demo-close { position: absolute; top: 8px; right: 8px; background: rgba(13, 16, 20, 0.6); color: var(--fog); border: none; border-radius: var(--radius); padding: 2px 8px; font-size: 11px; cursor: pointer; }
+.cto-demo-close { position: absolute; top: 8px; right: 8px; background: var(--band); color: var(--on-band); border: none; border-radius: var(--radius); padding: 2px 8px; font-size: 11px; cursor: pointer; }
 .cto-links { display: flex; flex-direction: column; gap: 6px; }
 .cto-link { font-size: 14px; color: var(--fog); text-decoration: underline; padding: 4px 0; }
 
@@ -1444,6 +1602,18 @@ a:hover { color: #8ce4c2; }
   color: var(--static); cursor: pointer;
 }
 .inbox-mark-read:hover { border-color: var(--static); color: var(--fog); }
+/* A refused Mark read, on its row (page audit 5477d9eb, 129da587). */
+.inbox-write-refused { margin: 0 0 4px; font-size: 12px; color: var(--err); }
+.inbox-open-anyway { margin-left: 12px; }
+/* The page's exit: per-row Archive and the bulk bar (backlog 5963a322). */
+.inbox-archive { margin-left: 0; }
+.inbox-select { margin: 0; }
+.inbox-bulk { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.inbox-bulk .inbox-mark-read { margin-left: 0; }
+.inbox-bulk .inbox-mark-read:disabled { opacity: 0.5; cursor: default; }
+.inbox-bulk-all { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--static); }
+.inbox-bulk-note { margin: 0 0 8px; font-size: 12px; color: var(--static); }
+.inbox-bulk-note-refused { color: var(--err); }
 
 /* ==========================================================================
    Debug Gear — floating dev tools panel
@@ -1459,80 +1629,20 @@ a:hover { color: #8ce4c2; }
 }
 .debug-gear-btn:hover { opacity: 1; transform: scale(1.1); }
 
-.debug-panel {
-  position: fixed; bottom: 70px; right: 20px; z-index: 9998;
-  width: 340px; max-height: 480px; overflow-y: auto;
-  background: var(--ink); color: var(--fog); border-radius: var(--radius);
-  border: 1px solid var(--hairline);
-  font-size: 13px; font-family: system-ui, sans-serif;
-}
-.debug-panel-header {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 12px 16px; border-bottom: 1px solid var(--hairline);
-}
-.debug-panel-title { font-weight: 700; font-size: 14px; }
+/* The panel's own rules (.debug-panel, -section, -row, -action-btn,
+   -quick-btn, -log ...) had no caller since DebugGear.svelte scoped its
+   look as .debug-gear-*; deleted with the dead button families (backlog
+   6f471ff6, car 4). The compose dialog's close still borrows this one. */
 .debug-close {
   background: none; border: none; color: var(--static); cursor: pointer;
   font-size: 16px; padding: 0; line-height: 1;
 }
 .debug-close:hover { color: var(--fog); }
 
-.debug-section { padding: 12px 16px; border-bottom: 1px solid var(--hairline); }
-.debug-section:last-child { border-bottom: none; }
-.debug-section-title {
-  font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.08em; color: var(--static); margin-bottom: 8px;
-}
-.debug-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.debug-row label { flex: 0 0 50px; font-size: 12px; color: var(--static); }
-.debug-input {
-  flex: 1; background: var(--void); border: 1px solid var(--hairline); border-radius: var(--radius);
-  color: var(--fog); padding: 4px 8px; font-size: 12px; font-family: monospace;
-}
-.debug-input:focus { outline: none; border-color: var(--static); }
-
-.debug-action-btn {
-  width: 100%; padding: 7px 0; margin-top: 4px;
-  background: var(--signal); color: var(--void); border: none; border-radius: var(--radius);
-  font-size: 12px; font-weight: 600; cursor: pointer;
-  transition: background 0.15s;
-}
-.debug-action-btn:hover { background: var(--signal); }
-.debug-action-btn:disabled { background: var(--ink-raised); color: var(--static); cursor: default; }
-
-.debug-result { font-size: 12px; color: var(--static); margin-top: 6px; }
-.debug-error { color: var(--err); }
-
-.debug-quick-btn {
-  display: block; width: 100%; text-align: left;
-  padding: 5px 8px; margin-bottom: 4px;
-  background: var(--wash); border: 1px solid var(--hairline); border-radius: var(--radius);
-  color: var(--fog); font-size: 12px; cursor: pointer;
-  transition: border-color 0.15s;
-}
-.debug-quick-btn:hover { border-color: var(--static); }
-
-.debug-log {
-  max-height: 120px; overflow-y: auto;
-  font-family: monospace; font-size: 11px;
-  background: var(--void); border-radius: var(--radius); padding: 6px 8px;
-}
-.debug-log-empty { color: var(--static); font-style: italic; }
-.debug-log-line { color: var(--static); line-height: 1.4; }
-
 /* ==========================================================================
    HR Workflows
    ========================================================================== */
 
-.hr-select {
-  padding: 5px 10px; font-size: 13px; border: 1px solid var(--hairline);
-  border-radius: var(--radius); background: var(--void); color: var(--fog);
-}
-.hr-action-btn {
-  padding: 5px 14px; font-size: 12px; font-weight: 600;
-  background: var(--fog); color: var(--void); border: none; border-radius: var(--radius); cursor: pointer;
-}
-.hr-action-btn:disabled { background: var(--wash); color: var(--static); cursor: default; }
 .hr-detail-btn {
   padding: 3px 10px; font-size: 11px; border: 1px solid var(--hairline);
   border-radius: var(--radius); background: var(--wash); cursor: pointer; color: var(--fog);
@@ -1542,7 +1652,7 @@ a:hover { color: #8ce4c2; }
   padding: 2px 8px; font-size: 11px; border: 1px solid var(--ok);
   border-radius: var(--radius); background: var(--wash); color: var(--ok); cursor: pointer;
 }
-.hr-done-btn:hover { background: rgba(79, 185, 138, 0.15); }
+.hr-done-btn:hover { background: var(--ok-wash); }
 .hr-progress { width: 100%; height: 6px; background: var(--wash); border-radius: var(--radius); margin-bottom: 2px; }
 .hr-progress-bar { height: 100%; background: var(--ok); border-radius: var(--radius); transition: width 0.3s; }
 .chip-task-pending { background: var(--wash); color: var(--static); }
@@ -1556,7 +1666,7 @@ a:hover { color: #8ce4c2; }
 
 .compose-overlay {
   position: fixed; inset: 0; z-index: 9000;
-  background: rgba(13, 16, 20, 0.6); display: flex; align-items: center; justify-content: center;
+  background: var(--scrim); display: flex; align-items: center; justify-content: center;
 }
 .compose-modal {
   width: 480px; max-width: 90vw; background: var(--ink); border-radius: var(--radius);
@@ -1569,16 +1679,11 @@ a:hover { color: #8ce4c2; }
 .compose-title { font-weight: 700; font-size: 16px; }
 .compose-field { padding: 8px 20px; }
 .compose-field label { display: block; font-size: 12px; font-weight: 600; color: var(--static); margin-bottom: 4px; }
-.compose-input {
-  width: 100%; padding: 6px 10px; font-size: 14px;
-  border: 1px solid var(--hairline); border-radius: var(--radius); box-sizing: border-box;
-}
-.compose-textarea {
-  width: 100%; padding: 8px 10px; font-size: 13px; line-height: 1.5;
-  border: 1px solid var(--hairline); border-radius: var(--radius); resize: vertical; box-sizing: border-box;
-  font-family: inherit;
-}
+.compose-input { width: 100%; box-sizing: border-box; }
+.compose-textarea { width: 100%; line-height: 1.5; resize: vertical; box-sizing: border-box; }
 .compose-actions { padding: 12px 20px 16px; display: flex; gap: 8px; }
+/* A refused Send, in the modal it was asked from (2a6fab80). */
+.compose-refused { margin: 0; padding: 8px 20px 0; font-size: 13px; color: var(--err); }
 
 /* ==========================================================================
    In-app help links
@@ -1609,9 +1714,9 @@ a:hover { color: #8ce4c2; }
    ========================================================================== */
 
 .at-consume-status { font-size: 12px; padding: 6px 10px; border-radius: var(--radius); margin-top: 6px; margin-left: 120px; }
-.at-consume-ok { background: rgba(79, 185, 138, 0.10); color: var(--ok); }
-.at-consume-alert { background: rgba(217, 164, 65, 0.10); color: var(--warn); }
-.at-consume-error { background: rgba(226, 104, 92, 0.10); color: var(--err); }
+.at-consume-ok { background: var(--ok-wash); color: var(--ok); }
+.at-consume-alert { background: var(--warn-wash); color: var(--warn); }
+.at-consume-error { background: var(--err-wash); color: var(--err); }
 
 /* =======================================================================
    Operating Model view
@@ -1692,270 +1797,6 @@ a:hover { color: #8ce4c2; }
 }
 .om-rel-verb { font-size: 12px; color: var(--static); font-style: italic; }
 .om-rel-detail { font-size: 13px; color: var(--static); line-height: 1.5; }
-
-/* =======================================================================
-   Shared button styles (used by Design and Sim pages)
-   ======================================================================= */
-
-.wb-btn {
-  padding: 6px 16px; border-radius: var(--radius); border: none; font-size: 13px;
-  cursor: pointer; font-weight: 500;
-}
-.wb-btn-primary { background: var(--accent); color: var(--void); }
-.wb-btn-primary:hover { opacity: 0.9; }
-.wb-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-/* =============================================================================
-   System Diagram
-   ========================================================================== */
-
-.sd-grid {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.sd-corner {
-  background: var(--bg);
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-}
-.sd-phase-header {
-  padding: 10px 8px;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-dim);
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  text-decoration: none;
-  transition: color 0.15s;
-}
-.sd-phase-header:hover { color: var(--accent); }
-.sd-team-header {
-  padding: 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  background: var(--bg);
-  border-right: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  text-decoration: none;
-  display: flex;
-  align-items: center;
-  transition: color 0.15s;
-}
-.sd-team-header:hover { color: var(--accent); }
-.sd-cell-wrapper {
-  border-bottom: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-  min-height: 56px;
-}
-.sd-cell { height: 100%; padding: 8px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
-.sd-cell-empty { background: transparent; }
-.sd-cell-active { background: var(--card); transition: background 0.2s; }
-.sd-cell-active:hover { background: var(--wash); }
-.sd-cell-low { background: rgba(95, 212, 168, 0.08); }
-.sd-cell-med { background: rgba(95, 212, 168, 0.16); }
-.sd-cell-high { background: rgba(95, 212, 168, 0.28); }
-.sd-cell-activities { display: flex; flex-direction: column; gap: 2px; }
-.sd-activity { font-size: 12px; color: var(--text-dim); }
-.sd-count {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--accent);
-  background: var(--wash);
-  border-radius: var(--radius);
-  padding: 2px 8px;
-  min-width: 28px;
-  text-align: center;
-}
-
-/* External parties */
-.sd-externals { display: flex; gap: 12px; justify-content: center; padding: 12px 0; }
-.sd-externals-top { margin-bottom: 4px; }
-.sd-externals-bottom { margin-top: 4px; }
-.sd-external {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-dim);
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 4px 14px;
-  text-decoration: none;
-  transition: border-color 0.15s, color 0.15s;
-}
-.sd-external:hover { border-color: var(--accent); color: var(--accent); }
-
-/* Lifecycle arrow */
-.sd-lifecycle-arrow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 12px 0 0;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.sd-arrow-line { font-size: 18px; }
-
-/* Job span bars */
-.sd-jobs-layer { padding: 8px 0; }
-.sd-job-bar {
-  background: var(--ink-raised);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
-  padding: 6px 12px;
-  margin: 2px 4px;
-  position: relative;
-  overflow: hidden;
-}
-.sd-job-bar-fill {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  pointer-events: none;
-  opacity: 0.55;
-  z-index: 0;
-}
-.sd-job-bar-segment {
-  height: 100%;
-  position: relative;
-  transition: width 700ms ease-in-out;
-}
-/* A "just-happened" highlight overlay. React re-mounts this element
-   whenever its `pulseToken` key changes; the CSS keyframe then runs
-   from zero, giving a brief flash where work just advanced. */
-.sd-job-bar-pulse {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: var(--signal);
-  opacity: 0;
-  animation: sd-pulse 1200ms ease-out;
-}
-@keyframes sd-pulse {
-  0%   { opacity: 0.85; }
-  60%  { opacity: 0.55; }
-  100% { opacity: 0;    }
-}
-/* Tier colors — a signal-intensity ramp from early (faint) to late
-   (full), with OK for the terminal tier. */
-.sd-tier-0    { background: rgba(95, 212, 168, 0.15); }
-.sd-tier-1    { background: rgba(95, 212, 168, 0.28); }
-.sd-tier-2    { background: rgba(95, 212, 168, 0.42); }
-.sd-tier-3    { background: rgba(95, 212, 168, 0.56); }
-.sd-tier-4    { background: rgba(95, 212, 168, 0.70); }
-.sd-tier-5    { background: rgba(95, 212, 168, 0.85); }
-.sd-tier-done { background: var(--ok); }  /* ok = terminal */
-.sd-job-label { font-size: 12px; font-weight: 600; color: var(--accent); position: relative; z-index: 1; }
-.sd-job-bar .sd-count { position: relative; z-index: 1; }
-.sd-jobs-note { font-size: 13px; color: var(--text-dim); margin: 12px 0 0; line-height: 1.5; }
-
-/* Cross-cutting functions layout */
-.sd-cross-cutting {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 12px;
-  padding: 8px 0;
-}
-.sd-cross-cutting-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 14px 16px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  text-decoration: none;
-  color: var(--text);
-  transition: border-color 0.15s, background 0.15s;
-}
-.sd-cross-cutting-item:hover {
-  border-color: var(--accent);
-  background: var(--wash);
-}
-.sd-cross-cutting-item strong { font-size: 14px; }
-.sd-cross-cutting-desc { font-size: 13px; color: var(--text-dim); line-height: 1.4; }
-
-/* Live activity feed — plain-English narrative of tier transitions. */
-.sd-activity-empty {
-  font-size: 13px;
-  color: var(--text-dim);
-  padding: 16px;
-  background: var(--bg);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  margin: 0;
-}
-.sd-activity-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.sd-activity-item {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
-  padding: 10px 14px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 13px;
-  animation: sd-activity-slide-in 500ms ease-out;
-}
-@keyframes sd-activity-slide-in {
-  0%   { transform: translateY(-4px); opacity: 0;   }
-  100% { transform: translateY(0);    opacity: 1;   }
-}
-.sd-activity-time {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--text-dim);
-  min-width: 80px;
-}
-.sd-activity-kind { color: var(--accent); font-weight: 500; }
-.sd-activity-from { color: var(--text-dim); }
-.sd-activity-to   { color: var(--signal); font-weight: 500; }
-
-/* Knowledge base layer */
-.sd-kb-layer { padding: 8px 0; }
-.sd-kb-flow {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  justify-content: center;
-  padding: 16px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-.sd-kb-node {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 6px 12px;
-}
-.sd-kb-learnings { font-style: italic; color: var(--text-dim); }
-.sd-kb-link { color: var(--accent); text-decoration: none; cursor: pointer; }
-.sd-kb-link:hover { text-decoration: underline; }
-.sd-kb-arrow { font-size: 18px; color: var(--text-dim); }
-.sd-kb-note { font-size: 13px; color: var(--text-dim); margin: 12px 0 0; line-height: 1.5; }
-
-/* Navigation footer */
-.sd-nav-footer { padding: 8px 0; }
-.sd-nav-footer a { font-size: 13px; color: var(--accent); }
 
 /* =============================================================================
    My Day — Job cards
@@ -2248,24 +2089,6 @@ a:hover { color: #8ce4c2; }
   gap: 8px;
   margin-bottom: 4px;
 }
-.admin-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
-.admin-field > span { color: var(--text-dim); font-size: 12px; }
-.admin-field input[type="text"],
-.admin-field input[type="date"],
-.admin-field select,
-.admin-field textarea {
-  padding: 6px 8px;
-  font-size: 13px;
-  font-family: inherit;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--card);
-  color: var(--text);
-}
-.admin-field textarea { font-family: var(--font-mono, ui-monospace, monospace); }
-.admin-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.admin-field-inline { flex-direction: row; align-items: center; gap: 8px; }
-.admin-field-inline > span { flex: 1; }
 .admin-form-actions {
   display: flex;
   align-items: center;
@@ -2288,21 +2111,37 @@ a:hover { color: #8ce4c2; }
   padding: 10px 12px;
   background: var(--wash);
 }
-.btn {
-  padding: 6px 12px;
+/* Enamel's button: tracked caps in a 2px frame. The frame is ink, so a
+   secondary button reads as a sign rather than a hairline box. The values
+   are the round-2 board's `.btn` (backlog 6f471ff6, car 1): 13px, 800,
+   11px 18px, line-height 1; primary filled with the action blue; danger in
+   troubled words and frame; disabled .45; small 12.5px at 7px 12px.
+
+   The old names are aliases on the SAME rules, never a second look. The
+   step plugins (infra/step-plugins/*.js) are bundles served beside the app
+   and still write .step-btn*, and three IT surfaces are left to the IT map
+   cars; every other component names .btn itself. A sign-off's approve is
+   the action that moves the packet on, so it is the primary; its reject is
+   the danger button. */
+.btn, .step-btn, .wb-btn {
+  padding: 11px 18px;
   border-radius: var(--radius);
-  border: 1px solid var(--border);
+  border: var(--frame) solid var(--border-strong);
   background: var(--card);
+  font-family: inherit;
   font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-button);
   cursor: pointer;
   color: var(--text);
 }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-sm { padding: 3px 8px; font-size: 11px; }
-.btn-primary { background: var(--accent); color: var(--void); border-color: var(--accent); }
-.btn-primary:hover { background: var(--signal); }
-.btn-danger-outline { color: var(--err); border-color: var(--err); }
-.btn-danger-outline:hover { background: rgba(226, 104, 92, 0.10); }
+.btn:disabled, .step-btn:disabled, .wb-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-sm { padding: 7px 12px; font-size: 12.5px; }
+.btn-primary, .step-btn-primary, .step-btn-approve { background: var(--accent); color: var(--void); border-color: var(--accent); }
+.btn-danger-outline, .step-btn-reject { color: var(--err); border-color: var(--err); }
+.btn-danger-outline:hover, .step-btn-reject:hover { background: var(--err-wash); }
 
 /* Subject-page deep-link actions: "Create a Job for this …".
    Sits under PageHeader on every Subject detail page (Account,
@@ -2438,11 +2277,6 @@ button.manual-tree-node {
 .jd-main { min-width: 0; }
 .jd-sidebar { display: flex; flex-direction: column; gap: 16px; }
 
-/* Progress */
-.jd-progress { margin-bottom: 16px; }
-.jd-progress-bar { height: 6px; background: var(--border); border-radius: var(--radius); overflow: hidden; }
-.jd-progress-fill { height: 100%; background: var(--accent); border-radius: var(--radius); transition: width 0.3s; }
-
 /* Step list */
 .jd-steps { display: flex; flex-direction: column; gap: 6px; }
 .jd-step {
@@ -2462,8 +2296,8 @@ button.manual-tree-node {
 .jd-step-ds-queued { border-left: 3px solid var(--hairline); }
 .jd-step-ds-ready { border-left: 3px solid var(--signal); }
 .jd-step-ds-in-progress { border-left: 3px solid var(--signal); }
-.jd-step-ds-in-progress-blocked { border-left: 3px solid var(--err); background: rgba(226, 104, 92, 0.08); }
-.jd-step-ds-blocked { border-left: 3px solid var(--warn); background: rgba(217, 164, 65, 0.08); }
+.jd-step-ds-in-progress-blocked { border-left: 3px solid var(--err); background: var(--err-wash); }
+.jd-step-ds-blocked { border-left: 3px solid var(--warn); background: var(--warn-wash); }
 .jd-step-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .jd-step-icon { font-size: 16px; flex-shrink: 0; }
 .jd-step-title { font-size: 14px; font-weight: 500; color: var(--text); flex: 1; }
@@ -2680,14 +2514,6 @@ button.manual-tree-node {
    ========================================================================== */
 
 .jl-filters { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
-.jl-select {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 13px;
-  background: var(--card);
-  color: var(--text);
-}
 .jl-count { font-size: 13px; color: var(--text-dim); margin-left: auto; }
 
 /* Kind-filter chips — long-tail counterpart to the 5 pre-saved
@@ -2745,14 +2571,6 @@ button.manual-tree-node {
 .jl-status-cancelled { color: var(--err); }
 .jl-priority-emergency { background: var(--wash); color: var(--err); border: 1px solid var(--err); }
 .jl-priority-urgent { background: var(--wash); color: var(--warn); border: 1px solid var(--warn); }
-
-/* Phase header count in System Diagram */
-.sd-phase-count {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--accent);
-  margin-top: 2px;
-}
 
 /* =============================================================================
    Knowledge Base View
@@ -2822,24 +2640,8 @@ button.manual-tree-node {
 .step-surface { padding: 12px 0; }
 .step-surface-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .step-surface-header h3 { margin: 0; font-size: 15px; flex: 1; }
-.step-status { font-size: 11px; font-weight: 500; }
-/* Step lifecycle — five states across three stages (JobKind v2).
-   Stage 1: dim (pending) / signal (ready). Stage 2: accent for active.
-   Stage 3: ok for completed, muted struck-through for skipped.
-   The legacy three-class set (`pending` / `done` / `waived`)
-   survives so unmigrated rows still render with their historical
-   colors. See `boss-core::job::StepStatus` doc for the state
-   diagram. */
-/* Stage 1 — pre-execution */
-.step-status-pending { color: var(--text-dim); }
-.step-status-ready { color: var(--signal); font-weight: 600; }
-/* Stage 2 — in-flight */
-.step-status-active { color: var(--accent); }
-/* Stage 3 — terminal */
-.step-status-done,
-.step-status-completed { color: var(--ok); }
-.step-status-waived,
-.step-status-skipped { color: var(--text-dim); text-decoration: line-through; }
+/* .step-status and its five states are plates — see "States are plates"
+   above, where each is grouped with the plate it wears. */
 .step-kind-label { font-size: 10px; text-transform: uppercase; color: var(--text-dim); }
 
 /* Repair/Inspection two-column layout */
@@ -2848,13 +2650,11 @@ button.manual-tree-node {
 .step-repair-form { display: flex; flex-direction: column; gap: 12px; }
 .step-repair-context { display: flex; flex-direction: column; gap: 12px; }
 
-/* Form fields */
-.step-field { display: flex; flex-direction: column; gap: 4px; }
-.step-field label { font-size: 12px; font-weight: 500; color: var(--text-dim); }
-.step-field input, .step-field select, .step-field textarea {
-  padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 13px; background: var(--card); color: var(--text);
-}
+/* Form fields. A step's field is the board's `.field`: its control is
+   Enamel's field (the one rule near the top draws it), and its label is
+   13.5px, 700, in night ink (backlog 6f471ff6, car 2). */
+.step-field { display: flex; flex-direction: column; gap: 5px; }
+.step-field label { font-size: 13.5px; font-weight: 700; color: var(--text); }
 .step-field textarea { resize: vertical; }
 
 /* KB context cards */
@@ -2884,35 +2684,26 @@ button.manual-tree-node {
 /* Refused writes + degraded registry (packet cc9d7fc6). Every step
    surface renders a rejected write inline via .step-write-error; the
    dispatcher renders a failed registry read as .step-registry-error
-   with a Retry beside the still-usable generic fallback. */
+   with a Retry beside the still-usable generic fallback. That banner
+   wears .load-failed (sweep c3e4edcc), which draws its card, rail and
+   ink; this rule only lays it out. */
 .step-write-error { color: var(--err); font-size: 12px; margin: 8px 0 0; }
 .step-registry-error {
   display: flex; align-items: center; gap: 10px;
-  padding: 6px 10px; margin-bottom: 10px;
-  border: 1px solid var(--err); border-radius: var(--radius);
-  color: var(--err); font-size: 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
 }
 .step-registry-error span { flex: 1 1 auto; }
 
 /* Action buttons */
 .step-actions { display: flex; gap: 8px; margin-top: 8px; }
-.step-btn {
-  padding: 6px 14px; border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 13px; background: var(--card); color: var(--text);
-  cursor: pointer; transition: border-color 0.15s;
-}
-.step-btn:hover { border-color: var(--accent); }
-.step-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.step-btn-primary { background: var(--accent); color: var(--void); border-color: var(--accent); }
-.step-btn-primary:hover { background: var(--signal); }
-.step-btn-approve { background: var(--ok); color: var(--void); border-color: var(--ok); }
-.step-btn-reject { background: var(--err); color: var(--void); border-color: var(--err); }
+/* .step-btn and its variants are aliases on Enamel's .btn — see there. */
 
 /* Approval result */
 .step-approval-result { padding: 12px; border-radius: var(--radius); font-size: 14px; }
-.step-approval-approved { background: rgba(79, 185, 138, 0.10); color: var(--ok); border: 1px solid var(--ok); }
-.step-approval-rejected { background: rgba(226, 104, 92, 0.10); color: var(--err); border: 1px solid var(--err); }
-.step-approval-changes-requested { background: rgba(217, 164, 65, 0.10); color: var(--warn); border: 1px solid var(--warn); }
+.step-approval-approved { background: var(--ok-wash); color: var(--ok); border: 1px solid var(--ok); }
+.step-approval-rejected { background: var(--err-wash); color: var(--err); border: 1px solid var(--err); }
+.step-approval-changes-requested { background: var(--warn-wash); color: var(--warn); border: 1px solid var(--warn); }
 .step-approval-comment { margin-top: 6px; font-size: 13px; color: var(--text-dim); }
 
 /* Checklist */
@@ -2922,7 +2713,7 @@ button.manual-tree-node {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   font-size: 13px; cursor: pointer;
 }
-.step-checklist-checked { background: rgba(79, 185, 138, 0.08); text-decoration: line-through; color: var(--text-dim); }
+.step-checklist-checked { background: var(--ok-wash); text-decoration: line-through; color: var(--text-dim); }
 .step-checklist-progress { font-size: 12px; color: var(--text-dim); margin-left: auto; }
 
 /* Metadata display */
@@ -2949,23 +2740,20 @@ button.manual-tree-node {
 .step-plugin-skeleton-row.mid { width: 70%; }
 .step-plugin-skeleton-row.tall { height: 80px; }
 .step-plugin-missing {
-  padding: 8px; background: rgba(217, 164, 65, 0.12); border-radius: var(--radius);
+  padding: 8px; background: var(--warn-wash); border-radius: var(--radius);
   font-size: 12px;
 }
 
 /* A registered bundle that failed to load is NOT "no plugin" — the
    banner names the reason and the generic form renders below it
-   (ff87f782). */
+   (ff87f782). It wears .load-failed (sweep c3e4edcc) for its card, rail
+   and ink; this rule only lays it out. */
 .step-plugin-failed {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 12px;
   margin-bottom: 8px;
-  border: 1px solid #f59e0b;
-  border-radius: 6px;
-  background: #fffbeb;
   font-size: 13px;
 }
 @keyframes step-plugin-shimmer {
@@ -3020,7 +2808,7 @@ button.manual-tree-node {
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
-.pp-glance-stat-warn { border-color: var(--warn); background: rgba(217, 164, 65, 0.10); }
+.pp-glance-stat-warn { border-color: var(--warn); background: var(--warn-wash); }
 .pp-glance-stat-muted { color: var(--text-dim); }
 .pp-glance-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
 .pp-glance-value { font-size: 22px; font-weight: 600; color: var(--text); margin-top: 2px; }
@@ -3033,8 +2821,8 @@ button.manual-tree-node {
   background: var(--ink-raised); border-left: 3px solid var(--hairline);
   font-size: 13px;
 }
-.pp-action-warning { background: rgba(217, 164, 65, 0.10); border-left-color: var(--warn); }
-.pp-action-critical { background: rgba(226, 104, 92, 0.10); border-left-color: var(--err); }
+.pp-action-warning { background: var(--warn-wash); border-left-color: var(--warn); }
+.pp-action-critical { background: var(--err-wash); border-left-color: var(--err); }
 .pp-action-icon { font-size: 16px; flex-shrink: 0; }
 .pp-action-title { flex: 1; font-weight: 500; }
 .pp-action-detail { color: var(--text-dim); font-size: 12px; }
@@ -3093,11 +2881,7 @@ button.manual-tree-node {
   display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
   padding: 6px; background: var(--wash); border-radius: var(--radius);
 }
-.pp-team-select {
-  flex: 1 1 auto; min-width: 120px; padding: 3px 6px;
-  border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 11px; background: var(--void); color: var(--fog);
-}
+.pp-team-select { flex: 1 1 auto; min-width: 120px; }
 .pp-team-post, .pp-team-cancel {
   padding: 3px 10px; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--wash); color: var(--fog); font-size: 11px; cursor: pointer;
@@ -3110,16 +2894,8 @@ button.manual-tree-node {
 .pp-note-body { font-style: italic; color: var(--fog); }
 .pp-note-meta { color: var(--text-dim); margin-top: 4px; font-style: normal; }
 .pp-note-compose { margin-bottom: 12px; }
-.pp-note-textarea {
-  width: 100%; box-sizing: border-box; padding: 6px 8px;
-  border: 1px solid var(--border); border-radius: var(--radius);
-  font: inherit; font-size: 12px; resize: vertical;
-}
+.pp-note-textarea { width: 100%; box-sizing: border-box; resize: vertical; }
 .pp-note-compose-row { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
-.pp-note-kind {
-  padding: 3px 6px; border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 11px; background: var(--void); color: var(--fog);
-}
 .pp-note-post {
   padding: 3px 10px; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--wash); color: var(--fog); font-size: 11px; font-weight: 500; cursor: pointer;
@@ -3167,11 +2943,6 @@ button.manual-tree-node {
 
 .tb-controls { display: flex; justify-content: flex-end; margin-bottom: 8px; gap: 8px; }
 
-.tb-asof input {
-  border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 4px 6px; font-size: 13px; background: var(--void); color: var(--fog);
-}
-
 .tb-table, .tb-periods, .tb-entries, .tb-entry-lines {
   width: 100%; border-collapse: collapse; font-size: 13px;
 }
@@ -3197,8 +2968,7 @@ button.manual-tree-node {
 
 .tb-row { cursor: pointer; }
 .tb-row:hover { background: var(--wash); }
-.tb-row.selected { background: rgba(95, 212, 168, 0.12); }
-.tb-row.selected:hover { background: rgba(95, 212, 168, 0.18); }
+.tb-row.selected, .tb-row.selected:hover { background: var(--signal-wash); }
 
 .pill {
   display: inline-block; padding: 2px 8px; border-radius: var(--radius);
@@ -3233,23 +3003,11 @@ button.manual-tree-node {
 /* Step assignment + schedule row on GenericSurface */
 .step-assign-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .step-assign-row label { font-size: 12px; color: var(--text-dim); min-width: 72px; }
-.step-assign-row select, .step-assign-row input[type="date"] {
-  padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 13px; background: var(--void); color: var(--fog); min-width: 200px;
-}
+.step-assign-row select, .step-assign-row input[type="date"] { min-width: 200px; }
 .step-assign-row .small { color: var(--text-dim); font-size: 11px; }
 .jd-info-action { padding: 8px 12px 12px; }
 .jd-info-action .error { color: var(--err); margin-top: 6px; }
 .jd-assign-inline { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.jd-assign-inline select {
-  font: inherit;
-  padding: 2px 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--card);
-  color: var(--text);
-  max-width: 260px;
-}
 .jd-assign-edit {
   background: transparent;
   border: none;
@@ -3275,10 +3033,6 @@ button.manual-tree-node {
 .ni-field label { font-size: 12px; font-weight: 600; color: var(--text-dim); }
 .ni-field-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .ni-field-row .ni-field { flex: 1; min-width: 140px; margin-bottom: 0; }
-.ni-input {
-  padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  font-size: 13px; background: var(--void); color: var(--fog);
-}
 .ni-num { text-align: right; width: 120px; }
 .ni-hint { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
 
@@ -3291,24 +3045,10 @@ button.manual-tree-node {
 .ni-lines-table td.num, .ni-lines-table th.num { text-align: right; }
 .ni-lines-table tfoot td { border-top: 2px solid var(--border); padding-top: 10px; }
 
-.ni-btn {
-  padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--wash); color: var(--fog); cursor: pointer; font-size: 13px;
-}
-.ni-btn:hover { background: var(--ink-raised); }
-.ni-btn-primary { background: var(--signal); color: var(--void); border-color: var(--signal); }
-.ni-btn-primary:hover { background: var(--signal); }
-.ni-btn-primary:disabled { background: var(--static); border-color: var(--static); cursor: not-allowed; }
-.ni-btn-remove { color: var(--err); border-color: var(--err); }
 .ni-actions { display: flex; gap: 8px; margin-top: 16px; }
 
-/* --- StatusChip tones (@boss/web-kit/ui/StatusChip.svelte) --- */
-/* The closed five-tone set for the generic chip; pairs with the
-   base .chip rule above. Domain chips (chip-cert-*, chip-opp-*,
-   …) predate this and migrate here as their pages get touched
-   (chip-stock-*, chip-emp-* and chip-stage-* already have). */
-.chip-tone-ok     { background: var(--wash); color: var(--ok); border-color: var(--ok); }
-.chip-tone-warn   { background: var(--wash); color: var(--warn); border-color: var(--warn); }
-.chip-tone-err    { background: var(--wash); color: var(--err); border-color: var(--err); }
-.chip-tone-muted  { background: transparent; color: var(--text-faint); }
-.chip-tone-active { background: var(--wash); color: var(--signal); border-color: var(--signal); }
+/* --- StatusChip (@boss/web-kit/ui/StatusChip.svelte) renders the plates
+   defined under "States are plates"; its five tinted .chip-tone-* rules
+   retired with backlog 7eb59678 car 2. Domain chips (chip-cert-*,
+   chip-opp-*, …) predate it and move onto StatusChip as their pages are
+   audited (page-audit's styled step). */

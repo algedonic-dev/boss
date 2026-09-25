@@ -9,7 +9,8 @@
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { expiringCerts } from '../people/utils';
-  import { humanizeClassCode, type Employee } from '../people/types';
+  import { classLabel, type Employee } from '../people/types';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import {
     workflowSurfaces,
     type WorkflowSpec,
@@ -138,6 +139,8 @@
       (e) => e.role === 'lab-tech' || e.role === 'head-brewer',
     ),
   );
+  // Each role cell reads its Class display_name (backlog 8677728c).
+  let roleClasses = $derived(classesFor('employee', 'role'));
 
   // Latest 8 QA jobs in flight (qaKinds-driven feed).
   let recentQaJobs = $derived(
@@ -207,7 +210,7 @@
             <dd><strong>{totalActive > 0 ? (totalCerts / totalActive).toFixed(1) : '0'}</strong></dd>
             <dt>Expiring ≤ 30 days</dt>
             <dd>
-              <strong style={expiring30.length > 0 ? 'color:#b45309' : ''}>{expiring30.length}</strong>
+              <strong style={expiring30.length > 0 ? 'color:var(--warn)' : ''}>{expiring30.length}</strong>
             </dd>
             <dt>Expiring ≤ 60 days</dt><dd><strong>{expiring60.length}</strong></dd>
             <dt>Expiring ≤ 90 days</dt><dd><strong>{expiring90.length}</strong></dd>
@@ -288,7 +291,7 @@
                     {e.name}
                   </Link>
                 </td>
-                <td>{humanizeClassCode(e.role)}</td>
+                <td>{classLabel(e.role, roleClasses)}</td>
                 <td>{e.location}</td>
                 <td class="num">{e.certifications?.length ?? 0}</td>
               </tr>
@@ -347,7 +350,7 @@
                 <td>{row.cert.expires_on}</td>
                 <td class="num">
                   {#if d <= 30}
-                    <strong style="color:#b45309">{d}d</strong>
+                    <strong style="color:var(--warn)">{d}d</strong>
                   {:else}
                     {d}d
                   {/if}
@@ -407,6 +410,6 @@
     font-size: 0.95rem;
     font-weight: 600;
     margin: 0 0 8px;
-    color: #444;
+    color: var(--static);
   }
 </style>

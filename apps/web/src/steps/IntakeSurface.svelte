@@ -200,7 +200,7 @@
   <div class="step-actions">
     {#if !terminal && isPending(step.status)}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('active')}
         disabled={saving}
       >
@@ -209,7 +209,7 @@
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving}
       >
@@ -228,32 +228,32 @@
   }
   .step-line-items td {
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-line-items .qty {
     width: 60px;
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
   .step-line-items .desc {
-    color: var(--text, #111827);
+    color: var(--text);
   }
   .step-line-items .amount {
     width: 100px;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
   .step-line-items tr.total {
     font-weight: 600;
   }
   .step-line-items tr.total td {
-    border-top: 1px solid var(--border, #d1d5db);
+    border-top: 1px solid var(--border);
     border-bottom: none;
-    color: var(--text, #111827);
+    color: var(--text);
   }
   .step-line-items tr.total .amount {
-    color: var(--text, #111827);
+    color: var(--text);
   }
 </style>

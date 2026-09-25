@@ -145,6 +145,7 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: None,
         metadata: serde_json::json!({}),
@@ -172,6 +173,9 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
             filled_by: Default::default(),
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }],
     ))
     .await

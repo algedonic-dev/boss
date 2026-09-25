@@ -318,35 +318,37 @@ impl Bases {
     /// would read some other stack (CLAUDE.md §Doors: a wrong target
     /// answers instead of erroring).
     pub fn on_door(base: &str) -> Result<Self> {
-        let trimmed = base.trim();
-        let (scheme, rest) = match trimmed.split_once("://") {
-            Some((s, r)) => (s, r),
-            None => ("http", trimmed),
-        };
-        let hostport = rest.split('/').next().unwrap_or(rest);
-        // An explicit port is dropped; an IPv6 literal keeps its
-        // brackets, so only a trailing all-digit `:port` is a port.
-        let host = match hostport.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
-            _ => hostport,
-        };
-        if scheme.is_empty() || host.is_empty() {
-            bail!(
-                "--door {base:?} names no host: give the machine door's address, the same \
-                 BOSS_JOBS_URL the estate spells (http://<host>:<jobs port>)"
-            );
-        }
-        let at = |service: &str| format!("{scheme}://{host}:{}", boss_ports::prod(service));
         Ok(Self {
-            classes: at("classes"),
-            ledger: at("ledger"),
-            locations: at("locations"),
-            calendar: at("calendar"),
-            subjects: at("subject-kinds"),
-            policy: at("policy"),
-            people: at("people"),
-            jobs: at("jobs"),
-            dispatcher: at("dispatcher"),
+            classes: service_on_door(base, "classes")?,
+            ledger: service_on_door(base, "ledger")?,
+            locations: service_on_door(base, "locations")?,
+            calendar: service_on_door(base, "calendar")?,
+            subjects: service_on_door(base, "subject-kinds")?,
+            policy: service_on_door(base, "policy")?,
+            people: service_on_door(base, "people")?,
+            jobs: service_on_door(base, "jobs")?,
+            dispatcher: service_on_door(base, "dispatcher")?,
+        })
+    }
+
+    /// The route a `boss tenant` verb takes, and the one line that says
+    /// so: the machine door when one is given, else a gateway, else the
+    /// in-pod localhost ports. Publish and export both call this, so the
+    /// two cannot route one flag two ways (backlog e32a423e: export had
+    /// `--door` and publish had none, leaving an approved publish from
+    /// the operator's seat no way in). clap holds `door` and `gateway`
+    /// exclusive; a door wins here only as a guard.
+    pub fn routed(gateway: Option<&str>, door: Option<&str>) -> Result<(Self, String)> {
+        Ok(match door {
+            Some(d) => (
+                Self::on_door(d)?,
+                format!("routing: each service's own port on the machine door {d}"),
+            ),
+            None => {
+                let bases = Self::resolve(gateway);
+                let line = bases.describe(gateway);
+                (bases, line)
+            }
         })
     }
 
@@ -357,6 +359,37 @@ impl Bases {
             None => "routing: each service's own localhost port (boss_ports)".to_string(),
         }
     }
+}
+
+/// One service of the machine door: `base`'s scheme and host, on the
+/// service's `boss_ports` PROD port. The rule [`Bases::on_door`] applies
+/// to every registry, and the one `boss attach` applies to the file
+/// store (backlog 7610dd2f) — kept here once, so the two cannot learn
+/// different ideas of what a host is.
+///
+/// An explicit port on `base` is dropped (it is the jobs port the
+/// estate spells), a path is not part of the host, and an IPv6 literal
+/// keeps its brackets, so only a trailing all-digit `:port` is a port.
+/// A base with no host is refused rather than resolved into a
+/// well-formed URL that would read some other stack.
+pub fn service_on_door(base: &str, service: &str) -> Result<String> {
+    let trimmed = base.trim();
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("http", trimmed),
+    };
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = match hostport.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => hostport,
+    };
+    if scheme.is_empty() || host.is_empty() {
+        bail!(
+            "{base:?} names no host: give the machine door's address, the same \
+             BOSS_JOBS_URL the estate spells (http://<host>:<jobs port>)"
+        );
+    }
+    Ok(format!("{scheme}://{host}:{}", boss_ports::prod(service)))
 }
 
 /// One shared door and what this directory sends through it.
@@ -3091,6 +3124,53 @@ mod tests {
         // well-formed URL that reads a different stack.
         assert!(Bases::on_door("http://").is_err());
         assert!(Bases::on_door("   ").is_err());
+    }
+
+    /// `boss tenant publish --door` (backlog e32a423e, 2026-09-23): the
+    /// operator's seat reaches production only through the machine
+    /// door — the gateway answers the seed identity 401 and the dev
+    /// session cannot exec into the boss namespace — so publish routes
+    /// the way export does, through the ONE function both verbs call.
+    /// Every registry a publish writes lands on its own prod port of
+    /// the given host, the routing line names the door, and a base
+    /// with no host is refused before any write is planned.
+    #[test]
+    fn a_door_routes_every_registry_a_publish_writes_to_its_prod_port() {
+        let (b, routing) = Bases::routed(None, Some("http://door:7900")).unwrap();
+        for (field, service) in [
+            (&b.classes, "classes"),
+            (&b.ledger, "ledger"),
+            (&b.locations, "locations"),
+            (&b.calendar, "calendar"),
+            (&b.subjects, "subject-kinds"),
+            (&b.policy, "policy"),
+            (&b.people, "people"),
+            (&b.jobs, "jobs"),
+            (&b.dispatcher, "dispatcher"),
+        ] {
+            assert_eq!(
+                field,
+                &format!("http://door:{}", boss_ports::prod(service)),
+                "{service} rides the door on its own prod port"
+            );
+        }
+        assert!(
+            routing.contains("machine door http://door:7900"),
+            "{routing}"
+        );
+
+        // No host is a refusal, not a URL that reads another stack.
+        assert!(Bases::routed(None, Some("http://")).is_err());
+        assert!(Bases::routed(None, Some("  ")).is_err());
+
+        // Without a door, the gateway and the in-pod default are
+        // unchanged — the same bases and line `resolve` gives.
+        let (g, line) = Bases::routed(Some("http://gw:8080"), None).unwrap();
+        assert_eq!(g, Bases::resolve(Some("http://gw:8080")));
+        assert!(line.contains("gateway http://gw:8080"), "{line}");
+        let (d, line) = Bases::routed(None, None).unwrap();
+        assert_eq!(d, Bases::resolve(None));
+        assert!(line.contains("boss_ports"), "{line}");
     }
 
     fn line_of<'a>(lines: &'a [String], path: &str) -> &'a str {

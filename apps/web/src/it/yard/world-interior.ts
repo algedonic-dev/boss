@@ -16,7 +16,7 @@
 // `/api/stations/load`, rate from `/api/stations/flow`), the receiving
 // platforms from the inbound rows `receiving.ts` already parsed and
 // classified. The pages that own those reads hand them up, the way
-// YardPage hands its Scene up for the other six territories — one read
+// FloorDeck hands its Scene up for the other six territories — one read
 // of a region on the page, never two.
 //
 // A NUMBER NOBODY COULD TAKE IS UNKNOWN, NEVER NOUGHT. A station whose
@@ -31,10 +31,18 @@
 // platform that lies fails world-interior.test.ts before it is a
 // picture. WorldMap.svelte owns the strokes.
 
-import { AGE_THRESHOLDS, CHANNELS, ageDays, type Channel, type InboundRow } from '../receiving/receiving';
-import type { Crew } from '../crew/crew';
+import {
+  AGE_THRESHOLDS,
+  CHANNELS,
+  ageDays,
+  standsHere,
+  type Channel,
+  type InboundRow,
+} from '../receiving/receiving';
+import type { Place } from './regions';
+import type { Actor } from './shop-floor';
 import type { Siding } from '../marshalling/marshalling';
-import { contentsBox } from './region-contents';
+import { contentsBox, overflowNoteAt, type NoteAt } from './region-contents';
 import type { Territory } from './world';
 
 /** Which standing packets are flagged, and from which end of the
@@ -44,7 +52,15 @@ export type Flag = Readonly<{ from: 'head' | 'tail'; n: number }>;
 
 /** One queue, drawn as a platform with its packets standing on it. */
 export type Platform = Readonly<{
-  /** The queue's own name — a station, or an inbound channel. */
+  /** WHICH queue — unique among a region's platforms, and what the map
+   *  keys it on. Apart from `name` since backlog 846ab934: the shop
+   *  floor named its crews by actor and keyed them on that name, and
+   *  live every crew is the same actor, so the keyed each threw and
+   *  the region never drew. A station and a channel are their own key;
+   *  a crew is `session:<id>`, the spelling the server's machines use. */
+  key: string;
+  /** The queue's own name — a station, or an inbound channel. The
+   *  label, which need not be unique. */
   name: string;
   /** Packets standing on it. `null` is a count nobody could take. */
   standing: number | null;
@@ -63,14 +79,25 @@ export type Platform = Readonly<{
 export type Deck =
   | Readonly<{ kind: 'reading' }>
   | Readonly<{ kind: 'unavailable'; why: string }>
-  | Readonly<{ kind: 'ready'; region: string; platforms: ReadonlyArray<Platform> }>;
+  | Readonly<{
+      kind: 'ready';
+      region: string;
+      platforms: ReadonlyArray<Platform>;
+      /** THE SHOP FLOOR'S ACTORS (design 62de32ae, decision 8): a lamp
+       *  per session and per run, under the identity they share
+       *  (shop-floor.ts). The shop floor hands these up in place of
+       *  platforms, and the region map draws them instead. */
+      actors?: ReadonlyArray<Actor>;
+    }>;
 
 /** The regions whose interior is platforms rather than wagons in
  *  transit. The other six are region-contents.ts's INTERIOR_REGIONS.
- *  The shop floor joined them on backlog 94c6ffd0: a crew is a
- *  platform and its runs are what stands on it — the same picture as a
- *  queue, because a crew IS one, bounded by how much it can build at
- *  once rather than by a WIP limit. */
+ *  The shop floor joined them on backlog 94c6ffd0 as a platform per
+ *  crew; since decision 8 of design 62de32ae its deck carries ACTORS
+ *  instead (shop-floor.ts) — a lamp per session and per run, labelled,
+ *  because anonymous marks on a crew's track could not say which run
+ *  was building what. It stays in this list because its board mounts
+ *  under the map the same way the queue boards do. */
 export const PLATFORM_REGIONS: ReadonlyArray<string> = ['receiving', 'marshalling', 'shop-floor'];
 
 export function hasPlatforms(region: string): boolean {
@@ -96,6 +123,7 @@ export function marshallingPlatforms(
         ? `${s.flow.served} left in ${windowHours}h`
         : `rate not counted — ${s.flow.reason}`;
     return {
+      key: s.station,
       name: s.station,
       standing: s.depth,
       bound: s.wipLimit,
@@ -106,61 +134,39 @@ export function marshallingPlatforms(
   });
 }
 
-/** THE SHOP FLOOR: a platform per CREW — one open session — with the
- *  runs it dispatched standing on it (design 511fa7d4 car 2b, backlog
- *  94c6ffd0). The busiest crew leads, then the idle ones, so a floor
- *  with someone working reads as working.
- *
- *  A crew whose silence could not be judged is `null`-idle upstream
- *  and says so here rather than claiming either; and `rate` is null on
- *  every platform, because what a crew FINISHED in the window is not
- *  in the reads this board makes — the runs it lists are the open
- *  ones. A `?` is the honest mark for it; a 0 would say the crew
- *  shipped nothing.
- *
- *  `unlinked` is the runs no listed session claims — a hand dispatch,
- *  or a session outside the read window. They get a platform of their
- *  own rather than being dropped, because a run drawn nowhere is the
- *  false-empty class. */
-export function crewPlatforms(
-  crews: ReadonlyArray<Crew>,
-  unlinked: ReadonlyArray<unknown>,
+/** EACH STATION AT THE PARTITION THE SERVER COUNTED (design 62de32ae,
+ *  the rest of decision 5; car E on backlog c3105b2a). A station's
+ *  depth is every packet whose step its predicate matches — an
+ *  untriaged item's `triage` as much as a triaged one's `build` — and
+ *  the marshalling head counts only the packets that are marshalling's.
+ *  Drawn at their depths the platforms stood 562 under a head of 236
+ *  (live, 2026-09-24). The server's `places` carry the partition per
+ *  station, so the platform stands that, and its note keeps the depth
+ *  the station holds in all; the flag, a count of packets past the
+ *  station's WIP bound, never exceeds what the platform stands. A
+ *  platform the server names no place for is left as it was — an older
+ *  server, or a station it did not read — and an unknown stays unknown. */
+export function withPlaces(
+  platforms: ReadonlyArray<Platform>,
+  places: ReadonlyArray<Place>,
 ): ReadonlyArray<Platform> {
-  const platforms = crews.map((c): Platform => {
-    const who = c.session.actor ?? c.session.title;
-    const state = c.idle === null ? 'silence not measured' : c.idle ? 'idle' : 'at work';
-    const prompts = c.session.promptCount === null ? null : `${c.session.promptCount} prompts`;
+  return platforms.map((p): Platform => {
+    const place = places.find((x) => x.name === p.key);
+    if (place === undefined || p.standing === null || place.count === p.standing) return p;
+    const own = `${place.count} of the ${p.standing} here are marshalling’s`;
     return {
-      name: who,
-      standing: c.runs.length,
-      bound: null,
-      rate: null,
-      flag: { from: 'tail', n: 0 },
-      note: [state, prompts, c.session.host].filter((p) => p !== null && p !== '').join(' · '),
+      ...p,
+      standing: place.count,
+      flag: { ...p.flag, n: Math.min(p.flag.n, place.count) },
+      note: p.note === '' ? own : `${own} · ${p.note}`,
     };
   });
-  const sorted = [...platforms].sort(
-    (a, b) => (b.standing ?? 0) - (a.standing ?? 0) || a.name.localeCompare(b.name),
-  );
-  return unlinked.length === 0
-    ? sorted
-    : [
-        ...sorted,
-        {
-          name: 'no session',
-          standing: unlinked.length,
-          bound: null,
-          rate: null,
-          flag: { from: 'tail', n: unlinked.length },
-          note: 'dispatched by hand, or by a session this read did not reach',
-        },
-      ];
 }
 
 /** Receiving: a platform per channel, the channels holding flagged
  *  work first, then the deepest. `rows` is every inbound packet the
- *  page read — open ones stand, ones that closed inside the window are
- *  what left. */
+ *  page read — open ones nothing has taken in stand, ones that closed
+ *  inside the window are what left. */
 export function receivingPlatforms(
   rows: ReadonlyArray<InboundRow>,
   today: string,
@@ -169,13 +175,16 @@ export function receivingPlatforms(
   const window = new Set(days);
   const platforms = CHANNELS.map((channel: Channel): Platform => {
     const mine = rows.filter((r) => r.channel === channel);
+    // Standing = open AND not yet taken in: a triaged packet waiting on
+    // its build is marshalling's (design 62de32ae decision 4).
     const ages = mine
-      .filter((r) => r.status === 'open')
+      .filter(standsHere)
       .map((r) => ageDays(r.openedOn, today))
       .sort((a, b) => b - a);
     const stale = ages.filter((d) => d > AGE_THRESHOLDS.stale).length;
     const oldest = ages[0];
     return {
+      key: channel,
       name: channel,
       standing: ages.length,
       // A channel has no WIP bound — what it is read against is the
@@ -240,10 +249,11 @@ const RATE_W = 26;
 export function platformLayout(
   t: Territory,
   platforms: ReadonlyArray<Platform>,
-): Readonly<{ placed: ReadonlyArray<PlacedPlatform>; hidden: number }> {
+): Readonly<{ placed: ReadonlyArray<PlacedPlatform>; hidden: number; note: NoteAt }> {
   // The room the region's contents may use — head off the top, edge
-  // and MACHINERY STRIP off the bottom. One definition, shared with
-  // `interiorLayout` (backlog 3a916816): this divided the same canvas
+  // and MACHINERY STRIP off the bottom. One definition, once shared
+  // with the wagon plates' `interiorLayout` (backlog 3a916816; deleted,
+  // fe77a1d2 car 3): this divided the same canvas
   // without the strip's term, so a platform row and a machine glyph
   // could be placed in the same pixels.
   const box = contentsBox(t, PLATFORM_H);
@@ -290,5 +300,5 @@ export function platformLayout(
           : null,
     };
   });
-  return { placed, hidden: Math.max(0, platforms.length - placed.length) };
+  return { placed, hidden: Math.max(0, platforms.length - placed.length), note: overflowNoteAt(box) };
 }

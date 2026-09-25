@@ -13,17 +13,29 @@
   // there is no camera between them — `/it/yard/<region>` renders
   // this, `/it` renders the world, and the route is the state.
   //
-  // WHAT IT DRAWS IS UNCHANGED, and deliberately so. The wagon plates,
-  // the platform tracks with their bounds and flags, and the machinery
-  // glyphs are the same marks cars 3–5 built, off the same reads, with
-  // the same ids and lamps the Train Yard uses. Only the rect they lay
-  // out inside changed — from a slot on the world line to
-  // `regionCanvas`, which every region gets equally.
+  // WHAT IT DRAWS. The platform tracks with their bounds and flags, and
+  // the machinery glyphs, are the same marks cars 3–5 built, off the
+  // same reads, laid out in `regionCanvas`, which every region gets
+  // equally.
+  //
+  // A FLOOR REGION DRAWS ITS SLICE OF THE FLOOR (design fe77a1d2, car
+  // 2). The six regions the yard stands wagons in drew one plate per
+  // wagon here, which could not be clicked, while the whole floor was
+  // drawn again under this map. They now draw their own part of that
+  // floor — the dock its stretch of the mainline, the track its
+  // signals and trains, the shed its probe lanes (RegionFloor.svelte)
+  // — and every wagon, bay, locomotive and machine on it selects into
+  // the entity panel through `selected` / `onselect`. Their canvas is
+  // as tall as their slice (`regionFloorView`), not the fixed slot the
+  // plates were laid out in.
   import { navigate } from '@boss/web-kit/nav';
   import {
     REGION_NAMES,
+    bandText,
     countText,
+    kpiText,
     lampOf,
+    stateText,
     trendText,
     type Region,
     type RegionName,
@@ -31,9 +43,13 @@
   } from './regions';
   import { wrapWords } from './world';
   import { REGION_CANVAS, regionCanvas } from './region-canvas';
-  import { hasInterior, interiorLayout, interiorWagons } from './region-contents';
-  import { hasPlatforms, platformLayout, type Deck, type Platform } from './world-interior';
+  import { asFloorRegion, regionFloorView } from './floor-slices';
+  import RegionFloor from './RegionFloor.svelte';
+  import { countNote, drawnNote, placesNote } from './region-page';
+  import { hasPlatforms, platformLayout, withPlaces, type Deck, type Platform } from './world-interior';
+  import { CHAR_W, actorLayout, fitText, runsDrawn, type Lamp } from './shop-floor';
   import { machineTitle, machineryLabel, machineryStrip } from './world-machines';
+  import type { Territory } from './world';
   import type { Scene } from './yard-floor';
 
   type Props = Readonly<{
@@ -47,10 +63,23 @@
     /** The queues standing in receiving or marshalling. Handed up by
      *  the page that owns the read, so this derives nothing. */
     deck?: Deck | null;
+    /** What the entity panel under the map shows, in the floor's one
+     *  selection vocabulary (`car:<id>`, `train:<id>`, `bay:<n>`, a
+     *  machine) — and how a click on the map changes it. */
+    selected?: string;
+    onselect?: (key: string) => void;
     /** Back to the world: Escape, or the control in the corner. */
     onleave?: () => void;
   }>;
-  let { region, regions, floor = null, deck = null, onleave = () => navigate('/it') }: Props = $props();
+  let {
+    region,
+    regions,
+    floor = null,
+    deck = null,
+    selected = '',
+    onselect = (_key: string) => {},
+    onleave = () => navigate('/it'),
+  }: Props = $props();
 
   /** The region's rect IS its canvas. One definition of "lay your
    *  contents out in here", shared with the world's territories.
@@ -64,12 +93,60 @@
   const troubled = $derived(state === 'troubled');
   const why = $derived(r?.why ?? 'the server answered no reading for this region');
 
-  /** What is moving inside, placed in the region's own rect. */
-  const interior = $derived.by(() => {
-    if (floor === null || !hasInterior(region)) return null;
-    return interiorLayout(rect, interiorWagons(floor, region));
-  });
-  const machinery = $derived(machineryStrip(rect, r?.machines ?? []));
+  /** A region the yard stands wagons in, or null for a queue region. */
+  const floorRegion = $derived(asFloorRegion(region));
+  /** That region's slice of the floor, placed on its canvas — null
+   *  until the floor's read lands. */
+  const view = $derived(floor !== null && floorRegion !== null ? regionFloorView(floorRegion, floor) : null);
+  /** The queue platforms, each station standing the members the
+   *  server's partition left there (`places`, car E) rather than its
+   *  full depth. */
+  const platforms = $derived<ReadonlyArray<Platform>>(
+    deck !== null && deck.kind === 'ready' ? withPlaces(deck.platforms, r?.places ?? []) : [],
+  );
+  /** THE SHOP FLOOR'S ACTORS (design 62de32ae, decision 8), laid out on
+   *  the region's canvas — which grows to hold every lamp rather than
+   *  hiding one. Null for every other region. */
+  const actorsLaid = $derived(
+    deck !== null && deck.kind === 'ready' && deck.actors !== undefined ? actorLayout(rect, deck.actors) : null,
+  );
+  /** The canvas: the slice's own size for a floor region, as tall as
+   *  its lamps for the shop floor, the fixed region canvas for
+   *  everything else (and while the floor is read). */
+  const canvas = $derived<Territory>(
+    view !== null
+      ? { ...rect, w: view.width, h: view.height }
+      : actorsLaid !== null
+        ? { ...rect, h: actorsLaid.height }
+        : rect,
+  );
+  /** The machinery strip — except where the actors are drawn: the shop
+   *  floor's machines ARE its sessions, and each already has its lamp,
+   *  label and age in the rows above. */
+  const machinery = $derived(
+    actorsLaid !== null ? { placed: [], hidden: 0 } : machineryStrip(canvas, r?.machines ?? []),
+  );
+  /** What the interior draws against the head's count, SAID (design
+   *  62de32ae, decision 5): the platforms against it, the shop floor's
+   *  runs against its runs in flight, and a floor slice against the
+   *  places the server counted — the shed drew 5 under SHED 11. */
+  const drawn = $derived(
+    actorsLaid !== null && deck !== null && deck.kind === 'ready' && deck.actors !== undefined
+      ? countNote(r, runsDrawn(deck.actors), 'the floor draws')
+      : deck !== null && deck.kind === 'ready'
+        ? drawnNote(r, platforms)
+        : floor !== null && view !== null
+          ? placesNote(r, floor.wagons)
+          : null,
+  );
+  /** A lamp's colour class, in the yard's own lamp vocabulary. */
+  const LAMP_TONE: Readonly<Record<Lamp, string>> = {
+    'at-work': 'ok',
+    idle: 'idle',
+    waiting: 'warn',
+    silent: 'err',
+    unknown: 'unknown',
+  };
 
   // The head is a region-scale block now, not a compact one squeezed
   // into a slot: the count, the state, the trend and the why all fit,
@@ -100,23 +177,30 @@
     <span class="region-name">{region}</span>
     <span class="region-count">{r ? countText(r) : 'no reading'}</span>
     <span class="lamp-dot lamp {lampOf(state)}"></span>
-    <span class="region-state" class:err={troubled}>{state}</span>
+    <!-- The state with how long the record says it has held, and the
+         declared band that decided it read against its number
+         (design 62de32ae, decisions 1 and 2) — so a state can always
+         be checked against the number beside it. -->
+    <span class="region-state" class:err={troubled} class:warn={state === 'attention'}>{stateText(r)}</span>
+    {#if bandText(r)}<span class="region-band" class:err={troubled} data-band={r?.band?.id}>{bandText(r)}</span>{/if}
+    {#if r && r.kpi.length > 0}<span class="region-kpi">{kpiText(r)}</span>{/if}
     {#if r}<span class="region-trend">{r.trend.metric} · {trendText(r.trend)}</span>{/if}
   </div>
   <div class="region-why" class:err={troubled}>{why}</div>
+  {#if drawn}<div class="region-drawn" data-drawn={region}>{drawn}</div>{/if}
 
   <svg
-    viewBox="0 0 {REGION_CANVAS.width} {REGION_CANVAS.height}"
+    viewBox="0 0 {canvas.w} {canvas.h}"
     role="img"
     aria-label="{region} · {state} — {why}">
     <!-- The region's own outline: its whole canvas, not a slot. -->
     <rect
       x="0.5"
       y="0.5"
-      width={REGION_CANVAS.width - 1}
-      height={REGION_CANVAS.height - 1}
+      width={canvas.w - 1}
+      height={canvas.h - 1}
       class="shed"
-      class:warn={state === 'busy'}
+      class:warn={state === 'attention'}
       class:err={troubled} />
 
     {#if hasPlatforms(region)}
@@ -133,13 +217,59 @@
             <tspan x={HEAD_X} dy={i === 0 ? 0 : 12}>{line}</tspan>
           {/each}
         </text>
-      {:else if deck.platforms.length === 0}
+      {:else if actorsLaid !== null}
+        <!-- THE SHOP FLOOR AS ACTORS (design 62de32ae, decision 8): one
+             lamp per session and per run, each labelled and aged, under
+             the identity they share. The lamp reads without a legend:
+             at work is green and pulses, idle is still and grey, a run
+             past its build is amber, a run unmoved past the age-out
+             bound blinks red, and a reading nobody took is a broken
+             ring with a `?`. -->
+        {#if actorsLaid.rows.length === 0}
+          <text x={HEAD_X} y="40" class="tiny">nobody is on the floor — no open session and no run in flight</text>
+        {:else}
+          <g class="interior actors" data-interior={region}>
+            {#each actorsLaid.rows as row (row.key)}
+              {#if row.kind === 'actor'}
+                <g class="actor" data-actor={row.actor.identity}>
+                  <text x={row.x} y={row.y} class="identity">{row.actor.identity}</text>
+                  <text x={row.x + row.w} y={row.y} text-anchor="end" class="tiny age"
+                    >{row.actor.sessions.length} {row.actor.sessions.length === 1 ? 'session' : 'sessions'} · {row.actor.runs}
+                    {row.actor.runs === 1 ? 'run' : 'runs'} in flight</text>
+                </g>
+              {:else}
+                {@const lamp = row.kind === 'session' ? row.session : row.run}
+                {@const age = lamp.age}
+                {@const words = row.kind === 'session' ? row.session.label : `${row.run.label} · ${row.run.title}`}
+                <g
+                  class="lamp-row {row.kind}"
+                  data-lamp-row={row.key}
+                  data-lamp={lamp.lamp}>
+                  <title>{words} — {age}</title>
+                  <circle
+                    class="lamp-bulb {LAMP_TONE[lamp.lamp]}"
+                    cx={row.x + 5}
+                    cy={row.y - 4}
+                    r={row.kind === 'session' ? 5 : 4.5} />
+                  {#if lamp.lamp === 'unknown'}
+                    <text x={row.x + 5} y={row.y - 1.5} text-anchor="middle" class="tiny bulb-mark">?</text>
+                  {/if}
+                  <text x={row.x + 16} y={row.y} class="lamp-words" class:run={row.kind === 'run'}
+                    >{fitText(words, row.w - 16 - (age.length + 3) * CHAR_W)}</text>
+                  <text x={row.x + row.w} y={row.y} text-anchor="end" class="tiny age" class:err={lamp.lamp === 'silent'}
+                    >{age}</text>
+                </g>
+              {/if}
+            {/each}
+          </g>
+        {/if}
+      {:else if platforms.length === 0}
         <text x={HEAD_X} y="40" class="tiny">no queue is declared here</text>
       {:else}
-        {@const laid = platformLayout(rect, deck.platforms)}
+        {@const laid = platformLayout(rect, platforms)}
         <g class="interior" data-interior={region}>
-          {#each laid.placed as p (p.platform.name)}
-            <g class="platform" data-platform={p.platform.name}>
+          {#each laid.placed as p (p.platform.key)}
+            <g class="platform" data-platform={p.platform.key}>
               <title
                 >{p.platform.name} — {p.platform.note}{p.perMark > 1
                   ? ` · the track is the whole queue: one mark is ${Math.round(p.perMark)} packets`
@@ -169,35 +299,24 @@
           {/each}
           {#if laid.hidden > 0}
             <!-- what did not fit is COUNTED, never quietly dropped -->
-            <text x={REGION_CANVAS.width - HEAD_X} y={REGION_CANVAS.height - 6} text-anchor="end" class="tiny"
-              >+{laid.hidden} more</text>
+            <text x={laid.note.x} y={laid.note.y} text-anchor="end" class="tiny">+{laid.hidden} more</text>
           {/if}
         </g>
       {/if}
-    {:else if interior === null}
+    {:else if floorRegion === null}
+      <!-- Neither a floor nor a queue region — publish, today. No read
+           will ever land for it, so "reading…" here never resolved and
+           read as an outage (backlog 846ab934). Say what is true. -->
+      <text x={HEAD_X} y="40" class="tiny">no floor drawn for this region yet</text>
+    {:else if floor === null || view === null}
       <text x={HEAD_X} y="40" class="tiny">reading what is inside…</text>
-    {:else if interior.placed.length === 0}
-      <text x={HEAD_X} y="40" class="tiny">nothing is standing here</text>
     {:else}
-      <!-- WHAT IS MOVING INSIDE. One plate per wagon standing at a
-           station this region covers, off the floor's own Scene — same
-           ids, same tags, same lamps the Train Yard draws, because they
-           are the same wagons. Keyed on the wagon id, so a wagon that
-           moves between polls moves rather than being rebuilt. -->
-      <g class="interior" data-interior={region}>
-        {#each interior.placed as p (p.wagon.id)}
-          <g class="plate" data-car={p.wagon.id} data-station={p.wagon.station}>
-            <title>{p.wagon.title} — {p.wagon.status}</title>
-            <rect x={p.x} y={p.y} width={p.w} height={p.h} class="wagon {p.wagon.tone}" />
-            <circle cx={p.x + 7} cy={p.y + p.h / 2} r="3" class="lamp {p.wagon.lamp}" />
-            <text x={p.x + 14} y={p.y + p.h / 2 + 3} class="tiny plate-tag">{p.wagon.tag}</text>
-          </g>
-        {/each}
-        {#if interior.hidden > 0}
-          <text x={REGION_CANVAS.width - HEAD_X} y={REGION_CANVAS.height - 6} text-anchor="end" class="tiny"
-            >+{interior.hidden} more</text>
-        {/if}
-      </g>
+      <!-- THE REGION'S SLICE OF THE FLOOR (design fe77a1d2, car 2): its
+           rails, sidings, machines and every wagon standing in it, off
+           the floor's own Scene — same ids, same tags, the same buttons
+           into the entity panel. An empty region draws its empty
+           sidings, which say so more plainly than a sentence. -->
+      <RegionFloor {view} scene={floor} {selected} {onselect} />
     {/if}
 
     <!-- THE MACHINERY (car 5). The region's actors, read from the
@@ -226,38 +345,38 @@
 </section>
 
 <style>
-  /* The yard's own classes and tokens — the same names WorldMap and
-     YardMap use, because Svelte scopes styles per component and a
-     region map must look like the world it came out of. Nothing new
-     enters the system here, and no state or surface appears as a hex
-     (42f66fb3). */
+  /* The yard's own classes — the same names WorldMap and YardMap use,
+     because Svelte scopes styles per component and a region map must
+     look like the world it came out of. Every colour is the same
+     --map-* token WorldMap reads, with no fallback, so no state or
+     surface appears as a hex (42f66fb3, map-palette.test.ts). */
   .yard {
-    --rail: var(--border-strong, #3a434d);
-    --tie: var(--hairline, #2a3138);
-    background: var(--void, #0d1014);
-    border: 1px solid var(--hairline, #2a3138);
-    padding: var(--s2, 8px);
+    --rail: var(--map-rule-strong);
+    --tie: var(--map-rule);
+    background: var(--map-bg);
+    border: 1px solid var(--map-rule);
+    padding: var(--s2);
     overflow-x: auto;
-    margin-top: var(--s3, 12px);
+    margin-top: var(--s3);
   }
   .yard svg {
     display: block;
     width: 100%;
     min-width: 900px;
     height: auto;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
   }
   .yard text {
-    fill: var(--static, #7a838c);
+    fill: var(--map-muted);
     font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
   .yard text.tiny { font-size: 9px; letter-spacing: 0.04em; text-transform: none; }
-  .yard text.err { fill: var(--err, #e2685c); }
-  .shed { fill: var(--ink, #12161c); stroke: var(--border-strong, #3a434d); }
-  .shed.err { stroke: var(--err, #e2685c); }
-  .shed.warn { stroke: var(--warn, #d9a441); }
+  .yard text.err { fill: var(--map-bad-ink); }
+  .shed { fill: var(--map-surface); stroke: var(--map-rule-strong); }
+  .shed.err { stroke: var(--map-bad-edge); }
+  .shed.warn { stroke: var(--map-warn-edge); }
 
   /* THE HEAD is HTML, not SVG. On the world line it had to be text
      inside an outline, wrapped by hand to the slot's width; a region
@@ -266,51 +385,70 @@
   .region-head {
     display: flex;
     align-items: baseline;
-    gap: var(--s3, 12px);
+    gap: var(--s3);
     flex-wrap: wrap;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
   }
   .leave {
     background: none;
-    border: 1px solid var(--hairline, #2a3138);
-    color: var(--static, #7a838c);
+    border: 1px solid var(--map-rule);
+    color: var(--map-muted);
     font: inherit;
     font-size: 11px;
-    letter-spacing: var(--ls-nav, 0.14em);
+    letter-spacing: var(--ls-nav);
     padding: 4px 10px;
     cursor: pointer;
   }
-  .leave:hover, .leave:focus-visible { color: var(--fog, #e8ecef); border-color: var(--border-strong, #3a434d); }
-  .region-name { font-size: 15px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fog, #e8ecef); }
-  .region-count { font-size: 18px; font-weight: 600; color: var(--fog, #e8ecef); }
-  .region-state { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--static, #7a838c); }
-  .region-state.err { color: var(--err, #e2685c); }
-  .region-trend { font-size: 11px; color: var(--static, #7a838c); }
-  .region-why { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
-    color: var(--static, #7a838c); margin-top: var(--s2, 8px); }
-  .region-why.err { color: var(--err, #e2685c); }
+  .leave:hover, .leave:focus-visible { color: var(--map-ink); border-color: var(--map-rule-strong); }
+  .region-name { font-size: 15px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--map-ink); }
+  .region-count { font-size: 18px; font-weight: 600; color: var(--map-ink); }
+  .region-state { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--map-muted); }
+  .region-state.err { color: var(--map-bad-ink); }
+  .region-state.warn { color: var(--map-warn-ink); }
+  .region-band { font-size: 11px; color: var(--map-warn-ink); border: 1px solid var(--map-warn-edge);
+    padding: 1px 6px; }
+  .region-band.err { color: var(--map-bad-ink); border-color: var(--map-bad-edge); }
+  .region-kpi { font-size: 12px; color: var(--map-ink); }
+  .region-trend { font-size: 11px; color: var(--map-muted); }
+  .region-why { font-family: var(--font-mono); font-size: 12px;
+    color: var(--map-muted); margin-top: var(--s2); }
+  .region-why.err { color: var(--map-bad-ink); }
+  .region-drawn { font-family: var(--font-mono); font-size: 11px; color: var(--map-muted);
+    margin-top: 4px; }
   .lamp-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block;
-    background: var(--border-strong, #3a434d); }
-  .lamp-dot.ok { background: var(--ok, #4fb98a); }
-  .lamp-dot.warn { background: var(--warn, #d9a441); }
-  .lamp-dot.err { background: var(--err, #e2685c); animation: blink 1s steps(2) infinite; }
+    background: var(--map-rule-strong); }
+  .lamp-dot.ok { background: var(--map-ok-edge); }
+  .lamp-dot.warn { background: var(--map-warn-edge); }
+  .lamp-dot.err { background: var(--map-bad-edge); animation: blink 1s steps(2) infinite; }
 
-  .plate .wagon { fill: var(--ink, #12161c); stroke: var(--border-strong, #3a434d); }
-  .plate .wagon.ok { stroke: var(--ok, #4fb98a); }
-  .plate .wagon.warn { stroke: var(--warn, #d9a441); }
-  .plate .wagon.red { stroke: var(--err, #e2685c); }
-  .yard text.plate-tag { fill: var(--fog, #e8ecef); letter-spacing: 0; }
+  .yard text.plate-tag { fill: var(--map-ink); letter-spacing: 0; }
   .platform .track { stroke: var(--tie); stroke-width: 1; }
-  .platform .mark { fill: var(--static); }
-  .platform .mark.flagged { fill: var(--err); }
-  .platform .bound { stroke: var(--warn); stroke-width: 1; }
-  .yard text.standing { fill: var(--fog); letter-spacing: 0; }
-  .yard text.rate { fill: var(--static); letter-spacing: 0; }
-  .yard text.unknown { fill: var(--static); opacity: 0.6; font-style: italic; }
-  .lamp { fill: var(--border-strong, #3a434d); }
-  .lamp.ok { fill: var(--ok, #4fb98a); }
-  .lamp.warn { fill: var(--warn, #d9a441); }
-  .lamp.err { fill: var(--err, #e2685c); animation: blink 1s steps(2) infinite; }
+  .platform .mark { fill: var(--map-muted); }
+  .platform .mark.flagged { fill: var(--map-bad-edge); }
+  .platform .bound { stroke: var(--map-warn-edge); stroke-width: 1; }
+  .yard text.standing { fill: var(--map-ink); letter-spacing: 0; }
+  .yard text.rate { fill: var(--map-muted); letter-spacing: 0; }
+  .yard text.unknown { fill: var(--map-muted); opacity: 0.6; font-style: italic; }
+  /* THE SHOP FLOOR'S LAMPS (decision 8). One bulb per session and per
+     run; the tone is the yard's lamp vocabulary, and what tells idle
+     from unknown is SHAPE — a solid still bulb against a broken ring —
+     as the machine glyphs tell them apart. */
+  .yard text.identity { fill: var(--map-ink); font-size: 13px; letter-spacing: 0.04em; text-transform: none; }
+  .yard text.lamp-words { fill: var(--map-ink); font-size: 11px; letter-spacing: 0; text-transform: none; }
+  .yard text.lamp-words.run { fill: var(--map-muted); }
+  .yard text.age { font-size: 11px; letter-spacing: 0; }
+  .yard text.bulb-mark { font-size: 7px; }
+  .lamp-bulb { fill: var(--map-rule-strong); stroke: none; }
+  .lamp-bulb.ok { fill: var(--map-ok-edge); animation: pulse 1.6s ease-in-out infinite; }
+  .lamp-bulb.idle { fill: var(--map-muted); opacity: 0.55; }
+  .lamp-bulb.warn { fill: var(--map-warn-edge); }
+  .lamp-bulb.err { fill: var(--map-bad-edge); animation: blink 1s steps(2) infinite; }
+  .lamp-bulb.unknown { fill: var(--map-surface); stroke: var(--map-muted); stroke-dasharray: 2 1.5; }
+  @keyframes pulse { 50% { opacity: 0.45; } }
+  .lamp { fill: var(--map-rule-strong); }
+  .lamp.ok { fill: var(--map-ok-edge); }
+  .lamp.warn { fill: var(--map-warn-edge); }
+  .lamp.err { fill: var(--map-bad-edge); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0.25; } }
   /* The machine glyphs, as car 5 declared them: the housing is the
      map's own `.shed`, the parts are its `.lamp` tones, and what tells
@@ -322,7 +460,7 @@
   .yard .glyph text.mark { font-size: 9px; letter-spacing: 0; }
   @keyframes piston { to { transform: translateX(4px); } }
   @media (prefers-reduced-motion: reduce) {
-    .lamp, .lamp-dot, .glyph { animation: none !important; }
+    .lamp, .lamp-dot, .lamp-bulb, .glyph { animation: none !important; }
     /* A still piston is still a FILLED housing, which idle never is. */
     .glyph .piston { animation: none !important; }
   }

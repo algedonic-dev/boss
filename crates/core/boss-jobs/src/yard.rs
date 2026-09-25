@@ -215,8 +215,10 @@ pub struct TrainStatus {
     pub id: String,
     pub title: String,
     pub phase: TrainPhase,
-    /// The title of the step the train currently sits at (the first
-    /// ready/active one), for the operator who wants the exact step.
+    /// The step the train currently sits at (the first ready/active
+    /// one), for the operator who wants the exact step — its title with
+    /// its status beside it ([`standing_at`]), because a perfect-tense
+    /// title alone reads as done (648a68a9).
     pub at_step: Option<String>,
     /// Why it is not moving, when it is not. Prominent by being its own
     /// field rather than buried in a step's metadata.
@@ -259,13 +261,87 @@ pub struct TrainStatus {
     pub eta: TrainEta,
 }
 
-/// The title of the first ready-or-active step — the exact place the
-/// train sits, matching `boss orient`'s `at_step`.
-fn at_step(steps: &[Step]) -> Option<String> {
-    steps
+/// The first ready-or-active step — the exact place the train sits —
+/// as [`standing_at`] spells it, the phrase `boss orient` prints too.
+///
+/// EXCEPT AT THE MERGE. A train standing at `merged` with its `ci` step
+/// completed is spelled by [`awaiting_merge`] from that completed step's
+/// verdict — the live one on the job (`ci_verdict_latest`) when the
+/// conductor has noticed it move — never by the `merged` step's title:
+/// "DEPARTED — merged into main (ready, not yet done)" still read as
+/// departed for trains f7bd1e9d and 02801b05, red and never going to
+/// merge (a2d4d842).
+fn at_step(job_md: &Value, steps: &[Step]) -> Option<String> {
+    let at = steps
         .iter()
-        .find(|s| matches!(s.status, StepStatus::Ready | StepStatus::Active))
-        .map(|s| s.title.clone())
+        .find(|s| matches!(s.status, StepStatus::Ready | StepStatus::Active))?;
+    let ci = find_step(steps, &CI).filter(|s| s.status == StepStatus::Completed);
+    let at_merge = at.spec_slug.as_deref() == Some(MERGED.slug) || at.title == MERGED.title;
+    if at_merge && let Some(ci) = ci {
+        let verdict = meta_str(job_md, "ci_verdict_latest")
+            .or_else(|| meta_str(&ci.metadata, "result"))
+            .unwrap_or("unknown");
+        return Some(awaiting_merge(
+            verdict,
+            meta_str(&ci.metadata, "checks"),
+            meta_str(&ci.metadata, "train_gate"),
+        ));
+    }
+    let status = if at.status == StepStatus::Ready {
+        "ready"
+    } else {
+        "active"
+    };
+    Some(standing_at(&at.title, status))
+}
+
+/// Where a train stands when its CI has spoken and its merge has not
+/// happened: the verdict, the failing checks by name when it is red,
+/// and that it has NOT merged — the one fact the `merged` step's
+/// perfect-tense title could never say. `checks` is the `ci` step's
+/// `name:CONCLUSION, …` summary; `gate_line` its `train_gate` line,
+/// which names the train gate as the failing half when the forge's
+/// checks name none. `boss orient` calls this on raw JSON, so the
+/// terminal and the yard say the same words.
+pub fn awaiting_merge(verdict: &str, checks: Option<&str>, gate_line: Option<&str>) -> String {
+    match verdict {
+        "failing" => {
+            let mut failed: Vec<&str> = checks
+                .unwrap_or_default()
+                .split(", ")
+                .filter_map(|c| c.trim().rsplit_once(':'))
+                .filter(|(_, conclusion)| *conclusion == "FAILURE")
+                .map(|(name, _)| name)
+                .collect();
+            if failed.is_empty() && gate_line.is_some_and(|g| g.starts_with("train gate: RED")) {
+                failed.push("train gate");
+            }
+            if failed.is_empty() {
+                "CI verdict RED — not merged".to_string()
+            } else {
+                format!("CI verdict RED ({} failed) — not merged", failed.join(", "))
+            }
+        }
+        "green" => "CI verdict green — not merged yet".to_string(),
+        other => format!("CI verdict {other} — not merged"),
+    }
+}
+
+/// A step a packet is STANDING AT, spelled so its name cannot be read
+/// as the fact it names: the title, with the step's own status beside
+/// it. Step titles are written in the perfect tense by house convention
+/// — 169 of 328 across the 57 published Workflows end in `-ed`
+/// (measured 2026-09-22) — which reads true of a completed step and
+/// false of one the packet is waiting at. `boss orient` printed
+/// `at: In transit — cluster converged` while that step was READY
+/// (train 8b365d83), and the operator spent minutes hunting a second
+/// defect behind a fix that had worked; on 2026-09-23 the yard showed
+/// `DEPARTED — merged into main` for train 47391bfc while main had not
+/// moved, and it was read as done (648a68a9). The titles are right and
+/// stay; the fix is here, in the one phrase every renderer of "where it
+/// stands" shares — the yard status, the borders, `boss orient`.
+pub fn standing_at(title: &str, status: &str) -> String {
+    format!("{title} ({status}, not yet done)")
 }
 
 /// The phase a train is in: the furthest step reached. A train whose
@@ -412,7 +488,7 @@ pub fn train_status(
         id: job.id.to_string(),
         title: job.title.clone(),
         phase,
-        at_step: at_step(steps),
+        at_step: at_step(&job.metadata, steps),
         block: block_of(job, steps, phase, stall_before),
         ci_result: find_step(steps, &CI)
             .and_then(|s| meta_str(&s.metadata, "result"))
@@ -2847,6 +2923,7 @@ mod tests {
             status: JobStatus::Open,
             priority: Priority::Standard,
             opened_on: chrono::NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+            opened_at: None,
             due_on: None,
             closed_on: None,
             metadata,
@@ -2995,6 +3072,124 @@ mod tests {
             anchor_date: None,
             business_calendar: None,
         }
+    }
+
+    // ---- where it stands ----
+
+    /// Train 47391bfc, 2026-09-23 07:21Z: CI completed, `merged` READY,
+    /// main had not moved — and the place it stood read "DEPARTED —
+    /// merged into main", which the operator took as done (648a68a9).
+    /// The title stays; the step's own status rides beside it, so the
+    /// name cannot be read as the fact it names.
+    #[test]
+    fn a_step_the_train_stands_at_carries_its_status_beside_its_title() {
+        let claimed = vec![step(
+            "converged",
+            "In transit — cluster converged",
+            StepStatus::Active,
+            json!({}),
+        )];
+        assert_eq!(
+            at_step(&json!({}), &claimed).as_deref(),
+            Some("In transit — cluster converged (active, not yet done)")
+        );
+    }
+
+    /// The shape trains f7bd1e9d and 02801b05 had on 2026-09-24: `ci`
+    /// completed `failing` with `CI / web` named, `merged` READY. The
+    /// fix above (648a68a9) still printed "DEPARTED — merged into main
+    /// (ready, not yet done)" for a train that could never depart, while
+    /// main had not moved (a2d4d842). A train at its merge is spelled
+    /// from the step it COMPLETED and the verdict that step holds.
+    fn at_the_merge(ci: Value) -> Vec<Step> {
+        let mut ci_md = ci;
+        ci_md["completed_at"] = json!("2026-09-24T17:20:32Z");
+        vec![
+            step(
+                "ci",
+                "Yard inspection — CI verdict",
+                StepStatus::Completed,
+                ci_md,
+            ),
+            step(
+                "merged",
+                "DEPARTED — merged into main",
+                StepStatus::Ready,
+                json!({}),
+            ),
+            step(
+                "deployed",
+                "In transit — deployed to the playground",
+                StepStatus::Pending,
+                json!({}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_red_train_at_its_merge_reads_red_and_never_departed() {
+        let steps = at_the_merge(json!({
+            "result": "failing",
+            "forge_result": "failing",
+            "checks": "CI / build-image (pull_request):SUCCESS, CI / locomotive (pull_request):SUCCESS, \
+                       CI / web (pull_request):FAILURE, CI / reclaim (pull_request):SUCCESS",
+            "train_gate": "train gate: running",
+        }));
+        let at = at_step(&json!({}), &steps).unwrap();
+        assert_eq!(
+            at,
+            "CI verdict RED (CI / web (pull_request) failed) — not merged"
+        );
+        assert!(!at.contains("DEPARTED") && !at.contains("merged into main"));
+    }
+
+    #[test]
+    fn a_red_gate_under_a_green_forge_is_named_as_the_train_gate() {
+        let steps = at_the_merge(json!({
+            "result": "failing",
+            "forge_result": "green",
+            "checks": "CI / web (pull_request):SUCCESS",
+            "train_gate": "train gate: RED — the cars aboard are struck unless every failure lies in a file no car changed",
+        }));
+        assert_eq!(
+            at_step(&json!({}), &steps).as_deref(),
+            Some("CI verdict RED (train gate failed) — not merged")
+        );
+    }
+
+    #[test]
+    fn a_green_train_at_its_merge_says_it_has_not_merged_yet() {
+        let steps = at_the_merge(json!({"result": "green", "checks": "CI / web:SUCCESS"}));
+        assert_eq!(
+            at_step(&json!({}), &steps).as_deref(),
+            Some("CI verdict green — not merged yet")
+        );
+    }
+
+    /// The `ci` step is frozen at its first verdict; the conductor keeps
+    /// the moving one on the job as `ci_verdict_latest`. The label reads
+    /// the live one, the way the yard's lamp should.
+    #[test]
+    fn the_label_reads_the_live_verdict_over_the_frozen_one() {
+        let steps = at_the_merge(json!({"result": "failing", "checks": "CI / web:FAILURE"}));
+        assert_eq!(
+            at_step(&json!({"ci_verdict_latest": "green"}), &steps).as_deref(),
+            Some("CI verdict green — not merged yet")
+        );
+        assert_eq!(
+            at_step(&json!({"ci_verdict_latest": "aborted"}), &steps).as_deref(),
+            Some("CI verdict aborted — not merged")
+        );
+    }
+
+    /// The one phrase every renderer of "where a packet stands" shares —
+    /// `boss orient` calls it on raw JSON, so it takes the status word.
+    #[test]
+    fn standing_at_names_the_status_word_it_was_handed() {
+        assert_eq!(
+            standing_at("Train arrived", "ready"),
+            "Train arrived (ready, not yet done)"
+        );
     }
 
     // ---- phase ----

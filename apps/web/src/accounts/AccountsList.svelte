@@ -10,6 +10,7 @@
   // is deferred to the session rewrite tracked in phase-1 trade-ins.
 
   import { navigate, href } from '../router';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { formatMoney } from '@boss/web-kit/ui/money';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
@@ -22,17 +23,20 @@
   import type { Asset, Job, Account } from './types';
   import type { Invoice } from '../finance/types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
+  import { fetchAccountsPage } from './api';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
-
-  type Tier = Account['tier'] | 'all';
+  import { okRead, readStateOf, type ReadState } from '../data/readState';
+  import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { tierAdmits, tierBuckets, type TierFilter } from './tiers';
 
   let accounts = $state<Account[]>([]);
+  let accountsPage = $state<Paged<Account> | null>(null);
   let devicesPage = $state<Paged<Asset> | null>(null);
   let jobsPage = $state<Paged<Job> | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
-  let tier = $state<Tier>('all');
+  let tier = $state<TierFilter>({ kind: 'all' });
   let stateFilter = $state<string>('all');
   let query = $state('');
 
@@ -52,6 +56,15 @@
   const supportOn = $derived(moduleEnabled('support'));
 
   let invoicesPage = $state<Paged<Invoice> | null>(null);
+  // What each secondary read did. Their `failed` arms were dropped on
+  // the floor (`dPaged.kind === 'ready' ? dPaged.page : null`), and the
+  // tenant-shaping below hides an all-zero column — so a failed read
+  // removed its column without a word, the paint of "no account has
+  // any" (backlogs 223ebcd6 and e30ee8b9). The column still goes, since
+  // there is nothing true to put in it, but the page now says why.
+  let devicesRead = $state<ReadState>(okRead);
+  let jobsRead = $state<ReadState>(okRead);
+  let invoicesRead = $state<ReadState>(okRead);
 
   let devices = $derived(devicesPage?.data ?? []);
   let jobs = $derived(jobsPage?.data ?? []);
@@ -63,8 +76,11 @@
     (async () => {
       try {
         const includeJobs = supportOn;
-        const [pResp, dPaged, jPaged, iPaged] = await Promise.all([
-          fetch('/api/people/accounts'),
+        const [pPaged, dPaged, jPaged, iPaged] = await Promise.all([
+          // The directory itself is enveloped since backlog 2d1d298e
+          // (2026-09-23) — it was an unbounded bare array, so this list
+          // could not say when it was incomplete.
+          fetchAccountsPage(),
           // `/api/assets` — `/api/assets/systems` was the fleet-era
           // path; it has no route and fell through to
           // `/api/assets/{asset_id}` → 404, so this list rendered
@@ -78,16 +94,19 @@
           // truncation if a tenant blows past it.
           fetchPaged<Invoice>('/api/commerce/invoices?limit=10000'),
         ]);
-        if (!pResp.ok) throw new Error(`accounts HTTP ${pResp.status}`);
-        const pBody = await pResp.json();
+        if (pPaged.kind === 'failed') throw new Error(pPaged.error);
         if (!cancelled) {
-          accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
+          accountsPage = pPaged.page;
+          accounts = [...pPaged.page.data];
           // Device/ticket/AR columns are secondary joins — a failed
           // side-load degrades those columns, it does not fail the
           // account list itself.
           devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
           jobsPage = jPaged && jPaged.kind === 'ready' ? jPaged.page : null;
           invoicesPage = iPaged.kind === 'ready' ? iPaged.page : null;
+          devicesRead = readStateOf(dPaged);
+          jobsRead = jPaged ? readStateOf(jPaged) : okRead;
+          invoicesRead = readStateOf(iPaged);
           loading = false;
         }
       } catch (e) {
@@ -131,7 +150,7 @@
 
   let visible = $derived(
     rows.filter((r) => {
-      if (tier !== 'all' && r.account.tier !== tier) return false;
+      if (!tierAdmits(tier, r.account.tier)) return false;
       if (stateFilter !== 'all' && r.account.state !== stateFilter) return false;
       if (query) {
         const q = query.toLowerCase();
@@ -170,23 +189,51 @@
       .join(' · ') || undefined,
   );
 
-  const TIERS: ReadonlyArray<'platinum' | 'gold' | 'silver'> = [
-    'platinum', 'gold', 'silver',
-  ];
+  // Each failed secondary read, with the column it takes away.
+  let failedColumns = $derived(
+    [
+      { what: 'installed devices', read: devicesRead, column: 'Equipment' },
+      { what: 'service jobs', read: jobsRead, column: 'Open SRs' },
+      { what: 'invoices', read: invoicesRead, column: 'Open AR' },
+    ].flatMap((f) => (f.read.kind === 'failed' ? [{ ...f, error: f.read.error }] : [])),
+  );
 
-  function cap(s: string): string {
-    return s ? s[0]!.toUpperCase() + s.slice(1) : s;
-  }
+  // The Tier buttons come from the (account, tier) Classes, plus No
+  // tier when an account has none — the watchlist's tiers.ts, reused
+  // (backlog d2c9e79f, after 1be37454 fixed the same trio there). A
+  // hand-written Platinum / Gold / Silver hid any tier a tenant added
+  // by one Class row, and left the untiered sponsor reachable only
+  // under All. Counted over every row, as the other filters are.
+  $effect(() => {
+    void loadClasses('account');
+  });
+  let tierButtons = $derived(
+    tierBuckets(
+      rows.map((r) => r.account.tier),
+      classesFor('account', 'tier'),
+    ),
+  );
 </script>
 
 <div class="catalog theme-exec">
   <PageHeader
     eyebrow="Customers"
-    title={`${accounts.length} accounts`}
-    subtitle={subtitleLine}
-    motif="tap"
+    title={error ? 'Accounts' : `${accounts.length} accounts`}
+    subtitle={error
+      ? // "0 accounts" above the failure line read as an empty book
+        // (sweep c3e4edcc). The count is unknown, so say so.
+        'Account count unknown — the read failed'
+      : subtitleLine}
   />
 
+  {#if isCapped(accountsPage)}
+    <OverflowBanner
+      showing={accounts.length}
+      total={accountsPage!.total}
+      noun="accounts"
+      hint="The list and its filters cover only the accounts loaded."
+    />
+  {/if}
   {#if isCapped(devicesPage)}
     <OverflowBanner
       showing={devices.length}
@@ -211,12 +258,15 @@
       </FilterGroup>
 
       <FilterGroup label="Tier">
-          <FilterButton active={tier === 'all'} onclick={() => (tier = 'all')}>
+          <FilterButton active={tier.kind === 'all'} onclick={() => (tier = { kind: 'all' })}>
             All ({rows.length})
           </FilterButton>
-          {#each TIERS as t (t)}
-            <FilterButton active={tier === t} onclick={() => (tier = t)}>
-                {cap(t)} ({rows.filter((r) => r.account.tier === t).length})
+          {#each tierButtons as b (b.code ?? '')}
+            <FilterButton
+              active={tier.kind === 'code' && tier.code === b.code}
+              onclick={() => (tier = { kind: 'code', code: b.code })}
+            >
+                {b.label} ({b.count})
             </FilterButton>
           {/each}
       </FilterGroup>
@@ -234,10 +284,17 @@
     </aside>
 
     <section class="list-section">
+      {#if !loading && !error}
+        {#each failedColumns as f (f.what)}
+          <p class="empty load-failed" role="alert">
+            Couldn't load {f.what} — {f.error}. The {f.column} column is not shown: its counts are unknown, not zero.
+          </p>
+        {/each}
+      {/if}
       {#if loading}
         <p class="empty">Loading…</p>
       {:else if error}
-        <p class="empty">Couldn't load accounts: {error}</p>
+        <p class="empty load-failed" role="alert">Couldn't load accounts: {error}</p>
       {:else if visible.length === 0}
         <p class="empty">No accounts match those filters.</p>
       {:else}
@@ -257,10 +314,7 @@
           <tbody>
             {#each visible as r (r.account.id)}
               {@const to = entityHref('account', r.account.id)}
-              <tr
-                class="data-table-row-link"
-                onclick={() => navigate(to)}
-              >
+              <tr use:rowLink={{ onActivate: () => navigate(to), label: `Account ${r.account.name}` }}>
                 <td>
                   <strong>
                     <EntityLink

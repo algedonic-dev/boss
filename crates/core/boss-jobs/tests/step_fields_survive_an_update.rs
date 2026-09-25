@@ -30,6 +30,7 @@ fn job(id: JobId) -> Job {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: None,
         metadata: serde_json::Value::Null,
@@ -46,6 +47,9 @@ fn field(name: &str, required: bool) -> StepField {
         filled_by: boss_core::job::FilledBy::Executor,
         item_keys: Vec::new(),
         covers: None,
+        binds: None,
+        item_value_max_bytes: None,
+        item_one_of: Vec::new(),
     }
 }
 

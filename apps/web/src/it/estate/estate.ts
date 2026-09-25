@@ -13,6 +13,7 @@
 // empty estate (the false-empty family).
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { sinceText } from '../yard/yard-floor';
 
 export type EstateNode = Readonly<{
   id: string;
@@ -71,68 +72,128 @@ export type Comparison = Readonly<{
   counts: ComparisonCounts;
 }>;
 
+// THE LOOPS (backlog 0d9b2960; page audit 2cff1d6e, GAP 10). The
+// estate is kept by loops — the hosts converge themselves, observe
+// their units and the other hosts, the forge watches the cluster from
+// outside, the runners answer ops-requests — and every run leaves a
+// packet. This page showed none of them, so "did the loop run" had no
+// answer here while ~2,000 packets of each kind sat in the log. The
+// newest TERMINAL of each loop is that answer (outcome and age); an
+// open packet is a run in flight, or one that never finished.
+//
+// PER HOST where the packet names one, and only there. Measured
+// 2026-09-24: an ops-request carries `metadata.host`; the forge and
+// boss-gcp converges stamp `node_id` on their run step; the watchdog,
+// the cluster converge and both observers name no host (observe-host
+// runs on BOTH the forge and boss-gcp under one kind, and neither
+// packet says which). The page says "not named on the packet" rather
+// than guess one from a unit file it cannot read.
+
+/** A loop the page reads by kind. Pinned to infra/platform/workflows by
+ *  estate.test.ts, so a renamed kind is a red test rather than a row
+ *  that reads "never finished" forever. */
+export type EstateLoop = Readonly<{ kind: string; label: string }>;
+
+export const ESTATE_LOOPS: readonly EstateLoop[] = [
+  { kind: 'maintenance-forge-converge', label: 'forge converge' },
+  { kind: 'maintenance-boss-gcp-converge', label: 'boss-gcp converge' },
+  { kind: 'maintenance-cluster-converge', label: 'cluster converge' },
+  { kind: 'maintenance-cluster-watchdog', label: 'cluster watchdog' },
+  { kind: 'maintenance-estate-observe-host', label: 'observe hosts' },
+  { kind: 'maintenance-estate-observe-units', label: 'observe units' },
+];
+
+/** The ops-request loop is read once per host that DECLARES it answers
+ *  them — the `ops-runner` role (infra/estate/roles.toml: "which hosts
+ *  should be answering ... so silence has something to be silence
+ *  from"). Its packets carry `metadata.host`, so the split is the
+ *  server's filter, not this page's. */
+export const OPS_REQUEST_KIND = 'ops-request';
+export const OPS_RUNNER_ROLE = 'ops-runner';
+
+/** The success terminals of the loops above; every other terminal they
+ *  declare (failed, refused) renders as trouble. Held to the workflow
+ *  files by estate.test.ts. */
+export const LOOP_OK_OUTCOMES: ReadonlySet<string> = new Set(['completed', 'answered']);
+
+/** One packet of a loop, reduced to what "did it run" needs. */
+export type LoopPacket = Readonly<{
+  id: string;
+  status: string;
+  /** `metadata.outcome`, stamped on close; null while open. */
+  outcome: string | null;
+  /** When it closed (a terminal) or opened (an open packet). */
+  at: string | null;
+  /** The host the packet names, or null when it names none. */
+  host: string | null;
+}>;
+
+export type LoopPlan = Readonly<{ kind: string; label: string; host: string | null }>;
+
+export type LoopRow = LoopPlan & Readonly<{
+  /** Ready-and-null is a kind with no closed packet at all. */
+  latest: Remote<LoopPacket | null>;
+  open: Remote<readonly LoopPacket[]>;
+}>;
+
 export type EstateState = Readonly<{
   nodes: Remote<readonly EstateNode[]>;
   observations: Remote<readonly Observation[]>;
   comparisons: Remote<readonly Comparison[]>;
+  loops: readonly LoopRow[];
 }>;
 
-// The dev session door. HARDCODED FALLBACK, and loudly so: the estate
-// registry DECLARES this door — service_instances row `boss-dev-ssh`
-// in migration 202608310030-the-dev-session-has-an-ssh-door.sql:
-// Dropbear in the boss-dev pod, LoadBalancer 10.20.0.35 port 22,
-// key-only, root — but the jobs API serves only
-// /api/estate/nodes|observations|comparisons today (boss-jobs
-// http/mod.rs); there is no service-instances read endpoint. So the
-// row lives twice, and a fact that lives twice gets an equality test:
-// estate.test.ts pins the literal below to that migration, so a drift
-// is a red test, not a dead link. When a read endpoint lands, these
-// constants die and the launch block renders from the registry like
-// everything else on the page. Tracked on the estate reader item
-// d471a8ce.
-export type SshDoor = Readonly<{ user: string; host: string }>;
-export const DEV_SSH_DOOR: SshDoor = { user: 'root', host: '10.20.0.35' };
-export const DEV_SSH_LABEL = `${DEV_SSH_DOOR.user}@${DEV_SSH_DOOR.host}`;
-export const DEV_SSH_URL = `ssh://${DEV_SSH_LABEL}`;
+// THE DEV WORKSPACE DOOR (design 5fc71f03, David 2026-09-18; backlog
+// e4cedb46). One hostname, from anywhere, behind a Cloudflare Access
+// SSH application that issues a certificate good for one session.
+//
+// It replaces a MetalLB VIP on the LAN, reached from outside through
+// the boss-gcp WireGuard bastion on a key that lived forever — a jump
+// this page had to spell out in three forms, because ssh:// cannot
+// carry a ProxyJump. None of that is needed now, so none of it is
+// here; the VIP still answers and is no longer advertised
+// (infra/cluster/manifests/boss-dev.yaml, Service boss-dev-ssh).
+//
+// HARDCODED, and loudly so, for the same reason the VIP was: the
+// hostname is DECLARED — the tunnel route in
+// infra/cluster/tunnel-origins.toml and the application in
+// infra/cluster/dns/access.toml — but the jobs API serves only
+// /api/estate/nodes|observations|comparisons (boss-jobs http/mod.rs),
+// so no read reaches either file. A fact that lives twice gets an
+// equality test (CLAUDE.md §9a): the Rust test
+// the_dev_door_is_an_access_ssh_application.rs holds the literal below
+// to the route the connector serves, so a drift is a red test rather
+// than a terminal block that opens nothing. When the estate reader
+// lands (d471a8ce) this constant dies and the block renders from the
+// registry like everything else on the page.
+export const DEV_DOOR_HOST = 'dev.algedonic.dev';
 
-/** A declared node that can carry a jump: the bastion's address is the
- *  one field the route cannot do without, so the type says so. */
-export type BastionNode = EstateNode & Readonly<{ address: string }>;
+/** One line of the terminal setup, with the reason it is there: a
+ *  command an operator pastes blind is a command they cannot judge. */
+export type DoorStep = Readonly<{ what: string; command: string; why: string }>;
 
-/** The live node the registry declares as the bastion (role=bastion —
- *  boss-gcp, the WireGuard hub, since 202609050510). 10.20.0.35 is a
- *  LAN address; from outside the VPN the only way to it is through
- *  this node. Null when none is declared, retired, or address-less:
- *  the page then renders no route at all, never a broken one. */
-export function bastionOf(nodes: readonly EstateNode[]): BastionNode | null {
-  const isLiveBastion = (n: EstateNode): n is BastionNode =>
-    !n.retired && n.role === 'bastion' && n.address !== null;
-  return nodes.find(isLiveBastion) ?? null;
-}
-
-export type BastionRoutes = Readonly<{
-  /** Open a shell on the bastion. No username: the viewer's ssh config supplies it. */
-  shellUrl: string;
-  /** The second hop, typed on the bastion. */
-  hopCommand: string;
-  /** Both hops in one line, from anywhere. */
-  jumpCommand: string;
-  /** ~/.ssh/config lines that make the primary ssh:// link work from anywhere. */
-  sshConfig: string;
-}>;
-
-/** The three ways through the bastion to the door, spelled verbatim.
- *  An ssh:// URL cannot express a ProxyJump, so the jump is offered as
- *  a command and as config rather than as a link. `<you>` is left for
- *  the viewer: the bastion account is theirs, not the page's. */
-export function bastionRoutes(bastionAddress: string, door: SshDoor = DEV_SSH_DOOR): BastionRoutes {
-  const target = `${door.user}@${door.host}`;
-  return {
-    shellUrl: `ssh://${bastionAddress}`,
-    hopCommand: `ssh ${target}`,
-    jumpCommand: `ssh -J <you>@${bastionAddress} ${target}`,
-    sshConfig: `Host ${door.host}\n  ProxyJump <you>@${bastionAddress}`,
-  };
+/** The one-time terminal setup for the dev door, in order. Steps 1 and
+ *  2 are done once per machine; step 3 is every session — and after
+ *  step 2, so is any other ssh to the name (scp, rsync, ProxyJump),
+ *  because the stanza teaches ssh itself how to reach it. */
+export function devDoorSteps(host: string = DEV_DOOR_HOST): readonly DoorStep[] {
+  return [
+    {
+      what: 'Install cloudflared, once per machine',
+      command: 'cloudflared --version',
+      why: 'it is the client half of the tunnel: ssh talks to it, it talks to the edge. Not found means not installed — take it from Cloudflare downloads, or your package manager, and run this again.',
+    },
+    {
+      what: 'Teach ssh the route, once per machine',
+      command: `grep -qsF 'Match host ${host} ' ~/.ssh/config || cloudflared access ssh-config --hostname ${host} --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config`,
+      why: `it appends a ProxyCommand stanza for ${host}; ssh then reaches it like any other host. The sed drops cloudflared's "Add to your …/.ssh/config:" banner, which ssh cannot parse, and the grep makes a second run a no-op.`,
+    },
+    {
+      what: 'Open the workspace',
+      command: `ssh root@${host}`,
+      why: 'the browser asks who you are, Access issues a certificate for the session, and the pod accepts it. Nothing long-lived is stored.',
+    },
+  ];
 }
 
 function asArray(raw: unknown): readonly unknown[] {
@@ -235,11 +296,81 @@ export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } 
   return { ok: false, text: problems.join('; ') };
 }
 
+const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+export function parseLoopPackets(raw: unknown): readonly LoopPacket[] {
+  return asArray(raw).map((r) => {
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== 'string' || typeof o.status !== 'string') {
+      throw new Error('jobs row missing id/status');
+    }
+    const md = (o.metadata ?? {}) as Record<string, unknown>;
+    const steps = Array.isArray(o.steps) ? (o.steps as Record<string, unknown>[]) : [];
+    const run = steps.find((s) => s.spec_slug === 'run');
+    const runMd = (run?.metadata ?? {}) as Record<string, unknown>;
+    const open = o.status === 'open';
+    return {
+      id: o.id,
+      status: o.status,
+      outcome: open ? null : str(md.outcome),
+      at: open ? (str(o.opened_at) ?? str(md.opened_at)) : (str(md.closed_at) ?? str(o.closed_on)),
+      host: str(md.host) ?? str(runMd.node_id),
+    };
+  });
+}
+
+/** The rows the page reads: every declared loop, then the ops-request
+ *  loop per live host declaring the runner role. With the registry
+ *  unreadable the runner row is kept, unfiltered — "did ANY runner
+ *  answer" is still a question the log can settle. */
+export function loopPlan(nodes: Remote<readonly EstateNode[]>): readonly LoopPlan[] {
+  const loops = ESTATE_LOOPS.map((l) => ({ ...l, host: null }));
+  if (nodes.kind !== 'ready') return [...loops, { kind: OPS_REQUEST_KIND, label: 'ops-request', host: null }];
+  const runners = nodes.data.filter((n) => !n.retired && n.roles.includes(OPS_RUNNER_ROLE));
+  return [...loops, ...runners.map((n) => ({ kind: OPS_REQUEST_KIND, label: 'ops-request', host: n.id }))];
+}
+
+/** Newest terminal = the first closed row (the listing is newest-opened
+ *  first); open = every open packet of the kind, typically none or one. */
+export function loopQueries(kind: string, host: string | null): { latest: string; open: string } {
+  const narrow = host === null ? '' : `&metadata=${encodeURIComponent(JSON.stringify({ host }))}`;
+  return {
+    latest: `/api/jobs?kind=${encodeURIComponent(kind)}&status=closed&limit=1${narrow}`,
+    open: `/api/jobs?kind=${encodeURIComponent(kind)}&status=open${narrow}`,
+  };
+}
+
+/** The host a row is about, from the query or the packet — never
+ *  guessed (see THE LOOPS above). */
+export function loopHost(row: LoopRow): string {
+  if (row.host) return row.host;
+  const fromLatest = row.latest.kind === 'ready' ? (row.latest.data?.host ?? null) : null;
+  const fromOpen = row.open.kind === 'ready' ? (row.open.data.find((p) => p.host)?.host ?? null) : null;
+  return fromLatest ?? fromOpen ?? 'not named on the packet';
+}
+
+/** How long ago, to the minute — a five-minute loop dated "today"
+ *  answers nothing. The board's own reading (yard-floor sinceText). */
+export function loopAge(at: string | null, now: Date): string {
+  return at ? `${sinceText(at, now.getTime())} ago` : 'undated';
+}
+
+async function fetchLoop(plan: LoopPlan): Promise<LoopRow> {
+  const q = loopQueries(plan.kind, plan.host);
+  const [latest, open] = await Promise.all([
+    fetchRemote(q.latest, (raw) => parseLoopPackets(raw)[0] ?? null),
+    fetchRemote(q.open, parseLoopPackets),
+  ]);
+  return { ...plan, latest, open };
+}
+
 export async function fetchEstate(): Promise<EstateState> {
-  const [nodes, observations, comparisons] = await Promise.all([
-    fetchRemote('/api/estate/nodes', parseNodes),
+  const nodesRead = fetchRemote('/api/estate/nodes', parseNodes);
+  const [nodes, observations, comparisons, loops] = await Promise.all([
+    nodesRead,
     fetchRemote('/api/estate/observations?limit=20', parseObservations),
     fetchRemote('/api/estate/comparisons?limit=20', parseComparisons),
+    nodesRead.then((n) => Promise.all(loopPlan(n).map(fetchLoop))),
   ]);
-  return { nodes, observations, comparisons };
+  return { nodes, observations, comparisons, loops };
 }

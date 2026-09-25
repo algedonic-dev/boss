@@ -68,6 +68,9 @@
   let selectedNode = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  // An empty registry is an answer, not a failed read, so it is not
+  // painted on the failure marker `error` wears (sweep c3e4edcc).
+  let noKinds = $state(false);
 
   // Decode once, defensively, at the fetch site — the route-smoke
   // crawl runs every page against an adversarial mock, and a
@@ -154,7 +157,7 @@
         if (kind) await switchTo(kind);
         else {
           loading = false;
-          error = 'no Workflows in the registry';
+          noKinds = true;
         }
       } catch (e) {
         loading = false;
@@ -269,7 +272,9 @@
 {#if loading}
   <p class="fleet-msg">Reading the fleet…</p>
 {:else if error}
-  <p class="fleet-msg fleet-err">{error}</p>
+  <p class="fleet-msg load-failed" role="alert">Couldn't read the fleet — {error}</p>
+{:else if noKinds}
+  <p class="fleet-msg">No Workflows in the registry.</p>
 {:else if dag}
   <StepDag
     nodes={dag.nodes}
@@ -371,18 +376,15 @@
     align-items: baseline;
     gap: 8px;
     font-size: 13px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-scope {
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-msg {
     margin: 24px 0;
-    color: var(--static, #7A838C);
-  }
-  .fleet-err {
-    color: var(--err, #e2685c);
+    color: var(--static);
   }
   .fleet-table {
     margin-top: 16px;
@@ -393,11 +395,11 @@
   .fleet-table td {
     text-align: left;
     padding: 6px 14px 6px 0;
-    border-bottom: 1px solid var(--hairline, #2A3138);
+    border-bottom: 1px solid var(--hairline);
   }
   .fleet-table th {
     font-weight: 600;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-node-items {
     margin-top: 14px;
@@ -411,7 +413,7 @@
   .fleet-node-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-items {
     list-style: none;
@@ -429,9 +431,9 @@
     width: 100%;
     text-align: left;
     padding: 7px 12px;
-    border: 1px solid var(--hairline, #2A3138);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
-    background: var(--card, var(--ink, #12161C));
+    background: var(--card);
     cursor: pointer;
     font: inherit;
     color: inherit;
@@ -440,11 +442,11 @@
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-item-pri[data-pri='urgent'],
   .fleet-item-pri[data-pri='emergency'] {
-    color: var(--err, #e2685c);
+    color: var(--err);
   }
   .fleet-item-title {
     flex: 1;
@@ -452,12 +454,12 @@
   }
   .fleet-item-age {
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-offmap {
     margin-left: 6px;
     font-size: 11px;
     font-weight: 600;
-    color: var(--signal, #5FD4A8);
+    color: var(--signal);
   }
 </style>

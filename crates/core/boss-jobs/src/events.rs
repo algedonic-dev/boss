@@ -80,6 +80,22 @@ pub const STEP_SIGNED_OFF: &str = "jobs.step.signed_off";
 /// the listed stamps no longer attest the current content and the
 /// named roles must re-sign before the step can complete.
 pub const STEP_STAMPS_INVALIDATED: &str = "jobs.step.stamps_invalidated";
+/// A correction was appended beside a completed or skipped step
+/// (`corrections`, design 4105b020): payload `{job_id, step_id, index,
+/// correction}`. The fact of the correction; the job's row state rides
+/// the sibling JOB_UPDATED in the same transaction, which is what the
+/// rebuild replays, so the rebuild ignores this marker.
+pub const STEP_CORRECTED: &str = "jobs.step.corrected";
+/// A packet was moved to another version of its protocol through the
+/// re-pin door (`POST /api/jobs/{id}/convert`, design 7cf202a9 Q3):
+/// payload `{job_id, from, to, by, at, reprojected: [{step, step_id,
+/// changed, kept?}], inserted: [{step, step_id}]}` with the actor as
+/// `_actor` — the same entry appended to the job's reserved `repins`
+/// list. The fact of the move; the rows it changed ride the sibling
+/// JOB_UPDATED / STEP_UPDATED / STEP_CREATED state events in the same
+/// transaction, which is what the rebuild replays, so the rebuild
+/// ignores this marker.
+pub const JOB_REPINNED: &str = "jobs.job.repinned";
 pub const JOB_CLOSED: &str = "jobs.job.closed";
 /// A quarantine pass found an ACTIVE Workflow that fails the viability
 /// lint and retired it. Boot no longer emits this: it checks and logs

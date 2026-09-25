@@ -82,6 +82,13 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // per code-scanning rule off the reading on the packet — the
         // analyst setting, the same as the retros' work steps.
         "publish-to-github/judge-checks analyst $2.00 medium",
+        // v8's work steps (backlog d4bfe548, David 2026-09-24): the
+        // daily packet sat at `measure` from 00:00Z until the operator
+        // worked it after 03:50Z, because no step before the sign-off
+        // declared an agent. The same analyst setting as judge-checks;
+        // `approve` stays David's and declares none.
+        "publish-to-github/measure analyst $2.00 medium",
+        "publish-to-github/review analyst $2.00 medium",
         // The page march (backlog 4a1b307c, 2026-09-19). Three efforts
         // across four steps of ONE kind, each argued in the TOML beside
         // the step: `measure` subtracts a department's needs from a
@@ -93,6 +100,11 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         "page-audit/file analyst $1.00 low",
         "page-audit/test builder $5.00 high",
         "page-audit/revise builder $3.00 medium",
+        // The fold (2026-09-23): a car writing the settled paragraphs
+        // into docs/architecture-decisions.md, so the builder setting.
+        // Without it `boss dispatch` refused every answered design by
+        // name and 34 waited at `fold` with no way to hand them out.
+        "design-doc/fold builder $5.00 high",
     ]
     .into_iter()
     .map(str::to_string)

@@ -14,13 +14,14 @@
 
   import { BREAK_GLASS_ROLE, session } from '@boss/web-kit/session/session.svelte';
   import GuestHome from './GuestHome.svelte';
-  import { appNow } from '@boss/web-kit/sim-clock';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
   import {
     fetchMyDay,
     claimStep,
     assignmentPacket,
     filterByProtocol,
     protocolCounts,
+    waitingOf,
     type MyDayQueues,
     type AssignmentRow,
   } from './assignments';
@@ -105,6 +106,10 @@
   // overwrite a newer one, and a persona switch mid-flight must not
   // bleed rows split against the old uid into the new person's page.
   let queueSeq = 0;
+  // The day a verdict's age is read against — the app clock, the one
+  // `opened_on` is stamped by, taken when the queues land so the age
+  // and the rows it describes are one reading (3bc896be).
+  let today = $state(appToday());
   async function loadQueues(uid: string, role: string): Promise<void> {
     const seq = ++queueSeq;
     const res = await fetchMyDay(uid, role);
@@ -112,6 +117,7 @@
     loading = false;
     if (res.kind === 'ready') {
       queues = res.queues;
+      today = appToday();
       loadError = null;
     } else {
       // Keep whatever was last known-good; the template says which
@@ -280,7 +286,6 @@
       eyebrow="Emergency session"
       title="Break-glass operator"
       subtitle="break-glass · hardware key · no employee record"
-      motif="glass"
     />
     <p class="empty">
       This session is a key someone is holding, not a person on the
@@ -302,7 +307,6 @@
       eyebrow={`Good ${timeOfDay()}`}
       title={user.name}
       subtitle={`${user.role} · ${tenureYears(user.hire_date).toFixed(1)} years · ${user.department}`}
-      motif="glass"
     />
 
     <!-- Worth showing when there is a choice to make — and ALWAYS
@@ -336,7 +340,7 @@
            and the page says so instead of swapping them for a fake
            empty day. Dismissable: the next successful refetch clears
            it anyway. -->
-      <div class="myday-stale-note" role="alert">
+      <div class="myday-stale-note load-failed" role="alert">
         <span>
           Couldn't refresh ({errLabel(loadError)}) — showing the last
           good view.
@@ -357,7 +361,7 @@
              so the page says error. Four sections of "you have no
              work" here would be the exact lie this state replaces. -->
         <Section title="Your queues" wide>
-          <div class="myday-fetch-error" role="alert">
+          <div class="myday-fetch-error load-failed" role="alert">
             <span>
               Couldn't load your queues ({errLabel(loadError)}). Your
               day is unknown, not empty.
@@ -380,13 +384,27 @@
           {:else}
             <div class="myday-jobs-list">
               {#each shown.verdicts as row (row.step.id)}
+                {@const waited = waitingOf(row, today)}
                 <!-- Decide beside the card, the same grammar as Claim:
                      the card is the packet, the button is the queue
                      mechanic. It opens the step's real surface in a
                      modal, so a docket of verdicts is decide → next
-                     without leaving the queue (feedback 0ab5fa3a). -->
-                <div class="myday-grab-row">
+                     without leaving the queue (feedback 0ab5fa3a).
+                     The age rides beside it, toned by band, because
+                     this list is the founder's watch list and a
+                     watch list that does not age stops being read
+                     (3bc896be, design 5877860d q2). -->
+                <div class="myday-grab-row myday-verdict-row">
                   <PacketCard card={assignmentPacket(row)} />
+                  {#if waited}
+                    <span
+                      class="myday-age myday-age-{waited.band}"
+                      data-band={waited.band}
+                      title="Packet opened {row.opened_on}"
+                    >open {waited.days} d</span>
+                  {:else}
+                    <span></span>
+                  {/if}
                   <button class="myday-claim-btn" onclick={() => (deciding = row)}>
                     Decide
                   </button>
@@ -481,7 +499,7 @@
             The watchlist station hasn't reached this deployment yet.
           </div>
         {:else if watchlist.kind === 'error'}
-          <div class="myday-empty">Couldn't load your watchlist.</div>
+          <div class="myday-empty load-failed" role="alert">Couldn't load your watchlist.</div>
         {:else if watchlist.entries.length === 0}
           <div class="myday-empty">
             You haven't filed anything. Feedback you send from the
@@ -610,28 +628,27 @@
     font-size: 11px;
     font-weight: 600;
     padding: 2px 10px;
-    border: 1px solid var(--accent, #0284c7);
-    color: var(--accent, #0284c7);
+    border: 1px solid var(--accent);
+    color: var(--accent);
     background: transparent;
     border-radius: 4px;
     cursor: pointer;
   }
   .myday-claim-btn:hover,
   .myday-retry-btn:hover {
-    background: var(--accent, #0284c7);
-    color: #fff;
+    background: var(--accent);
+    color: var(--on-band);
   }
   /* Fetch failure is words, never a mimed empty queue. The stale note
      rides above a kept last-good view; the fetch-error block stands in
-     for queues the page never got. */
+     for queues the page never got. Both wear the shared failure marker
+     (sweep c3e4edcc), which draws the rail, the card and the ink; these
+     rules only lay the words out beside their button. */
   .myday-stale-note {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 8px 12px;
-    border: 1px solid var(--warn, #d9a441);
-    border-radius: 6px;
     font-size: 13px;
     margin: 0 0 12px 0;
   }
@@ -639,7 +656,7 @@
     font-size: 11px;
     font-weight: 600;
     padding: 2px 10px;
-    border: 1px solid var(--border, #d6d3d1);
+    border: 1px solid var(--border);
     color: inherit;
     background: transparent;
     border-radius: 4px;
@@ -654,8 +671,8 @@
   }
   .myday-claim-note {
     padding: 8px 12px;
-    background: var(--bg, #f5f5f4);
-    border: 1px solid var(--border, #d6d3d1);
+    background: var(--bg);
+    border: 1px solid var(--border);
     border-radius: 6px;
     font-size: 13px;
     margin: 0 0 12px 0;
@@ -663,7 +680,7 @@
   .myday-inflight-note {
     margin-top: 8px;
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
 
   /* Card + outcome side by side, the same shape the claim row uses. */
@@ -690,7 +707,7 @@
     align-items: center;
     gap: 7px;
     padding-bottom: 8px;
-    border-bottom: 1px solid var(--hairline, #2A3138);
+    border-bottom: 1px solid var(--hairline);
     margin-bottom: 10px;
   }
   /* Lit only where something is standing. */
@@ -698,22 +715,22 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: var(--hairline, #2A3138);
+    background: var(--hairline);
     flex: 0 0 auto;
   }
   .watch-stop-dot.lit {
-    background: var(--signal, #29C7B0);
+    background: var(--signal);
   }
   .watch-stop-label {
     font-size: 12px;
     line-height: 1.3;
-    color: var(--fog, #E8ECEF);
+    color: var(--fog);
   }
   .watch-stop-card {
     margin-bottom: 8px;
   }
   .watch-stop-empty {
-    color: var(--static, #7A838C);
+    color: var(--static);
     margin: 0;
     font-size: 13px;
   }
@@ -723,15 +740,15 @@
   .watch-offtrack {
     margin-top: 16px;
     padding-top: 12px;
-    border-top: 1px solid var(--hairline, #2A3138);
+    border-top: 1px solid var(--hairline);
   }
   .watch-offtrack-h {
     display: block;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 11px;
-    letter-spacing: var(--ls-nav, 0.14em);
+    letter-spacing: var(--ls-nav);
     text-transform: uppercase;
-    color: var(--static, #7A838C);
+    color: var(--static);
     margin-bottom: 8px;
   }
   .watch-row {
@@ -747,27 +764,48 @@
   }
   .watch-window {
     font-size: 12px;
-    color: var(--static, #7a838c);
+    color: var(--static);
     margin: 0 0 8px 0;
   }
   /* Mono + caps, matching the packet card's own chip treatment; only
      the color changes, and only to a declared status token. */
-  .watch-outcome {
-    font-family: var(--font-mono, ui-monospace, monospace);
+  .myday-verdict-row {
+    grid-template-columns: 1fr auto auto;
+  }
+  /* A verdict's age, in the receiving yard's bands: quiet while fresh,
+     warn past 3 days, err past 14 — crossing a threshold changes how
+     the row reads, not only the number on it (3bc896be q2). */
+  .myday-age {
+    font-family: var(--font-mono);
     font-size: 10px;
-    letter-spacing: var(--ls-label, 0.1em);
+    letter-spacing: var(--ls-label);
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--static);
+  }
+  .myday-age-aging {
+    color: var(--warn);
+  }
+  .myday-age-stale {
+    color: var(--err);
+    font-weight: 600;
+  }
+  .watch-outcome {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: var(--ls-label);
     text-transform: uppercase;
     padding: 1px 6px;
     border: 1px solid currentColor;
     white-space: nowrap;
   }
   .watch-ok {
-    color: var(--ok, #4fb98a);
+    color: var(--ok);
   }
   .watch-warn {
-    color: var(--warn, #d9a441);
+    color: var(--warn);
   }
   .watch-static {
-    color: var(--static, #7a838c);
+    color: var(--static);
   }
 </style>

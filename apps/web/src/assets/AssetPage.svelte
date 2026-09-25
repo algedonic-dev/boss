@@ -1,11 +1,13 @@
 <script lang="ts">
   // Asset detail page.
   //
-  // Fetches the device current state + event log + any open
-  // field-service jobs. DeviceInsights cross-service panel is
-  // phase-2 work — it hits three services and adds a good chunk
-  // of component weight we don't need for the primitive-coverage
-  // proof.
+  // Fetches the device current state + event log + the open Jobs
+  // about it, of any kind (the query carries subject_id, not a
+  // workflow kind). The DeviceInsights panel over
+  // /api/assets/{id}/insights was never built here; that endpoint's
+  // service-history section, which read the device shop's
+  // `field-service` Jobs, was retired unread (backlog a8991c86,
+  // car 3).
 
   import { href, navigate } from '../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
@@ -117,7 +119,7 @@
   <div class="catalog theme-exec"><p class="empty">Loading…</p></div>
 {:else if error || !device}
   <div class="catalog theme-exec">
-    <p class="empty">Couldn't load device: {error ?? 'not found'}</p>
+    <p class="empty load-failed" role="alert">Couldn't load device: {error ?? 'not found'}</p>
   </div>
 {:else}
   <div class="detail-page theme-exec">

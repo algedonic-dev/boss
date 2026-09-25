@@ -1,8 +1,8 @@
 //! Audit-log tail HTTP endpoint — the read surface for `audit_log`.
 //!
 //! Writers (every service's `PgAuditWriter`) insert rows; this router
-//! serves recent-first reads with filters on source, kind, and time
-//! window. Intended home: the CTO surface at `/cto/events`, where an
+//! serves recent-first reads with filters on source, kind, actor, and
+//! time window. Intended home: the CTO surface at `/cto/events`, where an
 //! operator can watch the event stream flow in ~real time.
 //!
 //! Access: Operator tier, Auditor tier, or role ∈ {ceo, cto}.
@@ -232,26 +232,75 @@ async fn events_health() -> Response {
 /// through its own reader. Filtering the returned page in Rust would
 /// not fix that: by then the slow rows are already gone.
 ///
-/// One statement with a nullable bind rather than the tail's dynamic
-/// composition — there is exactly one optional filter here, and
-/// `$2::text IS NULL` says "no filter" without building SQL by hand.
+/// `since` (inclusive) and `until` (exclusive) bound the series in time
+/// — the half-open window [`TailQuery`] states — and sit in the same
+/// WHERE clause for the same reason (backlog bf362f25). A reader that
+/// could only ever see the newest page could not answer a post-mortem:
+/// thirty hours after an incident the oldest reachable estate row was
+/// already past the window it needed, while every row was still in the
+/// log. `until` is the before-cursor: the oldest timestamp on one page
+/// is the `until` of the next.
+///
+/// `total` is the count of the WINDOW, not of the page, so a caller can
+/// tell a whole answer (rows == total) from the head of a longer one —
+/// the comparison a bare `limit=` read never makes (e7cf78c6). It is a
+/// second statement, not a transaction with the first: a row appended
+/// between them can make `total` one ahead of an unbounded page, never
+/// behind, and an `until`-bounded window is closed and cannot move.
+///
+/// One statement per question with nullable binds rather than the
+/// tail's dynamic composition — `$n IS NULL` says "no filter" without
+/// building SQL by hand.
 pub async fn recent_by_kind(
     pool: &PgPool,
     kind: &str,
-    scope: Option<&str>,
+    window: &KindWindow<'_>,
     limit: i64,
-) -> Result<Vec<AuditEntry>, String> {
-    sqlx::query_as::<_, AuditEntry>(
-        "SELECT event_id, timestamp, source, kind, payload FROM audit_log \
-         WHERE kind = $1 AND ($2::text IS NULL OR payload->>'scope' = $2) \
-         ORDER BY timestamp DESC LIMIT $3",
-    )
+) -> Result<KindPage, String> {
+    const WHERE: &str = "WHERE kind = $1 \
+         AND ($2::text IS NULL OR payload->>'scope' = $2) \
+         AND ($3::timestamptz IS NULL OR timestamp >= $3) \
+         AND ($4::timestamptz IS NULL OR timestamp < $4)";
+    let rows = sqlx::query_as::<_, AuditEntry>(&format!(
+        "SELECT event_id, timestamp, source, kind, payload FROM audit_log {WHERE} \
+         ORDER BY timestamp DESC LIMIT $5"
+    ))
     .bind(kind)
-    .bind(scope)
+    .bind(window.scope)
+    .bind(window.since)
+    .bind(window.until)
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let (total,): (i64,) =
+        sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM audit_log {WHERE}"))
+            .bind(kind)
+            .bind(window.scope)
+            .bind(window.since)
+            .bind(window.until)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(KindPage { rows, total })
+}
+
+/// Which rows of one kind [`recent_by_kind`] reads: an exact payload
+/// `scope`, and a half-open `[since, until)` window on `timestamp`.
+/// Every field absent reads the whole kind.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KindWindow<'a> {
+    pub scope: Option<&'a str>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One page of a kind's rows, newest first, and how many rows its
+/// window holds in all.
+#[derive(Debug, Clone)]
+pub struct KindPage {
+    pub rows: Vec<AuditEntry>,
+    pub total: i64,
 }
 
 /// One `(job kind, step kind, spec slug, authority role)` cell of the
@@ -383,6 +432,47 @@ pub struct TailQuery {
     /// COALESCEs: a row predating the flag is real, because the
     /// simulator did not exist to have written it.
     pub simulated: Option<String>,
+    /// Exact match on who acted — `payload->>'_actor'`, the stamp every
+    /// writer puts on its payload (backlog 03f79eca). park-a-job,
+    /// rotate-a-credential and ship-a-change each state that the log
+    /// answers "who and when"; until this, the tail could answer only
+    /// "when", and who acted was visible only by opening a row's JSON.
+    /// Exact, not the kind filter's substring: `agent-claude` must not
+    /// also return `agent-claude-2`. A row predating the stamp has no
+    /// actor and matches no actor filter.
+    pub actor: Option<String>,
+}
+
+/// The actor clause, shared by the three reads that take one — tail,
+/// export and stream — so the lens a page sets is the lens all three
+/// apply. That the three reads each composed their own WHERE is how
+/// the provenance lens came to be honoured by one of them and ignored
+/// by two (34ea2ae0); a new filter does not repeat it.
+fn push_actor(actor: Option<&String>, sql: &mut String, binds: &mut Vec<Bind>) {
+    if let Some(actor) = actor {
+        binds.push(Bind::Str(actor.clone()));
+        sql.push_str(&format!(" AND payload->>'_actor' = ${}", binds.len()));
+    }
+}
+
+/// The provenance clause — [`TailQuery::simulated`] — shared by tail,
+/// export and stream for the reason [`push_actor`] states. Until
+/// 2026-09-24 only the tail applied it: the stream declared no
+/// `simulated` and the export's WHERE never read the one it parsed, so
+/// live mode (the page's default) and Save .jsonl both served synthetic
+/// rows under a select reading "Real only" (backlog 34ea2ae0).
+///
+/// No bind: the two spellings are a closed set decided here, never
+/// caller text reaching SQL. An unrecognised value filters nothing,
+/// which keeps a typo in a URL from silently hiding the log.
+fn push_simulated(simulated: Option<&str>, sql: &mut String) {
+    match simulated {
+        Some("real") => {
+            sql.push_str(" AND COALESCE(payload->>'_simulated', 'false') <> 'true'");
+        }
+        Some("sim") => sql.push_str(" AND payload->>'_simulated' = 'true'"),
+        _ => {}
+    }
 }
 
 async fn tail(
@@ -425,16 +515,8 @@ async fn tail(
         binds.push(Bind::Ts(until));
         sql.push_str(&format!(" AND timestamp < ${}", binds.len()));
     }
-    // No bind: the two spellings are a closed set decided here, never
-    // caller text reaching SQL. An unrecognised value filters nothing,
-    // which keeps a typo in a URL from silently hiding the log.
-    match q.simulated.as_deref() {
-        Some("real") => {
-            sql.push_str(" AND COALESCE(payload->>'_simulated', 'false') <> 'true'");
-        }
-        Some("sim") => sql.push_str(" AND payload->>'_simulated' = 'true'"),
-        _ => {}
-    }
+    push_actor(q.actor.as_ref(), &mut sql, &mut binds);
+    push_simulated(q.simulated.as_deref(), &mut sql);
     binds.push(Bind::Int(limit));
     sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ${}", binds.len()));
 
@@ -468,7 +550,8 @@ async fn tail(
 /// - Append-only-friendly — the same shape the audit_log table
 ///   has on the writer side.
 ///
-/// Filters mirror /api/events/tail (source, kind, since, until).
+/// Filters mirror /api/events/tail (source, kind, since, until, actor,
+/// simulated).
 /// Cap is higher (50,000 rows) and the response is streamed so a
 /// long-range export doesn't pin server memory.
 ///
@@ -516,6 +599,8 @@ async fn export(
         binds.push(Bind::Ts(until));
         sql.push_str(&format!(" AND timestamp < ${}", binds.len()));
     }
+    push_actor(q.actor.as_ref(), &mut sql, &mut binds);
+    push_simulated(q.simulated.as_deref(), &mut sql);
     binds.push(Bind::Int(limit));
     sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT ${}", binds.len()));
 
@@ -668,14 +753,22 @@ pub struct StreamQuery {
     pub source: Option<String>,
     /// Case-insensitive substring match on `kind`.
     pub kind: Option<String>,
+    /// Exact match on `payload->>'_actor'` — [`TailQuery::actor`].
+    pub actor: Option<String>,
+    /// Provenance lens — [`TailQuery::simulated`]. Absent until
+    /// 2026-09-24, so the page's default live mode painted synthetic
+    /// rows into a "Real only" view (backlog 34ea2ae0).
+    pub simulated: Option<String>,
 }
 
 /// SSE companion to `/api/events/tail`. Pushes new audit_log rows
 /// as they land, keyed off the table's monotonic id column. Filters
-/// (source, kind) match the tail endpoint's shape.
+/// (source, kind, actor, simulated) match the tail endpoint's shape.
 ///
 /// Server-side polls the audit_log every 2s for `id > last_seen`,
-/// dedupes by id, pushes each new row as one SSE `data` frame.
+/// dedupes by id, pushes each new row as one SSE `data` frame. A read
+/// that fails sends one `event: failed` frame, `{"error": "..."}`, and
+/// ends the stream — silence means a quiet log and nothing else.
 /// Same auth gate as `tail` — operator/auditor tier or ceo/cto
 /// role. Per the SSE policy doc (docs/design/sse-policy.md) this
 /// view is "every event matters" → SSE-push, since the 5s poll
@@ -702,17 +795,40 @@ async fn stream(
     let pool = state.pool.clone();
     let source_filter = q.source;
     let kind_filter = q.kind;
+    let actor_filter = q.actor;
+    let simulated_filter = q.simulated;
+
+    // A failed read of the log is ONE named frame, and then the stream
+    // ends (backlog 260879f5, page audit 65a273d5). It used to be
+    // `Err(_) => continue`: the connection stayed open, keep-alives
+    // kept flowing and no frame ever came, which to the page is exactly
+    // a log where nothing is happening. Named `failed` rather than
+    // sent as a plain `data:` frame so the page's row handler never
+    // reads it as a row; ended rather than retried so a reconnect is
+    // the page's decision, made in words it can show.
+    fn read_failed(read: &str, e: &sqlx::Error) -> Result<SseEvent, Infallible> {
+        let body = serde_json::json!({ "error": format!("{read}: {e}") });
+        Ok(SseEvent::default().event("failed").data(body.to_string()))
+    }
 
     let stream = async_stream::stream! {
         // First: anchor the cursor at the current MAX(id). The
         // operator gets rows arriving AFTER they connect, not a
         // history dump (the tail endpoint is the right tool for
         // history). MAX is constant-time on the audit_log_id_pk
-        // index.
-        let mut cursor: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM audit_log")
+        // index. A failed anchor used to read as cursor 0, so a read
+        // that recovered on the next tick replayed the whole log as
+        // if it were landing now.
+        let anchor = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM audit_log")
             .fetch_one(pool.as_ref())
-            .await
-            .unwrap_or(0);
+            .await;
+        let mut cursor: i64 = match anchor {
+            Ok(id) => id,
+            Err(e) => {
+                yield read_failed("anchoring the stream at the log's newest row", &e);
+                return;
+            }
+        };
 
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(
@@ -739,6 +855,8 @@ async fn stream(
                 binds.push(Bind::Str(format!("%{kind}%")));
                 sql.push_str(&format!(" AND kind ILIKE ${}", binds.len()));
             }
+            push_actor(actor_filter.as_ref(), &mut sql, &mut binds);
+            push_simulated(simulated_filter.as_deref(), &mut sql);
             sql.push_str(" ORDER BY id ASC LIMIT 500");
 
             #[derive(sqlx::FromRow)]
@@ -760,7 +878,10 @@ async fn stream(
             }
             let rows = match q.fetch_all(pool.as_ref()).await {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    yield read_failed("reading rows past the stream's cursor", &e);
+                    return;
+                }
             };
             for row in rows {
                 cursor = row.id;

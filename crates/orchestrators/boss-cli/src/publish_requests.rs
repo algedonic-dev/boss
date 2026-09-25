@@ -34,7 +34,8 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::gate::{api, rows, stamp};
+use crate::gate::{api, stamp};
+use crate::train::rows;
 use crate::train::{find_step, id8, metadata_map, step_done};
 
 /// What a publish-request packet asks for, read off its metadata.
@@ -473,17 +474,17 @@ async fn drain_one(
                 detail: format!("{e:#}"),
             },
             Ok(bytes) => {
-                // The pid, not just the request id: the dev pod runs
-                // `boss` as root AND as the gate's uid 65534, and /tmp is
-                // 1777 — two accounts fulfilling the same request would
-                // otherwise meet on one path, and the second would fail
-                // on a file it cannot write for a reason that has nothing
-                // to do with the request.
-                let path = std::env::temp_dir().join(format!(
-                    "boss-publish-request-{}-{}.bundle",
-                    id8(&jid),
-                    std::process::id()
-                ));
+                // The uid and the pid, not just the request id: the dev
+                // pod runs `boss` as root AND as the gate's uid 65534, and
+                // /tmp is 1777 — two accounts fulfilling the same request
+                // would otherwise meet on one path, and the second would
+                // fail on a file it cannot write for a reason that has
+                // nothing to do with the request. The pid alone kept two
+                // live runs apart but not a recycled pid's leftover from
+                // the other account (307df975).
+                let path =
+                    crate::own_temp::own_temp_path(&format!("boss-publish-request-{}", id8(&jid)))
+                        .with_extension("bundle");
                 std::fs::write(&path, &bytes)
                     .with_context(|| format!("writing {}", path.display()))?;
                 let _guard = TempFile(path.clone());
@@ -519,7 +520,7 @@ pub(crate) async fn run(clone: &str, remote: &str, dry: bool, now: DateTime<Utc>
             None,
         )
         .await?,
-    );
+    )?;
     if open.is_empty() {
         println!("publish-requests: queue empty");
         return Ok(());

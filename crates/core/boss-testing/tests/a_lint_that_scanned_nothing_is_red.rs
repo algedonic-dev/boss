@@ -58,6 +58,14 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
         "self-test of the estate observer against a planted dispatcher endpoint",
     ),
     (
+        "a-dead-host-ends-its-runs",
+        "self-test of the estate observer against planted dev pods and runs",
+    ),
+    (
+        "an-eviction-is-recorded-where-the-record-can-read-it",
+        "self-test of the estate observer against planted evicted pods and events",
+    ),
+    (
         "a-dead-runner-is-settled-by-its-observer",
         "self-test of the gate-runner observer against planted Job states",
     ),
@@ -502,6 +510,11 @@ fn a_live_reading_lint_that_cannot_reach_its_registry_exits_3_and_scans_nothing(
             .current_dir(&root)
             .stdin(Stdio::null())
             .env(env, "http://[::1]:9")
+            // A refused connect is waited out as a rollout since
+            // backlog 834ddb7c; a zero window reads the refusal at once
+            // (a_lint_that_reads_the_api_waits_out_a_roll.rs pins the
+            // wait itself).
+            .env("BOSS_SOR_WAIT_SECONDS", "0")
             .output()
             .unwrap_or_else(|e| panic!("run {rel}: {e}"));
         let code = out.status.code().unwrap_or(-1);

@@ -24,6 +24,7 @@ import {
   appsFor,
   departmentJobsPath,
   departmentsWithoutSurfaces,
+  inPerspective,
   type NavItem,
 } from './nav-catalog';
 import { parseRoute } from '../router';
@@ -144,7 +145,7 @@ describe('nav catalog — app assignment', () => {
     // The network map — every registry station as a node
     // (stations.md: priority queues, stations, and network nodes are
     // one concept). No edges until motion is evented.
-    // Incidents — active incident-post-mortem packets to respond to,
+    // Incidents — active incident packets to respond to,
     // plus the closed ones rendered as a durable archive (David:
     // "both where we respond to active incidents and document post
     // mortems for posterity").
@@ -314,6 +315,69 @@ describe('nav catalog — app assignment', () => {
     expect(ROUTE_CATALOG['system-yard'].path).toBe('/it');
   });
 
+  // A row a fixed-perspective group lists must be one that perspective
+  // can render. AppShell's visible() runs inPerspective on every row,
+  // which drops any catalog row whose app is not the app being
+  // rendered — so a row listed under
+  // the wrong app is dead text: no role ever sees it, and nothing says
+  // so. Home's Mine group carried `exec` (app executive) that way until
+  // backlog e8fe5e5a (2026-09-24), one group down from the Work group's
+  // role lists (0f9be7c0). Exec was never reachable through Home; it is
+  // the Executive app's row, and every department tab is offered to
+  // every role (appsFor takes the departments alone), so removing the
+  // dead row takes no route away from anyone.
+  //
+  // The department groups ride the same check (backlog 72a88031,
+  // 2026-09-24): Production's Products row carries permKey `parts`, the
+  // gate it shares with Warehouse's Ingredients & parts, and the rule
+  // then looked its app up THROUGH that permKey — warehouse — so
+  // Production dropped the row for every role. The rule is now the
+  // shell's own function, imported here rather than restated, so the
+  // pin judges the rows the way the sidebar does.
+  it('every row the Home, IT and department sidebars list is one that app renders', () => {
+    const shell = readFileSync(new URL('./AppShell.svelte', import.meta.url), 'utf8');
+    const between = (from: string, to: string): string => {
+      const start = shell.indexOf(from);
+      const end = shell.indexOf(to, start);
+      // A marker that moved would make the slice empty and the check
+      // vacuous; refuse that rather than pass it.
+      expect(start, `marker not found: ${from}`).toBeGreaterThanOrEqual(0);
+      expect(end, `marker not found: ${to}`).toBeGreaterThan(start);
+      return shell.slice(start, end);
+    };
+    const rowsOf = (src: string): ReadonlyArray<string> =>
+      [...src.matchAll(/ROUTE_CATALOG(?:\.(\w[\w-]*)|\['([^']+)'\])/g)].map((m) => (m[1] ?? m[2])!);
+    const groups: ReadonlyArray<readonly [AppId, ReadonlyArray<string>]> = [
+      ['home', rowsOf(between('const WORK', 'const IT_GROUPS'))],
+      ['home', rowsOf(between('const HOME_GROUPS', 'let MAIN'))],
+      ['it', rowsOf(between('const IT_GROUPS', '// Home —'))],
+    ];
+    // Every department group: APP_SURFACES, one `app: ['row', ...]`
+    // line per department — the list the shell maps into that app's
+    // sidebar.
+    const surfaces = between('const APP_SURFACES', '};');
+    const departmentGroups = [...surfaces.matchAll(/^\s*([\w-]+|'[^']+'):\s*\[([^\]]*)\]/gm)].map(
+      (m) =>
+        [
+          m[1]!.replace(/'/g, '') as AppId,
+          [...m[2]!.matchAll(/'([^']+)'/g)].map((r) => r[1]!),
+        ] as const,
+    );
+    expect(departmentGroups.length, 'APP_SURFACES lists no department').toBeGreaterThan(0);
+    const allGroups = [...groups, ...departmentGroups];
+    for (const [, rows] of allGroups) expect(rows.length).toBeGreaterThan(0);
+    const catalog = ROUTE_CATALOG as Readonly<Record<string, NavItem | undefined>>;
+    const dead = allGroups.flatMap(([app, rows]) =>
+      rows
+        .filter((k) => {
+          const item = catalog[k];
+          return item === undefined || !inPerspective(item, app);
+        })
+        .map((k) => `${k} (listed under ${app}, app ${catalog[k]?.app ?? 'none'})`),
+    );
+    expect(dead, `sidebar rows no role can ever see: ${dead.join(', ')}`).toEqual([]);
+  });
+
   it('nothing from the original System Model set has left the IT app', () => {
     // The half of the pin that matters most: a surface silently
     // changing app is the failure this list was written for.
@@ -467,7 +531,7 @@ describe('departments map to apps', () => {
       } else {
         expect(app.href).toBe(departmentJobsPath(app.id));
       }
-      expect(parseRoute(app.href).kind, `app "${app.id}" lands on the catch-all`).not.toBe('home');
+      expect(parseRoute(app.href).kind, `app "${app.id}" lands on the catch-all`).not.toBe('notFound');
     }
   });
 
@@ -623,5 +687,24 @@ describe('a surface that lists a department names the department', () => {
   it('the two jobs-queue surfaces carry one, so neither needs a kind literal', () => {
     expect(ROUTE_CATALOG.sales.department).toBe('sales');
     expect(ROUTE_CATALOG.service.department).toBe('support');
+  });
+
+  // Backlog 044dffa1 (2026-09-23, page audit 63d810aa): /ux/parts made
+  // four reads and none was a jobs read, so a warehouse packet — once a
+  // protocol declares the department — could never appear on the
+  // warehouse's own page. The department rides here, beside the path,
+  // for the reason the two queues' do.
+  it('the parts surface lists the warehouse department it sits under', () => {
+    expect(ROUTE_CATALOG.parts.app).toBe('warehouse');
+    expect(ROUTE_CATALOG.parts.department).toBe('warehouse');
+  });
+
+  // Backlog 4d4dc204 (2026-09-23, page audit 3f964c57 gap 2): /ux/finance
+  // made no jobs read and linked nowhere that did, so a receive-a-payout
+  // packet waiting at its post step for 2.6 days was on no finance
+  // surface. Same key, same reason as the warehouse's above.
+  it('the finance surface lists the finance department it sits under', () => {
+    expect(ROUTE_CATALOG.finance.app).toBe('finance');
+    expect(ROUTE_CATALOG.finance.department).toBe('finance');
   });
 });

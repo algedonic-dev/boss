@@ -164,7 +164,20 @@ pub fn step_fields(
 /// cancelled train can release the car by clearing the stamp).
 pub const REVIEW: &str = "Open for review";
 
-/// One step write a car's filer owes: which step, and the body to PUT.
+/// One step completion a car's filer owes: which step, the evidence to
+/// MERGE onto it, and the status-only body that then completes it.
+///
+/// TWO WRITES, IN THIS ORDER (backlog e39a9d2a, car 2 of its plan). This
+/// was one PUT of `{status, metadata}` built fresh, with no read. The
+/// step PUT REPLACES metadata wholesale, and the registry materializes
+/// keys onto every step at admission (`metadata_defaults`,
+/// `authority_role`, `station`, `audience`, `claimable`), so every
+/// `boss car open`, `boss park` and auto-park shed them. Now the
+/// evidence goes through the step merge door — [`StepWrite::merge_path`],
+/// one transaction against the row as it stands, so it cannot race — and
+/// then [`StepWrite::status_path`] takes a body carrying nothing to
+/// drop. Merge FIRST: a step's required-at-done fields are validated
+/// when it flips to completed, so the evidence must already be there.
 ///
 /// The step ID is read OFF the car, never assembled — the same rule the
 /// receipt lives by, for the same reason.
@@ -174,8 +187,36 @@ pub struct StepWrite {
     pub step_id: String,
     /// Its title, so a message can name what was written.
     pub title: &'static str,
-    /// `PUT /api/jobs/{car}/steps/{step_id}` body.
-    pub body: Value,
+    /// `PATCH /api/jobs/{car}/steps/{step_id}/metadata` body: top-level
+    /// keys merged into what the step already holds.
+    pub metadata: Value,
+    /// `PUT /api/jobs/{car}/steps/{step_id}` body, sent AFTER the merge:
+    /// the status alone.
+    pub status_body: Value,
+}
+
+impl StepWrite {
+    fn completing(step_id: &str, title: &'static str, metadata: Value) -> Self {
+        Self {
+            step_id: step_id.to_string(),
+            title,
+            metadata,
+            status_body: json!({"status": "completed"}),
+        }
+    }
+
+    /// The step merge door on `job_id` — the FIRST write. The job is the
+    /// car for its own steps, and the linked item for
+    /// [`triage_on_park`]'s.
+    pub fn merge_path(&self, job_id: &str) -> String {
+        format!("/api/jobs/{job_id}/steps/{}/metadata", self.step_id)
+    }
+
+    /// The step PUT on `job_id` — the SECOND write, carrying
+    /// [`StepWrite::status_body`].
+    pub fn status_path(&self, job_id: &str) -> String {
+        format!("/api/jobs/{job_id}/steps/{}", self.step_id)
+    }
 }
 
 /// PURE: the id of `(slug, title)` on this car, or `None` when the
@@ -248,14 +289,11 @@ pub fn open_writes(
         return Err(format!("the `{SCOPE_SLUG}` step on this car has no id"));
     };
     let at = stamp(now);
-    Ok(vec![StepWrite {
-        step_id: step_id.to_string(),
-        title: SCOPE,
-        body: json!({
-            "status": "completed",
-            "metadata": {"summary": summary, "excludes": excludes, "completed_at": at},
-        }),
-    }])
+    Ok(vec![StepWrite::completing(
+        step_id,
+        SCOPE,
+        json!({"summary": summary, "excludes": excludes, "completed_at": at}),
+    )])
 }
 
 /// PURE: the writes a GREEN owes a car — each of scope/build/gate that
@@ -292,11 +330,7 @@ pub fn finish_writes(
         let Some(step_id) = step.get("id").and_then(Value::as_str) else {
             return Err(format!("the `{slug}` step on this car has no id"));
         };
-        out.push(StepWrite {
-            step_id: step_id.to_string(),
-            title,
-            body: json!({"status": "completed", "metadata": metadata}),
-        });
+        out.push(StepWrite::completing(step_id, title, metadata));
     }
     Ok(out)
 }
@@ -378,6 +412,391 @@ pub fn proof_intent(
     m
 }
 
+/// THE NOT-YET STREAK (backlog adef5ddf). A car's `proof_attempt` is
+/// REPLACED on every run, so until 2026-09-23 it said what the last run
+/// answered and nothing about how long it had been answering it. `exit
+/// 75` means "early, not wrong", and a probe that can NEVER pass says
+/// exactly that too: car b8c4267f greps a literal a later car removed on
+/// 9a grounds, car 52e0287e takes the last of four matches where the
+/// call is the second. Both were counted as patiently waiting and
+/// rechecked hourly — measured over the 1812 ops-requests on record
+/// (2026-09-17 to 09-23): six open cars at 86 to 88 consecutive
+/// not-yets each, spanning 97h to 134h, and no probe run ever answered
+/// them otherwise. The exit code cannot tell starving from waiting; the
+/// length of the streak is the only signal there is, so each attempt now
+/// carries where its streak began and how many runs it holds.
+///
+/// Written by the doors that record an attempt
+/// (`boss prove`'s `attempt_json`), read by [`not_yet_streak`].
+pub const NOT_YET_SINCE: &str = "not_yet_since";
+/// How many consecutive runs of the same probe have answered not-yet,
+/// this one included. See [`NOT_YET_SINCE`].
+pub const NOT_YET_RUNS: &str = "not_yet_runs";
+
+/// Did this recorded attempt answer NOT YET? The flag the doors stamp,
+/// or a bare exit 75 on records older than the flag — one definition,
+/// read by the shed's classification and the streak both.
+pub fn attempt_said_not_yet(attempt: &Value) -> bool {
+    attempt.get("not_yet").and_then(Value::as_bool) == Some(true)
+        || attempt.get("exit").and_then(Value::as_i64) == Some(75)
+}
+
+/// Where a not-yet run's streak began and how many runs it now holds,
+/// given the car's PRIOR attempt: `(since, runs)`, for a run at `at` of
+/// `probe`. The streak continues only across not-yets of the SAME probe
+/// text — a corrected probe is the repair for a starved one, and must
+/// not inherit its four days. A prior record written before these keys
+/// existed dates the streak from its own `at`, the earliest not-yet this
+/// door can vouch for.
+pub fn carried_not_yet_streak(prior: Option<&Value>, probe: &str, at: &str) -> (String, u64) {
+    let continuing = prior.filter(|p| {
+        attempt_said_not_yet(p) && p.get("probe").and_then(Value::as_str) == Some(probe)
+    });
+    match continuing {
+        Some(p) => {
+            let since = p
+                .get(NOT_YET_SINCE)
+                .and_then(Value::as_str)
+                .or_else(|| p.get("at").and_then(Value::as_str))
+                .unwrap_or(at);
+            let runs = p
+                .get(NOT_YET_RUNS)
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+                .unwrap_or(1);
+            (since.to_string(), runs + 1)
+        }
+        None => (at.to_string(), 1),
+    }
+}
+
+/// A car's not-yet streak, read back: how many hours lie between its
+/// first and its latest not-yet, and how many runs answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotYetStreak {
+    pub hours: i64,
+    pub runs: u64,
+}
+
+/// The streak on a car's metadata, if its last run answered not-yet.
+///
+/// Measured between two RUNS, never against the clock: a recheck that
+/// stopped firing must not age a streak nobody is asking. And `None`
+/// when the car's recorded probe is no longer the text that ran, so a
+/// probe corrected by a metadata PATCH stops reading as starved at once
+/// rather than at the next hourly write.
+pub fn not_yet_streak(md: &Value) -> Option<NotYetStreak> {
+    let attempt = md.get("proof_attempt")?;
+    if !attempt_said_not_yet(attempt) {
+        return None;
+    }
+    let ran = attempt.get("probe").and_then(Value::as_str);
+    let recorded = md.get(PROOF_PROBE).and_then(Value::as_str);
+    if let (Some(ran), Some(recorded)) = (ran, recorded)
+        && ran != recorded
+    {
+        return None;
+    }
+    let instant = |k: &str| {
+        attempt
+            .get(k)
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    };
+    let last = instant("at")?;
+    let since = instant(NOT_YET_SINCE).unwrap_or(last);
+    let runs = attempt
+        .get(NOT_YET_RUNS)
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    Some(NotYetStreak {
+        hours: (last - since).num_hours(),
+        runs,
+    })
+}
+
+/// WHAT THE CAR SAYS IT WAITS ON (backlog b461341d). Duration alone
+/// cannot tell stuck from patient: the operator triage of the six cars
+/// adef5ddf's streak measured past its bound (b8c4267f, 4b05fe3e,
+/// f71a3c90, b94cb42f, 59398050, 7f01b854, 2026-09-23) found ALL SIX
+/// honestly waiting on the world — a publish failure that has not
+/// happened, a tenant publish, a red crawl, a release David has not
+/// opened, a destructive prune that is his call, a real Stripe charge —
+/// and none with a wrong probe. So about three days after that bound
+/// converged the shed would have called six honest waits "ours to read",
+/// the false signal the label exists to prevent, pointed the other way.
+///
+/// So the car SAYS what it waits on, as `{"on": <prose naming the event
+/// or the actor>, "seen": <optional shell text>}`. `seen` is a second,
+/// smaller probe, run by the same door and on the same host as the
+/// proof probe whenever that one answers not-yet, which exits 0 once the
+/// awaited event is in the record. It is what turns the declaration from
+/// a belief into something the record can contradict: a probe still
+/// saying not-yet AFTER its own declared event was seen is the true
+/// "ours to read", at any streak length. Written by `boss car waits-on`
+/// (or the metadata PATCH it wraps), read by [`starved`].
+pub const WAITS_ON: &str = "waits_on";
+/// On a not-yet `proof_attempt`: when the car's declared `seen` check
+/// first exited 0 in an unbroken run of sightings, or `null`. Carried by
+/// [`carried_seen_at`].
+pub const WAITS_ON_SEEN_AT: &str = "waits_on_seen_at";
+
+/// A car's declared wait, read back. `None` for no declaration, and for
+/// one that names nothing — a blank `on` must not silence the label by
+/// merely being present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitsOn {
+    pub on: String,
+    pub seen: Option<String>,
+}
+
+fn non_blank(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub fn waits_on(md: &Value) -> Option<WaitsOn> {
+    let w = md.get(WAITS_ON)?;
+    Some(WaitsOn {
+        on: non_blank(w.get("on"))?,
+        seen: non_blank(w.get("seen")),
+    })
+}
+
+/// The declaration in the one shape [`waits_on`] reads — what the verb
+/// PATCHes, and what an operator writing the PATCH by hand should copy.
+pub fn waits_on_value(on: &str, seen: Option<&str>) -> Value {
+    let seen = seen.map(str::trim).filter(|s| !s.is_empty());
+    json!({"on": on.trim(), "seen": seen})
+}
+
+/// A written declaration MERGED into the one the car carries (backlog
+/// e9b164a1 piece 3): each field `update` carries replaces that field,
+/// every other field `existing` declares is kept. `None` when the result
+/// names no `on` — a declaration of nothing, which neither writer may
+/// record. One definition for both writers, `boss car waits-on` and the
+/// auto-park handler's copy of `--park-waits-on`, because the object is
+/// wider than its first two fields now: an `owner` and a patience
+/// written by hand must survive a writer that re-states only `on`, and
+/// the metadata door merges top-level keys only.
+pub fn merge_waits_on(existing: Option<&Value>, update: &Value) -> Option<Value> {
+    let mut merged = existing
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merged.extend(update.as_object()?.clone());
+    let merged = Value::Object(merged);
+    waits_on(&json!({ WAITS_ON: merged.clone() }))?;
+    Some(merged)
+}
+
+/// When the declared event was first seen, for a run that `seen` it (or
+/// not): the prior attempt's sighting if it had one, else this run's
+/// instant; `None` for a run that did not see it — a sighting that stops
+/// is not a sighting.
+pub fn carried_seen_at(prior: Option<&Value>, seen: bool, at: &str) -> Option<String> {
+    if !seen {
+        return None;
+    }
+    Some(
+        prior
+            .and_then(|p| p.get(WAITS_ON_SEEN_AT))
+            .and_then(Value::as_str)
+            .unwrap_or(at)
+            .to_string(),
+    )
+}
+
+/// Why a not-yet car is ours to read rather than the world's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Starved {
+    /// No declared wait, and the probe has said not-yet without a break
+    /// past `regions::NOT_YET_STARVED_HOURS` — adef5ddf's rule, which is
+    /// all the record can say of a car that never said what it waits on.
+    Undeclared(NotYetStreak),
+    /// The car declared what it waits on, its `seen` check found that
+    /// in the record, and the probe STILL said not-yet.
+    SeenWhileNotYet { on: String, seen_at: String },
+}
+
+/// Is this car's not-yet ours to read? One definition, read by the
+/// shed and by `boss orient`. A DECLARED wait not yet seen is never
+/// starved, however long — its patience is stated, and it becomes ours
+/// the moment the record holds what it named.
+pub fn starved(md: &Value) -> Option<Starved> {
+    let streak = not_yet_streak(md)?;
+    match waits_on(md) {
+        None => (streak.hours >= crate::regions::NOT_YET_STARVED_HOURS)
+            .then_some(Starved::Undeclared(streak)),
+        Some(w) => md
+            .pointer(&format!("/proof_attempt/{WAITS_ON_SEEN_AT}"))
+            .and_then(Value::as_str)
+            .map(|seen_at| Starved::SeenWhileNotYet {
+                on: w.on,
+                seen_at: seen_at.to_string(),
+            }),
+    }
+}
+
+/// WHOSE MOVE A DECLARED WAIT IS (backlog 3881f5c9). Inside `waits_on`:
+/// `"world"` for an event nobody here can cause, or the id of the actor
+/// whose act it is. DECLARED, never inferred — `on` prose that says
+/// "David opens it" names no owner, because a reader that guessed an
+/// owner out of prose would be the mostly-sure the shed exists to
+/// refuse. No writer sets it yet (`boss car waits-on` writes only `on`
+/// and `seen`); until one does, it is written through the metadata
+/// PATCH, and a car without it reads as ours.
+pub const WAITS_ON_OWNER: &str = "owner";
+/// Inside `waits_on`, optional: how many hours from the car's opening
+/// the owner's move may take before the wait is ours again. A positive
+/// integer or nothing — patience is the car's to state, not a default.
+pub const WAITS_ON_MAX_WAIT_HOURS: &str = "max_wait_hours";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOwner {
+    World,
+    Actor(String),
+}
+
+impl std::fmt::Display for WaitOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitOwner::World => f.write_str("the world"),
+            WaitOwner::Actor(a) => f.write_str(a),
+        }
+    }
+}
+
+/// The owner a car's `waits_on` declares, or `None` for none or blank.
+pub fn wait_owner(md: &Value) -> Option<WaitOwner> {
+    let owner = non_blank(md.get(WAITS_ON)?.get(WAITS_ON_OWNER))?;
+    Some(if owner.eq_ignore_ascii_case("world") {
+        WaitOwner::World
+    } else {
+        WaitOwner::Actor(owner)
+    })
+}
+
+/// A wait that is someone else's move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWait {
+    pub owner: WaitOwner,
+    pub on: String,
+    pub max_wait_hours: Option<i64>,
+}
+
+impl OwnedWait {
+    /// Past the patience the car declared, measured on its age.
+    pub fn overdue(&self, age_hours: i64) -> bool {
+        self.max_wait_hours.is_some_and(|max| age_hours > max)
+    }
+}
+
+/// Is this car's wait someone else's move? Only when all four hold: it
+/// DECLARED the wait, it names an OWNER, a WORLD wait has something
+/// that OBSERVES it (a `seen` check), and the event has not been seen
+/// while the probe says not-yet ([`starved`] is `None`). Anything short
+/// of that is ours — the shed's troubled colour means exactly that set.
+///
+/// WHY ONLY THE WORLD NEEDS AN OBSERVER (3881f5c9, fix shape (2)).
+/// Nothing but a `seen` check can say a Stripe charge arrived, so an
+/// unobserved world wait is ours to observe. A named actor's act is
+/// that actor's next move whether or not a check watches for it — the
+/// dev-door car, waiting on David's SSH CA ceremony with no probe at
+/// all, troubled the shed alone on 2026-09-24 though its owner was
+/// declared as data. Its bound is the patience the car declares, and a
+/// check that does exist still turns a seen-while-not-yet into ours.
+pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
+    let w = waits_on(md)?;
+    let owner = wait_owner(md)?;
+    if owner == WaitOwner::World && w.seen.is_none() {
+        return None;
+    }
+    if starved(md).is_some() {
+        return None;
+    }
+    Some(OwnedWait {
+        owner,
+        on: w.on,
+        max_wait_hours: md
+            .pointer(&format!("/{WAITS_ON}/{WAITS_ON_MAX_WAIT_HOURS}"))
+            .and_then(Value::as_i64)
+            .filter(|h| *h > 0),
+    })
+}
+
+/// THE PROOF A LANDED CAR OWES (backlog b9005734, approved by David
+/// 2026-09-24). The packet measured 21 cars standing at `proven`,
+/// several five to seven days old, each waiting on a rare event nobody
+/// here causes — a Stripe charge, a release David cuts, his destructive
+/// prune, a red nightly crawl — and each holding its item open while the
+/// shed read TROUBLED every hour of every day. A permanently red surface
+/// is read like a silent one (CLAUDE.md §Diagnosis). So a car whose
+/// wait is declared, observed and owned closes LANDED with its proof
+/// owed, and the proof becomes an obligation keyed to the event it
+/// waits on: when that event fires, the recorded probe runs again.
+///
+/// `proof_owed = "true"` is the one marker — a string, because a
+/// protocol predicate compares strings (`job.metadata.proof_owed =
+/// "true"`, the idiom every `abandoned` terminal uses) — and the
+/// obligation reads it through [`owes_proof`]. Paying the proof removes
+/// it; the car's closing outcome keeps the history.
+pub const PROOF_OWED: &str = "proof_owed";
+
+/// Does this car owe its proof? Only under the one marker.
+pub fn owes_proof(md: &Value) -> bool {
+    md.get(PROOF_OWED).and_then(Value::as_str) == Some("true")
+}
+
+/// Inside `waits_on`: the event that settles the wait, declared so a
+/// MACHINE can match it — `{"closes": <kind>, "title": <prefix>}`, the
+/// close of a packet of that kind, optionally narrowed by the start of
+/// its title (an `ops-request`'s title leads with its verb). `on` is
+/// prose for a reader and `seen` a probe for the forge; neither can key
+/// a dispatcher firing, which is what an owed proof needs (b9005734).
+/// The close marker carries `kind` and `title` on all three emit sites,
+/// so this is matched against the event itself, never a re-fetch.
+pub const WAITS_ON_EVENT: &str = "event";
+
+/// A declared wait's event, read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitEvent {
+    /// The kind of packet whose close is the event.
+    pub closes: String,
+    /// Optional: the closing packet's title must start with this.
+    pub title: Option<String>,
+}
+
+impl WaitEvent {
+    /// Is this `jobs.job.closed` marker the declared event? The kind
+    /// must match, and a declared prefix must lead the closing title —
+    /// a marker with no title satisfies no prefix.
+    pub fn fired_by(&self, closed: &Value) -> bool {
+        let title = closed.get("title").and_then(Value::as_str);
+        closed.get("kind").and_then(Value::as_str) == Some(self.closes.as_str())
+            && self
+                .title
+                .as_deref()
+                .is_none_or(|p| title.is_some_and(|t| t.starts_with(p)))
+    }
+}
+
+/// The event a car's `waits_on` declares, or `None` — for no wait, a
+/// wait naming nothing ([`waits_on`] refuses a blank `on`), or an event
+/// whose `closes` is blank, so an empty object can never key an
+/// obligation to every close there is.
+pub fn wait_event(md: &Value) -> Option<WaitEvent> {
+    waits_on(md)?;
+    let e = md.get(WAITS_ON)?.get(WAITS_ON_EVENT)?;
+    Some(WaitEvent {
+        closes: non_blank(e.get("closes"))?,
+        title: non_blank(e.get("title")),
+    })
+}
+
 /// THE ITEM A CAR ANSWERS, AND AUTHORISES THE CLOSE OF.
 ///
 /// The declared one-to-one job edge (`('ship-a-change', 'backlog_item',
@@ -409,6 +828,17 @@ pub const BACKLOG_ITEM: &str = "backlog_item";
 /// work outstanding. This key records the same provenance under a name
 /// NO rule reads, which is what makes it inert at arrival.
 pub const PARTIAL_ITEM: &str = "partial_item";
+
+/// EVERY OTHER ITEM A CAR ANSWERS, AND AUTHORISES THE CLOSE OF.
+///
+/// A `job_id_list` edge beside [`BACKLOG_ITEM`], followed on merge by
+/// the same arrival rule (its `also_link`), so each listed item is
+/// routed and built exactly as the primary is. `backlog_item` holds ONE
+/// id, and on 2026-09-23 two landed items stayed open that way and were
+/// dispatched to builders who rediscovered the landing: 5994de6d (its
+/// fix rode on cars filed under three other items) and cab50f4c (car
+/// c842f18b named only 3ec04168). Backlog a994f533.
+pub const ALSO_ANSWERS: &str = "also_answers";
 /// Why this car names no item at all — the answer a deliberately
 /// item-less car gives (`--park-no-item`). Item-less cars legitimately
 /// exist (a fix asked for in conversation, a defect found while
@@ -435,11 +865,13 @@ pub const NO_ITEM_REASON: &str = "no_item_reason";
 /// without anyone watching. `--hold` stays: a declared edge and a human
 /// brake are different tools (design doc 364f892e, backlog d3320278).
 ///
-/// The READ side is the conductor's — `boss train board` filters its
-/// candidates on it and names which of four situations holds when it
-/// refuses. The key lives here because the writers (`boss gate
-/// --park-after`, the auto-park handler) and that reader must not keep
-/// two spellings of one fact (CLAUDE.md §9a).
+/// Two READERS, one judgement: `boss train board` filters its candidates
+/// on it, and the dock region (`regions::dock_edges`) counts the cars it
+/// holds — both through [`boards_after_outcome`] below, which names which
+/// of four situations holds (backlog 4142d821). The key lives here
+/// because the writers (`boss gate --park-after`, the auto-park handler)
+/// and those readers must not keep two spellings of one fact (CLAUDE.md
+/// §9a).
 pub const BOARDS_AFTER: &str = "boards_after";
 
 /// The gate-run key `boss gate --park-after` stamps, which the auto-park
@@ -483,6 +915,46 @@ pub const PARK_EXPECT: &str = "park_expect";
 pub const PARK_PROOF_EVENT: &str = "park_proof_event";
 pub const PARK_NO_ITEM: &str = "park_no_item";
 pub const PARK_PARTIAL_ITEM: &str = "park_partial_item";
+/// `boss gate --park-waits-on` (backlog e9b164a1 piece 3): the car's
+/// declared wait as the builder states it at park — an object carrying
+/// only the [`WAITS_ON`] fields given. The auto-park handler MERGES it
+/// onto the car's `waits_on` with [`merge_waits_on`], never replaces.
+pub const PARK_WAITS_ON: &str = "park_waits_on";
+/// `boss gate --park-also-answers` (backlog a994f533, the writer half):
+/// every OTHER item the car answers, as a JSON list of full ids. The
+/// auto-park handler copies it onto the car as [`ALSO_ANSWERS`] through
+/// [`also_answers`]. Until this existed the edge had a reader and no
+/// writer, so nothing a builder typed could set it.
+pub const PARK_ALSO_ANSWERS: &str = "park_also_answers";
+
+/// The `also_answers` edge a car carries, read off what the gate stamped
+/// under [`PARK_ALSO_ANSWERS`]: each id once, in the order given, blanks
+/// dropped. Anything but a list, or a list with no id in it, is omitted
+/// rather than written empty — the same absent-never-nulled contract as
+/// [`item_provenance`], so a re-gate that names none leaves a recorded
+/// list alone.
+pub fn also_answers(stamped: Option<&Value>) -> serde_json::Map<String, Value> {
+    let ids = stamped
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .fold(Vec::<&str>::new(), |mut seen, id| {
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                    }
+                    seen
+                })
+        })
+        .unwrap_or_default();
+    let mut m = serde_json::Map::new();
+    if !ids.is_empty() {
+        m.insert(ALSO_ANSWERS.to_string(), json!(ids));
+    }
+    m
+}
 
 /// The item provenance a car carries beyond the closing edge: the item
 /// it is one piece of, or the reason it names none. Absent and blank
@@ -840,22 +1312,19 @@ pub const TRIAGE_SLUG: &str = "triage";
 /// The disposition a parked car states: this car is the item's build.
 pub const DISPOSITION_BUILD: &str = "build";
 
-/// The step write a park owes the item its car links — the step to
-/// complete and the body to PUT. The HTTP stays with each caller
-/// (`boss park` and the dispatcher's auto-park handler); the DECISION
-/// lives here once.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TriageWrite {
-    /// The id of the item's routing step.
-    pub step_id: String,
-    /// `PUT /api/jobs/{item}/steps/{step_id}` body: completed, with the
-    /// disposition and the evidence merged onto whatever the step
-    /// already carried.
-    pub body: Value,
-}
-
 /// PURE: the triage write parking this car owes the item it links — or
-/// `None` when there is nothing for a park to state.
+/// `None` when there is nothing for a park to state. The HTTP stays with
+/// each caller (`boss park`, `boss car open` and the dispatcher's
+/// auto-park handler); the DECISION lives here once.
+///
+/// THE SAME TWO WRITES AS EVERY OTHER CAR WRITE — a [`StepWrite`],
+/// addressed through the ITEM's id: the route through the step merge
+/// door, then a status-only PUT (backlog e39a9d2a, Stage 1). This was
+/// one PUT of `{status, metadata}` whose metadata was the step's as the
+/// park had READ it plus the two route keys; the PUT replaces metadata
+/// wholesale, so a key written between that read and the PUT was dropped
+/// by omission. The merge body holds the route alone, because the merge
+/// keeps what the step already carries.
 ///
 /// WHY A PARK DECIDES THE ROUTE. `--park-backlog-item <id>` says "this
 /// car is that item's build". But the item's `build` step only OPENS
@@ -882,7 +1351,7 @@ pub struct TriageWrite {
 /// with no routing step, and a kind outside `TRIAGEABLE_KINDS` all
 /// answer `None` — so a re-gate, a refresh or a redelivery writes
 /// nothing, and no human's disposition is ever overwritten.
-pub fn triage_on_park(item: &Value, car_id: &str, branch: &str) -> Option<TriageWrite> {
+pub fn triage_on_park(item: &Value, car_id: &str, branch: &str) -> Option<StepWrite> {
     let kind = item.get("kind").and_then(Value::as_str)?;
     if !TRIAGEABLE_KINDS.contains(&kind) {
         return None;
@@ -900,27 +1369,24 @@ pub fn triage_on_park(item: &Value, car_id: &str, branch: &str) -> Option<Triage
     ) {
         return None;
     }
-    let mut metadata = match step.get("metadata").cloned() {
-        Some(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
-    };
     // Belt to the status guard's braces: a disposition already written
     // is a decision already made, whatever the step's status says.
-    if metadata.contains_key("disposition") {
+    if step
+        .get("metadata")
+        .and_then(|m| m.get("disposition"))
+        .is_some()
+    {
         return None;
     }
-    let step_id = step.get("id").and_then(Value::as_str)?.to_string();
-    metadata.insert("disposition".to_string(), json!(DISPOSITION_BUILD));
-    metadata.insert(
-        "evidence".to_string(),
-        json!(park_triage_evidence(car_id, branch)),
-    );
-    Some(TriageWrite {
+    let step_id = step.get("id").and_then(Value::as_str)?;
+    Some(StepWrite::completing(
         step_id,
-        // PATCH-on-PUT replaces top-level `metadata` wholesale, so the
-        // step's existing keys ride along rather than being wiped.
-        body: json!({ "status": "completed", "metadata": Value::Object(metadata) }),
-    })
+        TRIAGE_SLUG,
+        json!({
+            "disposition": DISPOSITION_BUILD,
+            "evidence": park_triage_evidence(car_id, branch),
+        }),
+    ))
 }
 
 /// The `evidence` the routing step records at done, naming WHAT made
@@ -939,6 +1405,212 @@ fn park_triage_evidence(car_id: &str, branch: &str) -> String {
          the car is filed rather than left un-triaged until the car merges \
          (backlog ca76d8f9, a29c3687)."
     )
+}
+
+// ---------------------------------------------------------------------------
+// THE DECLARED ORDERING EDGE, JUDGED — one answer for the conductor and the dock
+//
+// Moved here from `boss-cli/src/train/boarding.rs` (backlog 4142d821, design
+// cf820810 Q7). Until then only the conductor asked whether a parked car's
+// `boards_after` predecessor had landed, so the conductor refused the car
+// every 60 seconds while the dock region counted it as boardable and said
+// "the boarding depth is met, a train is due" — the sentence it says two
+// minutes after a healthy departure. Two readers of one edge must not keep
+// two answers to "can this car board" (CLAUDE.md §9a), so the judgement
+// lives in core beside the key it reads, and both take it from here.
+//
+// The words below are the conductor's own and are unchanged by the move:
+// four situations, told apart at a glance, because an operator reading them
+// is deciding whether the pipeline is stuck (d3320278):
+//
+//   still in flight  — nobody does anything; it departs on its own
+//   landed           — satisfied; the car boards (no refusal at all)
+//   abandoned        — a human must break the edge; it will never clear
+//   no such Job      — a human must fix the reference
+//
+// AND IT MUST NEVER FREEZE A LANDING: an edge that cannot be READ boards the
+// car and says why (`BoardUnjudged`). The edge exists to stop a known
+// collision, not to become a new way for the pipeline to stop.
+// ---------------------------------------------------------------------------
+
+/// The structured marker a boarding-edge hold leaves on its `left_behind`
+/// entry, so the window's own refusal line is composed from DATA and not
+/// from sniffing the reason string back apart.
+pub const EDGE_HOLD: &str = "edge_hold";
+/// The predecessor is still in flight — self-clearing, no action.
+pub const EDGE_HOLD_WAITING: &str = "waiting";
+/// The edge can never be satisfied as declared — a person must act.
+pub const EDGE_HOLD_NEEDS_HUMAN: &str = "needs_human";
+
+/// What a reader managed to learn about a car's declared predecessor.
+/// `Unreadable` is a first-class answer, not an error: "I could not ask"
+/// must be distinguishable from "it is not there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Predecessor {
+    /// The Job came back — as the jobs API serves it, with its `steps` —
+    /// judged by this file's own predicates so no reader can disagree with
+    /// the rest of the system about what "landed" means.
+    Found(Value),
+    /// The jobs API answered that there is no such Job.
+    Absent,
+    /// The read itself failed — a blip, an outage, a malformed body.
+    Unreadable(String),
+}
+
+/// Why a car may not board on its declared edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeHold {
+    /// The reason, journal and Job chip alike — ONE string, as every
+    /// other skip reason is.
+    pub reason: String,
+    /// `EDGE_HOLD_WAITING` or `EDGE_HOLD_NEEDS_HUMAN`.
+    pub kind: &'static str,
+    /// The predecessor as a reader names it — its branch and id8 where
+    /// the packet came back, the id8 alone where it did not. Structured
+    /// so the dock can say "waiting behind X" without parsing `reason`.
+    pub behind: String,
+}
+
+/// What boarding should do about a car's declared edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeOutcome {
+    /// Board it: the edge is satisfied, or there is none.
+    Board,
+    /// Board it, and SAY why the edge could not be judged. Fail-open by
+    /// design — see the section comment.
+    BoardUnjudged(String),
+    /// Leave it behind, with the reason named on it.
+    Hold(EdgeHold),
+}
+
+/// The predecessor a car's METADATA declares, if it declares one. A blank
+/// value is no declaration — the metadata door deletes a null key but a
+/// `""` is a real stored value, and `jobs_clear_waiting` shows `""` is how
+/// an edge gets cleared in practice.
+pub fn boards_after_of(md: &Value) -> Option<String> {
+    md.get(BOARDS_AFTER)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The predecessor a car (a whole packet) declared, if it declared one.
+pub fn declared_predecessor(car: &Value) -> Option<String> {
+    car.get("metadata").and_then(boards_after_of)
+}
+
+/// The first eight characters of an id — the spelling every journal,
+/// report and surface prints.
+fn id8(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// How to name a predecessor in a refusal an operator reads: its BRANCH
+/// where we have it, never a bare id (MEMORY: refer by protocol + title).
+/// The id8 rides along so the packet is still findable.
+fn predecessor_name(declared: &str, pred: Option<&Value>) -> String {
+    let branch = pred
+        .and_then(|p| p.pointer("/metadata/branch"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if branch.is_empty() {
+        format!("car {}", id8(declared))
+    } else {
+        format!("{branch} (car {})", id8(declared))
+    }
+}
+
+/// Where a live predecessor actually is, so "still in flight" names a
+/// place rather than asserting a mood. The three states are this file's
+/// (`is_boarded` / `is_parked` / `is_building`), in the order a car
+/// passes through them backwards.
+fn in_flight_at(pred: &Value) -> String {
+    if is_boarded(pred) {
+        let train = pred
+            .pointer("/metadata/train")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if train.is_empty() {
+            "aboard a train".to_string()
+        } else {
+            format!("aboard train {}", id8(train))
+        }
+    } else if is_parked(pred) {
+        "parked at the dock".to_string()
+    } else if is_building(pred) {
+        "still building".to_string()
+    } else {
+        "open".to_string()
+    }
+}
+
+/// How a spent predecessor ended, read off the packet rather than
+/// guessed, so the refusal says what the record says.
+fn spent_as(pred: &Value) -> String {
+    let status = pred
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("not open");
+    match pred.pointer("/metadata/outcome").and_then(Value::as_str) {
+        Some(o) if !o.is_empty() => format!("{status}, outcome '{o}'"),
+        _ => format!("{status}, no landing recorded"),
+    }
+}
+
+/// PURE: what boarding does about one car's declared edge.
+///
+/// The four situations, and the exact words each gets. They are written
+/// to be told apart at a glance by an operator scanning the journal:
+/// "STILL IN FLIGHT" carries "no action needed", and both unsatisfiable
+/// cases carry "a human must". That distinction is the feature — not the
+/// hold (David on d3320278: "the refusal's wording matters as much as its
+/// existence").
+pub fn boards_after_outcome(declared: &str, pred: &Predecessor) -> EdgeOutcome {
+    match pred {
+        // FAIL-OPEN, LOUDLY. A car that would have boarded yesterday must
+        // not be held because the system of record blipped while the
+        // conductor asked about its edge.
+        Predecessor::Unreadable(cause) => EdgeOutcome::BoardUnjudged(format!(
+            "boards after car {}, and that packet could not be read ({cause}) — boarding \
+             anyway: an unreadable edge is not evidence of a collision, and holding the \
+             dock on a read failure would stop every train",
+            id8(declared)
+        )),
+        Predecessor::Absent => EdgeOutcome::Hold(EdgeHold {
+            reason: format!(
+                "boards after car {}, which DOES NOT EXIST — a human must fix \
+                 metadata.{} on this car (the edge is ref-checked at the write, so this \
+                 id was stored before the edge was declared, or with ref-checking off)",
+                id8(declared),
+                BOARDS_AFTER
+            ),
+            kind: EDGE_HOLD_NEEDS_HUMAN,
+            behind: predecessor_name(declared, None),
+        }),
+        Predecessor::Found(p) if is_landed(p) => EdgeOutcome::Board,
+        Predecessor::Found(p) if is_open(p) => EdgeOutcome::Hold(EdgeHold {
+            reason: format!(
+                "boards after {}, which is STILL IN FLIGHT ({}) — no action needed; this \
+                 car boards on a later window once that one lands",
+                predecessor_name(declared, Some(p)),
+                in_flight_at(p)
+            ),
+            kind: EDGE_HOLD_WAITING,
+            behind: predecessor_name(declared, Some(p)),
+        }),
+        Predecessor::Found(p) => EdgeOutcome::Hold(EdgeHold {
+            reason: format!(
+                "boards after {}, which was ABANDONED ({}) — the edge can never be \
+                 satisfied; a human must clear metadata.{} on this car, or abandon it too",
+                predecessor_name(declared, Some(p)),
+                spent_as(p),
+                BOARDS_AFTER
+            ),
+            kind: EDGE_HOLD_NEEDS_HUMAN,
+            behind: predecessor_name(declared, Some(p)),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1014,6 +1686,27 @@ mod tests {
         assert_eq!(n[NO_ITEM_REASON], "David asked for this in conversation");
         assert_ne!(PARTIAL_ITEM, BACKLOG_ITEM);
         assert_ne!(NO_ITEM_REASON, BACKLOG_ITEM);
+    }
+
+    /// EVERY OTHER ITEM, AS STAMPED (a994f533, the writer half). The
+    /// gate stamps a list; the car gets the declared `also_answers` edge
+    /// with blanks dropped and repeats folded, and nothing at all when
+    /// the gate stated none — absent, never an empty list, so a re-gate
+    /// that names none leaves a recorded list alone.
+    #[test]
+    fn also_answers_carries_every_stated_id_once_and_nothing_else() {
+        assert!(also_answers(None).is_empty());
+        assert!(also_answers(Some(&json!([]))).is_empty());
+        assert!(also_answers(Some(&json!(["  ", ""]))).is_empty());
+        assert!(
+            also_answers(Some(&json!("5994de6d"))).is_empty(),
+            "a bare string is not the list the gate stamps"
+        );
+        let a = also_answers(Some(&json!(["5994de6d", " ", "cab50f4c", "5994de6d"])));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[ALSO_ANSWERS], json!(["5994de6d", "cab50f4c"]));
+        assert_ne!(PARK_ALSO_ANSWERS, ALSO_ANSWERS);
+        assert_ne!(ALSO_ANSWERS, BACKLOG_ITEM);
     }
 
     #[test]
@@ -1475,16 +2168,54 @@ mod park_triage_tests {
         let w = triage_on_park(&untriaged_item(), CAR_ID, BRANCH)
             .expect("an un-triaged item gets the route its car states");
         assert_eq!(w.step_id, "s-triage");
-        assert_eq!(w.body["status"], "completed");
-        assert_eq!(w.body["metadata"]["disposition"], DISPOSITION_BUILD);
-        let evidence = w.body["metadata"]["evidence"].as_str().unwrap_or_default();
+        assert_eq!(w.status_body, json!({"status": "completed"}));
+        assert_eq!(w.metadata["disposition"], DISPOSITION_BUILD);
+        let evidence = w.metadata["evidence"].as_str().unwrap_or_default();
         assert!(
             evidence.contains("9442139b") && evidence.contains(BRANCH),
             "the evidence names the car and its branch: {evidence}"
         );
-        // PUT replaces `metadata` wholesale, so what the step already
-        // carried has to ride along.
-        assert_eq!(w.body["metadata"]["context_md"], "filed by a builder");
+    }
+
+    /// THE ROUTE RIDES THE MERGE DOOR (backlog e39a9d2a, Stage 1). This
+    /// was one PUT of `{status, metadata}` whose metadata was the step's
+    /// metadata AS THE PARK READ IT plus the two route keys. The step PUT
+    /// replaces metadata wholesale, so any key written between that read
+    /// and the PUT — a claim's lease, a person's note — was dropped by
+    /// omission, silently. Now the two keys go through
+    /// `PATCH …/steps/{id}/metadata`, one transaction against the row as
+    /// it stands, and the PUT carries the status and nothing to drop. The
+    /// step's own keys are therefore NOT in the body: the merge keeps
+    /// them where they are, and a body that re-sent them would re-send a
+    /// stale copy.
+    #[test]
+    fn the_park_route_merges_its_keys_and_puts_only_the_status() {
+        for item in [untriaged_item(), untriaged_feedback()] {
+            let w = triage_on_park(&item, CAR_ID, BRANCH).expect("an un-triaged packet routes");
+            assert_eq!(
+                w.status_body,
+                json!({"status": "completed"}),
+                "the PUT must carry the status alone"
+            );
+            let keys: Vec<&str> = w
+                .metadata
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                keys,
+                ["disposition", "evidence"],
+                "the merge body carries the route and nothing read off the step"
+            );
+            assert_eq!(
+                w.merge_path("item-1"),
+                format!("/api/jobs/item-1/steps/{}/metadata", w.step_id)
+            );
+            assert_eq!(
+                w.status_path("item-1"),
+                format!("/api/jobs/item-1/steps/{}", w.step_id)
+            );
+        }
     }
 
     /// The idempotence that makes this safe to run on every re-gate and
@@ -1547,17 +2278,12 @@ mod park_triage_tests {
         let w = triage_on_park(&untriaged_feedback(), CAR_ID, BRANCH)
             .expect("un-triaged feedback gets the route its car states");
         assert_eq!(w.step_id, "s-triage");
-        assert_eq!(w.body["status"], "completed");
-        assert_eq!(w.body["metadata"]["disposition"], DISPOSITION_BUILD);
-        let evidence = w.body["metadata"]["evidence"].as_str().unwrap_or_default();
+        assert_eq!(w.status_body, json!({"status": "completed"}));
+        assert_eq!(w.metadata["disposition"], DISPOSITION_BUILD);
+        let evidence = w.metadata["evidence"].as_str().unwrap_or_default();
         assert!(
             evidence.contains(CAR_ID) && evidence.contains(BRANCH),
             "the evidence names the car and its branch: {evidence}"
-        );
-        // The filer's own words ride along with the route.
-        assert_eq!(
-            w.body["metadata"]["finding"],
-            "a page for the codebase stats"
         );
     }
 
@@ -1801,11 +2527,11 @@ mod building_tests {
         assert_eq!(writes.len(), 1, "one write: scope");
         assert_eq!(writes[0].step_id, "s-scope");
         assert_eq!(writes[0].title, SCOPE);
-        assert_eq!(writes[0].body["status"], "completed");
-        assert_eq!(writes[0].body["metadata"]["summary"], "does a thing");
-        assert_eq!(writes[0].body["metadata"]["excludes"], "not that");
+        assert_eq!(writes[0].status_body, json!({"status": "completed"}));
+        assert_eq!(writes[0].metadata["summary"], "does a thing");
+        assert_eq!(writes[0].metadata["excludes"], "not that");
         assert_eq!(
-            writes[0].body["metadata"]["completed_at"], "2026-09-10T18:00:00Z",
+            writes[0].metadata["completed_at"], "2026-09-10T18:00:00Z",
             "the same stamp format every other writer uses"
         );
     }
@@ -1844,13 +2570,13 @@ mod building_tests {
         let titles: Vec<&str> = writes.iter().map(|w| w.title).collect();
         assert_eq!(titles, vec![BUILD, GATE], "scope is already declared");
         assert_eq!(writes[0].step_id, "s-build");
-        assert_eq!(writes[0].body["metadata"]["test"], "ran the tests");
+        assert_eq!(writes[0].metadata["test"], "ran the tests");
         assert_eq!(writes[1].step_id, "s-gate");
         assert_eq!(
-            writes[1].body["metadata"]["receipt"], GREEN,
+            writes[1].metadata["receipt"], GREEN,
             "the receipt rides verbatim, as it does on a fresh car"
         );
-        assert_eq!(writes[1].body["metadata"]["verified"], "seen working");
+        assert_eq!(writes[1].metadata["verified"], "seen working");
     }
 
     /// And the path auto-park has always taken is unchanged: a car it
@@ -1872,11 +2598,67 @@ mod building_tests {
         assert_eq!(titles, vec![SCOPE, BUILD, GATE]);
         assert_eq!(writes[0].step_id, "s-scope");
         for w in &writes {
-            assert_eq!(w.body["status"], "completed");
+            assert_eq!(w.status_body, json!({"status": "completed"}));
             assert_eq!(
-                w.body["metadata"]["completed_at"], "2026-09-10T18:30:00Z",
+                w.metadata["completed_at"], "2026-09-10T18:30:00Z",
                 "{} was filled without saying when",
                 w.title
+            );
+        }
+    }
+
+    /// NO CAR WRITE PUTS METADATA (backlog e39a9d2a, car 2 of its plan).
+    ///
+    /// The step PUT REPLACES metadata wholesale, and the registry
+    /// materializes keys onto every step at admission —
+    /// `metadata_defaults`, `authority_role`, `station`, `audience`,
+    /// `claimable` — so these writers, which build their bodies fresh with
+    /// no read, shed every one of those keys on every `boss car open`,
+    /// `boss park` and auto-park. The evidence rides the step MERGE door
+    /// (`PATCH …/steps/{id}/metadata`, one transaction against the row as
+    /// it stands, so it cannot race) and the completion is a PUT carrying
+    /// the status and nothing else to drop.
+    #[test]
+    fn every_car_write_merges_its_evidence_and_puts_only_the_status() {
+        let opened = open_writes(&fresh("f1", BRANCH), "s", "e", at("2026-09-10T18:00:00Z"))
+            .expect("a fresh car can be opened");
+        let finished = finish_writes(
+            &fresh("f1", BRANCH),
+            "s",
+            "e",
+            "t",
+            "v",
+            &receipt(),
+            at("2026-09-10T18:30:00Z"),
+        )
+        .expect("a fresh car can be finished");
+        assert!(!opened.is_empty() && finished.len() == 3);
+        for w in opened.iter().chain(&finished) {
+            assert_eq!(
+                w.status_body,
+                json!({"status": "completed"}),
+                "{}: the PUT must carry the status alone — a metadata key in it \
+                 replaces the step's stored keys wholesale",
+                w.title
+            );
+            assert!(
+                w.metadata.as_object().is_some_and(|m| !m.is_empty()),
+                "{}: the evidence rides the merge body",
+                w.title
+            );
+            assert!(
+                w.metadata.get("status").is_none(),
+                "{}: `status` on the merge door would be a metadata key named status",
+                w.title
+            );
+            assert_eq!(
+                w.merge_path("car-1"),
+                format!("/api/jobs/car-1/steps/{}/metadata", w.step_id),
+                "the merge door, addressed through the car the step is on"
+            );
+            assert_eq!(
+                w.status_path("car-1"),
+                format!("/api/jobs/car-1/steps/{}", w.step_id)
             );
         }
     }
@@ -1945,5 +2727,728 @@ mod building_tests {
             Some("s-build")
         );
         assert!(step_id_for(&json!({"steps": []}), BUILD_SLUG, BUILD).is_none());
+    }
+}
+
+#[cfg(test)]
+mod not_yet_streak_tests {
+    use super::*;
+
+    const PROBE: &str = "grep -c x f || exit 75";
+
+    fn not_yet(at: &str, since: Option<&str>, runs: Option<u64>) -> Value {
+        let mut a = json!({"at": at, "exit": 75, "not_yet": true, "probe": PROBE});
+        if let Some(s) = since {
+            a[NOT_YET_SINCE] = json!(s);
+        }
+        if let Some(n) = runs {
+            a[NOT_YET_RUNS] = json!(n);
+        }
+        a
+    }
+
+    /// The first not-yet of a streak starts it at this run.
+    #[test]
+    fn a_first_not_yet_starts_the_streak_at_this_run() {
+        let (since, runs) = carried_not_yet_streak(None, PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+    }
+
+    /// A not-yet after a not-yet of the SAME probe keeps the streak's
+    /// start and counts the run — the only way a reader can later tell
+    /// "asked once" from "asked 86 times across four days".
+    #[test]
+    fn a_not_yet_after_a_not_yet_carries_the_start_and_counts() {
+        let prior = not_yet(
+            "2026-09-23T06:00:00Z",
+            Some("2026-09-19T05:50:00Z"),
+            Some(85),
+        );
+        let (since, runs) = carried_not_yet_streak(Some(&prior), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-19T05:50:00Z", 86));
+    }
+
+    /// A record written before the streak existed still vouches for its
+    /// own run: its `at` is the earliest not-yet this door can prove, so
+    /// the streak starts there rather than at zero on every car already
+    /// standing in the shed when this lands.
+    #[test]
+    fn a_legacy_not_yet_record_dates_the_streak_from_its_own_run() {
+        let prior = not_yet("2026-09-23T06:00:00Z", None, None);
+        let (since, runs) = carried_not_yet_streak(Some(&prior), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T06:00:00Z", 2));
+    }
+
+    /// THE STREAK BELONGS TO THE PROBE TEXT. A corrected probe is the
+    /// repair for a starved one (52e0287e), and inheriting the old
+    /// probe's four days would name the repair starved on its first run.
+    /// And a run that answered anything but not-yet ends the streak.
+    #[test]
+    fn a_new_probe_or_a_different_answer_restarts_the_streak() {
+        let prior = not_yet(
+            "2026-09-23T06:00:00Z",
+            Some("2026-09-19T05:50:00Z"),
+            Some(85),
+        );
+        let (since, runs) =
+            carried_not_yet_streak(Some(&prior), "a corrected probe", "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+
+        let failed =
+            json!({"at": "2026-09-23T06:00:00Z", "exit": 1, "not_yet": false, "probe": PROBE});
+        let (since, runs) = carried_not_yet_streak(Some(&failed), PROBE, "2026-09-23T07:00:00Z");
+        assert_eq!((since.as_str(), runs), ("2026-09-23T07:00:00Z", 1));
+    }
+
+    /// The reader: the streak's length is measured between its first and
+    /// its latest not-yet — two runs that happened — never against the
+    /// clock, so a recheck that stopped running cannot age a streak.
+    #[test]
+    fn the_streak_reads_back_as_hours_between_its_first_and_latest_run() {
+        let md = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", Some("2026-09-19T05:50:00Z"), Some(86)),
+        });
+        assert_eq!(
+            not_yet_streak(&md),
+            Some(NotYetStreak {
+                hours: 97,
+                runs: 86
+            })
+        );
+        // Legacy: one run vouched for, no length yet.
+        let md = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", None, None),
+        });
+        assert_eq!(
+            not_yet_streak(&md),
+            Some(NotYetStreak { hours: 0, runs: 1 })
+        );
+    }
+
+    /// No streak when the last run did not say not-yet, and none when the
+    /// car's recorded probe is no longer the one that ran — a probe
+    /// corrected by a metadata PATCH stops reading as starved at once,
+    /// not an hour later when the recheck next writes.
+    #[test]
+    fn no_streak_for_another_answer_or_a_since_replaced_probe() {
+        let failed = json!({
+            PROOF_PROBE: PROBE,
+            "proof_attempt": {"at": "2026-09-23T07:00:00Z", "exit": 1, "probe": PROBE},
+        });
+        assert_eq!(not_yet_streak(&failed), None);
+        let replaced = json!({
+            PROOF_PROBE: "a corrected probe",
+            "proof_attempt": not_yet("2026-09-23T07:00:00Z", Some("2026-09-19T05:50:00Z"), Some(86)),
+        });
+        assert_eq!(not_yet_streak(&replaced), None);
+        assert_eq!(not_yet_streak(&json!({})), None);
+    }
+}
+
+#[cfg(test)]
+mod waits_on_tests {
+    use super::*;
+
+    const PROBE: &str = "grep -c x f || exit 75";
+
+    /// A car at `proven` whose probe has said not-yet for `hours` straight.
+    fn waiting(hours: i64, waits: Option<Value>, seen_at: Option<&str>) -> Value {
+        let last = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z").unwrap();
+        let since = (last - chrono::Duration::hours(hours)).to_rfc3339();
+        let mut attempt = json!({
+            "at": last.to_rfc3339(), "exit": 75, "not_yet": true, "probe": PROBE,
+            NOT_YET_SINCE: since, NOT_YET_RUNS: hours + 1,
+        });
+        if let Some(s) = seen_at {
+            attempt[WAITS_ON_SEEN_AT] = json!(s);
+        }
+        let mut md = json!({PROOF_PROBE: PROBE, "proof_attempt": attempt});
+        if let Some(w) = waits {
+            md[WAITS_ON] = w;
+        }
+        md
+    }
+
+    /// THE WRITER MERGES, IT DOES NOT REPLACE (backlog e9b164a1 piece 3).
+    /// Until this, `boss car waits-on` PATCHed the whole object, so a
+    /// re-statement of `on` or `seen` dropped an `owner` an operator had
+    /// added by hand — and a wait without an owner reads as ours. Each
+    /// field the update carries replaces that field; every other field
+    /// the car already declares is kept; a result naming no `on` declares
+    /// nothing and is `None`.
+    #[test]
+    fn a_written_declaration_merges_into_the_one_the_car_carries() {
+        let owned = json!({"on": "a release", "seen": "true", WAITS_ON_OWNER: "emp-david"});
+        let got = merge_waits_on(
+            Some(&owned),
+            &json!({"on": "a tagged release", "seen": "exit 0"}),
+        );
+        assert_eq!(
+            got,
+            Some(json!({"on": "a tagged release", "seen": "exit 0", WAITS_ON_OWNER: "emp-david"}))
+        );
+        // An owner and a patience added to a declaration keep its on/seen.
+        let got = merge_waits_on(
+            Some(&waits_on_value("a Stripe charge", Some("true"))),
+            &json!({WAITS_ON_OWNER: "world", WAITS_ON_MAX_WAIT_HOURS: 336}),
+        )
+        .unwrap();
+        let md = json!({ WAITS_ON: got });
+        assert_eq!(wait_owner(&md), Some(WaitOwner::World));
+        assert_eq!(waits_on(&md).unwrap().seen.as_deref(), Some("true"));
+        assert_eq!(md[WAITS_ON][WAITS_ON_MAX_WAIT_HOURS], 336);
+        // Nothing to merge into and no `on`: nothing is declared.
+        assert_eq!(
+            merge_waits_on(None, &json!({WAITS_ON_OWNER: "world"})),
+            None
+        );
+        // A non-object recorded by hand is replaced, not merged into.
+        assert_eq!(
+            merge_waits_on(Some(&json!("prose only")), &json!({"on": "x"})),
+            Some(json!({"on": "x"}))
+        );
+    }
+
+    /// UNDECLARED: exactly adef5ddf's rule — past the bound it is ours to
+    /// read, under it nobody's business yet.
+    #[test]
+    fn an_undeclared_wait_is_starved_only_past_the_bound() {
+        assert!(matches!(
+            starved(&waiting(97, None, None)),
+            Some(Starved::Undeclared(NotYetStreak { hours: 97, .. }))
+        ));
+        assert_eq!(starved(&waiting(40, None, None)), None);
+    }
+
+    /// DECLARED AND NOT SEEN: the car said what it waits on and the
+    /// record does not hold it yet, so however long the streak, the move
+    /// is the world's (the six cars b461341d triaged, at 97h to 134h).
+    #[test]
+    fn a_declared_wait_not_yet_seen_is_never_starved() {
+        let w = waits_on_value("a Stripe sponsorship charge", None);
+        assert_eq!(starved(&waiting(134, Some(w), None)), None);
+    }
+
+    /// DECLARED AND SEEN, PROBE STILL NOT YET: the event the car named
+    /// is in the record and the probe still cannot see it — the true
+    /// "ours to read", at any streak length.
+    #[test]
+    fn a_declared_wait_seen_while_the_probe_says_not_yet_is_ours_at_once() {
+        let w = waits_on_value("a red crawl", Some("true"));
+        let md = waiting(3, Some(w), Some("2026-09-26T11:00:00Z"));
+        assert_eq!(
+            starved(&md),
+            Some(Starved::SeenWhileNotYet {
+                on: "a red crawl".into(),
+                seen_at: "2026-09-26T11:00:00Z".into(),
+            })
+        );
+    }
+
+    /// A declaration must name something: a blank `on` is no declaration,
+    /// so it cannot silence the label by being present.
+    #[test]
+    fn a_blank_or_malformed_declaration_is_no_declaration() {
+        assert_eq!(waits_on(&json!({WAITS_ON: {"on": "  "}})), None);
+        assert_eq!(waits_on(&json!({WAITS_ON: "prose only"})), None);
+        assert!(starved(&waiting(97, Some(json!({"on": ""})), None)).is_some());
+        assert_eq!(
+            waits_on(&json!({WAITS_ON: waits_on_value("x", Some(" "))})),
+            Some(WaitsOn {
+                on: "x".into(),
+                seen: None
+            })
+        );
+    }
+
+    /// The first run that saw the event dates the sighting; later runs
+    /// that still see it keep that date, and a run that does not see it
+    /// clears it.
+    #[test]
+    fn a_sighting_is_dated_from_the_first_run_that_saw_it() {
+        let prior = json!({WAITS_ON_SEEN_AT: "2026-09-26T09:00:00Z"});
+        assert_eq!(
+            carried_seen_at(Some(&prior), true, "2026-09-26T10:00:00Z").as_deref(),
+            Some("2026-09-26T09:00:00Z")
+        );
+        assert_eq!(
+            carried_seen_at(None, true, "2026-09-26T10:00:00Z").as_deref(),
+            Some("2026-09-26T10:00:00Z")
+        );
+        assert_eq!(carried_seen_at(Some(&prior), false, "x"), None);
+    }
+
+    /// A declared wait with its owner and optional patience added.
+    fn owned(on: &str, seen: Option<&str>, owner: Value, max: Value) -> Value {
+        let mut w = waits_on_value(on, seen);
+        w[WAITS_ON_OWNER] = owner;
+        w[WAITS_ON_MAX_WAIT_HOURS] = max;
+        w
+    }
+
+    /// THE OWNER IS READ, NEVER INFERRED (backlog 3881f5c9): `world`
+    /// (any case) is the world, any other non-blank string is the actor
+    /// named, and a blank or missing owner is no owner — the `on` prose
+    /// saying "David opens it" does not make David the owner.
+    #[test]
+    fn a_wait_owner_is_the_declared_field_and_nothing_else() {
+        let md =
+            |owner: Value| json!({WAITS_ON: owned("an event", Some("true"), owner, Value::Null)});
+        assert_eq!(wait_owner(&md(json!(" World "))), Some(WaitOwner::World));
+        assert_eq!(
+            wait_owner(&md(json!("emp-david"))),
+            Some(WaitOwner::Actor("emp-david".into()))
+        );
+        assert_eq!(wait_owner(&md(json!("  "))), None);
+        assert_eq!(wait_owner(&md(Value::Null)), None);
+        let prose = json!({WAITS_ON: waits_on_value("a release (David opens it)", Some("true"))});
+        assert_eq!(wait_owner(&prose), None);
+    }
+
+    /// OBSERVED, OWNED, NOT SEEN: someone else's move, and only that.
+    /// Every one of the three missing — the owner, the `seen` check, or
+    /// the event still unseen — leaves the wait ours.
+    #[test]
+    fn an_owned_wait_is_only_a_declared_observed_owned_unseen_one() {
+        let w = owned("a Stripe charge", Some("true"), json!("world"), json!(336));
+        let md = waiting(134, Some(w.clone()), None);
+        assert_eq!(
+            owned_wait(&md),
+            Some(OwnedWait {
+                owner: WaitOwner::World,
+                on: "a Stripe charge".into(),
+                max_wait_hours: Some(336),
+            })
+        );
+        // Seen while not yet: ours, not the owner's.
+        assert_eq!(
+            owned_wait(&waiting(3, Some(w), Some("2026-09-26T11:00:00Z"))),
+            None
+        );
+        // No `seen` check: nothing can say the event came.
+        let unobserved = owned("a Stripe charge", None, json!("world"), Value::Null);
+        assert_eq!(owned_wait(&waiting(134, Some(unobserved), None)), None);
+        // No owner.
+        let unowned = waits_on_value("a Stripe charge", Some("true"));
+        assert_eq!(owned_wait(&waiting(134, Some(unowned), None)), None);
+        // Undeclared.
+        assert_eq!(owned_wait(&waiting(134, None, None)), None);
+    }
+
+    /// A NAMED ACTOR'S ACT NEEDS NO SEEN CHECK TO BE THEIRS (backlog
+    /// 3881f5c9, fix shape (2)). Measured 2026-09-24 16:42Z: the shed
+    /// read troubled on ONE car, the dev-door login, whose declared wait
+    /// is David's Access SSH CA ceremony — `owner: emp-david`, no
+    /// `seen`, no probe. The observation rule exists because nothing
+    /// else can say a WORLD event arrived; an actor's act has its actor,
+    /// whose next move it is, and the car's own declared patience still
+    /// bounds it. A world wait with no `seen` stays ours, and an actor's
+    /// wait whose check DID see the act while the probe says not yet is
+    /// ours too — the declaration never hides a contradiction.
+    #[test]
+    fn a_named_actors_act_is_theirs_without_a_seen_check_and_the_worlds_is_not() {
+        let act = owned("the SSH CA ceremony", None, json!("emp-david"), Value::Null);
+        assert_eq!(
+            owned_wait(&json!({ WAITS_ON: act })),
+            Some(OwnedWait {
+                owner: WaitOwner::Actor("emp-david".into()),
+                on: "the SSH CA ceremony".into(),
+                max_wait_hours: None,
+            }),
+            "declared on no probe at all, as the dev-door car is"
+        );
+        let world = owned("a Stripe charge", None, json!("world"), Value::Null);
+        assert_eq!(owned_wait(&json!({ WAITS_ON: world })), None);
+        let seen = owned("a release", Some("true"), json!("emp-david"), Value::Null);
+        assert_eq!(
+            owned_wait(&waiting(3, Some(seen), Some("2026-09-26T11:00:00Z"))),
+            None
+        );
+    }
+
+    /// PATIENCE IS OPTIONAL AND BOUNDED ONLY WHEN DECLARED: no
+    /// `max_wait_hours` is never overdue; a declared one is overdue past
+    /// it on the car's age; a zero, negative or non-numeric one is no
+    /// declaration, so it cannot turn a car overdue the hour it lands.
+    #[test]
+    fn a_declared_max_wait_bounds_the_owned_wait_and_nothing_else_does() {
+        let read = |max: Value| {
+            let w = owned("a release", Some("true"), json!("emp-david"), max);
+            owned_wait(&waiting(10, Some(w), None)).unwrap()
+        };
+        assert!(!read(Value::Null).overdue(10_000));
+        assert!(read(json!(48)).overdue(49));
+        assert!(!read(json!(48)).overdue(48));
+        assert_eq!(read(json!(0)).max_wait_hours, None);
+        assert_eq!(read(json!(-5)).max_wait_hours, None);
+        assert_eq!(read(json!("48")).max_wait_hours, None);
+    }
+
+    /// A declared wait with the event a machine can match — the close of
+    /// a packet of one kind, optionally narrowed by its title.
+    fn with_event(event: Value) -> Value {
+        let mut w = waits_on_value("a cut-a-release tag", Some("true"));
+        w[WAITS_ON_EVENT] = event;
+        json!({ WAITS_ON: w })
+    }
+
+    fn close_marker(kind: &str, title: &str) -> Value {
+        json!({"id": "p1", "kind": kind, "title": title, "outcome": "answered",
+               "closed_on": "2026-09-24", "subject_id": "forge", "parent_step_id": null})
+    }
+
+    /// THE EVENT IS DECLARED AS DATA, and read back only when it names
+    /// the kind whose close it is. A blank or absent `closes`, a wait
+    /// with no `on`, or no `event` at all is no declaration — so an
+    /// empty object cannot key an obligation to every close there is.
+    #[test]
+    fn a_wait_event_is_read_only_when_it_names_the_closing_kind() {
+        let md = with_event(json!({"closes": "ops-request", "title": "tag-release"}));
+        assert_eq!(
+            wait_event(&md),
+            Some(WaitEvent {
+                closes: "ops-request".into(),
+                title: Some("tag-release".into()),
+            })
+        );
+        let bare = with_event(json!({"closes": "maintenance-playground-crawl"}));
+        assert_eq!(wait_event(&bare).and_then(|e| e.title), None);
+        assert_eq!(wait_event(&with_event(json!({"closes": "  "}))), None);
+        assert_eq!(wait_event(&with_event(json!({}))), None);
+        assert_eq!(wait_event(&with_event(Value::Null)), None);
+        let no_on = json!({ WAITS_ON: {"on": "", "event": {"closes": "ops-request"}} });
+        assert_eq!(wait_event(&no_on), None);
+        assert_eq!(wait_event(&json!({})), None);
+    }
+
+    /// FIRED BY exactly the close it names: the kind must match, and a
+    /// declared title prefix must lead the closing packet's title. A
+    /// marker with no title never satisfies a declared prefix.
+    #[test]
+    fn a_wait_event_is_fired_by_the_close_it_names_and_no_other() {
+        let tag = wait_event(&with_event(
+            json!({"closes": "ops-request", "title": "tag-release"}),
+        ))
+        .unwrap();
+        assert!(tag.fired_by(&close_marker(
+            "ops-request",
+            "tag-release on forge — cut-a-release v0.4.0"
+        )));
+        assert!(!tag.fired_by(&close_marker(
+            "ops-request",
+            "converge on forge — a train merged"
+        )));
+        assert!(!tag.fired_by(&close_marker("cut-a-release", "tag-release v0.4.0")));
+        assert!(!tag.fired_by(&json!({"kind": "ops-request", "title": null})));
+        let crawl = wait_event(&with_event(
+            json!({"closes": "maintenance-playground-crawl"}),
+        ))
+        .unwrap();
+        assert!(crawl.fired_by(&close_marker("maintenance-playground-crawl", "anything")));
+        assert!(!crawl.fired_by(&close_marker("maintenance-sweep", "anything")));
+    }
+
+    /// OWED IS ONE MARKER, spelled once: the string `"true"`. Anything
+    /// else — absent, a boolean, `"paid"` — owes nothing, so a car whose
+    /// proof was paid drops out of the obligation by the same read.
+    #[test]
+    fn a_car_owes_its_proof_only_under_the_one_marker() {
+        assert!(owes_proof(&json!({ PROOF_OWED: "true" })));
+        assert!(!owes_proof(&json!({ PROOF_OWED: true })));
+        assert!(!owes_proof(&json!({ PROOF_OWED: "paid" })));
+        assert!(!owes_proof(&json!({})));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The declared ordering edge — the four refusals, and the fail-open.
+// ---------------------------------------------------------------------------
+
+/// WHAT AN OPERATOR DEPENDS ON HERE IS THE WORDING, so the wording is
+/// what these assert. David on d3320278: *"the refusal's wording matters
+/// as much as its existence: the dock's no-departure line is read by an
+/// operator deciding whether the pipeline is stuck, so 'held: boards
+/// after <car>, which is abandoned' has to be distinguishable from
+/// 'held: boards after <car>, still in flight' — the first needs a
+/// human, the second does not."*
+///
+/// A test that only checked "it held" would let the four collapse into
+/// one message a release later, which is the quiet hold the feature
+/// exists to remove.
+///
+/// Moved from `boss-cli/src/train/boarding.rs` with the function they
+/// pin (backlog 4142d821): the words are unchanged, and so are these.
+#[cfg(test)]
+mod boards_after_tests {
+    use super::{
+        EDGE_HOLD_NEEDS_HUMAN, EDGE_HOLD_WAITING, EdgeOutcome, Predecessor, boards_after_of,
+        boards_after_outcome, declared_predecessor,
+    };
+    use serde_json::{Value, json};
+
+    const PRED: &str = "bbbbbbbb-1111-2222-3333-444444444444";
+
+    /// A predecessor packet: open, with a branch, and whatever extra
+    /// metadata / steps the situation needs.
+    fn pred(status: &str, md: Value, steps: Value) -> Value {
+        let mut metadata = json!({"branch": "fix/the-predecessor"});
+        if let (Some(dst), Some(src)) = (metadata.as_object_mut(), md.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        json!({"id": PRED, "status": status, "metadata": metadata, "steps": steps})
+    }
+
+    fn review(status: &str) -> Value {
+        json!([{"spec_slug": "review", "status": status}])
+    }
+
+    fn hold_reason(declared: &str, p: &Predecessor) -> String {
+        match boards_after_outcome(declared, p) {
+            EdgeOutcome::Hold(h) => h.reason,
+            other => panic!("expected a hold, got {other:?}"),
+        }
+    }
+
+    /// (1) STILL IN FLIGHT — nobody needs to do anything, and the line
+    /// says so outright. It also names WHERE the predecessor is, because
+    /// "in flight" alone sends the reader to the yard to find out.
+    #[test]
+    fn a_predecessor_in_flight_holds_and_asks_for_nobody() {
+        let p = Predecessor::Found(pred(
+            "open",
+            json!({"train": "77777777-aaaa-bbbb-cccc-dddddddddddd"}),
+            review("ready"),
+        ));
+        let r = hold_reason(PRED, &p);
+        assert!(
+            r.contains("STILL IN FLIGHT") && r.contains("aboard train 77777777"),
+            "it must name the state AND where: {r}"
+        );
+        assert!(
+            r.contains("no action needed"),
+            "an operator deciding whether the pipeline is stuck must be told it is not: {r}"
+        );
+        assert!(
+            !r.contains("human"),
+            "a self-clearing hold must never read as one that needs a person: {r}"
+        );
+        assert_eq!(
+            match boards_after_outcome(PRED, &p) {
+                EdgeOutcome::Hold(h) => h.kind,
+                other => panic!("{other:?}"),
+            },
+            EDGE_HOLD_WAITING
+        );
+    }
+
+    /// The dock and the build are in-flight states too, and each names
+    /// itself — a car waiting on one still building is a different wait
+    /// from one waiting on a car about to merge.
+    #[test]
+    fn in_flight_names_the_dock_and_the_build_separately() {
+        let parked = hold_reason(
+            PRED,
+            &Predecessor::Found(pred("open", json!({}), review("ready"))),
+        );
+        assert!(parked.contains("parked at the dock"), "{parked}");
+        let building = hold_reason(
+            PRED,
+            &Predecessor::Found(pred(
+                "open",
+                json!({}),
+                json!([{"spec_slug": "gate", "status": "ready"}]),
+            )),
+        );
+        assert!(building.contains("still building"), "{building}");
+    }
+
+    /// (2) LANDED — the edge is satisfied and the car boards. If this
+    /// ever holds, the bug is in the filter and not on the dock.
+    #[test]
+    fn a_landed_predecessor_satisfies_the_edge() {
+        for landed in [
+            pred("closed", json!({"outcome": "merged"}), json!([])),
+            pred("open", json!({"merged": "true"}), review("ready")),
+        ] {
+            assert_eq!(
+                boards_after_outcome(PRED, &Predecessor::Found(landed.clone())),
+                EdgeOutcome::Board,
+                "a landed predecessor must board its successor: {landed}"
+            );
+        }
+    }
+
+    /// (3) ABANDONED — it can NEVER clear, so the line says a human must
+    /// act, says what to do, and reports how the record says it ended.
+    #[test]
+    fn an_abandoned_predecessor_names_a_human_and_what_to_clear() {
+        let p = Predecessor::Found(pred(
+            "closed",
+            json!({"outcome": "abandoned"}),
+            review("ready"),
+        ));
+        let r = hold_reason(PRED, &p);
+        assert!(r.contains("ABANDONED"), "{r}");
+        assert!(
+            r.contains("can never be satisfied"),
+            "waiting is futile and the line must say so: {r}"
+        );
+        assert!(
+            r.contains("a human must clear metadata.boards_after"),
+            "name the fix, not just the fault: {r}"
+        );
+        assert!(
+            r.contains("closed, outcome 'abandoned'"),
+            "report what the record says, not a guess: {r}"
+        );
+        assert!(
+            !r.contains("no action needed"),
+            "this one DOES need action: {r}"
+        );
+        assert_eq!(
+            match boards_after_outcome(PRED, &p) {
+                EdgeOutcome::Hold(h) => h.kind,
+                other => panic!("{other:?}"),
+            },
+            EDGE_HOLD_NEEDS_HUMAN
+        );
+    }
+
+    /// A cancelled predecessor is spent, not landed — the same refusal,
+    /// and it must not be read as in flight just because `outcome` is
+    /// missing.
+    #[test]
+    fn a_cancelled_predecessor_is_spent_not_in_flight() {
+        let r = hold_reason(
+            PRED,
+            &Predecessor::Found(pred("cancelled", json!({}), review("ready"))),
+        );
+        assert!(
+            r.contains("ABANDONED") && r.contains("cancelled, no landing recorded"),
+            "{r}"
+        );
+    }
+
+    /// (4) NO SUCH JOB — a human must fix the REFERENCE, which is a
+    /// different repair from breaking a live edge, so it gets different
+    /// words. The line also says this should have been impossible, so the
+    /// reader knows to suspect the write path and not the car.
+    #[test]
+    fn a_dangling_edge_says_the_job_does_not_exist() {
+        let r = hold_reason(PRED, &Predecessor::Absent);
+        assert!(r.contains("DOES NOT EXIST"), "{r}");
+        assert!(
+            r.contains("a human must fix metadata.boards_after"),
+            "fix the reference, do not break the edge: {r}"
+        );
+        assert!(r.contains("ref-checked"), "say why this is surprising: {r}");
+    }
+
+    /// THE ASSERTION THE FEATURE IS TRUSTED ON: no two of the four read
+    /// the same, and each side of the needs-a-human line is recognisable
+    /// without reading the whole sentence.
+    #[test]
+    fn the_four_situations_are_told_apart_by_their_words() {
+        let in_flight = hold_reason(
+            PRED,
+            &Predecessor::Found(pred("open", json!({}), review("ready"))),
+        );
+        let abandoned = hold_reason(
+            PRED,
+            &Predecessor::Found(pred("closed", json!({"outcome": "abandoned"}), json!([]))),
+        );
+        let absent = hold_reason(PRED, &Predecessor::Absent);
+        let unjudged = match boards_after_outcome(PRED, &Predecessor::Unreadable("boom".into())) {
+            EdgeOutcome::BoardUnjudged(note) => note,
+            other => panic!("an unreadable edge must still board: {other:?}"),
+        };
+        let landed = boards_after_outcome(
+            PRED,
+            &Predecessor::Found(pred("closed", json!({"outcome": "merged"}), json!([]))),
+        );
+
+        let all = [&in_flight, &abandoned, &absent, &unjudged];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two situations read identically");
+            }
+        }
+        assert_eq!(landed, EdgeOutcome::Board, "landed is not a refusal at all");
+        // The one-glance test: does this need a person?
+        assert!(!in_flight.contains("human") && in_flight.contains("no action needed"));
+        assert!(abandoned.contains("a human must") && !abandoned.contains("no action needed"));
+        assert!(absent.contains("a human must") && !absent.contains("no action needed"));
+        assert!(unjudged.contains("boarding anyway"));
+    }
+
+    /// THE HAZARD THIS CAR WAS WARNED ABOUT. A read failure must not
+    /// hold the dock: the conductor boards the car it cannot judge and
+    /// says why, loudly. Refusing everything it could not evaluate would
+    /// freeze every landing, and the gate does not run the conductor.
+    #[test]
+    fn an_unreadable_edge_boards_the_car_and_says_why() {
+        let note = match boards_after_outcome(
+            PRED,
+            &Predecessor::Unreadable("HTTP 503 Service Unavailable".into()),
+        ) {
+            EdgeOutcome::BoardUnjudged(n) => n,
+            other => panic!("fail-open is the whole point: {other:?}"),
+        };
+        assert!(note.contains("HTTP 503"), "carry the cause: {note}");
+        assert!(note.contains("boarding anyway"), "{note}");
+        assert!(
+            note.contains("would stop every train"),
+            "say why fail-open is the right choice here: {note}"
+        );
+    }
+
+    /// THE REGRESSION THAT MATTERS MOST: every car in flight today has
+    /// no edge, and must behave exactly as it did before this car.
+    #[test]
+    fn a_car_with_no_edge_declares_no_predecessor() {
+        for md in [
+            json!({"branch": "fix/x"}),
+            json!({"branch": "fix/x", "boards_after": ""}),
+            json!({"branch": "fix/x", "boards_after": "   "}),
+            json!({"branch": "fix/x", "boards_after": Value::Null}),
+        ] {
+            let car = json!({"id": "c", "status": "open", "metadata": md});
+            assert_eq!(
+                declared_predecessor(&car),
+                None,
+                "no edge, or a cleared one, is not a constraint: {car}"
+            );
+        }
+        let declared = json!({"id": "c", "metadata": {"boards_after": PRED}});
+        assert_eq!(declared_predecessor(&declared).as_deref(), Some(PRED));
+        assert_eq!(
+            boards_after_of(&json!({"boards_after": PRED})).as_deref(),
+            Some(PRED),
+            "the dock reads the edge off a Job's metadata, the conductor off the packet — \
+             one reading of one key"
+        );
+    }
+
+    /// THE DOCK'S HALF (backlog 4142d821): a hold names what it waits
+    /// behind as DATA, so the dock region can say "waiting behind X"
+    /// without parsing the reason sentence back apart.
+    #[test]
+    fn a_hold_names_what_it_waits_behind() {
+        let in_flight = Predecessor::Found(pred("open", json!({}), review("ready")));
+        match boards_after_outcome(PRED, &in_flight) {
+            EdgeOutcome::Hold(h) => {
+                assert_eq!(h.behind, "fix/the-predecessor (car bbbbbbbb)");
+                assert!(h.reason.contains(&h.behind), "{}", h.reason);
+            }
+            other => panic!("{other:?}"),
+        }
+        match boards_after_outcome(PRED, &Predecessor::Absent) {
+            EdgeOutcome::Hold(h) => assert_eq!(h.behind, "car bbbbbbbb", "no packet, no branch"),
+            other => panic!("{other:?}"),
+        }
     }
 }

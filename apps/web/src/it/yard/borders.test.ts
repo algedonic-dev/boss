@@ -2,11 +2,15 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  RAIL_MAX_WIDTH,
+  crossedText,
   densityOf,
+  machineStatus,
   machineText,
   parseBorders,
+  railWidth,
   rateText,
-  summaryLine,
+  unlistedText,
   waitingText,
   type Border,
   type Machine,
@@ -34,7 +38,7 @@ const machine = (over: Partial<Machine> = {}): Machine => ({
 });
 
 const border = (over: Partial<Border> = {}): Border => ({
-  from: 'gates',
+  from: 'dock',
   to: 'track',
   crossing: 'a car boarded a train',
   rate: {
@@ -48,6 +52,10 @@ const border = (over: Partial<Border> = {}): Border => ({
   last_crossed: '2026-09-19T11:00:00+00:00',
   waiting: 2,
   holds: [{ what: 'fix/a', why: 'parked, waiting for the boarding depth' }],
+  holds_by_class: { machine: 2, person: 0, unknown: 0, stuck: 0 },
+  flowing: true,
+  held_since: null,
+  flowing_why: 'last crossed 1h ago, inside 4× its mean gap',
   machine: machine(),
   state: 'troubled',
   why: '2 packets waiting and train-board-on-dock-depth silent for 180m',
@@ -96,6 +104,30 @@ describe('parseBorders — the payload, once', () => {
     expect(b.machine.silent).toBeNull();
     expect(b.last_crossed).toBeNull();
     expect(b.holds).toEqual([]);
+  });
+
+  // Car M1 (design 31bade8f decision 8): the server judges whether a
+  // rail flows, since when it has been held, and whom each waiting
+  // packet waits on. The client reads the four fields and judges none.
+  it('reads the motion fields as the server judged them, null staying null', () => {
+    const wire = { ...border(), holds_by_class: { machine: 1, person: 0, unknown: 0, stuck: 1 },
+      flowing: false, held_since: '2026-09-19T08:00:00+00:00', flowing_why: 'quiet 3h > 4 mean gaps' };
+    const b = parseBorders({ window_hours: 24, now: '', borders: [wire] }).borders[0]!;
+    expect(b.flowing).toBe(false);
+    expect(b.held_since).toBe('2026-09-19T08:00:00+00:00');
+    expect(b.flowing_why).toBe('quiet 3h > 4 mean gaps');
+    expect(b.holds_by_class).toEqual({ machine: 1, person: 0, unknown: 0, stuck: 1 });
+
+    const unread = parseBorders({ window_hours: 24, now: '', borders: [{ ...wire, flowing: null, held_since: null,
+      holds_by_class: null, waiting: null }] }).borders[0]!;
+    expect(unread.flowing).toBeNull();
+    expect(unread.held_since).toBeNull();
+    expect(unread.holds_by_class).toBeNull();
+    // An older server that sends none of them: cannot tell, never "flowing".
+    const { flowing: _f, held_since: _h, holds_by_class: _c, flowing_why: _w, ...old } = wire;
+    const older = parseBorders({ window_hours: 24, now: '', borders: [old] }).borders[0]!;
+    expect(older.flowing).toBeNull();
+    expect(older.holds_by_class).toBeNull();
   });
 
   it('refuses a payload without borders — a wrong server is not an empty map', () => {
@@ -170,6 +202,69 @@ describe('the words a rail prints', () => {
     ).toContain('no firing recorded');
   });
 
+  // The rail's status half on its own — the line written under the
+  // machine's name ON the rail (design 62de32ae decision 6), which
+  // machineText joins to the name for the one-line surfaces.
+  it('says the machine\'s status apart from its name, in the same words machineText uses', () => {
+    expect(machineStatus(machine())).toBe('SILENT 180m');
+    expect(machineStatus(machine({ silent: false, silent_for_minutes: 4 }))).toBe('fired 4m ago');
+    expect(machineStatus(machine({ silent: null, silent_for_minutes: null, last_fired: null }))).toBe(
+      'no firing recorded',
+    );
+    expect(machineStatus(machine({ kind: 'actors', silent: null, silent_for_minutes: null }))).toBe(
+      'worked by actors',
+    );
+    for (const m of [machine(), machine({ kind: 'actors' }), machine({ silent: false, silent_for_minutes: 4 })]) {
+      expect(machineText(m)).toBe(`${m.name} · ${machineStatus(m)}`);
+    }
+  });
+
+  // RAIL WIDTH FOLLOWS RATE (decision 6). Presentation only — the rate
+  // is printed beside it — but it must never draw an unmeasured rail as
+  // a quiet one, nor let a busy rail swallow the map.
+  it('draws a rail wider the more crosses it, a hairline when nothing did, and never past its cap', () => {
+    expect(railWidth(0)).toBeLessThan(railWidth(1));
+    expect(railWidth(1)).toBeLessThan(railWidth(10));
+    expect(railWidth(10)).toBeLessThan(railWidth(100));
+    expect(railWidth(100)).toBeLessThan(railWidth(400));
+    expect(railWidth(100_000)).toBe(RAIL_MAX_WIDTH);
+    expect(railWidth(0)).toBeLessThan(2);
+    // Unknown is its own drawing (the dotted density band), at the
+    // width of a thin measured rail — not the hairline an empty one is.
+    expect(railWidth(null)).toBeGreaterThan(railWidth(0));
+  });
+
+  it('keeps the live rates apart: a few a day, tens and hundreds each draw a different width', () => {
+    // Measured 2026-09-24: 2/d (publish), 44/d (arrivals), 194/d
+    // (boarding), 493/d (intake). A curve that put the last three at
+    // the cap would say nothing about which rail carries the traffic.
+    const widths = [2, 44, 194, 493].map(railWidth);
+    for (let i = 1; i < widths.length; i++) expect(widths[i]! - widths[i - 1]!).toBeGreaterThanOrEqual(0.7);
+    expect(widths[3]).toBeLessThan(RAIL_MAX_WIDTH);
+  });
+
+  it('says when a rail last crossed in the stack\'s own clock, and how long ago — and admits when nothing did', () => {
+    const now = '2026-09-24T14:49:10Z';
+    expect(crossedText(border({ last_crossed: '2026-09-24T14:46:00.356667+00:00' }), now)).toBe(
+      '2026-09-24 14:46 UTC · 3m ago',
+    );
+    expect(crossedText(border({ last_crossed: '2026-09-24T11:40:00+00:00' }), now)).toBe(
+      '2026-09-24 11:40 UTC · 3h ago',
+    );
+    expect(crossedText(border({ last_crossed: '2026-09-21T14:00:00+00:00' }), now)).toBe(
+      '2026-09-21 14:00 UTC · 3d ago',
+    );
+    expect(crossedText(border({ last_crossed: null }), now)).toBe('nothing crossed in the two windows read');
+    // A clock the payload did not carry is not "just now".
+    expect(crossedText(border({ last_crossed: '2026-09-24T14:46:00+00:00' }), '')).toBe('2026-09-24 14:46 UTC');
+  });
+
+  it('says how many wait that the list does not name, since the server bounds the list and not the count', () => {
+    expect(unlistedText(border({ waiting: 2 }))).toBe('+1 more waiting, not listed');
+    expect(unlistedText(border({ waiting: 1 }))).toBe('');
+    expect(unlistedText(border({ waiting: null }))).toBe('');
+  });
+
   it('gives traffic a density band, and an unmeasured rate its own band — not the empty one', () => {
     expect(densityOf(null)).toBe('unknown');
     expect(densityOf(0)).toBe('none');
@@ -177,27 +272,6 @@ describe('the words a rail prints', () => {
     expect(densityOf(6)).toBe('steady');
     expect(densityOf(30)).toBe('heavy');
     expect(densityOf(null)).not.toBe(densityOf(0));
-  });
-});
-
-describe('summaryLine — the activity bubbled up to the high-level view', () => {
-  it('counts the crossings and names the troubled borders', () => {
-    const line = summaryLine({
-      window_hours: 24,
-      now: '',
-      borders: [border(), border({ from: 'track', to: 'arrivals', state: 'clear', waiting: 0 })],
-    });
-    expect(line).toContain('6 crossings in 24h');
-    expect(line).toContain('gates → track');
-  });
-
-  it('says a border it could not read rather than leaving it out of the count', () => {
-    const blind = border({
-      rate: { ...border().rate, current: null, previous: null, samples: 0 },
-      waiting: null,
-    });
-    const line = summaryLine({ window_hours: 24, now: '', borders: [blind] });
-    expect(line).toContain('1 border unread');
   });
 });
 

@@ -97,6 +97,215 @@ fn dock_station_row() -> boss_jobs::StationSpec {
     s
 }
 
+/// A station every ready TASK lands on, whoever's packet it is — the
+/// shape of the live `q.platform-admin.task`, which is where receiving
+/// and marshalling counted the same packets (design 62de32ae decision 4).
+fn task_station_row() -> boss_jobs::StationSpec {
+    let mut s = boss_jobs::StationSpec::draft(
+        "q.platform-admin.task",
+        "Ready tasks",
+        boss_jobs::StationKind::Constraint,
+        boss_jobs::station_queue::StationPredicate {
+            status: Some(JobStatus::Open),
+            step: Some(boss_jobs::station_queue::StepMatch {
+                kind: Some("task".into()),
+                status_in: vec![StepStatus::Ready],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        t(NOW),
+    );
+    s.status = boss_jobs::registry::WorkflowStatus::Active;
+    s
+}
+
+/// The app with the platform protocols in its workflow registry — so the
+/// inbound kinds can be named — and the task station beside the dock.
+fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
+    let jobs = Arc::new(InMemoryJobs::new());
+    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::new());
+    for spec in boss_jobs::registry::seedable_platform_workflows() {
+        kinds.seed(spec).expect("seed platform kind");
+    }
+    let policy_client: Arc<dyn PolicyClient> = Arc::new(
+        FakePolicyClient::builder()
+            .allow("operator", Action::Read, Resource::job(), Scope::All)
+            .build(),
+    );
+    let bus = RecordingEventBus::new();
+    let bus_dyn: Arc<dyn EventBus> = bus.clone();
+    let stations = Arc::new(boss_jobs::InMemoryStations::new());
+    stations
+        .seed(dock_station_row())
+        .expect("seed the dock row");
+    stations
+        .seed(task_station_row())
+        .expect("seed the task station");
+    let state = JobsApiState {
+        stations: Some(stations),
+        kind_registry: Some(kinds as Arc<dyn boss_jobs::WorkflowRegistry>),
+        ..JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            DomainPublisher::new(bus_dyn, "jobs"),
+            policy_client,
+            Arc::new(boss_clock_client::FixedClockClient::new(
+                boss_clock_client::ClockNow {
+                    now: t(NOW),
+                    simulated: false,
+                    epoch_start: None,
+                    epoch_end: None,
+                    paused: false,
+                    restart_in_progress: false,
+                    warp_factor: None,
+                },
+            )),
+        )
+    };
+    (router(state), jobs)
+}
+
+/// An open backlog-item as the protocol admits one: `filed` (its
+/// trigger) completed, then `triage` — completed or still ready — and,
+/// once triaged, `build` ready.
+async fn backlog_item(jobs: &InMemoryJobs, n: u32, triaged: bool) -> JobId {
+    let id = Uuid::from_u128(0xB0B0_0000_0000_0000_0000_0000_0000_0000 + u128::from(n)).to_string();
+    let item = job(
+        "backlog-item",
+        &id,
+        &format!("item {n}"),
+        JobStatus::Open,
+        json!({}),
+    );
+    jobs.create_job_at(&item, t(NOW), &[]).await.unwrap();
+    let mut filed = step(&item.id, "filed", "filed", StepStatus::Completed, json!({}));
+    filed.kind = boss_jobs::regions::TRIGGER_STEP_KIND.into();
+    let triage_status = if triaged {
+        StepStatus::Completed
+    } else {
+        StepStatus::Ready
+    };
+    let mut steps = vec![
+        filed,
+        step(&item.id, "triage", "triage", triage_status, json!({})),
+    ];
+    if triaged {
+        steps.push(step(
+            &item.id,
+            "build",
+            "build",
+            StepStatus::Ready,
+            json!({}),
+        ));
+    }
+    for s in steps {
+        jobs.add_step_at(&s, t(NOW), &[]).await.unwrap();
+    }
+    item.id
+}
+
+/// THE PARTITION, END TO END (design 62de32ae decision 4): two
+/// backlog-items standing at the one task station — one waiting on its
+/// triage, one triaged and waiting on its build — are one packet in
+/// receiving and one in marshalling, and the two borders out of the pair
+/// wait on one each. Before, both regions counted both, and the world's
+/// "waiting at the borders" summed the overlap.
+#[tokio::test]
+async fn a_packet_is_in_receiving_or_marshalling_and_never_both() {
+    let (app, jobs) = app_with_intake();
+    backlog_item(&jobs, 1, false).await;
+    backlog_item(&jobs, 2, true).await;
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let receiving = region(&v, "receiving");
+    assert_eq!(receiving["count"], 1, "{receiving}");
+    let marshalling = region(&v, "marshalling");
+    assert_eq!(marshalling["count"], 1, "{marshalling}");
+
+    let (status, b) = get(&app, "operator", "/api/yard/borders").await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let waiting = |from: &str, to: &str| {
+        b["borders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["from"] == from && x["to"] == to)
+            .map(|x| x["waiting"].clone())
+            .unwrap_or_else(|| panic!("no border {from} -> {to} in {b}"))
+    };
+    assert_eq!(waiting("receiving", "marshalling"), 1);
+    assert_eq!(waiting("marshalling", "shop-floor"), 1);
+}
+
+/// RECEIVING READS PAST ITS PAGE (design 62de32ae decision 4): the
+/// inbound read took ONE page of the handler's `MAX_LIMIT` (1000) and
+/// counted what came back, so past it the count was a floor that did not
+/// say it was one. One more untriaged item than a page holds is counted
+/// in full — and the open-packet page the steps ride is a page too, so
+/// the one past it is judged on steps read for it alone.
+#[tokio::test]
+async fn receiving_counts_every_inbound_packet_past_one_page() {
+    const PAST_ONE_PAGE: u32 = 1001;
+    let (app, jobs) = app_with_intake();
+    for n in 0..PAST_ONE_PAGE {
+        backlog_item(&jobs, n, false).await;
+    }
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let receiving = region(&v, "receiving");
+    assert_eq!(receiving["count"], PAST_ONE_PAGE, "{receiving}");
+}
+
+/// THE CROSSING INTO MARSHALLING IS THE INTAKE, END TO END (design
+/// 62de32ae, car C). A backlog-item triaged this morning and CLOSED on
+/// that act is one crossing of receiving -> marshalling, stamped at its
+/// triage — which the handler can only see if it reads the steps of a
+/// CLOSED inbound row, not just the open ones (it read none of them,
+/// and the rail counted closures instead).
+#[tokio::test]
+async fn a_closed_packets_intake_is_a_crossing_into_marshalling() {
+    let (app, jobs) = app_with_intake();
+    let id = Uuid::from_u128(0xC105_0000_0000_0000_0000_0000_0000_0001).to_string();
+    let item = job(
+        "backlog-item",
+        &id,
+        "triaged and closed",
+        JobStatus::Closed,
+        json!({ "closed_at": "2026-09-19T10:00:00Z" }),
+    );
+    jobs.create_job_at(&item, t(NOW), &[]).await.unwrap();
+    let mut filed = step(&item.id, "filed", "filed", StepStatus::Completed, json!({}));
+    filed.kind = boss_jobs::regions::TRIGGER_STEP_KIND.into();
+    filed.completed_at = Some(t("2026-09-18T20:00:00Z"));
+    let mut triage = step(
+        &item.id,
+        "triage",
+        "triage",
+        StepStatus::Completed,
+        json!({}),
+    );
+    triage.completed_at = Some(t("2026-09-19T08:00:00Z"));
+    for s in [filed, triage] {
+        jobs.add_step_at(&s, t(NOW), &[]).await.unwrap();
+    }
+
+    let (status, b) = get(&app, "operator", "/api/yard/borders").await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let rail = b["borders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["from"] == "receiving" && x["to"] == "marshalling")
+        .unwrap_or_else(|| panic!("no receiving -> marshalling rail in {b}"));
+    assert_eq!(rail["rate"]["samples"], 1, "{rail}");
+    assert_eq!(
+        rail["last_crossed"], "2026-09-19T08:00:00+00:00",
+        "stamped at the intake, not the close: {rail}"
+    );
+    assert_eq!(rail["waiting"], 0, "a closed packet stands nowhere: {rail}");
+}
+
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
@@ -148,6 +357,7 @@ fn job(kind: &str, id: &str, title: &str, status: JobStatus, metadata: Value) ->
         status,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()),
@@ -328,6 +538,49 @@ async fn the_read_answers_every_region_each_with_count_state_and_trend() {
     assert_eq!(receiving["state"], "troubled");
 }
 
+/// THE STUCK BLOCK RIDES THE SAME READ (backlog 4142d821, design
+/// cf820810 car 2): one entry per third, in the operator surface's order,
+/// computed here so the HUD and `boss orient` read it rather than
+/// recompute it. With no workflow registry wired the intake cannot be
+/// read, and the queue-management third says so in `unknown` — a floor,
+/// never a confident zero.
+#[tokio::test]
+async fn the_read_carries_a_stuck_block_per_third_and_an_unread_intake_is_unknown() {
+    let (app, jobs) = app();
+    seed(&jobs).await;
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let thirds: Vec<&str> = v["stuck"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no stuck block: {v}"))
+        .iter()
+        .map(|t| t["third"].as_str().unwrap())
+        .collect();
+    assert_eq!(thirds, ["queue-management", "actors-building", "delivery"]);
+    let queue = &v["stuck"][0];
+    assert!(
+        queue["unknown"].as_array().unwrap().iter().any(|u| u
+            .as_str()
+            .unwrap()
+            .contains("inbound kinds could not be read")),
+        "{queue}"
+    );
+    assert!(
+        queue["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "receiving"),
+        "{queue}"
+    );
+    // The parked car declares no edge and nothing has landed: delivery
+    // has nothing stuck and nothing waiting.
+    let delivery = &v["stuck"][2];
+    assert_eq!(delivery["stuck"], 0, "{delivery}");
+    assert_eq!(delivery["waiting"], 0, "{delivery}");
+    assert_eq!(delivery["oldest_hours"], Value::Null, "{delivery}");
+}
+
 #[tokio::test]
 async fn the_window_is_a_query_parameter_and_a_bad_one_is_refused() {
     let (app, jobs) = app();
@@ -357,7 +610,8 @@ async fn a_denied_caller_gets_an_empty_well_formed_map() {
 /// absent glyph is indistinguishable from a runner that does not exist.
 /// This pins the read that closes it: the handler asks the ESTATE
 /// REGISTRY which hosts should have a runner, and each declared host
-/// stands in receiving whether or not it has said anything.
+/// stands in the PLANT — the strip of machinery that serves every region
+/// (design 62de32ae, decision 11) — whether or not it has said anything.
 #[tokio::test]
 async fn a_declared_runner_host_stands_on_the_map_with_no_request_of_its_own() {
     let (app, jobs) = app();
@@ -389,7 +643,7 @@ async fn a_declared_runner_host_stands_on_the_map_with_no_request_of_its_own() {
 
     let (status, v) = get(&app, "operator", "/api/yard/regions").await;
     assert_eq!(status, StatusCode::OK, "{v}");
-    let machines = region(&v, "receiving")["machines"].as_array().unwrap();
+    let machines = v["plant"].as_array().unwrap();
     let ids: Vec<&str> = machines.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert_eq!(
         ids,

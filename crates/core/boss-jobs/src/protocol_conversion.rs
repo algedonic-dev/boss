@@ -71,7 +71,11 @@ pub struct Obstacle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bites {
     /// Retroactive evidence. A completed step would be claiming work
-    /// that was never done; a step still ahead simply collects it.
+    /// that was never done; a step still ahead simply collects it —
+    /// true BECAUSE the re-pin re-projects that step's row
+    /// ([`crate::repin`]): completion validates the ROW's `fields`, not
+    /// the spec's, so a required field the row never received would
+    /// never be asked for (backlog 1e973965, until 4347a1af carried it).
     IfDone,
     /// Only affects work the packet has not reached yet.
     IfNotDone,
@@ -192,6 +196,14 @@ fn required_fields(s: &StepSpec) -> BTreeSet<&str> {
 /// `done` holds the slugs of steps this packet has already completed.
 /// Structural obstacles and workflow-level ones bite regardless — this
 /// filters, it never overrides.
+///
+/// It judges the MOVE, and the verdict leans on what the move writes:
+/// "a step still ahead simply collects it" and "an inserted step ahead
+/// of the packet will simply be walked" are true only because the
+/// re-pin door re-projects every unfinished step's row and materialises
+/// every inserted one ([`crate::repin::plan`], design 7cf202a9 Q2). A
+/// door that moved only the pinned version would make both false —
+/// which the first door did, measured on page-audit c0d2caf0 (1e973965).
 pub fn convertibility_for_packet(
     from: &WorkflowSpec,
     to: &WorkflowSpec,
@@ -526,6 +538,9 @@ mod tests {
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }
     }
 

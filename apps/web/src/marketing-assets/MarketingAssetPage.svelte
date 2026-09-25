@@ -9,6 +9,8 @@
   import { type MarketingAsset } from './types';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { href } from '../router';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
+  import { okRead, type ReadState } from '../data/readState';
 
   type Props = { assetId: string };
   let { assetId }: Props = $props();
@@ -20,7 +22,8 @@
   /// lookup gets to make (packet 3fba9c35).
   let loadFailed = $state<string | null>(null);
   let loading = $state(true);
-  let empNames = $state<Map<string, string>>(new Map());
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
 
   let decoded = $derived(decodeURIComponent(assetId));
 
@@ -42,10 +45,9 @@
     loading = true;
     (async () => {
       try {
-        const [aResp, hResp, pResp] = await Promise.all([
+        const [aResp, hResp] = await Promise.all([
           fetch(`/api/catalog/marketing-assets/${encodeURIComponent(id)}`),
           fetch(`/api/catalog/marketing-assets/${encodeURIComponent(id)}/history`),
-          fetch('/api/people'),
         ]);
         if (aResp.status === 404) {
           if (!cancelled) {
@@ -68,12 +70,6 @@
           const body = (await hResp.json()) as MarketingAsset[];
           if (!cancelled) history = Array.isArray(body) ? body : [];
         }
-        if (pResp.ok) {
-          const people = (await pResp.json()) as Array<{ id: string; name: string }>;
-          const m = new Map<string, string>();
-          for (const e of people) m.set(e.id, e.name);
-          if (!cancelled) empNames = m;
-        }
       } catch (e) {
         if (!cancelled) {
           asset = null;
@@ -81,6 +77,27 @@
         }
       }
       if (!cancelled) loading = false;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // Names only the owner and the brand reviewer, one row each, and says
+  // so when a name cannot load. Until backlog 1e73bd93 this rode the
+  // record's own Promise.all as a read of the WHOLE roster, and a
+  // refusal was an `if (pResp.ok)` with no else, so both people
+  // silently became ids (see ../data/ownerNames.ts).
+  let peopleKey = $derived(personIdsOf([asset?.owner_id, asset?.brand_reviewed_by]).join('\n'));
+  $effect(() => {
+    const ids = peopleKey ? peopleKey.split('\n') : [];
+    let cancelled = false;
+    (async () => {
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
+      }
     })();
     return () => {
       cancelled = true;
@@ -144,6 +161,11 @@
 
     <div class="tab-grid">
       <Section title="Profile">
+          {#if namesRead.kind === 'failed'}
+            <p class="empty load-failed" role="alert">
+              Couldn't load the names on this asset — {namesRead.error}. People show as ids.
+            </p>
+          {/if}
           <dl class="kv">
             <dt>File</dt>
             <dd>
@@ -316,20 +338,10 @@
           </table>
         {/if}
     </Section>
-
-    <Section title="Insights" wide>
-        <p class="empty">
-          Download count, campaigns used in, and motion references will land
-          with the attribution plugin once it grows past read-only mode.
-        </p>
-    </Section>
-
-    <Section title="In-flight motions" wide>
-        <p class="empty">
-          Active <code>marketing-motion</code> Jobs referencing this asset
-          via their tier 3 checklist step will surface here once session 1's
-          motion execution picks up assets in metadata.
-        </p>
-    </Section>
+    <!-- "Insights" and "In-flight motions" placeholders retired
+         2026-09-24 (backlog a8991c86): each promised a read from the
+         device shop's marketing-motion Workflow and its attribution
+         plugin, both gone. The Campaigns list above is the live way from
+         an asset to the Jobs about it. -->
   {/if}
 </div>

@@ -15,6 +15,7 @@
   import GenericSurface from './GenericSurface.svelte';
   import DecisionContext from './DecisionContext.svelte';
   import StepProcedure from './StepProcedure.svelte';
+  import StepCorrections from './StepCorrections.svelte';
   import ApprovalSurface from './ApprovalSurface.svelte';
   import RepairSurface from './RepairSurface.svelte';
   import InspectionSurface from './InspectionSurface.svelte';
@@ -56,6 +57,9 @@
     }[];
     metadata: Record<string, unknown>;
     notes: string | null;
+    /** The job's corrections that target this step, attached by the
+     *  job GET (design 4105b020); absent when there are none. */
+    corrections?: unknown;
   };
 
   type Props = {
@@ -75,11 +79,23 @@
   let pluginProbeFailed = $state(false);
   // Bumped by the Retry affordance so the probe effect re-runs.
   let retryNonce = $state(0);
+  // The probe depends on the KIND, never the step object (backlog
+  // fec57f5f). It read `step.kind` inside the effect, which made the
+  // whole `step` prop a dependency; JobDetailPage replaces the packet
+  // on every SSE frame and every fallback poll, so each reload reset
+  // this to null, the `{#if}` below unmounted the plugin, and the
+  // review-design box lost the answer David was typing. A $derived
+  // primitive only notifies when its VALUE changes, so a same-kind
+  // reload never re-runs the probe and never unmounts a mounted
+  // plugin. Which step and which status the plugin shows is
+  // StepPluginMount's to judge, by id and status.
+  let kind = $derived(step.kind);
   $effect(() => {
     void retryNonce;
+    const k = kind;
     pluginAvailable = null;
     let cancelled = false;
-    probeActivePlugin(step.kind).then((probe) => {
+    probeActivePlugin(k).then((probe) => {
       if (cancelled) return;
       if (probe.kind === 'failed') {
         pluginProbeFailed = true;
@@ -194,6 +210,11 @@
      as the generic surface was. A procedure is what the protocol says
      about doing the work; it is not a presentation choice. -->
 <StepProcedure {step} />
+<!-- The step's corrections, above both sides of the fork for the same
+     reason as the procedure (design 4105b020): a reader of a step is
+     handed what corrects it, whichever surface draws the step — a
+     plugin that never reads `corrections` still sits under the marker. -->
+<StepCorrections {step} />
 {#if pluginAvailable === true}
   <!-- Plugin-backed steps can also take the whole viewport. Reading
        tasks (a design review is a document plus decisions) compete
@@ -204,7 +225,7 @@
     </a>
   </div>
   <StepPluginMount
-    kind={step.kind}
+    {kind}
     {step}
     {jobId}
     {onUpdate}
@@ -212,12 +233,12 @@
   />
 {:else}
   {#if registryDegraded}
-    <div class="step-registry-error" role="alert">
+    <div class="step-registry-error load-failed" role="alert">
       <span>
         Couldn't load the step-surface registry — showing the generic
         surface for now.
       </span>
-      <button class="step-btn" onclick={retryRegistries}>Retry</button>
+      <button class="btn" onclick={retryRegistries}>Retry</button>
     </div>
   {/if}
   <!-- Non-plugin surfaces get the packet's case rendered above the
@@ -256,14 +277,14 @@
   .step-surface-expand { display: flex; justify-content: flex-end; }
   .step-surface-expand-link {
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     text-decoration: none;
     padding: 2px 6px;
     border-radius: 4px;
   }
   .step-surface-expand-link:hover {
-    background: var(--bg, #f5f5f4);
-    color: var(--text, #1c1917);
+    background: var(--bg);
+    color: var(--text);
   }
   .step-attachments {
     margin-top: 12px;

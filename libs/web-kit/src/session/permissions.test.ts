@@ -54,7 +54,7 @@ describe('canSeeRoute — a role whose Class row declares surfaces sees exactly 
   });
   test('an empty declaration is a declaration: only the always-on routes', () => {
     const none = row('bartender', { surfaces: [] });
-    expect(canSeeRoute('bartender', 'calendar', none)).toBe(false);
+    expect(canSeeRoute('bartender', 'schedule', none)).toBe(false);
     expect(canSeeRoute('bartender', 'inbox', none)).toBe(true);
   });
 });
@@ -97,4 +97,28 @@ describe('the brewery seed declares its surfaces in the vocabulary the SPA reads
     );
     expect(bad).toEqual([]);
   });
+});
+
+describe('no role row declares a Work list — nothing reads one', () => {
+  // Home's Work group is All jobs for every role (backlog 0f9be7c0,
+  // 2026-09-24). The per-role lists 6a3b93eb moved onto role rows as
+  // `metadata.work` could never render: the shell's in-perspective
+  // filter drops every Home entry whose catalog app is not home, and of
+  // the gated routes only `jobs` and `schedule` are (and `schedule`
+  // already sits in Mine). So `sales`, `exec`, `qa`… in a Work list were
+  // data nobody saw. The reader and the key went together; a seed that
+  // grows the key back is declaring something the SPA will not show.
+  type Seeded = { subject_kind: string; code: string; member_attribute?: string; metadata?: Record<string, unknown> };
+  const seeds: ReadonlyArray<[string, () => Promise<ReadonlyArray<Seeded>>]> = [
+    ['brewery', async () =>
+      (await Bun.file(new URL('../../../../examples/brewery/seeds/classes.json', import.meta.url)).json()) as Seeded[]],
+  ];
+  for (const [tenant, load] of seeds) {
+    test(`${tenant}: no role row carries metadata.work`, async () => {
+      const roles = (await load()).filter((r) => r.subject_kind === 'employee' && r.member_attribute === 'role');
+      expect(roles.length).toBeGreaterThan(20);
+      const declaring = roles.filter((r) => r.metadata?.['work'] !== undefined).map((r) => r.code);
+      expect(declaring).toEqual([]);
+    });
+  }
 });

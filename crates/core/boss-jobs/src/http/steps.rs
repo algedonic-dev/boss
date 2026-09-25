@@ -294,27 +294,50 @@ async fn dispatch_workflow_publish(
 ///
 /// `Presence` is producible exactly one way — the gateway verified a
 /// WebAuthn assertion over `sha256(shape_hash || ":" || nonce)` and
-/// swapped the ticket for an `x-boss-presence` header, which the edge
-/// strips from every inbound request, so its presence here means the
-/// gateway itself vouched. The binding is re-checked against the
-/// step's CURRENT shape: a stale hash means the content moved after
-/// the ceremony, and an approval must not survive an edit it never saw.
+/// signed a ticket for it, and THIS SERVICE verifies that ticket's
+/// signature (`boss_core::presence::PresenceTicket::decode`, the same
+/// function the gateway checks it with) before reading a word of it.
+/// Until backlog 72fe3640 (2026-09-24) the header held the ticket's
+/// fields as plain JSON and was trusted because the gateway's edge strip
+/// removes inbound `x-boss-*` — but the machine door (:7900) is
+/// reachable without the gateway, so every machine-token holder could
+/// stamp presence on any step as any person. The binding is then
+/// re-checked against the step's CURRENT shape: a stale hash means the
+/// content moved after the ceremony, and an approval must not survive
+/// an edit it never saw.
 pub(super) struct Assured {
     pub required: boss_core::job::Assurance,
     pub produced: boss_core::job::Assurance,
     pub presence_nonce: Option<String>,
     /// What to tell a caller that fell short, or "" when it did not.
     pub detail: &'static str,
+    /// A presence claim was made and did not verify. Refused on every
+    /// judged write, whatever the step requires: a claim this service
+    /// cannot check is a forgery or a fault, and either one said aloud
+    /// beats a stamp quietly downgraded to Session.
+    pub unverified: bool,
 }
 
 impl Assured {
     pub fn falls_short(&self) -> bool {
-        self.required > self.produced
+        self.unverified || self.required > self.produced
     }
 
     /// The refusal both doors return, in one shape so a caller cannot
     /// tell which door it knocked on.
     pub fn refusal(&self) -> Response {
+        if self.unverified {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "the presence claim on this request did not verify",
+                    "required": self.required,
+                    "produced": self.produced,
+                    "detail": self.detail,
+                })),
+            )
+                .into_response();
+        }
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
@@ -338,33 +361,48 @@ pub(super) fn judge_assurance(
     step_id_str: &str,
     user_id: &str,
     headers: &axum::http::HeaderMap,
+    // The gateway's key, or `None` when this service has none — and then
+    // nothing verifies (http/presence.rs).
+    key: Option<&[u8]>,
 ) -> Assured {
+    use boss_core::presence::{HEADER, PresenceTicket, now_epoch};
     // The step's own requirement wins when it is stronger than the
     // kind's floor; a Workflow may raise, never lower.
     let required = step.assurance_required.unwrap_or_default().max(floor);
     let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
-    let claim = headers
-        .get("x-boss-presence")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    let (produced, presence_nonce, detail) = match &claim {
-        Some(p)
-            if p["step_id"] == step_id_str
-                && p["shape_hash"] == shape.as_str()
-                && p["employee_id"] == user_id =>
-        {
-            (
-                boss_core::job::Assurance::Presence,
-                p["nonce"].as_str().map(String::from),
-                "",
-            )
-        }
-        Some(_) => (
+    // Absent → no claim. Present → it verifies against the key, or it is
+    // refused; there is no third reading of a header anyone at the
+    // machine door can write.
+    let claim = headers.get(HEADER).map(|v| {
+        v.to_str()
+            .ok()
+            .zip(key)
+            .and_then(|(value, key)| PresenceTicket::decode(value, key, now_epoch()))
+    });
+    let (produced, presence_nonce, detail, unverified) = match &claim {
+        Some(Some(t)) if t.s == step_id_str && t.h == shape && t.i == user_id => (
+            boss_core::job::Assurance::Presence,
+            Some(t.n.clone()),
+            "",
+            false,
+        ),
+        Some(Some(_)) => (
             boss_core::job::Assurance::Session,
             None,
             " A presence ticket WAS presented but did not match: either the step's \
              content changed after the ceremony (stale shape hash — re-run it against \
              the current content) or it was minted for a different step or actor.",
+            false,
+        ),
+        Some(None) => (
+            boss_core::job::Assurance::Session,
+            None,
+            "An x-boss-presence header was presented and did not verify: it is not a \
+             ticket the gateway signed, it has expired, or this service holds no key to \
+             check it with. Presence is granted only on a signed ticket, verified here \
+             (backlog 72fe3640) — run the passkey ceremony through the gateway and \
+             present the ticket it issues.",
+            true,
         ),
         None => (
             boss_core::job::Assurance::Session,
@@ -372,6 +410,7 @@ pub(super) fn judge_assurance(
             " Complete the passkey ceremony for this step \
              (POST /api/auth/passkey/assert/begin, then .../finish) and retry with \
              the issued ticket.",
+            false,
         ),
     };
     Assured {
@@ -379,6 +418,7 @@ pub(super) fn judge_assurance(
         produced,
         presence_nonce,
         detail,
+        unverified,
     }
 }
 
@@ -387,9 +427,9 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
     // The presence claim rides here, exactly as it does on the sign-off
-    // door: `x-boss-presence`, stamped by the gateway and stripped from
-    // every inbound request, so this handler can judge the same way
-    // (backlog 148549c5).
+    // door: `x-boss-presence`, the gateway's signed ticket, verified by
+    // `judge_assurance` before it is believed, so this handler judges
+    // the same way (backlog 148549c5; verification 72fe3640).
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -486,6 +526,62 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         Some(obj) => obj,
         None => return (StatusCode::BAD_REQUEST, "body must be a JSON object").into_response(),
     };
+
+    // A METADATA BODY THAT DROPS A STORED KEY IS REFUSED (backlog
+    // e39a9d2a, design baf738b7 answered 2026-09-23 — the one-car rule).
+    //
+    // The overlay above replaces `metadata` WHOLESALE, so a body that
+    // omits a key deletes it. Three keys were hand-carried past that
+    // replace — `authority_role`, `human_only`, `agent_run` — each
+    // after someone lost it in production (the run edge: a completer
+    // erased it and the run died four hours later on the silence clock,
+    // b91a2103), and two more step-level keys were in flight. The list
+    // grew by incident; this removes the class instead.
+    //
+    // WHY REFUSE AND NOT MERGE, since merging looks obviously nicer:
+    // merging silently changes the meaning of EVERY existing call at
+    // once — a caller that clears a key by omitting it today would stop
+    // clearing it, invisibly and retroactively. A refusal is loud and
+    // arrives at the one call site that must change, which is the shape
+    // the terminal-step refusal below already has. A read-merge-write
+    // caller sends every stored key and is untouched; a PUT with no
+    // `metadata` key (a status-only flip) is not judged; a caller whose
+    // read went stale while a concurrent writer added a key is now
+    // caught instead of erasing that key. Clearing on purpose is the
+    // merge door's job, with the key sent as `null`.
+    //
+    // NOT ON A TERMINAL STEP. The merge door refuses a terminal step
+    // too, so routing the caller there would send it from one 409 to
+    // another; the terminal refusal below speaks instead (an omitting
+    // body changes the metadata, so it fires), and its hint names the
+    // doors that work on a record. An unchanged re-send is not an
+    // omission and stays the no-op the freeze lets through.
+    //
+    // STAGE 1 of design 93d2bddb (decided_2026_09_24b on e39a9d2a): the
+    // decided end state refuses ANY metadata body; this omission rule
+    // removes the silent wipe now, and the tighten is this one block
+    // once the read-merge-write writers have moved to the merge door.
+    let is_terminal = matches!(old.status, StepStatus::Completed | StepStatus::Skipped);
+    if let Some(sent) = body_obj.get("metadata")
+        && !is_terminal
+    {
+        let missing = crate::step_metadata_write::omitted_keys(&old.metadata, sent);
+        if !missing.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "metadata body omits stored keys — a step PUT replaces \
+                              metadata wholesale, so an omitted key would be deleted",
+                    "step_id": step_id.to_string(),
+                    "missing_keys": missing,
+                    "merge_door": format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+                    "hint": crate::step_metadata_write::OMITTED_KEYS_HINT,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     for (k, v) in body_obj {
         merged_obj.insert(k.clone(), v.clone());
     }
@@ -513,51 +609,38 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     step.completed_by = old.completed_by.clone();
     step.completed_at = old.completed_at;
 
-    // `authority_role` is immutable across PUTs. Carry the persisted
-    // value forward so a body can neither raise nor lower the required
-    // sign-off authority — the sign-off gate above reads `old.metadata`
-    // for its decision, and this keeps the stored row consistent with
-    // that decision (a caller can't change it in a prior PUT either).
+    // `authority_role` is immutable across PUTs: the persisted value
+    // wins, so a body can neither raise nor lower the required sign-off
+    // authority — the sign-off gate reads `old.metadata` for its
+    // decision, and this keeps the stored row consistent with it. The
+    // merge door strips the key for the same reason. (Its OMISSION is
+    // the drop refusal above; `agent_run`, which was carried past
+    // omission beside it until e39a9d2a, needs nothing here now — a
+    // body that omits it is refused, and it remains writable through
+    // the merge door. `human_only` is not writable anywhere once the
+    // row carries it: the change refusal below, adac8fa4.)
     if let Some(old_obj) = old.metadata.as_object()
         && let Some(auth) = old_obj.get("authority_role").cloned()
         && let Some(obj) = step.metadata.as_object_mut()
     {
         obj.insert("authority_role".into(), auth);
     }
-    // So is `human_only` (c17871fe): the protocol's requirement for a
-    // person is materialisation data, and a metadata PUT that omits it
-    // must not turn a human-only step into one an agent can take.
-    if let Some(old_obj) = old.metadata.as_object()
-        && let Some(flag) = old_obj.get(crate::human_only::KEY).cloned()
-        && let Some(obj) = step.metadata.as_object_mut()
-    {
-        obj.insert(crate::human_only::KEY.into(), flag);
-    }
 
-    // AND SO IS THE RUN EDGE (b91a2103). `boss dispatch` writes
-    // `agent_run` onto the step it CLAIMS, and the delivery rule
-    // follows that edge from `step.done.<kind>` to land the run
-    // (dd6d44b7) — for an analyst run, which ships no car and files no
-    // gate-run, it is the ONLY thing that makes the run land. A
-    // completer that sends `metadata` without reading and merging
-    // erased it, and the failure was silent and delayed: the
-    // completion succeeded, the work was recorded correctly, and the
-    // run then died four hours later on the silence clock as though
-    // the agent had gone quiet. Losing it breaks something invisible,
-    // which is the same reason the two keys above are carried.
-    //
-    // Carried, not frozen: unlike `authority_role` this key is NOT
-    // stripped from the merge door, because a step re-claimed by a
-    // different run must name the run that now holds it — and
-    // `boss dispatch` writes the new id through that door right after
-    // the claim (the claim route itself never touches metadata), so a
-    // carried-forward value can never outlive the next dispatch. What
-    // survives here is OMISSION, nothing more.
-    if let Some(old_obj) = old.metadata.as_object()
-        && let Some(run) = old_obj.get(crate::agent_runs::EDGE_KEY).cloned()
-        && let Some(obj) = step.metadata.as_object_mut()
-    {
-        obj.insert(crate::agent_runs::EDGE_KEY.into(), run);
+    // THE DECLARATION IS FROZEN ON THE STEP (adac8fa4). The completion
+    // check below reads the STORED row, so a body that set `human_only`
+    // to false — in the completing PUT itself, or in an earlier one —
+    // would otherwise walk round it. Refused, not silently kept like
+    // `authority_role` above, so the caller learns the rule at the call.
+    if crate::human_only::declaration_changed(&old.metadata, &step.metadata) && !is_terminal {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(crate::human_only::change_refusal_body(
+                &step_id.to_string(),
+                &old.title,
+                &old.metadata,
+            )),
+        )
+            .into_response();
     }
 
     // A HUMAN-ONLY STEP REFUSES A NON-HUMAN ASSIGNEE (c17871fe). Checked
@@ -619,7 +702,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // to set. Repeating the check here would preempt that message with
     // a vaguer one. This block covers only the two fields that were
     // still being dropped in silence.
-    if matches!(old.status, StepStatus::Completed | StepStatus::Skipped) {
+    if is_terminal {
         let mut frozen: Vec<&str> = Vec::new();
         if step.completed_on != old.completed_on {
             frozen.push("completed_on");
@@ -635,12 +718,34 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     "step_id": step_id.to_string(),
                     "step_status": status_word(old.status),
                     "refused_fields": frozen,
-                    "hint": "a completed step is a record of what happened. To correct or \
-                             annotate it, write to the parent job's metadata \
-                             (PATCH /api/jobs/{id}/metadata) instead.",
+                    // Names the corrections door (design 4105b020):
+                    // this hint was the only guidance a correcting
+                    // author got, and pointing at free-form job
+                    // metadata is where 25 invented key names came from.
+                    "hint": crate::corrections::TERMINAL_STEP_HINT,
                 })),
             )
                 .into_response();
+        }
+
+        // AN UNCHANGED RE-SEND OF A TERMINAL STEP WRITES NOTHING (backlog
+        // 29a7ea09). The freeze above lets it through so a racing writer
+        // stays harmless — and it was not: it still rewrote the step row,
+        // re-ran the re-evaluator and ran the all-steps-terminal catch-all
+        // close below. Measured on car 6b23d135, 2026-09-24T22:18:10Z: a
+        // direct PUT completed the `disproved` terminal and its close
+        // stamped `outcome=disproved` (.556307); the dispatcher's
+        // complete-marker-on-step-ready re-sent the completion (.576623, a
+        // bare STEP_UPDATED — the step was already completed), and its
+        // catch-all, having read the Job before that close committed,
+        // wrote the whole row back closed with no outcome (.586476). A
+        // write that changes nothing cannot have made a packet closable,
+        // so it has nothing to close: answer 204 and touch nothing.
+        // (Both closes are still whole-row writes; a writer that DOES
+        // change a step can still race one — the compare-and-set close
+        // is the rest of 29a7ea09.)
+        if step == old {
+            return StatusCode::NO_CONTENT.into_response();
         }
     }
 
@@ -673,13 +778,47 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // completing by another name.
     let is_leaving_open = !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
         && matches!(step.status, StepStatus::Completed | StepStatus::Skipped);
+    // A HUMAN-ONLY STEP IS COMPLETED BY A PERSON (backlog adac8fa4). The
+    // assignment and claim checks above guard who may HOLD the step; an
+    // unheld one could still be flipped by any caller the policy lets
+    // write steps, and on the in-memory API an agent's bare
+    // `{"status":"completed"}` answered 204 and stamped the agent as
+    // `completed_by`. Every completion path in the estate — the UI, the
+    // merge door followed by this PUT, `boss step complete`, a
+    // dispatcher handler — lands here, so this is the one boundary.
+    //
+    // Judged on the actor that SIGNED the write, not on the one the
+    // event will name: an automation's body `completed_by` proxy (the
+    // sim's attribution, below) names a person who did not make this
+    // call, and the declaration's whole claim is that a person did.
+    // Read from `old.metadata`, the protocol's materialised row, never
+    // from the body (the change refusal above keeps them equal). The
+    // same scope as the assurance guard: a skip satisfies `steps.x.done`
+    // exactly as a completion does.
+    if is_leaving_open
+        && crate::human_only::declared(&old.metadata)
+        && let Err(why) = crate::human_only::person_check(state.roster.as_deref(), &user.id).await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(crate::human_only::completion_refusal_body(
+                &step_id.to_string(),
+                &old.title,
+                old.metadata.get("authority_role").and_then(|v| v.as_str()),
+                &user.id,
+                &why,
+            )),
+        )
+            .into_response();
+    }
     if is_leaving_open {
         let floor = state
             .step_registry
             .get(&step.kind)
             .map(|t| t.assurance_floor)
             .unwrap_or_default();
-        let assured = judge_assurance(floor, &old, &step_id_str, &user.id, &headers);
+        let key = super::presence::key_for(state.presence_key.as_deref(), &headers).await;
+        let assured = judge_assurance(floor, &old, &step_id_str, &user.id, &headers, key);
         if assured.falls_short() {
             return assured.refusal();
         }
@@ -741,6 +880,40 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             format!("invalid step metadata: {msg}"),
         )
             .into_response();
+    }
+
+    // THE STANDING REFUSALS, ON A PUT THAT DOES NOT COMPLETE (backlog
+    // 73ef81fa, the gap car 1 left). The merge door judges a repeated
+    // anchor, a value over an inline bound, a binding to an anchor the
+    // step lacks and two of a one-of as the write lands; completion
+    // judges them again above. A PUT carrying metadata WITHOUT completing
+    // was judged by neither, so sending the whole bag here walked round
+    // the door. Judged for the keys this write CHANGES — a PUT must
+    // resend every stored key (the omission refusal above), so "sent"
+    // would be every field, and a reviewer's resolutions save would be
+    // refused over an exhibit an author wrote before these rules existed.
+    if step.status != StepStatus::Completed && body_obj.contains_key("metadata") {
+        let changed = |k: &str| step.metadata.get(k) != old.metadata.get(k);
+        // Against the fields the step STANDS with, as the merge door
+        // judges — a body that also rewrote `fields` does not get to
+        // choose the contract its own metadata is judged by.
+        let refusals = crate::step_registry::StepRegistry::standing_refusals(
+            &old.fields,
+            &step.metadata,
+            changed,
+        );
+        if !refusals.is_empty() {
+            let msg = refusals
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid step metadata: {msg}"),
+            )
+                .into_response();
+        }
     }
 
     // Blocker gate (invariant I-4 — preconditions enforced). When the
@@ -1253,8 +1426,9 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 .get(step.sort_order as usize)
                 .and_then(|spec_step| spec_step.terminal.as_ref())
                 .map(|t| t.outcome.clone())
+            && let Err(e) = close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await
         {
-            close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await;
+            return close_not_written(&job_id, &e);
         }
     }
 
@@ -1299,78 +1473,111 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 .stamp_with_actor(actor.clone())
                 .await
                 .with_partition(job.partition);
-            let mut close_events = vec![
-                close_stamp.event(
-                    events::JOB_UPDATED,
-                    serde_json::to_value(&job).unwrap_or_default(),
-                ),
-                close_stamp.event(
-                    events::JOB_STATUS_CHANGED,
-                    serde_json::json!({
-                        "id": job.id.to_string(),
-                        "old_status": old_status,
-                        "new_status": new_status,
-                    }),
-                ),
-            ];
-            if new_status == JobStatus::Closed {
-                close_events.push(close_stamp.event(
-                    events::JOB_CLOSED,
-                    serde_json::json!({
-                        "id": job.id.to_string(),
-                        "closed_on": job.closed_on,
-                        // ALWAYS present, on all three emit sites,
-                        // defaulting null — the dispatcher's expr
-                        // binder makes an ABSENT identifier a
-                        // PredicateFailed → Retry → dead-letter storm
-                        // rather than a quiet false, so a rule gating
-                        // on `kind` / `outcome` needs the keys on every
-                        // close, not just the ones that have an answer.
-                        // (The `notify_on_done` field on step.done,
-                        // migration 106, is the same contract.) A
-                        // catch-all close carries no declared outcome,
-                        // so `outcome` is null here unless a terminal
-                        // already stamped one.
-                        "kind": job.kind,
-                        "outcome": job.metadata.get("outcome"),
-                        // What closed, in words. A rule that SPAWNS off
-                        // a close has to title the new packet, and the
-                        // only titles available to it are a literal or
-                        // an identifier from this payload — the arg
-                        // language has no concatenation. Without this
-                        // key, `title = "title"` binds nothing and the
-                        // whole event dead-letters (see below); with a
-                        // literal instead, every spawned packet is
-                        // named identically and the board cannot tell
-                        // them apart.
-                        "title": job.title,
-                        // WHAT the closed packet was about. A recurring
-                        // sweep names its target here
-                        // (`stale-build-caches`), and that is the only
-                        // stable identity a spawning rule can dedupe
-                        // on: the sweep's `id` differs every firing and
-                        // its `title` is templated per target, so two
-                        // days of the same finding are indistinguishable
-                        // without this. Present on all three sites for
-                        // the same reason `kind` and `title` are.
-                        "subject_id": boss_core::primitives::Subject::id(&job.subject),
-                        // D7: same delegate-subjob back-link as the
-                        // terminal-close path, so a child Job that
-                        // closes via the all-steps-terminal catch-all
-                        // (no declared `outcome` step) still triggers
-                        // the parent resolve. Null when absent.
-                        "parent_step_id": job.metadata.get("parent_step_id"),
-                    }),
-                ));
-            }
-            let _ = state
+            // `compute_job_status` answers only Open or Closed, and an
+            // Open Job is the only one that reaches here, so this
+            // transition is always a close — and it goes through the
+            // close door, never a whole-row write (backlog 29a7ea09:
+            // on car 6b23d135 this site wrote back a copy read before
+            // the terminal close committed, and erased its outcome).
+            // The adapter builds the state event from the post-close
+            // row; these markers are built from that row too.
+            let markers = |job: &Job| {
+                vec![
+                    close_stamp.event(
+                        events::JOB_STATUS_CHANGED,
+                        serde_json::json!({
+                            "id": job.id.to_string(),
+                            "old_status": old_status,
+                            "new_status": new_status,
+                        }),
+                    ),
+                    close_stamp.event(
+                        events::JOB_CLOSED,
+                        serde_json::json!({
+                            "id": job.id.to_string(),
+                            "closed_on": job.closed_on,
+                            // ALWAYS present, on all three emit sites,
+                            // defaulting null — the dispatcher's expr
+                            // binder makes an ABSENT identifier a
+                            // PredicateFailed → Retry → dead-letter storm
+                            // rather than a quiet false, so a rule gating
+                            // on `kind` / `outcome` needs the keys on every
+                            // close, not just the ones that have an answer.
+                            // (The `notify_on_done` field on step.done,
+                            // migration 106, is the same contract.) A
+                            // catch-all close carries no declared outcome,
+                            // so `outcome` is null here unless a terminal
+                            // already stamped one.
+                            "kind": job.kind,
+                            "outcome": job.metadata.get("outcome"),
+                            // What closed, in words. A rule that SPAWNS off
+                            // a close has to title the new packet, and the
+                            // only titles available to it are a literal or
+                            // an identifier from this payload — the arg
+                            // language has no concatenation. Without this
+                            // key, `title = "title"` binds nothing and the
+                            // whole event dead-letters (see below); with a
+                            // literal instead, every spawned packet is
+                            // named identically and the board cannot tell
+                            // them apart.
+                            "title": job.title,
+                            // WHAT the closed packet was about. A recurring
+                            // sweep names its target here
+                            // (`stale-build-caches`), and that is the only
+                            // stable identity a spawning rule can dedupe
+                            // on: the sweep's `id` differs every firing and
+                            // its `title` is templated per target, so two
+                            // days of the same finding are indistinguishable
+                            // without this. Present on all three sites for
+                            // the same reason `kind` and `title` are.
+                            "subject_id": boss_core::primitives::Subject::id(&job.subject),
+                            // D7: same delegate-subjob back-link as the
+                            // terminal-close path, so a child Job that
+                            // closes via the all-steps-terminal catch-all
+                            // (no declared `outcome` step) still triggers
+                            // the parent resolve. Null when absent.
+                            "parent_step_id": job.metadata.get("parent_step_id"),
+                        }),
+                    ),
+                ]
+            };
+            // A close that loses the compare-and-set (another closer
+            // got there first) writes nothing and is not a failure; a
+            // close the store REFUSED is, and it is answered, never
+            // dropped: this site discarded it with `let _ =` and said
+            // 204 over a packet left open with every step terminal.
+            let closed_on = job.closed_on.unwrap_or_else(|| now.date_naive());
+            if let Err(e) = state
                 .jobs
-                .update_job_at(&job, close_stamp.timestamp, &close_events)
-                .await;
+                .close_job_at(
+                    &job_id,
+                    closed_on,
+                    &close_owned_fields(&job),
+                    &close_stamp,
+                    &markers,
+                )
+                .await
+            {
+                return close_not_written(&job_id, &e);
+            }
         }
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The answer to a step write whose close did not land: a 500 NAMING
+/// THE PACKET and saying which half committed. The step row is already
+/// written, so the caller must not read this as "nothing happened" —
+/// nor, as the 204 it replaced let them, as "the packet closed"
+/// (backlog 29a7ea09).
+fn close_not_written(job_id: &boss_core::job::JobId, e: &crate::port::JobsError) -> Response {
+    tracing::error!(job_id = %job_id, error = %e, "step written, but its job close failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("the step was written, but closing job {job_id} failed: {e}"),
+    )
+        .into_response()
 }
 
 /// `PATCH /api/jobs/{id}/steps/{step_id}/metadata` — merge top-level
@@ -1391,11 +1598,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
 ///
 /// A terminal step is refused with the PUT's own 409 shape (job
 /// 903e6b90: the caller is TOLD, never 204'd into believing a frozen
-/// write landed), and the hint points at the job metadata merge — the
-/// door that works, because a completed step is a record of what
-/// happened. Unlike the PUT there is no idempotent-re-send carve-out:
-/// nothing redelivers through this route, and a no-op "change" to a
-/// terminal step still has a better answer the message names.
+/// write landed), and the hint names the doors that work, because a
+/// completed step is a record of what happened: the corrections door
+/// for a correction, the job metadata merge for an annotation. A patch
+/// that CHANGES NOTHING is the one exception, answered 204 like the
+/// PUT's idempotent re-send: this door said "nothing redelivers through
+/// this route" until e39a9d2a moved the gate verdict, auto-park, boss
+/// park, prove and design onto it, each of which re-sends on a retry
+/// ([`crate::step_metadata_write::patch_is_noop`]).
 ///
 /// Policy: the same coarse `(Update, step)` gate as the step PUT.
 pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -1454,6 +1664,57 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     // lower the required sign-off authority — nor shed it with null.
     patch.remove("authority_role");
 
+    // THE STANDING REFUSALS, AS THE WRITE LANDS (design 26a89f11,
+    // exhibits). A repeated anchor, a value over the field's inline
+    // bound, or a binding to an anchor the step does not carry is what a
+    // record may never say, so it is refused here, where the writer is on
+    // the line — not at done, where it would land on the reviewer. Judged
+    // against the row AS IT WOULD STAND (the patch overlaid, null
+    // removing), and only for the fields this write touches or that bind
+    // one it touches. A step whose fields declare none of these answers
+    // exactly as before.
+    let merged_view = {
+        let mut md = old.metadata.as_object().cloned().unwrap_or_default();
+        for (k, v) in &patch {
+            if v.is_null() {
+                md.remove(k);
+            } else {
+                md.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::Value::Object(md)
+    };
+    // `human_only` is the protocol's, same rule as the PUT (adac8fa4):
+    // deleting it here with `null`, or flipping it, and then PUTting the
+    // status alone was the second road round the completion check.
+    if crate::human_only::declaration_changed(&old.metadata, &merged_view) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(crate::human_only::change_refusal_body(
+                &step_id.to_string(),
+                &old.title,
+                &old.metadata,
+            )),
+        )
+            .into_response();
+    }
+    let refusals =
+        crate::step_registry::StepRegistry::standing_refusals(&old.fields, &merged_view, |k| {
+            patch.contains_key(k)
+        });
+    if !refusals.is_empty() {
+        let msg = refusals
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid step metadata: {msg}"),
+        )
+            .into_response();
+    }
+
     // The parent packet: the event stamp inherits its admission-fixed
     // partition, and the re-evaluator runs against it.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
@@ -1477,6 +1738,20 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
         // it saw the step at write time — so both the pre-known and
         // the raced terminal case land here, in the PUT's 409 shape.
         Err(crate::port::JobsError::TerminalStep { status, .. }) => {
+            // THE IDEMPOTENT RE-SEND (e39a9d2a). A patch that would
+            // leave the terminal row exactly as it is changes nothing,
+            // and is answered as the no-op it is — the PUT's freeze has
+            // the same carve-out, and the writers moved from that PUT
+            // onto this door (the gate verdict, auto-park, boss park,
+            // prove, design) re-send on a redelivery or a retry. Judged
+            // against a FRESH read, not `old`: in the raced case the
+            // step went terminal after `old` was taken, and what the
+            // patch must match is the row as it now stands.
+            if let Ok(Some(now)) = state.jobs.get_step(&step_id).await
+                && crate::step_metadata_write::patch_is_noop(&now.metadata, &patch)
+            {
+                return StatusCode::NO_CONTENT.into_response();
+            }
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -1484,9 +1759,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
                     "step_id": step_id.to_string(),
                     "step_status": status,
                     "refused_fields": ["metadata"],
-                    "hint": "a completed step is a record of what happened. To correct or \
-                             annotate it, write to the parent job's metadata \
-                             (PATCH /api/jobs/{id}/metadata) instead.",
+                    "hint": crate::corrections::TERMINAL_STEP_HINT,
                 })),
             )
                 .into_response();
@@ -1536,6 +1809,126 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/jobs/{id}/steps/{step_id}/corrections` — append a
+/// correction beside a completed or skipped step (design 4105b020,
+/// backlog 56727f95). The ONLY writer of the job's reserved
+/// `corrections` list; the rules are `crate::corrections`'.
+///
+/// Body: `{field, reads, should_read, why}`, or `{withdraws, why}` to
+/// withdraw an earlier entry of this step by appending. 201 with
+/// `{index, correction}`. Refuses: an open step (409 — it is still
+/// editable), and with 422 a missing key, a `field` the step does not
+/// hold, a `reads` excerpt not in that field's stored text, and a
+/// withdrawal that names no live entry of this step. The step itself
+/// and every event it produced are untouched; the entry is signed with
+/// the caller and stamped with the write's time.
+///
+/// Policy: the job metadata merge's gate — `(Update, job)` plus the
+/// scope check — because the write lands in the job's metadata.
+pub(super) async fn post_step_correction<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+    Json(req): Json<crate::corrections::CorrectionRequest>,
+) -> Response {
+    let job_id = match super::jobs::resolve_path_job_id(&state, &id).await {
+        Ok(job_id) => job_id,
+        Err(refusal) => return refusal,
+    };
+    let step_id = match parse_step_id(&step_id_str) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid step id").into_response(),
+    };
+    let job = match state.jobs.get_job(&job_id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => return (StatusCode::NOT_FOUND, "job not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let scope = match state
+        .policy
+        .check(&user, Action::Update, Resource::job())
+        .await
+    {
+        Ok(Decision::Deny { reason }) => return (StatusCode::FORBIDDEN, reason).into_response(),
+        Ok(Decision::Allow { scope }) => scope,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if !scope_matches(&user, &scope, &job) {
+        return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
+    }
+    let step = match state.jobs.get_step(&step_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // Same containment rule as the claim and merge routes.
+    if step.job_id != job_id {
+        return (StatusCode::NOT_FOUND, "step not on this job").into_response();
+    }
+
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let stamp = state
+        .publisher
+        .stamp_with_actor(actor.clone())
+        .await
+        .with_partition(job.partition);
+    let step_id_text = step_id.to_string();
+    let entry = match crate::corrections::entry_for(
+        crate::corrections::Target {
+            step_id: &step_id_text,
+            terminal: matches!(step.status, StepStatus::Completed | StepStatus::Skipped),
+            status: status_word(step.status),
+            metadata: &step.metadata,
+        },
+        crate::corrections::list(&job.metadata),
+        &req,
+        &actor.to_string(),
+        &stamp.timestamp.to_rfc3339(),
+    ) {
+        Ok(entry) => entry,
+        Err(refusal) => {
+            let code = if refusal.is_conflict() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            return (
+                code,
+                Json(serde_json::json!({
+                    "error": refusal.message(),
+                    "step_id": step_id_text,
+                    "step_status": status_word(step.status),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .jobs
+        .append_step_correction_at(&job_id, &entry, &stamp)
+        .await
+    {
+        Ok((_, index)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "index": index, "correction": entry })),
+        )
+            .into_response(),
+        Err(crate::port::JobsError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, "job not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1634,6 +2027,22 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // reads its Subject identity.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
 
+    // The step's agent block as every gate below reads it: the packet's
+    // own projection, else its kind's ACTIVE row (backlog 51aef4dd) —
+    // the resolution the station queue made, so the door an agent
+    // claims through agrees with the queue it read. Read only when the
+    // step carries no projection; best-effort, since a registry that
+    // cannot answer leaves the step as recorded, which is how every
+    // claim was judged before. `old` itself stays as recorded: it is
+    // what the CAS writes back, and the resolution is never written.
+    let active_row = match (&state.kind_registry, &parent_job) {
+        (Some(reg), Some(job)) if crate::agent_spec::projected(&old.metadata).is_none() => {
+            reg.get_active(&job.kind).await.ok()
+        }
+        _ => None,
+    };
+    let resolved = crate::agent_spec::resolved(&old, active_row.as_ref());
+
     // The claimant's agents row, read once for the two gates below:
     // the station's model capability and the budget reservation.
     // `None` is a person or an unregistered login — neither gate
@@ -1684,8 +2093,16 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             return (StatusCode::NOT_FOUND, "job not found").into_response();
         };
         let needs_steps = bound.as_ref().is_some_and(|s| s.predicate.needs_steps());
+        // A failed steps read is a 500 naming the packet, not an empty
+        // list: empty cannot match a step clause, so the claim was
+        // refused 409 "packet is not at this station" — a confident
+        // wrong answer to a question the door never read (f6c97006).
         let steps = if needs_steps {
-            state.jobs.list_steps(&job_id).await.unwrap_or_default()
+            let steps = match state.jobs.list_steps(&job_id).await {
+                Ok(steps) => steps,
+                Err(e) => return steps_unreadable(&job_id, &e),
+            };
+            crate::agent_spec::resolved_steps(&steps, active_row.as_ref())
         } else {
             Vec::new()
         };
@@ -1769,25 +2186,34 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // numbers, BEFORE the CAS, so a claim the budget does not admit
     // never enters the race. A person, an unregistered login, and a
     // row with no cap reserve nothing (see `agent_budget`).
+    //
+    // A READING, NOT A REFUSAL, since backlog e6b2066f. Once a run is
+    // priced from what it consumed — about five times the figure this
+    // gate was calibrated against — the $40 hour would have refused
+    // claims all day, and David's direction (2026-09-23) is that
+    // budgets give protocols a cost signal and do not limit building.
+    // So an over-cap reservation admits the claim and puts the reading
+    // on the log beside it (`agents.claim.over_budget`, committed with
+    // the claim), and a failed read of the hour is logged and admits
+    // too: a gate that no longer refuses must not refuse on a hiccup.
+    let mut over_budget: Option<serde_json::Value> = None;
     if let (Some(door), Some(row), Some(budget_usd)) = (
         state.agent_budget.as_ref(),
         agent_row.as_ref(),
-        old.metadata
+        resolved
+            .metadata
             .get(crate::agent_spec::BUDGET_KEY)
             .and_then(|v| v.as_f64()),
     ) {
         let now = boss_clock_client::now_from(&state.clock).await;
         match door.reserve(row, budget_usd, now).await {
             Ok(reservation) if reservation.decision.is_allowed() => {}
-            Ok(reservation) => {
-                return (StatusCode::CONFLICT, Json(reservation.refusal_body())).into_response();
-            }
+            Ok(reservation) => over_budget = Some(reservation.reading_body()),
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("budget gate could not measure the actor's hour: {e}"),
-                )
-                    .into_response();
+                tracing::warn!(
+                    actor = %row.id,
+                    "budget reading could not measure the actor's hour, claim admitted: {e}"
+                );
             }
         }
     }
@@ -1815,7 +2241,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // After the budget gate, because `BudgetDecision::decide` reports
     // money before concurrency and the two doors keep that order.
     if let Some(row) = agent_row.as_ref()
-        && crate::agent_budget::declares_an_agent_run(&old.metadata)
+        && crate::agent_budget::declares_an_agent_run(&resolved.metadata)
         && let Some(cap) = row.max_concurrent_runs.and_then(|n| u32::try_from(n).ok())
     {
         // Every spelling of the actor: the registered id and the
@@ -1865,15 +2291,42 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     let mut claimed = old.clone();
     claimed.assignee_id = Some(user.id.clone());
     claimed.status = StepStatus::Active;
+    // The CAS drops the previous run's edge when the holder changes
+    // (9562f6df); the event says so too, or the log would go on naming
+    // a run the row no longer names. The claimant's aliases come from
+    // its agents row — the same holder the CAS reads as `me`.
+    let aliases = agent_row
+        .as_ref()
+        .map(|r| r.aliases.as_slice())
+        .unwrap_or_default();
+    if crate::agent_runs::claim_changes_holder(old.assignee_id.as_deref(), &user.id, aliases) {
+        claimed.metadata = crate::agent_runs::without_edge(&claimed.metadata);
+    }
 
     let mut claim_events = vec![stamp.event(
         events::STEP_UPDATED,
         serde_json::to_value(&claimed).unwrap_or_default(),
     )];
-    // Same grammar as the PUT path: an assignment marker only when
-    // the assignee genuinely changed (a re-claim is not an
-    // assignment), payload mirroring step.ready for messages.notify.
-    if old.assignee_id.as_deref() != Some(user.id.as_str()) && !claimed.kind.is_empty() {
+    // The over-budget reading, on the log in the same commit as the
+    // claim it describes (backlog e6b2066f): which step, which actor,
+    // and every number the old refusal carried.
+    if let Some(mut reading) = over_budget {
+        if let Some(obj) = reading.as_object_mut() {
+            obj.insert("job_id".into(), serde_json::json!(job_id.to_string()));
+            obj.insert("step_id".into(), serde_json::json!(step_id.to_string()));
+        }
+        claim_events.push(stamp.event(crate::agent_budget::CLAIM_OVER_BUDGET, reading));
+    }
+    // An assignment marker only when the executor genuinely changed —
+    // the same alias-aware answer the run edge took above, so a re-claim
+    // and a respelled holder announce nothing (735ddc03). Payload
+    // mirrors step.ready for messages.notify.
+    if crate::agent_runs::assignment_marker_due(
+        old.assignee_id.as_deref(),
+        &user.id,
+        aliases,
+        &claimed.kind,
+    ) {
         let (subject_kind, subject_id) = if let Some(job) = &parent_job {
             (
                 boss_core::primitives::Subject::kind(&job.subject).to_string(),
@@ -1976,7 +2429,8 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         .get(&step.kind)
         .map(|t| t.assurance_floor)
         .unwrap_or_default();
-    let assured = judge_assurance(floor, &step, &step_id_str, &user.id, &headers);
+    let key = super::presence::key_for(state.presence_key.as_deref(), &headers).await;
+    let assured = judge_assurance(floor, &step, &step_id_str, &user.id, &headers, key);
     let produced = assured.produced;
     let presence_nonce = assured.presence_nonce.clone();
     if assured.falls_short() {
@@ -2039,22 +2493,28 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
 /// (`Pending` / `Ready` / `Active`) `Skipped` so the closed Job has no
 /// dangling open work. No-ops if the Job is already terminal
 /// (Cancelled / Draft) or already Closed.
+///
+/// The close itself is [`JobsRepository::close_job_at`]: it writes only
+/// the fields a close owns and only while the row is still open
+/// (backlog 29a7ea09), and its failure is returned rather than logged,
+/// because the step write that called this has already committed and
+/// its caller would otherwise be told the completion landed whole.
 async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job_id: &boss_core::job::JobId,
     outcome: &str,
     actor: &boss_core::actor::ActorId,
     now: chrono::DateTime<chrono::Utc>,
-) {
-    let Ok(Some(mut job)) = state.jobs.get_job(job_id).await else {
-        return;
+) -> Result<(), crate::port::JobsError> {
+    let Some(mut job) = state.jobs.get_job(job_id).await? else {
+        return Ok(());
     };
     if matches!(
         job.status,
         JobStatus::Closed | JobStatus::Cancelled | JobStatus::Draft
     ) {
         // Already terminal / not-yet-open — nothing to close.
-        return;
+        return Ok(());
     }
 
     let terminal_stamp = state
@@ -2111,55 +2571,77 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
     stamp_close_instant(&mut job, &now);
 
     // OUTBOX (phase 2): the close's state event + markers record in
-    // the SAME transaction as the row.
-    let close_events = [
-        terminal_stamp.event(
-            events::JOB_UPDATED,
-            serde_json::to_value(&job).unwrap_or_default(),
-        ),
-        terminal_stamp.event(
-            events::JOB_STATUS_CHANGED,
-            serde_json::json!({
-                "id": job.id.to_string(),
-                "old_status": old_status,
-                "new_status": JobStatus::Closed,
-            }),
-        ),
-        terminal_stamp.event(
-            events::JOB_CLOSED,
-            serde_json::json!({
-                "id": job.id.to_string(),
-                "closed_on": job.closed_on,
-                "outcome": outcome,
-                // Which protocol closed. Present on all three emit
-                // sites so a rule can select the Workflow it cares
-                // about as data: the close marker otherwise names no
-                // kind, and every consumer had to fetch the Job to
-                // find out whether the event was even about them.
-                "kind": job.kind,
-                // Present on all three sites for the same reason `kind`
-                // is: a spawning rule can only name the packet it
-                // creates from a literal or from this payload.
-                "title": job.title,
-                // See the status-transition site above: the subject is
-                // the recurring packet's stable identity, and the only
-                // key a spawn rule can dedupe a repeating finding on.
-                "subject_id": boss_core::primitives::Subject::id(&job.subject),
-                // D7: surface the delegate-subjob back-link (if any) on
-                // the close marker so the jobs.subjob_resolve rule can
-                // gate `when` on it without fetching the Job. Null for
-                // an ordinary (non-delegated) Job.
-                "parent_step_id": job.metadata.get("parent_step_id"),
-            }),
-        ),
-    ];
-    if let Err(e) = state
+    // the SAME transaction as the row — the adapter builds the state
+    // event from the post-close row, and these markers from it too.
+    let markers = |job: &Job| {
+        vec![
+            terminal_stamp.event(
+                events::JOB_STATUS_CHANGED,
+                serde_json::json!({
+                    "id": job.id.to_string(),
+                    "old_status": old_status,
+                    "new_status": JobStatus::Closed,
+                }),
+            ),
+            terminal_stamp.event(
+                events::JOB_CLOSED,
+                serde_json::json!({
+                    "id": job.id.to_string(),
+                    "closed_on": job.closed_on,
+                    "outcome": outcome,
+                    // Which protocol closed. Present on all three emit
+                    // sites so a rule can select the Workflow it cares
+                    // about as data: the close marker otherwise names no
+                    // kind, and every consumer had to fetch the Job to
+                    // find out whether the event was even about them.
+                    "kind": job.kind,
+                    // Present on all three sites for the same reason `kind`
+                    // is: a spawning rule can only name the packet it
+                    // creates from a literal or from this payload.
+                    "title": job.title,
+                    // See the status-transition site above: the subject is
+                    // the recurring packet's stable identity, and the only
+                    // key a spawn rule can dedupe a repeating finding on.
+                    "subject_id": boss_core::primitives::Subject::id(&job.subject),
+                    // D7: surface the delegate-subjob back-link (if any) on
+                    // the close marker so the jobs.subjob_resolve rule can
+                    // gate `when` on it without fetching the Job. Null for
+                    // an ordinary (non-delegated) Job.
+                    "parent_step_id": job.metadata.get("parent_step_id"),
+                }),
+            ),
+        ]
+    };
+    let closed_on = job.closed_on.unwrap_or_else(|| now.date_naive());
+    state
         .jobs
-        .update_job_at(&job, terminal_stamp.timestamp, &close_events)
+        .close_job_at(
+            job_id,
+            closed_on,
+            &close_owned_fields(&job),
+            &terminal_stamp,
+            &markers,
+        )
         .await
-    {
-        tracing::warn!(job_id = %job_id, error = %e, "terminal close: failed to persist closed Job");
-    }
+        .map(|_| ())
+}
+
+/// The metadata keys a close OWNS, read off the closer's own copy of
+/// the Job after it stamped them: the close instant (`closed_at`, from
+/// [`stamp_close_instant`]) and the outcome, when the copy carries one.
+/// Only these merge into the row ([`JobsRepository::close_job_at`]);
+/// every other key stays as the row holds it at write time, so a key
+/// another writer merged after this closer read the Job survives the
+/// close (backlog 29a7ea09).
+fn close_owned_fields(job: &Job) -> serde_json::Map<String, serde_json::Value> {
+    ["closed_at", "outcome"]
+        .into_iter()
+        .filter_map(|key| {
+            job.metadata
+                .get(key)
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect()
 }
 
 /// D6 ready marker — build the `step.ready.<kind>` event for a step

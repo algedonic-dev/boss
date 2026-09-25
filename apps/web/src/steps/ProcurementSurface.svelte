@@ -1,6 +1,6 @@
 <script lang="ts">
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import { putStep } from './stepWrite';
+  import { saveStep } from './stepWrite';
   import { formatMoney } from '@boss/web-kit/ui/money';
   // Procurement step surface — place a purchase order with a
   // vendor. The ingredient-restock Workflow opens with this step
@@ -84,17 +84,17 @@
     saving = true;
     writeError = null;
     try {
+      // The key this surface owns, through the merge door; an emptied
+      // date is sent as null and deleted, where it used to be cleared by
+      // omission from a wholesale PUT (backlog e39a9d2a).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
         status: status ?? step.status,
         metadata: {
-          ...step.metadata,
           expected_date: expectedDate || undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      const res = await saveStep(jobId, step.id, body);
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -187,7 +187,7 @@
   <div class="step-actions">
     {#if !terminal && isPending(step.status)}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('active')}
         disabled={saving}
       >
@@ -196,7 +196,7 @@
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || lineItems.length === 0}
       >
@@ -217,8 +217,8 @@
     text-align: left;
     font-weight: 600;
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border, #e5e7eb);
-    color: var(--text-muted, #6b7280);
+    border-bottom: 1px solid var(--border);
+    color: var(--static);
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -228,7 +228,7 @@
   }
   .step-line-items td {
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-line-items .col-sku { width: 160px; }
   .step-line-items .num {
@@ -237,16 +237,16 @@
     width: 90px;
   }
   .step-line-items .desc {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
   .step-line-items tr.total {
     font-weight: 600;
   }
   .step-line-items tr.total td {
-    border-top: 1px solid var(--border, #d1d5db);
+    border-top: 1px solid var(--border);
     border-bottom: none;
   }
   .muted {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
 </style>

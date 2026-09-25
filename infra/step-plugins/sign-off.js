@@ -34,7 +34,9 @@
 // must be IN the shape), then the user's own stamp if their role is
 // required and unsigned, then the completion — skipped, with a plain
 // explanation, while other roles' signatures are still outstanding.
-// Request changes records without completing. NOTHING writes metadata
+// Request changes records without completing — unless the step's
+// protocol declares `changes_requested_completes = true`, when it takes
+// the Approve path (backlog da322e8f). NOTHING writes metadata
 // after a signature exists: on 2026-09-05 15:40 David signed, then
 // this surface re-saved his unchanged decision with a fresh
 // decided_at, and the completion answered 409 stale two seconds after
@@ -111,6 +113,19 @@
       const cur = (step.metadata || {})[f.name];
       fieldValues[f.name] = cur == null ? '' : String(cur);
     });
+
+    // Whether Request changes COMPLETES this step, read off the step's
+    // own metadata — the protocol's declaration, not this surface's
+    // guess (backlog da322e8f, 2026-09-23). An ordinary sign-off keeps
+    // its step open on changes-requested so the same approver can
+    // re-decide once the thing is revised. A protocol that ROUTES the
+    // decision — page-audit's `revise` is ready_when `steps.review.done
+    // AND decision = "changes-requested"` — needs the step done, and
+    // declares it with `changes_requested_completes = true` in the
+    // step's metadata_defaults. Undeclared, the old behaviour stands:
+    // three founder change requests sat recorded and unrouted until the
+    // operator completed them by hand, which is what this ends.
+    const changesRequestedCompletes = (step.metadata || {}).changes_requested_completes === true;
 
     const stampFor = (role) => stamps.find((s) => s && s.role === role);
     const outstanding = () => required.filter((r) => !stampFor(r) || stale.has(r));
@@ -285,7 +300,9 @@
           'button',
           {
             className: 'step-btn',
-            disabled: busy,
+            // A Request changes that completes meets the same
+            // required-at-done contract as Approve, so it waits too.
+            disabled: changesRequestedCompletes ? disabled : busy,
             onClick: () => decide('changes-requested'),
           },
           'Request changes',
@@ -339,7 +356,14 @@
         body: JSON.stringify({ job_id: jobId, step_id: step.id }),
       });
       if (begin.status === 409) throw new Error('No passkey enrolled — add one first.');
-      if (!begin.ok) throw new Error(`presence ceremony unavailable (${begin.status})`);
+      if (!begin.ok) {
+        // The gateway's refusal text names which of its steps refused
+        // (job fetch, stored passkeys, challenge mint); the status alone
+        // does not. The app's own copy of the ceremony says the same
+        // since 2e893e27 (backlog f3436d99).
+        const text = await begin.text().catch(() => '');
+        throw new Error(`presence ceremony unavailable (${begin.status}): ${text}`);
+      }
       const opts = await begin.json();
       const cred = await navigator.credentials.get({
         publicKey: {
@@ -373,7 +397,12 @@
           },
         }),
       });
-      if (!finish.ok) throw new Error(`assertion rejected (${finish.status})`);
+      if (!finish.ok) {
+        // e.g. 410 'challenge already spent or expired — begin again',
+        // or the verifier's own reason on a 401.
+        const text = await finish.text().catch(() => '');
+        throw new Error(`assertion rejected (${finish.status}): ${text}`);
+      }
       return (await finish.json()).ticket;
     }
 
@@ -478,7 +507,7 @@
           // server has just marked them stale, and so does the roster.
           stamps.forEach((st) => st && stale.add(st.role));
         }
-        if (d === 'changes-requested') {
+        if (d === 'changes-requested' && !changesRequestedCompletes) {
           if (typeof onUpdate === 'function') onUpdate();
           return;
         }

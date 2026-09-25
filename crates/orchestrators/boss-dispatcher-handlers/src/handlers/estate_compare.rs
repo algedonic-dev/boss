@@ -94,7 +94,7 @@ use serde_json::{Value as Json, json};
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{api_client, get_json, post_json};
+use super::common::{api_client, get_json, post_json, rows_or_refuse};
 use super::spool::{PostFuture, Spool};
 
 /// The cluster scope this comparator understands. The observer stamps
@@ -120,6 +120,19 @@ pub(crate) const HOST_SCOPE: &str = "host";
 /// would dead-end as unknown_scope — the exact class the HOST_SCOPE
 /// comment above records fixing (49a8d842).
 pub(crate) const UNITS_SCOPE: &str = "host-units";
+
+/// The door scope (`infra/estate/observe-door.sh`, backlog e6406701):
+/// the estate's doors, probed from OUTSIDE what they open onto. The
+/// dev pod's two ssh doors were dark ~36 hours from 2026-09-22T23:23Z
+/// and a person found it (incident 55d001b0) — the pod judged its own
+/// door once at boot, and nothing outside it ever looked again. Like
+/// UNITS_SCOPE it is self-judged by the observation: there is no
+/// declared-doors registry row to sweep, the observation carries both
+/// what was probed and the band it is judged against
+/// (`infra/estate/doors.toml`). Unlike the host scopes it is ONE
+/// series for the whole scope — every door rides one observation — so
+/// its comparisons carry no `host`, as the cluster's do not.
+pub(crate) const DOOR_SCOPE: &str = "door";
 
 /// The disk floor that turns a reading into a HARD finding (49a8d842:
 /// the forge host — 228G, 83% full, "THE TIGHT ONE" — could fill and
@@ -156,9 +169,11 @@ pub(crate) const UNITS_SCOPE: &str = "host-units";
 /// would have landed hours after CI had gone red (2026-09-05: the
 /// series ran 109 → 71 GB across eight trains with no finding at all).
 /// 35% of 228 is 80 GB: above the locomotive's floor by the three
-/// consecutive comparisons the raiser demands before it files. On a
-/// 48 GB bastion 35% is under the 16 GiB minimum, which then rules —
-/// the same reading as before for hosts that do less.
+/// consecutive comparisons the raiser demands before it files. At 45 GB
+/// and below 35% is under the 16 GiB minimum, which then rules — the
+/// same reading as before for hosts that do less. (This said a 48 GB
+/// bastion; 35% of 48 is 16.8, so there the percentage still rules by
+/// one GB — found when the finding began stating its floor, e4ec8150.)
 const DISK_TIGHT_FLOOR_GB: i64 = 16;
 const DISK_TIGHT_FLOOR_PCT: i64 = 35;
 
@@ -222,17 +237,29 @@ fn disk_tight_finding(node: &Json) -> Option<Json> {
     let id = node.get("id").and_then(Json::as_str)?;
     let free = node.get("disk_free_gb").and_then(Json::as_i64)?;
     let total = node.get("disk_gb").and_then(Json::as_i64)?;
-    // The floor is the MAX of an absolute minimum and a CAPPED
-    // percentage — `max(DISK_TIGHT_FLOOR_GB, min(pct of capacity,
-    // DISK_TIGHT_HEADROOM_CEILING_GB))`. The cap is the clause that was
-    // missing: a percentage alone rules at BOTH ends of the disk-size
-    // range, and on a big enough disk 35% is more headroom than anything
-    // in this pipeline asks for (8e425862).
-    let below_minimum = free < DISK_TIGHT_FLOOR_GB;
-    let below_capped_pct =
-        free < DISK_TIGHT_HEADROOM_CEILING_GB && free * 100 < total * DISK_TIGHT_FLOOR_PCT;
-    (total > 0 && (below_minimum || below_capped_pct))
-        .then(|| json!({ "id": id, "free_gb": free, "disk_gb": total }))
+    let floor = disk_floor_gb(total);
+    // The finding carries the floor it crossed (e4ec8150): the
+    // comparison holds that number when it decides, and an alarm that
+    // says `free_gb: 192` without it sends the reader to re-derive the
+    // rule from this file — the reduce-before-storing class.
+    (total > 0 && free < floor)
+        .then(|| json!({ "id": id, "free_gb": free, "disk_gb": total, "floor_gb": floor }))
+}
+
+/// The effective floor for a disk of `total_gb`, in whole GB: free
+/// strictly below it is `disk_tight`. It is the MAX of an absolute
+/// minimum and a CAPPED percentage — `max(DISK_TIGHT_FLOOR_GB, min(pct
+/// of capacity, DISK_TIGHT_HEADROOM_CEILING_GB))`. The cap is the clause
+/// that was missing: a percentage alone rules at BOTH ends of the
+/// disk-size range, and on a big enough disk 35% is more headroom than
+/// anything in this pipeline asks for (8e425862). The percentage is
+/// rounded UP: free is whole GB, so `free < 79.8` and `free < 80` are
+/// the same test, and the stated floor is the one the test applies.
+fn disk_floor_gb(total_gb: i64) -> i64 {
+    let pct = (total_gb * DISK_TIGHT_FLOOR_PCT + 99) / 100;
+    // Both bounds are consts with minimum < ceiling, so clamp's
+    // max-below-min panic cannot arise.
+    pct.clamp(DISK_TIGHT_FLOOR_GB, DISK_TIGHT_HEADROOM_CEILING_GB)
 }
 
 /// The self-scoped host comparison, pure: for each observed host that
@@ -634,6 +661,95 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
     })
 }
 
+/// The door comparison, pure (backlog e6406701): every half the
+/// observer did not stamp `open: true` is dark, and a dark half is
+/// judged against its door's declared band — dark for at least
+/// `band_s` (the observation's `observed_at` minus the half's
+/// `dark_since`) is `door_dark`, the HARD finding; less is
+/// `door_dimming`, visible and never raised.
+///
+/// The observer, not this function, holds when a half first went dark:
+/// it is the instrument that saw the transition, the way the cluster
+/// watchdog counts its own dark checks. What this function adds is the
+/// judgement, over nothing but the observation, so a replayed reading
+/// is judged exactly as it was when it was taken.
+///
+/// NO EVIDENCE OF DURATION IS NOT A PASS: a dark half with no readable
+/// `dark_since`, or a door with no `band_s`, is `door_dark` — a
+/// malformed instrument surfaces, as a unit row with no healthy flag
+/// does. A half with no `open` flag is dark for the same reason.
+///
+/// The doors ride the comparison whole (`doors`), so `boss orient`
+/// prints the door from the judged record without a second read.
+pub(crate) fn compare_door(observation: &Json) -> Json {
+    let observed_at = observation
+        .get("observed_at")
+        .and_then(Json::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    let doors: Vec<&Json> = observation
+        .get("nodes")
+        .and_then(Json::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+
+    let mut halves = 0usize;
+    let mut door_dark: Vec<Json> = Vec::new();
+    let mut door_dimming: Vec<Json> = Vec::new();
+
+    for door in &doors {
+        let id = door.get("id").and_then(Json::as_str).unwrap_or("");
+        let band_s = door.get("band_s").and_then(Json::as_i64);
+        for half in door
+            .get("halves")
+            .and_then(Json::as_array)
+            .map(|a| a.iter())
+            .into_iter()
+            .flatten()
+        {
+            halves += 1;
+            if half.get("open").and_then(Json::as_bool) == Some(true) {
+                continue;
+            }
+            let name = half.get("half").and_then(Json::as_str).unwrap_or("");
+            let dark_since = half.get("dark_since").and_then(Json::as_str);
+            let dark_for_s = match (observed_at, dark_since) {
+                (Some(at), Some(since)) => chrono::DateTime::parse_from_rfc3339(since)
+                    .ok()
+                    .map(|since| (at - since).num_seconds()),
+                _ => None,
+            };
+            let entry = json!({
+                "id": format!("{id}/{name}"),
+                "door": id,
+                "half": name,
+                "target": half.get("target"),
+                "reason": half.get("reason"),
+                "dark_since": dark_since,
+                "dark_for_s": dark_for_s,
+                "band_s": band_s,
+            });
+            match (dark_for_s, band_s) {
+                (Some(dark), Some(band)) if dark < band => door_dimming.push(entry),
+                _ => door_dark.push(entry),
+            }
+        }
+    }
+
+    json!({
+        "counts": {
+            "doors": doors.len(),
+            "halves": halves,
+            "dark": door_dark.len(),
+            "dimming": door_dimming.len(),
+        },
+        "findings": {
+            "door_dark": door_dark,
+            "door_dimming": door_dimming,
+        },
+        "doors": doors,
+    })
+}
+
 /// The stage name, and therefore the subdirectory the retained
 /// observations wait in under the one estate spool.
 const STAGE: &str = "estate.compare";
@@ -682,15 +798,7 @@ async fn compare_and_record(
 
     let declared = async {
         let nodes = get_json(client, &format!("{base}/api/estate/nodes"), rule).await?;
-        nodes
-            .get("data")
-            .and_then(Json::as_array)
-            .cloned()
-            .ok_or_else(|| {
-                HandlerError::Downstream(
-                    "GET /api/estate/nodes: response carries no data array".into(),
-                )
-            })
+        rows_or_refuse::<Json>(&nodes, "GET /api/estate/nodes").map_err(HandlerError::Downstream)
     };
 
     let body = if scope == KNOWN_SCOPE {
@@ -706,6 +814,11 @@ async fn compare_and_record(
         // read — the observation itself carries both what was
         // watched and what the observer concluded about it.
         envelope(compare_units(observation))
+    } else if scope == DOOR_SCOPE {
+        // Self-judged like UNITS_SCOPE: the observation carries what
+        // was probed, when each half went dark, and the band it is
+        // judged against (backlog e6406701).
+        envelope(compare_door(observation))
     } else {
         // An observation from an instrument this comparator does
         // not understand. Guessing which declared rows it should
@@ -1041,8 +1154,10 @@ mod tests {
             // A 228 GB host genuinely filling — below the ceiling, so
             // the percentage still rules and the raise still works.
             (60, 228, 1, "a filling 228 GB host, 60 of 228 = 26%"),
-            // A 48 GB bastion: 35% is under the 16 GiB minimum, which
-            // rules, exactly as before. Unchanged by the cap.
+            // A 48 GB bastion: tight under either rule (its floor is 17,
+            // the 16 GiB minimum rules only at 45 GB and below — see
+            // `a_disk_finding_names_the_floor_it_crossed`). Unchanged by
+            // the cap.
             (10, 48, 1, "a 48 GB bastion at 10 of 48"),
             // AT the ceiling is CLEAN, one GB under it is tight: every
             // comparison in this file is strict `<`, so "exactly at the
@@ -1071,6 +1186,45 @@ mod tests {
                 want,
                 "host scope: {why}"
             );
+        }
+    }
+
+    #[test]
+    fn a_disk_finding_names_the_floor_it_crossed() {
+        // e4ec8150: alarm e1fea3b2 carried `free_gb: 192, disk_gb: 929`
+        // for w-1 and nothing else, so a reader asking "tight against
+        // WHAT?" had to re-derive `max(16, min(35% of 929, 200))` from
+        // this file's constants. The comparison held the floor when it
+        // decided and dropped it before storing — the reduce-before-
+        // storing class. The finding now carries the number it crossed,
+        // the way `disk-report.sh` already prints `free=… floor=…`.
+        let dec = vec![json!({"id":"h","role":"talos-worker","retired":false})];
+        let dec_host = vec![json!({"id":"h","role":"forge"})];
+        for (free, total, floor, why) in [
+            // The e1fea3b2 reading: the headroom ceiling rules.
+            (
+                192,
+                929,
+                DISK_TIGHT_HEADROOM_CEILING_GB,
+                "w-1, ceiling rules",
+            ),
+            // 35% of 228 is 79.8 GB; free is whole GB, so `free < 79.8`
+            // is `free < 80` and the floor is stated as 80 — the same
+            // figure the forge's disk report prints for this host.
+            (60, 228, 80, "a 228 GB host, percentage rules"),
+            // The absolute minimum rules only at 45 GB and below: 35% of
+            // 48 is 16.8, so a 48 GB disk's floor is 17 — measured by
+            // this test's first run, which is why the case is 40 GB.
+            (10, 48, 17, "a 48 GB disk, percentage rules by one GB"),
+            (10, 40, DISK_TIGHT_FLOOR_GB, "a 40 GB disk, minimum rules"),
+        ] {
+            let cluster = compare(&dec, &cluster_obs("h", total, Some(free)));
+            let host = compare_host(&dec_host, &host_obs("h", free, total));
+            for (scope, cmp) in [("cluster", &cluster), ("host", &host)] {
+                let finding = &cmp["findings"]["disk_tight"][0];
+                assert_eq!(finding["free_gb"], free, "{scope} scope: {why}");
+                assert_eq!(finding["floor_gb"], floor, "{scope} scope: {why}");
+            }
         }
     }
 
@@ -1529,6 +1683,128 @@ mod tests {
         );
     }
 
+    // ----- the door scope (backlog e6406701) -----
+
+    /// A `door` observation as `infra/estate/observe-door.sh` posts it:
+    /// one node per declared door, its band, and one row per half.
+    fn door_obs(halves: Json) -> Json {
+        json!({
+            "observed_at": "2026-09-24T12:00:00Z",
+            "observer": "boss-door-observe",
+            "scope": "door",
+            "nodes": [{"id": "dev-ssh", "band_s": 900, "halves": halves}],
+        })
+    }
+
+    fn open_lan() -> Json {
+        json!({"half":"lan","target":"10.20.0.35:22","open":true,"tcp":true,
+               "keyscan":"ssh-ed25519","reason":null,"dark_since":null})
+    }
+
+    fn open_public() -> Json {
+        json!({"half":"public","target":"dev.algedonic.dev","open":true,
+               "address":"104.21.0.1","reason":null,"dark_since":null})
+    }
+
+    #[test]
+    fn a_door_whose_halves_answer_has_no_findings() {
+        let body = compare_door(&door_obs(json!([open_lan(), open_public()])));
+        assert_eq!(body["counts"]["doors"], 1);
+        assert_eq!(body["counts"]["halves"], 2);
+        assert_eq!(body["counts"]["dark"], 0);
+        assert_eq!(body["findings"]["door_dark"], json!([]));
+        assert_eq!(body["findings"]["door_dimming"], json!([]));
+        // The halves ride the comparison, so a reader of the judged
+        // record (boss orient) prints the door without a second read.
+        assert_eq!(body["doors"][0]["id"], "dev-ssh");
+        assert_eq!(body["doors"][0]["halves"][1]["target"], "dev.algedonic.dev");
+    }
+
+    #[test]
+    fn a_half_dark_past_its_band_is_the_finding_and_names_which_half() {
+        // Dark since 11:40, observed 12:00 — 20 minutes against a
+        // 15-minute band.
+        let body = compare_door(&door_obs(json!([
+            {"half":"lan","target":"10.20.0.35:22","open":false,"tcp":false,
+             "reason":"connection refused","dark_since":"2026-09-24T11:40:00Z"},
+            open_public(),
+        ])));
+        let dark = &body["findings"]["door_dark"];
+        assert_eq!(dark.as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(dark[0]["id"], "dev-ssh/lan");
+        assert_eq!(dark[0]["door"], "dev-ssh");
+        assert_eq!(dark[0]["half"], "lan");
+        assert_eq!(dark[0]["target"], "10.20.0.35:22");
+        assert_eq!(dark[0]["reason"], "connection refused");
+        assert_eq!(dark[0]["dark_for_s"], 1200);
+        assert_eq!(dark[0]["band_s"], 900);
+        assert_eq!(body["findings"]["door_dimming"], json!([]));
+        assert_eq!(body["counts"]["dark"], 1);
+    }
+
+    #[test]
+    fn a_half_dark_inside_its_band_is_dimming_not_dark() {
+        // Five minutes dark against fifteen: a pod roll restarts sshd
+        // inside a minute, but this is still weather until the band.
+        let body = compare_door(&door_obs(json!([
+            open_lan(),
+            {"half":"public","target":"dev.algedonic.dev","open":false,
+             "reason":"does not resolve","dark_since":"2026-09-24T11:55:00Z"},
+        ])));
+        assert_eq!(body["findings"]["door_dark"], json!([]));
+        let dim = &body["findings"]["door_dimming"];
+        assert_eq!(dim[0]["id"], "dev-ssh/public");
+        assert_eq!(dim[0]["dark_for_s"], 300);
+        assert_eq!(body["counts"]["dimming"], 1);
+    }
+
+    #[test]
+    fn exactly_the_band_is_past_it() {
+        let body = compare_door(&door_obs(json!([
+            {"half":"lan","target":"10.20.0.35:22","open":false,
+             "reason":"timed out","dark_since":"2026-09-24T11:45:00Z"},
+            open_public(),
+        ])));
+        assert_eq!(body["findings"]["door_dark"][0]["id"], "dev-ssh/lan");
+    }
+
+    #[test]
+    fn a_dark_half_that_cannot_say_how_long_is_dark_not_dimming() {
+        // No dark_since, or no band: no evidence of duration is not a
+        // pass — a malformed instrument must surface, like a unit row
+        // with no healthy flag.
+        let mut obs = door_obs(json!([
+            {"half":"lan","target":"10.20.0.35:22","open":false,"reason":"refused"},
+            {"half":"public","target":"dev.algedonic.dev"},
+        ]));
+        let body = compare_door(&obs);
+        let ids: Vec<&str> = body["findings"]["door_dark"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["dev-ssh/lan", "dev-ssh/public"]);
+
+        obs["nodes"][0].as_object_mut().unwrap().remove("band_s");
+        obs["nodes"][0]["halves"] = json!([
+            {"half":"lan","target":"10.20.0.35:22","open":false,
+             "reason":"refused","dark_since":"2026-09-24T11:59:00Z"},
+        ]);
+        let body = compare_door(&obs);
+        assert_eq!(body["findings"]["door_dark"][0]["id"], "dev-ssh/lan");
+    }
+
+    #[test]
+    fn the_door_scope_is_its_own_series_with_no_host() {
+        let body = compare_door(&door_obs(json!([open_lan(), open_public()])));
+        // The door series is ONE series keyed by its scope, like the
+        // cluster's: its rows carry no host, so the alarm it raises
+        // carries none and `estate.recover` matches it (3908d555).
+        assert!(body.get("host").is_none(), "{body}");
+        assert_eq!(DOOR_SCOPE, "door");
+    }
+
     // -----------------------------------------------------------------
     // Retain and replay, at the handler (packet 6bf34846). The unit
     // tests in `super::spool` pin the mechanism; these pin that THIS
@@ -1632,11 +1908,10 @@ mod tests {
     struct SpoolDir(std::path::PathBuf);
     impl SpoolDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "boss-estate-compare-test-{tag}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&p);
+            // uid AND pid (307df975); the spool makes its own directory,
+            // so it starts absent, as it always did.
+            let p = boss_testing::scratch_dir(&format!("boss-estate-compare-test-{tag}"));
+            let _ = std::fs::remove_dir(&p);
             Self(p)
         }
     }

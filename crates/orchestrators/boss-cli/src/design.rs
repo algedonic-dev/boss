@@ -223,24 +223,57 @@ pub(crate) fn feedback_question(design_title: &str, design_id: &str) -> String {
     )
 }
 
-/// The feedback's design-review step metadata with the question laid
-/// over what is already there. PATCH-on-PUT replaces `metadata`
-/// wholesale, and `authority_role` living there is what keeps the step
-/// gated — so the existing keys are kept, and only `question` is added.
-pub(crate) fn design_review_step_metadata(
-    existing: &Value,
+/// One step write this verb owes: method, path, body.
+pub(crate) type StepWrite = (reqwest::Method, String, Value);
+
+/// THE STEP MERGE DOOR, `PATCH /api/jobs/{job}/steps/{step}/metadata`:
+/// the keys named are merged into what the step holds, in one
+/// transaction against the row as it stands, and nothing unnamed is
+/// touched.
+///
+/// Every step write here used to be a PUT carrying `metadata`, and the
+/// step PUT REPLACES metadata wholesale (backlog e39a9d2a, the car after
+/// `boss prove`, 2026-09-24). Two of the three read the step first and
+/// laid their key over it — correct only if nothing wrote between the
+/// read and the PUT, and the feedback's review was read BEFORE the
+/// design was filed. The third, the review-step mirror, sent a fresh
+/// body and deleted every key the registry materializes at admission
+/// (`authority_role`, `station`, `audience`, `claimable`,
+/// `metadata_defaults`) on every design filed. The item's last car makes
+/// the PUT refuse a metadata body; the merge door is the form it routes
+/// to, so this verb is on it first.
+fn step_merge(job_id: &str, step_id: &str, md: Value) -> StepWrite {
+    (
+        reqwest::Method::PATCH,
+        format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+        md,
+    )
+}
+
+/// The status-only flip that follows a merge: a PUT carrying no
+/// `metadata`, so it can drop no stored key.
+fn step_flip(job_id: &str, step_id: &str) -> StepWrite {
+    (
+        reqwest::Method::PUT,
+        format!("/api/jobs/{job_id}/steps/{step_id}"),
+        json!({ "status": "completed" }),
+    )
+}
+
+/// The feedback's design-review gets its question through the merge
+/// door, carrying `question` alone — so `authority_role`, which keeps
+/// the step gated, and every other key it holds stay as they are.
+pub(crate) fn feedback_question_write(
+    feedback: &str,
+    review_step: &str,
     design_title: &str,
     design_id: &str,
-) -> Value {
-    let mut md = match existing {
-        Value::Object(m) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
-    md.insert(
-        "question".to_string(),
-        json!(feedback_question(design_title, design_id)),
-    );
-    Value::Object(md)
+) -> StepWrite {
+    step_merge(
+        feedback,
+        review_step,
+        json!({ "question": feedback_question(design_title, design_id) }),
+    )
 }
 
 /// Where a packet stands on its design route, as `--answers` needs it:
@@ -352,16 +385,42 @@ pub(crate) fn answerable(packet: &Value) -> std::result::Result<DesignRoute, Str
     })
 }
 
-/// The draft-design completion: `design_id` laid over the step's own
-/// metadata (PATCH-on-PUT replaces `metadata` wholesale, and
-/// `authority_role` lives there), status done.
-pub(crate) fn draft_done_body(existing: &Value, design_id: &str) -> Value {
-    let mut md = match existing {
-        Value::Object(m) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
-    md.insert("design_id".to_string(), json!(design_id));
-    json!({ "status": "completed", "metadata": Value::Object(md) })
+/// The draft-design completion, in order: `design_id` through the merge
+/// door, then the status-only flip. Merge FIRST — a step's
+/// required-at-done fields are judged when it flips to completed.
+pub(crate) fn draft_done_writes(
+    feedback: &str,
+    draft_step: &str,
+    design_id: &str,
+) -> [StepWrite; 2] {
+    [
+        step_merge(feedback, draft_step, json!({ "design_id": design_id })),
+        step_flip(feedback, draft_step),
+    ]
+}
+
+/// The questions mirrored onto the filed design's own `review-design`
+/// step, through the merge door (see [`step_merge`] for why) — with the
+/// exhibits, when the design carries any, in the same write, so the
+/// merge door judges each question's bindings against the exhibits
+/// landing beside it.
+pub(crate) fn review_mirror_write(
+    design: &str,
+    review_step: &str,
+    body: &Value,
+    doc_path: &str,
+    exhibits: &[Value],
+) -> StepWrite {
+    let mut md = review_step_metadata(body, doc_path);
+    // ON THE STEP ONLY. An exhibit is up to 256 KB, and the step is
+    // where the review reads it and where completion freezes it; a
+    // second copy on the job would be a copy nothing reviews and every
+    // job listing carries. Absent, not `[]`, when there are none, so a
+    // design without exhibits mirrors exactly what it always did.
+    if !exhibits.is_empty() {
+        md["exhibits"] = json!(exhibits);
+    }
+    step_merge(design, review_step, md)
 }
 
 /// The review step's own copy. The tracker reads the STEP, so a doc
@@ -378,6 +437,206 @@ pub(crate) fn review_step_metadata(body: &Value, doc_path: &str) -> Value {
     })
 }
 
+/// The inline bound on one exhibit's html, in UTF-8 bytes: design
+/// 26a89f11's 256 KB. The protocol states it as the design-doc review
+/// step's `item_value_max_bytes` on `exhibits` and the merge door holds
+/// it; this copy exists because the verb refuses BEFORE it files, which
+/// is before any registry is read — so it is pinned equal to the bundle
+/// file by `the_verbs_inline_bound_is_the_protocols` (CLAUDE.md §9a).
+pub(crate) const EXHIBIT_INLINE_MAX_BYTES: u64 = 256 * 1024;
+
+/// One `--exhibit`, read and judged before anything is filed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Exhibit {
+    /// Within the inline bound: `{anchor, title, html}`, ready to ride
+    /// the review step as it is.
+    Inline(Value),
+    /// Over it (design 26a89f11's file_refs arm): attached to the review
+    /// step in the file store once the packet exists, and carried as
+    /// `{anchor, title, file_ref, sha256, size_bytes}` — see
+    /// [`carry_exhibits`].
+    Attach {
+        anchor: String,
+        title: String,
+        path: PathBuf,
+    },
+}
+
+impl Exhibit {
+    pub(crate) fn anchor(&self) -> &str {
+        match self {
+            Exhibit::Inline(v) => v.get("anchor").and_then(Value::as_str).unwrap_or(""),
+            Exhibit::Attach { anchor, .. } => anchor,
+        }
+    }
+}
+
+/// `anchor|title|path.html` — one `--exhibit`. The file is read as
+/// BYTES by `read` (the filesystem in production, a closure in the
+/// tests), with no shell between the file and the record: a byte a
+/// shell re-encodes is a byte the review no longer shows as authored.
+/// Refused, naming the flag: a partial triple, an unreadable, empty or
+/// non-UTF-8 file, and one the file store could not take either (over
+/// [`crate::attach::largest_file`]). Within [`EXHIBIT_INLINE_MAX_BYTES`]
+/// it rides inline; above it, it is attached after filing.
+pub(crate) fn read_exhibit(
+    raw: &str,
+    read: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Exhibit> {
+    let parts: Vec<&str> = raw.splitn(3, '|').map(str::trim).collect();
+    let [anchor, title, path] = parts[..] else {
+        bail!("--exhibit wants `anchor|title|path.html`, got {raw:?}");
+    };
+    if anchor.is_empty() || title.is_empty() || path.is_empty() {
+        bail!("--exhibit needs all three of anchor, title and path: {raw:?}");
+    }
+    let bytes =
+        read(Path::new(path)).with_context(|| format!("--exhibit {anchor}: reading {path}"))?;
+    if bytes.is_empty() {
+        bail!("--exhibit {anchor}: {path} is empty — an exhibit with nothing in it shows nothing");
+    }
+    let size = bytes.len() as u64;
+    let largest = crate::attach::largest_file();
+    if size > largest {
+        bail!(
+            "--exhibit {anchor}: {path} is {size} bytes. An exhibit rides inline up to \
+             {EXHIBIT_INLINE_MAX_BYTES} bytes and is attached to the file store above that, \
+             which takes a file of at most {largest} bytes (design 26a89f11) — make the \
+             rendering smaller, or split it into two exhibits. {}",
+            crate::attach::limit_sentence()
+        );
+    }
+    let html = String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "--exhibit {anchor}: {path} is not UTF-8 text — an exhibit is an HTML document, \
+             rendered from its text"
+        )
+    })?;
+    if size > EXHIBIT_INLINE_MAX_BYTES {
+        return Ok(Exhibit::Attach {
+            anchor: anchor.to_string(),
+            title: title.to_string(),
+            path: PathBuf::from(path),
+        });
+    }
+    Ok(Exhibit::Inline(
+        json!({ "anchor": anchor, "title": title, "html": html }),
+    ))
+}
+
+/// The exhibits as the review step carries them: inline ones as they
+/// are, and each [`Exhibit::Attach`] attached to `target` (the filed
+/// design's review step) through the `boss attach` path — which reads
+/// the file back by id and refuses unless the bytes on disk, the row's
+/// sha256 and the bytes read back are one digest — and carried as its
+/// `file_ref` with the sha256 and size that read-back CONFIRMED: the
+/// receipt copied, not retyped. The review surface checks what it
+/// fetches against that sha256 before it renders anything.
+pub(crate) async fn carry_exhibits(
+    http: &reqwest::Client,
+    content_base: &str,
+    target: &crate::attach::Target,
+    exhibits: &[Exhibit],
+    signature: crate::identity::Signature,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(exhibits.len());
+    for e in exhibits {
+        match e {
+            Exhibit::Inline(v) => out.push(v.clone()),
+            Exhibit::Attach {
+                anchor,
+                title,
+                path,
+            } => {
+                let a =
+                    crate::attach::attach_at(http, content_base, target, path, signature.clone())
+                        .await
+                        .with_context(|| {
+                            format!("--exhibit {anchor}: attaching {}", path.display())
+                        })?;
+                out.push(json!({
+                    "anchor": anchor,
+                    "title": title,
+                    "file_ref": a.file_id,
+                    "sha256": a.sha256,
+                    "size_bytes": a.size_bytes,
+                }));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Apply every `--bind Q|E`: exhibit anchor E joins question Q's
+/// `exhibits` list — the element key the protocol's `binds = "exhibits"`
+/// names. Refused before filing, naming the anchor: a question or an
+/// exhibit this design does not carry, and an exhibit anchor used twice
+/// (the merge door refuses both; refusing here keeps a half-filed
+/// packet from existing). Questions nothing binds carry no key.
+pub(crate) fn bind_exhibits(
+    questions: &[Value],
+    exhibits: &[Value],
+    binds: &[String],
+) -> Result<Vec<Value>> {
+    let anchor = |v: &Value| {
+        v.get("anchor")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let carried: Vec<String> = exhibits.iter().map(anchor).collect();
+    if let Some(dup) = carried
+        .iter()
+        .enumerate()
+        .find(|(i, a)| carried[..*i].contains(a))
+        .map(|(_, a)| a)
+    {
+        bail!("--exhibit anchor {dup} is used twice — an anchor names one exhibit");
+    }
+    let mut out = questions.to_vec();
+    for raw in binds {
+        let (q, e) = raw
+            .split_once('|')
+            .map(|(q, e)| (q.trim(), e.trim()))
+            .filter(|(q, e)| !q.is_empty() && !e.is_empty())
+            .with_context(|| format!("--bind wants `question|exhibit` anchors, got {raw:?}"))?;
+        if !carried.iter().any(|a| a == e) {
+            bail!(
+                "--bind {raw:?}: this design carries no exhibit {e} (it carries: {}) — attach it \
+                 with --exhibit {e}|title|path.html",
+                if carried.is_empty() {
+                    "none".to_string()
+                } else {
+                    carried.join(", ")
+                }
+            );
+        }
+        let question = out
+            .iter_mut()
+            .find(|v| anchor(v) == q)
+            .with_context(|| format!("--bind {raw:?}: this design asks no question {q}"))?;
+        let list = question
+            .as_object_mut()
+            .context("a question is an object")?
+            .entry("exhibits")
+            .or_insert_with(|| json!([]));
+        if let Some(items) = list.as_array_mut()
+            && !items.iter().any(|v| v.as_str() == Some(e))
+        {
+            items.push(json!(e));
+        }
+    }
+    Ok(out)
+}
+
+/// What a design may still ASK David, in the words the drafting
+/// procedures use (backlog 4f71e608; the Workflow rows' copies are
+/// pinned by boss-jobs' the_author_decides_from_the_company_frame.rs).
+/// Everything else the author decides from the company frame.
+const ESCALATE_ONLY: &str = "strategy or priority trade-offs, trust and security boundaries, \
+                             credentials, money, and brand or voice";
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     title: String,
     markdown: String,
@@ -386,6 +645,8 @@ pub async fn run(
     no_questions: bool,
     doc_path: Option<String>,
     answers: Option<String>,
+    exhibits: Vec<String>,
+    binds: Vec<String>,
 ) -> Result<()> {
     // Refuse before filing, not after: a doc with neither questions nor
     // the flag is the exact packet this verb exists to stop reaching a
@@ -396,7 +657,13 @@ pub async fn run(
              decision already made.\n\n\
              Pass questions as `--question 'Q1|title|proposal'` (repeatable). A doc \
              with neither reaches the reviewer with nothing to answer, which is the \
-             failure this verb exists to prevent."
+             failure this verb exists to prevent.\n\n\
+             A question is for David, and only for {ESCALATE_ONLY}. Every other \
+             choice, decide from the company frame (one person plus agents; a hosting \
+             business on the open-source release; our instance runs only the modules \
+             it uses; the demo tenant's leftovers cleared out, then cleaned up), write it into \
+             the markdown with its reason, and file with --no-questions when none are \
+             left (backlog 4f71e608)."
         );
     }
     // The body: read from the file named, or the text given — and a
@@ -415,6 +682,38 @@ pub async fn run(
         .iter()
         .map(|q| parse_question(q).and_then(|q| question_is_prose(&q, is_file).map(|()| q)))
         .collect::<Result<Vec<_>>>()?;
+    // EXHIBITS (design 26a89f11): read and bound-checked, and every
+    // `--bind` resolved, BEFORE anything is filed. They ride the review
+    // step, which a --no-questions doc never queues, so nothing would
+    // ever render one there — refused rather than recorded unseen.
+    if no_questions && !exhibits.is_empty() {
+        bail!(
+            "--exhibit rides the review step, and --no-questions queues no review, so nothing \
+             would render it. File the design with its questions, or without --exhibit."
+        );
+    }
+    let exhibits = exhibits
+        .iter()
+        .map(|raw| read_exhibit(raw, |p| std::fs::read(p)))
+        .collect::<Result<Vec<_>>>()?;
+    let anchors: Vec<Value> = exhibits
+        .iter()
+        .map(|e| json!({ "anchor": e.anchor() }))
+        .collect();
+    let parsed = bind_exhibits(&parsed, &anchors, &binds)?;
+    // An exhibit over the inline bound is ATTACHED after filing, and an
+    // attachment is a write of its own: an unnamed one is refused here,
+    // before the packet exists, rather than after it is half-built.
+    let attach_signature = crate::identity::signature_for(
+        &reqwest::Method::POST,
+        "/api/files",
+        crate::identity::caller(),
+    );
+    if exhibits.iter().any(|e| matches!(e, Exhibit::Attach { .. }))
+        && let crate::identity::Signature::Refused(msg) = &attach_signature
+    {
+        bail!("{msg}");
+    }
     let http = reqwest::Client::new();
 
     // `--answers`: the feedback (or backlog item) this design decides.
@@ -468,8 +767,8 @@ pub async fn run(
     // The other half of the link: the answered packet's design-review
     // step gets a real question, naming this design. The edge on the
     // design is what the close rule follows; this is what the person
-    // assigned that step reads. Merged over the step's own metadata —
-    // PATCH-on-PUT replaces it wholesale.
+    // assigned that step reads. Through the step merge door, so the
+    // step's own keys are untouched (e39a9d2a).
     if let Some((feedback, route)) = &answered {
         // RECORDED, BUT COMPLETING NOTHING. The edge went onto the
         // design at filing, which is the fact; there is no open step
@@ -485,15 +784,8 @@ pub async fn run(
                 .get("id")
                 .and_then(Value::as_str)
                 .context("the answered packet's design-review step has no id")?;
-            let existing = review.get("metadata").cloned().unwrap_or_else(|| json!({}));
-            api(
-                &http,
-                reqwest::Method::PUT,
-                &format!("/api/jobs/{feedback}/steps/{sid}"),
-                Some(json!({ "metadata": design_review_step_metadata(&existing, &title, &id) })),
-            )
-            .await
-            .with_context(|| {
+            let (method, path, md) = feedback_question_write(feedback, sid, &title, &id);
+            api(&http, method, &path, Some(md)).await.with_context(|| {
                 format!(
                     "writing the question onto {}'s design-review (the design {short} is filed \
                  and carries the edge; only the question is missing)",
@@ -510,22 +802,18 @@ pub async fn run(
                     .get("id")
                     .and_then(Value::as_str)
                     .context("the answered packet's draft-design step has no id")?;
-                let existing = draft.get("metadata").cloned().unwrap_or_else(|| json!({}));
-                api(
-                    &http,
-                    reqwest::Method::PUT,
-                    &format!("/api/jobs/{feedback}/steps/{did}"),
-                    Some(draft_done_body(&existing, &id)),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "completing {}'s draft-design with design_id {short} (the design is \
-                     filed, the edge and the question are written; only the draft's record \
-                     is missing)",
-                        &feedback[..8]
-                    )
-                })?;
+                for (method, path, body) in draft_done_writes(feedback, did, &id) {
+                    api(&http, method, &path, Some(body))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "completing {}'s draft-design with design_id {short} (the design \
+                                 is filed, the edge and the question are written; only the \
+                                 draft's record is missing)",
+                                &feedback[..8]
+                            )
+                        })?;
+                }
             }
             println!(
                 "boss design: {short} answers {} — its design-review now asks for this design, \
@@ -559,20 +847,57 @@ pub async fn run(
         .and_then(Value::as_str)
         .context("the filed doc has no review-design step")?
         .to_string();
-    let step_md = review_step_metadata(&body, doc_path.as_deref().unwrap_or(""));
-    api(
-        &http,
-        reqwest::Method::PUT,
-        &format!("/api/jobs/{id}/steps/{sid}"),
-        Some(json!({ "metadata": step_md })),
-    )
-    .await
-    .context("writing the questions onto the review step")?;
+    // Exhibits over the inline bound are attached to THAT step — the
+    // one whose completion freezes the record that names them — before
+    // the mirror write, so the questions' bindings and every exhibit
+    // land in one write the merge door judges together.
+    let exhibits = if exhibits.iter().any(|e| matches!(e, Exhibit::Attach { .. })) {
+        let content = crate::tenant_publish::service_on_door(
+            &crate::gate::resolve_jobs_base(None)?,
+            "content",
+        )?;
+        let target = crate::attach::Target {
+            kind: "step",
+            id: sid.clone(),
+            label: format!("the review step of design {short}"),
+        };
+        carry_exhibits(&http, &content, &target, &exhibits, attach_signature)
+            .await
+            .with_context(|| {
+                format!(
+                    "attaching exhibits to the review step (the design {short} is filed; its \
+                     review step carries no questions yet)"
+                )
+            })?
+    } else {
+        exhibits
+            .iter()
+            .filter_map(|e| match e {
+                Exhibit::Inline(v) => Some(v.clone()),
+                Exhibit::Attach { .. } => None,
+            })
+            .collect()
+    };
+    let (method, path, step_md) = review_mirror_write(
+        &id,
+        &sid,
+        &body,
+        doc_path.as_deref().unwrap_or(""),
+        &exhibits,
+    );
+    api(&http, method, &path, Some(step_md))
+        .await
+        .context("writing the questions onto the review step")?;
 
     println!(
         "boss design: {short} filed with {} open question(s) — review queued",
         parsed.len()
     );
+    // Each exhibit named the way a terminal lists one — anchor, title,
+    // size, hash — since a terminal cannot render it (design 26a89f11).
+    for e in &exhibits {
+        println!("  exhibit {}", crate::brief::exhibit_line(e));
+    }
     Ok(())
 }
 
@@ -746,19 +1071,30 @@ mod tests {
     /// The feedback's design-review step is an `answer-question` with
     /// no question — the design IS the question, and it lives on the
     /// other packet. So the verb writes a real one, naming the design
-    /// and saying what deciding it does. The step's own keys survive:
-    /// PATCH-on-PUT replaces `metadata` wholesale, and `authority_role`
-    /// living there is what keeps the step gated.
+    /// and saying what deciding it does. The step's own keys survive
+    /// because the question goes through the step MERGE door carrying
+    /// `question` alone (backlog e39a9d2a): nothing else is named, so
+    /// nothing else — `authority_role`, `verdict`, the keys the registry
+    /// materialized — can be dropped.
     #[test]
-    fn the_feedbacks_design_review_gets_a_real_question_and_keeps_its_own_keys() {
-        let existing = json!({ "authority_role": "platform-admin", "verdict": "" });
-        let md = design_review_step_metadata(
-            &existing,
+    fn the_feedbacks_design_review_gets_a_real_question_through_the_merge_door() {
+        let (method, path, md) = feedback_question_write(
+            "61366e5a-d15f-472c-a667-f4cc007ef8f8",
+            "s-review",
             "A car lands where its change goes live",
             "c6bd173e-3dc9-426f-8fff-866a3b2a6117",
         );
-        assert_eq!(md["authority_role"], json!("platform-admin"));
-        assert_eq!(md["verdict"], json!(""));
+        assert_eq!(method, reqwest::Method::PATCH);
+        assert_eq!(
+            path,
+            "/api/jobs/61366e5a-d15f-472c-a667-f4cc007ef8f8/steps/s-review/metadata"
+        );
+        assert_eq!(
+            md.as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["question".to_string()]),
+            "the merge names only the key it adds: {md}"
+        );
         let q = md["question"].as_str().expect("a question is written");
         assert!(
             q.contains("A car lands where its change goes live") && q.contains("c6bd173e"),
@@ -944,18 +1280,359 @@ mod tests {
         );
     }
 
+    /// The refusal of a doc with no questions is the one place this verb
+    /// instructs an author on questions, and it used to say only "a
+    /// design doc needs open questions" — so the author filled the flag
+    /// with choices the company frame answered, and David got three of
+    /// them on design e1dba350 (backlog 4f71e608). It now names what a
+    /// question is FOR, in the words the drafting procedures use, and
+    /// offers `--no-questions` for a doc whose choices were decided.
+    #[tokio::test]
+    async fn the_no_questions_refusal_says_what_a_question_is_for() {
+        let err = run(
+            "a title".into(),
+            "a body".into(),
+            None,
+            vec![],
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+        )
+        .await
+        .expect_err("a doc with neither questions nor the flag is refused");
+        let text = err.to_string();
+        for phrase in [
+            "strategy or priority trade-offs, trust and security boundaries, credentials, money, and brand or voice",
+            "decide",
+            "--no-questions",
+        ] {
+            assert!(text.contains(phrase), "the refusal says `{phrase}`: {text}");
+        }
+    }
+
     /// The draft's completion carries the id the filing returned —
-    /// copied, never retyped — over the step's own keys.
+    /// copied, never retyped — as TWO writes (backlog e39a9d2a): the id
+    /// through the step merge door, then a status-only flip. Merge
+    /// first, because `design_id` is what the flip is judged on; the flip
+    /// carries no `metadata`, so it can drop no stored key.
     #[test]
-    fn the_draft_is_completed_with_the_filed_id_and_keeps_its_own_keys() {
-        let existing = json!({ "authority_role": "platform-admin", "procedure": "file it" });
-        let body = draft_done_body(&existing, "5fc71f03-db4f-4be2-9839-484ccf29781a");
-        assert_eq!(body["status"], json!("completed"));
+    fn the_draft_merges_the_filed_id_then_flips_the_status_alone() {
+        let writes = draft_done_writes("fb-1", "s-draft", "5fc71f03-db4f-4be2-9839-484ccf29781a");
+        assert_eq!(writes.len(), 2, "one merge, one flip: {writes:?}");
+        let (method, path, body) = &writes[0];
+        assert_eq!(*method, reqwest::Method::PATCH);
+        assert_eq!(path, "/api/jobs/fb-1/steps/s-draft/metadata");
         assert_eq!(
-            body["metadata"]["design_id"],
-            json!("5fc71f03-db4f-4be2-9839-484ccf29781a")
+            body,
+            &json!({ "design_id": "5fc71f03-db4f-4be2-9839-484ccf29781a" })
         );
-        assert_eq!(body["metadata"]["authority_role"], json!("platform-admin"));
-        assert_eq!(body["metadata"]["procedure"], json!("file it"));
+        let (method, path, body) = &writes[1];
+        assert_eq!(*method, reqwest::Method::PUT);
+        assert_eq!(path, "/api/jobs/fb-1/steps/s-draft");
+        assert_eq!(body, &json!({ "status": "completed" }));
+    }
+
+    /// The questions are mirrored onto the design's own review step
+    /// through the merge door too. That step was just admitted, so every
+    /// key it holds is one the registry materialized (`authority_role`,
+    /// `station`, `audience`, `claimable`, `metadata_defaults`); a PUT of
+    /// the fresh mirror replaced all of them, on every design filed
+    /// (correction_2026_09_23 on backlog e39a9d2a, design.rs ~549-571).
+    #[test]
+    fn the_review_mirror_merges_onto_the_review_step() {
+        let q = vec![question("Q1", "which brick first?", "the cheap one")];
+        let body = design_job_body("t", "# doc", &q, false, None, "emp-owner");
+        let (method, path, md) =
+            review_mirror_write("d-1", "s-review", &body, "docs/design/x.md", &[]);
+        assert_eq!(method, reqwest::Method::PATCH);
+        assert_eq!(path, "/api/jobs/d-1/steps/s-review/metadata");
+        assert_eq!(md, review_step_metadata(&body, "docs/design/x.md"));
+        // The merge door DELETES a key sent as null, where the PUT stored
+        // it; the mirror sends none, so nothing it means to write is lost.
+        assert!(
+            md.as_object()
+                .is_some_and(|m| m.values().all(|v| !v.is_null())),
+            "no mirrored key is null: {md}"
+        );
+    }
+
+    /// `--exhibit anchor|title|path.html` (design 26a89f11): the file is
+    /// read as BYTES, with no shell between it and the record, and rides
+    /// as `{anchor, title, html}` up to the inline bound. A partial
+    /// triple, an empty file and a file that is not UTF-8 are each
+    /// refused before anything is filed, naming the flag. Over the inline
+    /// bound it is to be ATTACHED (the file_refs arm); over what the file
+    /// store takes it is refused, naming both numbers.
+    #[test]
+    fn an_exhibit_is_read_from_its_file_and_attached_over_the_bound() {
+        let board = b"<!doctype html><style>b{color:red}</style><b>palette</b>".to_vec();
+        let read_ok = |_: &Path| Ok(board.clone());
+        let Exhibit::Inline(e) =
+            read_exhibit("E1 | IT map motion | /x/board.html", read_ok).expect("an exhibit")
+        else {
+            panic!("a small exhibit rides inline");
+        };
+        assert_eq!(e["anchor"], json!("E1"));
+        assert_eq!(e["title"], json!("IT map motion"));
+        assert_eq!(
+            e["html"].as_str().map(str::as_bytes),
+            Some(board.as_slice()),
+            "the bytes arrive as they were on disk"
+        );
+
+        for bad in ["E1|only-two", "|t|/x.html", "E1||/x.html", "E1|t|"] {
+            assert!(
+                read_exhibit(bad, read_ok).is_err(),
+                "a partial triple is refused: {bad:?}"
+            );
+        }
+        let err = read_exhibit("E1|t|/x.html", |_: &Path| Ok(Vec::new())).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        let err = read_exhibit("E1|t|/x.html", |_: &Path| Ok(vec![0xff, 0xfe])).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+        let err = read_exhibit("E1|t|/x.html", |_: &Path| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("/x.html"), "{err:#}");
+
+        let at = vec![b'a'; EXHIBIT_INLINE_MAX_BYTES as usize];
+        assert!(
+            matches!(
+                read_exhibit("E1|t|/x.html", |_: &Path| Ok(at.clone())),
+                Ok(Exhibit::Inline(_))
+            ),
+            "exactly the bound rides inline"
+        );
+        let over = vec![b'a'; EXHIBIT_INLINE_MAX_BYTES as usize + 1];
+        assert_eq!(
+            read_exhibit("E1 | big board | /x.html", |_: &Path| Ok(over.clone())).unwrap(),
+            Exhibit::Attach {
+                anchor: "E1".into(),
+                title: "big board".into(),
+                path: PathBuf::from("/x.html"),
+            },
+            "one byte over is attached, not refused"
+        );
+        // Over the inline bound, still UTF-8 or refused: it renders as
+        // text either way.
+        let mut not_text = vec![b'a'; EXHIBIT_INLINE_MAX_BYTES as usize + 1];
+        not_text.push(0xff);
+        let err = read_exhibit("E1|t|/x.html", |_: &Path| Ok(not_text.clone())).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+
+        let largest = crate::attach::largest_file();
+        let too_big = vec![b'a'; largest as usize + 1];
+        let text = read_exhibit("E1|t|/x.html", |_: &Path| Ok(too_big.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains(&(largest + 1).to_string())
+                && text.contains(&largest.to_string())
+                && text.contains(&EXHIBIT_INLINE_MAX_BYTES.to_string()),
+            "the refusal names the size, the store's limit and the inline bound: {text}"
+        );
+    }
+
+    /// The file_refs arm, through the REAL files router (in-memory
+    /// adapters, on a socket): an inline exhibit passes through as it is,
+    /// and an attached one is sent to the review step and carried as its
+    /// `file_ref` with the sha256 and size the attach path CONFIRMED by
+    /// reading the bytes back — the receipt copied, not retyped. The
+    /// store then lists the file on that step.
+    #[tokio::test]
+    async fn an_exhibit_over_the_bound_is_attached_to_the_review_step_and_carried_by_ref() {
+        use sha2::Digest;
+        let big = format!(
+            "<!doctype html><style>b{{color:red}}</style>{}",
+            "<b>frame</b>".repeat(30_000)
+        );
+        let path = boss_testing::scratch_dir("boss-design-exhibit").join("motion.html");
+        std::fs::write(&path, &big).unwrap();
+        let big_exhibit = read_exhibit(&format!("E2|Motion prototype|{}", path.display()), |p| {
+            std::fs::read(p)
+        })
+        .unwrap();
+        assert!(matches!(big_exhibit, Exhibit::Attach { .. }));
+        let small = Exhibit::Inline(json!({"anchor": "E1", "title": "board", "html": "<p>x</p>"}));
+
+        let base = crate::attach::tests::store().await;
+        let target = crate::attach::Target {
+            kind: "step",
+            id: "5f8ec71b-60a5-4d6c-99d1-2591fcea966f".into(),
+            label: "the review step".into(),
+        };
+        let carried = carry_exhibits(
+            &reqwest::Client::new(),
+            &base,
+            &target,
+            &[small.clone(), big_exhibit],
+            crate::identity::Signature::As("agent-test".into()),
+        )
+        .await
+        .expect("carried");
+        assert_eq!(
+            carried[0],
+            json!({"anchor": "E1", "title": "board", "html": "<p>x</p>"})
+        );
+        let e2 = &carried[1];
+        assert_eq!(e2["anchor"], json!("E2"));
+        assert_eq!(e2["title"], json!("Motion prototype"));
+        assert!(e2.get("html").is_none(), "one of html and file_ref: {e2}");
+        assert_eq!(
+            e2["sha256"],
+            json!(hex::encode(sha2::Sha256::digest(big.as_bytes())))
+        );
+        assert_eq!(e2["size_bytes"], json!(big.len()));
+        let file = e2["file_ref"].as_str().expect("a file id");
+
+        let listed: Value = reqwest::Client::new()
+            .get(format!(
+                "{base}/api/files?target_kind=step&target_id={}",
+                target.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["id"].as_str(), Some(file), "{listed}");
+
+        // An unnamed attach is refused before the socket, naming why.
+        let err = carry_exhibits(
+            &reqwest::Client::new(),
+            &base,
+            &target,
+            &[Exhibit::Attach {
+                anchor: "E3".into(),
+                title: "t".into(),
+                path: path.clone(),
+            }],
+            crate::identity::Signature::Refused(crate::identity::refusal("POST", "/api/files")),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("E3"), "{err:#}");
+    }
+
+    /// The verb's bound IS the protocol's: the design-doc review step's
+    /// `item_value_max_bytes` on `exhibits`, read out of the bundle file
+    /// the registry seeds. A copy is pinned (CLAUDE.md §9a) — the verb
+    /// must refuse before filing, which is before any registry is read.
+    #[test]
+    fn the_verbs_inline_bound_is_the_protocols() {
+        let toml = include_str!("../../../../infra/platform/workflows/design-doc.toml");
+        let line = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("item_value_max_bytes"))
+            .expect("design-doc.toml declares item_value_max_bytes");
+        let declared: u64 = line
+            .split('=')
+            .nth(1)
+            .map(str::trim)
+            .and_then(|n| n.parse().ok())
+            .expect("a number");
+        assert_eq!(declared, EXHIBIT_INLINE_MAX_BYTES);
+    }
+
+    /// `--bind Q|E` puts the exhibit anchor on the question as its
+    /// `exhibits` list — the key the protocol's `binds` names — and
+    /// refuses a question or an exhibit the design does not carry, and a
+    /// repeated exhibit anchor, before anything is filed.
+    #[test]
+    fn a_bind_attaches_an_exhibit_to_a_question_and_refuses_what_is_not_there() {
+        let qs = vec![
+            question("Q1", "which palette?", "the warm one"),
+            question("Q2", "t", "p"),
+        ];
+        let ex = vec![
+            json!({"anchor": "E1", "title": "a", "html": "x"}),
+            json!({"anchor": "E2", "title": "b", "html": "y"}),
+        ];
+        let bound =
+            bind_exhibits(&qs, &ex, &["Q1|E1".to_string(), "Q1 | E2".to_string()]).expect("binds");
+        assert_eq!(bound[0]["exhibits"], json!(["E1", "E2"]));
+        assert!(
+            bound[1].get("exhibits").is_none(),
+            "an unbound question carries no key"
+        );
+        assert_eq!(
+            bound[0]["title"],
+            json!("which palette?"),
+            "the rest untouched"
+        );
+
+        let err = bind_exhibits(&qs, &ex, &["Q1|E9".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("E9"), "{err}");
+        let err = bind_exhibits(&qs, &ex, &["Q7|E1".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("Q7"), "{err}");
+        assert!(bind_exhibits(&qs, &ex, &["Q1".to_string()]).is_err());
+        let twice = vec![ex[0].clone(), ex[0].clone()];
+        let err = bind_exhibits(&qs, &twice, &[]).unwrap_err();
+        assert!(err.to_string().contains("E1"), "{err}");
+    }
+
+    /// The exhibits ride onto the REVIEW STEP through the same merge that
+    /// mirrors the questions — the step whose completion freezes them —
+    /// and a design without exhibits mirrors exactly what it did before.
+    #[test]
+    fn exhibits_ride_the_review_mirror_and_only_when_there_are_some() {
+        let q = vec![question("Q1", "which palette?", "the warm one")];
+        let body = design_job_body("t", "# doc", &q, false, None, "emp-owner");
+        let ex = vec![json!({"anchor": "E1", "title": "board", "html": "<p>x</p>"})];
+        let (_, _, md) = review_mirror_write("d-1", "s-review", &body, "", &ex);
+        assert_eq!(md["exhibits"], json!(ex));
+        let (_, _, md) = review_mirror_write("d-1", "s-review", &body, "", &[]);
+        assert!(md.get("exhibits").is_none(), "{md}");
+        assert!(
+            body["metadata"].get("exhibits").is_none(),
+            "the bytes ride the step, not a second copy on the job"
+        );
+    }
+
+    /// An exhibit rides the REVIEW step, and `--no-questions` queues no
+    /// review: nothing would ever render it, so the pair is refused
+    /// before anything is read or filed.
+    #[tokio::test]
+    async fn an_exhibit_on_a_doc_with_no_review_is_refused() {
+        let err = run(
+            "a title".into(),
+            "a body".into(),
+            None,
+            vec![],
+            true,
+            None,
+            None,
+            vec!["E1|board|/nonexistent/board.html".into()],
+            vec![],
+        )
+        .await
+        .expect_err("refused");
+        assert!(err.to_string().contains("--no-questions"), "{err}");
+    }
+
+    /// The text half of the pins above: no step write in this verb
+    /// carries a `metadata` body through the PUT any longer, so a later
+    /// edit that builds one by hand again fails here by name.
+    #[test]
+    fn no_design_step_write_puts_metadata() {
+        let src = include_str!("design.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first piece");
+        for banned in [
+            "json!({ \"metadata\"",
+            "\"status\": \"completed\", \"metadata\"",
+        ] {
+            assert!(
+                !production.contains(banned),
+                "a design step write PUTs a metadata body ({banned}) — that replaces the \
+                 step's stored keys wholesale; write through step_merge (e39a9d2a)"
+            );
+        }
     }
 }

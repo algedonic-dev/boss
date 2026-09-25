@@ -66,7 +66,7 @@ impl ProxyConfig {
         }
     }
 
-    fn upstream_url(&self) -> &str {
+    pub(crate) fn upstream_url(&self) -> &str {
         self.upstream.get_or_init(|| {
             let env_key = format!("BOSS_{}_UPSTREAM", self.name.to_uppercase());
             if let Ok(v) = std::env::var(&env_key) {
@@ -341,10 +341,6 @@ pub static CLASSES: ProxyConfig = ProxyConfig::new("classes");
 pub static LOCATIONS: ProxyConfig = ProxyConfig::new("locations");
 pub static SUBJECT_KINDS: ProxyConfig = ProxyConfig::new("subject_kinds");
 pub static CALENDAR: ProxyConfig = ProxyConfig::new("calendar");
-/// Cross-VM Cybernetics dashboard aggregator. Hosts /api/snapshot
-/// (which the SPA's Operations page reads) + the per-VM
-/// cybernetics rollup. Port 7880, declared in boss_ports.
-pub static OBSERVABILITY: ProxyConfig = ProxyConfig::new("observability");
 pub static PRODUCTS: ProxyConfig = ProxyConfig::new("products");
 pub static CAMPAIGNS: ProxyConfig = ProxyConfig::new("campaigns");
 pub static CUSTOMERS: ProxyConfig = ProxyConfig::new("customers");

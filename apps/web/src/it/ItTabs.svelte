@@ -26,6 +26,10 @@
     registry: [
       { label: 'Workflows', path: '/it/registry' },
       { label: 'Dispatcher', path: '/it/registry/dispatcher' },
+      // The authoring list of the rules the cascade draws. Rendered bare
+      // until 2026-09-24, reachable only through the cascade's "Edit
+      // rules →" link, and 0 of 784 surface-opens reached it (0a98d93f).
+      { label: 'Rules', path: '/it/registry/rules' },
       { label: 'Step plugins', path: '/it/registry/step-plugins' },
       { label: 'Policy', path: '/it/registry/policy' },
       { label: 'Subjects', path: '/it/registry/subjects' },
@@ -62,7 +66,7 @@
     display: flex;
     gap: 0.25rem;
     padding: 0.5rem 1.25rem 0;
-    border-bottom: 1px solid var(--border, #d5d2ca);
+    border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
   }
   .it-tabs a {
@@ -75,11 +79,11 @@
     font-size: 0.85rem;
   }
   .it-tabs a:hover {
-    background: var(--surface-2, #efece5);
+    background: var(--ink-raised);
   }
   .it-tabs a.active {
-    border-color: var(--border, #d5d2ca);
-    background: var(--surface-1, #faf8f4);
+    border-color: var(--border);
+    background: var(--ink);
     font-weight: 600;
   }
 </style>

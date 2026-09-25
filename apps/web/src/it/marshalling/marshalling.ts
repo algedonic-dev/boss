@@ -42,6 +42,18 @@ export type StationLoadRow = Readonly<{
    *  it to be. Over-reports rather than under-reports. */
   oldestAgeDays: number | null;
   capabilityRoles: ReadonlyArray<string> | null;
+  /** Members that also stand at another station in the same read.
+   *  `null` from a server that does not count it — unknown, not none. */
+  alsoElsewhere: number | null;
+}>;
+
+/** The load read whole: its rows, and how many DISTINCT packets they
+ *  hold between them — which is not their depths' sum, because a packet
+ *  stands at every station whose predicate it matches (140a2222). */
+export type StationLoadEnvelope = Readonly<{
+  rows: ReadonlyArray<StationLoadRow>;
+  /** `null` from a server that does not count it. */
+  distinctPackets: number | null;
 }>;
 
 /** What the log could be made to say about one station's flow. */
@@ -80,8 +92,52 @@ export function parseStationLoad(raw: unknown): ReadonlyArray<StationLoadRow> {
       capabilityRoles: Array.isArray(r.capability_roles)
         ? (r.capability_roles.filter((x) => typeof x === 'string') as ReadonlyArray<string>)
         : null,
+      alsoElsewhere: num(r.also_elsewhere),
     }))
     .filter((r) => r.station !== '');
+}
+
+export function parseStationLoadEnvelope(raw: unknown): StationLoadEnvelope {
+  return {
+    rows: parseStationLoad(raw),
+    distinctPackets: num((raw as { distinct_packets?: unknown } | null)?.distinct_packets),
+  };
+}
+
+/**
+ * The sentence that stops the depth column being read as a count of
+ * the work. Stations OVERLAP — every packet the agent station holds
+ * also stands in its role's task queue — so the depths summed on
+ * 2026-09-23 to 517 over 303 distinct packets, and a reader adding the
+ * column overstated the work by 214 with nothing on the board to say
+ * so (backlog 140a2222). Both figures are the server's own counts;
+ * without the distinct one the sum is refused as a count rather than
+ * offered as one. `null` when nothing stands anywhere.
+ */
+export function overlapLine(load: StationLoadEnvelope): string | null {
+  const sum = load.rows.reduce((acc, r) => acc + r.depth, 0);
+  if (sum === 0) return null;
+  const distinct = load.distinctPackets;
+  if (distinct === null) {
+    return (
+      `The depths sum to ${sum}, but the load read did not say how many distinct packets ` +
+      `that is, and a packet can stand at more than one station, so the sum is not a count of the work.`
+    );
+  }
+  if (distinct >= sum) {
+    return `The depths sum to ${sum}, and no packet stands at two stations, so that is ${distinct} distinct packets.`;
+  }
+  const shared = [...load.rows]
+    .filter((r) => (r.alsoElsewhere ?? 0) > 0)
+    .sort((a, b) => b.depth - a.depth || a.station.localeCompare(b.station))
+    .map((r) => `${r.station} ${r.alsoElsewhere} of ${r.depth}`)
+    .join(', ');
+  return (
+    `The depths sum to ${sum} but hold ${distinct} distinct packets: a packet stands at every ` +
+    `station whose predicate it matches, so ${sum - distinct} of those standings count a packet ` +
+    `already counted at another station.` +
+    (shared === '' ? '' : ` Also standing elsewhere: ${shared}.`)
+  );
 }
 
 export function parseStationFlow(raw: unknown): StationFlowEnvelope {
@@ -363,6 +419,32 @@ export function longestWaits(waits: ReadonlyArray<Wait>, limit: number): Readonl
     .slice(0, Math.max(0, limit));
 }
 
+/**
+ * What the waits table leaves out, counted — the line under it.
+ *
+ * On 2026-09-23 the table showed 12 of 320 real obligations and said
+ * neither number (backlog 18683a0a, page-audit 7c228914 gap 8), so a
+ * display cap read as "these are the waits". The platform map already
+ * draws "+N more" for what it cannot place; this is the same courtesy.
+ * The total is always stated, cut or not, and the not-real waits
+ * `longestWaits` drops (simulated or shadow — `simulated` is derived as
+ * not-real at the parse) are counted too: dropping them is right, and
+ * saying so is what keeps it from being a silent filter.
+ */
+export function waitsCountLine(waits: ReadonlyArray<Wait>, limit: number): string {
+  const real = waits.filter((w) => !w.simulated).length;
+  const simulated = waits.length - real;
+  const shown = Math.min(real, Math.max(0, limit));
+  const noun = real === 1 ? 'obligation' : 'obligations';
+  return [
+    `${shown} of ${real} outstanding ${noun}, longest first`,
+    ...(shown < real ? [`+${real - shown} more not shown`] : []),
+    ...(simulated > 0
+      ? [`${simulated} on simulated or shadow packets not ranked`]
+      : []),
+  ].join(' · ');
+}
+
 /** How long it has waited — and, when the stamp is a fallback, that it
  *  is a floor rather than the figure. */
 export function waitText(w: Wait): string {
@@ -375,8 +457,8 @@ export function waitText(w: Wait): string {
 // Reads
 // ---------------------------------------------------------------------
 
-export function loadStations(): Promise<Exclude<Remote<ReadonlyArray<StationLoadRow>>, { kind: 'loading' }>> {
-  return fetchRemote('/api/stations/load', parseStationLoad);
+export function loadStations(): Promise<Exclude<Remote<StationLoadEnvelope>, { kind: 'loading' }>> {
+  return fetchRemote('/api/stations/load', parseStationLoadEnvelope);
 }
 
 export function loadFlow(

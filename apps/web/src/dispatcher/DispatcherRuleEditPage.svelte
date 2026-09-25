@@ -1,15 +1,20 @@
 <script lang="ts">
-  // /it/registry/rules/{name} (and {name}==='new' for create mode) —
-  // edit a dispatcher rule: a draft form seeded from the active/latest
+  // /it/registry/rules/{name} — edit a dispatcher rule: a draft form seeded from the active/latest
   // version, a version-history table, and the draft → publish/retire
   // lifecycle actions. Models the step-plugin detail page (LoadState
   // discriminated union + action/actionError pattern + version-history
   // table). Writes flow through ./ruleAuthoring.
+  //
+  // {name}==='new' renders NewRuleGuide instead: there is no create mode
+  // (backlog 7d9df2fe, design ff1c3615). A rule created here was a
+  // product rule no file names, which the dispatcher's boot seed retires
+  // at the next restart; a rule starts as a file or a tenant seed.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import StatusChip from '@boss/web-kit/ui/StatusChip.svelte';
+  import NewRuleGuide from './NewRuleGuide.svelte';
   import {
     listVersions,
     createDraft,
@@ -21,16 +26,22 @@
     type RuleStatus,
     type RuleSpec,
   } from './ruleAuthoring';
-  import { href, navigate } from '../router';
+  import { href } from '../router';
 
   type Props = { ruleName: string };
   let { ruleName }: Props = $props();
 
   let isNew = $derived(ruleName === 'new');
 
+  // `missing` (the read answered: no versions) and `failed` (the read
+  // did not answer) used to be one `error` arm painting its message as
+  // the header subtitle, so a dispatcher outage read like a rule that
+  // does not exist, with no marker for the outage crawl (backlog
+  // d7732e88).
   type LoadState =
     | { kind: 'loading' }
-    | { kind: 'error'; message: string }
+    | { kind: 'missing'; message: string }
+    | { kind: 'failed'; message: string }
     | { kind: 'ready'; versions: ReadonlyArray<RuleVersion> };
 
   let loadState = $state<LoadState>({ kind: 'loading' });
@@ -68,19 +79,11 @@
   async function load(): Promise<void> {
     validateState = null;
     actionError = null;
-    if (isNew) {
-      formName = '';
-      onEvent = '';
-      whenExpr = '';
-      delay = '';
-      doRows = [{ handler: '', args: [] }];
-      loadState = { kind: 'ready', versions: [] };
-      return;
-    }
+    if (isNew) return;
     try {
       const versions = await listVersions(ruleName);
       if (versions.length === 0) {
-        loadState = { kind: 'error', message: `No versions found for "${ruleName}".` };
+        loadState = { kind: 'missing', message: `No versions found for "${ruleName}".` };
         return;
       }
       // Seed from the active version, else the latest (versions are
@@ -89,7 +92,7 @@
       seedFrom(seed);
       loadState = { kind: 'ready', versions };
     } catch (e) {
-      loadState = { kind: 'error', message: e instanceof Error ? e.message : String(e) };
+      loadState = { kind: 'failed', message: e instanceof Error ? e.message : String(e) };
     }
   }
 
@@ -164,12 +167,7 @@
       return;
     }
     try {
-      const created = await createDraft(spec);
-      if (isNew) {
-        // Land on the now-existing rule's editor.
-        navigate(href(`/it/registry/rules/${encodeURIComponent(created.name)}`));
-        return;
-      }
+      await createDraft(spec);
       await load();
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
@@ -198,8 +196,8 @@
       const msg =
         `Retire rule "${ruleName}"?\n\n` +
         `The active version flips to retired. In-flight events already ` +
-        `matched are unaffected; on the next dispatcher restart this rule ` +
-        `stops firing.`;
+        `matched are unaffected; the dispatcher reloads its rules within ` +
+        `about 30 seconds, and then this rule stops firing.`;
       if (!window.confirm(msg)) {
         action = null;
         return;
@@ -214,14 +212,29 @@
   }
 </script>
 
-{#if loadState.kind === 'loading'}
+{#if isNew}
+  <NewRuleGuide />
+{:else if loadState.kind === 'loading'}
   <div class="catalog theme-exec">
     <p class="empty">Loading…</p>
   </div>
-{:else if loadState.kind === 'error'}
+{:else if loadState.kind === 'missing'}
   <div class="catalog theme-exec">
     <Breadcrumb to={href('/it/registry/rules')}>← All dispatcher rules</Breadcrumb>
     <PageHeader eyebrow="Platform · Dispatcher rule" title={ruleName} subtitle={loadState.message} />
+  </div>
+{:else if loadState.kind === 'failed'}
+  <div class="catalog theme-exec">
+    <Breadcrumb to={href('/it/registry/rules')}>← All dispatcher rules</Breadcrumb>
+    <PageHeader
+      eyebrow="Platform · Dispatcher rule"
+      title={ruleName}
+      subtitle="Versions unknown — the registry read failed"
+    />
+    <!-- load-failed + role=alert: the shared marker the outage crawl
+         asserts (tests/mocked/_routes.ts FAILURE_MARKER), in the rules
+         list's own words for its failed read (backlog d7732e88). -->
+    <p class="empty load-failed" role="alert" style="margin:0 24px">Failed to load: {loadState.message}</p>
   </div>
 {:else}
   {@const versions = loadState.versions}
@@ -232,22 +245,25 @@
     <Breadcrumb to={href('/it/registry/rules')}>← All dispatcher rules</Breadcrumb>
     <PageHeader
       eyebrow="Platform · Dispatcher rule"
-      title={isNew ? 'New dispatcher rule' : ruleName}
-      subtitle={isNew
-        ? 'Author a rule, then Save draft. Publishing activates it (retiring the prior active version).'
-        : `${versions.length} version${versions.length === 1 ? '' : 's'}${active ? ` · active v${active.version}` : ' · no active version'}`}
+      title={ruleName}
+      subtitle={`${versions.length} version${versions.length === 1 ? '' : 's'}${active ? ` · active v${active.version}` : ' · no active version'}`}
     />
 
-    <p class="empty" style="padding:0 24px 8px; color:#92400e">
-      Published changes take effect on the next dispatcher restart — live
-      hot-reload is a follow-up.
+    <!-- The reload half was stale: the dispatcher polls dispatcher_rules
+         every 30s and rebuilds its runners (backlog 1e576baf). The file
+         half is the drift the boot seed reports as `behind` (7d9df2fe). -->
+    <p class="empty" style="padding:0 24px 8px; color:var(--warn)">
+      A version published here is live within about 30 seconds, and runs ahead of
+      the file that authors this rule until that file's version is raised to match:
+      infra/dispatcher/rules/{ruleName}.toml for a product rule, the tenant's
+      seeds/rules.toml for a tenant's.
     </p>
 
     <!-- Lifecycle actions -->
     <div style="padding:0 24px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap">
       <button
         type="button"
-        class="wb-btn"
+        class="btn"
         onclick={runValidate}
         disabled={action !== null}
         title="Dry-run the draft against the dispatcher parser"
@@ -256,42 +272,40 @@
       </button>
       <button
         type="button"
-        class="wb-btn wb-btn-primary"
+        class="btn btn-primary"
         onclick={runSaveDraft}
         disabled={action !== null}
         title="Persist a new draft version (validated server-side)"
       >
         {action === 'save' ? 'Saving…' : 'Save draft'}
       </button>
-      {#if !isNew}
-        <button
-          type="button"
-          class="wb-btn"
-          onclick={runPublish}
-          disabled={!hasDraft || action !== null}
-          title={hasDraft ? 'Activate the latest draft' : 'No draft to publish'}
-        >
-          {action === 'publish' ? 'Publishing…' : 'Publish draft'}
-        </button>
-        <button
-          type="button"
-          class="wb-btn"
-          onclick={runRetire}
-          disabled={!hasActive || action !== null}
-          title={hasActive ? 'Retire the active version' : 'No active version to retire'}
-        >
-          {action === 'retire' ? 'Retiring…' : 'Retire'}
-        </button>
-      {/if}
+      <button
+        type="button"
+        class="btn"
+        onclick={runPublish}
+        disabled={!hasDraft || action !== null}
+        title={hasDraft ? 'Activate the latest draft' : 'No draft to publish'}
+      >
+        {action === 'publish' ? 'Publishing…' : 'Publish draft'}
+      </button>
+      <button
+        type="button"
+        class="btn"
+        onclick={runRetire}
+        disabled={!hasActive || action !== null}
+        title={hasActive ? 'Retire the active version' : 'No active version to retire'}
+      >
+        {action === 'retire' ? 'Retiring…' : 'Retire'}
+      </button>
       {#if validateState}
         {#if validateState.ok}
-          <span style="color:#166534; font-size:13px">✓ Valid</span>
+          <span style="color:var(--ok); font-size:13px">✓ Valid</span>
         {:else}
-          <span style="color:#dc2626; font-size:13px">✗ {validateState.error}</span>
+          <span style="color:var(--err); font-size:13px">✗ {validateState.error}</span>
         {/if}
       {/if}
       {#if actionError}
-        <span style="color:#dc2626; font-size:13px">{actionError}</span>
+        <span style="color:var(--err); font-size:13px">{actionError}</span>
       {/if}
     </div>
 
@@ -300,21 +314,21 @@
       <Section title="Rule">
         <div style="display:grid; gap:12px; max-width:800px">
           <div>
-            <div style="font-size:12px; color:#666; margin-bottom:2px">
+            <div style="font-size:12px; color:var(--static); margin-bottom:2px">
               Name
-              {#if !isNew}<span style="color:#888"> — the rule's permanent identity (not editable)</span>{/if}
+              <span style="color:var(--static)"> — the rule's permanent identity (not editable)</span>
             </div>
             <input
               bind:value={formName}
-              readonly={!isNew}
+              readonly
               placeholder="advance-dag-on-step-done"
               class="mono"
               style="padding:6px; font-size:13px; width:100%"
             />
           </div>
           <div>
-            <div style="font-size:12px; color:#666; margin-bottom:2px">
-              On event <span style="color:#888"> — the NATS topic this rule listens for</span>
+            <div style="font-size:12px; color:var(--static); margin-bottom:2px">
+              On event <span style="color:var(--static)"> — the NATS topic this rule listens for</span>
             </div>
             <input
               bind:value={onEvent}
@@ -324,8 +338,8 @@
             />
           </div>
           <div>
-            <div style="font-size:12px; color:#666; margin-bottom:2px">
-              When <span style="color:#888"> — optional predicate; rule fires only when it's true</span>
+            <div style="font-size:12px; color:var(--static); margin-bottom:2px">
+              When <span style="color:var(--static)"> — optional predicate; rule fires only when it's true</span>
             </div>
             <input
               bind:value={whenExpr}
@@ -335,8 +349,8 @@
             />
           </div>
           <div>
-            <div style="font-size:12px; color:#666; margin-bottom:2px">
-              Delay <span style="color:#888"> — optional; defers the side-effects (e.g. 5m, 1h)</span>
+            <div style="font-size:12px; color:var(--static); margin-bottom:2px">
+              Delay <span style="color:var(--static)"> — optional; defers the side-effects (e.g. 5m, 1h)</span>
             </div>
             <input
               bind:value={delay}
@@ -356,9 +370,9 @@
         </p>
         <div style="display:grid; gap:16px; max-width:900px">
           {#each doRows as row, i (i)}
-            <div style="border:1px solid #e7e5e4; border-radius:6px; padding:12px">
+            <div style="border:1px solid var(--hairline); border-radius:6px; padding:12px">
               <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px">
-                <span style="font-size:12px; color:#888; width:48px">#{i + 1}</span>
+                <span style="font-size:12px; color:var(--static); width:48px">#{i + 1}</span>
                 <input
                   bind:value={row.handler}
                   placeholder="handler-name"
@@ -367,7 +381,7 @@
                 />
                 <button
                   type="button"
-                  class="wb-btn"
+                  class="btn"
                   onclick={() => removeDoRow(i)}
                   title="Remove this step"
                 >
@@ -383,7 +397,7 @@
                       class="mono"
                       style="padding:5px; font-size:12px; width:200px"
                     />
-                    <span style="color:#888">=</span>
+                    <span style="color:var(--static)">=</span>
                     <input
                       bind:value={arg.value}
                       placeholder="expression"
@@ -392,7 +406,7 @@
                     />
                     <button
                       type="button"
-                      class="wb-btn"
+                      class="btn"
                       onclick={() => removeArg(i, ai)}
                       title="Remove this arg"
                     >
@@ -401,42 +415,40 @@
                   </div>
                 {/each}
                 <div>
-                  <button type="button" class="wb-btn" onclick={() => addArg(i)}>+ arg</button>
+                  <button type="button" class="btn" onclick={() => addArg(i)}>+ arg</button>
                 </div>
               </div>
             </div>
           {/each}
           <div>
-            <button type="button" class="wb-btn" onclick={addDoRow}>+ do step</button>
+            <button type="button" class="btn" onclick={addDoRow}>+ do step</button>
           </div>
         </div>
       </Section>
 
       <!-- Version history -->
-      {#if !isNew}
-        <Section title={`Version history (${versions.length})`}>
-          <table class="data-table data-table-striped">
-            <thead>
+      <Section title={`Version history (${versions.length})`}>
+        <table class="data-table data-table-striped">
+          <thead>
+            <tr>
+              <th class="num">Version</th>
+              <th>Status</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each versions as v (v.version)}
               <tr>
-                <th class="num">Version</th>
-                <th>Status</th>
-                <th>Created</th>
+                <td class="num">{v.version}</td>
+                <td>
+                  <StatusChip value={v.status} tone={statusTone(v.status)} />
+                </td>
+                <td>{new Date(v.created_at).toISOString().slice(0, 19).replace('T', ' ')}</td>
               </tr>
-            </thead>
-            <tbody>
-              {#each versions as v (v.version)}
-                <tr>
-                  <td class="num">{v.version}</td>
-                  <td>
-                    <StatusChip value={v.status} tone={statusTone(v.status)} />
-                  </td>
-                  <td>{new Date(v.created_at).toISOString().slice(0, 19).replace('T', ' ')}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </Section>
-      {/if}
+            {/each}
+          </tbody>
+        </table>
+      </Section>
     </div>
   </div>
 {/if}

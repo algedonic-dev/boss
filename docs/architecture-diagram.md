@@ -50,8 +50,8 @@ highest level it splits into three things:
 - **Work** — how state changes. Jobs + Steps (coordination), the
   Workflow / StepPlugin / StepType registries (workflows as data),
   automation runners that turn events into work (`boss-dispatcher`
-  step side-effect rules, `boss-cybernetics` agent runtime, tenant
-  tick engines), and policy (row-level authorization as rows, not
+  step side-effect rules, tenant tick engines), agents claiming steps
+  through the same claim door as humans (`boss dispatch`), and policy (row-level authorization as rows, not
   code).
 
 <img src="architecture/00-state-surfaces-work.svg" alt="state surfaces work" width="900">
@@ -59,7 +59,7 @@ highest level it splits into three things:
 This is MVC stretched to company scale, with one important caveat:
 classic MVC's "Controller" is a thin router between Model and View.
 BOSS's Work layer is a **substantive coordination layer** — Jobs
-are stateful, registries are authoring surfaces, cybernetics reacts
+are stateful, registries are authoring surfaces, the dispatcher reacts
 to events with new work. So we use MVC only as a *shape* analogy;
 the company-native vocabulary (State / Surfaces / Work) is clearer.
 
@@ -129,9 +129,7 @@ role and shows how cross-service calls are shaped.
   their own narrow slice of data.
 - **Runtime automation** (purple) subscribes to NATS and reacts to
   events — `boss-dispatcher` runs the step side-effect rules off
-  `step.done.<kind>`, `boss-cybernetics` is the VSM agent runtime
-  (per-VM inbox + budget caps + agent dispatch), `boss-observability`
-  fans NATS out to browsers as SSE and serves health.
+  `step.done.<kind>`.
 - **External adapters** (pink) are library crates, not services.
   They expose a port trait any service can consume. None ship in
   v1; future candidates: payroll, banks, shipping carriers, CRMs.
@@ -146,14 +144,14 @@ The colour groups above are operational ("which subsystem") but
 the audit-bar split is orthogonal. Four tiers in the workspace
 today:
 
-- **Tier 1 — core state-machine OS** (`crates/core/`, 28 crates).
+- **Tier 1 — core state-machine OS** (`crates/core/`, 25 crates).
   `boss-gateway`, `boss-jobs-api`, `boss-dispatcher`, `boss-policy-api`,
   `boss-classes-api`, `boss-locations-api`,
   `boss-subject-kinds-api`, `boss-calendar-api`,
-  `boss-content-api`, `boss-cybernetics`, plus the libraries
+  `boss-content-api`, plus the libraries
   (`boss-core`, `boss-events`, `boss-ml`,
-  `boss-testing`, `boss-ports`, `boss-nats`,
-  `boss-observability`) and matching `*-client` crates. Yellow +
+  `boss-testing`, `boss-ports`, `boss-nats`) and matching
+  `*-client` crates. Yellow +
   most of the rails. **Tightest review bar; correctness protocol
   non-negotiable.**
 - **Tier 2 — company-modeling layer** (`crates/modules/`,
@@ -169,9 +167,8 @@ today:
   `boss-cli`, `boss-sim`,
   `boss-ml-api` (wires the Tier-1 ML framework + Tier-2 plugins),
   `boss-simulator` (the standalone `/simulator` UX service).
-- **Tenants** (`crates/tenants/`, 2 crates).
-  `boss-brewery-engine` (Algedonic Ales) and
-  `boss-used-device-shop-engine`. Outside the tier system;
+- **Tenants** (`crates/tenants/`, 1 crate).
+  `boss-brewery-engine` (Algedonic Ales). Outside the tier system;
   tenant-shaped.
 
 A Tier-1 LIBRARY crate must NOT depend on a Tier-2 crate

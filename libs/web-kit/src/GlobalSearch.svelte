@@ -194,15 +194,18 @@
     font: inherit;
     font-size: 13px;
     padding: 4px 10px;
-    border-radius: 5px;
-    border: 1px solid var(--border, #d6d3d1);
-    background: var(--bg, #fafaf9);
-    color: var(--text, #1c1917);
+    /* A white field let into the enamel band (backlog 7eb59678 car 2):
+       squared to a field's 3px, and focused with the amber ring — the
+       action blue measures 3.1:1 against the band, too faint to find. */
+    border-radius: var(--radius-field);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
   }
   .gs-input:focus {
-    outline: 2px solid var(--accent, #2563eb);
-    outline-offset: -1px;
-    background: var(--card, #fff);
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
+    background: var(--card);
   }
   .gs-scrim {
     position: fixed;
@@ -221,12 +224,17 @@
     max-height: 70vh;
     overflow-y: auto;
     z-index: 41;
-    background: var(--card, #fff);
-    border: 1px solid var(--border, #e7e5e4);
+    background: var(--card);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    box-shadow: 0 8px 28px rgb(0 0 0 / 12%);
     padding: 4px;
     text-align: left;
+  }
+  /* On a phone the chrome bar scrolls sideways and so clips anything
+     hanging out of it (PerspectiveTabs, car G of design 62de32ae): the
+     results pin under the band, the screen's width less a margin. */
+  @media (max-width: 720px) {
+    .gs-panel { position: fixed; top: 50px; left: 8px; right: 8px; width: auto; }
   }
   .gs-row {
     display: grid;
@@ -236,10 +244,10 @@
     padding: 7px 10px;
     border-radius: 5px;
     text-decoration: none;
-    color: var(--text, #1c1917);
+    color: var(--text);
   }
   .gs-row:hover {
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
   }
   .gs-row-static:hover {
     background: none;
@@ -248,7 +256,7 @@
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .gs-title {
     font-size: 13px;
@@ -258,27 +266,27 @@
   }
   .gs-sub {
     font-size: 11px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     white-space: nowrap;
   }
   .gs-msg {
     padding: 14px 10px;
     font-size: 13px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .gs-err {
-    color: #b91c1c;
+    color: var(--err);
   }
   .gs-all {
     display: block;
     margin-top: 4px;
     padding: 8px 10px;
-    border-top: 1px solid var(--border, #e7e5e4);
+    border-top: 1px solid var(--border);
     font-size: 12px;
-    color: var(--accent, #2563eb);
+    color: var(--accent);
     text-decoration: none;
   }
   .gs-all:hover {
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
   }
 </style>

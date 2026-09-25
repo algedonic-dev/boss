@@ -129,7 +129,7 @@
           onselect={(s) => (selected = s)}
         />
       {:catch err}
-        <div class="jk-canvas-msg jk-canvas-err">Graph editor failed to load: {err}</div>
+        <div class="jk-canvas-msg load-failed" role="alert">Graph editor failed to load: {err}</div>
       {/await}
     </div>
     {#if selectedStep}
@@ -173,23 +173,20 @@
   }
   .jk-canvas-msg {
     padding: 24px;
-    color: #94a3b8;
+    color: var(--static);
     font-size: 0.9rem;
   }
-  .jk-canvas-err {
-    color: #dc2626;
-  }
   .jk-list-details {
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
-    background: #fff;
+    background: var(--ink);
   }
   .jk-list-details summary {
     cursor: pointer;
     padding: 10px 12px;
     font-size: 13px;
     font-weight: 600;
-    color: #475569;
+    color: var(--static);
     user-select: none;
   }
   .jk-list-body {

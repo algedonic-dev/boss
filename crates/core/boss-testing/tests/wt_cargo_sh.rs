@@ -1,7 +1,10 @@
 //! `infra/dev/wt-cargo` — the door every cargo build on the dev pod goes
 //! through: a per-worktree `CARGO_TARGET_DIR` reflink-seeded from the
 //! warm shared one, and a jobs bound that keeps a builder inside its
-//! share of the pod's 16 GiB cgroup (backlog 34b29b52).
+//! share of the pod's cgroup — the limits the dev container declares in
+//! `infra/cluster/manifests/boss-dev.yaml`, not a figure typed here
+//! (backlog 34b29b52; the typed one said 16 GiB against a declared 32Gi,
+//! 28fc3a39).
 //!
 //! Until 2026-09-14 this script was pod-local text under
 //! /work/tools/bin, with its OWN copy of the cargo bound — and it
@@ -46,6 +49,11 @@ struct Fixture {
     niced: PathBuf,
     /// Written by the `cp` stub, once per call, with its argv.
     copied: PathBuf,
+    /// The stub scratch-floor pass wt-cargo runs before each build.
+    reclaim: PathBuf,
+    /// Written by that stub: its argv, the scratch mount and primary it
+    /// was handed, and every dir under the mount with its mtime.
+    reclaimed: PathBuf,
 }
 
 impl Fixture {
@@ -57,12 +65,29 @@ impl Fixture {
         let copied = root.join("copied.txt");
         // cargo: print what the script decided. The real one is never
         // reached — this test is about the environment it is handed.
+        // Under `--no-run` it also prints one `Executable` line per test
+        // binary, the way the real cargo does — that is what the count
+        // pass reads (backlog 3566f5b4). STUB_EXECUTABLES sets how many,
+        // STUB_BUILD_FAIL makes the build fail instead.
         write_exec(
             &bin.join("cargo"),
             "#!/usr/bin/env bash\n\
              echo \"target=${CARGO_TARGET_DIR:-unset}\"\n\
              echo \"jobs=${CARGO_BUILD_JOBS:-unset}\"\n\
-             echo \"argv=$*\"\n",
+             echo \"argv=$*\"\n\
+             case \"$*\" in\n\
+               *--no-run*)\n\
+                 if [ -n \"${STUB_BUILD_FAIL:-}\" ]; then\n\
+                   echo 'error: could not compile'\n\
+                   exit \"$STUB_BUILD_FAIL\"\n\
+                 fi\n\
+                 i=1\n\
+                 while [ \"$i\" -le \"${STUB_EXECUTABLES:-3}\" ]; do\n\
+                   echo \"  Executable tests/t$i.rs (/dev/null)\"\n\
+                   i=$((i+1))\n\
+                 done\n\
+                 ;;\n\
+             esac\n",
         );
         // nice: record that it was called and with what, then run the
         // rest exactly as the real one would.
@@ -89,12 +114,34 @@ impl Fixture {
                  exit \"$STUB_CP_FAIL\"\n\
              fi\n",
         );
+        // The scratch-floor pass: never the real one here, which would
+        // take a df of whatever filesystem the test runs on. Records
+        // what it was handed and exits STUB_RECLAIM_RC.
+        let reclaim = root.join("reclaim-stub.sh");
+        let reclaimed = root.join("reclaimed.txt");
+        write_exec(
+            &reclaim,
+            "#!/usr/bin/env bash\n\
+             {\n\
+               echo \"argv=$* mount=${SCRATCH_MOUNT:-unset} primary=${CARGO_TARGET_DIR:-unset}\"\n\
+               for d in \"$SCRATCH_MOUNT\"/*/; do\n\
+                 [ -d \"$d\" ] && echo \"dir=$(basename \"$d\") mtime=$(stat -c %Y \"$d\")\"\n\
+               done\n\
+             } >> \"$STUB_RECLAIMED\"\n\
+             exit \"${STUB_RECLAIM_RC:-0}\"\n",
+        );
         Self {
             root,
             bin,
             niced,
             copied,
+            reclaim,
+            reclaimed,
         }
+    }
+
+    fn reclaim_calls(&self) -> String {
+        std::fs::read_to_string(&self.reclaimed).unwrap_or_default()
     }
 
     /// A real git repository whose basename is `name` — the script
@@ -121,8 +168,18 @@ impl Fixture {
     }
 
     fn run(&self, worktree: &Path, seed: &Path, env: &[(&str, &str)]) -> (i32, String) {
+        self.run_args(worktree, seed, env, &["test", "-p", "boss-cli"])
+    }
+
+    fn run_args(
+        &self,
+        worktree: &Path,
+        seed: &Path,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> (i32, String) {
         let mut cmd = Command::new(repo_root().join(SCRIPT));
-        cmd.args(["test", "-p", "boss-cli"])
+        cmd.args(args)
             .current_dir(worktree)
             .env(
                 "PATH",
@@ -136,8 +193,13 @@ impl Fixture {
             .env("STUB_COPIED", &self.copied)
             .env("WT_SEED", seed)
             .env("WT_TARGET_ROOT", self.targets())
+            .env("WT_RECLAIM", &self.reclaim)
+            .env("STUB_RECLAIMED", &self.reclaimed)
+            .env_remove("STUB_RECLAIM_RC")
             .env_remove("WT_JOBS")
             .env_remove("STUB_CP_FAIL")
+            .env_remove("STUB_EXECUTABLES")
+            .env_remove("STUB_BUILD_FAIL")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_JOBS");
         for (k, v) in env {
@@ -380,4 +442,249 @@ fn outside_a_worktree_it_refuses() {
     assert_eq!(rc, 2, "must refuse with exit 2: {out}");
     assert!(out.contains("not in a git worktree"), "must say why: {out}");
     assert!(!out.contains("argv="), "cargo must not run: {out}");
+}
+
+/// MEASURED 2026-09-22 (backlog 3566f5b4). `cargo test -p boss-jobs
+/// --all-features` reaches 148 test binaries in 11m20s on this pod —
+/// longer than the 10-minute window a builder's tool call gets. A run
+/// cut off at that mark has printed 125 `Running` lines, no failure and
+/// no final `test result:` summary, so it reads exactly like a green
+/// suite while the last eleven binaries (everything sorting at or after
+/// `waiting_on_pg.rs`) never ran. That car went to the gate twice, red
+/// on `yard_borders_http` and then on `yard_regions_http` — two
+/// one-line stale expectations a completed local run would have named
+/// in seconds.
+///
+/// Counting `Running` lines was already possible; what was missing was
+/// the total to count them against, and it has to be printed BEFORE the
+/// run or the truncation eats it too. `cargo test --no-run` prints one
+/// `Executable` line per test binary and the real run then prints one
+/// `Running` line per binary — measured equal at 148 — so the count
+/// pass is the same build the run needs anyway.
+#[test]
+fn a_test_run_says_how_many_binaries_it_must_reach_before_it_starts() {
+    let f = Fixture::new("count");
+    let wt = f.worktree("agent-count");
+    let (rc, out) = f.run(
+        &wt,
+        &f.root.join("no-such-seed"),
+        &[("STUB_EXECUTABLES", "7")],
+    );
+    assert_eq!(rc, 0, "wt-cargo failed: {out}");
+
+    assert!(
+        out.contains("7 test binaries"),
+        "the count must be stated: {out}"
+    );
+    assert!(
+        out.contains("Running"),
+        "the line must name what to count against it: {out}"
+    );
+    assert!(
+        out.contains("argv=test -p boss-cli --no-run"),
+        "the count pass is a --no-run build of the same arguments: {out}"
+    );
+    assert!(
+        out.lines()
+            .filter(|l| *l == "argv=test -p boss-cli")
+            .count()
+            == 1,
+        "the real run must still happen, once, with the argv it was given: {out}"
+    );
+}
+
+/// The count pass IS the build, so a build that fails must fail there
+/// and stop — running cargo a second time would print every compiler
+/// error twice, which is the opposite of the legibility this line is
+/// for.
+#[test]
+fn a_build_that_fails_in_the_count_pass_stops_there() {
+    let f = Fixture::new("count-fail");
+    let wt = f.worktree("agent-countfail");
+    let (rc, out) = f.run(
+        &wt,
+        &f.root.join("no-such-seed"),
+        &[("STUB_BUILD_FAIL", "101")],
+    );
+
+    assert_eq!(rc, 101, "the build's own exit code must survive: {out}");
+    assert!(
+        out.contains("could not compile"),
+        "the compiler's output must be shown, not swallowed: {out}"
+    );
+    assert_eq!(
+        out.matches("argv=").count(),
+        1,
+        "cargo must not be run a second time after a failed build: {out}"
+    );
+    assert!(
+        !out.contains("test binaries"),
+        "nothing was built, so there is no count to state: {out}"
+    );
+}
+
+/// The count pass is for a whole-crate suite run and nothing else: a
+/// non-`test` subcommand, a run that already says `--no-run`, and an
+/// invocation with its own `--` harness arguments (where `--no-run`
+/// would land on libtest, which does not know it) are all left alone.
+#[test]
+fn the_count_pass_is_skipped_where_it_would_not_apply() {
+    let f = Fixture::new("count-skip");
+    let seed = f.root.join("no-such-seed");
+    let cases: [&[&str]; 4] = [
+        &["clippy", "-p", "boss-cli"],
+        &["build", "-p", "boss-cli"],
+        &["test", "-p", "boss-cli", "--no-run"],
+        &["test", "-p", "boss-cli", "--", "--nocapture"],
+    ];
+    for args in cases {
+        let wt = f.worktree(&format!("agent-skip-{}", args.join("-").replace("--", "x")));
+        let (rc, out) = f.run_args(&wt, &seed, &[("STUB_EXECUTABLES", "7")], args);
+        assert_eq!(rc, 0, "wt-cargo failed for {args:?}: {out}");
+        assert_eq!(
+            out.matches("argv=").count(),
+            1,
+            "{args:?} must reach cargo exactly once: {out}"
+        );
+        assert!(
+            !out.contains("test binaries"),
+            "{args:?} is not a whole-crate suite run: {out}"
+        );
+    }
+}
+
+/// THE FLOOR FOLLOWS THE BUILD (backlog 3f2a08ab, 2026-09-24): the dev
+/// pod was evicted with the 25% scratch floor in force, because the
+/// sidecar checks it hourly and w-1 fell from above the floor to the
+/// kubelet's 15% line in under 27 minutes. The builds are what fill
+/// /scratch, so each one runs the floor's sibling pass first — on this
+/// door's own scratch root, with the SEED named as the primary (the pod
+/// sets CARGO_TARGET_DIR to it, and this script re-points that variable
+/// at the worktree's dir — handed through, the floor pass would read
+/// the caller's dir as the primary and the warm seed as a sibling it
+/// may take).
+#[test]
+fn a_build_first_runs_the_scratch_floor_pass_on_its_own_scratch_root() {
+    let f = Fixture::new("floor");
+    let wt = f.worktree("agent-floor0001");
+    let seed = f.root.join("seed");
+    boss_testing::create_dir(&seed);
+
+    let (rc, out) = f.run(&wt, &seed, &[]);
+    assert_eq!(rc, 0, "wt-cargo failed: {out}");
+    let calls = f.reclaim_calls();
+    let first = calls
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("wt-cargo never ran the scratch-floor pass: {out}"));
+    assert_eq!(
+        first,
+        format!(
+            "argv=--scratch-floor mount={} primary={}",
+            f.targets().display(),
+            seed.display()
+        ),
+        "the pass runs in its floor mode, on this door's root, with the seed as primary"
+    );
+}
+
+/// The floor pass takes idle siblings, least recently used first — and
+/// a builder that has been reading for half an hour has an idle target.
+/// Its own must not be the one taken the moment before it builds, so
+/// the door marks it live first.
+#[test]
+fn the_callers_own_target_is_marked_live_before_the_floor_pass_runs() {
+    let f = Fixture::new("floor-own");
+    let wt = f.worktree("agent-floor0002");
+    let seed = f.root.join("seed");
+    boss_testing::create_dir(&seed);
+    let own = f.targets().join("target-agent-floor0002");
+    boss_testing::create_dir(&own);
+    let ok = Command::new("touch")
+        .args(["-d", "-5 hours"])
+        .arg(&own)
+        .status()
+        .expect("touch")
+        .success();
+    assert!(ok, "touch -d");
+
+    let (rc, out) = f.run(&wt, &seed, &[]);
+    assert_eq!(rc, 0, "wt-cargo failed: {out}");
+    let calls = f.reclaim_calls();
+    let mtime: u64 = calls
+        .lines()
+        .find_map(|l| l.strip_prefix("dir=target-agent-floor0002 mtime="))
+        .unwrap_or_else(|| panic!("the stub never saw the caller's target: {calls}"))
+        .parse()
+        .expect("mtime is a number");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    assert!(
+        now.saturating_sub(mtime) < 600,
+        "the caller's target must read as live (mtime {mtime}, now {now}) when the \
+         floor pass looks at it: {calls}"
+    );
+}
+
+/// A reclaim that fails is the hourly pass's to report; it never stops
+/// a build, and it is never silent either.
+#[test]
+fn a_floor_pass_that_fails_never_stops_the_build() {
+    let f = Fixture::new("floor-fails");
+    let wt = f.worktree("agent-floor0003");
+    let seed = f.root.join("no-such-seed");
+    let (rc, out) = f.run(&wt, &seed, &[("STUB_RECLAIM_RC", "3")]);
+    assert_eq!(rc, 0, "a failed floor pass must not fail the build: {out}");
+    assert!(out.contains("argv=test"), "cargo still ran: {out}");
+    assert!(
+        out.contains("scratch-floor pass exited 3"),
+        "the failure is named: {out}"
+    );
+}
+
+/// Unstubbed, the door runs the sidecar's own script out of the tree
+/// beside it — one reclaim, two triggers — and a floor of 0% keeps the
+/// real pass a no-op on whatever filesystem this test runs on.
+#[test]
+fn the_default_floor_pass_is_the_sidecars_own_script() {
+    let f = Fixture::new("floor-default");
+    let wt = f.worktree("agent-floor0004");
+    let seed = f.root.join("no-such-seed");
+    let mut cmd = Command::new(repo_root().join(SCRIPT));
+    cmd.args(["build", "-p", "boss-cli"])
+        .current_dir(&wt)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                f.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("STUB_NICED", &f.niced)
+        .env("STUB_COPIED", &f.copied)
+        .env("WT_SEED", &seed)
+        .env("WT_TARGET_ROOT", f.targets())
+        .env("BOSS_SCRATCH_FLOOR_PCT", "0")
+        .env_remove("WT_RECLAIM")
+        .env_remove("CARGO_TARGET_DIR");
+    let out = cmd.output().expect("run wt-cargo");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        !text.contains("scratch-floor"),
+        "the tree's own pass is found, and above its floor it says nothing: {text}"
+    );
+    assert!(
+        repo_root()
+            .join("infra/cluster/dev-scratch-reclaim.sh")
+            .is_file(),
+        "the pass wt-cargo runs by default is the sidecar's"
+    );
 }

@@ -13,9 +13,11 @@
 /// Every top-level surface a ceo persona reaches, from the router's
 /// exact-match routes. Pure-action / form-submit routes (/login,
 /// /finance/new, /finance/journal-entries/new) are excluded — the crawls
-/// assert surfaces RENDER, not that forms submit. Two detail routes are
+/// assert surfaces RENDER, not that forms submit. Detail routes are
 /// included (a Workflow + a marketing asset) because the mock seeds them,
-/// and that is where the omitted-field crashes live.
+/// and that is where the omitted-field crashes live — and one per
+/// parameterised catalog path (the rule editor), because a pattern is
+/// not a URL a crawl can open.
 ///
 /// Pinned against the route catalog by route-smoke.mocked.spec.ts, so a
 /// newly registered surface is crawled by default — by BOTH crawls.
@@ -24,7 +26,7 @@ export const ROUTES: ReadonlyArray<string> = [
   // operator surfaces are re-rooted under /ux/*.
   '/', '/ux/me', '/ux/inbox', '/ux/views', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
   '/ux/products', '/ux/shipping', '/ux/assets', '/ux/catalog',
-  '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar', '/ux/calendar/me',
+  '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar/me',
   '/ux/support', '/ux/service', '/ux/qa', '/ux/hr', '/ux/sales',
   '/ux/shop', '/ux/manual',
   // The IT department — six surfaces, families as tabs (1f6d55e0).
@@ -32,6 +34,14 @@ export const ROUTES: ReadonlyArray<string> = [
   // this list crawls exactly what the catalog declares and nothing
   // else answers.
   '/it', '/it/registry/subjects', '/it/registry/dispatcher', '/it/registry/rules',
+  // The rule editor — a detail route, because its catalog path is the
+  // pattern /it/registry/rules/:ruleName (car 3071e235) and a pattern
+  // is not a URL. route-smoke's drift test holds every parameterised
+  // catalog path to a row here that routes to it (backlog d7732e88).
+  // Under the mock's `[]` catch-all the versions read answers empty, so
+  // the editor paints "No versions found"; under the outage it paints
+  // `load-failed`.
+  '/it/registry/rules/auto-park-on-gate-green',
   '/it/operate/perf',
   '/it/operate/atlas', '/it/registry/step-plugins', '/it/kb', '/it/design',
   '/it/design/experiments',
@@ -54,6 +64,12 @@ export const ROUTES: ReadonlyArray<string> = [
   // Yard status renders the empty yard under the mock's `[]` catch-all
   // for /api/yard/status — chrome + "no trains / no cars", no crash.
   '/it/operate/yard-status',
+  // The Audit Log (catalogued as Monitoring). Deferred until 2026-09-23
+  // for want of an object-shaped /api/events/stats fixture, which
+  // _smokeMocks.ts now carries (EVENTS_STATS); its live stream answers
+  // the floor's 204, so the page falls to its snapshot poll. Its own
+  // controls are pinned in audit-log-page.mocked.spec.ts (65a273d5).
+  '/it/operate/audit',
   // The yard's FLOORS (design 0524fc95, car 2). /it above is the MAP —
   // eight region cards read from /api/yard/regions — and each yard
   // card opens the Train Yard at /it/yard/<region>, focused on that
@@ -140,18 +156,23 @@ export const ROUTES: ReadonlyArray<string> = [
   // `[]` catch-all for `/api/jobs?department=sales` renders the "no
   // jobs in Sales" state, and the outage renders `load-failed`.
   '/ux/departments/sales',
-  // The router's catch-all — see LANDING_FALLBACK.
-  '/ux/unknown-path',
+  // The landing page (the System Model live view). It was reachable only
+  // through the router's catch-all, crawled here as '/ux/unknown-path',
+  // until design ee3a3a2f gave it this door.
+  '/ux/system-model',
+  // The router's catch-all — see NOT_FOUND_ROW.
+  '/ux/accounts/agreements/x',
 ];
 
 /// The one ROUTES entry the router does NOT serve, on purpose: an
-/// unknown path renders LandingPage (the System Model live view) as the
-/// catch-all, and nothing else reaches that page. Until 2026-09-18 this
-/// row was spelled '/ux/refurb' and both crawls believed they were
-/// crawling a refurb page — there is no refurb route, and the outage
-/// roster explained its silence with reads the landing page makes.
-/// interaction-crawl pins every OTHER row to the router (f2b8a01c).
-export const LANDING_FALLBACK = '/ux/unknown-path';
+/// unmatched path renders the not-found page, naming the path (design
+/// ee3a3a2f). It is spelled as one of the dead links that motivated that
+/// page — a greedy `/accounts/(.+)` used to render it as the account page
+/// for a missing account "agreements/x". Before that the catch-all
+/// rendered the landing page, and until 2026-09-18 this row was spelled
+/// '/ux/refurb' while both crawls believed they were crawling a refurb
+/// page. interaction-crawl pins every OTHER row to the router (f2b8a01c).
+export const NOT_FOUND_ROW = '/ux/accounts/agreements/x';
 
 /// Routes the crawls cannot cover yet, each with why. Shrinking this
 /// list is the work; adding to it is a decision.
@@ -163,7 +184,9 @@ export const LANDING_FALLBACK = '/ux/unknown-path';
 /// interaction-checked, or the reverse, with nothing to say so. One
 /// definition cannot disagree with itself (CLAUDE.md §9a).
 export const DEFERRED: ReadonlyMap<string, string> = new Map([
-  ['/it/operate/audit', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
+  // '/it/operate/audit' left on 2026-09-23 (page audit 65a273d5, gap
+  // 0398c4d0): the fixture it waited for is EVENTS_STATS in
+  // _smokeMocks.ts, and audit-log-page.mocked.spec.ts pins the page.
   ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
   ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
   ['/ux/exec', '.find/.length over object-shaped summaries'],

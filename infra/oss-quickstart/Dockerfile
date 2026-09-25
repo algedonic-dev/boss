@@ -104,6 +104,11 @@ COPY infra/platform/tiers.toml ./infra/platform/tiers.toml
 # the host runner enforces (one per verb, 5086842d), listed by boss-cli's
 # build.rs; the terminal applies the same rules first.
 COPY infra/ops/verbs ./infra/ops/verbs
+# `boss tenant check` compiles the platform workflow roster in — the
+# DIRECTORY of kind files, listed by the same build.rs — because it
+# judges a tenant's sensor references offline, with no registry to ask
+# (b8d8c928).
+COPY infra/platform/workflows ./infra/platform/workflows
 
 # NO `ENV BOSS_BUILD_COMMIT` HERE — see the stage header; it is set in
 # the runtime stage so this layer keys on the sources alone.
@@ -263,8 +268,10 @@ RUN groupadd --gid 1500 boss && \
 # sim-state dir (/var/lib/boss-sim) the brewery sim checkpoints its
 # counterparty queue into — without it the sim (UID 1500) logs
 # "could not create sim-state dir; Permission denied" and the
-# collections queue can't survive a container restart.
-RUN mkdir -p /var/lib/boss/auth /var/lib/boss-sim /etc/boss-gateway && \
+# collections queue can't survive a container restart. Same again for
+# the file_refs root (/var/lib/boss/files, BOSS_FILES_ROOT): a named
+# volume there copies this ownership, so the boss uid can write uploads.
+RUN mkdir -p /var/lib/boss/auth /var/lib/boss/files /var/lib/boss-sim /etc/boss-gateway && \
     chown -R 1500:1500 /var/lib/boss /var/lib/boss-sim /etc/boss-gateway
 
 # Binaries.
@@ -378,6 +385,10 @@ COPY infra/oss-quickstart/tenant-modules.sh /usr/local/bin/tenant-modules.sh
 # crates/core/boss-testing/tests/a_chore_records_ok_and_failed.rs pins
 # the pairing; the gate never builds the image.
 COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh infra/boss-api-curl.sh infra/boss-chore.sh /usr/local/bin/
+# boss-api-curl.sh sources the one roll wait from lib/ beside itself and
+# refuses without it (backlog c51967b5);
+# crates/core/boss-testing/tests/a_chore_write_is_sent_once.rs pins it.
+COPY infra/lib/curl-through-a-roll.sh /usr/local/bin/lib/curl-through-a-roll.sh
 # The platform's conservation-invariant sweep and the helper it sources,
 # for the hourly boss-conservation-invariants CronJob (H12, backlog
 # 236529aa) — the brewery's own sweep rides in with `COPY examples`

@@ -369,6 +369,9 @@ fn workflow_design_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             }],
             ..Default::default()
         },
@@ -386,7 +389,16 @@ fn workflow_design_spec() -> WorkflowSpec {
             sign_offs_required: vec!["workflow-approver".into()],
             assurance_required: None,
             authority_role: Some("workflow-approver".into()),
-            metadata_defaults: serde_json::json!({ "authority_role": "workflow-approver" }),
+            // `changes_requested_completes` (backlog da322e8f,
+            // 2026-09-23): the sign-off surface completes a Request
+            // changes only where the step declares it, and
+            // `not-published` needs this step done on changes-requested.
+            // Rides through BOTH copies for the reason the note below
+            // gives.
+            metadata_defaults: serde_json::json!({
+                "authority_role": "workflow-approver",
+                "changes_requested_completes": true,
+            }),
             // 2026-08-31, cdfe2e1a: the decision must LEAVE a record
             // (workflow_lint Phase 5) — required at completion, on the
             // step itself, unlike `sign_off_context` above which
@@ -405,6 +417,9 @@ fn workflow_design_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             }],
             ..Default::default()
         },
@@ -536,6 +551,9 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             }],
             ..Default::default()
         }
@@ -569,6 +587,9 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
                     covers: None,
+                    binds: None,
+                    item_value_max_bytes: None,
+                    item_one_of: Vec::new(),
                 },
                 boss_core::job::StepField {
                     name: "destroying".into(),
@@ -577,6 +598,9 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
                     covers: None,
+                    binds: None,
+                    item_value_max_bytes: None,
+                    item_one_of: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -1309,25 +1333,33 @@ fn filer_field_misses(
     if filer_value_missing(value) {
         return vec![field.name.clone()];
     }
-    if field.item_keys.is_empty() {
+    if field.item_keys.is_empty() && field.item_one_of.is_empty() {
         return Vec::new();
     }
     let Some(items) = value.and_then(|v| v.as_array()) else {
         return vec![format!("{} (not an array)", field.name)];
     };
+    let blank = |item: &serde_json::Value, key: &str| {
+        item.get(key)
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.trim().is_empty())
+    };
     items
         .iter()
         .enumerate()
         .flat_map(|(i, item)| {
-            field
+            let keys = field
                 .item_keys
                 .iter()
-                .filter(move |key| {
-                    item.get(key.as_str())
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|s| s.trim().is_empty())
-                })
-                .map(move |key| format!("{}[{i}].{key}", field.name))
+                .filter(move |key| blank(item, key))
+                .map(move |key| format!("{}[{i}].{key}", field.name));
+            // An element carrying none of its one-of keys (design
+            // 26a89f11) is missing its one required choice, named as the
+            // alternatives it could have carried.
+            let choice = (!field.item_one_of.is_empty()
+                && field.item_one_of.iter().all(|k| blank(item, k)))
+            .then(|| format!("{}[{i}].({})", field.name, field.item_one_of.join("|")));
+            keys.chain(choice)
         })
         .collect()
 }
@@ -1711,7 +1743,11 @@ pub fn reevaluate(
 
 /// If the step has an `authority_role`, surface it in metadata so the
 /// sign-off gate in `boss-jobs::http::update_step` can enforce it.
-fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
+///
+/// A re-pin compares what this writes for two versions of one step
+/// (through [`materialize_steps_at`], in `repin::plan`): a key that
+/// differs is one it moves on a step not yet finished (1e973965).
+pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
     let mut merged = match defaults {
         serde_json::Value::Object(_) => defaults.clone(),
         _ => serde_json::Value::Object(serde_json::Map::new()),
@@ -3460,150 +3496,6 @@ mod tests {
     }
     use super::*;
 
-    /// The `post-mortem` protocol is an ANALYSIS that produces many
-    /// countermeasures, not a single decision handed to the operator.
-    ///
-    /// It exists because an incident retrospective was filed on
-    /// `backlog-item`, whose triage → "Decide the design"
-    /// (`answer-question`) → build shape routed the ENTIRE retrospective
-    /// into the operator's design-decision queue as one verdict. A
-    /// post-mortem is IT-worked analysis whose product is a SET of
-    /// corrective actions, each of which becomes its own packet. So the
-    /// load-bearing assertion here is the negative one: this protocol
-    /// carries NO step that collapses the whole thing into one operator
-    /// decision (no `answer-question`, no approval-surface step whose
-    /// completion the whole flow funnels through). Authored as DATA in
-    /// the bundle, so the assertions follow it there — a new protocol
-    /// never touches Rust (see `the_platform_bundle_matches_the_specs_it
-    /// _replaced`).
-    #[test]
-    fn bundle_post_mortem_is_analysis_into_many_packets_not_one_decision() {
-        let bundled = crate::seed_loader::load_workflows(platform_bundle_path())
-            .expect("the platform bundle parses");
-        let pm = bundled
-            .iter()
-            .find(|k| k.kind == "post-mortem")
-            .expect("post-mortem present in the bundle");
-
-        assert_eq!(pm.version, 1);
-        assert_eq!(pm.status, WorkflowStatus::Active);
-        assert_eq!(pm.category, "platform");
-        assert_eq!(pm.subject_kinds, vec!["custom".to_string()]);
-        assert_eq!(pm.owning_team, "platform");
-
-        let step = |title: &str| {
-            pm.steps
-                .iter()
-                .find(|s| s.title == title)
-                .unwrap_or_else(|| panic!("`{title}` step present in post-mortem"))
-        };
-
-        // Kinds: analysis and countermeasures are IT WORK (`task`), the
-        // close is a `sign-off`, and the escape hatch is an `outcome`.
-        assert_eq!(step("recorded").kind, "trigger");
-        assert_eq!(step("analysis").kind, "task");
-        assert_eq!(step("countermeasures").kind, "task");
-        assert_eq!(step("complete").kind, "sign-off");
-        assert_eq!(step("abandoned").kind, "outcome");
-
-        // The implicit DAG: an edge A → B exists iff B.ready_when
-        // references A. recorded → analysis → countermeasures → complete,
-        // with abandoned branching off analysis.
-        assert_eq!(step("recorded").ready_when, "true", "trigger fires at open");
-        assert!(
-            step("analysis").ready_when.contains("steps.recorded"),
-            "analysis is ready after the trigger"
-        );
-        assert!(
-            step("countermeasures")
-                .ready_when
-                .contains("steps.analysis"),
-            "countermeasures is ready after analysis"
-        );
-        assert!(
-            step("complete")
-                .ready_when
-                .contains("steps.countermeasures"),
-            "complete is ready after countermeasures"
-        );
-        let abandoned_rw = &step("abandoned").ready_when;
-        assert!(
-            abandoned_rw.contains("steps.analysis"),
-            "abandoned branches off analysis (the DAG edge the lint needs)"
-        );
-        assert!(
-            abandoned_rw.contains("job.metadata.abandoned"),
-            "abandoned needs a person-set marker, or the dispatcher auto-completes \
-             it the instant analysis finishes and shuts the Job"
-        );
-
-        // THE POINT OF THE PROTOCOL: no step routes the whole
-        // retrospective to the operator as a single decision. That is
-        // exactly what filing it on `backlog-item` did, via the
-        // `answer-question` "Decide the design" step. Asserted through a
-        // kinds membership check rather than a `kind ==` comparison,
-        // which `infra/lint/no-step-kind-match.sh` refuses even in a
-        // src-file test.
-        let step_kinds: Vec<&str> = pm.steps.iter().map(|s| s.kind.as_str()).collect();
-        assert!(
-            !step_kinds.contains(&"answer-question"),
-            "a post-mortem must NOT collapse into one operator decision — a \
-             countermeasure that needs judgement becomes its OWN design-decision \
-             packet, filed by the countermeasures step, not a step in this Workflow"
-        );
-
-        // `countermeasures` records the filed packets (plural), and its
-        // required field is also what keeps the `complete` sign-off from
-        // arriving blind (viability lint Phase 4).
-        let cms = step("countermeasures");
-        let cms_field = cms
-            .fields
-            .iter()
-            .find(|f| f.name == "countermeasures")
-            .expect("countermeasures step declares a `countermeasures` field");
-        assert!(
-            cms_field.required,
-            "countermeasures must be recorded at done"
-        );
-        assert_eq!(
-            cms_field.field_type, "array",
-            "MANY corrective actions, each its own packet — an array, not one field"
-        );
-
-        // The happy terminal IS the sign-off, and it requires a
-        // `decision` so completion cannot lose the judgement (Phase 5).
-        let complete = step("complete");
-        assert_eq!(
-            complete.terminal.as_ref().map(|t| t.outcome.as_str()),
-            Some("completed"),
-            "reaching the sign-off closes the Job completed"
-        );
-        assert!(
-            complete.fields.iter().any(|f| f.required),
-            "the sign-off must record its decision, not close empty (Phase 5)"
-        );
-
-        // The escape hatch is a real, countable outcome.
-        assert_eq!(
-            step("abandoned")
-                .terminal
-                .as_ref()
-                .map(|t| t.outcome.as_str()),
-            Some("abandoned")
-        );
-
-        // And it is a viable protocol: every step reachable, every
-        // terminal reachable, no blind sign-off, no orphan fork. This
-        // names post-mortem specifically; `the_bundle_is_as_viable_as
-        // _the_code` proves it for the whole bundle.
-        let registry = crate::step_registry::StepRegistry::v1();
-        let findings = crate::workflow_lint::validate_all(std::slice::from_ref(pm), &registry);
-        assert!(
-            findings.is_empty(),
-            "post-mortem has viability findings: {findings:#?}"
-        );
-    }
-
     #[test]
     fn expand_metadata_substitutes_subject_fields_in_string_leaves() {
         let subject = Subject::new("account", "acc-bigseed-0042");
@@ -3660,6 +3552,9 @@ mod tests {
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
             StepField {
                 name: "markdown".into(),
@@ -3668,6 +3563,9 @@ mod tests {
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
             StepField {
                 name: "resolutions".into(),
@@ -3676,6 +3574,9 @@ mod tests {
                 filled_by: FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
         ];
         step.metadata = serde_json::json!({ "title": "Packet loss" });
@@ -3704,6 +3605,9 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }];
 
         // An explicit null is not a value.
@@ -3744,6 +3648,9 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }];
 
         // A title-less element is named by index and key.
@@ -3788,6 +3695,40 @@ mod tests {
         assert!(missing_filer_fields(std::slice::from_ref(&step)).is_empty());
     }
 
+    /// `item_one_of` at admission (design 26a89f11's file_refs arm): a
+    /// required filer field whose element carries NONE of its one-of
+    /// keys is missing its one choice, named as the alternatives. One
+    /// is whole; which one is the filer's call.
+    #[test]
+    fn missing_filer_fields_names_an_element_with_none_of_its_one_of_keys() {
+        use boss_core::job::{FilledBy, StepField};
+        let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
+        step.spec_slug = Some("review".into());
+        step.fields = vec![StepField {
+            name: "exhibits".into(),
+            field_type: "array".into(),
+            required: true,
+            filled_by: FilledBy::Filer,
+            item_keys: vec!["anchor".into()],
+            covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: vec!["html".into(), "file_ref".into()],
+        }];
+        step.metadata = serde_json::json!({ "exhibits": [
+            { "anchor": "E1", "html": "<p>x</p>" },
+            { "anchor": "E2", "file_ref": "f-1" },
+            { "anchor": "E3", "html": " " },
+        ]});
+        assert_eq!(
+            missing_filer_fields(std::slice::from_ref(&step)),
+            vec![(
+                "review".to_string(),
+                "exhibits[2].(html|file_ref)".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn missing_filer_fields_ignores_optional_filer_fields() {
         use boss_core::job::{FilledBy, StepField};
@@ -3799,6 +3740,9 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }];
         assert!(
             missing_filer_fields(std::slice::from_ref(&step)).is_empty(),

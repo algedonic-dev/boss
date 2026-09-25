@@ -319,6 +319,27 @@ impl StepRegistry {
                     }
                 }
             }
+            // ONE OF, at done: an element carrying NONE of its
+            // `item_one_of` keys is incomplete the way a missing item
+            // key is (design 26a89f11 — an exhibit with neither `html`
+            // nor `file_ref` shows nothing). Carrying two is the
+            // standing refusal below, judged at every write.
+            if let Some(items) = obj.get(&field.name).and_then(|v| v.as_array())
+                && !field.item_one_of.is_empty()
+            {
+                for (i, item) in items.iter().enumerate() {
+                    if one_of_carried(field, item).is_empty() {
+                        errors.push(ValidationError {
+                            field: format!("{}[{i}]", field.name),
+                            message: format!(
+                                "element {i} of '{}' carries none of {} — it must carry exactly one",
+                                field.name,
+                                field.item_one_of.join(", ")
+                            ),
+                        });
+                    }
+                }
+            }
             // COVERAGE: every anchor of the covered field has an element
             // here with the same anchor. The refusal names the anchors
             // still unanswered, so the reader knows which questions are
@@ -355,11 +376,167 @@ impl StepRegistry {
                 }
             }
         }
+        // STANDING refusals — the ones that hold at every write, not
+        // only at done — are part of the completion contract too, so a
+        // packet that reached review around the merge door is refused
+        // here rather than carried into the record.
+        errors.extend(Self::standing_refusals(fields, metadata, |_| true));
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
+    }
+
+    /// The refusals that hold at EVERY write, not only at done (design
+    /// 26a89f11, exhibits): an `anchor` repeated within one field, a
+    /// string over the field's `item_value_max_bytes`, a `binds`
+    /// element naming an anchor the bound field does not carry, and an
+    /// element carrying more than one of its `item_one_of` keys.
+    ///
+    /// Required-at-done is the rule for what the WORK must produce; these
+    /// are the rule for what a record may never say, so the step merge
+    /// door judges them as the write lands, where the writer is still on
+    /// the line. `touched` names the keys the write carries: a field is
+    /// judged when it is touched or when it binds a field that is, so a
+    /// reviewer saving `resolutions` is never refused over an exhibit an
+    /// author wrote. Presence, `item_keys` and `covers` are NOT judged
+    /// here — a half-answered review is a legitimate state between writes.
+    pub fn standing_refusals(
+        fields: &[boss_core::job::StepField],
+        metadata: &serde_json::Value,
+        touched: impl Fn(&str) -> bool,
+    ) -> Vec<ValidationError> {
+        let items = |name: &str| -> Vec<&serde_json::Value> {
+            metadata
+                .get(name)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().collect())
+                .unwrap_or_default()
+        };
+        let anchor = |item: &serde_json::Value| -> Option<String> {
+            item.get("anchor")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        };
+        let mut errors = Vec::new();
+        for field in fields
+            .iter()
+            .filter(|f| touched(&f.name) || f.binds.as_deref().is_some_and(&touched))
+        {
+            let elements = items(&field.name);
+            // AN ANCHOR IS AN IDENTIFIER. `covers` and `binds` both read
+            // elements by it, and a repeat makes either ambiguous.
+            if field.item_keys.iter().any(|k| k == "anchor") {
+                let mut seen: Vec<String> = Vec::new();
+                let mut repeated: Vec<String> = Vec::new();
+                for a in elements.iter().filter_map(|i| anchor(i)) {
+                    if seen.contains(&a) {
+                        if !repeated.contains(&a) {
+                            repeated.push(a);
+                        }
+                    } else {
+                        seen.push(a);
+                    }
+                }
+                if !repeated.is_empty() {
+                    errors.push(ValidationError {
+                        field: field.name.clone(),
+                        message: format!(
+                            "'{}' carries a repeated anchor: {} — an anchor names one element",
+                            field.name,
+                            repeated.join(", ")
+                        ),
+                    });
+                }
+            }
+            // TWO OF A ONE-OF is a record saying two things about one
+            // element — an exhibit with both inline `html` and a
+            // `file_ref` leaves every reader to guess which was reviewed.
+            if !field.item_one_of.is_empty() {
+                for (i, item) in elements.iter().enumerate() {
+                    let carried = one_of_carried(field, item);
+                    if carried.len() > 1 {
+                        errors.push(ValidationError {
+                            field: format!("{}[{i}]", field.name),
+                            message: format!(
+                                "'{}' element {i} carries {} — it may carry exactly one of {}",
+                                field.name,
+                                carried.join(" and "),
+                                field.item_one_of.join(", ")
+                            ),
+                        });
+                    }
+                }
+            }
+            if let Some(max) = field.item_value_max_bytes {
+                for (i, item) in elements.iter().enumerate() {
+                    for (key, value) in item.as_object().into_iter().flatten() {
+                        let Some(s) = value.as_str() else { continue };
+                        if s.len() as u64 > max {
+                            errors.push(ValidationError {
+                                field: format!("{}[{i}].{key}", field.name),
+                                message: format!(
+                                    "'{}' element {i} carries {} bytes in '{key}', over the \
+                                     {max}-byte inline bound this field declares",
+                                    field.name,
+                                    s.len()
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(bound) = &field.binds {
+                let carried: Vec<String> = items(bound).iter().filter_map(|i| anchor(i)).collect();
+                for (i, item) in elements.iter().enumerate() {
+                    let Some(binding) = item.get(bound.as_str()) else {
+                        continue;
+                    };
+                    let path = format!("{}[{i}].{bound}", field.name);
+                    let Some(list) = binding.as_array() else {
+                        errors.push(ValidationError {
+                            field: path,
+                            message: format!(
+                                "'{}' element {i} binds '{bound}' with something other than a \
+                                 list of anchors",
+                                field.name
+                            ),
+                        });
+                        continue;
+                    };
+                    let unknown: Vec<String> = list
+                        .iter()
+                        .map(|a| {
+                            a.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| a.to_string())
+                        })
+                        .filter(|a| !carried.contains(a))
+                        .collect();
+                    if !unknown.is_empty() {
+                        errors.push(ValidationError {
+                            field: path,
+                            message: format!(
+                                "'{}' element {i} binds {} that '{bound}' does not carry: {}",
+                                field.name,
+                                if unknown.len() == 1 {
+                                    "an anchor"
+                                } else {
+                                    "anchors"
+                                },
+                                unknown
+                                    .iter()
+                                    .map(|a| format!("'{a}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        errors
     }
 
     pub fn validate_metadata(
@@ -405,6 +582,25 @@ impl StepRegistry {
             Err(errors)
         }
     }
+}
+
+/// Which of `field.item_one_of` an element carries, as a non-empty
+/// string — the presence rule `item_keys` uses, so a blank or null value
+/// is not a choice made.
+fn one_of_carried<'a>(
+    field: &'a boss_core::job::StepField,
+    item: &serde_json::Value,
+) -> Vec<&'a str> {
+    field
+        .item_one_of
+        .iter()
+        .filter(|k| {
+            item.get(k.as_str())
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 fn validate_field_type(
@@ -656,8 +852,12 @@ mod tests {
         // kind, so the credential broker's rule can target
         // `step.done.credential-rotation` instead of firing on every
         // `task` — the same reasoning as `gate-verdict` before it).
+        // 47 since `marketing-launch` retired with the launch calendar
+        // (design 2ea444f5, backlog a8991c86). 45 since
+        // `marketing-brief` and `marketing-attribution` followed it: no
+        // active Workflow and no in-flight step used either (car 8).
         let reg = StepRegistry::v1();
-        assert_eq!(reg.all().len(), 48);
+        assert_eq!(reg.all().len(), 45);
     }
 
     /// The reason `scope-declaration` is registered at all.
@@ -757,7 +957,17 @@ mod tests {
         // and the entry is checked for staleness both ways, the same
         // discipline `the-live-protocols-are-the-authored-protocols.sh`
         // applies to its own list.
-        const PLUGIN_ONLY_KINDS: [&str; 1] = ["correction-verdict"];
+        //
+        // THE SECOND, decided 2026-09-24 (backlog 59d15039): `incident`'s
+        // review step declares `incident-review` for the same reason —
+        // the surface lays the packet's findings and every step's
+        // answers out as one document, and registered against `task` it
+        // would mount on every task step. It authors no `fields`: the
+        // review is an attestation, and the step's `human_only`
+        // declaration (enforced at assignment) plus `completed_by` IS
+        // its record — the same contract incident-post-mortem's bare
+        // `task` review had, which this protocol replaced.
+        const PLUGIN_ONLY_KINDS: [&str; 2] = ["correction-verdict", "incident-review"];
 
         let reg = StepRegistry::v1();
         let defined: std::collections::HashSet<&str> = reg.all().iter().map(|t| t.kind).collect();
@@ -973,6 +1183,9 @@ mod tests {
             filled_by: Default::default(),
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         }];
         let meta = serde_json::json!({"disposition": "ship"});
         let err = StepRegistry::validate_authored_fields(&fields, &meta).unwrap_err();
@@ -1044,8 +1257,8 @@ mod tests {
         let v = all_v1_types();
         assert_eq!(
             v.len(),
-            48,
-            "step_types.toml should have 48 [[step_type]] blocks"
+            45,
+            "step_types.toml should have 45 [[step_type]] blocks"
         );
     }
 
@@ -1064,6 +1277,9 @@ mod tests {
                 filled_by: FilledBy::Filer,
                 item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
             StepField {
                 name: "resolutions".into(),
@@ -1072,6 +1288,9 @@ mod tests {
                 filled_by: FilledBy::Executor,
                 item_keys: vec!["anchor".into(), "decision".into()],
                 covers: Some("questions".into()),
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
         ];
         let questions = serde_json::json!([
@@ -1138,6 +1357,287 @@ mod tests {
         .unwrap();
     }
 
+    /// The exhibit contract of design 26a89f11, in registry terms:
+    /// `questions` BINDS `exhibits`, and `exhibits` bounds each string it
+    /// carries, and each exhibit carries its bytes as ONE of `html`
+    /// (inline) or `file_ref` (the file store). Built here rather than
+    /// read from the bundle so the rules are pinned apart from the one
+    /// protocol that uses them today.
+    fn exhibit_contract(max: u64) -> Vec<boss_core::job::StepField> {
+        use boss_core::job::{FilledBy, StepField};
+        vec![
+            StepField {
+                name: "questions".into(),
+                field_type: "array".into(),
+                required: true,
+                filled_by: FilledBy::Filer,
+                item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
+                covers: None,
+                binds: Some("exhibits".into()),
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+            },
+            StepField {
+                name: "exhibits".into(),
+                field_type: "array".into(),
+                required: false,
+                filled_by: FilledBy::Filer,
+                item_keys: vec!["anchor".into(), "title".into()],
+                covers: None,
+                binds: None,
+                item_value_max_bytes: Some(max),
+                item_one_of: vec!["html".into(), "file_ref".into()],
+            },
+        ]
+    }
+
+    fn q(anchor: &str, binds: &[&str]) -> serde_json::Value {
+        serde_json::json!({"anchor": anchor, "title": "t", "proposal": "p", "exhibits": binds})
+    }
+
+    fn exhibit(anchor: &str, html: &str) -> serde_json::Value {
+        serde_json::json!({"anchor": anchor, "title": "a board", "html": html})
+    }
+
+    /// A question may bind exhibits by anchor, and a binding to an
+    /// anchor the packet does not carry is refused, naming the question
+    /// and the missing anchor — a question pointing at nothing.
+    #[test]
+    fn a_question_binding_an_exhibit_the_packet_lacks_is_refused_by_name() {
+        let fields = exhibit_contract(1024);
+        let ok = serde_json::json!({
+            "questions": [q("Q1", &["E1"]), q("Q2", &[])],
+            "exhibits": [exhibit("E1", "<p>palette</p>")],
+        });
+        assert!(StepRegistry::standing_refusals(&fields, &ok, |_| true).is_empty());
+
+        let bad = serde_json::json!({
+            "questions": [q("Q1", &["E1", "E9"])],
+            "exhibits": [exhibit("E1", "<p>palette</p>")],
+        });
+        let errs = StepRegistry::standing_refusals(&fields, &bad, |_| true);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "questions[0].exhibits")
+            .unwrap_or_else(|| panic!("the binding is named: {errs:?}"));
+        assert!(
+            e.message.contains("E9") && !e.message.contains("'E1'"),
+            "{}",
+            e.message
+        );
+
+        // No exhibits at all: every binding is to nothing.
+        let none = serde_json::json!({ "questions": [q("Q1", &["E1"])] });
+        assert_eq!(
+            StepRegistry::standing_refusals(&fields, &none, |_| true).len(),
+            1
+        );
+        // A binding that is not a list of anchors is refused too.
+        let shape = serde_json::json!({
+            "questions": [{"anchor": "Q1", "title": "t", "proposal": "p", "exhibits": "E1"}],
+            "exhibits": [exhibit("E1", "x")],
+        });
+        assert!(
+            StepRegistry::standing_refusals(&fields, &shape, |_| true)
+                .iter()
+                .any(|e| e.field == "questions[0].exhibits"),
+        );
+    }
+
+    /// An anchor is an identifier: a field whose elements are keyed by
+    /// `anchor` refuses a repeated one — two exhibits called E1 make
+    /// every binding to E1 ambiguous, and two questions called Q1 make
+    /// `covers` vacuous for the second.
+    #[test]
+    fn a_repeated_anchor_is_refused() {
+        let fields = exhibit_contract(1024);
+        let md = serde_json::json!({
+            "questions": [q("Q1", &[]), q("Q1", &[])],
+            "exhibits": [exhibit("E1", "a"), exhibit("E2", "b"), exhibit("E1", "c")],
+        });
+        let errs = StepRegistry::standing_refusals(&fields, &md, |_| true);
+        for field in ["questions", "exhibits"] {
+            let e = errs
+                .iter()
+                .find(|e| e.field == field)
+                .unwrap_or_else(|| panic!("{field} is refused: {errs:?}"));
+            assert!(e.message.contains("repeated"), "{}", e.message);
+        }
+    }
+
+    /// The inline bound is on the STRING, in UTF-8 bytes — the number an
+    /// author reads off the file — and the refusal names the element, the
+    /// key, the size and the bound.
+    #[test]
+    fn a_value_over_the_inline_bound_is_refused_with_both_numbers() {
+        let fields = exhibit_contract(8);
+        let at = serde_json::json!({ "exhibits": [exhibit("E1", "12345678")] });
+        assert!(StepRegistry::standing_refusals(&fields, &at, |_| true).is_empty());
+        // Nine bytes: one over. `é` is two bytes, so this is 9 bytes in
+        // 8 characters — a character count would wrongly pass it.
+        let over = serde_json::json!({ "exhibits": [exhibit("E1", "1234567é")] });
+        let errs = StepRegistry::standing_refusals(&fields, &over, |_| true);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "exhibits[0].html")
+            .unwrap_or_else(|| panic!("the value is named: {errs:?}"));
+        assert!(
+            e.message.contains('9') && e.message.contains('8'),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Standing refusals are judged only for the fields a write TOUCHES,
+    /// plus any field that binds one it touches — so a reviewer saving
+    /// `resolutions` is never refused over an exhibit someone else wrote.
+    #[test]
+    fn standing_refusals_judge_only_what_the_write_touches() {
+        let fields = exhibit_contract(1024);
+        let md = serde_json::json!({
+            "questions": [q("Q1", &["E9"])],
+            "exhibits": [exhibit("E1", "x"), exhibit("E1", "y")],
+            "resolutions": [],
+        });
+        assert!(
+            StepRegistry::standing_refusals(&fields, &md, |k| k == "resolutions").is_empty(),
+            "a write of resolutions alone judges neither questions nor exhibits"
+        );
+        // Touching exhibits judges exhibits AND the questions that bind them.
+        let errs = StepRegistry::standing_refusals(&fields, &md, |k| k == "exhibits");
+        assert!(errs.iter().any(|e| e.field == "exhibits"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.field == "questions[0].exhibits"),
+            "{errs:?}"
+        );
+    }
+
+    /// And at done they are part of the completion contract, so a packet
+    /// that reached review around the merge door is still refused.
+    #[test]
+    fn completion_holds_the_standing_refusals_too() {
+        let fields = exhibit_contract(1024);
+        let md = serde_json::json!({
+            "questions": [q("Q1", &["E9"])],
+            "exhibits": [exhibit("E1", "x")],
+        });
+        let err = StepRegistry::validate_authored_fields(&fields, &md).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.field == "questions[0].exhibits"),
+            "{err:?}"
+        );
+    }
+
+    /// `item_one_of` (design 26a89f11's file_refs arm): an exhibit
+    /// carries its bytes inline as `html` OR as a `file_ref` into the
+    /// file store. Either alone is a whole exhibit; both at once is a
+    /// record that says two things about one element, refused at every
+    /// write that touches the field and named by element and keys.
+    #[test]
+    fn an_element_carrying_two_of_its_one_of_keys_is_refused_at_every_write() {
+        let fields = exhibit_contract(1024);
+        let by_ref = serde_json::json!({"anchor": "E2", "title": "big", "file_ref": "f-1"});
+        let ok = serde_json::json!({
+            "questions": [q("Q1", &["E1", "E2"])],
+            "exhibits": [exhibit("E1", "<p>x</p>"), by_ref],
+        });
+        assert!(StepRegistry::standing_refusals(&fields, &ok, |_| true).is_empty());
+        StepRegistry::validate_authored_fields(&fields, &ok)
+            .expect("an inline exhibit and a file_ref exhibit are both whole");
+
+        let both = serde_json::json!({ "exhibits": [
+            {"anchor": "E1", "title": "t", "html": "<p>x</p>", "file_ref": "f-1"},
+        ]});
+        let errs = StepRegistry::standing_refusals(&fields, &both, |k| k == "exhibits");
+        let e = errs
+            .iter()
+            .find(|e| e.field == "exhibits[0]")
+            .unwrap_or_else(|| panic!("the element is named: {errs:?}"));
+        assert!(
+            e.message.contains("html") && e.message.contains("file_ref"),
+            "{}",
+            e.message
+        );
+        // Not judged by a write that touches neither.
+        assert!(StepRegistry::standing_refusals(&fields, &both, |k| k == "resolutions").is_empty());
+    }
+
+    /// Carrying NONE of the one-of keys is the shape of a missing item
+    /// key — judged at done, where the work must be whole, and not at
+    /// every write, where a half-built element is a legitimate state. An
+    /// empty string is not a value, exactly as for `item_keys`.
+    #[test]
+    fn an_element_carrying_none_of_its_one_of_keys_is_refused_at_done() {
+        let fields = exhibit_contract(1024);
+        for bare in [
+            serde_json::json!({"anchor": "E1", "title": "t"}),
+            serde_json::json!({"anchor": "E1", "title": "t", "html": "  "}),
+            serde_json::json!({"anchor": "E1", "title": "t", "file_ref": null}),
+        ] {
+            let md = serde_json::json!({ "exhibits": [bare] });
+            assert!(
+                StepRegistry::standing_refusals(&fields, &md, |_| true).is_empty(),
+                "not a standing refusal: {md}"
+            );
+            let err = StepRegistry::validate_authored_fields(&fields, &md).unwrap_err();
+            let e = err
+                .iter()
+                .find(|e| e.field == "exhibits[0]")
+                .unwrap_or_else(|| panic!("the element is named at done: {err:?}"));
+            assert!(
+                e.message.contains("html") && e.message.contains("file_ref"),
+                "{}",
+                e.message
+            );
+        }
+    }
+
+    /// The platform bundle's design-doc review step carries the exhibit
+    /// contract design 26a89f11 decided: `questions` binds `exhibits`,
+    /// an exhibit is `{anchor, title}` plus ONE of `html` (bounded inline
+    /// at 256 KB) or `file_ref` (the file store, above it). Read from the
+    /// file the registry seeds, so the protocol row and these rules
+    /// cannot part.
+    #[test]
+    fn the_design_doc_review_step_declares_the_exhibit_contract() {
+        let fields = crate::seed_loader::load_workflows(crate::registry::platform_bundle_path())
+            .expect("the platform Workflow bundle parses")
+            .into_iter()
+            .find(|w| w.kind == "design-doc")
+            .expect("the bundle carries design-doc")
+            .steps
+            .into_iter()
+            .find(|s| s.title == "review")
+            .expect("design-doc has a review step")
+            .fields;
+        let field = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("the review step declares {n}"))
+        };
+        assert_eq!(field("questions").binds.as_deref(), Some("exhibits"));
+        let exhibits = field("exhibits");
+        assert_eq!(exhibits.field_type, "array");
+        assert!(!exhibits.required, "most designs carry no exhibit");
+        assert_eq!(exhibits.item_keys, vec!["anchor", "title"]);
+        assert_eq!(exhibits.item_one_of, vec!["html", "file_ref"]);
+        assert_eq!(exhibits.item_value_max_bytes, Some(256 * 1024));
+
+        let md = serde_json::json!({
+            "title": "t", "markdown": "m",
+            "questions": [q("Q1", &["E1", "E2"])],
+            "exhibits": [exhibit("E1", "<p>x</p>")],
+            "resolutions": [{"anchor": "Q1", "decision": "yes"}],
+        });
+        let err = StepRegistry::validate_authored_fields(&fields, &md).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.field == "questions[0].exhibits" && e.message.contains("E2")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn authored_fields_validate_in_union_with_the_bundle() {
         use boss_core::job::StepField;
@@ -1149,6 +1649,9 @@ mod tests {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
             StepField {
                 name: "notes".into(),
@@ -1157,6 +1660,9 @@ mod tests {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
             },
         ];
         // Missing required authored field → error naming it.

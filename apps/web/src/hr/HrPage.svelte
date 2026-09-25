@@ -11,10 +11,11 @@
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import {
-    humanizeClassCode,
+    classLabel,
     type Department,
     type Employee,
   } from '../people/types';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import { tenureYears, expiringCerts } from '../people/utils';
   import {
     workflowSurfaces,
@@ -93,6 +94,9 @@
     }
     return [...m.entries()].sort((a, b) => b[1].active - a[1].active);
   });
+  // Headcount rows are labelled from the department's Class display_name
+  // (backlog 8677728c: `operations` printed Operations for Operations / IT).
+  let departmentClasses = $derived(classesFor('employee', 'department'));
 
   // ------------------------------------------------------------
   // Workflows tab — HR workflows driven through the canonical
@@ -341,7 +345,7 @@
               <p class="empty">Nothing urgent today.</p>
             {:else}
               <div style="margin-bottom:12px">
-                <h4 style="font-size:13px; font-weight:600; color:#dc2626; margin:0 0 4px">
+                <h4 style="font-size:13px; font-weight:600; color:var(--err); margin:0 0 4px">
                   {expiring30.length} cert{expiring30.length > 1 ? 's' : ''} expiring in 30 days
                 </h4>
                 {#each expiring30.slice(0, 5) as { employee, cert } (`${employee.id}-${cert.name}`)}
@@ -363,7 +367,7 @@
                 Couldn't load HR workflows — {workflowsFailed}
               </p>
             {:else if hrKinds.length === 0}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 No HR workflows are published in this deployment.
                 Workflows appear here once they declare
                 <code>metadata.surfaces ⊇ ["hr"]</code>.
@@ -378,7 +382,7 @@
                 </select>
                 {#each hrKinds as k (k.kind)}
                   <button
-                    class="hr-action-btn"
+                    class="btn btn-sm"
                     onclick={() => startWorkflow(k.kind)}
                     disabled={!startTarget}
                   >
@@ -391,13 +395,13 @@
 
         <Section title="Active Workflows">
             {#if workflowsLoading}
-              <p style="color:#78716c; font-size:13px">Loading...</p>
+              <p style="color:var(--static); font-size:13px">Loading...</p>
             {:else if workflowsFailed}
               <p class="load-failed" role="alert" style="font-size:13px">
                 Couldn't load active workflows — {workflowsFailed}
               </p>
             {:else if workflowsApiAvailable === false}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 Active-workflows list is not yet wired in this deployment.
                 The per-employee <code>onboard</code> / <code>offboard</code>
                 writes above work, but the cross-employee aggregation endpoint
@@ -405,7 +409,7 @@
                 implemented yet.
               </p>
             {:else if workflows.length === 0}
-              <p style="color:#78716c; font-size:13px">No active workflows.</p>
+              <p style="color:var(--static); font-size:13px">No active workflows.</p>
             {:else}
               <table class="data-table">
                 <thead>
@@ -439,7 +443,7 @@
                           <div class="hr-progress">
                             <div class="hr-progress-bar" style={`width:${pct}%`}></div>
                           </div>
-                          <span style="font-size:11px; color:#78716c">
+                          <span style="font-size:11px; color:var(--static)">
                             {w.done_tasks}/{w.total_tasks} tasks ({pct}%)
                           </span>
                         {:else}
@@ -469,7 +473,7 @@
           {@const empName = roster.find((e) => e.id === selectedEmp)?.name ?? selectedEmp}
           <Section title={`Tasks — ${empName}`}>
             {#if tasksLoading}
-              <p style="color:#78716c; font-size:13px">Loading…</p>
+              <p style="color:var(--static); font-size:13px">Loading…</p>
             {:else if tasks.kind === 'failed'}
               <p class="load-failed" role="alert" style="font-size:13px">
                 Couldn't read {empName}'s onboarding steps — {tasks.error}.
@@ -477,13 +481,13 @@
                 below this line are unknown, not absent.
               </p>
             {:else if tasks.kind === 'no-job'}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 {empName} has no open HR workflow in the list above, so
                 there are no steps to show. Start one from
                 <strong>Start Workflow</strong> above.
               </p>
             {:else if tasks.data.length === 0}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 This workflow has no steps — the Job was read and it is
                 genuinely empty.
               </p>
@@ -561,7 +565,7 @@
                       <td>{cert.expires_on ?? '—'}</td>
                       <td class="num">
                         {#if daysLeft !== null && daysLeft <= 30}
-                          <span style="color:#dc2626; font-weight:600">{daysLeft}d</span>
+                          <span style="color:var(--err); font-weight:600">{daysLeft}d</span>
                         {:else}
                           <span>{daysLeft}d</span>
                         {/if}
@@ -589,7 +593,7 @@
               <tbody>
                 {#each byDept as [dept, counts] (dept)}
                   <tr>
-                    <td>{humanizeClassCode(dept)}</td>
+                    <td>{classLabel(dept, departmentClasses)}</td>
                     <td class="num">{counts.active}</td>
                     <td class="num">{counts.onLeave || '—'}</td>
                     <td class="num">{counts.openReqs || '—'}</td>

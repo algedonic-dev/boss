@@ -166,7 +166,9 @@ pub(crate) const OPEN: &str = "{{invariant:";
 pub(crate) const CLOSE: &str = "}}";
 
 /// Every `{{invariant:<name>}}` in `body` replaced by that
-/// invariant's lines, indented four spaces as the brief indents them.
+/// invariant's block (`brief::block`: its lines, then where any value
+/// was read from a file other than its authority), indented four
+/// spaces as the brief indents them.
 ///
 /// A name no invariant carries is REFUSED, naming the names there
 /// are: rendered through, it would hand a builder a literal
@@ -189,7 +191,9 @@ pub(crate) fn expand(body: &str, invariants: &[crate::brief::Invariant]) -> Resu
                 invariants.iter().map(|i| i.name).collect::<Vec<_>>()
             );
         };
-        for line in &inv.lines {
+        // The invariant's whole block, attribution included — the
+        // same lines the invariants section prints (a7469d74).
+        for line in crate::brief::block(inv) {
             out.push_str(&format!("    {line}\n"));
         }
         // The lines each carry their own newline, so the one that
@@ -200,6 +204,109 @@ pub(crate) fn expand(body: &str, invariants: &[crate::brief::Invariant]) -> Resu
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Where a rules document asks for the COMMIT TRAILER — on a line of
+/// its own, filled by [`fill_trailer`] when the prompt is rendered
+/// (backlog 89d1572c, 2026-09-23).
+///
+/// THE CASE. Rule 5 of the builder document spelled the trailer as a
+/// literal naming one model and version, and every builder dispatched
+/// on 2026-09-23 ran as a newer one — so each car's commit credited the
+/// wrong model unless the operator overrode the rule in that prompt,
+/// which several did, by hand, every time. That is the per-prompt
+/// restatement the uid invariant was wrong in ten times (cc9ddc5d),
+/// and a document is the wrong home for the fact in the first place:
+/// the CLI rendering it cannot know which model will read it.
+///
+/// THE HONEST SOURCE is the session that dispatches. Its harness hands
+/// it its own attribution lines (the `Co-Authored-By` and session
+/// lines it is told to end commits with); nothing hands them to a
+/// process it runs, so the session SUPPLIES them through
+/// [`TRAILER_ENV`], and the prompt says that is where they came from.
+/// Unsupplied, the prompt says THAT — and sends the builder to its own
+/// harness's lines — rather than printing a literal that may be wrong.
+/// The pin `no_rules_document_renders_a_model_name_the_cli_cannot_know`
+/// refuses a model name anywhere in a rendered document.
+pub(crate) const TRAILER: &str = "{{trailer}}";
+
+/// The variable the dispatching session puts its own attribution lines
+/// in, one trailer per line, for `boss brief` and `boss dispatch` to
+/// fill [`TRAILER`] with.
+pub(crate) const TRAILER_ENV: &str = "BOSS_COMMIT_TRAILER";
+
+/// The trailer the shell running this verb supplied, unvalidated —
+/// [`fill_trailer`] judges it. The one place the variable is read, so
+/// both verbs that render a brief read it the same way.
+pub(crate) fn supplied_trailer() -> Option<String> {
+    std::env::var(TRAILER_ENV).ok()
+}
+
+/// A git trailer line: `Token: value`, the token letters, digits and
+/// hyphens. Anything else in a supplied value is prose, and prose
+/// would land as the last paragraph of every commit the builder makes.
+fn is_trailer_line(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(token, value)| {
+        !token.is_empty()
+            && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !value.trim().is_empty()
+    })
+}
+
+/// The lines [`TRAILER`] renders as: the supplied lines and where they
+/// came from, or the sentence saying none was supplied. A blank value
+/// is no value. A value holding a line that is not a trailer is
+/// REFUSED, naming the line.
+fn trailer_block(supplied: Option<&str>) -> Result<Vec<String>> {
+    let lines: Vec<&str> = supplied
+        .into_iter()
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Ok(vec![
+            format!("No trailer was supplied to this prompt: {TRAILER_ENV} was unset where it was"),
+            "rendered, and the CLI cannot know which model will run you, so none is printed here"
+                .into(),
+            "rather than one that may be wrong. End the message with the commit attribution lines"
+                .into(),
+            "YOUR session's harness gives you, copied exactly — never a model name typed from memory,"
+                .into(),
+            "from an old commit, or from this document.".into(),
+        ]);
+    }
+    if let Some(bad) = lines.iter().find(|l| !is_trailer_line(l)) {
+        anyhow::bail!(
+            "{TRAILER_ENV} holds `{bad}`, which is not a trailer line (`Token: value`); it \
+             carries the dispatching session's own attribution lines, one per line"
+        );
+    }
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    out.push(format!(
+        "(the dispatching session's own attribution lines, supplied through {TRAILER_ENV} when"
+    ));
+    out.push(
+        "this prompt was rendered; if your harness gives you different ones, use those and say so)"
+            .into(),
+    );
+    Ok(out)
+}
+
+/// `body` with [`TRAILER`] replaced by [`trailer_block`], indented four
+/// spaces as an invariant's quote is. A body that asks for no trailer
+/// is returned as it is, whatever was supplied.
+pub(crate) fn fill_trailer(body: &str, supplied: Option<&str>) -> Result<String> {
+    if !body.contains(TRAILER) {
+        return Ok(body.to_string());
+    }
+    let block: String = trailer_block(supplied)?
+        .iter()
+        .map(|l| format!("    {l}\n"))
+        .collect();
+    Ok(body
+        .replace(&format!("{TRAILER}\n"), &block)
+        .replace(TRAILER, block.trim_end()))
 }
 
 /// The rules section of a brief: the document's body under a header
@@ -214,12 +321,13 @@ pub(crate) fn section(
     repo: &Path,
     profile: &str,
     invariants: &[crate::brief::Invariant],
+    trailer: Option<&str>,
 ) -> Result<String> {
     Ok(match read(repo, profile)? {
         Some(doc) => format!(
             "== THE RULES — profile `{profile}`, from {} ==\n\n{}",
             path_for(profile),
-            expand(&body(&doc), invariants)?
+            fill_trailer(&expand(&body(&doc), invariants)?, trailer)?
         ),
         None => format!(
             "== THE RULES — profile `{profile}` has no document ==\n\n\
@@ -331,6 +439,36 @@ mod tests {
             "scratchpad/builders/<packet id>/",
         ] {
             assert!(text.contains(phrase), "the builder rules say `{phrase}`");
+        }
+    }
+
+    /// EVERY PROFILE'S WORKING FILES LIVE IN THE RUN'S OWN DIRECTORY
+    /// (backlog dd747b4c). Two page-audit runs dispatched together on
+    /// 2026-09-24 wrote the same generic names at the shared scratchpad
+    /// root, and one filed five backlog-items with the other's content.
+    /// THE RUN names the directory (`dispatch::working_dir`); each
+    /// document refers to it by the phrase that section carries, so the
+    /// spelling lives once in code and every profile is held to it.
+    #[test]
+    fn every_document_sends_working_files_to_the_directory_the_run_names() {
+        let dir = repo().join(DIR);
+        for entry in std::fs::read_dir(&dir).expect("the documents directory") {
+            let path = entry.expect("entry").path();
+            if !path.to_string_lossy().ends_with("-rules.md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable");
+            assert!(
+                text.contains(crate::dispatch::WORKING_DIR_REFERENCE),
+                "{} must send working files to `{}`",
+                path.display(),
+                crate::dispatch::WORKING_DIR_REFERENCE
+            );
+            assert!(
+                text.contains("dd747b4c"),
+                "{} says why a run needs its own directory",
+                path.display()
+            );
         }
     }
 
@@ -492,7 +630,7 @@ mod tests {
         );
         let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
         for profile in &profiles {
-            let rendered = section(&repo(), profile, &invs).expect("the section renders");
+            let rendered = section(&repo(), profile, &invs, None).expect("the section renders");
             assert!(
                 !rendered.contains("has no document"),
                 "{} declares profile `{profile}` and nothing serves it",
@@ -504,8 +642,8 @@ mod tests {
     #[test]
     fn a_profile_with_no_document_is_a_line_that_names_the_file() {
         let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
-        let s =
-            section(&repo(), "no-such-profile", &invs).expect("a missing document is not an error");
+        let s = section(&repo(), "no-such-profile", &invs, None)
+            .expect("a missing document is not an error");
         assert!(s.contains("has no document"), "{s}");
         assert!(
             s.contains("infra/platform/documents/no-such-profile-rules.md"),
@@ -516,7 +654,7 @@ mod tests {
     #[test]
     fn the_section_names_the_profile_and_the_file_it_came_from() {
         let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
-        let s = section(&repo(), "builder", &invs).expect("the builder rules render");
+        let s = section(&repo(), "builder", &invs, None).expect("the builder rules render");
         assert!(s.starts_with(
             "== THE RULES — profile `builder`, from infra/platform/documents/builder-rules.md =="
         ));
@@ -562,11 +700,85 @@ mod tests {
         // the whole point of the key.
         assert_eq!(lane(&repo(), "builder").expect("builder"), "car");
         assert_eq!(lane(&repo(), "analyst").expect("analyst"), "step");
+        assert_eq!(lane(&repo(), "tenant-builder").expect("tenant"), "tenant");
         // A profile nothing serves is briefed as it always was.
         assert_eq!(
             lane(&repo(), "no-such-profile").expect("no document is not an error"),
             DEFAULT_LANE
         );
+    }
+
+    /// THE TENANT BUILDER'S DOCUMENT (design fd8b5143, backlog
+    /// 6a34e9bc). It is read by the one profile that builds in a repo
+    /// this tree does not hold, where the only human act on the route is
+    /// David's approval of the merge — so what is pinned is exactly
+    /// that: it names the approval route by its verbs and its design,
+    /// every push it tells a builder to run pushes a BRANCH and never
+    /// main, the repo comes from the instance rather than a parameter,
+    /// and the run ends on the copied check the report refuses without.
+    #[test]
+    fn the_tenant_builder_document_names_the_approval_route_and_never_pushes_main() {
+        assert_eq!(
+            lane(&repo(), crate::dispatch::TENANT_BUILDER_PROFILE).expect("reads"),
+            crate::brief::LANE_TENANT
+        );
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let text = section(
+            &repo(),
+            crate::dispatch::TENANT_BUILDER_PROFILE,
+            &invs,
+            None,
+        )
+        .expect("the tenant-builder rules render");
+        assert!(text.contains("# Tenant builder rules"), "{text}");
+        for phrase in [
+            // The route to tenant main, by its verbs and its decisions.
+            "merge-tenant-main",
+            "plan-a-tenant-merge",
+            "plan-sha256",
+            "passkey",
+            "17835005",
+            "fd7090cc",
+            // The repo is the instance's, quoted from its invariant.
+            "never a parameter",
+            crate::brief::INSTANCES,
+            // The check and the receipt the run lands on.
+            "boss tenant check",
+            "tenant-check.txt",
+            // The item's own exit (4bcf1265), which ends the run through
+            // the delivery rule — and the hand fallback for a packet
+            // pinned before that exit existed.
+            "disposition=delivered",
+            "agent-run-delivers-when-its-step-is-done",
+            "result=delivered",
+            "--tenant-check-file",
+            "--tenant-branch",
+            "--tenant-sha",
+            "result=refused",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "the tenant-builder rules say `{phrase}`"
+            );
+        }
+        // Every push it SHOWS is a command pushing a named branch, and
+        // none of them names main: the prose may say "never push main",
+        // a command may not do it.
+        let commands: Vec<&str> = text
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|c| c.contains(" push"))
+            .collect();
+        assert!(!commands.is_empty(), "the rules show the push: {text}");
+        for c in &commands {
+            assert!(c.contains("refs/heads/<branch>"), "pushes a branch: {c}");
+            assert!(!c.contains("main"), "never main: {c}");
+            assert!(!c.contains("--force"), "never forced: {c}");
+        }
+        // No car-lane mechanics: no park flag, no gate script.
+        assert!(!text.contains("--park-"), "{text}");
+        assert!(!text.contains("gate.sh"), "{text}");
     }
 
     /// A lane nothing is filed under is refused rather than rendered:
@@ -672,7 +884,7 @@ mod tests {
             .iter()
             .find(|i| i.name == "base check")
             .expect("a base-check invariant");
-        let rendered = section(&repo(), "builder", &invs).expect("the section renders");
+        let rendered = section(&repo(), "builder", &invs, None).expect("the section renders");
         for line in &inv.lines {
             assert!(
                 rendered.contains(line.as_str()),
@@ -727,6 +939,63 @@ mod tests {
         );
     }
 
+    /// A QUOTED VALUE KEEPS ITS SOURCE (backlog a7469d74, 2026-09-22).
+    /// The invariants section prints a reading whose file is not the
+    /// invariant's authority under its lines; `expand` printed only the
+    /// lines, so a builder reading rule 2 got the dev pod's cgroup with
+    /// no file to check it against. A reading out of the authority
+    /// itself adds no line, by the section's own predicate.
+    #[test]
+    fn a_quoted_invariant_names_the_file_a_foreign_value_was_read_from() {
+        use crate::brief::{Grounding, Invariant, Reading};
+        let invs = vec![Invariant {
+            name: "cargo jobs",
+            authority: "infra/dev/pod-build.env".into(),
+            lines: vec!["jobs 6".into(), "cgroup 16".into()],
+            lanes: vec![crate::brief::LANE_CAR],
+            grounding: Grounding::Derived(vec![
+                Reading::read("infra/dev/pod-build.env", "6"),
+                Reading::read("infra/cluster/manifests/boss-dev.yaml", "16"),
+            ]),
+        }];
+        assert_eq!(
+            expand(
+                &format!("before\n{}\nafter\n", quote_of("cargo jobs")),
+                &invs
+            )
+            .expect("expands"),
+            "before\n    jobs 6\n    cgroup 16\n    \
+             (16 read from infra/cluster/manifests/boss-dev.yaml)\nafter\n"
+        );
+    }
+
+    /// ONE RULE READ TWICE, pinned on the live tree: every invariant a
+    /// rules document can quote expands to exactly the block the
+    /// invariants section prints for it, attribution included, so the
+    /// value and its source cannot be separated by which of the two a
+    /// reader happens to read (a7469d74).
+    #[test]
+    fn a_quoted_invariant_expands_to_its_block_in_the_invariants_section() {
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let mut foreign = 0;
+        for inv in &invs {
+            foreign += crate::brief::foreign_sources(inv).len();
+            let block = crate::brief::invariant_section(std::slice::from_ref(inv), inv.lanes[0]);
+            let quoted = expand(&format!("{}\n", quote_of(inv.name)), &invs).expect("expands");
+            assert!(
+                block.ends_with(&quoted),
+                "the {:?} invariant quotes differently from its section block:\n\
+                 {quoted}\n--- vs ---\n{block}",
+                inv.name
+            );
+        }
+        assert!(
+            foreign > 0,
+            "no invariant in this tree reads a value out of a second file, so this pin \
+             checks nothing about attributions"
+        );
+    }
+
     /// THE PRE-FLIGHT DOOR IS QUOTED, NOT RESTATED (backlog 5d919334,
     /// 2026-09-22).
     ///
@@ -767,6 +1036,169 @@ mod tests {
         assert!(
             expanded.contains(&door),
             "a builder reading the expanded rules never sees the door §Doors names: `{door}`"
+        );
+    }
+
+    /// RULE 2'S REASON IS THE CARGO BOUND, QUOTED (backlog 28fc3a39,
+    /// 2026-09-22). The rule told a builder not to run bare cargo and
+    /// gave the cgroup as its reason — "the pod's 16 GiB / 8-CPU
+    /// cgroup" — where `infra/cluster/manifests/boss-dev.yaml` declares
+    /// twice the memory and twice the CPU. The same figure was half
+    /// wrong in the `cargo jobs` invariant too, which is the shape
+    /// 395d24ad settled: one derivation, quoted here, rather than two
+    /// typed copies drifting apart.
+    ///
+    /// The negative half is the load-bearing one: no cgroup figure may
+    /// be spelled in the body at all, because a second spelling is
+    /// exactly what drifted.
+    #[test]
+    fn the_builder_document_quotes_the_cargo_bound() {
+        let doc = read(&repo(), "builder")
+            .expect("readable")
+            .expect("infra/platform/documents/builder-rules.md is authored");
+        let text = body(&doc);
+        assert!(
+            text.contains("{{invariant:cargo jobs}}"),
+            "the builder rules no longer quote the cargo bound"
+        );
+        assert!(
+            !text.contains("GiB"),
+            "the builder rules spell a cgroup figure of their own; the dev pod's \
+             manifest declares it and {}cargo jobs{} quotes it",
+            OPEN,
+            CLOSE
+        );
+
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive from this tree");
+        let expanded = expand(&text, &invs).expect("the placeholder expands");
+        let manifest = std::fs::read_to_string(repo().join(crate::brief::DEV_MANIFEST))
+            .expect("the dev manifest");
+        let limits =
+            crate::brief::pod_cgroup_limits(&manifest).expect("the dev container declares limits");
+        assert!(
+            expanded.contains(&limits),
+            "a builder reading the expanded rules never sees the cgroup the manifest \
+             declares: `{limits}`"
+        );
+    }
+
+    /// A model name as a trailer spells one — `Claude Opus 5`,
+    /// `Claude Sonnet 4.6`. What the pin below refuses anywhere in a
+    /// rendered rules document.
+    fn names_a_model(text: &str) -> Option<String> {
+        let re = regex::Regex::new(r"Claude (Opus|Sonnet|Haiku|Fable)\b[^\n]*")
+            .expect("the pattern compiles");
+        re.find(text).map(|m| m.as_str().to_string())
+    }
+
+    const A_TRAILER: &str = "Co-Authored-By: Claude Opus 9.9 (test context) <noreply@anthropic.com>\n\
+         Claude-Session: https://claude.ai/code/session_test";
+
+    /// THE PIN (backlog 89d1572c, 2026-09-23). Rule 5 of the builder
+    /// rules spelled `Co-Authored-By: Claude Opus 5 (1M context)` while
+    /// every builder dispatched that day ran as Claude Opus 5.5, so a
+    /// car credited the wrong model unless the operator overrode the
+    /// rule in each prompt — the per-prompt restatement that was wrong
+    /// in ten briefs (cc9ddc5d). The CLI rendering a document cannot
+    /// know which model will read it, so no document in the bundle may
+    /// name one: rendered with no trailer supplied, not one model name
+    /// and not one trailer line reaches a reader.
+    #[test]
+    fn no_rules_document_renders_a_model_name_the_cli_cannot_know() {
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(repo().join(DIR)).expect("the bundle directory") {
+            let path = entry.expect("a directory entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(profile) = name.strip_suffix("-rules.md") else {
+                continue;
+            };
+            seen += 1;
+            let rendered = section(&repo(), profile, &invs, None).expect("the section renders");
+            assert_eq!(
+                names_a_model(&rendered),
+                None,
+                "{name} renders a model name; the dispatching session supplies the trailer \
+                 through {TRAILER_ENV}"
+            );
+            assert!(
+                !rendered
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("Co-Authored-By:")),
+                "{name} renders a trailer line of its own"
+            );
+        }
+        assert!(
+            seen >= 2,
+            "the bundle holds the builder and analyst documents"
+        );
+    }
+
+    /// The builder document asks for the trailer through the
+    /// placeholder, once, rather than spelling one.
+    #[test]
+    fn the_builder_document_takes_its_trailer_from_the_placeholder() {
+        let doc = read(&repo(), "builder")
+            .expect("readable")
+            .expect("infra/platform/documents/builder-rules.md is authored");
+        assert_eq!(body(&doc).matches(TRAILER).count(), 1);
+    }
+
+    /// Supplied, the dispatching session's own lines reach the builder
+    /// verbatim, and the prompt says where they came from — a trailer
+    /// with no provenance is a literal someone typed.
+    #[test]
+    fn a_supplied_trailer_is_printed_verbatim_and_names_its_source() {
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let s = section(&repo(), "builder", &invs, Some(A_TRAILER)).expect("renders");
+        for line in A_TRAILER.lines() {
+            assert!(
+                s.contains(&format!("    {line}\n")),
+                "the supplied line `{line}` is not in the rules: {s}"
+            );
+        }
+        assert!(s.contains(TRAILER_ENV) && s.contains("dispatching session"));
+        assert!(
+            !s.contains(TRAILER),
+            "an unexpanded placeholder reached a reader"
+        );
+    }
+
+    /// Unsupplied, the rules SAY so and send the builder to its own
+    /// harness's lines — never a silent hole, never a literal.
+    #[test]
+    fn an_unsupplied_trailer_says_so_and_names_the_harness() {
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let s = section(&repo(), "builder", &invs, None).expect("renders");
+        assert!(s.contains(TRAILER_ENV), "{s}");
+        assert!(s.contains("harness"), "{s}");
+        assert!(
+            !s.contains(TRAILER),
+            "an unexpanded placeholder reached a reader"
+        );
+        // A blank value is no value: it must not render as an empty
+        // trailer under a confident header.
+        let blank = section(&repo(), "builder", &invs, Some("  \n")).expect("renders");
+        assert_eq!(blank, s);
+    }
+
+    /// A supplied value that is not trailer lines is REFUSED, naming
+    /// the line: rendered through, prose would land as the last
+    /// paragraph of every commit the builder makes.
+    #[test]
+    fn a_supplied_trailer_that_is_not_trailer_lines_is_refused() {
+        let err = fill_trailer("x\n{{trailer}}\n", Some("Claude Opus 5.5, I think"))
+            .expect_err("prose is not a trailer");
+        assert!(
+            format!("{err:#}").contains("Claude Opus 5.5, I think"),
+            "{err:#}"
+        );
+        // A body with no placeholder is left alone whatever is supplied.
+        assert_eq!(
+            fill_trailer("no placeholder\n", Some(A_TRAILER)).expect("fills"),
+            "no placeholder\n"
         );
     }
 }

@@ -10,9 +10,11 @@
 // (backlog cc76f755, 2026-09-18).
 //
 // WHICH PACKETS ARE THE DEPARTMENT'S is the server's question, not
-// this file's: `GET /api/jobs?department=<code>` narrows to the kinds
-// whose active workflow row declares `metadata.department = <code>`.
-// A packet carries no department; its workflow does. Before that
+// this file's: `GET /api/jobs?department=<code>` keeps the packets
+// whose own `metadata.department` is `<code>` (a retro, a page audit,
+// the items an audit files) and, for a packet naming none, those of
+// the kinds whose active workflow row declares it (backlog 481d7939,
+// `DepartmentFilter` in boss-jobs). Before that
 // parameter existed the listing ignored it and answered the
 // unfiltered count (1944 on prod), which is the reading this page
 // must never make — so the loader keeps `total` and the page reports
@@ -61,6 +63,22 @@ export function thirdOf(job: Pick<Job, 'status' | 'steps'>): Third {
     (s) => s.status === 'active' || s.status === 'completed' || s.status === 'skipped',
   );
   return moved ? 'working' : 'in';
+}
+
+/** Where a live packet stands: the titles of the steps that can be
+ *  taken now (ready or active), in the workflow's order. A terminal
+ *  packet waits on nothing, and a live one with no open step answers
+ *  '' rather than naming a step it is not at. Backlog 4d4dc204: a
+ *  payout sat at `post` for 2.6 days and the finance page could not
+ *  say so — a third says a packet is live; this says where. */
+export function waitingAt(job: Pick<Job, 'status' | 'steps'>): string {
+  if (job.status === 'closed' || job.status === 'cancelled') return '';
+  return (job.steps ?? [])
+    .filter((s) => s.status === 'ready' || s.status === 'active')
+    .slice()
+    .sort((a, b) => a.sort_order - b.sort_order)
+    .map((s) => s.title || s.kind)
+    .join(' · ');
 }
 
 export type Thirds = Readonly<{

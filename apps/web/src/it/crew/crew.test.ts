@@ -26,6 +26,11 @@ import {
   parseYard,
   parseWaits,
   parseAgentRuns,
+  parseRunRecords,
+  costText,
+  silence,
+  silenceText,
+  SILENT_BOUND_HOURS,
   parseSessions,
   crews,
   isBuilding,
@@ -676,6 +681,20 @@ const AGENT_RUNS_RAW = {
         { spec_slug: 'reported', status: 'pending' },
       ],
     },
+    // A run waiting at its report: the title is perfect-tense, so the
+    // step's status rides beside it or `Report recorded` reads as done
+    // (3102fe7a).
+    {
+      id: '5b1d2c3e-0000-4000-8000-000000000003',
+      kind: 'agent-run',
+      status: 'open',
+      title: 'builder run: waiting to report',
+      metadata: { packet: 'q' },
+      steps: [
+        { spec_slug: 'building', title: 'Building', status: 'completed' },
+        { spec_slug: 'reported', title: 'Report recorded', status: 'ready' },
+      ],
+    },
     // A run between states: nothing open on it yet.
     {
       id: '5b1d2c3e-0000-4000-8000-000000000002',
@@ -687,15 +706,16 @@ const AGENT_RUNS_RAW = {
     },
     { kind: 'agent-run', status: 'open', title: 'no id, not a row' },
   ],
-  total: 3,
+  total: 4,
 };
 
 describe('parseAgentRuns', () => {
   it('reads the dispatch-time keys and the step the run is at', () => {
     const runs = parseAgentRuns(AGENT_RUNS_RAW);
-    expect(runs.length).toBe(2);
+    expect(runs.length).toBe(3);
     const run = runs[0]!;
-    const between = runs[1]!;
+    const between = runs[2]!;
+    expect(runs[1]!.at).toBe('Report recorded (ready, not yet done)');
     expect(run.packet).toBe('39d0b528-ff69-4cb8-ba82-408b641da66c');
     expect(run.step).toBe('build');
     expect(run.agent).toBe('claude@algedonic.dev');
@@ -703,7 +723,8 @@ describe('parseAgentRuns', () => {
     expect(run.budgetUsd).toBe(5);
     expect(run.effort).toBe('high');
     expect(run.host).toBe('boss-dev-0');
-    expect(run.at).toBe('building');
+    // No title on the row: the slug stands in for it, status beside.
+    expect(run.at).toBe('building (ready, not yet done)');
     expect(run.openedAt).toBe('2026-09-18T19:40:00.000000Z');
     // Absence is null, never a made-up value.
     expect(between.at).toBeNull();
@@ -713,8 +734,147 @@ describe('parseAgentRuns', () => {
   });
 
   it('accepts a bare array as readily as a page', () => {
-    expect(parseAgentRuns(AGENT_RUNS_RAW.data).length).toBe(2);
+    expect(parseAgentRuns(AGENT_RUNS_RAW.data).length).toBe(3);
     expect(parseAgentRuns(null)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Silence — which open runs have not moved past the age-out bound
+// (backlog 5082a08b). The definition is the dispatcher rule's, read the
+// way its handler reads it: the newest `completed_at` across the run's
+// completed steps, else `metadata.opened_at`, and only while `building`
+// is open.
+// ---------------------------------------------------------------------
+
+/// A run shaped like the live one measured 2026-09-23: `briefed`
+/// completed at 18:11:15Z, `building` ready, no other stamp.
+const QUIET_RUN = {
+  id: '5b1d2c3e-0000-4000-8000-0000000000aa',
+  kind: 'agent-run',
+  status: 'open',
+  title: 'builder run: quiet',
+  metadata: { packet: 'x', agent: 'claude@algedonic.dev', opened_at: '2026-09-23T18:10:00Z' },
+  steps: [
+    { spec_slug: 'claimed', status: 'completed', completed_at: '2026-09-23T18:10:30Z' },
+    { spec_slug: 'briefed', status: 'completed', completed_at: '2026-09-23T18:11:15.772761Z' },
+    { spec_slug: 'building', status: 'ready', completed_at: null },
+    { spec_slug: 'reported', status: 'pending', completed_at: null },
+  ],
+};
+
+describe('silence', () => {
+  it('reads the last move as the newest completed stamp, not the opening', () => {
+    const [run] = parseAgentRuns([QUIET_RUN]);
+    expect(run!.lastMovedAt).toBe('2026-09-23T18:11:15.772761Z');
+    expect(run!.building).toBe(true);
+  });
+
+  it('falls back to opened_at when no step carries a stamp', () => {
+    const [run] = parseAgentRuns(AGENT_RUNS_RAW.data);
+    expect(run!.lastMovedAt).toBe('2026-09-18T19:40:00.000000Z');
+  });
+
+  it('is under the bound, then past it, measured against the reading instant', () => {
+    const [run] = parseAgentRuns([QUIET_RUN]);
+    const early = silence(run!, '2026-09-23T19:11:15.772761Z');
+    expect(early).toEqual({ hours: 1, past: false });
+    const late = silence(run!, '2026-09-23T22:41:15.772761Z');
+    expect(late).toEqual({ hours: 4.5, past: true });
+    expect(silenceText(late!)).toBe('4.5h unmoved — past the 4h bound');
+    expect(silenceText(early!)).toBe('1h unmoved');
+  });
+
+  it('says nothing of a run whose building is not open — it is not the one the rule ages', () => {
+    const waiting = parseAgentRuns(AGENT_RUNS_RAW.data)[1]!;
+    expect(waiting.building).toBe(false);
+    expect(silence(waiting, '2026-09-30T00:00:00Z')).toBeNull();
+  });
+
+  it('is null, never zero, when no instant was recorded', () => {
+    const between = parseAgentRuns(AGENT_RUNS_RAW.data)[2]!;
+    expect(between.lastMovedAt).toBeNull();
+    expect(silence({ ...between, building: true }, '2026-09-30T00:00:00Z')).toBeNull();
+  });
+
+  // CLAUDE.md 9a: the bound lives twice — as the rule's arg and as this
+  // board's constant — because a browser cannot read the rules
+  // directory. Pinned, so the board cannot call a run silent on a
+  // different clock from the rule that kills it.
+  it('holds SILENT_BOUND_HOURS equal to the age-out rule\'s own hours arg', () => {
+    const rule = readFileSync(
+      new URL(
+        '../../../../../infra/dispatcher/rules/agent-run-dies-when-building-is-silent.toml',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    const m = /hours = "\\"(\d+)\\""/.exec(rule);
+    expect(m).not.toBeNull();
+    expect(SILENT_BOUND_HOURS).toBe(Number(m![1]));
+  });
+});
+
+// ---------------------------------------------------------------------
+// The finish record — `GET /api/agent-runs`, one row per run that
+// reached a terminal: what it cost. Trimmed from the live payload
+// measured 2026-09-23 (usd_micros null on that row, as on 124 of the
+// 200 rows the cost roll-up counted that day).
+// ---------------------------------------------------------------------
+
+const RUN_RECORDS_RAW = [
+  {
+    run_id: 'fe591182-80ba-4391-9ff6-67f5a3eb85b2',
+    actor_id: 'agent-claude',
+    model: 'opus-5[1m]',
+    started_at: '2026-09-23T16:55:19.580182Z',
+    finished_at: '2026-09-23T18:13:05.439Z',
+    outcome: 'success',
+    total_tokens: null,
+    job_id: '7f3e871a-da38-4e46-a61d-fd67a3a279f7',
+    branch: 'fix/jobs-list-refuses-an-unknown-query-parameter',
+    detail: { agent_run: 'fe591182-80ba-4391-9ff6-67f5a3eb85b2', effort: 'high', step: 'build' },
+    usd_micros: null,
+  },
+  {
+    run_id: 'a1b2c3d4-0000-4000-8000-000000000001',
+    actor_id: 'agent-claude',
+    started_at: '2026-09-17T10:00:00Z',
+    finished_at: '2026-09-17T10:30:00Z',
+    outcome: 'died',
+    total_tokens: 1200000,
+    job_id: null,
+    branch: null,
+    detail: {},
+    usd_micros: 3456789,
+  },
+  { actor_id: 'no run id, not a row' },
+];
+
+describe('parseRunRecords', () => {
+  it('reads what each finished run cost, and absence as null', () => {
+    const records = parseRunRecords(RUN_RECORDS_RAW);
+    expect(records.length).toBe(2);
+    const live = records[0]!;
+    const priced = records[1]!;
+    expect(live.runId).toBe('fe591182-80ba-4391-9ff6-67f5a3eb85b2');
+    expect(live.actor).toBe('agent-claude');
+    expect(live.outcome).toBe('success');
+    expect(live.branch).toBe('fix/jobs-list-refuses-an-unknown-query-parameter');
+    expect(live.effort).toBe('high');
+    expect(live.minutes).toBe(78);
+    expect(live.usdMicros).toBeNull();
+    expect(costText(live)).toBe('not priced');
+    // The older era: no branch, no effort recorded — said, not guessed.
+    expect(priced.branch).toBeNull();
+    expect(priced.effort).toBeNull();
+    expect(priced.tokens).toBe(1200000);
+    expect(costText(priced)).toBe('$3.46');
+  });
+
+  it('accepts a page as readily as a bare array', () => {
+    expect(parseRunRecords({ data: RUN_RECORDS_RAW }).length).toBe(2);
+    expect(parseRunRecords(null)).toEqual([]);
   });
 });
 
@@ -839,6 +999,17 @@ describe('CrewBoardPage wiring', () => {
     expect(moduleCode).toContain('kind=agent-run&status=open');
     // And the sixth (design 511fa7d4 car 2b): open sessions, the crews.
     expect(moduleCode).toContain('kind=work-session&status=open');
+    // And the seventh (backlog 5082a08b): the finish record, windowed
+    // in the query — what each finished run cost.
+    expect(moduleCode).toMatch(/\/api\/agent-runs\?limit=/);
+  });
+
+  it('draws each open run\'s silence and the finished runs\' cost (backlog 5082a08b)', () => {
+    expect(pageCode).toContain('silence(');
+    expect(pageCode).toContain('runRecords');
+    expect(pageCode).toContain('costText(');
+    // An unreadable finish record is a failure, never "nothing finished".
+    expect(pageCode).toContain("crew.runRecords.kind === 'failed'");
   });
 
   it('renders the sessions as crew rows, data only', () => {

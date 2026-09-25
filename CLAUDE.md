@@ -129,7 +129,8 @@ company change how it works without rebuilding what it works *on*:
   endpoints: steps, the predicates that order them, the evidence each
   requires, the terminals, the obligations. That is why protocols are
   **registry data** — versioned, append-only, in-flight packets pinned to
-  the version they were admitted under. "The **current** operating model"
+  the version they were admitted under unless an actor explicitly moves
+  one, and then the move is on the record. "The **current** operating model"
   is load-bearing: a protocol that cannot be replaced without a deploy
   has leaked into the substrate, and that leak is the defect to hunt.
 - **The actors run it.** Humans and registered agents are the CPUs —
@@ -270,7 +271,7 @@ copy holds any information its source does not. This one held none.
 ### 10. Core vs. Example Tenant
 The core state-machine OS lives under `crates/core/` (
 among them `boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
-`boss-gateway`, `boss-observability`, `boss-cybernetics`,
+`boss-gateway`,
 `boss-ml`, `boss-content`, `boss-testing`,
 `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`, the
 two taxonomy registries (`boss-classes`, `boss-subject-kinds`),
@@ -303,7 +304,7 @@ The **Workflow registry** (`boss-jobs`, backed by the `workflows` table) is appe
 - `steps` — a flat set of Steps; the DAG is implicit in each step's `ready_when` predicate (an edge A → B exists iff B's `ready_when` references A), not an author-drawn graph
 - `metadata_schema` + `entitlements` — typed fields and policy hooks on the Job itself
 
-**Adding a new workflow means adding a Workflow row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/system/workflows`.
+**Adding a new workflow means adding a Workflow row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under — never moved on publish. Moving one is an explicit, recorded act: `boss job convert <packet> [--to vN] [--dry-run]` (`POST /api/jobs/{id}/convert`, `publish` authority on `workflow`) refuses a move that would demand evidence retroactively or strand a step, re-projects the target's text onto steps not yet completed, creates the steps it inserts, leaves completed steps with what they ran under, and records a `jobs.job.repinned` event plus a `repins` entry on the packet (design 7cf202a9). Authoring lives at `/system/workflows`.
 
 ### Steps
 A **Step** is the typed unit of work inside a Job. Each step has a `kind` (from the StepType registry), `status` (pending → ready → active → completed (+ skipped)), optional assignee, `blocked_by` (a predicate-derived denormalized edge list for DAG rendering — recovered from the step's `ready_when` references, not an author-specified gate), optional sign-off, and free-form `metadata`.
@@ -312,7 +313,7 @@ The **StepType registry** (`boss-jobs/src/step_registry.rs`) is the alphabet of 
 
 Two rules shape the contract:
 - **Required-at-done, not required-at-create.** A `scheduling` step can exist with no `scheduled_at`; that field is required only when the step flips to `status=completed`. Metadata validators run on completion, not on create.
-- **PATCH semantics on PUT.** `PUT /api/jobs/{id}/steps/{step_id}` fetches the current step, overlays the body, then saves. Callers can send `{"status":"completed"}` and keep every other field intact. Clients providing new `metadata` must merge with the existing keys — top-level fields are replaced wholesale, so partial metadata wipes unmentioned keys.
+- **PATCH semantics on PUT.** `PUT /api/jobs/{id}/steps/{step_id}` fetches the current step, overlays the body, then saves. Callers can send `{"status":"completed"}` and keep every other field intact. Top-level fields are replaced wholesale, so a `metadata` body that omits a key the step already holds is REFUSED 409, naming the keys (e39a9d2a) — it used to wipe them in silence. Write a key or two through the step merge door, `PATCH /api/jobs/{id}/steps/{step_id}/metadata` (a key sent as `null` is deleted), then PUT the status alone; or read the step and send every stored key back.
 
 ### Events
 Every state change emits an immutable fact through NATS (`boss-nats`) and lands in `audit_log` (`boss-events`). **The log is the system of record.** Projections rebuild from it; rebuilders reproduce truth from it; the five-property correctness protocol (provenance, conservation, closure, idempotence, determinism) guarantees the system contributes zero error of its own. Every state-changing operation publishes an event; nothing else.
@@ -359,7 +360,7 @@ the tier it touches.**
   `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`,
   the two taxonomy registries (`boss-classes`, `boss-subject-kinds`),
   `boss-calendar`,
-  `boss-content`, the ML stack, `boss-cybernetics`,
+  `boss-content`, the ML stack,
   `boss-testing`, `boss-ports`, plus matching
   `*-client` crates.
 
@@ -400,8 +401,8 @@ the tier it touches.**
 
 The `infra/lint/tier-import-audit.sh` script enforces the
 Tier-1-can't-depend-on-Tier-2 rule (orchestrators excluded);
-runs cleanly today (0 violations across 28 core crates; the script's
-own line says 29 because it counts crate manifests, and `boss-expr`
+runs cleanly today (0 violations across 25 core crates; the script's
+own line says 27 because it counts crate manifests, and `boss-expr`
 carries a nested `fuzz` crate).
 
 Each domain crate has a matching `*-client` for cross-service
@@ -593,7 +594,11 @@ queue, one read (needs `BOSS_JOBS_URL`, like every SoR verb). Its
 step assigned to the id the verb signs as or to any alias the agents
 registry ties to it, grouped by kind, oldest first — because 25 such
 steps sat on the agent's alias unseen while it read only the backlog
-station (65a89769). Run it
+station (65a89769). Its **REPORTING TO** line names the person the
+session reports to — the platform owner — with the company address off
+their employee row and the timezone off the Location that row names,
+because the stack runs UTC and those two facts used to live only in
+agent memory, where nothing consulted them (2de32950). Run it
 first; this section is the checklist behind it, and the reason each
 line exists. On its first live run it named three stranded greens —
 one of which was rescued onto the next train instead of rebuilt blind.
@@ -771,13 +776,21 @@ a door that stops being true is a defect worth a car.
   silent — and `BOSS_DOOR_FRESHNESS=off` runs anything anyway. **That
   fast-forward is the machine's now** (backlog 033d1fd3): the dev pod's
   reclaim sidecar takes the checkout to the origin/main it has already
-  fetched on every hourly pass, and defers while any `gate-run` packet
-  is open, because a gate renders its runner from a tree. The operator
+  fetched on every hourly pass, and defers while a `gate-run` packet is
+  LAUNCHING — opened in the last two minutes — because a gate renders
+  its runner from a tree as it starts. It deferred on ANY open gate-run
+  until 2026-09-22, and at 12 builders that was true 84% of the day, so
+  the pass landed one time in six and the checkout sat five commits
+  behind (backlog 475fbd10); `boss gate` reads the runner manifest once,
+  before it files its packet, and the runner Job clones from the forge,
+  so an older gate has already taken everything it will take from a
+  tree. The operator
   typed that command by hand four times on 2026-09-19, and a warning
   fired four times a day is a warning nobody reads. A warning you still
-  see means the hour has not turned yet, a gate is running, or the
+  see means the hour has not turned yet, a gate was launching, or the
   merge was refused — and a refusal is loud, on the sidecar's own
-  packet. The pod's
+  packet, as is a deferral that leaves the checkout behind for more
+  than two hours. The pod's
   system-of-record spelling is `infra/dev/sor-url`, which both
   `boss-api` and the shim read — WRITTEN from the one tree source,
   `infra/estate/estate.toml`, and held equal to it by a test (since
@@ -800,7 +813,11 @@ a door that stops being true is a defect worth a car.
   correctly. The step API refuses metadata writes to a completed step and
   its 409 names this endpoint as the way to annotate instead — which is
   how it was found, in the conductor's journal, failing every ten minutes
-  for weeks (`f402a681`). On 2026-08-27 a session made ~28 hand-built
+  for weeks (`f402a681`). **To CORRECT what a completed step says, use
+  `boss correct <packet> --step <slug> --field <name>`** (`--reads-file`
+  / `--should-read-file` for the prose), never an invented metadata key:
+  it appends to the job's reserved `corrections` list, which the job GET
+  hands to every reader of that step (design `4105b020`). On 2026-08-27 a session made ~28 hand-built
   calls before finding this door at all, ~14 of them writes carrying a
   forged `emp-david` actor, so the audit log credits a human with an
   agent's work.
@@ -882,21 +899,29 @@ a door that stops being true is a defect worth a car.
   branch must not move** — the receipt vouches for the sha the gate
   resolved at launch, so a commit pushed after it leaves a car the dock
   refuses as "gated, then changed" — a rebase of a parked car is the
-  same event. **The repair is TWO calls, and the second is the one
-  that repairs.** Gate the new tip, then `boss rerail <car> --finish`,
-  which copies the fresh green onto the car as `regate_receipt` and
-  clears the stale skip. A BARE re-gate does not refresh anything: it
-  produces a green gate-run that sits BESIDE a car still vouching for
-  the old sha, which is the worst of both — the branch looks repaired
-  and the dock refuses it again. Measured twice, on two cars, a day
-  apart (`bb49056b`, and car 817b1b84 on 2026-09-21, which had been
-  left behind by seventeen consecutive trains and boarded the next one
-  after `--finish`). This document said the re-gate alone was enough,
-  which is read at exactly the moment someone is already recovering
-  from a mistake. Whether a re-gate carrying its `--park-*` flags
-  refreshes the car is UNTESTED — the park intent is the difference
-  between the two forms, and neither run measured it, so do not rely
-  on it; `--finish` is the door that has been observed to work. And
+  same event. **The repair is a re-gate that carries the green onto the
+  car, and there are two.** Gate the new tip WITH its `--park-*` flags,
+  or gate it and then run `boss rerail <car> --finish`; either copies
+  the fresh green onto the car as `regate_receipt` and clears the stale
+  skip. The park intent is the whole difference: a green carrying it
+  reaches the auto-park handler, which finds the car still at the dock
+  and refreshes it in place (`ParkAction::Refresh` in
+  `jobs_auto_park.rs`) — observed on car 9972ae75 (2026-09-19), whose
+  note reads "receipt machine-copied to regate_receipt by the auto-park
+  handler"; of the 300 newest closed cars on 2026-09-23, one was
+  refreshed that way and five by `--finish`. A BARE re-gate refreshes
+  nothing: its green sits BESIDE a car still vouching for the old sha,
+  which is the worst of both — the branch looks repaired and the dock
+  refuses it again. Measured twice, on two cars, a day apart
+  (`bb49056b`, and car 817b1b84 on 2026-09-21, which had been left
+  behind by seventeen consecutive trains and boarded the next one after
+  `--finish`). This document said first that the bare re-gate was
+  enough and then that the park-flagged one was untested, each read at
+  exactly the moment someone is already recovering from a mistake — so
+  since 539cad85 the verb says it at launch: a gate with no park intent
+  on a branch whose car is at the dock prints a WARNING naming the car,
+  the head it still vouches for, and the `boss rerail <car> --finish`
+  that carries the green onto it. And
   **prose with backticks does not survive argv**, and that is not a
   `--park-*` rule — it belongs to EVERY flag that carries a sentence
   (`boss triage --evidence`, `boss fold --change`, `boss design
@@ -909,11 +934,16 @@ a door that stops being true is a defect worth a car.
   rule", caught only because bash printed "why: command not found"
   (backlog 2376b89e). **SINGLE-quote every prose value** — the backtick
   then arrives intact — or pass the text through the flag's `-file`
-  twin (`--evidence-file`, `--change-file`, `--markdown-file`), where
-  no word expansion happens at all. **No verb can refuse this for
-  you**: the substitution happens before the process starts, so a
-  literal-backtick check would refuse the single-quoted spelling that
-  works and pass the double-quoted one that does not. The reasoning is
+  twin (`--evidence-file`, `--change-file`, `--markdown-file`,
+  `--verified-file`, `--method-file`, `--summary-file`, `--title-file`),
+  where no word expansion happens at all. A park's prose is ONE object,
+  so it has ONE file rather than six twins: `boss gate --park-file
+  park.toml` carries `summary`, `excludes`, `test`, `verified`, `probe`,
+  `expect` and `proof_event` as TOML literal strings (backlog
+  6f1e9b99). **No verb can refuse this for you**: the substitution
+  happens before the process starts, so a literal-backtick check would
+  refuse the single-quoted spelling that works and pass the
+  double-quoted one that does not. The reasoning is
   in `crates/orchestrators/boss-cli/src/prose.rs`, pinned by a test.
 
 - **The train's gate is the assembled tree's test — it belongs in the
@@ -935,6 +965,43 @@ a door that stops being true is a defect worth a car.
   `refs/tmp/*`, push that to `origin` from there, delete the temp ref.
   Never push a car branch to a push-mirror target — it force-syncs from
   the forge and the branch disappears.
+
+- **A credential admin can MINT is never placed by hand — the credential
+  broker.** The hand-placement IS the exposure. On 2026-09-02 the dev
+  pod's forge write token surfaced in a session transcript during a
+  placement walkthrough; the broker's manifest says it plainly: "the
+  ceremony itself was the vulnerability"
+  (`infra/cluster/manifests/boss-credential-broker.yaml`, packet
+  7ee101aa). A `rotate-a-credential` packet, opened on the credential's
+  registry id, is the door: a human completes only its `scope` step, and
+  the dispatcher's `credential.rotate.*` handler mints the replacement
+  with a root credential only it holds, PATCHes it into ONE named Secret,
+  verifies it by effect, and only then revokes the old one — each phase
+  a step on the packet and a `credential.*` event. It rotates two today:
+  the dev pod's forge token and the Cloudflare tunnel credentials.
+  Consumers read Secret mounts; for the residue a mount cannot reach — a
+  token file on a writable path, the git credential helper — `boss
+  credential pull forge` reads the one Secret the dev session's Role
+  names, writes the file, points the helper AT the file, scrubs any
+  helper carrying an inline password, and prints lengths and paths,
+  never a value. It refuses any target but `forge` and an empty Secret
+  (the broker has not run); `boss credential list` renders the registry,
+  which holds locations and never a value. The broker itself cannot
+  create a Secret or write any Secret but its named ones — the Roles are
+  `resourceNames`-scoped. **The boundary is derivability, not
+  sensitivity.** Root material — an admin kubeconfig, a talosconfig, the
+  broker's own root tokens — cannot be minted from anything the estate
+  holds, so placing it genuinely is David's act (`infra/forge/install.sh`
+  CHECKS `/etc/boss-ops/*`, never writes one). A scoped ServiceAccount
+  credential, a forge token, a tunnel secret is minted FROM something
+  admin already holds, so its path is the broker — a credential of a new
+  kind needs a handler for its issuer, never a runbook with David's name
+  in it. On 2026-09-20 a session designed a scoped cluster credential for
+  David to mint and place at `/etc/boss-ops/kubeconfig` by hand,
+  generalising install.sh's "placed once by David" from root material to
+  a derivable credential. David caught it; the protocol did not, because
+  this entry did not exist (backlog 3c779ca8; the delivery itself is
+  design 835c0c9c).
 
 **And the rule behind all of them: a wrong target answers instead of
 erroring.** A query against the wrong deployment returns `total: 0`. A

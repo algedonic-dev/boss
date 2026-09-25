@@ -2,17 +2,19 @@
   // Root component — parses the URL, dispatches to the matched
   // page inside AppShell.
   //
-  // Phase 1 wires /me, /jobs, /jobs/:id, /service, /sales,
-  // /assets, /assets/:id. Unmatched URLs fall back to My Day
-  // (same as the React app's default).
+  // An unmatched URL renders the not-found page, naming the path
+  // (design ee3a3a2f) — never a page it did not ask for.
 
   import { onMount } from 'svelte';
-  import { parseRoute, type Route } from './router';
+  import { href, notFoundBack, parseRoute, type Route } from './router';
+  import NotFound from '@boss/web-kit/ui/NotFound.svelte';
+  import { JOBS_DEFAULT_STATUS } from './jobs/filterQuery';
   import { goToLogin } from '@boss/web-kit/session/deadSession';
   import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
+  import { flights, loadFlights } from '@boss/web-kit/session/flights.svelte';
   import { loadDepartments, departments } from '@boss/web-kit/session/departments.svelte';
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
@@ -71,7 +73,6 @@
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
-  import CalendarPage from './calendar/CalendarPage.svelte';
   import MyCalendarPage from './calendar/MyCalendarPage.svelte';
   import SchedulePage from './schedule/SchedulePage.svelte';
   import ExecPage from './exec/ExecPage.svelte';
@@ -185,6 +186,11 @@
   onMount(() => {
     loadSession();
     loadManifest();
+    // THE VIEWER'S FLIGHTS (design c4c2a607). The gateway inlines them
+    // into index.html, so a page it served already knows; a page it did
+    // not (the dev server, a gateway whose flights read failed) asks the
+    // same endpoint once. A failed read leaves every flight off.
+    if (flights.on === null) void loadFlights();
     loadStepTypeRegistry();
     loadClasses('employee');
     loadDepartments();
@@ -254,6 +260,20 @@
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}
       <LandingPage />
+    {:else if route.kind === 'notFound'}
+      <!-- An unmatched path says so, and names the path (design
+           ee3a3a2f). Rendered in place, inside the chrome of the
+           department it was under, with one door back into it. It
+           rendered the landing page (or, under /it, the yard) until
+           then, so a dead link looked like a working one that went
+           elsewhere (backlog c4f2ae24). -->
+      {@const back = notFoundBack(route.path)}
+      <div class="theme-exec">
+        <NotFound eyebrow="Not found" title="No page at this address" backHref={href(back.href)} backLabel={back.label}>
+          Nothing in this app answers <code>{route.path}</code>. The link that brought you here is out of date or
+          mistyped.
+        </NotFound>
+      </div>
     {:else if route.kind === 'search'}
       <SearchResultsPage q={route.q} />
     {:else if route.kind === 'views'}
@@ -276,13 +296,13 @@
       <JobsListPage
         initialKind={route.workflow ?? ''}
         initialKindPrefix={route.workflowPrefix ?? ''}
-        initialStatus={route.jobStatus ?? 'open'}
+        initialStatus={route.jobStatus ?? JOBS_DEFAULT_STATUS}
         initialOwnerId={route.jobOwnerId ?? ''}
-        initialSubjectKind={route.jobSubjectKind ?? ''}
         initialSubjectId={route.jobSubjectId ?? ''}
         initialNewJobOpen={route.newJobOpen ?? false}
         initialNewJobSubjectKind={route.newJobSubjectKind ?? ''}
         initialNewJobSubjectId={route.newJobSubjectId ?? ''}
+        writesFiltersToUrl
       />
     {:else if route.kind === 'jobDetail'}
       <JobDetailPage jobId={route.jobId} />
@@ -327,11 +347,13 @@
     {:else if route.kind === 'employee'}
       <EmployeePage empId={route.empId} />
     {:else if route.kind === 'parts'}
-      <PartsList />
+      <!-- The warehouse's packets beside its stock, by the catalog
+           entry's department like the two queues above (044dffa1). -->
+      <PartsList department={ROUTE_CATALOG.parts.department ?? ''} />
     {:else if route.kind === 'part'}
       <PartPage partSku={route.partSku} />
     {:else if route.kind === 'products'}
-      <ProductsList />
+      <ProductsList initialQuery={route.q} />
     {:else if route.kind === 'product'}
       <ProductPage sku={route.productSku} />
     {:else if route.kind === 'shipping'}
@@ -341,7 +363,13 @@
     {:else if route.kind === 'support'}
       <SupportPage />
     {:else if route.kind === 'finance'}
-      <FinancePage />
+      <!-- Keyed on the route, so a navigation to /ux/finance?… while the
+           page is up (the sidebar's Finance link, a ledger-entry link)
+           mounts what the link names; the page's own tab clicks
+           replaceState and never re-parse the route (2ab44d55). -->
+      {#key route}
+        <FinancePage view={route.view} department={ROUTE_CATALOG.finance.department ?? ''} />
+      {/key}
     {:else if route.kind === 'newInvoice'}
       <NewInvoicePage />
     {:else if route.kind === 'newJournalEntry'}
@@ -403,6 +431,7 @@
       <ItTabs group="registry" active="/it/registry/dispatcher" />
       <DispatcherCascadePage />
     {:else if route.kind === 'dispatcherRulesList'}
+      <ItTabs group="registry" active="/it/registry/rules" />
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
@@ -414,8 +443,6 @@
       <ProtocolDriftPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
-    {:else if route.kind === 'calendar'}
-      <CalendarPage />
     {:else if route.kind === 'myCalendar'}
       <MyCalendarPage />
     {:else if route.kind === 'schedule'}

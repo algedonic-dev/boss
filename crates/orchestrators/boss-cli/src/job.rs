@@ -284,10 +284,14 @@ pub(crate) fn render_packet(job: &Value, width: usize) -> String {
 /// An EMPTY queue says so in words. A header with no rows under it reads
 /// identically to a failed read, which is precisely the
 /// indistinguishable-from-a-true-negative class this verb exists to end.
-pub(crate) fn station_table(body: &Value, width: usize) -> String {
+///
+/// A body with no rows array REFUSES (backlog 7b7e0529): read as zero
+/// rows, a station answering an error envelope printed "empty", which is
+/// that same class one layer down.
+pub(crate) fn station_table(body: &Value, width: usize) -> Result<String> {
     let g = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("-");
     let total = body.get("total").and_then(Value::as_u64).unwrap_or(0);
-    let rows = crate::gate::rows(Some(body.clone()));
+    let rows = crate::train::rows(Some(body.clone()))?;
     let discipline = body
         .get("discipline")
         .and_then(Value::as_array)
@@ -316,7 +320,7 @@ pub(crate) fn station_table(body: &Value, width: usize) -> String {
     );
     if rows.is_empty() {
         out.push_str("  (empty — the station holds nothing)\n");
-        return out;
+        return Ok(out);
     }
     let kw = rows
         .iter()
@@ -339,7 +343,7 @@ pub(crate) fn station_table(body: &Value, width: usize) -> String {
         out.push_str(&fit(&line, width));
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 /// What the packet holds NOW for each key the patch sent — the whole
@@ -425,13 +429,23 @@ pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> 
         let path = format!("/api/jobs?status={status}&limit={RESOLVE_PAGE}&offset={offset}");
         crate::gate::api(http, reqwest::Method::GET, &path, None).await
     };
+    resolve_through(page, job_ref).await
+}
+
+/// [`fetch_and_resolve`] over any page reader — the seam its tests go
+/// through, so the paging rules are pinned without a socket.
+pub(crate) async fn resolve_through<F, Fut>(page: F, job_ref: &str) -> Result<String>
+where
+    F: Fn(&'static str, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
     let id_of = |row: &Value| {
         row.get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .context("matched a job with no id")
     };
-    let open = crate::gate::rows(page("open", 0).await?);
+    let open = crate::train::rows(page("open", 0).await?)?;
     match resolve(&open, job_ref) {
         Ok(row) => return id_of(row),
         Err(e) if e.to_string().starts_with("no job matches") => {}
@@ -440,15 +454,15 @@ pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> 
     let mut read = 0usize;
     let mut to_read = RESOLVE_CLOSED_MAX;
     while read < to_read {
-        let body = page("closed", read).await?;
-        let total = body
-            .as_ref()
-            .and_then(|b| b.get("total"))
-            .and_then(Value::as_u64)
-            .map(|t| usize::try_from(t).unwrap_or(usize::MAX))
-            .unwrap_or(0);
-        to_read = closed_rows_to_read(total);
-        let rows = crate::gate::rows(body);
+        // A page without its `total` is refused, never read as zero
+        // closed jobs (backlog 10776b6c): zero set the depth to nothing
+        // and the verb answered "no job matches" for a packet it had
+        // not looked for.
+        let body = page("closed", read)
+            .await?
+            .context("a closed-jobs page answered no JSON body")?;
+        to_read = closed_rows_to_read(crate::train::list_total(&body)?);
+        let rows = crate::train::rows(Some(body))?;
         if rows.is_empty() {
             break;
         }
@@ -502,7 +516,7 @@ pub async fn station(name: &str, raw: bool) -> Result<()> {
     .await?
     .with_context(|| format!("the station read for {name:?} returned no body"))?;
     if raw {
-        let packets: Vec<Value> = crate::gate::rows(Some(body.clone()))
+        let packets: Vec<Value> = crate::train::rows(Some(body.clone()))?
             .iter()
             .map(|r| {
                 json!({
@@ -530,7 +544,7 @@ pub async fn station(name: &str, raw: bool) -> Result<()> {
             }))?
         );
     } else {
-        print!("{}", station_table(&body, width()));
+        print!("{}", station_table(&body, width())?);
     }
     Ok(())
 }
@@ -665,7 +679,7 @@ pub async fn list(
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_u64);
-    let rows = crate::gate::rows(body);
+    let rows = crate::train::rows(body)?;
     let w = width();
     for r in &rows {
         println!("{}", list_line(r, w));
@@ -841,8 +855,262 @@ pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `--to 3` or `--to v3` — the version the way `boss job get` prints it
+/// (`kind v3`) or bare.
+pub(crate) fn parse_version(s: &str) -> Result<i32> {
+    s.trim()
+        .trim_start_matches(['v', 'V'])
+        .parse::<i32>()
+        .with_context(|| format!("--to {s:?} is not a protocol version (e.g. 3 or v3)"))
+}
+
+/// A judged move as an operator reads it: from, to, the verdict, each
+/// obstacle by step, then what the move writes — each step re-projected
+/// with what changed on it and what it kept, and each step inserted.
+/// Pure, over the body `GET /api/jobs/{id}/convert` answers (the POST's
+/// answer carries the same two lists).
+pub(crate) fn render_move(body: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let n = |k: &str| body.get(k).and_then(Value::as_i64).unwrap_or_default();
+    let list = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let words = |v: &Value| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    let _ = writeln!(out, "v{} -> v{}", n("from"), n("to"));
+    for o in list("obstacles") {
+        let step = o
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("(protocol)");
+        let why = o.get("reason").and_then(Value::as_str).unwrap_or("?");
+        let _ = writeln!(out, "  refused  {step}: {why}");
+    }
+    for r in list("reprojected") {
+        let step = r.get("step").and_then(Value::as_str).unwrap_or("?");
+        let _ = write!(out, "  re-project  {step}: {}", words(&r["changed"]));
+        if r.get("kept").is_some() {
+            let _ = write!(out, "  (kept as written: {})", words(&r["kept"]));
+        }
+        out.push('\n');
+    }
+    for i in list("inserted") {
+        let step = i.get("step").and_then(Value::as_str).unwrap_or("?");
+        let _ = writeln!(out, "  insert  {step}");
+    }
+    out
+}
+
+/// `boss job convert <packet> [--to vN] [--dry-run]` — move a packet to
+/// another version of its protocol, or preview the move (design
+/// 7cf202a9 Q1; the CLI twin of `/api/jobs/{id}/convert`).
+///
+/// The dry run is a READ (`GET`), so it can be run across a cohort
+/// before anyone moves a packet (Q5) and needs no actor. The move is a
+/// write, and the API refuses it to anyone who may not publish a
+/// protocol version (Q4). Either way the verb asks the preview first
+/// and prints it, so a refusal names each obstacle by step instead of
+/// arriving as a 409 inside an error line.
+///
+/// CONFIRMATION OVER STATUS CODES: after a move, the packet is read back
+/// and the verb FAILS unless it is pinned to the target and its
+/// `repins` record grew by one.
+pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<()> {
+    let to = to.map(parse_version).transpose()?;
+    let http = reqwest::Client::new();
+    let id = fetch_and_resolve(&http, job_ref).await?;
+    let query = to.map(|v| format!("?to_version={v}")).unwrap_or_default();
+    let preview = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}/convert{query}"),
+        None,
+    )
+    .await?
+    .context("the conversion preview returned no body")?;
+    if preview.get("reason").is_some() {
+        println!(
+            "boss job convert: {id} — {} (v{})",
+            preview["reason"].as_str().unwrap_or("nothing to do"),
+            preview["workflow_version"]
+        );
+        return Ok(());
+    }
+    print!("{}", render_move(&preview));
+    let convertible = preview.get("convertible").and_then(Value::as_bool) == Some(true);
+    if dry_run {
+        println!(
+            "boss job convert: {id} — dry run, nothing written ({})",
+            if convertible {
+                "convertible"
+            } else {
+                "refused"
+            }
+        );
+        return Ok(());
+    }
+    if !convertible {
+        bail!(
+            "{id} cannot be moved to v{} — the obstacles above name each step",
+            preview["to"]
+        );
+    }
+
+    let before = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the packet before moving it")?;
+    let body = match to {
+        Some(v) => json!({ "to_version": v }),
+        None => json!({}),
+    };
+    crate::gate::api(
+        &http,
+        reqwest::Method::POST,
+        &format!("/api/jobs/{id}/convert"),
+        Some(body),
+    )
+    .await?;
+
+    // The status code said yes; the packet is the authority.
+    let after = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the moved packet back")?;
+    let repins = |job: &Value| {
+        job.pointer("/metadata/repins")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    if after["workflow_version"] != preview["to"] || repins(&after) != repins(&before) + 1 {
+        bail!(
+            "the API answered the move but the packet does not show it: pinned v{}, {} repins \
+             record(s) (was {})",
+            after["workflow_version"],
+            repins(&after),
+            repins(&before)
+        );
+    }
+    println!(
+        "boss job convert: {id} moved to v{} — confirmed by reading it back",
+        after["workflow_version"]
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_version_reads_bare_or_as_printed() {
+        assert_eq!(super::parse_version("3").unwrap(), 3);
+        assert_eq!(super::parse_version("v8").unwrap(), 8);
+        assert!(super::parse_version("latest").is_err());
+    }
+
+    /// The preview names every step the move touches, and what it kept.
+    #[test]
+    fn a_rendered_move_names_each_step_and_what_it_kept() {
+        let out = super::render_move(&serde_json::json!({
+            "from": 1, "to": 3, "convertible": true, "obstacles": [],
+            "reprojected": [
+                {"step": "measure", "changed": ["`procedure`"]},
+                {"step": "file", "changed": [], "kept": ["`procedure`"]},
+            ],
+            "inserted": [{"step": "draft-design"}],
+        }));
+        assert!(out.starts_with("v1 -> v3\n"), "{out}");
+        assert!(out.contains("re-project  measure: `procedure`"), "{out}");
+        assert!(out.contains("(kept as written: `procedure`)"), "{out}");
+        assert!(out.contains("insert  draft-design"), "{out}");
+    }
+
+    /// A refusal names each obstacle by step.
+    #[test]
+    fn a_rendered_refusal_names_the_step() {
+        let out = super::render_move(&serde_json::json!({
+            "from": 2, "to": 7, "convertible": false,
+            "obstacles": [{"step": "measure", "reason": "required field `x` added"}],
+        }));
+        assert!(
+            out.contains("refused  measure: required field `x` added"),
+            "{out}"
+        );
+    }
+
+    /// A closed page with no `total` is refused, never read as zero
+    /// closed jobs (backlog 10776b6c). Counted as 0, it set the read
+    /// depth to 0, the loop never ran, and the verb said "no job
+    /// matches … give the full uuid" for a packet it had not looked for.
+    #[tokio::test]
+    async fn a_closed_page_without_a_total_refuses_rather_than_matching_nothing() {
+        let why = super::resolve_through(
+            |status, _offset| async move {
+                anyhow::Ok(Some(match status {
+                    "open" => serde_json::json!({"data": [], "total": 0}),
+                    _ => serde_json::json!({"data": [{"id": "abcdef12-0000-4000-8000-000000000000"}]}),
+                }))
+            },
+            "abcdef12",
+        )
+        .await
+        .expect_err("a page that cannot say how many closed jobs exist decides nothing")
+        .to_string();
+        assert!(why.contains("total"), "{why}");
+        assert!(!why.contains("no job matches"), "{why}");
+    }
+
+    /// And with its total, the same page resolves the prefix.
+    #[tokio::test]
+    async fn a_closed_page_with_its_total_resolves_the_prefix() {
+        let id = super::resolve_through(
+            |status, _offset| async move {
+                anyhow::Ok(Some(match status {
+                    "open" => serde_json::json!({"data": [], "total": 0}),
+                    _ => serde_json::json!({
+                        "data": [{"id": "abcdef12-0000-4000-8000-000000000000"}],
+                        "total": 1
+                    }),
+                }))
+            },
+            "abcdef12",
+        )
+        .await
+        .expect("resolved");
+        assert_eq!(id, "abcdef12-0000-4000-8000-000000000000");
+    }
+
+    /// A STATION THAT DID NOT ANSWER IS NOT AN EMPTY ONE (backlog
+    /// 7b7e0529): a body with no rows array refuses rather than printing
+    /// "(empty — the station holds nothing)".
+    #[test]
+    fn a_station_body_with_no_rows_refuses_rather_than_reading_empty() {
+        let body = serde_json::json!({"error": "no such station", "total": 0});
+        let why = super::station_table(&body, 120)
+            .expect_err("an error envelope is not an empty queue")
+            .to_string();
+        assert!(why.contains("cannot be read as zero"), "{why}");
+    }
+
     #[test]
     fn a_prefix_lookup_reads_the_whole_closed_set_when_it_fits_and_the_bound_when_not() {
         assert_eq!(super::closed_rows_to_read(0), 0);
@@ -1131,7 +1399,7 @@ mod tests {
               "title": "ESTATE ALARM: disk_tight:w-1 persisted", "metadata": {} }
           ]
         });
-        let out = station_table(&body, 120);
+        let out = station_table(&body, 120).expect("a station body with rows");
 
         // The station's own facts, which are the reason to ask a station
         // rather than list jobs: depth, discipline, and the WIP limit.
@@ -1156,11 +1424,8 @@ mod tests {
         // defect class this verb exists for.
         let empty = json!({"station": "loading-dock", "kind": "batch",
                            "discipline": ["priority"], "total": 0, "data": []});
-        assert!(
-            station_table(&empty, 120).contains("empty"),
-            "{}",
-            station_table(&empty, 120)
-        );
+        let empty = station_table(&empty, 120).expect("an empty queue is an answer");
+        assert!(empty.contains("empty"), "{empty}");
     }
 
     #[test]

@@ -35,6 +35,8 @@
   // board and the terminal queue reader. See jobs/fork.ts.
   import { type Fork, forkStep as forkStepOf, gatedStep, readFork } from './fork';
   import { formatActor } from '../data/actor';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
+  import { okRead, type ReadState } from '../data/readState';
 
   type Props = Readonly<{
     /// Which queue this board shows. One Workflow today because that is
@@ -120,10 +122,12 @@
   // Employee id -> name, so a card says "David Hauld" rather than
   // `emp-bootstrap-admin` (feedback 19896c17). formatActor already
   // knows how to spell every actor kind — machines, agents, humans —
-  // and falls back to the raw id when the roster has not arrived or
-  // does not contain the id, so a slow or failed fetch degrades to
-  // exactly the old behaviour rather than to a blank.
-  let empNames = $state<Map<string, string>>(new Map());
+  // and falls back to the raw id when a name has not arrived, so a slow
+  // or failed read degrades to the ids rather than to a blank — and,
+  // since backlog 1e73bd93, `namesRead` says so rather than leaving an
+  // outage looking like a board of people with ids for names.
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let busy = $state<Record<string, boolean>>({});
@@ -434,25 +438,38 @@
     if (j) void route(j, col);
   }
 
-  // The roster is decoration, not data the board depends on: it is
-  // fetched alongside `load` rather than inside it, and a failure is
-  // swallowed. formatActor falls back to the raw id, so the worst
-  // case is the ids we were already showing — a board that refuses to
-  // render because /api/people is down would be a strictly worse
-  // trade than a card that says `emp-bootstrap-admin`.
-  async function loadRoster() {
-    try {
-      const r = await fetch('/api/people');
-      if (!r.ok) return;
-      const roster = (await r.json()) as ReadonlyArray<{ id: string; name?: string }>;
-      empNames = new Map(roster.map((e) => [e.id, e.name ?? '']));
-    } catch {
-      /* names stay ids */
-    }
-  }
+  // Names are decoration, not data the board depends on: they are read
+  // beside `load` rather than inside it, and a board that refused to
+  // render because the people service is down would be a strictly
+  // worse trade than a card that says `emp-bootstrap-admin`. But a
+  // failure is SAID (one line above the board), not swallowed.
+  //
+  // Only the people shown are read — card owners, and the step
+  // assignees the packet modal names — one row each through the shared
+  // reader, where this read the WHOLE roster until backlog 1e73bd93.
+  // Keyed on the id list as a string, because `jobs` is replaced on
+  // every poll and the same people should not be re-asked each time.
+  let namesKey = $derived(
+    personIdsOf(
+      jobs.flatMap((j) => [j.owner_id, ...(j.steps ?? []).map((s) => s.assignee_id)]),
+    ).join('\n'),
+  );
+  $effect(() => {
+    const ids = namesKey ? namesKey.split('\n') : [];
+    let cancelled = false;
+    (async () => {
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
 
   onMount(load);
-  onMount(loadRoster);
 </script>
 
 <PageHeader {title} {subtitle} />
@@ -465,6 +482,11 @@
   <p class="tb-msg">{emptyMessage}</p>
   {@render archiveNote()}
 {:else}
+  {#if namesRead.kind === 'failed'}
+    <p class="tb-msg tb-err load-failed" role="alert">
+      Couldn't load owner names — {namesRead.error}. Owners show as ids.
+    </p>
+  {/if}
   <div class="tb-board">
     {#each columns as col (col.id)}
       {@const cards = byColumn[col.id] ?? []}
@@ -669,8 +691,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    background: var(--bg, #f5f5f4);
-    border: 1px solid var(--border, #e7e5e4);
+    background: var(--bg);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px;
     /* A column must be a target worth aiming at even with nothing in
@@ -679,8 +701,8 @@
     min-height: 160px;
   }
   .tb-col-over {
-    border-color: #78716c;
-    background: var(--card, #fff);
+    border-color: var(--border-strong);
+    background: var(--card);
   }
   .tb-col-head {
     display: flex;
@@ -693,39 +715,39 @@
   }
   .tb-count {
     font-size: 11px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     font-variant-numeric: tabular-nums;
   }
   .tb-col-hint {
     font-size: 11px;
-    color: var(--text-dim, #a8a29e);
+    color: var(--text-dim);
     margin: 0 0 4px;
   }
   .tb-col-empty {
     margin: 0;
     font-size: 11px;
-    color: var(--text-dim, #a8a29e);
+    color: var(--text-dim);
     font-style: italic;
   }
   .tb-drop-zone {
     margin: 0;
     padding: 14px 10px;
-    border: 1px dashed var(--text-dim, #a8a29e);
+    border: 1px dashed var(--text-dim);
     border-radius: 6px;
     text-align: center;
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .tb-drop-zone-over {
-    border-color: #1c1917;
+    border-color: var(--border-strong);
     border-style: solid;
-    color: #1c1917;
-    background: var(--card, #fff);
+    color: var(--fog);
+    background: var(--card);
   }
 
   .tb-card {
-    background: var(--card, #fff);
-    border: 1px solid var(--border, #e7e5e4);
+    background: var(--card);
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 10px;
     display: flex;
@@ -744,7 +766,7 @@
   @media (prefers-reduced-motion: reduce) {
     .tb-card-dragging {
       opacity: 1;
-      outline: 2px dashed #78716c;
+      outline: 2px dashed var(--border-strong);
     }
   }
   .tb-card-title {
@@ -758,13 +780,13 @@
     gap: 8px;
     flex-wrap: wrap;
     font-size: 11px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .tb-by {
     margin-left: auto;
   }
   .tb-finding {
-    border-left: 2px solid #0f766e;
+    border-left: 2px solid var(--signal);
     padding-left: 8px;
     display: flex;
     flex-direction: column;
@@ -778,13 +800,13 @@
   }
   .tb-finding-by {
     font-size: 10px;
-    color: var(--text-dim, #a8a29e);
+    color: var(--text-dim);
   }
   .tb-finding-input {
     font: inherit;
     font-size: 12px;
     padding: 6px;
-    border: 1px solid var(--border, #e7e5e4);
+    border: 1px solid var(--border);
     border-radius: 4px;
     resize: vertical;
     width: 100%;
@@ -793,7 +815,7 @@
   .tb-agent {
     margin: 0;
     font-size: 11px;
-    color: #b45309;
+    color: var(--warn);
   }
   .tb-actions {
     display: flex;
@@ -805,8 +827,8 @@
     font-size: 12px;
     padding: 3px 6px;
     border-radius: 4px;
-    border: 1px solid var(--border, #e7e5e4);
-    background: var(--card, #fff);
+    border: 1px solid var(--border);
+    background: var(--card);
     color: inherit;
     flex: 1 1 auto;
     min-width: 0;
@@ -816,15 +838,15 @@
     font-size: 12px;
     padding: 3px 8px;
     border-radius: 4px;
-    border: 1px solid var(--border, #e7e5e4);
-    background: var(--bg, #f5f5f4);
+    border: 1px solid var(--border);
+    background: var(--bg);
     color: inherit;
     cursor: pointer;
   }
   .tb-btn-primary {
-    background: #1c1917;
-    color: #fff;
-    border-color: #1c1917;
+    background: var(--band);
+    color: var(--on-band);
+    border-color: var(--border-strong);
   }
   .tb-btn:disabled {
     opacity: 0.5;
@@ -839,17 +861,17 @@
     white-space: nowrap;
   }
   .tb-msg {
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     font-size: 14px;
   }
   .tb-err {
-    color: #b91c1c;
+    color: var(--err);
   }
   /* A footnote, not a banner. It answers a question someone might
      have; it is not news. */
   .tb-note {
     margin: 12px 2px 0;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     font-size: 12px;
   }
   .tb-note a {

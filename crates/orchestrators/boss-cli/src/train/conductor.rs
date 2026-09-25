@@ -1043,24 +1043,218 @@ impl Conductor {
     /// `boss gate` performs, without the operator-facing guards (the
     /// train branch is the conductor's own, freshly assembled on main).
     /// What the train's gate-run says failed (`train_gate::fails`) and
-    /// why (`train_gate::fails_excerpt`), for the red-train alert — both
-    /// off the one GET. Empty when the train has no gate-run or it
-    /// cannot be read this pass — the alert then names what the forge
-    /// names, as before; a missing name is never an error here.
-    async fn train_gate_fails(&self, t: &Value) -> (Vec<String>, Vec<(String, String)>) {
+    /// why (`train_gate::fails_excerpt`), for the red-train alert, and
+    /// the head it judged (`train_gate::judged_head`), for the question
+    /// whether the red lies outside the consist — all off the one GET.
+    /// Empty when the train has no gate-run or it cannot be read this
+    /// pass — the alert then names what the forge names, as before, and
+    /// the train keeps the stall rule; a missing name is never an error
+    /// here.
+    async fn train_gate_fails(
+        &self,
+        t: &Value,
+    ) -> (Vec<String>, Vec<(String, String)>, Option<String>) {
         let Some(run_id) = t
             .pointer(&format!("/metadata/{}", crate::train_gate::KEY_RUN))
             .and_then(Value::as_str)
         else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), None);
         };
         match self.get_job(run_id).await {
             Ok(run) => (
                 crate::train_gate::fails(&run),
                 crate::train_gate::fails_excerpt(&run),
+                crate::train_gate::judged_head(&run),
             ),
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(_) => (Vec::new(), Vec::new(), None),
         }
+    }
+
+    /// The train's boarded cars as the jobs API holds them now, for the
+    /// once-per-car bound on an outside release. ALL or NOTHING: one car
+    /// that cannot be read might be the one carrying the stamp, so a
+    /// partial read answers empty — no early release, the stall rule
+    /// decides (backlog 5541d813).
+    async fn boarded_cars(&self, t: &Value) -> Vec<Value> {
+        let ids: Vec<&str> = t
+            .get("metadata")
+            .and_then(|m| m.get("boarded_jobs"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut cars = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.get_job(id).await {
+                Ok(car) => cars.push(car),
+                Err(_) => return Vec::new(),
+            }
+        }
+        cars
+    }
+
+    /// The files one car changed, from the conductor's clone: `git diff
+    /// --name-only origin/main...<boarded head>` — three dots, from the
+    /// merge-base, so a car on an older base reports its own change and
+    /// not main's since. Any git failure answers empty, which names the
+    /// car for nothing: no hold, the release alone.
+    fn car_changed_files(&self, head: &str) -> Vec<String> {
+        let range = format!("origin/main...{head}");
+        sh(&[
+            "git",
+            "-C",
+            self.cfg.clone.as_str(),
+            "diff",
+            "--name-only",
+            &range,
+        ])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            stdout_str(&o)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Brake the car(s) a JUDGED red names (a2d4d842): a file the
+    /// verdict locates that exactly ONE car aboard changed puts that car
+    /// on hold — `boss hold`'s marker on its open review step, so the
+    /// dock will not board it and `boss release` takes it off. Without
+    /// it the car goes back to the dock, re-boards the next train alone,
+    /// goes red again on the same file, and only its second strike stops
+    /// it — one more train spent learning what this one already said.
+    ///
+    /// BEST-EFFORT and silent-proof: every refusal logs a line naming
+    /// the car and why, and nothing here can abort the cancel.
+    async fn hold_named_cars(
+        &self,
+        t: &Value,
+        tid: &str,
+        named: &[String],
+        gate_fails: &[String],
+        gate_excerpt: &[(String, String)],
+        rollup: Option<&Value>,
+    ) {
+        let located = verdict_located_files(gate_fails, gate_excerpt, rollup);
+        if located.is_empty() {
+            log(format!(
+                "train {}: judged red names no file — releasing without a hold",
+                id8(tid)
+            ));
+            return;
+        }
+        let cars = self.boarded_cars(t).await;
+        let aboard = releasable_cars(&cars, tid);
+        let car_files: Vec<(String, Vec<String>)> = aboard
+            .iter()
+            .filter_map(|c| {
+                let id = c.get("id").and_then(Value::as_str)?;
+                let head = boarded_head(c)?;
+                Some((id.to_string(), self.car_changed_files(head)))
+            })
+            .collect();
+        let to_hold = cars_to_hold(&located, &car_files);
+        if to_hold.is_empty() {
+            log(format!(
+                "train {}: judged red in {} — no single car aboard changed it, so none is held",
+                id8(tid),
+                located.join(", ")
+            ));
+        }
+        for (cid, files) in to_hold {
+            let Some(car) = aboard
+                .iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some(cid.as_str()))
+            else {
+                continue;
+            };
+            let review = match crate::steps::holdable(car) {
+                Ok(r) => r,
+                Err(why) => {
+                    log(format!("car {}: not held — {why}", id8(&cid)));
+                    continue;
+                }
+            };
+            if let Some(already) = review
+                .get("metadata")
+                .and_then(boss_jobs::stranded::hold_reason)
+            {
+                log(format!("car {}: already held ({already})", id8(&cid)));
+                continue;
+            }
+            let Some(sid) = review.get("id").and_then(Value::as_str) else {
+                log(format!(
+                    "car {}: not held — its review step has no id",
+                    id8(&cid)
+                ));
+                continue;
+            };
+            let reason = judged_red_hold_reason(tid, named, &files);
+            if self.cfg.dry {
+                log(format!("DRY: would hold car {} ({reason})", id8(&cid)));
+                continue;
+            }
+            match self
+                .api(
+                    Method::PATCH,
+                    &format!("/api/jobs/{cid}/steps/{sid}/metadata"),
+                    Some(crate::steps::hold_patch(&reason)),
+                )
+                .await
+            {
+                Ok(_) => log(format!("held car {}: {reason}", id8(&cid))),
+                Err(e) => log(format!(
+                    "car {}: hold not written (non-fatal; the cancel and its strike stand): {e}",
+                    id8(&cid)
+                )),
+            }
+        }
+    }
+
+    /// The evidence `red_outside_consist` judges, read from the
+    /// conductor's own clone, where the train was assembled on main:
+    /// the consist's changed files (`git diff --name-only
+    /// origin/main...<head>` — three dots, from the merge-base, so a
+    /// main that moved since assembly adds nothing) and which of the
+    /// `failing` files exist in the tree the gate judged. Any git
+    /// failure answers empty, which `red_outside_consist` reads as
+    /// "not proven" — the train then keeps the stall rule and its
+    /// strikes, exactly as before (backlog 5541d813).
+    fn consist_evidence(&self, head: &str, failing: &[String]) -> (Vec<String>, Vec<String>) {
+        if failing.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let clone = self.cfg.clone.as_str();
+        let lines = |args: &[&str]| -> Vec<String> {
+            sh(args)
+                .map(|o| {
+                    stdout_str(&o)
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let range = format!("origin/main...{head}");
+        let consist = lines(&["git", "-C", clone, "diff", "--name-only", &range]);
+        let mut ls = vec![
+            "git",
+            "-C",
+            clone,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            head,
+            "--",
+        ];
+        ls.extend(failing.iter().map(String::as_str));
+        (consist, lines(&ls))
     }
 
     async fn launch_train_gate(&self, t: &Value, tid: &str) -> Result<String> {
@@ -1085,6 +1279,27 @@ impl Conductor {
         .map(|o| stdout_str(&o).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| short.to_string());
+        let title = t.get("title").and_then(Value::as_str).unwrap_or("PR train");
+        self.launch_gate(
+            branch,
+            &sha,
+            crate::gate::Requester::Train,
+            crate::train_gate::packet_marks(tid, title),
+        )
+        .await
+    }
+
+    /// File a gate-run for `branch@sha`, stamp `marks` on it, and create
+    /// its Job — the train's gate, and since backlog 969a1092 the dock's
+    /// re-gate of a car main moved under. One launch path, so the two
+    /// cannot differ in how a gate is admitted, filed or run.
+    async fn launch_gate(
+        &self,
+        branch: &str,
+        sha: &str,
+        who: crate::gate::Requester,
+        marks: Value,
+    ) -> Result<String> {
         let manifest_text =
             std::fs::read_to_string(&self.cfg.gate_manifest).with_context(|| {
                 format!(
@@ -1096,9 +1311,9 @@ impl Conductor {
         let ns = self.cfg.gate_namespace.as_str();
         let max = crate::gate::max_concurrent(&self.http).await?;
         let live = crate::gate::running_gates(ns)?;
-        // The train is admitted AT the bound (48f7aba1): the one
-        // predicate `boss gate` also consults, with the train's answer.
-        if !crate::gate::admits(live.len(), max, crate::gate::Requester::Train) {
+        // The train is admitted AT the bound (48f7aba1), a car's re-gate
+        // below it: the one predicate `boss gate` also consults.
+        if !crate::gate::admits(live.len(), max, who) {
             bail!(
                 "the cluster is at its gate bound ({} running of {max}: {})",
                 live.len(),
@@ -1112,7 +1327,7 @@ impl Conductor {
                 "/api/jobs",
                 Some(crate::gate::gate_run_body(
                     branch,
-                    &sha,
+                    sha,
                     &self.cfg.gate_manifest,
                     None,
                     &owner,
@@ -1123,16 +1338,15 @@ impl Conductor {
             .as_ref()
             .and_then(|c| c.get("data").unwrap_or(c).get("id"))
             .and_then(Value::as_str)
-            .context("the jobs API returned no id for the train's gate-run")?
+            .with_context(|| format!("the jobs API returned no id for {branch}'s gate-run"))?
             .to_string();
-        let title = t.get("title").and_then(Value::as_str).unwrap_or("PR train");
         self.api(
             Method::PATCH,
             &format!("/api/jobs/{run_id}/metadata"),
-            Some(crate::train_gate::packet_marks(tid, title)),
+            Some(marks),
         )
         .await
-        .context("marking the gate-run as the train's")?;
+        .with_context(|| format!("marking gate-run {} for {branch}", id8(&run_id)))?;
         let job = crate::gate::render_job(&manifest_text, branch, &run_id, "--auto")?;
         let mut child = crate::gate::kubectl(ns)
             .args(["create", "-f", "-"])
@@ -1152,7 +1366,7 @@ impl Conductor {
         let out = child.wait_with_output()?;
         if !out.status.success() {
             bail!(
-                "kubectl create failed for the train gate ({}): {}",
+                "kubectl create failed for the gate of {}: {}",
                 branch,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -1387,10 +1601,10 @@ impl Conductor {
             // so a broken alert is at worst a missing alert, never a wedge.
             // The gate's failing checks are read only on a red pass —
             // one extra GET when there is something to name.
-            let (gate_fails, gate_excerpt) = if verdict == "failing" {
+            let (gate_fails, gate_excerpt, gate_head) = if verdict == "failing" {
                 self.train_gate_fails(&t).await
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), None)
             };
             if info.get("state").and_then(Value::as_str) == Some("OPEN")
                 && let Some(alert) = red_train_alert(
@@ -1428,20 +1642,108 @@ impl Conductor {
                 return Ok(());
             }
 
+            // A red in files no car aboard changed releases the consist
+            // NOW and UNSTRUCK (backlog 5541d813): trains 36692142 and
+            // 578a0ee9 each held the one track on a failure no car
+            // touched until an operator cancelled by hand, because the
+            // only other way out was six hours of stall and a strike on
+            // every car. Proven from the record or not at all — the
+            // receipt's located failures, the judged head's diff — and a
+            // red in a file a car DID change keeps the stall rule and its
+            // strikes. It releases; it never merges.
+            let outside = gate_head.as_deref().and_then(|head| {
+                let failing: Vec<String> = gate_fails
+                    .iter()
+                    .filter_map(|e| fails_entry_path(e))
+                    .collect();
+                let (consist, present) = self.consist_evidence(head, &failing);
+                red_outside_consist(
+                    &gate_fails,
+                    info.get("statusCheckRollup"),
+                    &consist,
+                    &present,
+                )
+            });
+            // ONCE PER CAR: the cars aboard are read only when the red is
+            // proven outside, and a car already stamped by an earlier
+            // outside release sends the train to today's path — the
+            // livelock bound for a pair red only when assembled.
+            let decision = match outside.as_deref() {
+                Some(files) => {
+                    let cars = self.boarded_cars(&t).await;
+                    outside_consist_cancel_reason(&t, verdict, files, &cars)
+                }
+                None => None,
+            };
+            let spent_note = match &decision {
+                Some(OutsideRelease::Spent(note)) => {
+                    log(format!(
+                        "train {}: {note} — holding for the stall rule",
+                        id8(&tid)
+                    ));
+                    Some(note.clone())
+                }
+                _ => None,
+            };
+            // A JUDGED red — CI and the train gate both finished, one of
+            // them red, the red naming its check — does not wait out the
+            // stall rule (a2d4d842): trains f7bd1e9d and 02801b05 held
+            // the one track 40 and 27 minutes on 2026-09-24, each red on
+            // a named `CI / web` with its gate red on the same
+            // svelte-check, until an operator cancelled by hand. The
+            // six-hour rule stays the backstop for every red this does
+            // not judge.
+            let judged = judged_red_checks(
+                &t,
+                forge_verdict,
+                gate.as_ref(),
+                info.get("statusCheckRollup"),
+                &gate_fails,
+            );
+            // (reason, strike, outside release granted)
+            let cancel = match decision {
+                Some(OutsideRelease::Release(reason)) => Some((reason, false, true)),
+                _ => judged
+                    .as_deref()
+                    .map(|named| judged_red_cancel_reason(named, policy.stall_hours))
+                    .or_else(|| auto_cancel_reason(&t, verdict, now, policy.stall_hours))
+                    .map(|reason| {
+                        // Anything but a granted release is today's path,
+                        // strikes and all — an unread consist or a spent
+                        // release proves nothing for the cars.
+                        let reason = match &spent_note {
+                            Some(note) => format!("{reason} — {note}"),
+                            None => reason,
+                        };
+                        let strike = verdict_strikes_cars(verdict, info.get("statusCheckRollup"));
+                        (reason, strike, false)
+                    }),
+            };
             if self.cfg.auto_cancel
                 && info.get("state").and_then(Value::as_str) == Some("OPEN")
-                && let Some(reason) = auto_cancel_reason(&t, verdict, now, policy.stall_hours)
+                && let Some((reason, strike, outside_release)) = cancel
             {
                 log(format!("train {} auto-cancelling: {reason}", id8(&tid)));
+                // The car the failure names is braked BEFORE the release
+                // clears its train marker, so it never reads boardable
+                // in between. Best-effort: a hold that cannot be written
+                // leaves the cancel and its strike standing.
+                if !outside_release && let Some(named) = judged.as_deref() {
+                    self.hold_named_cars(
+                        &t,
+                        &tid,
+                        named,
+                        &gate_fails,
+                        &gate_excerpt,
+                        info.get("statusCheckRollup"),
+                    )
+                    .await;
+                }
                 if self.cfg.dry {
                     log(format!("DRY: would cancel {} ({reason})", id8(&tid)));
                 } else {
-                    self.cancel_train(
-                        &tid,
-                        &reason,
-                        verdict_strikes_cars(verdict, info.get("statusCheckRollup")),
-                    )
-                    .await?;
+                    self.cancel_train(&tid, &reason, strike, outside_release)
+                        .await?;
                 }
                 return Ok(());
             }
@@ -1831,6 +2133,23 @@ impl Conductor {
         let mut cars: Vec<(String, Value, String)> = Vec::new(); // (id, job, branch)
         for j0 in listed {
             let jid = job_id(&j0)?.to_string();
+            // A car off the dock keeps no preview (20d0d717): nothing
+            // here rewrites it, so it would name the dock it last saw
+            // forever. Cleared once, on the tick after it leaves — and
+            // best-effort, so one failed write cannot cost the parked
+            // cars their preview this tick; it is retried on the next.
+            if left_the_dock_with_a_preview(&j0) && !self.cfg.dry {
+                match self
+                    .merge_job_metadata(&jid, vec![("merge_preview", Value::Null)])
+                    .await
+                {
+                    Ok(_) => log(format!(
+                        "{}: merge preview cleared (left the dock)",
+                        id8(&jid)
+                    )),
+                    Err(e) => log(format!("{}: merge preview clear failed: {e}", id8(&jid))),
+                }
+            }
             if !parked_ready(&j0) {
                 continue;
             }
@@ -2562,12 +2881,33 @@ impl Conductor {
             // just published is judged on what actually landed there
             // rather than on what was offered.
             let boards = fork_head(&self.cfg.clone, &branch)?;
-            if let Some(reason) = receipt_skip_reason(&j, boards.as_deref()) {
+            // THE DOCK'S RE-GATE (backlog 969a1092) owns two of the holds
+            // below: a receipt the DOCK outran — it replayed the branch
+            // onto main, and the re-gate's green has not refreshed the
+            // car yet — and a car whose receipt still vouches for its
+            // head but whose files main has since moved into. Every other
+            // car passes through both untouched.
+            let hold = match receipt_skip_reason(&j, boards.as_deref()) {
+                Some(reason) => Some(
+                    match boards.as_deref().and_then(|b| dock_regate::pending(&j, b)) {
+                        Some(stamp) => self.regate_in_flight(&j, &jid, &branch, stamp).await,
+                        None => (reason, None),
+                    },
+                ),
+                None => match boards.as_deref() {
+                    Some(head) => self.base_hold(&j, &jid, &branch, head).await,
+                    None => None,
+                },
+            };
+            if let Some((reason, stamp)) = hold {
                 log(format!("{}: {reason} — leaving behind", id8(&jid)));
                 left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
                 if !self.cfg.dry {
-                    self.merge_job_metadata(&jid, vec![("skip_reason", json!(reason))])
-                        .await?;
+                    let mut kv = vec![("skip_reason", json!(reason))];
+                    if let Some(stamp) = stamp {
+                        kv.push((dock_regate::BASE_REGATE, stamp));
+                    }
+                    self.merge_job_metadata(&jid, kv).await?;
                 }
                 continue;
             }
@@ -2615,6 +2955,228 @@ impl Conductor {
             }
             EdgeOutcome::Hold(h) => Some(h),
         }
+    }
+
+    /// Does main's movement since this car's gate hold it back? `None` =
+    /// board it; otherwise the skip reason and, when this pass launched or
+    /// refused a re-gate, the `base_regate` stamp to record (backlog
+    /// 969a1092 — the rule and the bound are `dock_regate`'s).
+    ///
+    /// INFALLIBLE BY SIGNATURE, for `edge_hold`'s reason: this runs inside
+    /// the loop that boards every train, and a base git cannot read is not
+    /// a finding about the car. It boards, and the journal says why.
+    async fn base_hold(
+        &self,
+        car: &Value,
+        jid: &str,
+        branch: &str,
+        head: &str,
+    ) -> Option<(String, Option<Value>)> {
+        let reading = match dock_regate::read_base(&self.cfg.clone, head) {
+            Ok(r) => r,
+            Err(e) => {
+                log(format!(
+                    "{}: could not read its base against main ({e:#}) — boarding as gated; the \
+                     train gate still judges the assembled tree",
+                    id8(jid)
+                ));
+                return None;
+            }
+        };
+        let stamp = dock_regate::RegateStamp::of(car);
+        match dock_regate::judge(reading.as_ref(), stamp.as_ref()) {
+            dock_regate::DockBase::Current => None,
+            dock_regate::DockBase::Untouched { main_changed } => {
+                log(format!(
+                    "{}: behind main, but none of the {main_changed} path(s) main changed since \
+                     its gate touch it — boards as gated",
+                    id8(jid)
+                ));
+                None
+            }
+            // Already re-gated for this main: the bound. The only way here
+            // is a refused replay — a launched one moved the branch and is
+            // read by `regate_in_flight` instead.
+            dock_regate::DockBase::Touched {
+                launch: false,
+                touched,
+            } => {
+                let stamp = stamp.unwrap_or_default();
+                let reason = if stamp.refused.is_empty() {
+                    format!(
+                        "already re-gated once for main {} (gate-run {}) and still behind it with \
+                         {} path(s) touched — the dock re-gates it again when main moves",
+                        &stamp.main[..8.min(stamp.main.len())],
+                        id8(&stamp.gate_run),
+                        touched.len()
+                    )
+                } else {
+                    dock_regate::refused_reason(jid, &stamp)
+                };
+                Some((reason, None))
+            }
+            dock_regate::DockBase::Touched {
+                launch: true,
+                touched,
+            } => {
+                let reading = reading?;
+                self.launch_base_regate(car, jid, branch, &reading, &touched)
+                    .await
+            }
+        }
+    }
+
+    /// Replay the car onto current main and file its re-gate — the
+    /// `boss gate --rebase --park-*` a builder would run, run by the dock.
+    /// `None` = the MEANS failed and the car boards as gated.
+    async fn launch_base_regate(
+        &self,
+        car: &Value,
+        jid: &str,
+        branch: &str,
+        reading: &dock_regate::BaseReading,
+        touched: &[String],
+    ) -> Option<(String, Option<Value>)> {
+        let stamp = dock_regate::RegateStamp {
+            base: reading.base.clone(),
+            ..dock_regate::RegateStamp::for_main(&reading.main, touched)
+        };
+        if self.cfg.dry {
+            log(format!(
+                "DRY: {}: main moved into {} of its path(s) since its gate — would replay it onto \
+                 main and re-gate it",
+                id8(jid),
+                touched.len()
+            ));
+            return Some((dock_regate::busy_reason("dry run", reading, touched), None));
+        }
+        // A SLOT, AND THE MEANS TO USE IT, BEFORE THE BRANCH MOVES. A
+        // replayed branch no longer matches its receipt, so a car moved
+        // and then not gated is a car that cannot board — check first.
+        let ns = self.cfg.gate_namespace.as_str();
+        let slot: Result<(usize, usize)> = async {
+            std::fs::metadata(&self.cfg.gate_manifest).with_context(|| {
+                format!("no gate runner manifest at {}", self.cfg.gate_manifest)
+            })?;
+            let max = crate::gate::max_concurrent(&self.http).await?;
+            Ok((crate::gate::running_gates(ns)?.len(), max))
+        }
+        .await;
+        match slot {
+            Ok((live, max)) if crate::gate::admits(live, max, crate::gate::Requester::Car) => {}
+            Ok((live, max)) => {
+                let why = format!("{live} gate(s) running of {max}");
+                return Some((dock_regate::busy_reason(&why, reading, touched), None));
+            }
+            Err(e) => {
+                log(format!(
+                    "{}: main moved into its files, but no gate can be launched ({e:#}) — \
+                     boarding as gated; the train gate still judges the assembled tree",
+                    id8(jid)
+                ));
+                return None;
+            }
+        }
+        let rebased = match crate::freshness::rebase_onto_main(Path::new(&self.cfg.clone), branch) {
+            Ok(r) => r,
+            Err(e) if dock_regate::replay_refused(&e) => {
+                let refused = format!("{e:#}");
+                let stamp = dock_regate::RegateStamp {
+                    refused: refused.lines().next().unwrap_or_default().to_string(),
+                    ..stamp
+                };
+                return Some((
+                    dock_regate::refused_reason(jid, &stamp),
+                    Some(stamp.to_value(Utc::now())),
+                ));
+            }
+            Err(e) => {
+                log(format!(
+                    "{}: main moved into its files, but replaying it failed ({e:#}) — boarding \
+                     as gated; the train gate still judges the assembled tree",
+                    id8(jid)
+                ));
+                return None;
+            }
+        };
+        let stamp = dock_regate::RegateStamp {
+            head: rebased.new_head.clone(),
+            ..stamp
+        };
+        log(format!(
+            "{}: main moved into {} of its path(s) since its gate — replayed {} -> {} onto main {}",
+            id8(jid),
+            touched.len(),
+            &rebased.old_head[..8.min(rebased.old_head.len())],
+            &rebased.new_head[..8.min(rebased.new_head.len())],
+            &reading.main[..8.min(reading.main.len())],
+        ));
+        Some(self.file_regate(car, jid, branch, stamp).await)
+    }
+
+    /// File the gate-run for a replayed car and say what happened — the
+    /// half of a launch that is retried when it fails, because the branch
+    /// has already moved.
+    async fn file_regate(
+        &self,
+        car: &Value,
+        jid: &str,
+        branch: &str,
+        stamp: dock_regate::RegateStamp,
+    ) -> (String, Option<Value>) {
+        let marks = dock_regate::marks(car, jid, &stamp.main);
+        match self
+            .launch_gate(branch, &stamp.head, crate::gate::Requester::Car, marks)
+            .await
+        {
+            Ok(run) => {
+                let stamp = dock_regate::RegateStamp {
+                    gate_run: run,
+                    ..stamp
+                };
+                (
+                    dock_regate::launched_reason(&stamp),
+                    Some(stamp.to_value(Utc::now())),
+                )
+            }
+            Err(e) => (
+                dock_regate::unfiled_reason(&stamp, &format!("{e:#}")),
+                Some(stamp.to_value(Utc::now())),
+            ),
+        }
+    }
+
+    /// A car the dock replayed, whose receipt has not caught up: where its
+    /// re-gate stands, and the gate-run filed if the launch never got that
+    /// far. Always a hold — the car's receipt does not vouch for its head.
+    async fn regate_in_flight(
+        &self,
+        car: &Value,
+        jid: &str,
+        branch: &str,
+        stamp: dock_regate::RegateStamp,
+    ) -> (String, Option<Value>) {
+        if stamp.gate_run.is_empty() {
+            if self.cfg.dry {
+                let r =
+                    dock_regate::in_flight_reason(jid, &stamp, &dock_regate::InFlight::FileGate);
+                return (r, None);
+            }
+            return self.file_regate(car, jid, branch, stamp).await;
+        }
+        let verdict = match self.get_job(&stamp.gate_run).await {
+            Ok(run) => boss_jobs::flake::verdict(&run).map(str::to_string),
+            Err(e) => {
+                log(format!(
+                    "{}: could not read its re-gate {} ({e:#}) — reading it as still running",
+                    id8(jid),
+                    id8(&stamp.gate_run)
+                ));
+                None
+            }
+        };
+        let standing = dock_regate::in_flight(&stamp, verdict.as_deref());
+        (dock_regate::in_flight_reason(jid, &stamp, &standing), None)
     }
 
     async fn open_train_job(&self, train_branch: &str, window: &str) -> Result<Option<Value>> {
@@ -3324,7 +3886,7 @@ impl Conductor {
     /// withdrawn change), and only the automatic red-stall path below
     /// has evidence that the CARS were implicated.
     pub(super) async fn cancel(&self, handle: &str, reason: &str) -> Result<()> {
-        self.cancel_train(handle, reason, false).await
+        self.cancel_train(handle, reason, false, false).await
     }
 
     /// Honour an operator's `cancel_requested` stamp — the yard's cancel
@@ -3380,7 +3942,7 @@ impl Conductor {
         log(format!("train {} cancelling: {reason}", id8(tid)));
         if self.cfg.dry {
             log(format!("DRY: would cancel {} ({reason})", id8(tid)));
-        } else if let Err(e) = self.cancel_train(tid, &reason, false).await {
+        } else if let Err(e) = self.cancel_train(tid, &reason, false, false).await {
             log(format!(
                 "train {}: cancel failed (non-fatal, train intact, retries next pass): {e}",
                 id8(tid)
@@ -3389,7 +3951,16 @@ impl Conductor {
         true
     }
 
-    async fn cancel_train(&self, handle: &str, reason: &str, count_red: bool) -> Result<()> {
+    /// `outside_release`: this cancel is a red proven outside the consist,
+    /// so every released car is stamped with the train's id as its one
+    /// such release (`KEY_OUTSIDE_RELEASE`, backlog 5541d813).
+    async fn cancel_train(
+        &self,
+        handle: &str,
+        reason: &str,
+        count_red: bool,
+        outside_release: bool,
+    ) -> Result<()> {
         let listed = rows(
             self.api(
                 Method::GET,
@@ -3546,8 +4117,11 @@ impl Conductor {
             // that predates this change still carries a completed review
             // and cannot be released; those were translated into fresh
             // packets by hand on 2026-08-15 rather than reversed.
-            self.merge_job_metadata(cid, release_stamps(car, reason, count_red))
-                .await?;
+            self.merge_job_metadata(
+                cid,
+                release_stamps(car, reason, count_red, outside_release.then_some(tid)),
+            )
+            .await?;
             log(format!("released car {} back to the dock", id8(cid)));
         }
 
@@ -3874,7 +4448,9 @@ mod tests {
         );
         c.cfg.jobs = format!("http://{addr}");
 
-        let res = c.cancel_train("t1", "forge unreachable", false).await;
+        let res = c
+            .cancel_train("t1", "forge unreachable", false, false)
+            .await;
         assert!(res.is_err(), "cancel must surface the close_pr failure");
         assert!(
             *close_called.lock().unwrap(),
@@ -3987,7 +4563,7 @@ mod tests {
         let (c, close_called) = cancel_request_conductor(jobs, true);
 
         let err = c
-            .cancel_train("t1", "bad consist", false)
+            .cancel_train("t1", "bad consist", false, false)
             .await
             .expect_err("a train with no terminal cannot be cancelled");
         let msg = err.to_string();
@@ -4945,5 +5521,338 @@ mod tests {
             "the rerail original was never a car, so only its record can \
              reach it — leaked forever without this: {deleted:?}"
         );
+    }
+
+    // -- a judged red brakes the car it names (a2d4d842) -------------------
+    //
+    // Train f7bd1e9d's shape: two cars aboard, the verdict locating its
+    // failure in apps/web/src/it/yard/phone-strip.test.ts, which only car
+    // G changed. Real git for the per-car diff (the conductor's clone,
+    // with origin/main at the base both cars branched from) and an
+    // in-process jobs API recording the step-metadata PATCH, because the
+    // claim is that the hold lands on the RIGHT car's review step through
+    // the door `boss hold` uses — a faked diff would only prove this file
+    // agrees with itself.
+
+    fn rev_parse_head(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_file(clone: &std::path::Path, from: &str, path: &str, body: &str) -> String {
+        git_ok(clone, &["checkout", "-q", from]);
+        let file = clone.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, body).expect("write");
+        git_ok(clone, &["add", "-A"]);
+        git_ok(clone, &["commit", "-qm", path]);
+        rev_parse_head(clone)
+    }
+
+    type StepPatches = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+
+    async fn hold_jobs_api(cars: Vec<Value>) -> (String, StepPatches) {
+        use axum::extract::Path;
+        use axum::routing::{get, patch};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let patches: StepPatches = Arc::new(Mutex::new(Vec::new()));
+        let rec = patches.clone();
+        let app = Router::new()
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(id): Path<String>| {
+                    let cars = cars.clone();
+                    async move {
+                        Json(
+                            cars.into_iter()
+                                .find(|c| c["id"] == json!(id))
+                                .unwrap_or(json!({})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{sid}/metadata",
+                patch(
+                    move |Path((id, sid)): Path<(String, String)>, Json(body): Json<Value>| {
+                        let rec = rec.clone();
+                        async move {
+                            rec.lock().unwrap().push((id, sid, body));
+                            Json(json!({}))
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), patches)
+    }
+
+    fn aboard_car(id: &str, head: &str, review_md: Value) -> Value {
+        json!({
+            "id": id, "kind": "ship-a-change", "status": "open",
+            "metadata": {"train": "t1", "boarded_head": head},
+            "steps": [{"id": format!("{id}-rev"), "spec_slug": "review",
+                       "title": "Open for review", "status": "ready", "metadata": review_md}]
+        })
+    }
+
+    const PHONE_STRIP: &str = "apps/web/src/it/yard/phone-strip.test.ts";
+
+    fn judged_excerpt() -> Vec<(String, String)> {
+        vec![(
+            "svelte-check".to_string(),
+            format!(
+                "/gate-target/repo/{PHONE_STRIP}:83:26\n\
+                 Error: Conversion of type '{{ thirds: {{ third: string; }}[]; }}' may be a mistake\n"
+            ),
+        )]
+    }
+
+    #[tokio::test]
+    async fn a_judged_red_holds_the_one_car_that_changed_the_failing_file() {
+        let (_g, clone) = clone_fixture("judged-red-hold");
+        let base = rev_parse_head(&clone);
+        let car_g = commit_file(&clone, &base, PHONE_STRIP, "the cast\n");
+        let shed = commit_file(
+            &clone,
+            &base,
+            "crates/core/boss-jobs/src/car.rs",
+            "// shed\n",
+        );
+        let cars = vec![
+            aboard_car("c-g", &car_g, json!({})),
+            aboard_car("c-shed", &shed, json!({})),
+        ];
+        let (jobs, patches) = hold_jobs_api(cars).await;
+        let mut c = cleanup_conductor(
+            "forgejo",
+            Box::new(OperatorCancelForge {
+                close_ok: true,
+                close_called: Default::default(),
+            }),
+        );
+        c.cfg.jobs = jobs;
+        c.cfg.clone = clone.display().to_string();
+        let train = json!({"id": "t1", "metadata": {"boarded_jobs": ["c-g", "c-shed"]}});
+        let named = vec![
+            "CI / web (pull_request)".to_string(),
+            "svelte-check".to_string(),
+        ];
+
+        c.hold_named_cars(&train, "t1", &named, &[], &judged_excerpt(), None)
+            .await;
+
+        let patches = patches.lock().unwrap().clone();
+        assert_eq!(
+            patches.len(),
+            1,
+            "one car held, the shed car not: {patches:?}"
+        );
+        let (id, sid, body) = &patches[0];
+        assert_eq!((id.as_str(), sid.as_str()), ("c-g", "c-g-rev"));
+        let hold = body["hold"].as_str().unwrap_or_default();
+        assert!(
+            hold.contains(PHONE_STRIP) && hold.contains("CI / web (pull_request)"),
+            "the hold names the file and the check: {hold}"
+        );
+        assert_eq!(
+            boss_jobs::stranded::hold_reason(body).as_deref(),
+            Some(hold),
+            "written in the one shape the dock's hold predicate reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_car_already_held_keeps_its_own_reason() {
+        let (_g, clone) = clone_fixture("judged-red-held");
+        let base = rev_parse_head(&clone);
+        let car_g = commit_file(&clone, &base, PHONE_STRIP, "the cast\n");
+        let cars = vec![aboard_car(
+            "c-g",
+            &car_g,
+            json!({"hold": "waiting on a rebase by hand"}),
+        )];
+        let (jobs, patches) = hold_jobs_api(cars).await;
+        let mut c = cleanup_conductor(
+            "forgejo",
+            Box::new(OperatorCancelForge {
+                close_ok: true,
+                close_called: Default::default(),
+            }),
+        );
+        c.cfg.jobs = jobs;
+        c.cfg.clone = clone.display().to_string();
+        let train = json!({"id": "t1", "metadata": {"boarded_jobs": ["c-g"]}});
+
+        c.hold_named_cars(
+            &train,
+            "t1",
+            &["svelte-check".into()],
+            &[],
+            &judged_excerpt(),
+            None,
+        )
+        .await;
+
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "an operator's hold is not overwritten"
+        );
+    }
+
+    // -- the dock's re-gate on current main (backlog 969a1092) -------------
+
+    /// A car branch cut from the fixture's main, carrying one file at
+    /// `path`, published to both remotes — its head.
+    fn park_car(clone: &std::path::Path, branch: &str, path: &str) -> String {
+        git_ok(clone, &["checkout", "-q", "-b", branch, "main"]);
+        let file = clone.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, branch).expect("write");
+        git_ok(clone, &["add", "-A"]);
+        git_ok(clone, &["commit", "-qm", branch]);
+        git_ok(clone, &["push", "-q", "origin", branch]);
+        git_ok(clone, &["push", "-q", "fork", branch]);
+        git_ok(clone, &["checkout", "-q", "main"]);
+        rev(clone, branch)
+    }
+
+    /// Main lands a change at `path` — car F, in the measured case.
+    fn land_on_main(clone: &std::path::Path, path: &str) {
+        let file = clone.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "landed").expect("write");
+        git_ok(clone, &["add", "-A"]);
+        git_ok(clone, &["commit", "-qm", "a car lands"]);
+        git_ok(clone, &["push", "-q", "origin", "main"]);
+    }
+
+    /// The head the FORGE carries for `branch` — what a moved branch
+    /// would show, read from the bare remote itself.
+    fn forge_branch(clone: &std::path::Path, branch: &str) -> String {
+        let origin = clone.parent().expect("root").join("origin.git");
+        rev(&origin, &format!("refs/heads/{branch}"))
+    }
+
+    fn dock_conductor(clone: &std::path::Path) -> Conductor {
+        let mut c = cleanup_conductor(
+            "forgejo",
+            Box::new(FakeForge {
+                deleted: std::sync::Arc::default(),
+                fail_deletes: false,
+            }),
+        );
+        c.cfg.clone = clone.display().to_string();
+        c
+    }
+
+    /// Car G's shape on a real clone: parked on an old main, main lands a
+    /// change BESIDE its file, and the dock owes it a re-gate. Here the
+    /// means to gate are absent (no runner manifest, as on a box with no
+    /// cluster), so the car BOARDS AS GATED — and, the half that matters
+    /// most, its branch has not moved: a replay the dock could not follow
+    /// with a gate would leave a car no receipt vouches for.
+    #[tokio::test]
+    async fn a_touched_car_with_no_means_to_regate_boards_and_its_branch_stays_put() {
+        let (_g, clone) = clone_fixture("dock-no-means");
+        let head = park_car(&clone, "feat/g", "apps/web/src/it/yard/phone-strip.ts");
+        land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
+        let c = dock_conductor(&clone);
+        let car = json!({"id": "car-g", "metadata": {"branch": "feat/g", "summary": "G"}});
+        assert_eq!(
+            c.base_hold(&car, "car-g-000", "feat/g", &head).await,
+            None,
+            "a failure of the means must never freeze a landing"
+        );
+        assert_eq!(forge_branch(&clone, "feat/g"), head, "nothing was replayed");
+    }
+
+    /// The bound, end to end: a car already re-gated for the main it would
+    /// board on is held on the recorded answer and nothing is launched —
+    /// here the refused replay, whose reason names the repair.
+    #[tokio::test]
+    async fn a_car_already_regated_for_this_main_is_held_without_a_second_launch() {
+        let (_g, clone) = clone_fixture("dock-bound");
+        let head = park_car(&clone, "feat/g", "apps/web/src/it/yard/phone-strip.ts");
+        land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
+        let main = rev(&clone, "origin/main");
+        let stamp = dock_regate::RegateStamp {
+            refused: "boss gate --rebase: REFUSED — hit a conflict in: x".into(),
+            ..dock_regate::RegateStamp::for_main(&main, &[])
+        };
+        let car = json!({"id": "car-g", "metadata": {
+            "branch": "feat/g",
+            dock_regate::BASE_REGATE: stamp.to_value(Utc::now()),
+        }});
+        let c = dock_conductor(&clone);
+        let (reason, write) = c
+            .base_hold(&car, "car-g-000", "feat/g", &head)
+            .await
+            .expect("held");
+        assert!(reason.contains("boss rerail car-g-00"), "{reason}");
+        assert!(write.is_none(), "the recorded answer is not rewritten");
+        assert_eq!(forge_branch(&clone, "feat/g"), head);
+    }
+
+    /// A car a judged red held (`hold_named_cars`) is never re-gated by
+    /// the dock: the hold lands on its review step, `parked_ready` refuses
+    /// it, and `candidates` drops it before `base_hold` is asked. A
+    /// re-gate would replay a car its own red already named, and the
+    /// refresh on its green would not release the hold anyway.
+    #[test]
+    fn a_car_held_by_a_judged_red_never_reaches_the_dock_regate() {
+        let reason = judged_red_hold_reason("t1", &["svelte-check".into()], &[]);
+        let review_md = crate::steps::hold_patch(&reason);
+        let car = json!({
+            "id": "c-g", "kind": "ship-a-change", "status": "open",
+            "metadata": {"branch": "feat/g"},
+            "steps": [{"id": "c-g-rev", "spec_slug": "review", "title": "Open for review",
+                       "status": "ready", "metadata": review_md}]
+        });
+        assert!(
+            !parked_ready(&car),
+            "a held car must not board, so it is never judged for a re-gate"
+        );
+        let unheld = json!({
+            "id": "c-g", "kind": "ship-a-change", "status": "open",
+            "metadata": {"branch": "feat/g"},
+            "steps": [{"id": "c-g-rev", "spec_slug": "review", "title": "Open for review",
+                       "status": "ready", "metadata": {}}]
+        });
+        assert!(
+            parked_ready(&unheld),
+            "control: the same car unheld is parked"
+        );
+    }
+
+    /// A car main moved nowhere near, and a car on current main, board
+    /// exactly as before this rule existed.
+    #[tokio::test]
+    async fn an_untouched_or_current_car_boards_as_before() {
+        let (_g, clone) = clone_fixture("dock-untouched");
+        let far = park_car(&clone, "feat/far", "infra/lint/a-lint.sh");
+        land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
+        let fresh = park_car(&clone, "feat/fresh", "apps/web/src/it/yard/phone-strip.ts");
+        let c = dock_conductor(&clone);
+        let car = |b: &str| json!({"id": b, "metadata": {"branch": b}});
+        assert_eq!(
+            c.base_hold(&car("feat/far"), "far", "feat/far", &far).await,
+            None
+        );
+        assert_eq!(
+            c.base_hold(&car("feat/fresh"), "fresh", "feat/fresh", &fresh)
+                .await,
+            None
+        );
+        assert_eq!(forge_branch(&clone, "feat/far"), far);
     }
 }

@@ -11,34 +11,54 @@
   import StatusChip from '@boss/web-kit/ui/StatusChip.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
   import CalendarFeedSection from './CalendarFeedSection.svelte';
-  import { employmentTone, humanizeClassCode, type Employee } from './types';
+  import { classLabel, employeeRecordRead, employmentTone, type Employee } from './types';
   import { directReports, tenureYears } from './utils';
   import { href } from '../router';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { loadingRead, readStateOfResponse, type ReadState } from '../data/readState';
 
   let { empId } = $props<{ empId: string }>();
 
   let employee = $state<Employee | null>(null);
   let allEmployees = $state<Employee[]>([]);
+  /// Whether the ROSTER read worked. Direct reports and the reporting
+  /// chain are computed from the whole roster, and a refused roster used
+  /// to parse as `[]`, so a /api/people outage said "Direct reports 0"
+  /// and "No manager — reports to board." as fact (backlog 03c88448).
+  let rosterRead = $state<ReadState>(loadingRead);
   /// Non-null when the record fetch FAILED (5xx / network) — rendered
   /// instead of "Employee not found", which is a claim only a
   /// successful lookup gets to make (packet 3fba9c35).
   let loadFailed = $state<string | null>(null);
   let loading = $state(true);
 
+  // Department and role labels are the registry's display_name, not a
+  // title-cased code (backlog 8677728c, after 8a331c9b fixed the roster:
+  // `operations` printed Operations where its Class says Operations / IT).
+  let departmentClasses = $derived(classesFor('employee', 'department'));
+  let roleClasses = $derived(classesFor('employee', 'role'));
+
   $effect(() => {
     const id = empId;
+    const url = `/api/people/${encodeURIComponent(id)}`;
     let cancelled = false;
     loading = true;
     (async () => {
       try {
         const [eResp, rosterResp] = await Promise.all([
-          fetch(`/api/people/${encodeURIComponent(id)}`),
+          fetch(url),
           fetch('/api/people'),
         ]);
         if (!cancelled) {
           if (eResp.ok) {
-            employee = (await eResp.json()) as Employee;
-            loadFailed = null;
+            // A 2xx is not yet an employee. Cast straight to Employee, a
+            // body missing a list made the template throw "reading
+            // 'length'" and paint nothing (backlog 548a1e8d); it is a
+            // failed read, said on the failure line, naming the field.
+            const body: unknown = await eResp.json();
+            const read = employeeRecordRead(url, body);
+            employee = read.kind === 'ok' ? (body as Employee) : null;
+            loadFailed = read.kind === 'failed' ? read.error : null;
           } else if (eResp.status === 404) {
             employee = null;
             loadFailed = null;
@@ -46,7 +66,9 @@
             employee = null;
             loadFailed = `HTTP ${eResp.status}`;
           }
-          allEmployees = rosterResp.ok ? ((await rosterResp.json()) as Employee[]) : [];
+          rosterRead = readStateOfResponse('/api/people', rosterResp);
+          allEmployees =
+            rosterRead.kind === 'ok' ? ((await rosterResp.json()) as Employee[]) : [];
           loading = false;
         }
       } catch (e) {
@@ -132,17 +154,17 @@
     <header class="detail-hero">
       <div>
         <div class="detail-eyebrow">
-          <EntityLink kind="employee" id={e.id} /> · {humanizeClassCode(e.department)} ·
+          <EntityLink kind="employee" id={e.id} /> · {classLabel(e.department, departmentClasses)} ·
           <StatusChip value={e.status ?? 'unknown'} tone={employmentTone(e.status)} />
         </div>
         <h1 class="detail-title">{e.name}</h1>
-        <div class="detail-tagline">{humanizeClassCode(e.role)} · {e.email}</div>
+        <div class="detail-tagline">{classLabel(e.role, roleClasses)} · {e.email}</div>
         <div class="detail-meta">
           <Meta label="Tenure">{tenure.toFixed(1)} years</Meta>
           <Meta label="Skill level">
               {e.skill_level !== null ? `${e.skill_level}/5` : '—'}
           </Meta>
-          <Meta label="Direct reports">{reports.length}</Meta>
+          <Meta label="Direct reports">{rosterRead.kind === 'ok' ? reports.length : 'unknown'}</Meta>
           <Meta label="Location">{e.location}</Meta>
         </div>
       </div>
@@ -170,7 +192,11 @@
       </Section>
 
       <Section title="Reporting chain">
-          {#if chain.length === 0}
+          {#if rosterRead.kind === 'failed'}
+            <p class="empty load-failed" role="alert">
+              Couldn't load the reporting chain — {rosterRead.error}
+            </p>
+          {:else if chain.length === 0}
             <p class="empty">No manager — reports to board.</p>
           {:else}
             <ol class="checklist" style="padding-left:0; list-style:none">
@@ -180,14 +206,18 @@
                   <Link to={entityHref('employee', m.id)}>
                     {m.name}
                   </Link>
-                  <span style="color:#78716c"> · {humanizeClassCode(m.role)}</span>
+                  <span style="color:var(--static)"> · {classLabel(m.role, roleClasses)}</span>
                 </li>
               {/each}
             </ol>
           {/if}
       </Section>
 
-      {#if reports.length > 0}
+      {#if rosterRead.kind === 'failed'}
+        <Section title="Team" wide>
+          <p class="empty load-failed">Couldn't load direct reports — {rosterRead.error}</p>
+        </Section>
+      {:else if reports.length > 0}
         <Section
           title={`Team (${reports.length} direct report${reports.length === 1 ? '' : 's'})`}
           wide
@@ -203,7 +233,7 @@
                     <td>
                       <EntityLink kind="employee" id={r.id} label={r.name} mono={false} />
                     </td>
-                    <td class="prose-cell">{humanizeClassCode(r.role)}</td>
+                    <td class="prose-cell">{classLabel(r.role, roleClasses)}</td>
                     <td class="num">{tenureYears(r).toFixed(1)}y</td>
                   </tr>
                 {/each}

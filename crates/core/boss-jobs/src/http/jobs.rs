@@ -22,7 +22,18 @@ pub(super) async fn list_step_types<R: JobsRepository + 'static, B: EventBus + '
 // Jobs
 // ---------------------------------------------------------------------------
 
+/// The listing's query — and, by `deny_unknown_fields`, the ONE list of
+/// the parameters it accepts. Anything else is a 400 whose body names
+/// the parameter and lists these fields (axum's query rejection carries
+/// serde's "unknown field `x`, expected one of …"). Until 2026-09-23 an
+/// unknown parameter was dropped without a word, and every weekly
+/// department retro read `closed_since=<week start>` — which does not
+/// exist — and was handed the all-time list as its week (backlog
+/// 7f3e871a; the same shape as `department` before it existed,
+/// cc76f755). A filter the server cannot apply must not answer as if
+/// it had. Pinned in tests/jobs_list_refuses_an_unknown_parameter.rs.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ListJobsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
@@ -75,26 +86,29 @@ pub(super) struct ListJobsQuery {
     /// (`metadata ? $n`). Letters, digits, underscore; a dotted path
     /// is refused because `?` does not walk one.
     metadata_has: Option<String>,
-    /// `department=<code>` keeps the packets of the kinds whose ACTIVE
-    /// workflow row declares `metadata.department = <code>` — a
-    /// packet carries no department, its workflow does, and the
-    /// registry is the one copy (`crate::department`). A code nothing
-    /// declares is `total: 0`, never the unfiltered count: measured
-    /// on prod on 2026-09-18, `?department=sales` answered 1944 —
-    /// every packet — because nothing read the parameter (backlog
-    /// cc76f755). Needs the registry; without one it is a 503, not an
-    /// answer.
+    /// `department=<code>` keeps the packets IN that department: those
+    /// whose own `metadata.department` is `<code>`, and — when a packet
+    /// names none — those of the kinds whose ACTIVE workflow row
+    /// declares it (`crate::port::DepartmentFilter`; the packet's word
+    /// counts since backlog 481d7939, when the retros and page-audits
+    /// that name a department appeared on no department's view). A code
+    /// nothing declares or names is `total: 0`, never the unfiltered
+    /// count: measured on prod on 2026-09-18, `?department=sales`
+    /// answered 1944 — every packet — because nothing read the
+    /// parameter (backlog cc76f755). Needs the registry; without one it
+    /// is a 503, not an answer.
     department: Option<String>,
 }
 
-/// Resolve `department=<code>` to the kind set the port narrows on:
-/// the active kinds declaring it (`crate::department::kinds_declaring`),
-/// which may be empty — and empty is a real filter (no packet), not
-/// no filter. `None` when the param was not sent.
-async fn kinds_for_department<R: JobsRepository, B: EventBus>(
+/// Resolve `department=<code>` to the filter the port narrows on: the
+/// code, and the active kinds declaring it
+/// (`crate::department::kinds_declaring`), which may be empty — and
+/// empty is a real filter (only the packets naming it), not no filter.
+/// `None` when the param was not sent.
+async fn department_filter<R: JobsRepository, B: EventBus>(
     code: Option<&str>,
     state: &JobsApiState<R, B>,
-) -> Result<Option<Vec<String>>, Response> {
+) -> Result<Option<DepartmentFilter>, Response> {
     let Some(code) = code else {
         return Ok(None);
     };
@@ -106,7 +120,10 @@ async fn kinds_for_department<R: JobsRepository, B: EventBus>(
         )
             .into_response()
     })?;
-    Ok(Some(crate::department::kinds_declaring(&specs, code)))
+    Ok(Some(DepartmentFilter {
+        code: code.to_string(),
+        declaring_kinds: crate::department::kinds_declaring(&specs, code),
+    }))
 }
 
 /// Parse `metadata=<json>` into the containment document the port
@@ -207,15 +224,15 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         Ok(p) => p,
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
-    let kinds = match kinds_for_department(q.department.as_deref(), &state).await {
-        Ok(k) => k,
+    let department = match department_filter(q.department.as_deref(), &state).await {
+        Ok(d) => d,
         Err(resp) => return resp,
     };
 
     let filter = JobFilter {
         kind: q.kind,
         kind_prefix: q.kind_prefix,
-        kinds,
+        department,
         status: q.status,
         owner_id: q.owner_id,
         subject_id: q.subject_id,
@@ -251,13 +268,30 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     // spelling of the verb's exit on the request (50fede8b): a
     // request-level reader never had to fetch them. Held by
     // tests/a_listed_packet_carries_its_steps.rs.
+    //
+    // So a failed steps read FAILS the list, naming the packet. It used
+    // to answer `unwrap_or_default()`: the row went out with `steps: []`,
+    // which is exactly the row the ops-runner skips as "has no execute
+    // step" — a read failure the wire could not tell from a packet
+    // without work (backlog f6c97006).
     let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
     for job in &jobs {
-        let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
+        let steps = match state.jobs.list_steps(&job.id).await {
+            Ok(steps) => steps,
+            Err(e) => return steps_unreadable(&job.id, &e),
+        };
         let mut j = serde_json::to_value(job).unwrap_or_default();
         j["steps"] = serde_json::to_value(&steps).unwrap_or_default();
         enriched.push(j);
     }
+    // THE ENVELOPE IS A WIRE CONTRACT TOO (backlog 10eecbbc): shell,
+    // Rust and the web read these four fields, and three of those
+    // readers DEFAULT a missing `total` to the page's length or to 0 —
+    // so dropping or reshaping it turns every truncated page into a
+    // whole list without an error anywhere. `limit` echoes the limit
+    // APPLIED (after the clamp), not the one asked for. The readers and
+    // what each assumes are listed, and held, in
+    // tests/the_list_envelope_holds_what_its_readers_assume.rs.
     Json(serde_json::json!({
         "data": enriched,
         "total": total,
@@ -457,6 +491,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         kind: None,
         kind_prefix: None,
         kinds: None,
+        department: None,
         status: Some(boss_core::job::JobStatus::Open),
         closed_since: None,
         priority: None,
@@ -508,97 +543,14 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
     .into_response()
 }
 
-#[derive(Deserialize)]
-pub(super) struct LaunchCalendarQuery {
-    /// ISO date (YYYY-MM-DD); defaults to today (UTC).
-    from: Option<chrono::NaiveDate>,
-    /// ISO date (YYYY-MM-DD); defaults to `from + 90 days`.
-    to: Option<chrono::NaiveDate>,
-}
-
-/// Launch-calendar projection per examples/used-device-shop/design/marketing-needs.md E2. Returns every
-/// open/in-flight `marketing-motion` Job with its tier-4
-/// `marketing-launch` step's date + channel, plus the Job's current
-/// tier. Frontend renders at `/calendar` (standalone) and in the exec
-/// dashboard next-30-days panel.
-pub(super) async fn launch_calendar<R: JobsRepository + 'static, B: EventBus + 'static>(
-    State(state): State<Arc<JobsApiState<R, B>>>,
-    Query(q): Query<LaunchCalendarQuery>,
-) -> Response {
-    let from = q
-        .from
-        .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
-    let to = q.to.unwrap_or_else(|| from + chrono::Duration::days(90));
-    match state.jobs.list_launch_calendar(from, to).await {
-        Ok(rows) => {
-            #[derive(Serialize)]
-            struct Out {
-                data: Vec<LaunchCalendarRow>,
-                from: chrono::NaiveDate,
-                to: chrono::NaiveDate,
-            }
-            Json(Out {
-                data: rows,
-                from,
-                to,
-            })
-            .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
 /// Return the public kebab-case string for a JobStatus.
 /// Mirrors the DB storage format used by the adapters.
 pub(super) fn job_status_str_public(s: JobStatus) -> &'static str {
     match s {
         JobStatus::Draft => "draft",
         JobStatus::Open => "open",
-        JobStatus::Blocked => "blocked",
-        JobStatus::PendingSignOff => "pending-sign-off",
         JobStatus::Closed => "closed",
         JobStatus::Cancelled => "cancelled",
-    }
-}
-
-/// Per-kind distribution of Jobs across step sort_order tiers.
-///
-/// Response shape:
-/// ```json
-/// {
-///   "by_kind": {
-///     "refurb-used": { "tiers": { "0": 12, "1": 55153, "2": 4, "-1": 100 } },
-///     "sale":        { "tiers": { "0": 55779, "1": 3, "-1": 177 } }
-///   },
-///   "status": "open"
-/// }
-/// ```
-/// `tiers[-1]` = Jobs with every step terminal (completed/skipped)
-/// but the Job not yet closed (e.g. awaiting sign-off). Frontend maps
-/// tier → lifecycle phase via the Workflow's step list (sort_order
-/// buckets).
-pub(super) async fn jobs_phase_distribution<R: JobsRepository + 'static, B: EventBus + 'static>(
-    State(state): State<Arc<JobsApiState<R, B>>>,
-    Query(q): Query<JobsSummaryQuery>,
-) -> Response {
-    match state.jobs.jobs_tier_distribution(q.status).await {
-        Ok(rows) => {
-            let mut by_kind: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            for (kind, tier, count) in rows {
-                let entry = by_kind
-                    .entry(kind)
-                    .or_insert_with(|| serde_json::json!({ "tiers": {} }));
-                if let Some(tiers) = entry.get_mut("tiers").and_then(|v| v.as_object_mut()) {
-                    tiers.insert(tier.to_string(), serde_json::Value::from(count));
-                }
-            }
-            Json(serde_json::json!({
-                "by_kind": by_kind,
-                "status": q.status.map(job_status_str_public),
-            }))
-            .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -759,6 +711,22 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .into_response();
         }
     };
+
+    // THE ADMISSION INSTANT, server-owned (backlog 6c2eba00, design
+    // f2cdff23). Stamped here and only here: the adapters keep the
+    // column out of every UPDATE, so a later PUT cannot move when the
+    // packet arrived, and a body that supplies its own value is
+    // overwritten — the same ownership `workflow_version` and the
+    // experiment arm take a few lines down.
+    //
+    // Unconditional, unlike the metadata stamp below, because the two
+    // answer different questions: `metadata.opened_at` is the precise
+    // instant behind a CLOCK-OWNED `opened_on`, and is deliberately
+    // skipped when the caller backdates the date; this field is when
+    // the packet was ADMITTED, which is now whatever date the body
+    // names. That is also what the rebuilder recovers from the create
+    // event, so live and replay read the same instant.
+    job.opened_at = Some(now);
 
     // The precise instant behind the defaulted date. `opened_on` has
     // one-day resolution by construction; the metadata stamp is what
@@ -1176,7 +1144,34 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
 pub(super) struct JobDetail {
     #[serde(flatten)]
     job: Job,
-    steps: Vec<Step>,
+    steps: Vec<StepDetail>,
+}
+
+/// A step as the packet read hands it out: the row, plus the entries of
+/// the job's `corrections` list that target it (design 4105b020).
+/// READERS GET IT WITHOUT ASKING — a correction that lives only where
+/// the next reader has to think to look is the defect the list exists
+/// to retire. Omitted when there are none, so an uncorrected step reads
+/// exactly as it always has.
+#[derive(Serialize)]
+pub(super) struct StepDetail {
+    #[serde(flatten)]
+    step: Step,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    corrections: Vec<serde_json::Value>,
+}
+
+impl JobDetail {
+    pub(super) fn new(job: Job, steps: Vec<Step>) -> Self {
+        let steps = steps
+            .into_iter()
+            .map(|step| StepDetail {
+                corrections: crate::corrections::for_step(&job.metadata, &step.id.to_string()),
+                step,
+            })
+            .collect();
+        Self { job, steps }
+    }
 }
 
 /// An 8..=36-char run of hex and hyphens — the canonical id text minus
@@ -1193,10 +1188,12 @@ async fn job_detail_response<R: JobsRepository + 'static, B: EventBus + 'static>
     job_id: &boss_core::job::JobId,
 ) -> Response {
     match state.jobs.get_job(job_id).await {
-        Ok(Some(job)) => {
-            let steps = state.jobs.list_steps(job_id).await.unwrap_or_default();
-            Json(JobDetail { job, steps }).into_response()
-        }
+        // A packet whose steps cannot be read is not a packet with no
+        // steps: the detail page would draw it empty (f6c97006).
+        Ok(Some(job)) => match state.jobs.list_steps(job_id).await {
+            Ok(steps) => Json(JobDetail::new(job, steps)).into_response(),
+            Err(e) => steps_unreadable(job_id, &e),
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "job not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1362,6 +1359,7 @@ pub(super) async fn job_stream<R: JobsRepository + 'static, B: EventBus + 'stati
             Option<String>,    // priority as text
             Option<String>,    // closed_on as ISO string
             Vec<(boss_core::job::StepId, String, Option<String>)>,
+            usize,             // corrections appended (design 4105b020)
         );
         fn signature(
             job: &boss_core::job::Job,
@@ -1386,17 +1384,36 @@ pub(super) async fn job_stream<R: JobsRepository + 'static, B: EventBus + 'stati
                 Some(format!("{:?}", job.priority)),
                 job.closed_on.map(|d| d.to_string()),
                 step_sig,
+                // A correction changes no step status, so without this
+                // an open page would never be sent the frame carrying it.
+                crate::corrections::list(&job.metadata).len(),
             )
         }
 
         // Push initial snapshot. last_sig is bound from the
         // success branch so the compiler doesn't warn about a
         // dead-write on a `None` initializer that's never read.
+        // A steps read that fails is never pushed as a packet with no
+        // steps (backlog f6c97006): the first frame is then an `error`
+        // naming the packet, like the not-found one below, and a failed
+        // read on a later tick pushes an `unavailable` frame and keeps
+        // the last true signature, so the page holds what it last knew
+        // rather than drawing the packet empty until the next good read.
         let initial = state.jobs.get_job(&job_id).await;
         let mut last_sig: JobSig = if let Ok(Some(job)) = initial {
-            let steps = state.jobs.list_steps(&job_id).await.unwrap_or_default();
+            let steps = match state.jobs.list_steps(&job_id).await {
+                Ok(steps) => steps,
+                Err(e) => {
+                    yield Ok::<_, Infallible>(
+                        SseEvent::default()
+                            .event("error")
+                            .data(format!("the steps of packet {job_id} could not be read: {e}")),
+                    );
+                    return;
+                }
+            };
             let sig = signature(&job, &steps);
-            let detail = JobDetail { job, steps };
+            let detail = JobDetail::new(job, steps);
             if let Ok(json) = serde_json::to_string(&detail) {
                 yield Ok::<_, Infallible>(SseEvent::default().data(json));
             }
@@ -1421,10 +1438,20 @@ pub(super) async fn job_stream<R: JobsRepository + 'static, B: EventBus + 'stati
                 );
                 break;
             };
-            let steps = state.jobs.list_steps(&job_id).await.unwrap_or_default();
+            let steps = match state.jobs.list_steps(&job_id).await {
+                Ok(steps) => steps,
+                Err(e) => {
+                    yield Ok::<_, Infallible>(
+                        SseEvent::default()
+                            .event("unavailable")
+                            .data(format!("the steps of packet {job_id} could not be read: {e}")),
+                    );
+                    continue;
+                }
+            };
             let sig = signature(&job, &steps);
             if last_sig != sig {
-                let detail = JobDetail { job, steps };
+                let detail = JobDetail::new(job, steps);
                 if let Ok(json) = serde_json::to_string(&detail) {
                     yield Ok::<_, Infallible>(SseEvent::default().data(json));
                 }
@@ -1467,6 +1494,18 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     // keeps the JOB_UPDATED event payload (and the in-memory
     // adapter) agreeing with the row.
     job.partition = existing.partition;
+    // So is the corrections list, and for the same reason: this route
+    // REPLACES metadata, so a body built without the list — or with an
+    // edited one — would rewrite an append-only record. The stored list
+    // wins (design 4105b020); its one writer is the corrections door.
+    crate::corrections::carry_forward(&mut job.metadata, &existing.metadata);
+    // And the record of every move between protocol versions (design
+    // 7cf202a9 Q3), whose one writer is the re-pin door.
+    crate::corrections::carry_forward_key(
+        &mut job.metadata,
+        &existing.metadata,
+        crate::repin::REPINS_KEY,
+    );
 
     // Pick the right policy action: transitioning to Closed is a Close
     // action (more restricted than Update); everything else is Update.
@@ -1631,6 +1670,17 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         )
             .into_response();
     };
+    // The reserved, append-only corrections list (design 4105b020) is
+    // not a free key: a set here could rewrite it and a null erase it.
+    // Its one writer is the corrections door, which the refusal names.
+    if patch.contains_key(crate::corrections::CORRECTIONS_KEY) {
+        return (StatusCode::CONFLICT, crate::corrections::PATCH_REFUSAL).into_response();
+    }
+    // So is the record of every move between protocol versions
+    // (design 7cf202a9 Q3): its one writer is the re-pin door.
+    if patch.contains_key(crate::repin::REPINS_KEY) {
+        return (StatusCode::CONFLICT, crate::repin::PATCH_REFUSAL).into_response();
+    }
 
     let existing = match state.jobs.get_job(&job_id).await {
         Ok(Some(existing)) => existing,
@@ -1701,8 +1751,191 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /api/jobs/{id}/convert` — pull a packet forward to a newer
-/// protocol version, if where it stands allows it.
+/// A move of one packet between two versions of its protocol, judged:
+/// where it stands, whether the move is safe, and what it would write.
+/// Shared by the dry run and the write so the preview an operator reads
+/// is the move the door makes.
+struct JudgedMove {
+    existing: Job,
+    from: i32,
+    to: i32,
+    verdict: crate::protocol_conversion::Convertibility,
+    plan: Result<crate::repin::RepinPlan, crate::repin::Unplannable>,
+}
+
+/// Why a judged move stops before it is a plan: an answer the caller
+/// gets as it is (a refusal, a missing packet, "already there").
+enum NoMove {
+    Answer(Response),
+}
+
+async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+    id: &str,
+    to_version: Option<i32>,
+    action: Action,
+) -> Result<JudgedMove, NoMove> {
+    let answer = |r: Response| NoMove::Answer(r);
+    let job_id = resolve_path_job_id(state, id).await.map_err(answer)?;
+    let existing = match state.jobs.get_job(&job_id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return Err(answer(
+                (StatusCode::NOT_FOUND, "job not found").into_response(),
+            ));
+        }
+        Err(e) => {
+            return Err(answer(
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            ));
+        }
+    };
+    let scope = match state.policy.check(user, action, Resource::job()).await {
+        Ok(Decision::Allow { scope }) => scope,
+        Ok(Decision::Deny { reason }) => {
+            return Err(answer((StatusCode::FORBIDDEN, reason).into_response()));
+        }
+        Err(e) => {
+            return Err(answer(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("policy check failed: {e}"),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    if !scope_matches(user, &scope, &existing) {
+        return Err(answer(
+            (StatusCode::FORBIDDEN, "job is outside your scope").into_response(),
+        ));
+    }
+
+    let Some(ref reg) = state.kind_registry else {
+        return Err(answer(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no workflow registry: conversion cannot be judged without both specs",
+            )
+                .into_response(),
+        ));
+    };
+    let from = reg
+        .get_version(&existing.kind, existing.workflow_version)
+        .await
+        .map_err(|e| {
+            answer(
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "cannot read the version this packet is pinned to ({} v{}): {e}",
+                        existing.kind, existing.workflow_version
+                    ),
+                )
+                    .into_response(),
+            )
+        })?;
+    let to = match to_version {
+        Some(v) => reg.get_version(&existing.kind, v).await,
+        None => reg.get_active(&existing.kind).await,
+    }
+    .map_err(|e| {
+        answer((StatusCode::CONFLICT, format!("no such target version: {e}")).into_response())
+    })?;
+    if to.version == existing.workflow_version {
+        return Err(answer(
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "converted": false,
+                    "convertible": false,
+                    "reason": "already pinned to that version",
+                    "workflow_version": existing.workflow_version,
+                })),
+            )
+                .into_response(),
+        ));
+    }
+
+    // Where the packet actually stands: the slugs it has completed.
+    let steps =
+        state.jobs.list_steps(&job_id).await.map_err(|e| {
+            answer((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+        })?;
+    let done: std::collections::BTreeSet<String> = steps
+        .iter()
+        .filter(|s| s.status == boss_core::job::StepStatus::Completed)
+        .filter_map(|s| s.spec_slug.clone())
+        .collect();
+    let verdict = crate::protocol_conversion::convertibility_for_packet(&from, &to, &done);
+    let plan = crate::repin::plan(&from, &to, &existing, &steps);
+    Ok(JudgedMove {
+        existing,
+        from: from.version,
+        to: to.version,
+        verdict,
+        plan,
+    })
+}
+
+/// The obstacles a judged move answers with: the safety verdict's, and
+/// the one reason a packet cannot be planned at all.
+fn move_obstacles(judged: &JudgedMove) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = judged
+        .verdict
+        .obstacles()
+        .iter()
+        .map(|o| serde_json::json!({ "step": o.step, "reason": o.reason }))
+        .collect();
+    if let Err(why) = &judged.plan {
+        out.push(serde_json::json!({ "step": null, "reason": why.0 }));
+    }
+    out
+}
+
+#[derive(Deserialize)]
+pub(super) struct ConvertQuery {
+    to_version: Option<i32>,
+}
+
+/// `GET /api/jobs/{id}/convert[?to_version=N]` — the dry run (design
+/// 7cf202a9 Q1): the verdict and exactly what the move would write,
+/// with nothing written. A READ, on the job-read permission, because a
+/// cohort move is previewed by running this across the cohort before
+/// anyone moves a packet (Q5). `boss job convert --dry-run` is its twin.
+pub(super) async fn preview_convert_job<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path(id): Path<String>,
+    CurrentUser(user): CurrentUser,
+    Query(q): Query<ConvertQuery>,
+) -> Response {
+    let judged = match judge_move(&state, &user, &id, q.to_version, Action::Read).await {
+        Ok(j) => j,
+        Err(NoMove::Answer(r)) => return r,
+    };
+    let obstacles = move_obstacles(&judged);
+    let (reprojected, inserted) = judged
+        .plan
+        .as_ref()
+        .map(crate::repin::listed)
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "convertible": obstacles.is_empty(),
+            "from": judged.from,
+            "to": judged.to,
+            "obstacles": obstacles,
+            "reprojected": reprojected,
+            "inserted": inserted,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/jobs/{id}/convert` — move a packet to another version of
+/// its protocol, and make the move true of it and on the record.
 ///
 /// THE DOOR IS NARROW ON PURPOSE. `workflow_version` is excluded from
 /// `update_job`'s SET list, so no ordinary PUT can re-pin a packet by
@@ -1711,140 +1944,96 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
 /// returns the obstacles rather than a bare no, because each one names
 /// the step it concerns and an operator's next question is always
 /// "which step, and what changed".
+///
+/// WHAT IT WRITES (design 7cf202a9, David 2026-09-23, all five
+/// questions accepted as proposed; backlog 4347a1af). Until this car
+/// the door moved one column, so a moved packet's steps still read the
+/// admission version's text (1e973965). Now, in one transaction
+/// ([`crate::repin`]): every step not yet finished is re-projected from
+/// the target, every step the target inserts is materialised, completed
+/// steps keep the text they ran under (Q2); a `jobs.job.repinned` event
+/// and an entry in the packet's reserved `repins` list say from, to,
+/// who, and each step moved (Q3).
+///
+/// WHO. Moving a live packet changes what the registry guarantees about
+/// it, so it is the registry owner's act: the caller must hold
+/// `publish` on `workflow` — the permission that makes a protocol
+/// version live, `platform-admin`'s in the core defaults — as well as
+/// the ordinary write on this job (Q4). It was any job writer. Never
+/// automatic: nothing calls this on publish (Q5).
 pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let job_id = match resolve_path_job_id(&state, &id).await {
-        Ok(job_id) => job_id,
-        Err(refusal) => return refusal,
-    };
-    let existing = match state.jobs.get_job(&job_id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => return (StatusCode::NOT_FOUND, "job not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    // Same gate as any other job write.
-    let decision = match state
-        .policy
-        .check(&user, Action::Update, Resource::job())
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let scope = match decision {
-        Decision::Deny { reason } => return (StatusCode::FORBIDDEN, reason).into_response(),
-        Decision::Allow { scope } => scope,
-    };
-    if !scope_matches(&user, &scope, &existing) {
-        return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
+    let want = body
+        .get("to_version")
+        .and_then(serde_json::Value::as_i64)
+        .map(|v| v as i32);
+    if let Err(refusal) = super::kinds::policy_check(&state, &user, Action::Publish).await {
+        return refusal;
     }
-
-    let Some(ref reg) = state.kind_registry else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no workflow registry: conversion cannot be judged without both specs",
-        )
-            .into_response();
+    let judged = match judge_move(&state, &user, &id, want, Action::Update).await {
+        Ok(j) => j,
+        Err(NoMove::Answer(r)) => return r,
     };
-    let from = match reg
-        .get_version(&existing.kind, existing.workflow_version)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
+    let obstacles = move_obstacles(&judged);
+    let plan = match (&judged.plan, obstacles.is_empty()) {
+        (Ok(plan), true) => plan,
+        _ => {
             return (
                 StatusCode::CONFLICT,
-                format!(
-                    "cannot read the version this packet is pinned to ({} v{}): {e}",
-                    existing.kind, existing.workflow_version
-                ),
+                Json(serde_json::json!({
+                    "converted": false,
+                    "from": judged.from,
+                    "to": judged.to,
+                    "obstacles": obstacles,
+                })),
             )
                 .into_response();
         }
     };
-    let want = body.get("to_version").and_then(serde_json::Value::as_i64);
-    let to = match want {
-        Some(v) => reg.get_version(&existing.kind, v as i32).await,
-        None => reg.get_active(&existing.kind).await,
-    };
-    let to = match to {
-        Ok(s) => s,
-        Err(e) => {
-            return (StatusCode::CONFLICT, format!("no such target version: {e}")).into_response();
-        }
-    };
-    if to.version == existing.workflow_version {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "converted": false,
-                "reason": "already pinned to that version",
-                "workflow_version": existing.workflow_version,
-            })),
-        )
-            .into_response();
-    }
-
-    // Where the packet actually stands: the slugs it has completed.
-    let steps = match state.jobs.list_steps(&job_id).await {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let done: std::collections::BTreeSet<String> = steps
-        .iter()
-        .filter(|s| s.status == boss_core::job::StepStatus::Completed)
-        .filter_map(|s| s.spec_slug.clone())
-        .collect();
-
-    let verdict = crate::protocol_conversion::convertibility_for_packet(&from, &to, &done);
-    if !verdict.is_automatic() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "converted": false,
-                "from": from.version,
-                "to": to.version,
-                "obstacles": verdict.obstacles().iter().map(|o| serde_json::json!({
-                    "step": o.step, "reason": o.reason,
-                })).collect::<Vec<_>>(),
-            })),
-        )
-            .into_response();
-    }
 
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let stamp = state
         .publisher
-        .stamp_with_actor(actor)
+        .stamp_with_actor(actor.clone())
         .await
-        .with_partition(existing.partition);
+        .with_partition(judged.existing.partition);
+    let record = crate::repin::record(
+        plan,
+        judged.from,
+        judged.to,
+        &actor.to_string(),
+        stamp.timestamp,
+    );
     match state
         .jobs
-        .repin_workflow_version_at(&job_id, to.version, &stamp)
+        .repin_workflow_version_at(&judged.existing.id, judged.to, plan, &record, &stamp)
         .await
     {
-        Ok(job) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "converted": true,
-                "from": from.version,
-                "to": job.workflow_version,
-            })),
-        )
-            .into_response(),
+        Ok(job) => {
+            // An inserted step is born pending; the readiness pass the
+            // rest of the packet already had decides whether it is
+            // workable now, against the version it was moved to.
+            if job.status == JobStatus::Open {
+                super::steps::reevaluate_and_persist(&state, &job, &actor).await;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "converted": true,
+                    "from": judged.from,
+                    "to": job.workflow_version,
+                    "reprojected": record["reprojected"],
+                    "inserted": record["inserted"],
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1919,6 +2108,13 @@ pub(super) struct EstateEventsQuery {
     /// Exact-match filter on the payload's top-level `scope`, e.g.
     /// `codebase` or `kubernetes-nodes`. Absent reads every series.
     scope: Option<String>,
+    /// Only rows with `timestamp >= since` (RFC 3339).
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only rows with `timestamp < until` — the before-cursor: the
+    /// oldest timestamp on one page is the `until` of the next. An
+    /// instant that does not parse is a 400 from the extractor, never
+    /// read as absent, which would answer the newest page instead.
+    until: Option<chrono::DateTime<chrono::Utc>>,
     limit: Option<i64>,
 }
 
@@ -1947,6 +2143,18 @@ pub(super) struct EstateEventsQuery {
 /// could not be read through the one door that serves it. Asking for
 /// a scope answers about THAT scope — 50 rows of a nightly series is
 /// fifty nights, not half a day.
+///
+/// `?since=` / `?until=` do the same for TIME (backlog bf362f25). The
+/// cap had no way past it: post-mortem 3c3b202c, thirty hours after an
+/// incident, found the oldest reachable rows at 2026-09-22T20:52Z
+/// (observations) and 2026-09-23T06:50Z (comparisons), with the window
+/// it needed behind both — and the rows still in the log, which is
+/// append-only (measured through the events tail the same day: every
+/// estate row back to the log's first hour, 2026-09-16T23:58Z). The cap
+/// stays; `until=` walks past it a page at a time, and `total` counts
+/// the window so a reader compares its rows to it rather than taking a
+/// full page for the whole answer. Both are in the WHERE clause, beside
+/// the scope and before the limit.
 pub(super) async fn list_estate_observations<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(_user): CurrentUser,
@@ -1969,15 +2177,19 @@ async fn estate_events<R: JobsRepository + 'static, B: EventBus + 'static>(
     q: &EstateEventsQuery,
 ) -> Response {
     let limit = q.limit.unwrap_or(5).clamp(1, 50);
-    // The scope reaches the repository, which pushes it to the WHERE
-    // clause. Narrowing the page after it comes back would leave the
-    // slow series exactly as unreadable as it was.
-    match state
-        .jobs
-        .recent_events_by_kind(kind, q.scope.as_deref(), limit)
-        .await
-    {
-        Ok(rows) => Json(serde_json::json!({ "data": rows })).into_response(),
+    // The scope and the window reach the repository, which pushes them
+    // to the WHERE clause. Narrowing the page after it comes back would
+    // leave the slow series, and the old window, exactly as unreadable
+    // as they were.
+    let window = crate::port::EventWindow {
+        scope: q.scope.clone(),
+        since: q.since,
+        until: q.until,
+    };
+    match state.jobs.recent_events_by_kind(kind, &window, limit).await {
+        Ok(page) => {
+            Json(serde_json::json!({ "data": page.rows, "total": page.total })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

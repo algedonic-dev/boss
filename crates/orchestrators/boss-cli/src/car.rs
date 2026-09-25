@@ -98,12 +98,17 @@ impl ItemAnswer {
     /// excludes (both required), so an open's intent is never empty and
     /// the check always runs.
     ///
-    /// ONLY THE FLAG PREFIX IS ADAPTED. The gate spells these
-    /// `--park-backlog-item`; this verb spells them `--backlog-item`. The
-    /// rewrite is one mechanical substitution, pinned by
-    /// `an_open_with_no_item_answer_is_refused_naming_all_three`, so a
-    /// reworded gate refusal that stopped naming its flags reds a test
-    /// rather than printing flags that do not exist.
+    /// THE SPELLING IS ADAPTED, AND FLAGS THIS VERB LACKS ARE DROPPED.
+    /// The gate spells these `--park-backlog-item`; this verb spells them
+    /// `--backlog-item`. The gate ALSO has answers this verb does not —
+    /// `--park-design` — and a prefix rewrite alone rendered that as
+    /// `--design` at this door, a flag `boss car open --help` has never
+    /// listed (backlog 19a2aca3). Both halves are pinned:
+    /// `an_open_with_no_item_answer_is_refused_naming_all_three` that the
+    /// three real ones are named, and
+    /// `a_refusal_names_only_flags_this_verb_accepts` that nothing else
+    /// is — the second read off clap, so the next flag added at one door
+    /// is covered by construction.
     fn check(&self, summary: &str, excludes: &str) -> Result<()> {
         crate::gate::ParkIntent {
             summary: Some(summary.to_string()),
@@ -143,7 +148,7 @@ impl ItemAnswer {
         // query ran first (381a4872).
         let mut all = Vec::new();
         for kind in ["backlog-item", "user-feedback"] {
-            all.extend(crate::gate::rows(
+            all.extend(crate::train::rows(
                 crate::gate::api(
                     http,
                     reqwest::Method::GET,
@@ -151,7 +156,7 @@ impl ItemAnswer {
                     None,
                 )
                 .await?,
-            ));
+            )?);
         }
         let resolve = |flag: &str, given: Option<String>| -> Result<Option<String>> {
             let Some(given) = given else {
@@ -172,18 +177,74 @@ impl ItemAnswer {
 }
 
 /// The gate's refusal, in this verb's flag spelling: `--park-backlog-item`
-/// is `--backlog-item` here. One mechanical substitution over a shared
-/// message, rather than a second message to keep in step with it.
+/// is `--backlog-item` here. Two mechanical steps over a shared message,
+/// rather than a second message to keep in step with it: the prefix is
+/// substituted, then any line OFFERING a flag this verb does not accept
+/// is dropped.
+///
+/// WHY THE DROP (backlog 19a2aca3). The two doors do not offer the same
+/// set. `boss gate` gained `--park-design`, the shared refusal gained a
+/// fourth offer line, and the substitution alone printed `--design` here
+/// — a flag `boss car open` has never had, told to a builder who is
+/// already stuck. A refusal is a door's last chance to be helpful, and
+/// naming an unusable door wastes it exactly as naming none does
+/// (2e4d7624). Dropping is the CLASS fix: it holds for the next flag
+/// added at one door and not the other, with no list to remember.
+///
+/// It drops OFFERS, not mentions: see [`offered_flag`].
 ///
 /// The one line of our own says WHEN the answer is being asked for, which
 /// the shared text cannot: it was written for a verb that runs after the
 /// build, and here the build has not started.
 fn in_this_verbs_spelling(refusal: &str) -> String {
+    let rewritten = refusal.replace("--park-", "--");
+    let accepted = accepted_long_flags();
+    let kept: Vec<&str> = rewritten
+        .lines()
+        .filter(|line| offered_flag(line).is_none_or(|f| accepted.contains(f)))
+        .collect();
     format!(
         "a car states which item it is for when its build STARTS — the gate then only \
          has to confirm it.\n{}",
-        refusal.replace("--park-", "--")
+        kept.join("\n")
     )
+}
+
+/// The flag an indented line OFFERS — the "type this" lines of a list of
+/// answers, which is the only shape a caller-specific drop is safe on.
+///
+/// A line at column 0 is prose and survives whatever it mentions: the
+/// shared refusal for two answers at once STARTS with a flag and carries
+/// the whole explanation, so dropping it would delete the refusal.
+fn offered_flag(line: &str) -> Option<&str> {
+    if !line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let tok = line.split_whitespace().next()?;
+    tok.starts_with("--").then_some(tok)
+}
+
+/// EVERY LONG FLAG `boss car open` ACCEPTS, read from the verb's own
+/// clap definition — the one place that decides it (CLAUDE.md §9a).
+///
+/// A list typed here would be the same fact living twice, and the copy
+/// that drifted would be the one deciding what a refusal tells a builder
+/// to type. Reading clap costs one `Command` build on a path that has
+/// already failed.
+fn accepted_long_flags() -> std::collections::BTreeSet<String> {
+    <crate::CarAction as clap::Subcommand>::augment_subcommands(clap::Command::new("car"))
+        .find_subcommand("open")
+        .map(|open| {
+            open.get_arguments()
+                .flat_map(|a| {
+                    a.get_long()
+                        .into_iter()
+                        .chain(a.get_all_aliases().unwrap_or_default())
+                })
+                .map(|l| format!("--{l}"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What `boss car open` does about a branch, decided from the system of
@@ -394,13 +455,23 @@ pub(crate) async fn open(
     .ok_or_else(|| anyhow::anyhow!("filed car {id} and the API will not read it back"))?;
 
     // DECLARE THE SCOPE. The writes are decided in core, shared with the
-    // two finishers, and skip anything already done.
+    // two finishers, and skip anything already done. Each is the
+    // evidence through the step merge door, THEN a status-only PUT — a
+    // PUT carrying metadata replaces the step's stored keys wholesale
+    // (backlog e39a9d2a; `car::StepWrite` says why the order matters).
     for w in car::open_writes(&car_json, summary, excludes, now).map_err(anyhow::Error::msg)? {
         crate::gate::api(
             &http,
+            reqwest::Method::PATCH,
+            &w.merge_path(&id),
+            Some(w.metadata.clone()),
+        )
+        .await?;
+        crate::gate::api(
+            &http,
             reqwest::Method::PUT,
-            &format!("/api/jobs/{id}/steps/{}", w.step_id),
-            Some(w.body),
+            &w.status_path(&id),
+            Some(w.status_body),
         )
         .await?;
     }
@@ -467,10 +538,259 @@ pub(crate) async fn open(
     Ok(())
 }
 
+/// `boss car waits-on <car>` — say what an open car's proof waits on
+/// (backlog b461341d).
+///
+/// WHY A VERB. adef5ddf names a probe that has said not-yet for 72h
+/// without a break as ours to read, and all six cars it measured were
+/// honest waits on the world. The car has to be able to say so, and six
+/// already-landed cars have to be able to say so AFTER their park — so
+/// this is the metadata PATCH (`boss_jobs::car::WAITS_ON`), with the
+/// declaration built in the one shape the shed reads and a `seen` check
+/// held to the rules the forge will run it under, BEFORE it is written.
+///
+/// IT MERGES (backlog e9b164a1 piece 3). The declaration grew an `owner`
+/// and a `max_wait_hours` (3881f5c9), and the metadata door merges
+/// top-level keys only, so a verb that PATCHed the whole object from its
+/// own flags dropped whatever it was not given — an owner added by hand
+/// was lost to the next `--seen`. So the verb reads the car's declaration
+/// first and writes it back with only the given fields replaced.
+pub(crate) async fn waits_on(
+    given: &str,
+    fields: &WaitsOnFields,
+    clear: bool,
+    dry_run: bool,
+) -> Result<()> {
+    // Refuse a bad flag before the read: the rules need no car.
+    if !clear {
+        fields.update()?;
+    }
+    let http = reqwest::Client::new();
+    let (found, branch) = crate::rerail::find_car(&http, given).await?;
+    let id = found
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("car {branch} carries no id"))?;
+    let recorded = found.pointer(&format!("/metadata/{}", car::WAITS_ON));
+    let body = waits_on_body(recorded, fields, clear)?;
+    if dry_run {
+        println!("boss car waits-on: DRY — would PATCH /api/jobs/{id}/metadata with {body}");
+        return Ok(());
+    }
+    crate::gate::api(
+        &http,
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{id}/metadata"),
+        Some(body.clone()),
+    )
+    .await?;
+    println!("boss car waits-on: {branch} ({id}) now carries {body}");
+    Ok(())
+}
+
+/// The fields of a declared wait as a writer was GIVEN them — by `boss
+/// car waits-on`'s flags, by `boss gate --park-waits-on*`, or by the
+/// `[waits_on]` table of a park file. Each is the `boss_jobs::car` key
+/// of the same name; one absent is one not stated, which a merge keeps.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WaitsOnFields {
+    pub on: Option<String>,
+    pub seen: Option<String>,
+    pub owner: Option<String>,
+    pub max_wait_hours: Option<u32>,
+}
+
+impl WaitsOnFields {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The fields given, as the object [`car::merge_waits_on`] overlays —
+    /// or the refusal, naming the flag. A blank `on` or `seen` is
+    /// refused (a blank `on` declares nothing, and a blank `seen` is an
+    /// observer that never runs), and so is a `seen` check the recording
+    /// door would refuse to run: a check that never runs is a wait
+    /// nothing can ever contradict, which is the silence this field
+    /// exists to end. An owner is `world` or an actor's id — ONE token,
+    /// because the reader takes any other string as the actor it names,
+    /// and prose there would be a wait on nobody. Patience is positive:
+    /// the reader ignores a zero, so writing one would record a limit
+    /// that is not one.
+    pub(crate) fn update(&self) -> Result<Value> {
+        if self.is_empty() {
+            bail!(
+                "nothing to declare: give --on, --seen, --owner or --max-wait-hours \
+                 (or --clear to remove the declaration)"
+            );
+        }
+        let blank = |flag: &str, v: &Option<String>| -> Result<Option<String>> {
+            match v.as_deref().map(str::trim) {
+                Some("") => bail!("{flag} is empty — leave it out, or give it the text"),
+                other => Ok(other.map(str::to_string)),
+            }
+        };
+        if self.on.as_deref().is_some_and(|o| o.trim().is_empty()) {
+            bail!("--on names nothing: say which event or actor the proof waits on");
+        }
+        let on = blank("--on", &self.on)?;
+        let seen = blank("--seen", &self.seen)?;
+        let owner = blank("--owner", &self.owner)?;
+        if let Some(s) = seen.as_deref()
+            && let Some(r) = crate::prove::admit(s, true).refusal
+        {
+            bail!("--seen is refused under the rules the forge runs it by — {r}");
+        }
+        if let Some(o) = owner.as_deref()
+            && o.contains(char::is_whitespace)
+        {
+            bail!(
+                "--owner '{o}' is not an id: it is `world` for an event nobody here can \
+                 cause, or the one-word id of the actor whose act it is — the shed \
+                 reads it as that actor, so prose there is a wait on nobody"
+            );
+        }
+        if self.max_wait_hours == Some(0) {
+            bail!("--max-wait-hours 0 is no patience at all: give a positive number of hours");
+        }
+        let mut m = serde_json::Map::new();
+        let mut put = |k: &str, v: Option<Value>| {
+            if let Some(v) = v {
+                m.insert(k.to_string(), v);
+            }
+        };
+        put("on", on.map(Value::from));
+        put("seen", seen.map(Value::from));
+        put(car::WAITS_ON_OWNER, owner.map(Value::from));
+        put(
+            car::WAITS_ON_MAX_WAIT_HOURS,
+            self.max_wait_hours.map(Value::from),
+        );
+        Ok(Value::Object(m))
+    }
+}
+
+/// The PATCH body, or the refusal — pure, so the rules are testable.
+/// `recorded` is the car's own `waits_on`; the given fields are merged
+/// into it, and a result naming no `on` is refused.
+pub(crate) fn waits_on_body(
+    recorded: Option<&Value>,
+    fields: &WaitsOnFields,
+    clear: bool,
+) -> Result<Value> {
+    if clear {
+        return Ok(serde_json::json!({ (car::WAITS_ON): Value::Null }));
+    }
+    let merged = car::merge_waits_on(recorded, &fields.update()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--on names nothing, and the car declares no event to attach these to: say \
+             which event or actor the proof waits on"
+        )
+    })?;
+    Ok(serde_json::json!({ (car::WAITS_ON): merged }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// THE DECLARATION IS WRITTEN IN THE SHAPE THE SHED READS
+    /// (b461341d): whatever the verb PATCHes, `boss_jobs::car::waits_on`
+    /// reads back; a blank `on` is refused; `--clear` deletes the key
+    /// (the metadata door deletes a null).
+    #[test]
+    fn a_waits_on_body_reads_back_as_the_declaration_the_shed_reads() {
+        let body =
+            waits_on_body(None, &given(Some(" a red crawl "), Some("exit 0")), false).unwrap();
+        assert_eq!(
+            car::waits_on(&body),
+            Some(car::WaitsOn {
+                on: "a red crawl".into(),
+                seen: Some("exit 0".into())
+            })
+        );
+        let body = waits_on_body(None, &given(Some("an operator publish"), None), false).unwrap();
+        assert_eq!(car::waits_on(&body).unwrap().seen, None);
+        assert!(waits_on_body(None, &given(Some("  "), None), false).is_err());
+        assert!(waits_on_body(None, &given(None, None), false).is_err());
+        assert_eq!(
+            waits_on_body(None, &given(None, None), true).unwrap(),
+            json!({"waits_on": null})
+        );
+    }
+
+    /// The fields a test hands the verb: `on` and `seen` as given.
+    fn given(on: Option<&str>, seen: Option<&str>) -> WaitsOnFields {
+        WaitsOnFields {
+            on: on.map(str::to_string),
+            seen: seen.map(str::to_string),
+            ..WaitsOnFields::default()
+        }
+    }
+
+    /// A `seen` check the recording door would refuse is refused HERE,
+    /// at the operator's terminal, rather than silently never running.
+    #[test]
+    fn a_seen_check_the_forge_would_refuse_is_refused_at_the_verb() {
+        // An unidentified read of the jobs API's own port: the forge's
+        // door refuses it, because it answers a narrowed world.
+        let refused = "curl -s \"$BOSS_JOBS_URL/api/jobs?kind=x\" | grep -q x";
+        let err = waits_on_body(None, &given(Some("x"), Some(refused)), false).unwrap_err();
+        assert!(err.to_string().contains("--seen is refused"), "{err}");
+        assert!(waits_on_body(None, &given(Some("x"), Some("true")), false).is_ok());
+    }
+
+    /// THE VERB MERGES (backlog e9b164a1 piece 3). It used to PATCH the
+    /// whole object, so re-stating `on` and `seen` dropped the `owner` an
+    /// operator had added by hand — and a wait without an owner reads as
+    /// ours. Now each flag given replaces its field and nothing else is
+    /// touched, so `--owner` alone can be added to a car that already
+    /// declares its `on`.
+    #[test]
+    fn the_verb_merges_into_the_declaration_the_car_carries() {
+        let recorded =
+            json!({"on": "a release", "seen": "true", "owner": "emp-david", "max_wait_hours": 48});
+        let fields = given(Some("a tagged release"), Some("exit 0"));
+        let body = waits_on_body(Some(&recorded), &fields, false).unwrap();
+        assert_eq!(body["waits_on"]["owner"], "emp-david");
+        assert_eq!(body["waits_on"]["max_wait_hours"], 48);
+        assert_eq!(body["waits_on"]["on"], "a tagged release");
+
+        let owner_only = WaitsOnFields {
+            owner: Some("world".into()),
+            max_wait_hours: Some(336),
+            ..WaitsOnFields::default()
+        };
+        let seeded = car::waits_on_value("a Stripe charge", Some("true"));
+        let body = waits_on_body(Some(&seeded), &owner_only, false).unwrap();
+        assert_eq!(car::wait_owner(&body), Some(car::WaitOwner::World));
+        assert_eq!(body["waits_on"][car::WAITS_ON_MAX_WAIT_HOURS], 336);
+        assert_eq!(car::waits_on(&body).unwrap().seen.as_deref(), Some("true"));
+        // An owner with nothing to attach it to declares nothing.
+        let err = waits_on_body(None, &owner_only, false).unwrap_err();
+        assert!(err.to_string().contains("--on"), "{err}");
+    }
+
+    /// AN OWNER IS AN ID, AND PATIENCE IS POSITIVE. The reader takes any
+    /// non-blank owner other than `world` as the actor it names, so prose
+    /// ("David opens it") written there would be a wait on an actor who
+    /// does not exist; and a zero patience is no declaration at all.
+    #[test]
+    fn an_owner_is_one_token_and_a_max_wait_is_positive() {
+        let with = |owner: &str, max: Option<u32>| WaitsOnFields {
+            on: Some("x".into()),
+            owner: Some(owner.into()),
+            max_wait_hours: max,
+            ..WaitsOnFields::default()
+        };
+        assert!(waits_on_body(None, &with("emp-david", Some(1)), false).is_ok());
+        let err = waits_on_body(None, &with("David opens it", None), false).unwrap_err();
+        assert!(err.to_string().contains("--owner"), "{err}");
+        assert!(waits_on_body(None, &with("  ", None), false).is_err());
+        let err = waits_on_body(None, &with("world", Some(0)), false).unwrap_err();
+        assert!(err.to_string().contains("--max-wait-hours"), "{err}");
+    }
 
     const BRANCH: &str = "feat/a-car-opens-when-the-build-starts";
 
@@ -681,6 +1001,70 @@ mod tests {
             "this verb's flags have no `park` in them — the gate's spelling must not leak \
              into a refusal printed by `boss car open`: {e}"
         );
+    }
+
+    /// EVERY FLAG A REFUSAL NAMES IS ONE THIS VERB ACCEPTS — read from
+    /// `boss car open`'s OWN clap definition, never a list typed here
+    /// (CLAUDE.md §9a: prefer collapsing to one definition).
+    ///
+    /// WHY THE TEST ABOVE COULD NOT SEE THIS (backlog 19a2aca3). It
+    /// asserts the presence of the three flags that DO exist plus the
+    /// absence of one known-wrong prefix. Both stayed true when the gate
+    /// gained `--park-design`: the shared refusal grew a FOURTH offer
+    /// line, which the prefix rewrite rendered as `--design` — a flag
+    /// this verb has never had. A test that checks presence-of-expected
+    /// and absence-of-one-known-wrong cannot see a line naming something
+    /// that does not exist. This one asks the opposite question, so the
+    /// NEXT flag added at one door and not the other is covered without
+    /// anyone remembering to come back here.
+    #[test]
+    fn a_refusal_names_only_flags_this_verb_accepts() {
+        let accepted = accepted_long_flags();
+        // The clap read must not answer emptily — an empty set would
+        // make every assertion below vacuously true, which is how a
+        // renamed subcommand would slip past silently.
+        assert!(
+            accepted.contains("--backlog-item"),
+            "the clap read finds this verb's own flags: {accepted:?}"
+        );
+        let e = check(&ItemAnswer::default()).unwrap_err().to_string();
+        for flag in flags_named(&e) {
+            assert!(
+                accepted.contains(&flag),
+                "the refusal names {flag}, which `boss car open` does not accept \
+                 (it accepts {accepted:?}): {e}"
+            );
+        }
+    }
+
+    /// AND THE DROP IS MECHANICAL — a shared refusal offering a flag
+    /// this verb lacks loses that LINE and keeps everything else,
+    /// including the prose around it. Written against a synthetic
+    /// refusal because the live one is the instance under repair: when
+    /// the gate next gains a flag, this still says what the rewriter
+    /// does with it.
+    #[test]
+    fn the_rewriter_drops_an_offer_line_for_a_flag_this_verb_lacks() {
+        let out = in_this_verbs_spelling(
+            "pass exactly one of:\n  --park-backlog-item <id>    the closing edge\n  \
+             --park-design <id>          a flag only the gate has\n\nMeasured 2026-09-10.",
+        );
+        assert!(out.contains("--backlog-item <id>"), "{out}");
+        assert!(!out.contains("--design"), "{out}");
+        assert!(!out.contains("a flag only the gate has"), "{out}");
+        assert!(out.contains("Measured 2026-09-10."), "{out}");
+        assert!(out.contains("pass exactly one of:"), "{out}");
+    }
+
+    /// The flags a piece of refusal text names, as a reader reads them.
+    /// The trim keeps `-` so a leading `--` survives, and drops the
+    /// quotes, brackets and sentence punctuation around a flag.
+    fn flags_named(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !(c.is_alphanumeric() || c == '-')))
+            .filter(|t| t.starts_with("--") && t.len() > 2)
+            .map(str::to_string)
+            .collect()
     }
 
     /// EACH ANSWER, ALONE, IS ACCEPTED — and lands on the packet under

@@ -53,6 +53,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use boss_core::tenant_manifest::TenantToml;
 
+// `PLATFORM_WORKFLOW_KINDS` — the kinds the product ships, derived
+// from `infra/platform/workflows/*.toml` by build.rs, which carries
+// the reasoning.
+include!(concat!(env!("OUT_DIR"), "/platform_workflow_kinds.rs"));
+
 /// One file the product reads from a tenant directory. The order of
 /// [`CONTRACT`] is the order `check` reports and the doc's table.
 pub struct Entry {
@@ -84,6 +89,57 @@ struct Ctx {
     /// carries that refusal) — what a tax kind's account is checked
     /// against (backlog 7f163e58).
     chart: Option<BTreeSet<String>>,
+    /// The kinds `seeds/workflows.toml` declares — half of what a
+    /// sensor's `opens` is checked against (backlog b8d8c928).
+    workflows: Declared,
+    /// The ids `seeds/credentials.toml` declares — what a sensor's
+    /// `credential` is checked against, when the tenant wrote one.
+    credentials: Declared,
+}
+
+/// What a file a cross-file reference points INTO offers.
+enum Declared {
+    /// It parsed: these are the ids it declares, and a reference this
+    /// set does not hold is dangling.
+    Rows(BTreeSet<String>),
+    /// Not judged here, for one of two reasons. It EXISTS and does not
+    /// parse — its own row already carries that refusal, in the
+    /// loader's words, and a second one here would name the wrong
+    /// defect ("nothing declares it" about a file that does). Or it is
+    /// ABSENT and optional, and the registry it feeds is one the
+    /// instance may hold on its own (design e187198f: seeds bootstrap,
+    /// the instance is the truth) — a file that was never written
+    /// declares nothing and contradicts nothing.
+    NotJudged,
+}
+
+impl Declared {
+    fn holds(&self, id: &str) -> bool {
+        match self {
+            Declared::Rows(ids) => ids.contains(id),
+            Declared::NotJudged => true,
+        }
+    }
+}
+
+/// Read one referenced file into a [`Declared`]. `absent` is the
+/// verdict when there is no such file, which differs by registry: the
+/// workflow roster is REQUIRED of every tenant, so its absence is an
+/// empty roster and a reference into it dangles; an optional file the
+/// tenant never wrote is [`Declared::NotJudged`].
+fn declared<T>(
+    path: &Path,
+    absent: Declared,
+    load: impl FnOnce(&Path) -> Result<Vec<T>, String>,
+    id: impl Fn(T) -> String,
+) -> Declared {
+    if !path.is_file() {
+        return absent;
+    }
+    match load(path) {
+        Ok(rows) => Declared::Rows(rows.into_iter().map(id).collect()),
+        Err(_) => Declared::NotJudged,
+    }
 }
 
 /// What the scaffold templates need.
@@ -220,7 +276,7 @@ pub const CONTRACT: &[Entry] = &[
                 init` writes the hosted default `data` explicitly, and a name the map lacks is \
                 INVALID; a479faf7, design 01c3cc3f); `[modules] <module> = bool` — a module \
                 is ON only when listed true, a missing key is off (ce68f137); the SPA reads \
-                `calendar`, `equipment`, `exec`, `finance`, `marketing-assets`, `parts`, `qa`, \
+                `equipment`, `exec`, `finance`, `marketing-assets`, `parts`, `qa`, \
                 `shipping`, `shop`, `sim`, `support`, `warehouse`; `[labels] <dotted.key> = str`; \
                 `[gateway] public_reads = [path, ...]` — the API reads the instance answers WITHOUT \
                 a session, from the four the gateway can offer (`/api/workflows`, `/api/jobs/summary`, \
@@ -259,8 +315,8 @@ pub const CONTRACT: &[Entry] = &[
         paths: &["seeds/classes.json", "seeds/classes.toml"],
         required: false,
         read_by: "POST /api/classes/batch, one boss-classes `http::ClassInput` per row — sent by \
-                  the tenant prepare (brewery: classes.json; used-device-shop: classes.toml \
-                  `[[class]]`) and infra/postgres/reset-to-baseline.sh",
+                  the tenant prepare (brewery: classes.json) and \
+                  infra/postgres/reset-to-baseline.sh",
         shape: "JSON array (or TOML `[[class]]` rows) of {subject_kind, code, display_name, \
                 parent_code?, member_attribute?, metadata?, sort_order?}",
         parse: parse_classes,
@@ -311,7 +367,7 @@ pub const CONTRACT: &[Entry] = &[
                   instance is the truth; `--take employees` PUTs the declared fields and keeps \
                   the rest (design e187198f) — sent by `boss tenant publish` (the brewery \
                   engine's prepare reads it at the FIXED path /opt/boss/examples/brewery/seeds/, \
-                  not from the bundle; used-device-shop reads data/employees.json instead)",
+                  not from the bundle)",
         shape: "JSON array of Employee rows: id, name, email, role, department, hire_date, \
                 location, manager_id, employment_type, status, skills[], certifications[], \
                 annual_salary_cents; role/department/location are validated against the \
@@ -374,7 +430,10 @@ pub const CONTRACT: &[Entry] = &[
                 for paid payouts, both polled on the same credential; `site` push-only), credential \
                 (a `credentials` registry id; none on a push-only source), every_minutes (none on a \
                 push-only source), opens (the workflow kind one reading opens), subject_kind, \
-                enabled? — validated by `boss_jobs::sensors::load_sensors_toml`",
+                enabled? — validated by `boss_jobs::sensors::load_sensors_toml`. Cross-file: \
+                `opens` must name a workflow this tenant declares or the platform ships, and \
+                `credential` a row `seeds/credentials.toml` declares — a dangling reference \
+                passes every file-local check and opens nothing (backlog b8d8c928)",
         parse: parse_sensors,
         scaffold: Some(scaffold_sensors),
     },
@@ -751,9 +810,59 @@ fn parse_credentials(path: &Path, _: &Ctx) -> Result<String, String> {
     })
 }
 
-fn parse_sensors(path: &Path, _: &Ctx) -> Result<String, String> {
+/// The contract's cross-check on one sensor (backlog b8d8c928). A
+/// sensor names rows in two OTHER files — the workflow one reading
+/// opens, and the credential its source is read with — and until
+/// 2026-09-22 nothing held the files together: the real tenant's
+/// `www-visits` sensor declared `opens = "marketing-weekly"` on
+/// 2026-09-17 against a kind that has never existed (no workflow
+/// version of it, ever), so five days of LIVE readings reached a dead
+/// end in silence. Every file-local check passed, because the defect
+/// is BETWEEN files — CLAUDE.md §9a seen from the other side, so the
+/// refusal names the offending reference the way a drift pin does.
+///
+/// WHICH AUTHORITY. `check` is pure over the filesystem and never
+/// touches the network, so the live registry is not a source here and
+/// must not become one: a verdict that depended on which instance
+/// answered would pass or fail the same directory twice. The honest
+/// offline authority for "a workflow this tenant can open" is the
+/// tenant's own `seeds/workflows.toml` plus the kinds the PRODUCT
+/// ships ([`PLATFORM_WORKFLOW_KINDS`], derived from
+/// `infra/platform/workflows/` by build.rs) — a tenant opens a
+/// platform protocol without redeclaring it. Same rule the tax kinds
+/// follow against the chart: the file the reference points into is the
+/// authority, and its absence is refused rather than excused.
+fn cross_check_sensor(s: &boss_jobs::sensors::SensorInput, ctx: &Ctx) -> Result<(), String> {
+    if !ctx.workflows.holds(&s.opens) && !PLATFORM_WORKFLOW_KINDS.contains(&s.opens.as_str()) {
+        return Err(format!(
+            "sensor {}: opens `{}`, which is no workflow — seeds/workflows.toml does not \
+             declare it and it is none of the {} kinds the product ships. Every reading of \
+             this sensor would open nothing, silently; declare the protocol there, or name a \
+             kind that exists",
+            s.id,
+            s.opens,
+            PLATFORM_WORKFLOW_KINDS.len()
+        ));
+    }
+    // A push-only source names no credential; the loader has already
+    // refused an empty one on a polled source.
+    if !s.credential.is_empty() && !ctx.credentials.holds(&s.credential) {
+        return Err(format!(
+            "sensor {}: credential `{}`, which seeds/credentials.toml does not declare — \
+             publish sends the credentials BEFORE the sensors, because this is the id the \
+             poller reads the source's value by",
+            s.id, s.credential
+        ));
+    }
+    Ok(())
+}
+
+fn parse_sensors(path: &Path, ctx: &Ctx) -> Result<String, String> {
     let rows = boss_jobs::sensors::load_sensors_toml(path)?;
     refuse_if_stray(&read(path)?, "sensor", rows.len())?;
+    for s in &rows {
+        cross_check_sensor(s, ctx)?;
+    }
     Ok(match rows.len() {
         0 => "0 sensors".to_string(),
         n => format!(
@@ -870,7 +979,7 @@ fn parse_rules(path: &Path, _: &Ctx) -> Result<String, String> {
     use boss_dispatcher::rules::{authoring, registry};
     let raw = registry::parse_raw_file(path).map_err(|e| e.to_string())?;
     refuse_if_stray(&read(path)?, "rule", raw.rules.len())?;
-    let known = boss_dispatcher::cascade::handler_emits();
+    let known = boss_dispatcher_handlers::cascade::handler_emits();
     let mut lines = Vec::new();
     for rule in &raw.rules {
         authoring::validate(rule).map_err(|e| e.to_string())?;
@@ -878,7 +987,7 @@ fn parse_rules(path: &Path, _: &Ctx) -> Result<String, String> {
             if !known.contains_key(step.handler.as_str()) {
                 return Err(format!(
                     "rule `{}` names handler `{}`, which this build of BOSS does not have \
-                     (boss_dispatcher::cascade::handler_emits lists {} handlers); the publish \
+                     (boss_dispatcher_handlers::cascade::handler_emits lists {} handlers); the publish \
                      door would accept it and the dispatcher would refuse it at dispatch as \
                      UnknownHandler",
                     rule.name,
@@ -1024,6 +1133,58 @@ impl Report {
     }
 }
 
+/// The verdict word [`Report::render`] closes a passing check with.
+pub const PASS: &str = "PASS";
+
+/// Whether `text` is a PASSING `boss tenant check` report, read back in
+/// the shape [`Report::render`] writes it — `Ok(())`, or the reason it
+/// is not, naming what was read.
+///
+/// WHY (design fd8b5143, backlog 6a34e9bc). A tenant car has no gate, so
+/// the one artifact that says its tree is sound is this check's output,
+/// and a tenant-builder run lands on it: `boss dispatch --report`
+/// refuses a `delivered` tenant run whose receipt does not pass. The
+/// receipt is the check's own words, copied — never a builder's "it
+/// passed" — so the reader here accepts only the renderer's shape: the
+/// `boss tenant check <dir>` header first and the count line last, with
+/// no MISSING and no INVALID, ending in PASS. The pair is pinned by a
+/// test that renders a report and reads it back (CLAUDE.md 9a: the
+/// format lives in `render`, and this reader is held to it).
+pub fn passing_receipt(text: &str) -> std::result::Result<(), String> {
+    let mut lines = text.lines().map(str::trim_end).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    if !first.starts_with("boss tenant check ") {
+        return Err(format!(
+            "it does not open with the `boss tenant check <dir>` header the check prints (the \
+             first line is {first:?}) — the receipt is the check's own output, copied whole"
+        ));
+    }
+    let last = lines.next_back().unwrap_or("");
+    let Some((counts, verdict)) = last.rsplit_once(" — ") else {
+        return Err(format!(
+            "its last line is not the check's count line (it is {last:?}) — a receipt cut \
+             short is not a receipt"
+        ));
+    };
+    let count = |label: &str| {
+        counts.split(", ").find_map(|part| {
+            part.strip_suffix(label)
+                .and_then(|n| n.trim().parse::<usize>().ok())
+        })
+    };
+    match (count(" missing"), count(" invalid"), verdict.trim()) {
+        (Some(0), Some(0), PASS) => Ok(()),
+        (Some(_), Some(_), v) => Err(format!(
+            "the check did not pass: its verdict line reads {last:?} (verdict {v:?}) — a car \
+             lands on a PASS"
+        )),
+        _ => Err(format!(
+            "its last line is not the check's count line (it is {last:?}) — a receipt cut \
+             short is not a receipt"
+        )),
+    }
+}
+
 /// The `[meta] tenant_id` the directory declares, at either spelling;
 /// a placeholder when it cannot be read so the workflow loader still
 /// runs (the manifest row carries the real refusal).
@@ -1047,11 +1208,27 @@ pub fn declared_tenant_id(dir: &Path) -> Option<String> {
 /// Validate `dir` against [`CONTRACT`]. Pure over the filesystem: it
 /// reads, never writes, and never touches the network.
 pub fn check(dir: &Path) -> Report {
+    let tenant_id = tenant_id_of(dir);
     let ctx = Ctx {
-        tenant_id: tenant_id_of(dir),
         chart: boss_ledger::chart::load_chart_toml(&dir.join("seeds/chart_of_accounts.toml"))
             .ok()
             .map(|rows| rows.into_iter().map(|a| a.code).collect()),
+        workflows: declared(
+            &dir.join("seeds/workflows.toml"),
+            Declared::Rows(BTreeSet::new()),
+            |p| {
+                boss_jobs::seed_loader::load_workflows_with_owning_team(p, &tenant_id)
+                    .map_err(|e| e.to_string())
+            },
+            |s| s.kind,
+        ),
+        credentials: declared(
+            &dir.join("seeds/credentials.toml"),
+            Declared::NotJudged,
+            boss_jobs::credentials::load_credentials_toml,
+            |c| c.id,
+        ),
+        tenant_id,
     };
     let mut rows = Vec::new();
     let mut named: BTreeSet<String> = BTreeSet::new();
@@ -1248,8 +1425,7 @@ This directory is **{display}** described as a tenant of BOSS: what the
 company is (its taxonomy, people, calendars, access rules) and how it
 operates (its protocols). It lives OUTSIDE the product tree, in exactly
 the shape the product reads: `tenant.toml` (the manifest) + `seeds/`.
-The product's `examples/brewery` and `examples/used-device-shop`
-exercise the same contract publicly.
+The product's `examples/brewery` exercises the same contract publicly.
 
 Scaffolded by `boss tenant init {name}`. Validate it any time with
 `boss tenant check .` — it judges every file with the product's own
@@ -1748,6 +1924,15 @@ pub enum TenantAction {
         /// each service's own localhost port, the in-pod launcher path).
         #[arg(long)]
         gateway: Option<String>,
+        /// Publish through the LAN machine door instead: ONE host, each
+        /// service on its own `boss_ports` port, exactly as `export
+        /// --door` reads. Give the address the estate spells as
+        /// BOSS_JOBS_URL. This is the operator seat's route into a
+        /// deployment (backlog e32a423e) — every write is still signed
+        /// as the seed identity, which `--gateway` cannot carry because
+        /// the gateway answers a sessionless caller 401.
+        #[arg(long, conflicts_with = "gateway")]
+        door: Option<String>,
         /// Print every write the publish WOULD make; no HTTP.
         #[arg(long)]
         dry_run: bool,
@@ -1844,14 +2029,16 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::Tenant(TenantAction::Publish {
             dir,
             gateway,
+            door,
             dry_run,
             take,
         }) => {
             let take = crate::tenant_publish::Take::parse(take.as_deref())?;
             let plan = crate::tenant_publish::plan(&dir)?;
-            let bases = crate::tenant_publish::Bases::resolve(gateway.as_deref());
+            let (bases, routing) =
+                crate::tenant_publish::Bases::routed(gateway.as_deref(), door.as_deref())?;
             println!("{}", plan.render_header(dry_run));
-            println!("{}", bases.describe(gateway.as_deref()));
+            println!("{routing}");
             println!("{}", take.describe());
             if dry_run {
                 for s in &plan.steps {
@@ -1921,17 +2108,8 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                     dir.display()
                 );
             };
-            let (bases, routing) = match door.as_deref() {
-                Some(d) => (
-                    crate::tenant_publish::Bases::on_door(d)?,
-                    format!("routing: each service's own port on the machine door {d}"),
-                ),
-                None => {
-                    let bases = crate::tenant_publish::Bases::resolve(gateway.as_deref());
-                    let line = bases.describe(gateway.as_deref());
-                    (bases, line)
-                }
-            };
+            let (bases, routing) =
+                crate::tenant_publish::Bases::routed(gateway.as_deref(), door.as_deref())?;
             println!("{routing}");
             // The doors are blocking reqwest, like publish's.
             let snap = tokio::task::spawn_blocking({
@@ -2012,6 +2190,50 @@ mod tests {
         );
     }
 
+    /// THE RECEIPT IS READ IN THE SHAPE THE CHECK WRITES IT (design
+    /// fd8b5143, backlog 6a34e9bc). A tenant-builder run lands on its
+    /// copied `boss tenant check` output, so the reader is held to the
+    /// renderer rather than to a spelling typed here: a fresh `init`
+    /// renders a passing report that it accepts, the same report with
+    /// one required file deleted renders a FAIL it refuses, and a
+    /// receipt cut short, retyped as prose, or empty is refused too.
+    #[test]
+    fn a_receipt_passes_only_as_the_rendered_output_of_a_passing_check() {
+        let dir = scratch_dir("tenant-receipt-reader");
+        init("acme", Some(&dir)).unwrap();
+        let pass = check(&dir).render(&dir);
+        assert!(check(&dir).passed(), "{pass}");
+        assert_eq!(passing_receipt(&pass), Ok(()), "{pass}");
+        // Trailing blank lines and a CRLF copy are the same receipt.
+        assert_eq!(passing_receipt(&format!("{pass}\n\n")), Ok(()));
+        assert_eq!(passing_receipt(&pass.replace('\n', "\r\n")), Ok(()));
+
+        std::fs::remove_file(dir.join("seeds/workflows.toml")).unwrap();
+        let fail = check(&dir).render(&dir);
+        assert!(!check(&dir).passed(), "{fail}");
+        let why = passing_receipt(&fail).expect_err("a FAIL is refused");
+        assert!(why.contains("did not pass"), "{why}");
+
+        // Cut short: the header without the count line.
+        let head = pass.lines().next().unwrap().to_string();
+        assert!(passing_receipt(&head).is_err());
+        // Retyped: a builder's word for it, not the check's.
+        let why = passing_receipt("boss tenant check passed — PASS").expect_err("prose");
+        assert!(why.contains("count line"), "{why}");
+        let why = passing_receipt("all good\n3 ok, 0 missing, 0 invalid, 0 unknown — PASS")
+            .expect_err("no header");
+        assert!(why.contains("header"), "{why}");
+        assert!(passing_receipt("").is_err());
+        // A count line that says PASS over a nonzero count is not one
+        // the renderer can write, and it is refused rather than trusted.
+        assert!(
+            passing_receipt(&format!(
+                "{head}\n  OK  tenant.toml  x\n3 ok, 1 missing, 0 invalid, 0 unknown — PASS\n"
+            ))
+            .is_err()
+        );
+    }
+
     /// Every example ships a valid tenant — the product's public
     /// exercise of the contract. A new example must pass too.
     #[test]
@@ -2023,7 +2245,9 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.join("seeds").is_dir())
             .collect();
-        assert!(examples.len() >= 2, "expected brewery + used-device-shop");
+        // At least the brewery: an empty list would pass this test by
+        // judging nothing (the used-device shop retired, backlog a8991c86).
+        assert!(!examples.is_empty(), "expected at least examples/brewery");
         for ex in examples {
             assert_all_ok(&ex);
         }
@@ -2338,6 +2562,11 @@ terminal = { outcome = "sponsored" }
         let wf = status_of(&r, "seeds/workflows.toml").unwrap();
         assert_eq!(wf.status, Status::Invalid, "{wf:?}");
         assert!(wf.detail.contains("sensor"), "{wf:?}");
+        // And the sensor row above stays OK while this file does not
+        // parse: the cross-check on `opens` (b8d8c928) judges against
+        // the kinds this file declares, so when it declares NOTHING
+        // BECAUSE IT IS BROKEN, the refusal belongs to this row alone.
+        // A second one on the sensor would name the wrong defect.
         // A policy file with no grants, and a calendar in a shape the
         // batch endpoint rejects.
         let policy = status_of(&r, "seeds/policy_rules.toml").unwrap();
@@ -2378,6 +2607,216 @@ terminal = { outcome = "sponsored" }
         let row = status_of(&r, "seeds/sensors.toml").unwrap();
         assert_eq!(row.status, Status::Invalid, "{row:?}");
         assert!(row.detail.contains("[[sensor]]"), "{row:?}");
+    }
+
+    /// One viable tenant protocol — a trigger and a terminal — for the
+    /// cross-file cases below. `trigger_kind` is one of the StepType's
+    /// own `periodic|event|operator|counterparty`, as the real
+    /// tenant's sensor-fed protocols are: the file has to PARSE, or
+    /// the cross-check has no roster to judge against.
+    const ONE_WORKFLOW: &str = r#"[[workflow]]
+kind = "receive-a-sponsorship"
+label = "Receive a sponsorship"
+category = "sales"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "received"
+kind = "trigger"
+ready_when = "true"
+title_template = "Stripe reported a payment"
+metadata_defaults = { trigger_kind = "event", trigger_name = "stripe-checkout-completed" }
+
+[[workflow.step]]
+title = "sponsored"
+kind = "outcome"
+ready_when = "steps.received.done"
+title_template = "Sponsorship recognized"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "sponsored" }
+"#;
+
+    /// A tenant directory with the two files a sensor references, and
+    /// `sensors.toml` written by the caller.
+    fn sensor_fixture(tag: &str) -> PathBuf {
+        let dir = scratch_dir(tag);
+        put(&dir, "tenant.toml", "[meta]\ntenant_id = \"t\"\n");
+        put(&dir, "seeds/workflows.toml", ONE_WORKFLOW);
+        put(
+            &dir,
+            "seeds/credentials.toml",
+            "[[credential]]\nid = \"stripe-restricted-read\"\nkind = \"stripe-restricted-key\"\n\
+             issuer = \"stripe\"\nprincipal = \"the account\"\n\
+             storage_location = \"k8s Secret boss/boss-credential-broker-root key stripe\"\n",
+        );
+        dir
+    }
+
+    /// A sensor's `opens` is a reference INTO another file, and until
+    /// 2026-09-22 nothing held the two together: the real tenant's
+    /// `www-visits` sensor declared `opens = "marketing-weekly"` on
+    /// 2026-09-17 against a kind that has never existed, so five days
+    /// of live readings opened nothing, silently (backlog b8d8c928).
+    /// Every file-local check passed, because the defect is BETWEEN
+    /// files. The refusal names the sensor and the reference
+    /// (CLAUDE.md §9a).
+    #[test]
+    fn a_sensor_opening_a_workflow_nobody_declares_is_invalid_naming_the_kind() {
+        let dir = sensor_fixture("boss-cli-tenant-check-sensor-opens");
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"www-visits\"\nsource = \"site\"\n\
+             opens = \"marketing-weekly\"\nsubject_kind = \"custom\"\n",
+        );
+        let row = status_of(&check(&dir), "seeds/sensors.toml")
+            .cloned()
+            .unwrap();
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(
+            row.detail.contains("www-visits") && row.detail.contains("marketing-weekly"),
+            "the refusal names the sensor and the kind: {row:?}"
+        );
+        assert!(
+            row.detail.contains("seeds/workflows.toml"),
+            "and where to declare it: {row:?}"
+        );
+
+        // A kind the TENANT declares is fine.
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"www-visits\"\nsource = \"site\"\n\
+             opens = \"receive-a-sponsorship\"\nsubject_kind = \"custom\"\n",
+        );
+        assert_eq!(
+            status_of(&check(&dir), "seeds/sensors.toml")
+                .unwrap()
+                .status,
+            Status::Ok
+        );
+
+        // So is a kind the PRODUCT ships: a tenant opens a platform
+        // protocol without redeclaring it.
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"www-visits\"\nsource = \"site\"\n\
+             opens = \"backlog-item\"\nsubject_kind = \"custom\"\n",
+        );
+        let row = status_of(&check(&dir), "seeds/sensors.toml")
+            .cloned()
+            .unwrap();
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+
+        // A tenant with NO workflow roster at all declares no kind, so
+        // a tenant kind still dangles — the file is required of every
+        // tenant, and its own row says MISSING beside this one.
+        std::fs::remove_file(dir.join("seeds/workflows.toml")).unwrap();
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"www-visits\"\nsource = \"site\"\n\
+             opens = \"receive-a-sponsorship\"\nsubject_kind = \"custom\"\n",
+        );
+        let r = check(&dir);
+        assert_eq!(
+            status_of(&r, "seeds/workflows.toml").unwrap().status,
+            Status::Missing
+        );
+        assert_eq!(
+            status_of(&r, "seeds/sensors.toml").unwrap().status,
+            Status::Invalid
+        );
+    }
+
+    /// The other reference of the same shape in the same file: the
+    /// `credentials` registry id the poller reads the source with.
+    /// `boss tenant publish` sends the credentials BEFORE the sensors
+    /// for this reason, so a dangling one lands a sensor the poller
+    /// cannot run.
+    #[test]
+    fn a_sensor_naming_a_credential_nobody_declares_is_invalid() {
+        let dir = sensor_fixture("boss-cli-tenant-check-sensor-credential");
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"stripe-sponsorships\"\nsource = \"stripe\"\n\
+             credential = \"stripe-write-key\"\nevery_minutes = 15\n\
+             opens = \"receive-a-sponsorship\"\nsubject_kind = \"custom\"\n",
+        );
+        let row = status_of(&check(&dir), "seeds/sensors.toml")
+            .cloned()
+            .unwrap();
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(
+            row.detail.contains("stripe-sponsorships")
+                && row.detail.contains("stripe-write-key")
+                && row.detail.contains("seeds/credentials.toml"),
+            "{row:?}"
+        );
+
+        put(
+            &dir,
+            "seeds/sensors.toml",
+            "[[sensor]]\nid = \"stripe-sponsorships\"\nsource = \"stripe\"\n\
+             credential = \"stripe-restricted-read\"\nevery_minutes = 15\n\
+             opens = \"receive-a-sponsorship\"\nsubject_kind = \"custom\"\n",
+        );
+        assert_eq!(
+            status_of(&check(&dir), "seeds/sensors.toml")
+                .unwrap()
+                .status,
+            Status::Ok
+        );
+
+        // And a tenant that wrote NO credentials file is not judged
+        // against one: that registry is optional and the instance may
+        // hold it on its own (design e187198f). The workflow roster is
+        // required of every tenant, so it has no such exemption — the
+        // case above still refuses with the file absent.
+        std::fs::remove_file(dir.join("seeds/credentials.toml")).unwrap();
+        let row = status_of(&check(&dir), "seeds/sensors.toml")
+            .cloned()
+            .unwrap();
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+    }
+
+    /// The compiled roster IS `infra/platform/workflows/` — the
+    /// directory, not a hand-kept list (CLAUDE.md §9a) — and the kind
+    /// is the file name, which is the rule
+    /// `infra/gcp/publish-workflow.sh` applies. It also catches the
+    /// shared-target-dir staleness boss-testing's build.rs documents: a
+    /// roster linked from a neighbouring checkout's build would
+    /// disagree with this checkout's directory.
+    #[test]
+    fn the_platform_workflow_roster_is_the_directory() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../infra/platform/workflows");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("infra/platform/workflows/ exists")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+        let mut compiled: Vec<String> = PLATFORM_WORKFLOW_KINDS
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect();
+        compiled.sort();
+        assert_eq!(
+            compiled, on_disk,
+            "PLATFORM_WORKFLOW_KINDS is not infra/platform/workflows/*.toml — rebuild"
+        );
+        for kind in PLATFORM_WORKFLOW_KINDS {
+            let text = std::fs::read_to_string(dir.join(format!("{kind}.toml"))).unwrap();
+            assert!(
+                text.lines()
+                    .any(|l| l.trim() == format!("kind = \"{kind}\"")),
+                "{kind}.toml declares a kind other than its file name — the roster reads \
+                 the name, as publish-workflow.sh does"
+            );
+        }
     }
     /// A credential declaration (backlog ee368d0c) is judged by the
     /// registry's own loader: a row that smuggles a value under a key
@@ -2831,6 +3270,21 @@ terminal = { outcome = "sponsored" }
         let wf = status_of(&r, "seeds/workflows.toml").unwrap();
         assert_eq!(wf.status, Status::Invalid, "{wf:?}");
         assert!(!wf.detail.is_empty());
+    }
+
+    /// The demo roster had one reader, boss-observability, and it
+    /// retired as superseded-by (backlog 467175e7, car B, 2026-09-23):
+    /// the contract no longer names `seeds/demo_agents.toml`, so a
+    /// bundle that still ships one is told the file is read by nothing
+    /// rather than judged OK by a loader for a service no pod starts.
+    #[test]
+    fn a_demo_roster_is_no_longer_part_of_the_contract() {
+        let dir = scratch_dir("boss-cli-tenant-check-retired-demo-roster");
+        write_file(&dir.join("tenant.toml"), "[meta]\ntenant_id = \"t\"\n");
+        put(&dir, "seeds/demo_agents.toml", "[[agent]]\nid = \"a\"\n");
+        let r = check(&dir);
+        let row = status_of(&r, "seeds/demo_agents.toml").unwrap();
+        assert_eq!(row.status, Status::Unknown, "{row:?}");
     }
 
     /// CLAUDE.md §9a: the doc's table and the code's contract are one

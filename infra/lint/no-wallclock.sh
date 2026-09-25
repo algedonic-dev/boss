@@ -117,14 +117,6 @@ ALLOWED_PREFIXES=(
   "crates/core/boss-gateway/src/local_auth.rs"
   # Perf metrics — diagnostic only, never emitted as audit
   "crates/core/boss-gateway/src/perf.rs"
-  # Cybernetics-layer queue + dispatcher + cost-ledger
-  # operational state. claim_at, started_at, finished_at,
-  # cost-window math, all internal runtime accounting that
-  # never lands in audit_log.
-  "crates/core/boss-events/src/queue.rs"
-  "crates/core/boss-events/src/dispatcher.rs"
-  "crates/core/boss-events/src/ledger.rs"
-  "crates/core/boss-events/src/claude_dispatcher.rs"
   # Diagnostic CLI — checkpoint timestamps in operator output.
   "crates/core/boss-events/src/bin/boss_audit_integrity_check.rs"
   # Deprecated clock helpers, pre-Clock-as-service. The module
@@ -145,9 +137,6 @@ ALLOWED_PREFIXES=(
   # CLI flag defaults (today = Utc::now().date_naive() unless
   # --today is passed). Operators override at runtime.
   "crates/modules/boss-ledger/src/bin/boss_ledger_recognize.rs"
-  # Demo synthetic agent loop — wallclock is the intended
-  # source; events feed the /ops live ticker, never audit_log.
-  "crates/core/boss-observability/src/demo_agents.rs"
   # Sim output: shape_driven engine wires sim-time anchors via
   # clock-api in the LiveApiOutput path (#72). The shape_driven
   # / output.rs core uses Utc::now() in test/in-memory paths
@@ -165,8 +154,6 @@ ALLOWED_PREFIXES=(
   # for the next-week computation.
   "crates/core/boss-jobs/src/scheduling/materialize.rs"
   "crates/core/boss-jobs/src/scheduling/http.rs"
-  # Internal data struct default constructor — Message, etc.
-  "crates/core/boss-core/src/agent.rs"
 )
 
 # Files whose entire body is exempt (e.g. CLI boundary tools

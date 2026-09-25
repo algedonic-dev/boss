@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::events;
 use crate::in_memory::compute_job_status;
 use crate::policy_glue::scope_matches;
-use crate::port::{JobFilter, JobScope, JobsRepository, LaunchCalendarRow};
+use crate::port::{DepartmentFilter, JobFilter, JobScope, JobsRepository};
 use crate::registry::{WorkflowError, WorkflowRegistry, WorkflowSpec};
 use crate::step_plugins::{StepPluginError, StepPluginRegistry, StepPluginSpec};
 use crate::step_registry::StepRegistry;
@@ -31,12 +31,15 @@ pub mod machine_gate;
 
 mod borders;
 mod census;
+mod flights;
 mod jobs;
 mod kinds;
 mod plugins;
+mod presence;
 mod queue_age;
 mod refusals;
 mod regions;
+mod rule_firings;
 mod sim_clock;
 mod stations;
 mod steps;
@@ -46,17 +49,21 @@ mod yard;
 
 use borders::*;
 use census::*;
+use flights::*;
 use jobs::*;
 use kinds::*;
 use plugins::*;
 use queue_age::*;
 use refusals::*;
 use regions::*;
+use rule_firings::*;
 use sim_clock::*;
 use stations::*;
 use steps::*;
 use terminal_report::*;
 use yard::*;
+
+pub use presence::PresenceKey;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -92,7 +99,7 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
-    /// metadata (`scheduled_at`, `duration_hours`, `assignee_id`)
+    /// metadata (`scheduled_at`, `duration_minutes`, `assignee_id`)
     /// reserve the assignee's time; conflicts surface as 409.
     /// `None` keeps every existing test path working — the
     /// reservation hook is purely additive.
@@ -140,6 +147,18 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// hour-window spend. `None` is a deployment without the two
     /// registries, where every claim is admitted exactly as before.
     pub agent_budget: Option<Arc<crate::agent_budget::BudgetDoor>>,
+    /// The `schema_migrations` ledger, read on every `/api/jobs/health`
+    /// so `capabilities.schema` says whether the database has been
+    /// migrated to THIS build (design a5323701, backlog 7c298c34).
+    /// `None` is a wiring without a database, where health reports no
+    /// schema at all — absent, not `null`: nothing was tried.
+    pub schema_ledger: Option<Arc<dyn crate::schema_level::SchemaLedger>>,
+    /// The key presence tickets are verified with — the gateway's
+    /// session key, read from the file it signs with (backlog 72fe3640).
+    /// `None` grants presence to nothing: an `x-boss-presence` header is
+    /// then refused, never read on trust, because the machine door lets
+    /// any token holder write one by hand.
+    pub presence_key: Option<Arc<PresenceKey>>,
 }
 
 impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
@@ -194,6 +213,8 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             dispatcher_firings: None,
             delivery: None,
             agent_budget: None,
+            schema_ledger: None,
+            presence_key: None,
         }
     }
 }
@@ -229,7 +250,7 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
     let refusals =
         axum::middleware::from_fn_with_state(shared.clone(), record_step_write_refusals::<R, B>);
     Router::new()
-        .route("/api/jobs/health", get(health))
+        .route("/api/jobs/health", get(health::<R, B>))
         .route(
             "/api/jobs/step-write-refusals",
             get(list_step_write_refusals::<R, B>),
@@ -243,12 +264,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             post(sim_clock_restart_epoch::<R, B>),
         )
         .route("/api/jobs/sim-clock/stream", get(sim_clock_stream::<R, B>))
-        .route(
-            "/api/jobs/phase-distribution",
-            get(jobs_phase_distribution::<R, B>),
-        )
-        .route("/api/jobs/launch-calendar", get(launch_calendar::<R, B>))
         .route("/api/jobs/assignments", get(list_assignments::<R, B>))
+        // The flights read (design c4c2a607, backlog 73c31776): the
+        // codes on for the CALLER, judged from the open packets that
+        // carry a `flight` block against their pinned protocol rows. A
+        // code it does not list is off.
+        .route("/api/flights/mine", get(flights_mine::<R, B>))
         // The queue-age lens (2a0b034e): how long every outstanding
         // obligation — ready/active step on an open packet — has
         // waited. Read-only, own row shape; Job and Step untouched.
@@ -272,6 +293,11 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // above; a border whose flow cannot be computed answers unknown,
         // never zero.
         .route("/api/yard/borders", get(yard_borders::<R, B>))
+        // Every dispatcher rule's newest firing and its dead-letters —
+        // the rules list's second reading of the record the borders
+        // read, so a stalled rule no longer paints like an idle one
+        // (backlog 43c4451a).
+        .route("/api/yard/rule-firings", get(yard_rule_firings::<R, B>))
         .route("/api/jobs", get(list_jobs::<R, B>))
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
@@ -282,7 +308,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
-        .route("/api/jobs/{id}/convert", post(convert_job::<R, B>))
+        // Move a packet to another version of its protocol (POST), or
+        // preview the move without writing (GET) — design 7cf202a9.
+        .route(
+            "/api/jobs/{id}/convert",
+            get(preview_convert_job::<R, B>).post(convert_job::<R, B>),
+        )
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
         // The instance's hosting edit level, off the tenant manifest
         // (a479faf7): the word the dispatch door and the gate's
@@ -358,6 +389,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route(
             "/api/jobs/{id}/steps/{step_id}/metadata",
             patch(patch_step_metadata::<R, B>),
+        )
+        // A correction beside a completed step — the one writer of the
+        // job's append-only `corrections` list (design 4105b020).
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/corrections",
+            post(post_step_correction::<R, B>),
         )
         .route(
             "/api/jobs/{id}/steps/{step_id}/claim",
@@ -443,12 +480,27 @@ const STORAGE: &str = "postgres";
 #[cfg(not(feature = "postgres"))]
 const STORAGE: &str = "in-memory";
 
-async fn health() -> Json<boss_core::startup::HealthResponse> {
-    Json(boss_core::startup::health_response(
-        "boss-jobs-api",
-        env!("CARGO_PKG_VERSION"),
-        STORAGE,
-    ))
+/// `GET /api/jobs/health` — the standard payload, plus the schema
+/// reading when a ledger is wired. The ledger is read on THIS request,
+/// never cached: a startup read goes stale the moment the database is
+/// repointed or restored (design a5323701 D2). A failed or slow read is
+/// `schema: null` and the answer is still 200 — the process IS serving;
+/// what it could not do is vouch for its database.
+async fn health<R: JobsRepository, B: EventBus>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+) -> Json<boss_core::startup::HealthResponse> {
+    let response =
+        boss_core::startup::health_response("boss-jobs-api", env!("CARGO_PKG_VERSION"), STORAGE);
+    let capabilities = match state.schema_ledger.as_ref() {
+        Some(ledger) => response
+            .capabilities
+            .with_schema(crate::schema_level::read(ledger).await),
+        None => response.capabilities,
+    };
+    Json(boss_core::startup::HealthResponse {
+        capabilities,
+        ..response
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +650,28 @@ pub(super) fn stamp_close_instant(job: &mut Job, now: &chrono::DateTime<chrono::
     } else {
         job.metadata = serde_json::json!({ "closed_at": now.to_rfc3339() });
     }
+}
+
+/// The answer to a steps read that failed: a 500 NAMING THE PACKET.
+///
+/// Every handler that reads a packet's steps used to answer this with
+/// `list_steps(..).unwrap_or_default()`, and an empty step list is a
+/// well-formed, confident claim — "this packet has no steps" — so the
+/// failure shrank whatever the handler counted or listed and the 200
+/// said nothing (backlog f6c97006, after c11e9d3c found the shape in
+/// the station queue). The lint `a-steps-read-failure-is-not-empty`
+/// refuses the shape under `http/`; this is what a handler returns in
+/// its place. The adapter's own error rides along, but the packet id is
+/// written here because the Postgres error does not carry it.
+pub(super) fn steps_unreadable(
+    job_id: &boss_core::job::JobId,
+    e: &crate::port::JobsError,
+) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("the steps of packet {job_id} could not be read: {e}"),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

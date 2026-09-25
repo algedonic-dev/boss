@@ -4,8 +4,11 @@
   Renders the reactive layer the boss-dispatcher runs: trigger event →
   rule → handler(s) → emitted events → (loop back). Loops close where an
   emitted topic re-triggers a rule; jobs-api/external "system" edges that
-  re-enter the rule set are drawn distinctly, and the feedback cycles
-  (restock, DAG-advance, AR) are highlighted. Data: GET /api/dispatcher/rules.
+  re-enter the rule set are drawn distinctly, and the feedback cycles are
+  highlighted. Only what a live rule invokes is drawn and counted: the
+  feed's handler_emits is the dispatcher build's whole roster, most of
+  whose company-module handlers no rule on a given instance fires
+  (backlog ec40e269). Data: GET /api/dispatcher/rules.
   Layout dagre LR; render Svelte Flow (same stack as the Workflow graph).
 -->
 <script lang="ts">
@@ -14,7 +17,7 @@
   import type { Node, Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import dagre from '@dagrejs/dagre';
-  import { buildCascade, describeTrigger, filterCascadeFromEvents, triggerTopics, type Cascade } from './cascadeToGraph';
+  import { buildCascade, describeTrigger, filterCascadeFromEvents, invokedEmits, triggerTopics, type Cascade } from './cascadeToGraph';
   import type { DispatcherRules } from './types';
   import { href, navigate } from '../router';
 
@@ -71,11 +74,11 @@
   }
 
   const EDGE_STYLE: Record<string, string> = {
-    trigger: 'stroke:#64748b;stroke-width:1.5',
-    do: 'stroke:#3b82f6;stroke-width:1.5',
-    emit: 'stroke:#10b981;stroke-width:1.5',
-    system: 'stroke:#f59e0b;stroke-width:1.5;stroke-dasharray:6 4',
-    match: 'stroke:#cbd5e1;stroke-width:1;stroke-dasharray:2 3',
+    trigger: 'stroke:var(--border-strong);stroke-width:1.5',
+    do: 'stroke:var(--signal);stroke-width:1.5',
+    emit: 'stroke:var(--clear);stroke-width:1.5',
+    system: 'stroke:var(--busy);stroke-width:1.5;stroke-dasharray:6 4',
+    match: 'stroke:var(--hairline);stroke-width:1;stroke-dasharray:2 3',
   };
 
   function buildFlow(c: Cascade, sel: string | null): { nodes: Node[]; edges: Edge[] } {
@@ -106,9 +109,9 @@
       source: e.source,
       target: e.target,
       animated: e.inCycle,
-      style: e.inCycle ? 'stroke:#dc2626;stroke-width:2.5' : EDGE_STYLE[e.kind],
+      style: e.inCycle ? 'stroke:var(--troubled);stroke-width:2.5' : EDGE_STYLE[e.kind],
       label: e.kind === 'system' ? e.label : undefined,
-      labelStyle: 'font-size:10px;fill:#92400e',
+      labelStyle: 'font-size:10px;fill:var(--warn)',
       markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16 },
     }));
     return { nodes, edges };
@@ -137,7 +140,7 @@
     if (selected.startsWith('evt:')) {
       const event = selected.slice(4);
       const triggers = data.rules.filter((r) => r.on_event === event).map((r) => r.name);
-      const emittedBy = Object.entries(data.handler_emits)
+      const emittedBy = Object.entries(invokedEmits(data))
         .filter(([, list]) => list.includes(event))
         .map(([h]) => h);
       return { kind: 'event' as const, event, triggers, emittedBy };
@@ -147,7 +150,7 @@
 
   const counts = $derived({
     rules: data?.rules.length ?? 0,
-    handlers: Object.keys(data?.handler_emits ?? {}).length,
+    handlers: fullCascade.nodes.filter((n) => n.kind === 'handler').length,
     cycleNodes: fullCascade.nodes.filter((n) => n.inCycle).length,
   });
 </script>
@@ -188,9 +191,9 @@
     <span class="dx-key dx-event">event</span>
     <span class="dx-key dx-rule">rule</span>
     <span class="dx-key dx-handler">handler</span>
-    <span class="dx-edgekey"><i style="background:#10b981"></i>emits</span>
-    <span class="dx-edgekey"><i style="background:#f59e0b"></i>system (jobs-api / external)</span>
-    <span class="dx-edgekey"><i style="background:#dc2626"></i>feedback cycle</span>
+    <span class="dx-edgekey"><i style="background:var(--clear)"></i>emits</span>
+    <span class="dx-edgekey"><i style="background:var(--busy)"></i>system (jobs-api / external)</span>
+    <span class="dx-edgekey"><i style="background:var(--troubled)"></i>feedback cycle</span>
   </div>
 
   {#if data && !error && allTriggers.length}
@@ -225,7 +228,11 @@
       {#if loading}
         <div class="dx-msg">Loading dispatcher rules…</div>
       {:else if error}
-        <div class="dx-msg dx-err">Couldn’t load rules: {error}</div>
+        <!-- load-failed + role=alert: the shared failure marker the outage
+             crawl asserts (tests/mocked/_routes.ts FAILURE_MARKER). The
+             rules list, which makes the same read, learned it in cae1a377;
+             this page was left in the crawl's SILENT map (backlog d7732e88). -->
+        <div class="dx-msg dx-err load-failed" role="alert">Couldn’t load rules: {error}</div>
       {:else if cascade.nodes.length === 0}
         <div class="dx-msg">No dispatcher rules are loaded.</div>
       {:else}
@@ -336,7 +343,7 @@
   .dx-sub {
     margin: 0;
     max-width: 70ch;
-    color: #475569;
+    color: var(--static);
     font-size: 0.85rem;
   }
   .dx-head-right {
@@ -350,11 +357,11 @@
     gap: 12px;
     white-space: nowrap;
     font-size: 0.8rem;
-    color: #475569;
+    color: var(--static);
   }
   .dx-edit-link {
     font-size: 0.8rem;
-    color: #2563eb;
+    color: var(--signal);
     text-decoration: none;
     white-space: nowrap;
   }
@@ -362,7 +369,7 @@
     text-decoration: underline;
   }
   .dx-stat-cycle {
-    color: #dc2626;
+    color: var(--err);
     font-weight: 600;
   }
   .dx-legend {
@@ -372,7 +379,7 @@
     align-items: center;
     margin: 10px 0;
     font-size: 0.75rem;
-    color: #475569;
+    color: var(--static);
   }
   .dx-filter {
     display: flex;
@@ -381,7 +388,7 @@
     gap: 8px;
     margin: 0 0 10px;
     font-size: 0.78rem;
-    color: #475569;
+    color: var(--static);
   }
   .dx-filter-label {
     display: inline-flex;
@@ -391,7 +398,7 @@
   .dx-filter-select {
     font-size: 0.78rem;
     padding: 3px 6px;
-    border: 1px solid #cbd5e1;
+    border: 1px solid var(--hairline);
     border-radius: 6px;
     max-width: 340px;
   }
@@ -399,11 +406,11 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: #eff6ff;
-    border: 1px solid #bfdbfe;
+    background: var(--signal-wash);
+    border: 1px solid var(--signal);
     border-radius: 999px;
     padding: 2px 4px 2px 10px;
-    color: #1e3a8a;
+    color: var(--signal);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.72rem;
   }
@@ -411,28 +418,28 @@
     border: none;
     background: none;
     cursor: pointer;
-    color: #1e3a8a;
+    color: var(--signal);
     font-size: 0.95rem;
     line-height: 1;
     padding: 0 3px;
   }
   .dx-chip-x:hover {
-    color: #dc2626;
+    color: var(--err);
   }
   .dx-clear {
-    border: 1px solid #cbd5e1;
-    background: #fff;
+    border: 1px solid var(--hairline);
+    background: var(--ink);
     border-radius: 6px;
     padding: 2px 8px;
     cursor: pointer;
     font-size: 0.74rem;
-    color: #475569;
+    color: var(--static);
   }
   .dx-clear:hover {
-    background: #f1f5f9;
+    background: var(--ink-raised);
   }
   .dx-filter-note {
-    color: #94a3b8;
+    color: var(--static);
   }
   .dx-key {
     padding: 2px 8px;
@@ -458,27 +465,27 @@
   }
   .dx-flow {
     flex: 1;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
-    background: #fafafa;
+    background: var(--ink-raised);
     min-width: 0;
   }
   .dx-msg {
     display: grid;
     place-items: center;
     height: 100%;
-    color: #94a3b8;
+    color: var(--static);
     font-size: 0.9rem;
   }
   .dx-err {
-    color: #dc2626;
+    color: var(--err);
   }
   .dx-panel {
     width: 320px;
     overflow-y: auto;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
-    background: #fff;
+    background: var(--ink);
     padding: 12px 14px;
     font-size: 0.82rem;
   }
@@ -489,14 +496,14 @@
   }
   .dx-panel dt {
     font-weight: 600;
-    color: #475569;
+    color: var(--static);
     margin-top: 8px;
   }
   .dx-panel dd {
     margin: 2px 0 0;
   }
   .dx-panel code {
-    background: #f1f5f9;
+    background: var(--ink-raised);
     padding: 1px 4px;
     border-radius: 4px;
     font-size: 0.78rem;
@@ -509,13 +516,13 @@
   .dx-args {
     margin: 2px 0 6px 0;
     padding-left: 16px;
-    color: #64748b;
+    color: var(--static);
   }
   .dx-arg-k {
-    color: #0f766e;
+    color: var(--signal);
   }
   .dx-sink {
-    color: #94a3b8;
+    color: var(--static);
     margin: 2px 0;
   }
   /* Node styling — classes set in buildFlow; :global because nodes render
@@ -533,34 +540,34 @@
     box-sizing: border-box;
   }
   :global(.dx-event) {
-    background: #f8fafc;
-    border-color: #94a3b8;
+    background: var(--ink-raised);
+    border-color: var(--hairline);
   }
   :global(.dx-rule) {
-    background: #eff6ff;
-    border-color: #3b82f6;
+    background: var(--signal-wash);
+    border-color: var(--signal);
   }
   :global(.dx-handler) {
-    background: #ecfdf5;
-    border-color: #10b981;
+    background: var(--ok-wash);
+    border-color: var(--clear);
   }
   :global(.dx-cycle) {
-    box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.45);
-    border-color: #dc2626 !important;
+    box-shadow: 0 0 0 2px var(--troubled);
+    border-color: var(--troubled) !important;
   }
   :global(.dx-selected) {
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.6);
+    box-shadow: 0 0 0 3px var(--signal);
   }
   .dx-event {
-    background: #f8fafc;
-    border-color: #94a3b8;
+    background: var(--ink-raised);
+    border-color: var(--hairline);
   }
   .dx-rule {
-    background: #eff6ff;
-    border-color: #3b82f6;
+    background: var(--signal-wash);
+    border-color: var(--signal);
   }
   .dx-handler {
-    background: #ecfdf5;
-    border-color: #10b981;
+    background: var(--ok-wash);
+    border-color: var(--clear);
   }
 </style>

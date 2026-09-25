@@ -19,11 +19,11 @@
 //!   a trimmed roster is exactly the under-covering gate that let both
 //!   #226 failures through.
 //!
-//! There is ONE CI workflow now: `.forgejo/workflows/ci.yml`. The GitHub
-//! copy (`.github/workflows/ci.yml`) ran only on the public mirror —
-//! which is a backup of source, not part of CI/CD (design 7b59af2c,
-//! 2026-09-08) — and was deleted with it, so the pair it once formed
-//! with the forge file is gone rather than pinned.
+//! The GitHub workflow (`.github/workflows/ci.yml`) was deleted on
+//! 2026-09-08 (design 7b59af2c) and came back on backlog 2328c95e,
+//! because a public green that compiled nothing read as a green gate.
+//! It runs this script in full on the public mirror and gates nothing;
+//! its pins live in `the_mirror_runs_the_one_gate.rs`.
 //!
 //! Every test names the offending entry when it fails.
 
@@ -1696,5 +1696,189 @@ fn the_doors_list_names_the_mode_that_proves_clippy() {
         "the `Before pushing` door names only the pre-flight. `infra/gate.sh --lint` is \
          the same pre-flight plus a scoped clippy, and clippy is the red class the door \
          exists to prevent (packet 410e21e2). The entry as written:\n{door}"
+    );
+}
+
+/// `--lint` RUNS THE CHECK THE GATE'S FIRST ACT RUNS.
+///
+/// MEASURED on origin/main 1d917084, 2026-09-23 (backlog d8637703).
+/// `scope_self_test` is build-free and was called on only two paths, `-p`
+/// and `--auto` — the gate's own. Gate-run 1f412b9e went red before any
+/// check ran, on `gate.sh scope self-test FAIL: a script boss-testing
+/// executes implies boss-testing -> [boss-jobs boss-testing], wanted
+/// [boss-testing]`, and no receipt was written. The branch had passed
+/// `--lint` twice. A pre-flight that skips the check the gate runs first
+/// vouches for a tree the gate refuses in its first second.
+///
+/// Read out of the `--lint` branch rather than run: `--lint` compiles
+/// (clippy), and `scope_self_test` is silent on success, so a run could
+/// not tell "held" from "never asked". The call must precede the scope
+/// it vouches for — `crates_from_paths` is the map it tests.
+#[test]
+fn lint_runs_the_scope_self_test_before_the_scope_it_vouches_for() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim_end() == "if [ \"$LINT\" -eq 1 ]; then")
+        .expect("infra/gate.sh no longer has a --lint branch");
+    let len = lines[start..]
+        .iter()
+        .position(|l| *l == "fi")
+        .expect("the --lint branch never closes at column 0");
+    let branch = &lines[start..start + len];
+
+    let scope = branch
+        .iter()
+        .position(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("crates_from_paths")
+        })
+        .expect("the --lint branch no longer derives its scope from crates_from_paths");
+    match branch.iter().position(|l| l.trim() == "scope_self_test") {
+        Some(at) => assert!(
+            at < scope,
+            "the --lint branch calls scope_self_test AFTER crates_from_paths — it derives \
+             the clippy scope from a map it has not yet checked:\n{}",
+            branch.join("\n")
+        ),
+        None => panic!(
+            "the --lint branch never calls scope_self_test, so a stale scope fixture passes \
+             the pre-flight and reds the gate before any check runs (gate-run 1f412b9e, \
+             backlog d8637703). The branch reads:\n{}",
+            branch.join("\n")
+        ),
+    }
+}
+
+/// EVERY FUNCTION IS DEFINED ABOVE ITS FIRST TOP-LEVEL CALLER.
+///
+/// bash defines a function when execution reaches its definition, so a
+/// top-level line that calls one defined further down answers `command
+/// not found` — and inside `$(...)` that is an empty string, not an
+/// error, so the surrounding test simply goes the other way. MEASURED on
+/// origin/main 1d917084 (backlog d8637703, reported by builder run
+/// 2094f5d9): the `-p` refusal ran `$(schema_touched)` at :1167 and the
+/// function was defined at :1207, so the refusal printed `schema_touched:
+/// command not found` and silently dropped the line saying a schema
+/// change widened the scope.
+///
+/// Read for EVERY function, not only that one, because the shape is the
+/// file's and not the function's: the script is one long top-level
+/// program with its functions defined inline, where the next one moved
+/// or added is the next instance. Only column-0 definitions (`name() {`
+/// through a column-0 `}`) and only call-shaped uses count — a statement
+/// start, `$(`, `if`, `!`, `then`, `do`, or after `;`, `&`, `|` — so a
+/// function's name inside a sentence an `echo` prints does not (`check`
+/// is one: "nothing to check." is printed above `check()`).
+#[test]
+fn every_gate_function_is_defined_above_its_first_top_level_caller() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+
+    let def = regex::Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{").expect("definition regex");
+    let mut defined: Vec<(String, usize)> = Vec::new();
+    let mut in_body = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(name) = def.captures(lines[i]).map(|c| c[1].to_string()) else {
+            i += 1;
+            continue;
+        };
+        if !defined.iter().any(|(n, _)| *n == name) {
+            defined.push((name, i));
+        }
+        let end = lines[i..]
+            .iter()
+            .position(|l| *l == "}")
+            .map_or(lines.len() - 1, |n| i + n);
+        in_body[i..=end].iter_mut().for_each(|b| *b = true);
+        i = end + 1;
+    }
+    assert!(
+        defined.len() >= 20,
+        "only {} function definition(s) were read out of infra/gate.sh — the shape this \
+         test reads has changed, and a pin that matches nothing passes while proving nothing",
+        defined.len()
+    );
+
+    let mut called = 0usize;
+    let mut early: Vec<String> = Vec::new();
+    for (name, at) in &defined {
+        let call = regex::Regex::new(&format!(
+            r"(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+|\bif\s+|!\s+){}(?:\s|$|\)|;)",
+            regex::escape(name)
+        ))
+        .expect("call regex");
+        let first = lines.iter().enumerate().find(|(k, l)| {
+            let t = l.trim();
+            !in_body[*k] && !t.starts_with('#') && call.is_match(t)
+        });
+        if let Some((k, l)) = first {
+            called += 1;
+            if k < *at {
+                early.push(format!(
+                    "{name}: called at line {}, defined at line {}: {}",
+                    k + 1,
+                    at + 1,
+                    l.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        called >= 10,
+        "only {called} function(s) were found called at top level — the call shape this \
+         test reads has changed, and a pin that matches nothing passes while proving nothing"
+    );
+    assert!(
+        early.is_empty(),
+        "infra/gate.sh calls a function above its definition, which bash answers with \
+         `command not found` (backlog d8637703):\n{}",
+        early.join("\n")
+    );
+}
+
+/// THE PRE-FLIGHT CHECKS THE TREE IT LIVES IN, SO IT REFUSES TO CLAIM ANOTHER.
+///
+/// Measured 2026-09-22 on one worktree, one commit, one second (backlog
+/// 67adb415): `bash /work/boss/infra/gate.sh --lint` from a builder's
+/// worktree printed "no crate implied by the tree - skipping clippy",
+/// while `bash infra/gate.sh --lint` there said "clippy on boss-testing".
+/// The script `cd`s to its own tree, so an absolute path asked every git
+/// question of the clean main checkout — and then printed "pre-flight:
+/// clean, and clippy saw the crates this tree changed", which is false
+/// and is the sentence a builder reads.
+///
+/// So a caller standing in a DIFFERENT git tree is refused before any
+/// check runs, and the refusal names the command that checks the
+/// caller's tree. A caller inside the script's own tree — the gate
+/// runner, CI, every other test in this file — is untouched.
+#[test]
+fn run_from_another_tree_the_pre_flight_refuses_rather_than_checking_its_own() {
+    let caller = boss_testing::scratch_dir("gate-sh-other-tree");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&caller)
+        .status()
+        .expect("git init");
+    assert!(init.success(), "git init in {}", caller.display());
+
+    let out = gate_cmd(&["--quick"])
+        .current_dir(&caller)
+        .output()
+        .expect("run gate.sh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gate.sh run by absolute path from another git tree must refuse (exit 2), \
+         not check its own tree and call it yours. stderr:\n{stderr}"
+    );
+    let caller_real = std::fs::canonicalize(&caller).expect("canonicalize caller");
+    assert!(
+        stderr.contains(&caller_real.display().to_string())
+            && stderr.contains("bash infra/gate.sh"),
+        "the refusal names the caller's tree and the command that checks it:\n{stderr}"
     );
 }

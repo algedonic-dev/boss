@@ -18,6 +18,7 @@ import type { Page, Route } from '@playwright/test';
 // world.ts is pinned to the server's REGIONS and BORDERS by
 // world.test.ts and borders.test.ts, so this is one definition deep.
 import { BORDERS, TERRITORIES } from '../../src/it/yard/world';
+import LIVE_RECORDING from './live-tenant-manifest.json' with { type: 'json' };
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -31,6 +32,58 @@ export const MODULES_ON: Readonly<Record<string, boolean>> = {
   calendar: true, equipment: true, exec: true, finance: true, 'marketing-assets': true,
   parts: true, qa: true, shipping: true, support: true, warehouse: true, shop: true, sim: true,
 };
+
+/// The LIVE tenant's modules: the `modules` of the manifest the live
+/// gateway served, read out of live-tenant-manifest.json — a RECORDING,
+/// with the time it was taken and the read that took it, never a shape
+/// typed here. MODULES_ON above is shaped so a module gate cannot be
+/// seen at all — every gate answers "on" — which is how /ux/support
+/// stayed gated on 'shipping' and labelled "Shipments" with no mocked
+/// spec able to notice (backlog 5b2f3240, gap 10 of the /ux/support
+/// audit). A spec that pins a gate "as live" installs this shape through
+/// installTenantManifest, after installSmokeMocks.
+///
+/// This was a literal `{}` documented as the live manifest of
+/// 2026-09-19, and it went on saying so after the instance began serving
+/// eleven keys with exec, finance and support true — so every spec that
+/// rendered "the live instance" rendered those three off, and the
+/// products spec kept a second, correct copy beside it (41454ce1). A
+/// mocked run cannot read the instance, so the recording cannot refresh
+/// itself; what it can do is carry its date into every test title that
+/// renders it, and be one file to overwrite — the body verbatim from the
+/// read it names — after which every "as live" leg re-judges the page
+/// against the new shape and fails by name where the page changed.
+export const MODULES_LIVE: Readonly<Record<string, boolean>> = LIVE_RECORDING.body.modules;
+
+/// When the recording above was taken (UTC, as `date -u` read it). Specs
+/// put it in the titles of their live legs, so a reader of a run sees
+/// how old "live" is.
+export const LIVE_MANIFEST_RECORDED_AT: string = LIVE_RECORDING.recorded_at;
+
+/// A manifest listing no modules: what the gateway answers when it finds
+/// no tenant.toml (api.rs `tenant_manifest_now`), and what the live one
+/// served until it did not. Every module is off. This is its own shape,
+/// not "live", so a leg that means "nothing listed" keeps meaning it
+/// whatever the recording says.
+export const MODULES_NONE: Readonly<Record<string, boolean>> = {};
+
+/// `GET /api/tenant/manifest` with the given modules — the one place a
+/// spec says which tenant it is rendering for. Registered routes win in
+/// reverse order, so calling this after installSmokeMocks replaces the
+/// all-on manifest the crawl needs.
+export async function installTenantManifest(
+  page: Page,
+  modules: Readonly<Record<string, boolean>>,
+): Promise<void> {
+  await page.route(/\/api\/tenant\/manifest$/, (r) =>
+    json(r, {
+      display_name: 'Algedonic Ales',
+      tenant_id: 'brewery',
+      modules,
+      labels: {},
+    }),
+  );
+}
 
 /// The platform's department Classes (01-registries.sql) as `/api/classes`
 /// rows — the EMPLOYEE DRAWER: the values an employee's `department`
@@ -138,9 +191,40 @@ export const GATEWAY_PERF = /\/api\/gateway\/perf$/;
 export const MARKETING_ASSET_DETAIL = /\/api\/catalog\/marketing-assets\/[^/]+$/;
 export const VIEW_RESULTS = /\/api\/views\/[^/]+\/results/;
 export const SHIPMENT_DETAIL = /\/api\/shipping\/shipments\/[^/]+$/;
+/// The audit log's size-and-growth read (boss-events AuditStats). The
+/// fixture /it/operate/audit sat in DEFERRED waiting for ("snapshot .length
+/// needs a faithful fixture"; page audit 65a273d5, gap 0398c4d0): a `[]`
+/// here paints `undefined.toLocaleString()` and the page throws.
+export const EVENTS_STATS = /\/api\/events\/stats$/;
+/// The churn watchlist's scores, `{ accounts }` (RiskScoreListSchema):
+/// a `[]` is a wrong shape the page reports on the failure marker.
+export const RISK_SCORES = /\/api\/people\/accounts\/risk-scores(\?|$)/;
+/// The audit log's live stream. Not an object, but not a list either: a
+/// JSON `[]` is not an event stream, so the EventSource fails and the
+/// page says the stream is down, on the failure marker (sweep c3e4edcc).
+export const EVENTS_STREAM = /\/api\/events\/stream(\?|$)/;
+/// The live read's figures on 2026-09-23 21:44Z (the audit's controls_md,
+/// read 1), trimmed to two days and three kinds.
+export const AUDIT_STATS = {
+  total_rows: 384521,
+  table_bytes: 515522560,
+  oldest_at: '2026-09-16T23:54:00Z',
+  newest_at: '2026-09-23T21:44:00Z',
+  rows_last_24h: 78516,
+  rows_last_7d: 420000,
+  per_day: [
+    { day: '2026-09-22', rows: 71000 },
+    { day: '2026-09-23', rows: 73907 },
+  ],
+  top_kinds: [
+    { kind: 'jobs.step.updated', rows: 120000 },
+    { kind: 'dispatcher.rule.fired', rows: 60000 },
+    { kind: 'credential.rotate.verified', rows: 3 },
+  ],
+} as const;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
   JOBS_LIVE, JOBS_SUMMARY, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
-  MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL,
+  MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL, EVENTS_STATS, RISK_SCORES, EVENTS_STREAM,
   // `{data, total}`, not a list: a bare `[]` here is the shape a wrong
   // endpoint answers, and the bar reads it as a failed roster rather
   // than an empty one — deliberately, so the org chart cannot go
@@ -189,10 +273,28 @@ export async function installApiFloor(page: Page): Promise<void> {
   // 204 fails the EventSource cleanly — no reconnect — so the client
   // falls back to its poll, which the objects below answer.
   await page.route(/\/api\/.+\/stream(\?|$)/, (r) => r.fulfill({ status: 204 }));
+  // Except the audit log's, the one stream whose refusal a page reports
+  // as a failed read: its "Live stream down" line wears the failure
+  // marker since sweep c3e4edcc, so under the 204 the empty leg found a
+  // marker on a healthy backend. A well-formed empty stream that ends
+  // instead — the browser waits `retry` to reconnect, and the page says
+  // it is reconnecting, which is no failure.
+  await page.route(EVENTS_STREAM, (r) =>
+    r.fulfill({
+      status: 200,
+      headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+      body: 'retry: 3600000\n\n',
+    }),
+  );
 
   // Live job state (objects, not lists — `[]` would break these).
   await page.route(JOBS_LIVE, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(JOBS_SUMMARY, (r) => json(r, { counts: {}, total: 0 }));
+  // The churn watchlist's scores: `{ accounts }` (RiskScoreListSchema).
+  // Under the `[]` catch-all the page parses a wrong shape and says so on
+  // the failure marker (sweep c3e4edcc) — right for a broken backend,
+  // wrong for the empty leg.
+  await page.route(RISK_SCORES, (r) => json(r, { accounts: [] }));
   // The yard status read-model (object, not a list). An empty-but-well-
   // formed payload so the page renders its "no trains / no cars" states.
   await page.route(YARD_STATUS, (r) =>
@@ -244,6 +346,10 @@ export async function installApiFloor(page: Page): Promise<void> {
   // The other object reads, empty; the detail reads, absent.
   await page.route(DISPATCHER_RULES, (r) => json(r, { rules: [], handler_emits: {}, system_edges: [] }));
   await page.route(GATEWAY_PERF, (r) => json(r, { endpoints: [], window_started_at: '2026-01-01T00:00:00Z' }));
+  await page.route(EVENTS_STATS, (r) => json(r, {
+    total_rows: 0, table_bytes: 0, oldest_at: null, newest_at: null,
+    rows_last_24h: 0, rows_last_7d: 0, per_day: [], top_kinds: [],
+  }));
   for (const detail of [WORKFLOW_DETAIL, MARKETING_ASSET_DETAIL, SHIPMENT_DETAIL, VIEW_RESULTS]) {
     await page.route(detail, (r) => json(r, 'not found', 404));
   }
@@ -327,14 +433,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // something deterministic to read. A module is on only when listed
   // true (ce68f137), so the playground persona lists every module the
   // SPA gates — the crawl has to reach the pages behind them.
-  await page.route(/\/api\/tenant\/manifest$/, (r) =>
-    json(r, {
-      display_name: 'Algedonic Ales',
-      tenant_id: 'brewery',
-      modules: MODULES_ON,
-      labels: {},
-    }),
-  );
+  await installTenantManifest(page, MODULES_ON);
   await page.route(/\/api\/views(\?|$)/, (r) =>
     json(r, [
       {

@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 
 use boss_dispatcher::rules::registry::{RawRegistry, parse_raw_path};
 use boss_dispatcher_handlers::handlers::cadence_roster::{
-    ClockCadence, Guard, NotACadence, clock_cadences,
+    ClockCadence, Guard, NotACadence, clock_cadences, unreadable_guard_repair,
 };
 use boss_dispatcher_handlers::handlers::cadence_silence::declarations;
 use boss_testing::dispatcher_rules_dir;
@@ -115,6 +115,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          would otherwise be for.",
     ),
     (
+        "ops-runner-queue-watched-every-5-minutes",
+        "runs `ops.queue.alarm`, which reads the open ops-request queue and files the \
+         `ops_queue:<host>` estate alarm only when a host's oldest waiting request has waited \
+         past five runner cadences (backlog a45b38c1). On a healthy day it produces NOTHING, \
+         and that zero is the healthy reading; what it would file is an alarm keyed by host, \
+         not a packet of a kind a sweep could count. It is itself the watch on a cadence — \
+         the runner's — that no packet reports.",
+    ),
+    (
         "agent-run-dies-when-building-is-silent",
         "runs `jobs.age_out_step`, which completes the `building` step of every open \
          agent-run that has gone silent past the bound (design c87fb59b car 2, backlog \
@@ -144,6 +153,24 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          step it produces NOTHING, and that zero is the healthy reading. The packets it \
          touches are of every kind an agent block appears on, so there is no one kind a \
          sweep keyed by kind could watch.",
+    ),
+    (
+        "agent-held-real-work-is-watched-hourly",
+        "runs `jobs.agent_step_overdue`, which files one urgent backlog-item alarm per step \
+         held by an agent past the wait its workflow declares on the rule's args (backlog \
+         078ddcb0), and withdraws it once the step no longer waits. On an hour with no late \
+         step it produces NOTHING, and that zero is the healthy reading; what it files is an \
+         alarm keyed by step, not a packet of a kind a sweep could count. It is itself the \
+         watch on work no event reports as late.",
+    ),
+    (
+        "a-flight-past-its-period-is-an-alarm",
+        "runs `jobs.flight_overdue`, which files one backlog-item alarm per flight past its \
+         observe period with no verdict, or decided and not cleaned up (design c4c2a607, \
+         backlog 73c31776), and withdraws it once the flight no longer rots. On an hour with \
+         no rotting flight it produces NOTHING, and that zero is the healthy reading; what it \
+         files is an alarm keyed by flight, not a packet of a kind a sweep could count. It is \
+         itself the watch on a decision no event reports as missing.",
     ),
     (
         "work-session-ends-when-silent",
@@ -298,13 +325,12 @@ fn every_derived_cadence_has_a_readable_guard_or_none_at_all() {
     );
     for c in &cadences {
         if let Some(Guard::Unreadable(src)) = &c.guard {
-            panic!(
-                "clock rule `{}` guards on `{src}`, a shape `cadence_roster::parse_guard` does \
-                 not read. The sweep would call its silence UNEXPLAINED and never name the \
-                 packet holding it, which is the whole finding of cf0f5e2d. Teach the parser \
-                 the shape.",
-                c.rule
-            );
+            // The message is the roster module's own (fbcac8b4): an
+            // author meeting this refusal needs BOTH repairs, and the
+            // one this test used to name alone — teach the parser — is
+            // the unreachable one when the guard is a condition rather
+            // than a dedup question.
+            panic!("{}", unreadable_guard_repair(&c.rule, src));
         }
     }
 }

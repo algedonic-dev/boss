@@ -21,13 +21,21 @@ impl PgMessages {
 
 #[async_trait]
 impl MessageRepository for PgMessages {
-    async fn inbox(&self, recipient_id: &str) -> Result<Vec<Message>, MessageError> {
-        let rows: Vec<MessageRow> =
-            sqlx::query_as("SELECT * FROM messages WHERE recipient_id = $1 ORDER BY sent_at DESC")
-                .bind(recipient_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| MessageError::Storage(e.to_string()))?;
+    async fn inbox(
+        &self,
+        recipient_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<Message>, MessageError> {
+        let rows: Vec<MessageRow> = sqlx::query_as(
+            "SELECT * FROM messages \
+             WHERE recipient_id = $1 AND ($2 OR kind <> 'archived') \
+             ORDER BY sent_at DESC",
+        )
+        .bind(recipient_id)
+        .bind(include_archived)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MessageError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.into_message()).collect())
     }
@@ -39,11 +47,12 @@ impl MessageRepository for PgMessages {
     ) -> Result<u32, MessageError> {
         // One statement with a NULL-tolerant clause rather than two
         // query strings: `$2 IS NULL OR kind = $2` keeps the filtered
-        // and unfiltered counts provably the same query.
+        // and unfiltered counts provably the same query. Unfiltered
+        // leaves out `archived`, the rows the inbox read leaves out.
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM messages \
              WHERE recipient_id = $1 AND read_at IS NULL \
-               AND ($2::text IS NULL OR kind = $2)",
+               AND (($2::text IS NULL AND kind <> 'archived') OR kind = $2)",
         )
         .bind(recipient_id)
         .bind(kind)
@@ -248,6 +257,55 @@ impl MessageRepository for PgMessages {
              RETURNING id",
         )
         .bind(path_prefix)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| MessageError::Storage(e.to_string()))?;
+
+        for (id,) in &ids {
+            let event = stamp.event(
+                crate::events::MESSAGE_ARCHIVED,
+                serde_json::json!({ "id": id, "archived_at": now, "reason": "entity-past-relevancy" }),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(|e| MessageError::Storage(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        Ok(ids.len() as u32)
+    }
+
+    async fn expire_notices_under(
+        &self,
+        path_prefix: &str,
+        id_prefix: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<u32, MessageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+
+        // Same shape as `expire_signals_under`: RETURNING id so each
+        // row moved gets its own event. `starts_with` rather than LIKE
+        // for the id — a notice id is `notify:{uuid}:{recipient}`, and a
+        // recipient id may carry `_`, which LIKE would read as a
+        // wildcard. Any kind but `archived`: an assignee's notice is a
+        // `direct`, which is the whole point (backlog 0b2bac00).
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "UPDATE messages SET kind = 'archived' \
+             WHERE entity_path LIKE $1 || '%' \
+               AND starts_with(id, $2) \
+               AND kind <> 'archived' \
+               AND read_at IS NULL \
+             RETURNING id",
+        )
+        .bind(path_prefix)
+        .bind(id_prefix)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;

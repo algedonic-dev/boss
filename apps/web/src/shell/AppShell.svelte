@@ -10,13 +10,13 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
-  import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { departmentLabel } from '@boss/web-kit/nav';
   import { departments } from '@boss/web-kit/session/departments.svelte';
   import { href, navigate } from '../router';
   import {
     ROUTE_CATALOG,
     departmentJobsPath,
+    inPerspective,
     type AppId,
     type NavItem,
     type NavGroup,
@@ -131,7 +131,7 @@
     finance: ['finance', 'vendors'],
     warehouse: ['warehouse', 'parts'],
     distribution: ['shipping'],
-    production: ['products', 'calendar'],
+    production: ['products'],
     maintenance: ['catalog', 'assets'],
     people: ['people'],
   };
@@ -143,14 +143,17 @@
     return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
-  // Work group is role-keyed: each role gets a tailored 3-5 item
-  // list of the surfaces they personally operate from. The same
-  // visible() filter still applies, so a brewery manifest that turns
-  // off a module hides it from Work too.
-  const WORK = $derived<NavGroup>({
+  // Work group is All jobs, for every role (backlog 0f9be7c0,
+  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
+  // each role row's `metadata.work` — but visible() drops every entry
+  // whose catalog app is not home, so of any list only `jobs` could
+  // render and a list without it left Work empty. Each department app
+  // has its own sidebar; a role's surfaces are gated there, by the
+  // row's `surfaces`, and Work here is the same filter over one row.
+  const WORK: NavGroup = {
     label: 'Work',
-    items: workForRole(role).map((r) => ROUTE_CATALOG[r]),
-  });
+    items: [ROUTE_CATALOG.jobs],
+  };
 
   // The IT department — seven rows. Six came from the 2026-08-31
   // consolidation (packet 1f6d55e0), which established that families
@@ -187,11 +190,15 @@
     },
   ];
 
-  // Home — personal work, whichever domain it belongs to. The
-  // role-keyed Work list lives here rather than being repeated in
-  // every app: "what am I meant to be doing" is one question, and its
-  // answer crosses CRM, Operations and Finance freely.
-  const HOME_GROUPS = $derived<ReadonlyArray<NavGroup>>([
+  // Home — personal work, whichever domain it belongs to: "what am I
+  // meant to be doing" is one question, and its answer (All jobs, My
+  // Day) crosses every department freely.
+  //
+  // Mine lists Home surfaces only. It carried Exec until backlog
+  // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
+  // Exec's catalog app is executive — so it never rendered here; it is
+  // the Executive department's row, under a tab every role is offered.
+  const HOME_GROUPS: ReadonlyArray<NavGroup> = [
     WORK,
     {
       label: 'Mine',
@@ -202,10 +209,9 @@
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.views,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG.exec,
       ],
     },
-  ]);
+  ];
 
   // Every department group ends on its Jobs row — the department's in
   // / working / out over the packets whose workflow declares it
@@ -231,25 +237,17 @@
           ],
   );
 
-  // A surface is in-perspective when its catalog `app` matches the
-  // app this shell is rendering. One comparison against one field —
-  // where this used to be a MODEL_ROUTES set here that had to agree
-  // with a MODEL_KINDS set in App.svelte, keyed off a different
-  // vocabulary (RouteName vs Route['kind']).
-  function inPerspective(i: NavItem): boolean {
-    // A permKey-less NavItem (e.g. a plain sub-page link like Audit
-    // Log / Atlas) carries no app of its own — it belongs to whatever
-    // group it's placed in, so it's always in-perspective.
-    if (i.permKey === undefined) return true;
-    return (ROUTE_CATALOG[i.permKey]?.app ?? 'home') === activeApp;
-  }
-
+  // A surface is in-perspective when its own catalog `app` matches the
+  // app this shell is rendering — inPerspective in ./nav-catalog, where
+  // the test pinning every sidebar list imports it (72a88031). One
+  // comparison against one field, where this used to be a MODEL_ROUTES
+  // set here that had to agree with a MODEL_KINDS set in App.svelte.
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey, roleRow);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk && inPerspective(i);
+      return policyOk && moduleOk && inPerspective(i, activeApp);
     });
   }
 

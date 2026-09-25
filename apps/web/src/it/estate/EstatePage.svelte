@@ -3,19 +3,21 @@
   // (59ef456a: three hand-written accounts of the machines were wrong
   // the same way on 2026-08-30; this page reads the system so nobody
   // writes that doc again). Declared beside observed beside the
-  // difference, and the dev-workspace door at the bottom.
+  // difference, then the loops that keep the estate (0d9b2960), and the
+  // dev-workspace door at the bottom.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { formatRelative } from '@boss/web-kit/ui/date';
   import {
-    bastionOf,
-    bastionRoutes,
     comparisonVerdict,
-    DEV_SSH_LABEL,
-    DEV_SSH_URL,
+    DEV_DOOR_HOST,
+    devDoorSteps,
     fetchEstate,
     latestByScope,
     latestComparison,
+    LOOP_OK_OUTCOMES,
+    loopAge,
+    loopHost,
     type EstateState,
   } from './estate';
 
@@ -47,10 +49,9 @@
   const clusterCmp = $derived(
     estate?.comparisons.kind === 'ready' ? latestComparison(estate.comparisons.data, 'kubernetes-nodes') : null,
   );
-  // The off-VPN route reads the bastion from the same nodes table the
-  // page renders above — no second address typed into this file.
-  const bastion = $derived(estate?.nodes.kind === 'ready' ? bastionOf(estate.nodes.data) : null);
-  const routes = $derived(bastion ? bastionRoutes(bastion.address) : null);
+  // The one-time terminal setup, spelled by the module that holds the
+  // hostname — no second address typed into this file.
+  const doorSteps = devDoorSteps();
 </script>
 
 <div class="estate-root">
@@ -141,33 +142,72 @@
       </div>
     {/if}
 
-    <div class="estate-section">02 — THE DEV WORKSPACE</div>
+    <!-- THE LOOPS (backlog 0d9b2960, page audit 2cff1d6e GAP 10): the
+         packets the estate's own loops leave, so "did the loop run" is
+         answered here. Every cell is its own read, and a failed read says
+         so in that cell — an unread loop is not a loop that did not run. -->
+    <div class="estate-section">02 — THE LOOPS</div>
+    <p class="estate-hint">
+      Did each loop run: its newest finished packet (outcome and age) and any packet still open,
+      each linked. The host is the one the packet names; where a packet names none, the page says so
+      rather than guess.
+    </p>
+    <table class="estate-table estate-loops">
+      <thead>
+        <tr><th>loop</th><th>host</th><th>newest finished</th><th>open</th></tr>
+      </thead>
+      <tbody>
+        {#each estate.loops as l (`${l.kind}:${l.host ?? ''}`)}
+          <tr data-loop={l.kind}>
+            <td class="estate-id">{l.label}</td>
+            <td class="estate-addr">{loopHost(l)}</td>
+            <td class="estate-loop-latest">
+              {#if l.latest.kind === 'failed'}
+                <span class="estate-drift load-failed">unread: {l.latest.error}</span>
+              {:else if l.latest.kind === 'ready'}
+                {#if l.latest.data}
+                  {@const p = l.latest.data}
+                  <a class={LOOP_OK_OUTCOMES.has(p.outcome ?? '') ? 'estate-ok' : 'estate-drift'} href={`/ux/jobs/${p.id}`}>{p.outcome ?? p.status}</a>
+                  <span class="estate-age">{loopAge(p.at, loadedAt)}</span>
+                {:else}
+                  <span class="estate-drift">no finished run recorded</span>
+                {/if}
+              {/if}
+            </td>
+            <td class="estate-loop-open">
+              {#if l.open.kind === 'failed'}
+                <span class="estate-drift load-failed">unread: {l.open.error}</span>
+              {:else if l.open.kind === 'ready'}
+                {#each l.open.data as o (o.id)}
+                  <a href={`/ux/jobs/${o.id}`}>open</a>
+                  <span class="estate-age">{loopAge(o.at, loadedAt)}</span>
+                {:else}
+                  <span class="estate-quiet">none</span>
+                {/each}
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+
+    <div class="estate-section">03 — THE DEV WORKSPACE</div>
     <div class="estate-door">
-      <a class="estate-launch" href={DEV_SSH_URL}>Open the dev session — {DEV_SSH_LABEL}</a>
       <p class="estate-hint">
-        On the VPN or LAN. Opens your terminal straight into the workspace (key auth). Inside: the
-        durable tmux session is <code>dev</code> — attach with <code>/work/dev-session.sh</code>,
-        detach with <code>ctrl-b d</code>. For the browser instead, run
-        <code>claude remote-control</code> inside the session and drive it from claude.ai.
+        The workspace answers on <code>{DEV_DOOR_HOST}</code>, from anywhere, behind Cloudflare
+        Access. There is no VPN to join and no key to install: the edge asks who you are and issues
+        a certificate that lasts the session. Three lines, the first two once per machine.
       </p>
-      {#if bastion && routes}
-        <div class="estate-section estate-subsection">OFF THE VPN — THROUGH THE BASTION</div>
-        <p class="estate-hint">
-          {DEV_SSH_LABEL} is a LAN address; from outside, the way in is through
-          <span class="estate-id">{bastion.id}</span> ({bastion.address}).
-        </p>
-        <a class="estate-launch" href={routes.shellUrl}>Open a shell on the bastion — {bastion.address}</a>
-        <p class="estate-hint">
-          Your ssh config supplies the username. Once there, run <code>{routes.hopCommand}</code>.
-          Or both hops in one line:
-        </p>
-        <pre class="estate-snippet">{routes.jumpCommand}</pre>
-        <p class="estate-hint">
-          Or once, in <code>~/.ssh/config</code> — after which the link above works from anywhere,
-          since <code>ssh://</code> cannot carry a jump:
-        </p>
-        <pre class="estate-snippet">{routes.sshConfig}</pre>
-      {/if}
+      {#each doorSteps as step, i (step.command)}
+        <p class="estate-hint"><strong>{i + 1}. {step.what}</strong> — {step.why}</p>
+        <pre class="estate-snippet">{step.command}</pre>
+      {/each}
+      <p class="estate-hint">
+        Inside: the durable tmux session is <code>dev</code> — attach with
+        <code>/work/dev-session.sh</code>, detach with <code>ctrl-b d</code>. For the browser
+        instead, run <code>claude remote-control</code> inside the session and drive it from
+        claude.ai.
+      </p>
     </div>
   {/if}
 </div>
@@ -175,54 +215,48 @@
 <style>
   .estate-root { padding: 0 32px 32px; }
   .estate-section {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px; letter-spacing: var(--ls-eyebrow, 0.3em);
-    color: var(--signal, #5FD4A8); margin: 28px 0 8px;
+    font-family: var(--font-mono);
+    font-size: 12px; letter-spacing: var(--ls-eyebrow);
+    color: var(--signal); margin: 28px 0 8px;
     display: flex; align-items: center; gap: 12px;
   }
-  .estate-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline, #2A3138); }
-  .estate-quiet { color: var(--static, #7A838C); }
+  .estate-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
+  .estate-quiet { color: var(--static); }
   .estate-fail {
-    color: var(--warn, #d9a441);
-    border: 1px solid var(--warn, #d9a441);
+    color: var(--warn);
+    border: 1px solid var(--warn);
     padding: 8px 12px; font-size: 13px;
   }
   .estate-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .estate-table th {
-    text-align: left; font-family: var(--font-mono, ui-monospace, monospace);
+    text-align: left; font-family: var(--font-mono);
     font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--static, #7A838C); font-weight: 400;
-    border-bottom: 1px solid var(--hairline, #2A3138); padding: 4px 12px 4px 0;
+    color: var(--static); font-weight: 400;
+    border-bottom: 1px solid var(--hairline); padding: 4px 12px 4px 0;
   }
-  .estate-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline, #2A3138); }
-  .estate-id { font-family: var(--font-mono, ui-monospace, monospace); }
-  .estate-addr, .estate-num { font-family: var(--font-mono, ui-monospace, monospace); color: var(--static, #7A838C); }
-  .estate-roles { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--static, #7A838C); }
+  .estate-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline); }
+  .estate-id { font-family: var(--font-mono); }
+  .estate-addr, .estate-num { font-family: var(--font-mono); color: var(--static); }
+  .estate-roles { font-family: var(--font-mono); font-size: 11px; color: var(--static); }
   .estate-obs { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
   .estate-obs-row { display: flex; gap: 16px; align-items: baseline; }
   .estate-scope {
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
-    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static, #7A838C);
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static);
     min-width: 150px;
   }
-  .estate-when { color: var(--static, #7A838C); font-size: 12px; margin-left: auto; }
-  .estate-ok { color: var(--signal, #5FD4A8); }
-  .estate-drift { color: var(--warn, #d9a441); }
+  .estate-when { color: var(--static); font-size: 12px; margin-left: auto; }
+  .estate-age { color: var(--static); font-size: 12px; margin-left: 8px; }
+  .estate-ok { color: var(--signal); }
+  .estate-drift { color: var(--warn); }
   .estate-door { display: flex; flex-direction: column; gap: 8px; }
-  .estate-launch {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    color: var(--signal, #5FD4A8); text-decoration: none;
-    border: 1px solid var(--signal, #5FD4A8); border-radius: 0;
-    padding: 8px 14px; width: fit-content; letter-spacing: 0.06em;
-  }
-  .estate-launch:hover, .estate-launch:focus { background: var(--signal, #5FD4A8); color: var(--ink-inverse, #0d1117); }
-  .estate-hint { color: var(--static, #7A838C); font-size: 12px; max-width: 60ch; }
-  .estate-hint code { font-family: var(--font-mono, ui-monospace, monospace); }
-  .estate-subsection { margin-top: 20px; }
+  .estate-hint { color: var(--static); font-size: 12px; max-width: 60ch; }
+  .estate-hint code { font-family: var(--font-mono); }
+  .estate-hint strong { color: var(--fog); font-weight: 500; }
   /* One click selects the whole snippet — copyable without a button. */
   .estate-snippet {
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
-    color: var(--signal, #5FD4A8); border: 1px solid var(--hairline, #2A3138);
+    font-family: var(--font-mono); font-size: 12px;
+    color: var(--signal); border: 1px solid var(--hairline);
     padding: 8px 14px; margin: 0; width: fit-content; user-select: all;
   }
 </style>

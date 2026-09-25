@@ -159,26 +159,18 @@ pub async fn run(want: &str) -> Result<()> {
     let base = crate::gate::resolve_jobs_base(None)?;
     let url = format!("{base}/api/jobs?kind=user-feedback&limit=200");
     let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .header(
-            "x-boss-user",
-            crate::identity::header(&crate::identity::reader()),
-        )
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    // Waits out a jobs-API roll (backlog 034002b3), like every verb.
+    let user = crate::identity::header(&crate::identity::reader());
+    let resp = crate::train::send_through_a_roll(&format!("GET {url}"), || {
+        client.get(&url).header("x-boss-user", user.as_str())
+    })
+    .await?;
     if !resp.status().is_success() {
         bail!("GET {url}: HTTP {}", resp.status());
     }
     let body: Value = resp.json().await?;
-    let rows = match body {
-        Value::Object(mut o) if o.contains_key("data") => o.remove("data").unwrap_or(Value::Null),
-        other => other,
-    };
-    let Value::Array(rows) = rows else {
-        bail!("expected a job list from {url}");
-    };
+    // The one rows helper decides the shape (backlog 7b7e0529).
+    let rows = crate::train::rows(Some(body)).with_context(|| format!("GET {url}"))?;
 
     let mut buckets: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for k in ["waiting", "with-agent", "done"] {

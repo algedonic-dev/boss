@@ -10,6 +10,7 @@
   // A View holds a query and a layout, never rows. Its content comes
   // from the same projections every other surface reads, which is why
   // two people running the same View see the same numbers.
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -201,14 +202,9 @@
       <span>Columns <em>none selected shows everything</em></span>
       <div class="v-chips">
         {#each availableFields as f (f)}
-          <button
-            type="button"
-            class="v-chip"
-            class:v-chip-on={draftColumns.includes(f)}
-            onclick={() => toggleColumn(f)}
-          >
+          <FilterButton active={draftColumns.includes(f)} onclick={() => toggleColumn(f)}>
             {f}
-          </button>
+          </FilterButton>
         {/each}
       </div>
     </div>
@@ -232,7 +228,7 @@
 
     <div class="v-actions">
       <button
-        class="wb-btn"
+        class="btn"
         type="button"
         disabled={saving || draftTitle.trim().length === 0 || !viewerId}
         onclick={create}
@@ -249,7 +245,9 @@
 {#if loading}
   <p class="v-msg">Loading views…</p>
 {:else if error}
-  <p class="v-msg v-err">{error}</p>
+  <!-- The shared failure marker (sweep c3e4edcc), here and on a view
+       whose run failed. -->
+  <p class="v-msg load-failed" role="alert">{error}</p>
 {:else if views.length === 0}
   <p class="v-msg">
     No views yet. A view is a saved question — pick a source, describe what you
@@ -272,7 +270,7 @@
           <code class="v-filter">{v.filter}</code>
         {/if}
         <span class="v-spacer"></span>
-        <button class="wb-btn" type="button" onclick={() => run(v)} disabled={running[v.id]}>
+        <button class="btn" type="button" onclick={() => run(v)} disabled={running[v.id]}>
           {running[v.id] ? 'Running…' : 'Run'}
         </button>
         {#if v.owner_id === viewerId}
@@ -281,7 +279,7 @@
       </div>
 
       {#if rowErrors[v.id]}
-        <p class="v-msg v-err">{rowErrors[v.id]}</p>
+        <p class="v-msg load-failed" role="alert">{rowErrors[v.id]}</p>
       {:else if res}
         <p class="v-count">
           {res.matched}
@@ -346,21 +344,14 @@
     flex-direction: column;
     gap: 4px;
     font-size: 12px;
-    color: var(--text-dim, #666);
+    color: var(--text-dim);
   }
   .v-field-wide {
     grid-column: 1 / -1;
   }
   .v-field em {
     font-style: normal;
-    color: #999;
-  }
-  .v-field input,
-  .v-field select {
-    padding: 6px;
-    font-size: 13px;
-    font: inherit;
-    font-size: 13px;
+    color: var(--static);
   }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -369,19 +360,6 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-  }
-  .v-chip {
-    border: 1px solid var(--border, #e7e5e4);
-    background: var(--card, #fff);
-    border-radius: 999px;
-    padding: 3px 10px;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .v-chip-on {
-    background: #1c1917;
-    color: #fff;
-    border-color: #1c1917;
   }
   .v-actions {
     grid-column: 1 / -1;
@@ -403,25 +381,25 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #78716c);
-    border: 1px solid var(--border, #e7e5e4);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
     border-radius: 4px;
     padding: 1px 6px;
   }
   .v-tag-shared {
-    border-color: #15803d;
-    color: #15803d;
+    border-color: var(--clear);
+    color: var(--ok);
   }
   .v-filter {
     font-size: 12px;
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
     padding: 2px 6px;
     border-radius: 4px;
   }
   .v-del {
     background: none;
     border: none;
-    color: #b91c1c;
+    color: var(--err);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
@@ -431,7 +409,7 @@
     margin: 0 0 8px;
   }
   .v-trunc {
-    color: #b45309;
+    color: var(--warn);
     font-weight: 600;
   }
   .v-scroll {
@@ -444,7 +422,7 @@
   }
   .v-table th,
   .v-table td {
-    border-bottom: 1px solid var(--border, #e7e5e4);
+    border-bottom: 1px solid var(--border);
     padding: 5px 10px;
     text-align: left;
     white-space: nowrap;
@@ -453,7 +431,7 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .v-list {
     margin: 0;
@@ -461,10 +439,10 @@
     font-size: 13px;
   }
   .v-msg {
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     font-size: 14px;
   }
   .v-err {
-    color: #b91c1c;
+    color: var(--err);
   }
 </style>

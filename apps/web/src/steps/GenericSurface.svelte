@@ -13,7 +13,7 @@
   } from '../jobs/types';
   import type { SpecStep } from '../jobs/fork';
   import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { saveStep } from './stepWrite';
   import { PROCEDURE_KEY } from './procedure';
   import {
     askRoutes,
@@ -193,46 +193,36 @@
     [...employees].sort((a, b) => (a.name ?? "").localeCompare(b.name ?? "")),
   );
 
-  function mergeMetadata(
-    existing: Record<string, unknown>,
-    d: string,
-  ): Record<string, unknown> {
-    const next = { ...existing };
-    if (d) next.due_on = d;
-    else delete next.due_on;
-    return next;
-  }
-
   async function persist(overrides: {
     status?: string;
     assignee_id?: string | null;
-    metadata?: Record<string, unknown>;
     notes?: string;
   }): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // Only the keys this surface owns go to the merge door — never a
+      // spread of the step's metadata (backlog e39a9d2a). A cleared due
+      // date is an explicit null, which the door deletes; it used to be
+      // cleared by OMISSION from a wholesale PUT.
       const body = {
-        ...step,
-        job_id: jobId,
         notes: overrides.notes ?? notes ?? undefined,
         status: overrides.status ?? step.status,
         assignee_id:
           overrides.assignee_id !== undefined
             ? overrides.assignee_id
             : assigneeId || null,
-        metadata:
-          overrides.metadata ?? {
-            ...mergeMetadata(step.metadata, dueOn),
-            // Only send fields the operator actually filled — an
-            // empty string is not an answer, and writing one would
-            // satisfy a required-field check with nothing in it.
-            ...Object.fromEntries(
-              Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
-            ),
-          },
+        metadata: {
+          ...(dueOnDirty ? { due_on: dueOn || null } : {}),
+          // Only send fields the operator actually filled — an
+          // empty string is not an answer, and writing one would
+          // satisfy a required-field check with nothing in it.
+          ...Object.fromEntries(
+            Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
+          ),
+        },
       };
-      const res = await putStep(jobId, step.id, body);
+      const res = await saveStep(jobId, step.id, body);
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -353,7 +343,7 @@
              takes — and, when it cannot be pressed, the field it is
              waiting on, in the row rather than a hover title. -->
         <button
-          class="step-btn step-btn-primary"
+          class="btn btn-primary"
           onclick={() => persist({ status: 'completed' })}
           disabled={saving || missingRequired.length > 0}
         >
@@ -440,7 +430,7 @@
   <div class="step-actions">
     {#if dirty && !terminal}
       <button
-        class="step-btn"
+        class="btn"
         onclick={() => persist({})}
         disabled={saving}
       >
@@ -449,7 +439,7 @@
     {/if}
     {#if !terminal && isPending(step.status)}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist({ status: 'active' })}
         disabled={saving}
       >
@@ -460,7 +450,7 @@
       <!-- A step with no contract completes here; one WITH a contract
            completes from the ask above, where the answer is. -->
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist({ status: 'completed' })}
         disabled={saving}
       >
@@ -472,8 +462,8 @@
 
 <style>
   .step-ask {
-    border: 1px solid var(--border, #e7e5e4);
-    border-left: 3px solid var(--accent, #2563eb);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
     border-radius: 6px;
     padding: 10px 12px;
     margin-bottom: 12px;
@@ -487,18 +477,19 @@
   }
   .step-ask-needs {
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
+  /* Enamel's field label, the board's `.field label` (backlog 6f471ff6). */
   .step-field-label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-dim, #78716c);
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--text);
   }
   .step-ask-legend {
     margin-left: auto;
   }
   .step-field-required {
-    color: var(--danger, #b91c1c);
+    color: var(--err);
     margin-left: 2px;
   }
 </style>

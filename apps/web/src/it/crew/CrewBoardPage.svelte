@@ -20,13 +20,18 @@
   import { appToday } from '@boss/web-kit/sim-clock';
   import { formatActor } from '../../data/actor';
   import { href } from '../../router';
-  import { crewPlatforms, type Deck } from '../yard/world-interior';
+  import type { Deck } from '../yard/world-interior';
+  import { actors } from '../yard/shop-floor';
   import {
     actorCards,
     CAR_WINDOW,
+    costText,
     crews,
     fetchCrew,
     pipelineTrack,
+    silence,
+    silenceText,
+    SILENT_BOUND_HOURS,
     takenNotProgressed,
     waitText,
     type ActorCard,
@@ -104,9 +109,11 @@
       : null,
   );
 
-  // The territory's platforms, from the same fold the board renders.
-  // A failed read is a failed DECK — a region drawn with no crews on it
-  // would read as an empty shop rather than an unread one.
+  // The region's ACTORS, from the same fold the board renders (design
+  // 62de32ae, decision 8): a lamp per session and per run, under the
+  // identity they share — shop-floor.ts. A failed read is a failed DECK
+  // — a region drawn with no crews on it would read as an empty shop
+  // rather than an unread one.
   const deck = $derived<Deck>(
     crew === null
       ? { kind: 'reading' }
@@ -116,7 +123,12 @@
           ? { kind: 'unavailable', why: crew.agentRuns.error }
           : floor === null
             ? { kind: 'reading' }
-            : { kind: 'ready', region: 'shop-floor', platforms: crewPlatforms(floor.crews, floor.unlinked) },
+            : {
+                kind: 'ready',
+                region: 'shop-floor',
+                platforms: [],
+                actors: actors(floor.crews, floor.unlinked, loadedAt.toISOString()),
+              },
   );
   $effect(() => {
     ondeck(deck);
@@ -436,11 +448,12 @@
         <thead>
           <tr>
             <th>agent</th><th>run</th><th>on</th><th>at</th><th>model · budget · effort</th>
-            <th>host</th><th>since</th>
+            <th>host</th><th>since</th><th>unmoved</th>
           </tr>
         </thead>
         <tbody>
           {#each crew.agentRuns.data as r (r.id)}
+            {@const quiet = silence(r, loadedAt.toISOString())}
             <tr>
               <td>{r.agent === null ? '—' : formatActor(r.agent)}</td>
               <td><a href={href(`/ux/jobs/${r.id}`)}>{r.title}</a></td>
@@ -464,6 +477,13 @@
                   {formatRelative(r.openedAt, loadedAt)}
                 {/if}
               </td>
+              <td class="crew-num">
+                {#if quiet === null}
+                  <span class="crew-unknown">{r.building ? 'not recorded' : '—'}</span>
+                {:else}
+                  <span class:crew-silent={quiet.past}>{silenceText(quiet)}</span>
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -471,7 +491,82 @@
       <p class="crew-note">
         Open runs only: a run that landed, was refused or died is history the packet's own page
         tells. "At" is the run's own step — briefed, building, reported — not the step it is
-        executing on its packet, which "on" names.
+        executing on its packet, which "on" names. "Unmoved" is how long a BUILDING run's packet
+        has stood with no step completed — the same reading the hourly age-out rule takes, which
+        completes the run as died past {SILENT_BOUND_HOURS}h. A run past the bound is one that rule
+        has not reached yet. A run waiting at its report is held by the gate, not silent, and shows
+        no reading.
+      </p>
+    {/if}
+
+    <!-- ======================= WHAT RUNS COST ======================= -->
+    <!-- The finish record (backlog 5082a08b, design 8382bbb2): the
+         agent fleet read from the system of record — `agent_runs` —
+         rather than a dashboard on its own port. A row exists only once
+         a run reaches a terminal, so cost is a property of FINISHED
+         runs; the open ones above have none to show yet. -->
+    <div class="crew-section">05 — WHAT RUNS COST</div>
+
+    {#if crew.runRecords.kind === 'failed'}
+      <p class="crew-fail load-failed">
+        The finish record did not answer: {crew.runRecords.error}. An unreadable record is not a
+        fleet that spent nothing.
+      </p>
+    {:else if crew.runRecords.data.length === 0}
+      <p class="crew-stage-blank">No finished run is recorded.</p>
+    {:else}
+      <table class="crew-table">
+        <thead>
+          <tr>
+            <th>actor</th><th>run</th><th>outcome</th><th>branch</th><th>effort</th>
+            <th>took</th><th>cost</th><th>finished</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each crew.runRecords.data as f (f.runId)}
+            <tr>
+              <td>{f.actor === null ? '—' : formatActor(f.actor)}</td>
+              <td><a href={href(`/ux/jobs/${f.runId}`)}>{f.runId.slice(0, 8)}</a></td>
+              <td>{f.outcome ?? '—'}</td>
+              <td>
+                {#if f.branch === null}
+                  <span class="crew-unknown">not recorded</span>
+                {:else}
+                  {f.branch}
+                {/if}
+              </td>
+              <td>
+                {#if f.effort === null}
+                  <span class="crew-unknown">not recorded</span>
+                {:else}
+                  {f.effort}
+                {/if}
+              </td>
+              <td class="crew-num">{f.minutes === null ? '—' : `${f.minutes} min`}</td>
+              <td class="crew-num">
+                {#if f.usdMicros === null}
+                  <span class="crew-unknown">{costText(f)}</span>
+                {:else}
+                  {costText(f)}
+                {/if}
+              </td>
+              <td class="crew-num">
+                {#if f.finishedAt === null}
+                  <span class="crew-unknown">not recorded</span>
+                {:else}
+                  {formatRelative(f.finishedAt, loadedAt)}
+                {/if}
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      <p class="crew-note">
+        The newest {CAR_WINDOW} runs the record holds — a window, not a total, so no sum is drawn.
+        "Not priced" is a run whose report carried no tokens the rate card could price; it is not
+        a free run. Rows from before the effort instrumentation and before branches were recorded
+        on the finish record say "not recorded" rather than guess, and a run without a branch can
+        still be followed to its car through its own packet.
       </p>
     {/if}
   {/if}
@@ -482,29 +577,29 @@
     padding: 0 1.25rem 3rem;
   }
   .crew-quiet {
-    color: var(--muted, #6b675e);
+    color: var(--static);
     font-size: 0.85rem;
   }
   .crew-fail {
-    color: var(--danger, #a3302a);
+    color: var(--err);
     font-size: 0.85rem;
-    background: var(--danger-bg, #fbf0ef);
-    border-left: 3px solid var(--danger, #a3302a);
+    background: var(--err-wash);
+    border-left: 3px solid var(--err);
     padding: 0.5rem 0.75rem;
     margin: 0.5rem 0;
   }
   .crew-section {
     font-size: 0.7rem;
     letter-spacing: 0.12em;
-    color: var(--muted, #6b675e);
-    border-bottom: 1px solid var(--border, #d5d2ca);
+    color: var(--static);
+    border-bottom: 1px solid var(--border);
     padding-bottom: 0.3rem;
     margin: 1.75rem 0 0.75rem;
   }
   .crew-note {
     font-size: 0.74rem;
     line-height: 1.5;
-    color: var(--muted, #6b675e);
+    color: var(--static);
     max-width: 62rem;
     margin: 0.75rem 0 0;
   }
@@ -517,7 +612,7 @@
     overflow-x: auto;
   }
   .crew-stage {
-    border: 1px solid var(--border, #d5d2ca);
+    border: 1px solid var(--border);
     border-radius: 3px;
     padding: 0.4rem;
     min-width: 9rem;
@@ -531,7 +626,7 @@
   .crew-stage-label {
     font-size: 0.66rem;
     letter-spacing: 0.1em;
-    color: var(--muted, #6b675e);
+    color: var(--static);
   }
   .crew-stage-count {
     font-size: 0.95rem;
@@ -539,7 +634,7 @@
   }
   .crew-stage-blank {
     font-size: 0.72rem;
-    color: var(--muted, #6b675e);
+    color: var(--static);
     font-style: italic;
     margin: 0;
   }
@@ -547,17 +642,17 @@
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
-    border-left: 3px solid var(--accent, #4a7c59);
+    border-left: 3px solid var(--accent);
     padding: 0.3rem 0.4rem;
     margin-bottom: 0.35rem;
-    background: var(--surface-2, #f6f4ef);
+    background: var(--ink-raised);
   }
   .crew-car.troubled {
-    border-left-color: var(--danger, #a3302a);
-    background: var(--danger-bg, #fbf0ef);
+    border-left-color: var(--err);
+    background: var(--err-wash);
   }
   .crew-car-branch {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: var(--mono);
     font-size: 0.68rem;
     overflow-wrap: anywhere;
   }
@@ -566,7 +661,7 @@
   }
   .crew-car-detail {
     font-size: 0.67rem;
-    color: var(--muted, #6b675e);
+    color: var(--static);
   }
   .crew-garage {
     margin-top: 0.75rem;
@@ -576,7 +671,7 @@
     display: block;
     font-size: 0.66rem;
     letter-spacing: 0.1em;
-    color: var(--danger, #a3302a);
+    color: var(--err);
     margin-bottom: 0.3rem;
   }
 
@@ -587,7 +682,7 @@
     gap: 0.6rem;
   }
   .crew-card {
-    border: 1px solid var(--border, #d5d2ca);
+    border: 1px solid var(--border);
     border-radius: 3px;
     padding: 0.55rem 0.65rem;
   }
@@ -609,20 +704,20 @@
     padding: 0.08rem 0.3rem;
     border-radius: 2px;
     white-space: nowrap;
-    background: var(--surface-2, #f6f4ef);
-    color: var(--muted, #6b675e);
+    background: var(--ink-raised);
+    color: var(--static);
   }
   .crew-lane-agent {
-    background: #e8f0fb;
-    color: #2a5a8f;
+    background: var(--signal-wash);
+    color: var(--signal);
   }
   .crew-lane-human {
-    background: #eef7ea;
-    color: #2f6b3a;
+    background: var(--ok-wash);
+    color: var(--ok);
   }
   .crew-lane-automation {
-    background: #f4f0fa;
-    color: #5d4a8f;
+    background: var(--ink-raised);
+    color: var(--signal);
   }
   .crew-card-figs {
     display: flex;
@@ -641,7 +736,7 @@
   }
   .crew-fig-l {
     font-size: 0.64rem;
-    color: var(--muted, #6b675e);
+    color: var(--static);
     line-height: 1.2;
   }
   .crew-fig-l em {
@@ -650,31 +745,31 @@
   }
   .crew-card-last {
     font-size: 0.68rem;
-    color: var(--muted, #6b675e);
+    color: var(--static);
   }
   .crew-unknown {
     font-style: italic;
   }
   .crew-when {
-    color: var(--fg, #2b2823);
+    color: var(--fog);
   }
   .crew-holding {
     list-style: none;
     margin: 0.4rem 0 0;
     padding: 0.4rem 0 0;
-    border-top: 1px solid var(--border, #d5d2ca);
+    border-top: 1px solid var(--border);
     font-size: 0.7rem;
   }
   .crew-holding li {
     margin-bottom: 0.2rem;
   }
   .crew-holding-meta {
-    color: var(--muted, #6b675e);
+    color: var(--static);
     display: block;
     font-size: 0.65rem;
   }
   .crew-holding-more {
-    color: var(--muted, #6b675e);
+    color: var(--static);
     font-style: italic;
   }
 
@@ -690,21 +785,25 @@
     font-size: 0.64rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--muted, #6b675e);
-    border-bottom: 1px solid var(--border, #d5d2ca);
+    color: var(--static);
+    border-bottom: 1px solid var(--border);
     padding: 0.25rem 0.5rem 0.25rem 0;
   }
   .crew-table td {
     padding: 0.3rem 0.5rem 0.3rem 0;
-    border-bottom: 1px solid var(--border-subtle, #eceae4);
+    border-bottom: 1px solid var(--hairline);
     vertical-align: top;
   }
   .crew-num {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
+  .crew-silent {
+    color: var(--err);
+    font-weight: 600;
+  }
   .crew-floor {
     font-style: italic;
-    color: var(--muted, #6b675e);
+    color: var(--static);
   }
 </style>

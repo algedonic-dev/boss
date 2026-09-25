@@ -119,7 +119,7 @@
 
 <nav class="perspective-tabs" aria-label="Perspective">
   <span class="perspective-brand">
-    <LoopMark size={22} />
+    <LoopMark size={22} band />
     <span class="perspective-brand-name">{brandName}</span>
     {#if brandSub}<span class="perspective-brand-sub">{brandSub}</span>{/if}
   </span>
@@ -175,6 +175,19 @@
 </nav>
 
 <style>
+  /* An ENAMEL BAND: white words let into night ink, the way Enamel draws
+     every header (the fold, "Its parts are Enamel"; backlog 7eb59678
+     car 2). Until this car the bar was the white of the page it sat on,
+     told apart by one hairline — the one piece of furniture every app
+     shares, and the least legible as furniture.
+
+     The one bold move is the tab you are on: it is not tinted or
+     underlined but CUT OUT of the band, the page's own white ground
+     rising into it, so the bar visibly opens onto the page below. The
+     other tabs are the same notch waiting (their hover shows its shape).
+     Every control in the bar declares its own on-band colour — nothing
+     here inherits the document's ink, which is the defect
+     chrome-consistency.mocked.spec.ts was written for. */
   .perspective-tabs {
     position: fixed;
     top: 0;
@@ -185,8 +198,8 @@
     display: flex;
     align-items: stretch;
     gap: 20px;
-    background: var(--void, #0d1014);
-    border-bottom: 1px solid var(--hairline, #2a3138);
+    background: var(--band);
+    color: var(--on-band);
     padding: 0 16px;
   }
   .perspective-more {
@@ -220,25 +233,25 @@
     padding: 6px;
     display: flex;
     flex-direction: column;
-    background: var(--ink, #12161c);
-    border: 1px solid var(--hairline, #2a3138);
-    border-radius: 0 0 8px 8px;
-    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
+    background: var(--ink);
+    border: 1px solid var(--hairline);
+    border-top: 0;
+    border-radius: 0 0 var(--radius) var(--radius);
   }
   .perspective-more-item {
     padding: 7px 10px;
     border-radius: 4px;
     font-size: 13px;
-    color: var(--static, #7a838c);
+    color: var(--static);
     text-decoration: none;
     white-space: nowrap;
   }
   .perspective-more-item:hover {
-    background: var(--wash, rgba(232,236,239,.04));
-    color: var(--fog, #e8ecef);
+    background: var(--wash);
+    color: var(--fog);
   }
   .perspective-more-item-on {
-    color: var(--fog, #e8ecef);
+    color: var(--fog);
     font-weight: 500;
   }
 
@@ -251,24 +264,23 @@
     flex: 0 0 auto;
   }
   .perspective-brand-name {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 14px;
     font-weight: 500;
     text-transform: uppercase;
-    letter-spacing: var(--ls-nav, 0.14em);
-    color: var(--fog, #e8ecef);
+    letter-spacing: var(--ls-nav);
+    color: var(--on-band);
     white-space: nowrap;
   }
   .perspective-brand-sub {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 10px;
     font-weight: 400;
     text-transform: uppercase;
     letter-spacing: 0.2em;
-    /* Was brewery amber. Not SIGNAL either: the active-tab underline
-       already spends the bar's one green on answering "where am I",
-       which is the more useful signal of the two. */
-    color: var(--static, #7a838c);
+    /* Was brewery amber. Not SIGNAL either: the cut-out tab already
+       answers "where am I", which is the more useful signal of the two. */
+    color: var(--on-band-dim);
   }
   .perspective-tablist {
     display: flex;
@@ -276,42 +288,37 @@
   }
   /* Nav is instrument type — §03 assigns NAV to DM Mono, caps and
      letterspaced. */
+  /* Every tab is a notch in the band: squared top corners, open at the
+     foot, starting 8px below the band's top edge so the ink frames it on
+     three sides. */
   .perspective-tab {
     display: flex;
     align-items: center;
-    padding: 0 18px;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: 8px;
+    padding: 2px 18px 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    font-family: var(--font-mono);
     font-size: 12px;
     font-weight: 400;
     text-transform: uppercase;
-    letter-spacing: var(--ls-label, 0.1em);
-    color: var(--static, #7a838c);
+    letter-spacing: var(--ls-label);
+    color: var(--on-band-dim);
     text-decoration: none;
-    /* Reserve the active underline on every tab so selecting one
-       doesn't shift the row. */
-    border-bottom: 3px solid transparent;
     transition:
       color 0.1s,
-      background 0.1s,
-      border-color 0.1s;
+      background 0.1s;
   }
   .perspective-tab:hover {
-    color: var(--fog, #e8ecef);
-    background: var(--wash, rgba(232, 236, 239, 0.04));
+    color: var(--on-band);
+    background: var(--band-raised);
   }
-  /* Selected perspective: a neutral raised ground + the SIGNAL underline.
-     The fill was an amber tint left from the brewery palette, which read
-     olive against VOID. It also doesn't need a hue of its own — the
-     underline is already spending this bar's one green on "you are
-     here", and tinting the fill to match would just say it twice. */
-  .perspective-tab.active {
-    color: var(--fog, #e8ecef);
-    font-weight: 500;
-    background: var(--ink-raised, #171c24);
-    border-bottom-color: var(--signal, #5fd4a8);
-  }
+  /* Where you are: the page's own ground cut into the band, its word in
+     the page's ink. No hue is spent on it — the shape says it. */
+  .perspective-tab.active,
   .perspective-tab.active:hover {
-    background: var(--ink, #12161c);
+    color: var(--fog);
+    font-weight: 600;
+    background: var(--void);
   }
   .perspective-right {
     margin-left: auto;
@@ -319,5 +326,20 @@
     align-items: center;
     gap: 14px;
     flex: 0 0 auto;
+  }
+
+  /* ON A PHONE (design 62de32ae decision 12, car G; the width is
+     PHONE_QUERY in ui/phone.ts, pinned by its test). Measured at 390px:
+     the bar's content ran to 877px, so the tab you are on, search,
+     feedback and sign-in were past the edge of the screen with no way
+     to reach them. The band keeps its 44px — every shell offsets below
+     it — and scrolls sideways inside itself instead; the wordmark gives
+     its room to the tabs, the mark stays. A scroll container clips what
+     hangs out of it, so the More menu is pinned under the band rather
+     than to its button. */
+  @media (max-width: 720px) {
+    .perspective-tabs { gap: 12px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+    .perspective-brand-name, .perspective-brand-sub { display: none; }
+    .perspective-more-menu { position: fixed; top: 44px; left: 8px; right: 8px; }
   }
 </style>

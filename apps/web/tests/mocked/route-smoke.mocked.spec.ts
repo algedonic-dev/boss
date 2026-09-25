@@ -12,6 +12,7 @@
 import { test, expect } from '@playwright/test';
 import { installSmokeMocks } from './_smokeMocks';
 import { installAuthoringMocks, JOB_ID } from './_mockApi';
+import { paintedOrThrew, readsSettled, recordPageRequests } from './_helpers';
 // The roster lives in _routes.ts, not here: outage-crawl.mocked.spec.ts
 // reads the same list, and a second copy would reproduce the very defect
 // the drift test at the bottom of this file exists to stop (CLAUDE.md
@@ -24,7 +25,11 @@ import { DEFERRED, ROUTES } from './_routes';
 // can't fake; they need faithful per-endpoint fixtures before they can be
 // gated without false positives:
 //   /ux/finance (statements .reduce) · /ux/warehouse (summary.below_reorder_count)
-//   /ux/exec (.find/.length) · /it/operate/audit (snapshot .length)
+//   /ux/exec (.find/.length)
+//
+// /it/operate/audit LEFT THIS GROUP on 2026-09-23 (page audit 65a273d5):
+// its stats read now has a faithful fixture, EVENTS_STATS in
+// _smokeMocks.ts, so it is crawled from ROUTES.
 //
 // The watchlist LEFT THIS GROUP on 2026-08-28: its `.length` crash was
 // not a fixture problem but a CAST — the page read
@@ -60,6 +65,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     // wiping the previous route's JS state — so there's no effect/timer
     // bleed despite sharing the page. `page.route` handlers persist
     // across navigations, so the mocks are installed once.
+    await recordPageRequests(page);
     await installSmokeMocks(page);
 
     const issues: Issue[] = [];
@@ -82,7 +88,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
           // 'commit' (not 'load'/'domcontentloaded'): for a client-routed
           // SPA we only need the navigation to commit; the real readiness
           // signal is the AppShell painting, asserted next.
-          await page.goto(r, { waitUntil: 'commit', timeout: 20_000 });
+          await page.goto(r, { waitUntil: 'commit' });
           await expect(page.locator('.app-shell')).toBeVisible({ timeout: 20_000 });
           shellOk = true;
         } catch (e) {
@@ -92,8 +98,12 @@ test.describe('route smoke — every surface renders without a runtime crash', (
         }
       }
       // Let onMount effects + the (instant) mocked fetches settle so any
-      // data-render crash fires while we're listening.
-      if (shellOk) await page.waitForTimeout(500);
+      // data-render crash fires while we're listening: every read the
+      // route opened answered, and a frame painted with what it said. It
+      // was a flat 500 ms until backlog 840c5a76 — under load, a crash in
+      // a render the answers had not reached yet was never heard. A route
+      // whose reads outlast the budget is judged on what it painted.
+      if (shellOk) await readsSettled(page).catch(() => undefined);
     }
 
     // Gate on crashes: uncaught exceptions + shells that never painted.
@@ -121,11 +131,12 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
 
-    await page.goto(`/it/registry/authoring/${JOB_ID}`, { timeout: 20_000 });
-    await expect(page.locator('.app-shell')).toBeVisible({ timeout: 10_000 });
+    await page.goto(`/it/registry/authoring/${JOB_ID}`);
+    await expect(page.locator('.app-shell')).toBeVisible();
     // Wait for the lazy graph + the step-authoring surface (which mounts
-    // StepDagEditor) to render the seeded spec.
-    await page.waitForTimeout(2_000);
+    // StepDagEditor) to render the seeded spec — or for the throw this
+    // test exists to catch. It slept 2 000 ms until backlog 840c5a76.
+    await paintedOrThrew(page.locator('.sde-header'), errors);
 
     expect(errors, `pageerrors in the authoring workspace:\n${errors.join('\n')}`).toEqual([]);
   });
@@ -162,11 +173,17 @@ test.describe('the crawl covers every registered surface', () => {
 
   test('every catalog route is crawled or deferred with a reason', async () => {
     const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
-    const crawled = new Set(ROUTES);
+    const openedAs = await patternOf();
+    // A parameterised catalog path (/it/registry/rules/:ruleName) is a
+    // pattern no crawl can open, so it counts as crawled when a ROUTES
+    // row OPENS as it — routePattern, the spelling surface-opens records
+    // and the catalog uses. This filter used to drop every path with a
+    // `:` on the comment "covered by the detail routes above", which
+    // nothing checked: no row rendered the rule editor (backlog d7732e88).
+    const crawled = new Set([...ROUTES, ...ROUTES.map(openedAs)]);
     const missing = Object.values(ROUTE_CATALOG)
       .map((r) => (r as { path: string }).path)
-      // Parameterised paths are covered by the detail routes above.
-      .filter((p) => typeof p === 'string' && !p.includes(':'))
+      .filter((p) => typeof p === 'string')
       .filter((p) => !crawled.has(p) && !DEFERRED.has(p))
       .sort();
     expect(
@@ -175,4 +192,27 @@ test.describe('the crawl covers every registered surface', () => {
         `or to DEFERRED with the reason they cannot be crawled yet`,
     ).toEqual([]);
   });
+
+  test('a parameterised path is crawled through a row that opens as it — the rule editor', async () => {
+    // The test above counts a `:` catalog path as crawled only through a
+    // ROUTES row whose routePattern equals it. The rule editor's catalog
+    // path is that pattern (car 3071e235), so its row must open as it,
+    // or the editor is registered and never rendered (backlog d7732e88).
+    const openedAs = await patternOf();
+    const editors = ROUTES.filter((r) => openedAs(r) === '/it/registry/rules/:ruleName');
+    expect(editors).toEqual(['/it/registry/rules/auto-park-on-gate-green']);
+  });
 });
+
+/// The pattern a crawled path opens as — the router's parse, spelled by
+/// routePattern the way surface-opens records it and the catalog names a
+/// parameterised path. parseRoute reads the query string off `window`
+/// for /jobs and /search; this is Node and ROUTES carries no query, so
+/// it gets the one field it reads, empty (as interaction-crawl's
+/// servedBySpa does).
+async function patternOf(): Promise<(path: string) => string> {
+  const { parseRoute } = await import('../../src/router');
+  const { routePattern } = await import('../../src/shell/surface-opens');
+  (globalThis as { window?: unknown }).window = { location: { search: '' } };
+  return (path) => routePattern(parseRoute(path), path);
+}

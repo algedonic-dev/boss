@@ -73,13 +73,22 @@ impl Subject {
 }
 
 /// Lifecycle status of a Job.
+///
+/// Four words: `draft` and `open` are live, `closed` and `cancelled`
+/// are terminal. `Blocked` and `PendingSignOff` were retired on
+/// 2026-09-24 (backlog 3c3dc8f3): nothing ever set either — a step
+/// paused on a dependency is a `Pending` step on an `Open` Job, and
+/// completion refuses an unsigned step — and on the day they went,
+/// 0 of 16,963 Jobs and 0 of 97,909 `jobs.job.*` audit events (the
+/// whole log, 2026-09-16 onward) carried either word. What they did
+/// do was render as two status filters that could only ever answer
+/// "No jobs match." A retired word now fails to deserialize, and the
+/// `jobs.status` CHECK refuses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobStatus {
     Draft,
     Open,
-    Blocked,
-    PendingSignOff,
     Closed,
     Cancelled,
 }
@@ -161,6 +170,27 @@ pub struct Job {
     pub status: JobStatus,
     pub priority: Priority,
     pub opened_on: NaiveDate,
+    /// The instant the packet was admitted — server-stamped at
+    /// `POST /api/jobs`, immutable afterwards (the adapters keep it
+    /// out of every UPDATE, the same way they keep `partition` out).
+    ///
+    /// `opened_on` is a DATE, so the finest honest answer it supports
+    /// is a whole day; every surface that asks "how long has this been
+    /// waiting" — the ops-runner's `oldest_wait_s`, dock wait and gate
+    /// duration on the region map, the overdue alarms, the silence
+    /// sweep — needs the instant. Until backlog 6c2eba00 that instant
+    /// was `metadata.opened_at`, written by whoever filed the packet:
+    /// a convention the doors happen to follow, absent on anything
+    /// filed by a caller that does not know it. The metadata stamp is
+    /// still written for the readers already on it; this is the field
+    /// that cannot be absent by accident.
+    ///
+    /// `None` on packets that predate the column and whose
+    /// `jobs.job.created` event the back-fill could not find. An
+    /// absent stamp is the honest answer there — a projection of the
+    /// log, never an invention (design f2cdff23, question `backfill`).
+    #[serde(default)]
+    pub opened_at: Option<chrono::DateTime<chrono::Utc>>,
     pub due_on: Option<NaiveDate>,
     pub closed_on: Option<NaiveDate>,
     pub metadata: serde_json::Value,
@@ -203,6 +233,11 @@ impl Job {
             status: JobStatus::Draft,
             priority,
             opened_on,
+            // Server-stamped at admission, not by a constructor: a
+            // `Job::new` in a sim or replay path has no admission
+            // instant to report, and inventing one here would be the
+            // habit this field replaces.
+            opened_at: None,
             due_on: None,
             closed_on: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
@@ -296,6 +331,42 @@ pub struct StepField {
     /// field authored before this existed already meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covers: Option<String>,
+    /// For an `array` field of `{anchor, …}` elements: the name of
+    /// another array field on the same step whose anchors an element
+    /// here may BIND, by carrying a key of that same name holding a list
+    /// of them. Checked at every write that touches either field (the
+    /// step merge door) and again at done: a bound anchor the other
+    /// field does not carry is refused, naming it. Registry data for the
+    /// relation design 26a89f11 decided — a design question binds the
+    /// exhibits it is asked about (`questions` binds `exhibits`), and a
+    /// binding to an exhibit nobody attached would render as a question
+    /// pointing at nothing. None (the default) means no binding, which is
+    /// what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binds: Option<String>,
+    /// For an `array` field: the most UTF-8 bytes any one STRING value of
+    /// an element may hold, checked at every write that touches the field
+    /// and again at done. A design exhibit's `html` rides inline in step
+    /// metadata up to a bound (design 26a89f11: 256 KB), and a bound
+    /// stated nowhere is a bound nobody holds. It measures the string, not
+    /// its JSON encoding, so the number an author reads off `ls -l` is the
+    /// number the refusal names. None (the default) means unbounded, which
+    /// is what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_value_max_bytes: Option<u64>,
+    /// For an `array` field: keys of which every element must carry
+    /// EXACTLY ONE, as a non-empty string — the "one of" twin of
+    /// `item_keys`, which names keys an element carries ALL of. Carrying
+    /// two is refused at every write that touches the field (a record
+    /// that says two things about one element is ambiguous whoever reads
+    /// it); carrying none is refused at done, the way a missing item key
+    /// is. Registry data for design 26a89f11's second arm: an exhibit is
+    /// `{anchor, title}` plus its bytes inline as `html` OR, over the
+    /// inline bound, a `file_ref` into the file store — never both, and
+    /// never neither. Empty (the default) means no such choice, which is
+    /// what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub item_one_of: Vec<String>,
 }
 
 /// Who supplies a step field's value — the enforcement point follows
@@ -639,6 +710,39 @@ mod tests {
         assert_eq!(job, back);
     }
 
+    /// `opened_at` is a FIELD, not a filer habit (backlog 6c2eba00,
+    /// design f2cdff23). It is server-stamped at admission, so
+    /// `Job::new` leaves it absent; and it is `#[serde(default)]`, so
+    /// every `jobs.job.created` payload written before the promotion
+    /// still deserializes — a rebuild over an old slice must not fail,
+    /// and must not invent an instant nobody observed.
+    #[test]
+    fn job_opened_at_is_absent_until_something_stamps_it() {
+        let mut job = Job::new(
+            "test-kind",
+            Subject::new("asset", "sys-001"),
+            "Test job",
+            "emp-42",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 16).unwrap(),
+        );
+        assert_eq!(job.opened_at, None, "Job::new must not invent an instant");
+
+        let at = "2026-09-20T17:40:16.732718729Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        job.opened_at = Some(at);
+        let v = serde_json::to_value(&job).unwrap();
+        assert!(v.get("opened_at").is_some(), "the stamp rides the wire");
+        let back: Job = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.opened_at, Some(at), "sub-second resolution survives");
+
+        let mut pre = v;
+        pre.as_object_mut().unwrap().remove("opened_at");
+        let back: Job = serde_json::from_value(pre).unwrap();
+        assert_eq!(back.opened_at, None);
+    }
+
     #[test]
     fn job_partition_defaults_real_for_pre_flag_payloads() {
         // Old audit_log payloads (and old clients) predate both the
@@ -725,12 +829,31 @@ mod tests {
 
     #[test]
     fn job_status_kebab_case() {
-        let s = JobStatus::PendingSignOff;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#""pending-sign-off""#);
+        for (s, wire) in [
+            (JobStatus::Draft, r#""draft""#),
+            (JobStatus::Open, r#""open""#),
+            (JobStatus::Closed, r#""closed""#),
+            (JobStatus::Cancelled, r#""cancelled""#),
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, wire);
+            let back: JobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+        }
+    }
 
-        let back: JobStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, JobStatus::PendingSignOff);
+    /// `blocked` and `pending-sign-off` were retired (backlog 3c3dc8f3):
+    /// no Job and no `jobs.job.*` event ever held either. A retired word
+    /// must be REFUSED where it arrives — a query parameter answers 400
+    /// naming the four live statuses — never read as some other status,
+    /// because a filter that silently widens or narrows is a wrong
+    /// answer that looks like a result.
+    #[test]
+    fn a_retired_job_status_is_refused_not_read_as_another() {
+        for retired in [r#""blocked""#, r#""pending-sign-off""#] {
+            let parsed = serde_json::from_str::<JobStatus>(retired);
+            assert!(parsed.is_err(), "{retired} still parses: {parsed:?}");
+        }
     }
 
     #[test]
@@ -800,6 +923,9 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
         };
         let json = serde_json::to_value(&f).unwrap();
         assert_eq!(json["filled_by"], serde_json::json!("filer"));
@@ -813,10 +939,47 @@ mod tests {
             filled_by: FilledBy::Executor,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
             ..f
         };
         let json = serde_json::to_value(&exec).unwrap();
         assert_eq!(json["filled_by"], serde_json::json!("executor"));
+    }
+
+    /// `binds` and `item_value_max_bytes` (design 26a89f11, exhibits)
+    /// default to absent — every field authored before them reads as
+    /// unbound and unbounded — and round-trip when a protocol states
+    /// them, so a registry row carries the contract it was authored with.
+    #[test]
+    fn step_field_binds_and_value_bound_default_absent_and_round_trip() {
+        let bare: StepField = serde_json::from_value(serde_json::json!({
+            "name": "questions",
+            "field_type": "array",
+        }))
+        .unwrap();
+        assert_eq!(bare.binds, None);
+        assert_eq!(bare.item_value_max_bytes, None);
+        assert!(bare.item_one_of.is_empty());
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("binds").is_none() && json.get("item_value_max_bytes").is_none());
+        assert!(json.get("item_one_of").is_none());
+
+        let stated: StepField = serde_json::from_value(serde_json::json!({
+            "name": "exhibits",
+            "field_type": "array",
+            "binds": "other",
+            "item_value_max_bytes": 262144,
+            "item_one_of": ["html", "file_ref"],
+        }))
+        .unwrap();
+        assert_eq!(stated.binds.as_deref(), Some("other"));
+        assert_eq!(stated.item_value_max_bytes, Some(262_144));
+        assert_eq!(stated.item_one_of, vec!["html", "file_ref"]);
+        let back: StepField =
+            serde_json::from_value(serde_json::to_value(&stated).unwrap()).unwrap();
+        assert_eq!(back, stated);
     }
 
     #[test]

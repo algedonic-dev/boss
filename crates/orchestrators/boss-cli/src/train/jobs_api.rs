@@ -178,6 +178,136 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// The operator verbs' roll wait
+//
+// Backlog 034002b3, measured twice on 2026-09-23: the stack deployment
+// rolls with strategy Recreate (two RWO claims, three with boss-files),
+// so every train that converges takes the jobs API dark for about a
+// minute. Every verb that writes through it — `boss gate`, `boss
+// design`, `boss job file`, `boss dispatch` — exited 1 at once on `No
+// route to host`, and the operator (the 263f6b9 rollout) or the builder
+// (the 3669951 rollout, pod 28s old) had to notice and relaunch by
+// hand. The conductor's blip guard above is three attempts over six
+// seconds, sized for a pod that rolls one replica at a time; it does
+// not cover a Recreate minute, and its rules (5xx and ambiguous blips
+// retried when idempotent) are the loop's, not an operator's.
+//
+// This wait is narrower and longer. It retries ONE failure — a connect
+// that never established — because that is the one failure that proves
+// the request never reached a server: nothing was received, so nothing
+// landed, and a POST may go again. Any status is an answer. A timeout
+// or a body that died after the request went out may be a packet
+// already filed, so it is surfaced on the first attempt under every
+// method, GET included — a verb's read and its write are not told apart
+// here, and the price of a read surfaced once is a relaunch, the same
+// as before. The wait is visible (one line per retry, on stderr) and
+// bounded: past the window the verb fails naming how long it waited.
+// ---------------------------------------------------------------------------
+
+/// How long an operator verb waits out a jobs API that refuses its
+/// connections, and how the waits between attempts grow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RollWait {
+    /// Past this much elapsed time a refused connect is an outage, not
+    /// a roll, and the verb surfaces it.
+    pub(crate) window: Duration,
+    /// The first wait between attempts; each further wait doubles.
+    pub(crate) first: Duration,
+    /// No single wait is longer than this, so the attempt after the
+    /// API comes back is at most this late.
+    pub(crate) cap: Duration,
+}
+
+/// Two minutes: a Recreate roll is about one (backlog 034002b3), and a
+/// jobs API still refusing after twice that is worth a human's eyes.
+pub(crate) const ROLL_WAIT: RollWait = RollWait {
+    window: Duration::from_secs(120),
+    first: Duration::from_secs(2),
+    cap: Duration::from_secs(15),
+};
+
+impl RollWait {
+    /// The wait after attempt `n` failed: doubling from `first`,
+    /// capped at `cap`.
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
+        (self.first * 2u32.pow(attempt.saturating_sub(1).min(16))).min(self.cap)
+    }
+}
+
+/// Run `op` until it gets past the connect, or the roll outlasts
+/// `wait.window`. `what` names the call (`jobs api POST /api/jobs`) in
+/// every line `say` prints and in the failure. The ONE definition every
+/// operator verb's jobs-API call goes through — via [`send_through_a_roll`]
+/// — so the rule "only a refused connect is retried" lives once.
+pub(crate) async fn waiting_out_a_roll<T, F, Fut>(
+    wait: &RollWait,
+    what: &str,
+    say: &(dyn Fn(&str) + Sync),
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, ApiFailure>>,
+{
+    // The runtime's clock, not the wall's: the same instant `sleep`
+    // below advances, so a paused-time test can walk the whole window
+    // without spending it (a best-effort read against a dark SoR would
+    // otherwise cost every gate two real minutes).
+    let started = tokio::time::Instant::now();
+    let mut attempt = 1u32;
+    loop {
+        let failure = match op().await {
+            Ok(v) => return Ok(v),
+            Err(f) => f,
+        };
+        if failure.kind != Failure::Connect {
+            return Err(failure.cause);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= wait.window {
+            let cause = short_cause(&failure.cause, 120);
+            return Err(failure.cause.context(format!(
+                "{what}: the jobs API refused every connection for {:.0}s ({attempt} attempts, \
+                 waited out for up to {:.0}s in case it was a rollout) — nothing was sent, so \
+                 nothing landed and relaunching is safe. Last: {cause}",
+                elapsed.as_secs_f64(),
+                wait.window.as_secs_f64(),
+            )));
+        }
+        let pause = wait.backoff(attempt).min(wait.window - elapsed);
+        say(&format!(
+            "the jobs API is not answering (a rollout?) — retrying {what} in {:.0}s \
+             ({:.0}s of {:.0}s): {}",
+            pause.as_secs_f64(),
+            elapsed.as_secs_f64(),
+            wait.window.as_secs_f64(),
+            short_cause(&failure.cause, 120),
+        ));
+        tokio::time::sleep(pause).await;
+        attempt += 1;
+    }
+}
+
+/// Send the request `build` makes, waiting out a jobs-API roll
+/// ([`ROLL_WAIT`]) and saying so on stderr. `build` is called once per
+/// attempt because a request with a body cannot be re-sent. Every
+/// status comes back to the caller as the answer it is.
+pub(crate) async fn send_through_a_roll(
+    what: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    waiting_out_a_roll(&ROLL_WAIT, what, &|m| eprintln!("boss: {m}"), || {
+        let req = build();
+        async move {
+            req.send()
+                .await
+                .map_err(|e| ApiFailure::transport(e, what.to_string()))
+        }
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // jobs-api helpers
 // ---------------------------------------------------------------------------
 
@@ -228,19 +358,86 @@ pub(crate) fn track_occupied_by(open_trains: &[Value]) -> Option<String> {
     })
 }
 
-/// The list body, whether or not the endpoint wrapped it in
-/// `{"data": [...]}`.
+/// The rows of a list read — a bare array, or the envelope's `data`
+/// array — or a refusal. THE one rows helper in boss-cli: the
+/// conductor, every operator verb, the census, the doctor and the
+/// queue all read a listing through here (backlog 7b7e0529).
+///
+/// There were five, and they disagreed. `gate::rows` — ~40 callers,
+/// orient, park, dispatch, cadence and job among them — answered an
+/// EMPTY list for anything that was not a list, while this one refused;
+/// `gate::api` answers `Ok(None)` for a 200 whose body is not JSON (a
+/// proxy's login page, an error envelope), so through that helper a
+/// dark or wrong door read as an empty yard: the "a wrong target
+/// answers instead of erroring" failure CLAUDE.md §Doors names. The
+/// census's and the doctor's copies were the same decision written
+/// again (§9a), so they call this one now.
+///
+/// An empty ARRAY is still an honest answer — a registry may hold
+/// nothing. Only a body that is not a list is refused, and the refusal
+/// quotes what came back, cut short, because a login page is kilobytes.
+/// A caller that is deliberately best-effort turns the refusal into its
+/// own fallback, AT its call site and saying so — never by this helper
+/// guessing zero on its behalf.
 pub(crate) fn rows(resp: Option<Value>) -> Result<Vec<Value>> {
-    let resp = resp.ok_or_else(|| anyhow!("empty response for a list call"))?;
+    let resp = resp.ok_or_else(|| {
+        anyhow!(
+            "a list read answered no JSON body (an empty 200, or a page that is not JSON — a \
+             proxy's login page answers this way), so its rows cannot be read as zero"
+        )
+    })?;
     let list = match resp {
         Value::Object(mut o) if o.contains_key("data") => o.remove("data").unwrap_or(Value::Null),
         other => other,
     };
     match list {
         Value::Array(v) => Ok(v),
-        other => bail!("expected a job list, got: {other}"),
+        other => {
+            let seen = other.to_string();
+            let cut: String = seen.chars().take(ROWS_REFUSAL_QUOTE).collect();
+            let more = if cut.len() < seen.len() { "…" } else { "" };
+            bail!(
+                "a list read answered no array (neither bare nor under `data`), so its rows \
+                 cannot be read as zero; it answered: {cut}{more}"
+            )
+        }
     }
 }
+
+/// The rows of a list read that must be the WHOLE list — [`rows`], and
+/// a refusal when the envelope's `total` counts more rows than it
+/// carries (backlog 6cf47547).
+///
+/// For a reader that cannot page — a door that takes no `offset`, where
+/// [`list_all_pages`] would only re-read page one — and whose caller
+/// treats the rows as the registry: `boss tenant export` rewrites the
+/// tenant repo's seed files from them, so one page read as the whole
+/// drops the rest from the repo, well-formed and silent. Measured
+/// 2026-09-23, no door the export reads pages today (`/api/agents` and
+/// `/api/sensors` answer `total` as the length of `data`); this is what
+/// makes the day one starts to loud rather than lossy. A bare array, or
+/// an envelope with no numeric `total`, carries no count to hold the
+/// rows to and reads as [`rows`] does.
+pub(crate) fn every_row(resp: Option<Value>) -> Result<Vec<Value>> {
+    let total = resp
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_u64);
+    let got = rows(resp)?;
+    match total {
+        Some(total) if (got.len() as u64) < total => bail!(
+            "a list read answered {} of {total} rows — one page of a paged list, so reading \
+             it as the whole registry would drop the rest",
+            got.len()
+        ),
+        _ => Ok(got),
+    }
+}
+
+/// How much of a non-list body [`rows`]' refusal quotes — and of a
+/// non-JSON answer to a write, `gate::success_answer`'s: enough to
+/// recognise an error envelope or a login page, not the whole page.
+pub(crate) const ROWS_REFUSAL_QUOTE: usize = 200;
 
 /// One page of a paginated `/api/jobs` read. Kept at the historical
 /// 100 so a backlog that fits under a page still makes exactly one
@@ -669,6 +866,51 @@ mod tests {
     use crate::train::test_support::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Both list shapes read, and an empty array stays an honest zero.
+    #[test]
+    fn rows_reads_a_bare_array_and_the_envelope() {
+        let bare = rows(Some(serde_json::json!([1, 2, 3]))).expect("bare");
+        assert_eq!(bare.len(), 3);
+        let wrapped = rows(Some(serde_json::json!({"data": [1, 2], "total": 9}))).expect("env");
+        assert_eq!(wrapped.len(), 2);
+        assert!(
+            rows(Some(serde_json::json!({"data": [], "total": 0})))
+                .expect("an empty registry is an answer")
+                .is_empty()
+        );
+    }
+
+    /// Everything that is not a list refuses — no body (what `gate::api`
+    /// answers for a 200 that is not JSON), an error envelope, a `data`
+    /// that is not an array — and the refusal quotes the body, CUT, so
+    /// a login page does not bury the line that says what failed
+    /// (backlog 7b7e0529).
+    #[test]
+    fn rows_refuses_what_is_not_a_list_and_quotes_it_short() {
+        for body in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"error": "forbidden"})),
+            Some(serde_json::json!({"data": null})),
+            Some(serde_json::json!({"data": {"id": "x"}})),
+            Some(serde_json::json!("<html>sign in</html>")),
+        ] {
+            let why = rows(body.clone())
+                .expect_err(&format!("{body:?} must refuse, not read as zero rows"))
+                .to_string();
+            assert!(why.contains("cannot be read as zero"), "{why}");
+        }
+        let page = "x".repeat(10_000);
+        let why = rows(Some(Value::String(page))).unwrap_err().to_string();
+        assert!(
+            why.len() < 600,
+            "a page is quoted short: {} chars",
+            why.len()
+        );
+        assert!(why.ends_with('…'), "and says it was cut: {why}");
+    }
+
     /// 2026-09-04: two gate-runs whose pods were evicted sat at
     /// `record-verdict` for 17 hours, each holding one of three gate
     /// slots and rendering as a live gate, while their branches had long
@@ -732,6 +974,28 @@ mod tests {
         assert_eq!(next_offset(150, 150), None);
         // defensive — a `total` that shrank mid-read never asks for more.
         assert_eq!(next_offset(150, 160), None);
+    }
+
+    /// A SHORT PAGE IS NOT THE REGISTRY (backlog 6cf47547). A read that
+    /// must hold every row — a tenant export, which rewrites the repo's
+    /// seed files from it — refuses a body whose `total` counts more
+    /// rows than it carries, rather than reading one page as the whole.
+    #[test]
+    fn every_row_refuses_a_short_page_and_reads_a_whole_one() {
+        let short = json!({"data": [{"id": "a"}], "total": 2});
+        let why = every_row(Some(short))
+            .expect_err("1 of 2 is a page")
+            .to_string();
+        assert!(why.contains("1 of 2"), "names the shortfall: {why}");
+
+        let whole = json!({"data": [{"id": "a"}, {"id": "b"}], "total": 2});
+        assert_eq!(every_row(Some(whole)).unwrap().len(), 2);
+        // A bare array, and an envelope without `total`, carry no count
+        // to compare against — read as they always were.
+        assert_eq!(every_row(Some(json!([{"id": "a"}]))).unwrap().len(), 1);
+        assert_eq!(every_row(Some(json!({"data": []}))).unwrap().len(), 0);
+        // Still the one rows helper underneath: a non-list refuses.
+        assert!(every_row(Some(json!({"data": "nope", "total": 0}))).is_err());
     }
 
     #[test]
@@ -1106,5 +1370,153 @@ mod tests {
             0,
             "an answer is not a blip and journals none"
         );
+    }
+
+    // -- the operator verbs' roll wait --------------------------------------
+    //
+    // Backlog 034002b3, twice on 2026-09-23: the stack rolls with
+    // strategy Recreate, so every converging train takes the jobs API
+    // dark for about a minute, and an operator's `boss design` and a
+    // builder's first `boss gate` each died at once on `No route to
+    // host`. A refused connect proves nothing was sent, so the verb
+    // waits it out — and ONLY it: anything past the connect may have
+    // landed a write.
+
+    /// The tests' wait: the same decisions, over milliseconds.
+    const QUICK_ROLL: RollWait = RollWait {
+        window: Duration::from_millis(40),
+        first: Duration::from_millis(2),
+        cap: Duration::from_millis(5),
+    };
+
+    /// A journal that keeps its lines, so a test can read what the
+    /// operator would have seen.
+    fn keeping_journal(lines: &std::sync::Mutex<Vec<String>>) -> impl Fn(&str) + Sync {
+        move |l| lines.lock().unwrap().push(l.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_is_waited_out_until_the_api_answers() {
+        let mut calls = 0u32;
+        let lines = std::sync::Mutex::new(Vec::new());
+        let out: Result<u8> = waiting_out_a_roll(
+            &QUICK_ROLL,
+            "jobs api POST /api/jobs",
+            &keeping_journal(&lines),
+            || {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt < 3 {
+                        Err(blip(Failure::Connect))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7, "the write goes out once the API answers");
+        assert_eq!(calls, 3, "stops the moment the connect succeeds");
+        let lines = lines.into_inner().unwrap();
+        assert_eq!(lines.len(), 2, "one visible line per wait: {lines:?}");
+        for l in &lines {
+            assert!(
+                l.contains("the jobs API is not answering (a rollout?) — retrying"),
+                "the wait must be visible and say what it is: {l}"
+            );
+            assert!(l.contains("POST /api/jobs"), "names the call: {l}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_refused_connect_is_waited_out() {
+        // Everything past the connect is either an ANSWER (any status)
+        // or a request that may have reached the server — a timeout or
+        // a dropped body under a POST could be a packet already filed,
+        // so it is surfaced on the first attempt under every method.
+        for method in [Method::GET, Method::POST] {
+            for kind in [
+                Failure::Ambiguous,
+                Failure::Http(503),
+                Failure::Http(422),
+                Failure::Malformed,
+            ] {
+                let mut calls = 0u32;
+                let lines = std::sync::Mutex::new(Vec::new());
+                let out: Result<()> = waiting_out_a_roll(
+                    &QUICK_ROLL,
+                    &format!("jobs api {method} /api/jobs"),
+                    &keeping_journal(&lines),
+                    || {
+                        calls += 1;
+                        let kind = kind.clone();
+                        async move { Err(blip(kind)) }
+                    },
+                )
+                .await;
+                assert!(out.is_err(), "{method} {kind:?} surfaces");
+                assert_eq!(calls, 1, "{method} {kind:?} is asked once");
+                assert!(
+                    lines.into_inner().unwrap().is_empty(),
+                    "{method} {kind:?} is not a roll and journals none"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_roll_that_outlasts_the_window_fails_naming_the_elapsed_time() {
+        let mut calls = 0u32;
+        let lines = std::sync::Mutex::new(Vec::new());
+        let err = waiting_out_a_roll::<(), _, _>(
+            &QUICK_ROLL,
+            "jobs api POST /api/jobs",
+            &keeping_journal(&lines),
+            || {
+                calls += 1;
+                async { Err(blip(Failure::Connect)) }
+            },
+        )
+        .await
+        .expect_err("a jobs API still dark after the window is an outage");
+        assert!(calls > 1, "it waited before giving up ({calls} attempt)");
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("jobs api POST /api/jobs")
+                && said.contains("refused every connection for")
+                && said.contains("Connection refused (os error 61)"),
+            "the failure names the call, the elapsed time and the cause: {said}"
+        );
+        assert!(
+            said.contains("nothing was sent"),
+            "and says a refused connect landed nothing, so relaunching is safe: {said}"
+        );
+    }
+
+    #[test]
+    fn the_roll_wait_covers_a_recreate_roll_and_backs_off() {
+        // About a minute dark per converge (Recreate, three RWO
+        // claims); two minutes covers it with room, and is short
+        // enough that a real outage still reaches the operator.
+        assert_eq!(ROLL_WAIT.window, Duration::from_secs(120));
+        assert_eq!(ROLL_WAIT.backoff(1), Duration::from_secs(2));
+        assert_eq!(ROLL_WAIT.backoff(2), Duration::from_secs(4));
+        assert_eq!(ROLL_WAIT.backoff(3), Duration::from_secs(8));
+        assert_eq!(ROLL_WAIT.backoff(9), ROLL_WAIT.cap, "capped");
+    }
+
+    #[tokio::test]
+    async fn a_real_refused_connect_is_what_the_wait_retries() {
+        // The production failure end to end: reqwest's error for a port
+        // nothing serves must classify as Connect, or the wait above
+        // pins a shape the wire never produces.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/api/jobs")
+            .send()
+            .await
+            .expect_err("nothing serves port 1");
+        let f = ApiFailure::transport(err, "GET /api/jobs".into());
+        assert_eq!(f.kind, Failure::Connect);
     }
 }

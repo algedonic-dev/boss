@@ -77,9 +77,79 @@ use std::path::{Path, PathBuf};
 /// enters no gate, so the gate's phase list, uid, fixture paths and
 /// probe-time rule are forty lines it cannot act on (backlog c8faa7f3,
 /// measured on analyst run d5e0f287).
+///
+/// `tenant` is the lane that ships a car to ANOTHER repository — a
+/// tenant repo an instance declares in `infra/cluster/instances.toml`
+/// (design fd8b5143, backlog 6a34e9bc). It builds a branch like the car
+/// lane, but in the tenant's tree, checked by `boss tenant check` rather
+/// than by this tree's gate, so none of the car lane's forty lines
+/// apply and the two it needs — which repo, and which instance answers
+/// — are filed under it.
 pub(crate) const LANE_CAR: &str = "car";
 pub(crate) const LANE_STEP: &str = "step";
-pub(crate) const LANES: [&str; 2] = [LANE_CAR, LANE_STEP];
+pub(crate) const LANE_TENANT: &str = "tenant";
+pub(crate) const LANES: [&str; 3] = [LANE_CAR, LANE_STEP, LANE_TENANT];
+
+/// The file that names each instance's tenant source — the ONE place a
+/// tenant repo is spelled, read by the converge that delivers it and by
+/// `merge-tenant-main.sh` that lands on it.
+pub(crate) const INSTANCES: &str = "infra/cluster/instances.toml";
+
+/// An instance whose tenant comes from a repository: `tenant_repo` and
+/// the `tenant_ref` the converge delivers, under the instance's section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TenantSource {
+    pub(crate) instance: String,
+    pub(crate) repo: String,
+    pub(crate) reference: String,
+}
+
+/// Every instance in `instances_toml` that names a tenant REPOSITORY,
+/// in file order. The file is read the way its own header says every
+/// reader reads it — one `key = "value"` per line under a `[section]`,
+/// by the shell, not a TOML parser — so this reader takes the same
+/// lines render-instance.sh does. An instance with a repo and no ref is
+/// left out: the converge cannot deliver it, so no car can land on it.
+pub(crate) fn tenant_sources(instances_toml: &str) -> Vec<TenantSource> {
+    let mut out = Vec::new();
+    let mut section: Option<(String, Option<String>, Option<String>)> = None;
+    let flush = |s: Option<(String, Option<String>, Option<String>)>,
+                 out: &mut Vec<TenantSource>| {
+        if let Some((instance, Some(repo), Some(reference))) = s {
+            out.push(TenantSource {
+                instance,
+                repo,
+                reference,
+            });
+        }
+    };
+    for line in instances_toml.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            flush(section.take(), &mut out);
+            section = Some((name.trim().to_string(), None, None));
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().split('"').nth(1).map(str::to_string);
+        if let Some(s) = section.as_mut() {
+            match key.trim() {
+                "tenant_repo" => s.1 = value.filter(|v| !v.is_empty()),
+                "tenant_ref" => s.2 = value.filter(|v| !v.is_empty()),
+                _ => {}
+            }
+        }
+    }
+    flush(section, &mut out);
+    out
+}
+
+/// Where the dev pod keeps its checkout of a tenant repo: `/work/<name>`,
+/// beside `/work/boss`. The name is the repo's own last segment.
+pub(crate) fn tenant_checkout(repo: &str) -> String {
+    format!("/work/{}", repo.rsplit('/').next().unwrap_or(repo))
+}
 
 /// How an invariant's lines RELATE to the file named beside them
 /// (backlog c94ddc6f, 2026-09-19).
@@ -224,6 +294,44 @@ pub(crate) fn cargo_jobs(env_file: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The manifest that DECLARES the dev pod's cgroup — the pod every
+/// builder works in, and the ceiling a bare `cargo` drives to.
+pub(crate) const DEV_MANIFEST: &str = "infra/cluster/manifests/boss-dev.yaml";
+
+/// The resource limits the dev container declares, verbatim — the
+/// cgroup a builder is actually inside (backlog 28fc3a39, 2026-09-22).
+///
+/// Returned as the manifest's own line rather than parsed into numbers
+/// and reassembled: the figure printed to a builder is then the same
+/// string the declaration holds, so `Reading` can pin it against the
+/// file and neither unit nor spelling can drift between them. The two
+/// typed copies it replaces said 16 GiB where the manifest declares
+/// 32Gi, and one of them said 8 CPU where it declares 16 — the pod was
+/// resized for two builders and an operator (5ee0ff2a) and both copies
+/// stayed at the old size.
+///
+/// Scoped to the container named `dev`, for the same reason `gate_ids`
+/// is scoped: the postgres and reclaim sidecars declare limits of their
+/// own, and a scan that took the first (or the last) would confidently
+/// answer with a database's 4Gi.
+pub(crate) fn pod_cgroup_limits(manifest: &str) -> Option<String> {
+    let mut inside = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with("- name:") {
+            if inside {
+                break;
+            }
+            inside = t == "- name: dev";
+            continue;
+        }
+        if inside && t.starts_with("limits:") {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
 /// The admin URL `TestDb` connects to by default — i.e. the one a test
 /// reaches when nothing overrides it, which is the address a
 /// `kubectl port-forward` turns into the production cluster database.
@@ -364,6 +472,12 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
         .with_context(|| format!("{manifest} does not name the gate container's uid and gid"))?;
     let jobs = cargo_jobs(&read(repo, env_file)?)
         .with_context(|| format!("{env_file} does not set CARGO_BUILD_JOBS"))?;
+    // THE BOUND'S OWN REASON, read from the declaration (28fc3a39).
+    // What a bare `cargo` would drive to its ceiling was typed here,
+    // and in the builder rules, and both had stayed at the pod's old
+    // size — half the memory in both, half the CPU in one.
+    let cgroup = pod_cgroup_limits(&read(repo, DEV_MANIFEST)?)
+        .with_context(|| format!("{DEV_MANIFEST} does not declare the dev container's limits"))?;
     let admin_url = test_db_admin_url(&read(repo, test_db)?)
         .with_context(|| format!("{test_db} does not declare DEFAULT_ADMIN_URL"))?;
     let phases = gate_phases(&read(repo, gate)?);
@@ -377,15 +491,23 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
             name: "cargo jobs",
             authority: env_file.to_string(),
             lines: vec![
-                format!("set -a; . {env_file}; set +a     # CARGO_BUILD_JOBS={jobs}"),
-                "Nothing else bounds cargo here (there is no .cargo/config.toml), so the".into(),
-                "default is one job per CPU — 32 on this pod, against a 16 GiB cgroup.".into(),
+                // ONE PLAIN COMMAND (65cea113): the `set -a; . file`
+                // spelling this line carried is refused by a
+                // worktree-isolated builder's harness, and wt-cargo
+                // already sources the file itself.
+                format!(
+                    "wt-cargo <cargo args>     # reads CARGO_BUILD_JOBS={jobs} from {env_file}"
+                ),
+                "Nothing else bounds cargo here (there is no .cargo/config.toml), so a bare".into(),
+                "cargo's default is one job per CPU — 32 on this pod, because nproc reads the NODE"
+                    .into(),
+                format!("and not the cgroup, which the dev pod declares as {cgroup}."),
             ],
             lanes: vec![LANE_CAR],
-            grounding: Grounding::Derived(vec![Reading::read(
-                env_file,
-                format!("CARGO_BUILD_JOBS={jobs}"),
-            )]),
+            grounding: Grounding::Derived(vec![
+                Reading::read(env_file, format!("CARGO_BUILD_JOBS={jobs}")),
+                Reading::read(DEV_MANIFEST, cgroup.clone()),
+            ]),
         },
         Invariant {
             name: "verify as the gate",
@@ -558,9 +680,49 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
             "a control read on the same connection whose answer you already know, and".into(),
             "say beside the finding what the control returned.".into(),
         ],
-        lanes: vec![LANE_STEP],
+        // A tenant builder reads and writes the system of record too —
+        // it completes its own run's `building` and files nothing blind
+        // — so the address is filed under its lane as well (6a34e9bc).
+        lanes: vec![LANE_STEP, LANE_TENANT],
         grounding: Grounding::Derived(vec![Reading::read(estate, sor.clone())]),
     });
+
+    // THE TENANT LANE'S OWN INVARIANT (design fd8b5143, backlog
+    // 6a34e9bc). Which repo a tenant car is built in is the instance's
+    // declaration, never a parameter and never a builder's memory: it is
+    // the same `tenant_repo` / `tenant_ref` the converge delivers and
+    // `merge-tenant-main.sh` lands on, read out of the one file that
+    // spells it. An estate with no tenant repo files nothing here, and
+    // `boss dispatch` then refuses every tenant car for want of one.
+    let sources = tenant_sources(&read(repo, INSTANCES)?);
+    if !sources.is_empty() {
+        let mut lines = Vec::new();
+        let mut readings = Vec::new();
+        for s in &sources {
+            lines.push(format!(
+                "{} @ {} — instance `{}`'s tenant_repo / tenant_ref, checkout {}",
+                s.repo,
+                s.reference,
+                s.instance,
+                tenant_checkout(&s.repo)
+            ));
+            readings.push(Reading::read(INSTANCES, s.repo.clone()));
+            readings.push(Reading::read(INSTANCES, s.reference.clone()));
+        }
+        lines.extend([
+            "The repo is the instance's, never a parameter: a packet naming any other is".into(),
+            "refused at dispatch. Your branch starts at that ref on origin, and the ref".into(),
+            "itself moves only through merge-tenant-main on David's approval of the plan".into(),
+            "hash (plan-a-tenant-merge renders it) — never through a push of yours.".into(),
+        ]);
+        out.push(Invariant {
+            name: "the tenant repo",
+            authority: INSTANCES.to_string(),
+            lines,
+            lanes: vec![LANE_TENANT],
+            grounding: Grounding::Derived(readings),
+        });
+    }
 
     // THE PRE-FLIGHT DOOR (backlog 5d919334, 2026-09-22). CLAUDE.md
     // §Doors is where a session looks for the command to run before a
@@ -575,7 +737,13 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
         name: "pre-flight",
         authority: doors.to_string(),
         lines: vec![
-            format!("bash {door} > <your scratch dir>/preflight.log 2>&1; echo $?"),
+            // ONE PLAIN COMMAND (65cea113): a trailing `; echo $?`
+            // made the line a list, which a worktree-isolated builder's
+            // harness refuses to run; the exit code it echoed is the
+            // command's own, and the harness reports that.
+            format!("bash {door} > <your scratch dir>/preflight.log 2>&1"),
+            "Its exit status is the verdict — the tool reports it; in a shell, run".into(),
+            "echo $? as the NEXT command, never chained to this one on the same line.".into(),
             "The `Before pushing` door of CLAUDE.md §Doors, read out of that entry:".into(),
             "the whole build-free pre-flight PLUS clippy scoped to the crates this tree".into(),
             "changed, seconds against the ~11 minutes a gate costs. It is not a gate —".into(),
@@ -667,22 +835,41 @@ pub(crate) fn invariant_section(invs: &[Invariant], lane: &str) -> String {
             Grounding::Derived(_) => String::new(),
         };
         out.push_str(&format!("\n{}   [{}{mark}]\n", inv.name, inv.authority));
-        for l in &inv.lines {
+        for l in block(inv) {
             out.push_str(&format!("    {l}\n"));
-        }
-        // A value read out of some OTHER file says so here, grouped by
-        // that file and in the order the values were read. One
-        // authority standing for every value is what let the gate's gid
-        // ride under a file that does not contain it (d334116c).
-        for (from, values) in foreign_sources(inv) {
-            out.push_str(&format!("    {}\n", foreign_source_line(&values, &from)));
         }
     }
     out
 }
 
-/// The packet half: the envelope, the step it is at, and EVERY metadata
-/// key verbatim.
+/// What a reader sees of `inv` under its header, wherever it is read:
+/// its lines, then one attribution per file OTHER than its authority
+/// that a substituted value came out of, grouped by that file and in
+/// the order the values were read. One authority standing for every
+/// value is what let the gate's gid ride under a file that does not
+/// contain it (d334116c).
+///
+/// Both renderers read this — the invariants section and a rules
+/// document's `{{invariant:<name>}}` quote — because until 2026-09-22
+/// the quote printed only the lines, and builder rule 2 handed the dev
+/// pod's cgroup to a reader with no file to check it against, on the
+/// day the same figure was found stale in four places (a7469d74). One
+/// function, so the value and its source cannot part by which of the
+/// two a reader reads.
+pub(crate) fn block(inv: &Invariant) -> Vec<String> {
+    inv.lines
+        .iter()
+        .cloned()
+        .chain(
+            foreign_sources(inv)
+                .into_iter()
+                .map(|(from, values)| foreign_source_line(&values, &from)),
+        )
+        .collect()
+}
+
+/// The packet half: the envelope, the step it is at, EVERY metadata key
+/// verbatim, and every key of every completed step's metadata likewise.
 ///
 /// Untruncated on purpose. `boss job get` fits values to the terminal,
 /// which is right for scanning a list; here a clipped claim is the
@@ -731,13 +918,151 @@ pub(crate) fn packet_section(job: &Value) -> String {
         None => out.push_str("now at: no ready or active step\n"),
     }
 
-    let md: BTreeMap<String, Value> = job
-        .get("metadata")
+    let md = sorted_metadata(job);
+    out.push_str(&format!("\nmetadata ({} key(s)), in full:\n", md.len()));
+    out.push_str(&key_blocks(&md));
+
+    // EVERY COMPLETED STEP'S METADATA, IN FULL (backlog 3cdad35a,
+    // measured by builder run df220512 on 3bc896be, 2026-09-23). The
+    // record of what a packet has already decided lives on its steps,
+    // not in its own metadata: triage's `evidence` and `disposition`,
+    // the `design_id` of the approved design that answers it. That
+    // brief showed an item as an open question while its steps carried
+    // the design approved two days earlier, and every dispatch since
+    // has carried an operator note telling the builder to GET the
+    // steps by hand. Completed steps only — a skipped step recorded no
+    // work, and the step the packet is AT is THE STEP section's — and
+    // every key, uncurated, for the reason the job's own are.
+    for step in crate::envelope::steps(job)
+        .into_iter()
+        .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"))
+    {
+        let l = crate::envelope::step_line(step);
+        let s = |k: &str| step.get(k).and_then(Value::as_str);
+        let md = sorted_metadata(step);
+        out.push_str(&format!(
+            "\ncompleted step `{}` — {}, kind {}{}{}, metadata ({} key(s)), in full:\n",
+            l.slug,
+            l.title,
+            l.kind,
+            s("completed_by")
+                .map(|b| format!(", by {b}"))
+                .unwrap_or_default(),
+            s("completed_at")
+                .map(|t| format!(" at {t}"))
+                .unwrap_or_default(),
+            md.len(),
+        ));
+        // Each correction the server handed this step, printed under
+        // the field it corrects (design 4105b020): the original stays
+        // in full, and the correction arrives beside it rather than in
+        // a job-metadata key the reader would have to think to open.
+        let corrections: Vec<&Value> = step
+            .get("corrections")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        out.push_str(&key_blocks_corrected(&md, &corrections));
+    }
+    out
+}
+
+/// [`key_blocks`], with each key followed by the corrections that name
+/// it as their `field`.
+fn key_blocks_corrected(md: &BTreeMap<String, Value>, corrections: &[&Value]) -> String {
+    md.iter()
+        .map(|(k, v)| key_blocks([(k, v)]) + &correction_lines(k, corrections))
+        .collect()
+}
+
+/// The lines a reader of `field` owes the corrections of it, in the
+/// list's order. A correction later withdrawn says by which entry; a
+/// withdrawal names the entry it withdraws. `reads` / `should read` /
+/// `why` keep their own lines, because the prose here is exactly the
+/// kind that was damaged once already.
+fn correction_lines(field: &str, corrections: &[&Value]) -> String {
+    let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let index = |c: &Value| c.get("index").and_then(Value::as_u64);
+    let mut out = String::new();
+    for c in corrections
+        .iter()
+        .filter(|c| c.get("field").and_then(Value::as_str) == Some(field))
+    {
+        let i = index(c)
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "?".into());
+        let signed = format!("by {} at {}", s(c, "by"), s(c, "at"));
+        if let Some(target) = c.get("withdraws").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "    ↳ correction [{i}] withdraws [{target}], {signed}: {}\n",
+                s(c, "why")
+            ));
+            continue;
+        }
+        let withdrawn_by = corrections
+            .iter()
+            .find(|w| {
+                index(c).is_some_and(|i| w.get("withdraws").and_then(Value::as_u64) == Some(i))
+            })
+            .and_then(|w| index(w))
+            .map(|w| format!(" (withdrawn by [{w}])"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "    ↳ correction [{i}]{withdrawn_by}, {signed}:\n"
+        ));
+        for (label, key) in [
+            ("reads:       ", "reads"),
+            ("should read: ", "should_read"),
+            ("why:         ", "why"),
+        ] {
+            let text = s(c, key);
+            if key == "why" && text.is_empty() {
+                continue;
+            }
+            let mut lines = text.lines();
+            out.push_str(&format!("        {label} {}\n", lines.next().unwrap_or("")));
+            for more in lines {
+                out.push_str(&format!(
+                    "        {:width$} {more}\n",
+                    "",
+                    width = label.len()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// A row's `metadata`, keys sorted so two reads print in one order.
+fn sorted_metadata(row: &Value) -> BTreeMap<String, Value> {
+    row.get("metadata")
         .and_then(Value::as_object)
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-    out.push_str(&format!("\nmetadata ({} key(s)), in full:\n", md.len()));
-    for (k, v) in &md {
+        .unwrap_or_default()
+}
+
+/// Each key and its value verbatim — a string as its own lines, any
+/// other value as JSON — indented under the key. The one "in full"
+/// shape every metadata block in the brief prints.
+fn key_blocks<'a>(md: impl IntoIterator<Item = (&'a String, &'a Value)>) -> String {
+    let mut out = String::new();
+    for (k, v) in md {
+        // A design's EXHIBITS are the one key not printed verbatim
+        // (design 26a89f11): each is an HTML document up to 256 KB that
+        // no terminal renders, so it is LISTED — anchor, title, size,
+        // hash — never dumped and never dropped.
+        if k == "exhibits"
+            && let Some(items) = v.as_array()
+        {
+            out.push_str(&format!(
+                "\n  {k}: ({} — HTML, rendered on /it/design; listed, not printed)\n",
+                items.len()
+            ));
+            for e in items {
+                out.push_str(&format!("    {}\n", exhibit_line(e)));
+            }
+            continue;
+        }
         let rendered = match v {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -751,6 +1076,38 @@ pub(crate) fn packet_section(job: &Value) -> String {
         }
     }
     out
+}
+
+/// One exhibit as a line a terminal can hold: anchor, title, the html's
+/// size in UTF-8 bytes, and its sha256 — enough to know exactly which
+/// rendering a reviewer saw and to check a copy against it. An exhibit
+/// over the inline bound rides as a `file_ref` into the file store
+/// (design 26a89f11's second arm): its size and hash are the ones the
+/// attaching verb confirmed by read-back and recorded beside the ref,
+/// listed with the file id a reader fetches it by. An element carrying
+/// neither says so rather than inventing a size.
+pub(crate) fn exhibit_line(e: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let s = |k: &str| e.get(k).and_then(Value::as_str);
+    let anchor = s("anchor").unwrap_or("?");
+    let title = s("title").unwrap_or("(untitled)");
+    match (s("html"), s("file_ref")) {
+        (Some(html), _) => format!(
+            "{anchor} — {title} — {} bytes — sha256 {}",
+            html.len(),
+            hex::encode(Sha256::digest(html.as_bytes()))
+        ),
+        (None, Some(file)) => {
+            let size = e
+                .get("size_bytes")
+                .and_then(Value::as_u64)
+                .map_or("size not recorded".to_string(), |n| format!("{n} bytes"));
+            let sha =
+                s("sha256").map_or("sha256 not recorded".to_string(), |h| format!("sha256 {h}"));
+            format!("{anchor} — {title} — {size} — {sha} — file {file}")
+        }
+        (None, None) => format!("{anchor} — {title} — no inline html and no file_ref"),
+    }
 }
 
 /// The step the packet is AT — ready or active — if it has one.
@@ -826,19 +1183,7 @@ pub(crate) fn step_section(job: &Value) -> Option<String> {
             ));
         }
     }
-    for (k, v) in &spec {
-        let rendered = match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        out.push_str(&format!("\n  {k}:\n"));
-        for line in rendered.lines() {
-            out.push_str(&format!("    {line}\n"));
-        }
-        if rendered.is_empty() {
-            out.push_str("    (empty)\n");
-        }
-    }
+    out.push_str(&key_blocks(&spec));
     Some(out)
 }
 
@@ -1037,6 +1382,10 @@ pub(crate) fn render(
     job: Option<&Value>,
     profile: &str,
     active: Option<&Value>,
+    // The dispatching session's own commit trailer, when it supplied
+    // one (`documents::TRAILER_ENV`, backlog 89d1572c) — read at the
+    // verb's edge, so this renderer stays a function of its arguments.
+    trailer: Option<&str>,
 ) -> Result<String> {
     let invs = invariants(repo)?;
     let lane = crate::documents::lane(repo, profile)?;
@@ -1057,7 +1406,7 @@ pub(crate) fn render(
     }
     out.push_str(&invariant_section(&invs, &lane));
     out.push_str(&format!("\n{HOW_TO_USE}\n\n"));
-    out.push_str(&crate::documents::section(repo, profile, &invs)?);
+    out.push_str(&crate::documents::section(repo, profile, &invs, trailer)?);
     Ok(out)
 }
 
@@ -1094,10 +1443,30 @@ pub async fn run(packet_ref: Option<String>, profile_override: Option<String>) -
         Some(j) => active_row(&http, j).await,
         None => None,
     };
-    let profile = profile_override.unwrap_or_else(|| profile_for(job.as_ref(), active.as_ref()));
+    // And through the SAME venue door (6a34e9bc): a packet whose
+    // deliverable is a tenant repo is briefed as the tenant builder the
+    // dispatch would hand it to — or refused, as the dispatch would.
+    let profile = match (profile_override, job.as_ref()) {
+        (Some(p), _) => p,
+        (None, Some(j)) => {
+            let declared = profile_for(Some(j), active.as_ref());
+            let slug = now_step(j)
+                .and_then(|s| s.get("spec_slug"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            crate::dispatch::venue_in(&repo, j, slug, &declared)?.profile
+        }
+        (None, None) => profile_for(None, active.as_ref()),
+    };
     print!(
         "{}",
-        render(&repo, job.as_ref(), &profile, active.as_ref())?
+        render(
+            &repo,
+            job.as_ref(),
+            &profile,
+            active.as_ref(),
+            crate::documents::supplied_trailer().as_deref(),
+        )?
     );
     Ok(())
 }
@@ -1169,6 +1538,99 @@ mod tests {
         assert_eq!(cargo_jobs(&live).as_deref(), Some("6"));
         assert_eq!(cargo_jobs("CARGO_BUILD_JOBS=11\n").as_deref(), Some("11"));
         assert_eq!(cargo_jobs("# nothing set here\n"), None);
+    }
+
+    /// THE CGROUP A BUILDER ACTS ON IS READ OUT OF THE MANIFEST THAT
+    /// DECLARES IT (backlog 28fc3a39, 2026-09-22).
+    ///
+    /// The cargo bound's own reason — what a bare `cargo` would drive
+    /// to its ceiling — was a typed figure in both places it appeared:
+    /// this invariant said "a 16 GiB cgroup" and the builder rules said
+    /// "16 GiB / 8-CPU", while `infra/cluster/manifests/boss-dev.yaml`
+    /// had declared `{cpu: "16", memory: 32Gi}` since the pod was
+    /// resized for two builders and an operator (5ee0ff2a). Half the
+    /// memory in both copies, half the CPU in one. A rule whose stated
+    /// reason is false teaches the reader to discount the rule, so the
+    /// figure is read from the declaration rather than corrected into
+    /// a third drift.
+    #[test]
+    fn the_cargo_bound_cites_the_cgroup_the_dev_pod_declares() {
+        let live = std::fs::read_to_string(repo().join(DEV_MANIFEST)).expect("the dev manifest");
+        let limits = pod_cgroup_limits(&live).expect("the dev container declares its limits");
+        assert_eq!(
+            limits, "limits: {cpu: \"16\", memory: 32Gi}",
+            "the dev pod was resized; that is fine — this assertion exists so the \
+             MOVE is visible, and the brief will already be printing the new figure \
+             because it reads it here"
+        );
+        // The anti-hardcode half: a different manifest must produce a
+        // different figure, or the derivation is a literal wearing a
+        // function's clothes.
+        let moved = live.replace(&limits, "limits: {cpu: \"64\", memory: 128Gi}");
+        assert_eq!(
+            pod_cgroup_limits(&moved).as_deref(),
+            Some("limits: {cpu: \"64\", memory: 128Gi}")
+        );
+
+        let invs = invariants(&repo()).expect("the invariants derive from this tree");
+        let inv = invs
+            .iter()
+            .find(|i| i.name == "cargo jobs")
+            .expect("the cargo bound is an invariant of this tree");
+        assert!(
+            inv.lines.join("\n").contains(&limits),
+            "the cargo bound states a cgroup the manifest does not declare: {:?}",
+            inv.lines
+        );
+        let Grounding::Derived(readings) = &inv.grounding else {
+            panic!("the cargo bound is derived, not written");
+        };
+        assert!(
+            readings
+                .iter()
+                .any(|r| r.from == DEV_MANIFEST && r.value == limits),
+            "the cgroup figure rides under the bound's own authority instead of \
+             naming the manifest it was read from"
+        );
+    }
+
+    #[test]
+    fn a_sidecars_limits_are_not_mistaken_for_the_dev_containers() {
+        // Declared AFTER the sidecar here, because in the real manifest
+        // it comes first — a scan that took the first `limits:` would
+        // pass against the tree and answer with postgres's 4Gi the day
+        // someone reorders it.
+        let manifest = "\
+      containers:
+        - name: postgres
+          resources:
+            limits: {cpu: \"2\", memory: 4Gi}
+        - name: dev
+          resources:
+            requests: {cpu: \"4\", memory: 8Gi}
+            limits: {cpu: \"16\", memory: 32Gi}
+        - name: reclaim
+          resources:
+            limits: {cpu: 500m, memory: 256Mi}
+";
+        assert_eq!(
+            pod_cgroup_limits(manifest).as_deref(),
+            Some("limits: {cpu: \"16\", memory: 32Gi}")
+        );
+        // No dev container is nothing, never the next container's
+        // numbers: a confident wrong figure is the failure class here.
+        assert_eq!(
+            pod_cgroup_limits("        - name: postgres\n            limits: {cpu: \"2\"}\n"),
+            None
+        );
+        // A dev container that declares no limits is unbounded, and
+        // saying so is not this function's business either.
+        assert_eq!(
+            pod_cgroup_limits(
+                "        - name: dev\n          image: x\n        - name: pg\n            limits: {cpu: \"2\"}\n"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1476,6 +1938,191 @@ mod tests {
         assert!(out.contains("cc9ddc5d-7e43-4a74-91f9-273b9ca2ba6a"));
     }
 
+    /// AN EXHIBIT IS LISTED, NEVER DROPPED AND NEVER DUMPED (design
+    /// 26a89f11). A terminal cannot render a design's HTML exhibit, and
+    /// printing 256 KB of markup "in full" would bury the brief; the
+    /// decided form is one line per exhibit — anchor, title, size, hash —
+    /// so a builder knows exactly what the reviewer saw and can fetch it.
+    #[test]
+    fn a_brief_lists_each_exhibit_by_anchor_title_size_and_hash() {
+        let html = "<!doctype html><style>b{color:red}</style><b>palette</b>".repeat(50);
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(html.as_bytes()));
+        let job = json!({
+            "id": "26a89f11-0000-0000-0000-000000000000",
+            "title": "A design with a board",
+            "kind": "design-doc",
+            "status": "open",
+            "metadata": {"title": "A design with a board"},
+            "steps": [{
+                "spec_slug": "review",
+                "kind": "review-design",
+                "status": "completed",
+                "title": "Answer the open questions",
+                "metadata": {
+                    "exhibits": [
+                        {"anchor": "E1", "title": "Warm palette", "html": html},
+                        {"anchor": "E2", "title": "Cool palette", "html": "<p>x</p>"},
+                        {"anchor": "E3", "title": "Motion prototype", "file_ref": "f-3",
+                         "sha256": "ab12", "size_bytes": 912_345},
+                    ],
+                },
+            }],
+        });
+        let out = packet_section(&job);
+        assert!(
+            out.contains(&format!(
+                "E1 — Warm palette — {} bytes — sha256 {digest}",
+                html.len()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("E2 — Cool palette — 8 bytes — sha256 "),
+            "{out}"
+        );
+        // Over the inline bound, a file_ref (design 26a89f11's second
+        // arm): listed the same way, by the size and hash recorded at
+        // attach, with the file id a reader fetches it by.
+        assert!(
+            out.contains("E3 — Motion prototype — 912345 bytes — sha256 ab12 — file f-3"),
+            "{out}"
+        );
+        assert!(out.contains("exhibits: (3 "), "{out}");
+        assert!(
+            !out.contains("<b>palette</b>"),
+            "the markup itself is not printed: a terminal cannot render it"
+        );
+    }
+
+    /// THE DECISION LIVES ON THE STEPS, SO THE BRIEF PRINTS THEM
+    /// (backlog 3cdad35a, measured by builder run df220512 on 3bc896be,
+    /// 2026-09-23). That item's brief showed an open question; its
+    /// steps carried the approved design that answered it, and the
+    /// triage step's evidence and disposition — exactly what a builder
+    /// needs — were on a step too. The shape below is the live
+    /// backlog-item's: a completed trigger, a completed triage, a
+    /// completed design step, a skipped one, and the active build.
+    #[test]
+    fn the_packet_half_prints_every_completed_steps_metadata_in_full() {
+        let long = "e".repeat(400);
+        let job = json!({
+            "id": "3bc896be-0000-4000-8000-000000000000",
+            "kind": "backlog-item",
+            "metadata": { "area": "platform" },
+            "steps": [
+                { "spec_slug": "entered", "kind": "trigger", "status": "completed",
+                  "title": "Item enters the backlog",
+                  "metadata": { "trigger_name": "item-enters-the-backlog" } },
+                { "spec_slug": "triage", "kind": "task", "status": "completed",
+                  "title": "Measure the claim, choose a route",
+                  "completed_by": "agent-claude",
+                  "completed_at": "2026-09-23T14:53:42.043974Z",
+                  "metadata": {
+                      "disposition": "design",
+                      "evidence": format!("{long}\nsecond line of evidence"),
+                  } },
+                { "spec_slug": "design", "kind": "task", "status": "completed",
+                  "title": "File the design",
+                  "metadata": { "design_id": "5877860d-aaaa-4bbb-8ccc-000000000000" } },
+                { "spec_slug": "answer", "kind": "answer-question", "status": "skipped",
+                  "title": "Answer the question",
+                  "metadata": { "skipped_key": "not a record of work done" } },
+                { "spec_slug": "build", "kind": "task", "status": "active",
+                  "title": "Build the change",
+                  "metadata": { "agent_run": "run-of-the-reader" } },
+            ],
+        });
+        let out = packet_section(&job);
+        // Every key of every completed step, untruncated, lines kept.
+        assert!(out.contains(&long), "{out}");
+        assert!(out.contains("    second line of evidence\n"), "{out}");
+        assert!(out.contains("disposition:\n    design\n"), "{out}");
+        assert!(
+            out.contains("5877860d-aaaa-4bbb-8ccc-000000000000"),
+            "{out}"
+        );
+        assert!(out.contains("item-enters-the-backlog"), "{out}");
+        // Each block names its step the way a surface does, and who
+        // completed it when the record says.
+        assert!(out.contains("Measure the claim, choose a route"), "{out}");
+        assert!(out.contains("step `triage`"), "{out}");
+        assert!(out.contains("agent-claude"), "{out}");
+        assert!(out.contains("2026-09-23T14:53:42.043974Z"), "{out}");
+        // Only COMPLETED steps: a skipped step recorded no work, and the
+        // step the packet is at has its own section.
+        assert!(!out.contains("skipped_key"), "{out}");
+        assert!(!out.contains("run-of-the-reader"), "{out}");
+        // In the packet's own step order.
+        let triage = out.find("step `triage`").expect("triage");
+        let design = out.find("step `design`").expect("design");
+        assert!(triage < design, "{out}");
+    }
+
+    /// A CORRECTION IS PRINTED UNDER THE FIELD IT CORRECTS (design
+    /// 4105b020). The job GET hands each step its own `corrections`;
+    /// the brief is a reader of step metadata like any other, so the
+    /// damaged sentence and its correction arrive together — the
+    /// original first, never replaced — and a withdrawn correction says
+    /// so.
+    #[test]
+    fn a_completed_steps_corrections_print_under_the_field_they_correct() {
+        let damaged = "Ordering trap confirmed:  is required of every rule";
+        let job = json!({
+            "id": "f3e091f0-0000-4000-8000-000000000000",
+            "metadata": {},
+            "steps": [
+                { "spec_slug": "triage", "kind": "task", "status": "completed",
+                  "title": "Measure the claim, choose a route",
+                  "metadata": { "disposition": "build", "evidence": damaged, "zeta": "z" },
+                  "corrections": [
+                      { "index": 0, "step": "s", "field": "evidence",
+                        "reads": "confirmed:  is", "should_read": "confirmed: `why` is",
+                        "why": "the shell ate the word", "by": "agent-claude",
+                        "at": "2026-09-19T19:10:00Z" },
+                      { "index": 2, "step": "s", "field": "evidence",
+                        "reads": "every rule", "should_read": "every rule file",
+                        "why": "", "by": "agent-claude", "at": "2026-09-20T00:00:00Z" },
+                      { "index": 3, "step": "s", "field": "evidence", "withdraws": 2,
+                        "why": "the original was right", "by": "emp-david",
+                        "at": "2026-09-21T00:00:00Z" },
+                  ] },
+            ],
+        });
+        let out = packet_section(&job);
+        let original = out.find(damaged).expect("the original is printed");
+        let first = out
+            .find("correction [0]")
+            .expect("the correction is printed");
+        let next_key = out.find("  zeta:").expect("the next key");
+        assert!(
+            original < first && first < next_key,
+            "under its field, before the next key: {out}"
+        );
+        assert!(out.contains("reads:        confirmed:  is\n"), "{out}");
+        assert!(out.contains("should read:  confirmed: `why` is\n"), "{out}");
+        assert!(
+            out.contains("why:          the shell ate the word\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("by agent-claude at 2026-09-19T19:10:00Z"),
+            "{out}"
+        );
+        assert!(out.contains("correction [2] (withdrawn by [3])"), "{out}");
+        assert!(
+            out.contains("correction [3] withdraws [2], by emp-david"),
+            "{out}"
+        );
+        // Nothing is printed under a field nobody corrected.
+        let disposition = out.find("  disposition:").expect("disposition");
+        let evidence = out.find("  evidence:").expect("evidence");
+        assert!(
+            !out[disposition..evidence].contains("correction ["),
+            "{out}"
+        );
+    }
+
     #[test]
     fn a_multiline_metadata_value_keeps_its_lines() {
         let job = json!({"metadata": {"claim": "first line\nsecond line"}});
@@ -1596,7 +2243,7 @@ mod tests {
         assert_eq!(profile_for(Some(&undeclared), None), "builder");
         assert_eq!(profile_for(None, None), "builder");
 
-        let out = render(&repo(), Some(&undeclared), "builder", None).expect("renders");
+        let out = render(&repo(), Some(&undeclared), "builder", None, None).expect("renders");
         let packet = out.find("== THE PACKET").expect("the packet half");
         let invariants = out.find("== THE INVARIANTS").expect("the invariant half");
         let rules = out.find("== THE RULES").expect("the rules half");
@@ -1607,7 +2254,7 @@ mod tests {
         assert!(out.contains("# Builder rules"));
         assert!(out.contains(HOW_TO_USE));
         // No packet: invariants and rules alone.
-        let alone = render(&repo(), None, "builder", None).expect("renders");
+        let alone = render(&repo(), None, "builder", None, None).expect("renders");
         assert!(!alone.contains("== THE PACKET"));
         assert!(alone.contains("== THE RULES"));
     }
@@ -1741,7 +2388,7 @@ mod tests {
             }],
         });
         assert_eq!(step_section(&build), None);
-        let rendered = render(&repo(), Some(&build), "builder", None).expect("renders");
+        let rendered = render(&repo(), Some(&build), "builder", None, None).expect("renders");
         assert!(!rendered.contains("== THE STEP"), "{rendered}");
     }
 
@@ -1777,8 +2424,8 @@ mod tests {
     #[test]
     fn a_lane_is_briefed_with_its_own_invariants_and_none_of_the_others() {
         let job = a_step_with_a_specification();
-        let analyst = render(&repo(), Some(&job), "analyst", None).expect("renders");
-        let builder = render(&repo(), Some(&job), "builder", None).expect("renders");
+        let analyst = render(&repo(), Some(&job), "analyst", None, None).expect("renders");
+        let builder = render(&repo(), Some(&job), "builder", None, None).expect("renders");
 
         // The car lane's invariants are absent from the step lane...
         for car_only in [
@@ -1870,7 +2517,71 @@ mod tests {
             "{:?}",
             inv.lines
         );
-        assert_eq!(inv.lanes, vec![LANE_STEP]);
+        assert_eq!(inv.lanes, vec![LANE_STEP, LANE_TENANT]);
+    }
+
+    /// THE TENANT REPO IS THE INSTANCE'S (design fd8b5143, backlog
+    /// 6a34e9bc): read out of instances.toml the way its own header says
+    /// every reader reads it, one key per line under a section. An
+    /// image-sourced instance (`tenant_dir`) names no repo, and a repo
+    /// with no ref cannot be delivered, so neither is a source.
+    #[test]
+    fn the_tenant_repo_invariant_reads_each_instances_source_from_instances_toml() {
+        let text = "\
+# a comment naming tenant_repo = \"nobody/else\"
+source = \"prod\"
+[prod]
+namespace = \"boss\"
+tenant_repo = \"acme/acme-co\"
+tenant_ref = \"main\"
+[playground]
+tenant_dir = \"examples/x\"
+[half]
+tenant_repo = \"acme/no-ref\"
+";
+        assert_eq!(
+            tenant_sources(text),
+            vec![TenantSource {
+                instance: "prod".into(),
+                repo: "acme/acme-co".into(),
+                reference: "main".into(),
+            }]
+        );
+        assert_eq!(tenant_checkout("acme/acme-co"), "/work/acme-co");
+
+        // The live file, and the invariant it becomes — filed under the
+        // tenant lane alone, naming every source the file declares.
+        let live = tenant_sources(
+            &std::fs::read_to_string(repo().join(INSTANCES)).expect("instances.toml"),
+        );
+        assert!(!live.is_empty(), "prod names its tenant repo");
+        let invs = invariants(&repo()).expect("the invariants derive");
+        let inv = invs
+            .iter()
+            .find(|i| i.name == "the tenant repo")
+            .expect("a tenant-repo invariant");
+        assert_eq!(inv.authority, INSTANCES);
+        assert_eq!(inv.lanes, vec![LANE_TENANT]);
+        for s in &live {
+            assert!(
+                inv.lines
+                    .iter()
+                    .any(|l| l.contains(&s.repo) && l.contains(&tenant_checkout(&s.repo))),
+                "{:?}",
+                inv.lines
+            );
+        }
+        assert!(
+            inv.lines.iter().any(|l| l.contains("merge-tenant-main")),
+            "names the one way the ref moves: {:?}",
+            inv.lines
+        );
+        // None of the car lane's gate facts reach a tenant builder.
+        let tenant = invariant_section(&invs, LANE_TENANT);
+        assert!(tenant.contains("the tenant repo"), "{tenant}");
+        assert!(tenant.contains("the system of record"), "{tenant}");
+        assert!(!tenant.contains("gate uid"), "{tenant}");
+        assert!(!tenant.contains("cargo jobs"), "{tenant}");
     }
 
     /// A page-audit packet pinned to v2, at its `measure` step, holding
@@ -1968,7 +2679,7 @@ mod tests {
     fn the_brief_dates_the_specification_it_renders() {
         let job = pinned_at_v2();
         let row = active_row(3, "Read the PAGE, then COMPLETE it.");
-        let out = render(&repo(), Some(&job), "analyst", Some(&row)).expect("renders");
+        let out = render(&repo(), Some(&job), "analyst", Some(&row), None).expect("renders");
         let packet = out.find("== THE PACKET").expect("the packet half");
         let protocol = out.find("== THE PROTOCOL").expect("the protocol half");
         let step = out.find("== THE STEP").expect("the step half");
@@ -2011,5 +2722,44 @@ mod tests {
             1,
             "the pre-flight invariant names a gate.sh mode more than once:\n{lines}"
         );
+    }
+
+    /// AN INVARIANT'S FIRST LINE RUNS AS ONE PLAIN COMMAND (backlog
+    /// 65cea113, 2026-09-23). The first line of an invariant is the one
+    /// a builder copies into a shell, and a builder here runs in a
+    /// worktree-isolated agent session whose harness refuses a command
+    /// it cannot show stays out of another tree's git. Measured on run
+    /// dba4bb17 against this tree, both invariant lines as printed:
+    /// `bash infra/gate.sh --lint > <log> 2>&1; echo $?` was refused as
+    /// "a construct too complex to verify", and `set -a; . infra/dev/
+    /// pod-build.env; set +a` as "a string through ., which can't be
+    /// verified" — while `bash infra/gate.sh --lint > <log> 2>&1` alone
+    /// ran, and the tool reported its exit code. Three builders in one
+    /// night each rediscovered the split by hand. The exit code the
+    /// `; echo $?` printed is the command's own, so nothing is lost by
+    /// dropping it; a pipe, a list or a sourced file is what the guard
+    /// refuses, so none of them may appear before a trailing comment.
+    #[test]
+    fn every_invariants_first_line_runs_as_one_plain_command() {
+        let invs = invariants(&repo()).expect("the invariants derive from this tree");
+        let refused = [";", "&&", "||", "|", "$?", "$("];
+        for inv in &invs {
+            let first = inv.lines.first().expect("an invariant has a first line");
+            let command = first.split(" #").next().unwrap_or(first).trim();
+            for op in refused {
+                assert!(
+                    !command.contains(op),
+                    "the {:?} invariant's first line carries `{op}`, which a worktree-isolated \
+                     builder's harness refuses to run: {first}",
+                    inv.name
+                );
+            }
+            assert!(
+                !command.starts_with(". ") && !command.starts_with("source "),
+                "the {:?} invariant's first line sources a file, which the harness refuses: \
+                 {first}",
+                inv.name
+            );
+        }
     }
 }

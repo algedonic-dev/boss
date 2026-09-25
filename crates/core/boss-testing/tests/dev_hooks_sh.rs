@@ -77,6 +77,7 @@ impl Fixture {
                  n=$(ls \"{log}\" 2>/dev/null | wc -l)\n\
                  d=\"{log}/$n\"; mkdir -p \"$d\"\n\
                  for a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"$d/argv\"\n\
+                 printf '%s' \"${{BOSS_SESSION_AGENT_DEFINITIONS:-}}\" > \"$d/definitions_env\"\n\
                  cat > \"$d/stdin\"\n\
                  [ \"$2\" = patch ] && cp \"$4\" \"$d/body\"\n\
                  {exit_early}\n\
@@ -104,6 +105,7 @@ impl Fixture {
                  d=\"{log}/$n\"; mkdir -p \"$d\"\n\
                  for a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"$d/argv\"\n\
                  [ -n \"$3\" ] && cp \"$3\" \"$d/body\"\n\
+                 printf '%s' \"${{BOSS_DOOR_FRESHNESS:-}}\" > \"$d/freshness\"\n\
                  {exit_early}\n\
                  case \"$1\" in\n\
                    GET) printf '%s' '{{\"id\":\"{SESSION}\",\"kind\":\"work-session\",\"steps\":[{{\"id\":\"st-opened\",\"spec_slug\":\"opened\",\"status\":\"completed\"}},{{\"id\":\"st-active\",\"spec_slug\":\"active\",\"status\":\"ready\",\"metadata\":{{\"authority_role\":\"platform-admin\"}}}}]}}' ;;\n\
@@ -139,6 +141,54 @@ impl Fixture {
         out
     }
 
+    /// What `BOSS_SESSION_AGENT_DEFINITIONS` held for the n-th `boss`
+    /// call — the snapshot the dispatch door reads (backlog e1c4dc93).
+    fn definitions_env(&self, n: usize) -> String {
+        std::fs::read_to_string(
+            self.root
+                .join("boss-calls")
+                .join(n.to_string())
+                .join("definitions_env"),
+        )
+        .unwrap_or_default()
+    }
+
+    /// What `BOSS_DOOR_FRESHNESS` held for the n-th `boss-api` call.
+    fn api_freshness(&self, n: usize) -> String {
+        std::fs::read_to_string(
+            self.root
+                .join("api-calls")
+                .join(n.to_string())
+                .join("freshness"),
+        )
+        .unwrap_or_default()
+    }
+
+    /// Put the stub `boss-api` where the pod's real one lives: behind
+    /// a symlink into a checkout one commit behind an `origin/main`
+    /// that changed it — so `door_is_stale` calls it stale, as it did
+    /// the pod's copy for most of 2026-09-19 (backlog 0b36dd65).
+    fn make_boss_api_stale(&self) {
+        let checkout = self.root.join("checkout");
+        boss_testing::create_dir(&checkout);
+        let door = checkout.join("boss-api");
+        std::fs::rename(self.bin.join("boss-api"), &door).expect("move the stub");
+        git(&checkout, &["init", "-q", "-b", "main"]);
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "the door"]);
+        let old = git(&checkout, &["rev-parse", "HEAD"]);
+        let body = std::fs::read_to_string(&door).expect("read the stub");
+        write_exec(&door, &format!("{body}# changed on origin/main\n"));
+        git(&checkout, &["commit", "-qam", "the door, changed"]);
+        let main = git(&checkout, &["rev-parse", "HEAD"]);
+        git(
+            &checkout,
+            &["update-ref", "refs/remotes/origin/main", &main],
+        );
+        git(&checkout, &["reset", "-q", "--hard", &old]);
+        std::os::unix::fs::symlink(&door, self.bin.join("boss-api")).expect("symlink the door");
+    }
+
     /// Run one hook with `payload` on stdin and the stub bin dir on
     /// PATH (`with_bin`), or a PATH with no `boss` at all.
     fn run(&self, hook: &str, payload: &str, with_bin: bool) -> (i32, String, String) {
@@ -172,9 +222,32 @@ impl Fixture {
     }
 }
 
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.email=t@test", "-c", "user.name=test"])
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn start_payload(source: &str) -> String {
     format!(
         r#"{{"session_id":"s-1","transcript_path":"/x/t.jsonl","cwd":"/work/boss","hook_event_name":"SessionStart","source":"{source}"}}"#
+    )
+}
+
+fn start_payload_in(source: &str, cwd: &Path) -> String {
+    format!(
+        r#"{{"session_id":"s-1","transcript_path":"/x/t.jsonl","cwd":"{cwd}","hook_event_name":"SessionStart","source":"{source}"}}"#,
+        cwd = cwd.display()
     )
 }
 
@@ -446,6 +519,105 @@ fn agent_start_dispatches_through_the_door_and_hands_back_its_answer() {
     );
 }
 
+/// WHAT THIS SESSION LOADED, snapshotted at the one moment Claude Code
+/// reads the definitions directory (backlog e1c4dc93). A car that adds
+/// `.claude/agents/effort-high.md` lands under sessions already
+/// running; those sessions cannot load it, and the dispatch door would
+/// name it on the Agent call. Measured live 2026-09-22: the harness
+/// answers `Agent type 'effort-ultra-nonexistent' not found. Available
+/// agents: …` — loud and immediate, never a silent fallback — but only
+/// after the door has claimed the step and filed the run. The snapshot
+/// is what lets the door refuse first instead. A RESUME loads the
+/// directory again, so it is written there too.
+#[test]
+fn session_start_snapshots_the_definitions_this_session_loaded() {
+    let f = Fixture::new("start-definitions");
+    f.stub_boss(false);
+    let project = f.root.join("project");
+    let agents = project.join(".claude").join("agents");
+    boss_testing::create_dir(&agents);
+    for name in ["effort-low", "effort-medium"] {
+        std::fs::write(agents.join(format!("{name}.md")), "---\n").expect("a definition");
+    }
+    std::fs::write(agents.join("notes.txt"), "not a definition").expect("a stray file");
+
+    let (code, _, err) = f.run(
+        "session-start.sh",
+        &start_payload_in("startup", &project),
+        true,
+    );
+    assert_eq!(code, 0, "{err}");
+    let snapshot = f.state.join("s-1").join("definitions");
+    let loaded = std::fs::read_to_string(&snapshot).expect("the snapshot is written");
+    let mut names: Vec<&str> = loaded.split_whitespace().collect();
+    names.sort_unstable();
+    assert_eq!(names, ["effort-low", "effort-medium"], "{loaded:?}");
+
+    // A resume reads the directory again — and the definition that
+    // landed since is in the snapshot the resumed session gets.
+    std::fs::write(agents.join("effort-high.md"), "---\n").expect("a third definition");
+    let (code, _, err) = f.run(
+        "session-start.sh",
+        &start_payload_in("resume", &project),
+        true,
+    );
+    assert_eq!(code, 0, "{err}");
+    let loaded = std::fs::read_to_string(&snapshot).expect("the snapshot is rewritten");
+    assert!(
+        loaded.split_whitespace().any(|n| n == "effort-high"),
+        "{loaded:?}"
+    );
+
+    // No definitions directory at all: an EMPTY snapshot, which says
+    // this session loaded none — not an ABSENT one, which says nothing
+    // is known and refuses nothing.
+    let f2 = Fixture::new("start-definitions-absent");
+    f2.stub_boss(false);
+    let bare = f2.root.join("bare");
+    boss_testing::create_dir(&bare);
+    let (code, _, err) = f2.run(
+        "session-start.sh",
+        &start_payload_in("startup", &bare),
+        true,
+    );
+    assert_eq!(code, 0, "{err}");
+    let snapshot = f2.state.join("s-1").join("definitions");
+    assert!(
+        snapshot.is_file(),
+        "the snapshot exists even when the directory does not"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&snapshot).expect("readable").trim(),
+        ""
+    );
+}
+
+/// The dispatch door reads the snapshot through the environment, so
+/// the hook that has the session's state directory is the one that
+/// names the file (backlog e1c4dc93).
+#[test]
+fn agent_start_hands_the_door_this_sessions_definitions() {
+    let f = Fixture::new("agent-start-definitions");
+    f.stub_boss(false);
+    std::fs::create_dir_all(f.state.join("s-1")).unwrap();
+    std::fs::write(f.state.join("s-1").join("packet"), format!("{SESSION}\n")).unwrap();
+    std::fs::write(f.state.join("s-1").join("definitions"), "effort-high\n").unwrap();
+    let (code, _, err) = f.run(
+        "agent-start.sh",
+        &agent_payload("PreToolUse", "Build it.\\nPacket: da925366", ""),
+        true,
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        f.definitions_env(0),
+        f.state
+            .join("s-1")
+            .join("definitions")
+            .display()
+            .to_string()
+    );
+}
+
 #[test]
 fn agent_stop_reports_the_run_it_remembered() {
     let f = Fixture::new("agent-stop");
@@ -524,6 +696,60 @@ fn session_end_completes_active_as_clean_through_boss_api() {
         !f.state.join("s-1").exists(),
         "the session's state is cleared"
     );
+}
+
+/// A session ending while the pod's `boss-api` is a stale copy still
+/// ends clean — and says it wrote past a stale door, on a line of its
+/// own (backlog 584dc9da). Since 0b36dd65 a stale door REFUSES a write
+/// with exit 78, and the pod's checkout was behind for most of
+/// 2026-09-19, so without the override most sessions would fall to
+/// the clock at the one moment nobody reads the journal. The distinct
+/// line keeps the override countable: if closing a session past a
+/// stale door is ever the wrong call, how often it happened is in the
+/// journal rather than re-derived.
+#[test]
+fn session_end_writes_past_a_stale_door_and_says_so() {
+    let f = Fixture::new("end-stale");
+    f.stub_boss(false);
+    f.make_boss_api_stale();
+    std::fs::create_dir_all(f.state.join("s-1")).unwrap();
+    std::fs::write(f.state.join("s-1").join("packet"), format!("{SESSION}\n")).unwrap();
+    let payload = r#"{"session_id":"s-1","cwd":"/work/boss","hook_event_name":"SessionEnd","reason":"logout"}"#;
+    let (code, out, err) = f.run("session-end.sh", payload, true);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "");
+    let calls = f.calls("api-calls");
+    assert!(
+        calls.iter().any(|(a, _)| a[0] == "PUT"),
+        "the step is still completed: {calls:?}"
+    );
+    for (n, (argv, _)) in calls.iter().enumerate() {
+        assert_eq!(
+            f.api_freshness(n),
+            "off",
+            "boss-api {argv:?} ran without the override, so a stale door refuses it"
+        );
+    }
+    assert!(
+        err.contains("past a stale door"),
+        "the write past a stale door is reported on its own line: {err}"
+    );
+    assert!(err.contains("ended clean"), "{err}");
+}
+
+/// A fresh door ends the session without the stale-door line — the
+/// line counts stale doors, not session ends.
+#[test]
+fn session_end_on_a_fresh_door_says_nothing_about_freshness() {
+    let f = Fixture::new("end-fresh");
+    f.stub_boss(false);
+    std::fs::create_dir_all(f.state.join("s-1")).unwrap();
+    std::fs::write(f.state.join("s-1").join("packet"), format!("{SESSION}\n")).unwrap();
+    let payload = r#"{"session_id":"s-1","cwd":"/work/boss","hook_event_name":"SessionEnd","reason":"logout"}"#;
+    let (code, _, err) = f.run("session-end.sh", payload, true);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("stale door"), "{err}");
+    assert!(err.contains("ended clean"), "{err}");
 }
 
 /// Every hook exits 0 with a failing `boss`, with no `boss` on PATH,

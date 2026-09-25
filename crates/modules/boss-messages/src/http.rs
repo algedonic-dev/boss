@@ -136,13 +136,17 @@ async fn inbox<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     CurrentUser(user): CurrentUser,
     Path(employee_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     // Security gate: a real session may only read its own inbox;
     // operators or trusted internal callers may read any.
     if !is_trusted(&user) && user.id != employee_id {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match state.messages.inbox(&employee_id).await {
+    // Archived rows have left the inbox (backlog 8578b91e); a reader
+    // that needs them anyway says `?include_archived=true`.
+    let include_archived = params.get("include_archived").is_some_and(|v| v == "true");
+    match state.messages.inbox(&employee_id, include_archived).await {
         Ok(msgs) => Json(msgs).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -176,6 +180,13 @@ struct ExpireRequest {
     /// `/jobs/{id}` expires both the job-level notifications and the
     /// `/jobs/{id}/steps/{step}` ones beneath it.
     entity_path_prefix: String,
+    /// When present, retire the unread NOTICES under the path whose id
+    /// starts with this, of any kind — a step's `direct` notice
+    /// included — instead of the unread signals (backlog 0b2bac00).
+    /// Absent, the door is what it was, and the job-close rule relies
+    /// on that.
+    #[serde(default)]
+    id_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -209,13 +220,38 @@ async fn expire_signals<R: MessageRepository + 'static>(
         )
             .into_response();
     }
+    // An empty id prefix matches every id under the path — a person's
+    // direct included — which is the one thing the prefix exists to
+    // leave alone. 422 rather than 400: the dispatcher's POST reads 422
+    // as permanent, and this body fails the same way on every retry.
+    if body
+        .id_prefix
+        .as_deref()
+        .is_some_and(|p| p.trim().is_empty())
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "id_prefix, when given, must not be empty",
+        )
+            .into_response();
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state).await;
-    match state
-        .messages
-        .expire_signals_under(&body.entity_path_prefix, now, &stamp)
-        .await
-    {
+    let expired = match body.id_prefix.as_deref() {
+        Some(id_prefix) => {
+            state
+                .messages
+                .expire_notices_under(&body.entity_path_prefix, id_prefix, now, &stamp)
+                .await
+        }
+        None => {
+            state
+                .messages
+                .expire_signals_under(&body.entity_path_prefix, now, &stamp)
+                .await
+        }
+    };
+    match expired {
         Ok(expired) => Json(ExpiredResponse { expired }).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

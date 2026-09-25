@@ -7,6 +7,8 @@
   // pre-filter. Same pattern as the React app.
 
   import { navigate, href } from '../router';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { shortId } from '../data/ids';
   import { subjectLabel, subjectPath, type Job } from './types';
@@ -15,6 +17,8 @@
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
   import { registeredAdHoc } from './adHoc';
+  import { ACCOUNTS_LIST_URL } from '../accounts/api';
+  import { jobsFilterSearch } from './filterQuery';
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
@@ -26,13 +30,13 @@
     initialDepartment = '',
     initialStatus = 'open',
     initialOwnerId = '',
-    initialSubjectKind = '',
     initialSubjectId = '',
     pageTitle,
     eyebrow = 'Work',
     initialNewJobOpen = false,
     initialNewJobSubjectKind = '',
     initialNewJobSubjectId = '',
+    writesFiltersToUrl = false,
   } = $props<{
     initialKind?: string;
     initialKindPrefix?: string;
@@ -48,9 +52,10 @@
     initialDepartment?: string;
     initialStatus?: string;
     // #93: list-filter props. owner_id filters by Job.owner_id;
-    // subjectKind+subjectId filter by Job.subject_kind+subject_id.
+    // subjectId filters by Job.subject_id. A subjectKind prop was
+    // captured and never sent — the jobs API has no such filter — and
+    // went with backlog 45ca0f89.
     initialOwnerId?: string;
-    initialSubjectKind?: string;
     initialSubjectId?: string;
     pageTitle?: string;
     eyebrow?: string;
@@ -60,6 +65,11 @@
     initialNewJobOpen?: boolean;
     initialNewJobSubjectKind?: string;
     initialNewJobSubjectId?: string;
+    /// Set by the /jobs mount only: the route whose query parseRoute
+    /// reads the filters from, so the only one a written filter can
+    /// come back through. The Service queue and the Sales pipeline
+    /// mount this page on paths that parse no query.
+    writesFiltersToUrl?: boolean;
   }>();
 
   let kind = $state(initialKind);
@@ -73,6 +83,19 @@
   let error = $state<string | null>(null);
   let total = $state(0);
 
+  // The filters live in the URL, not only in page state: choosing All
+  // and reloading used to come back as Open, and a filtered view could
+  // not be shared (backlog f8027805). replaceState, not a navigation —
+  // a filter is not a place the back button should step through, and
+  // App re-parses the route on popstate only. The write is the inverse
+  // of parseRoute's read, so a mount rewrites nothing.
+  $effect(() => {
+    if (!writesFiltersToUrl) return;
+    const { pathname, search, hash } = window.location;
+    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter });
+    if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
+  });
+
   // Auto-load kinds for the filter dropdown on mount; no user
   // interaction required.
   $effect(() => {
@@ -85,7 +108,6 @@
     const dept = initialDepartment;
     const s = status;
     const o = initialOwnerId;
-    const sk = initialSubjectKind;
     const si = subjectIdFilter;
     let cancelled = false;
     loading = true;
@@ -123,10 +145,11 @@
     };
   });
 
+  // Blocked and Pending sign-off were offered here until 2026-09-24:
+  // no Job ever held either, so each could only answer "No jobs
+  // match." (page audit 473f4f92, retired in backlog 3c3dc8f3).
   const STATUS_OPTIONS = [
     { v: 'open', l: 'Open' },
-    { v: 'blocked', l: 'Blocked' },
-    { v: 'pending-sign-off', l: 'Pending sign-off' },
     { v: 'closed', l: 'Closed' },
     { v: '', l: 'All' },
   ];
@@ -271,7 +294,7 @@
   // mapping reflects the actual service URLs in the dev-server +
   // gateway proxy table.
   const SUBJECT_LIST_URLS: Record<string, string> = {
-    account: '/api/people/accounts',
+    account: ACCOUNTS_LIST_URL,
     vendor: '/api/inventory/vendors',
     employee: '/api/people',
     location: '/api/locations',
@@ -470,8 +493,12 @@
   <PageHeader
     eyebrow={eyebrow}
     title={titleFor}
-    subtitle={`${total.toLocaleString()} ${status || 'any-status'}`}
-    motif="hops"
+    subtitle={error
+      ? // A failed read leaves `total` at 0 (or at the last filter's
+        // count), and "0 open" above the failure line reads as an
+        // answer (backlog e98cabd0, sweep c3e4edcc). Unknown, so say so.
+        'Job count unknown — the read failed'
+      : `${total.toLocaleString()} ${status || 'any-status'}`}
   />
 
   <!-- Filters: narrow the list down without leaving the page. The
@@ -519,11 +546,11 @@
     <!-- Admission is a write: a guest sees the entry buttons disabled
          (readonly gate) rather than a composer whose POST 403s. -->
     <WriteGate>
-      <button type="button" class="btn-primary" onclick={() => openNewJob()}>
+      <button type="button" class="btn btn-primary" onclick={() => openNewJob()}>
         Start a new Job
       </button>
       {#if adHoc}
-        <button type="button" class="btn-secondary" onclick={() => openNewJob({ kind: adHoc.kind })}>
+        <button type="button" class="btn" onclick={() => openNewJob({ kind: adHoc.kind })}>
           Create Ad Hoc Job
         </button>
       {/if}
@@ -648,14 +675,14 @@
       <div class="form-actions">
         <button
           type="submit"
-          class="btn-primary"
+          class="btn btn-primary"
           disabled={formSubmitting || !canSubmit}
         >
           {formSubmitting ? 'Creating…' : 'Create Job'}
         </button>
         <button
           type="button"
-          class="btn-secondary"
+          class="btn"
           onclick={() => {
             newJobOpen = false;
             // If the user landed via a deep-link
@@ -687,6 +714,7 @@
           <button
             type="button"
             class="filter-button {status === opt.v ? 'filter-button-active' : ''}"
+            aria-pressed={status === opt.v}
             onclick={() => (status = opt.v)}
           >
             {opt.l}
@@ -699,7 +727,9 @@
       {#if loading}
         <p class="empty">Loading…</p>
       {:else if error}
-        <p class="empty">Couldn't load jobs: {error}</p>
+        <!-- The shared failure marker (sweep c3e4edcc): this line is
+             /ux/jobs's, /ux/service's and /ux/sales's. -->
+        <p class="empty load-failed" role="alert">Couldn't load jobs: {error}</p>
       {:else if jobs.length === 0}
         <p class="empty">No jobs match.</p>
       {:else}
@@ -717,35 +747,14 @@
           </thead>
           <tbody>
             {#each jobs as j (j.id)}
-              <tr
-                class="data-table-row-link"
-                onclick={() => navigate(entityHref('job', j.id))}
-              >
+              <tr use:rowLink={{ onActivate: () => navigate(entityHref('job', j.id)), label: j.title }}>
                 <td class="mono">
-                  <a
-                    href={entityHref('job', j.id)}
-                    onclick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(entityHref('job', j.id));
-                    }}
-                  >
-                    {shortId(j.id)}
-                  </a>
+                  <Link to={entityHref('job', j.id)}>{shortId(j.id)}</Link>
                 </td>
                 <td>{j.kind}</td>
                 <td>{j.title}</td>
                 <td class="mono">
-                  <a
-                    href={href(subjectPath(j.subject))}
-                    onclick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(href(subjectPath(j.subject)));
-                    }}
-                  >
-                    {subjectLabel(j.subject)}
-                  </a>
+                  <Link to={href(subjectPath(j.subject))}>{subjectLabel(j.subject)}</Link>
                 </td>
                 <td>{j.status}</td>
                 <td>{j.priority}</td>
@@ -767,8 +776,8 @@
     align-items: end;
     margin-bottom: 16px;
     padding: 12px 16px;
-    background: rgba(0, 0, 0, 0.02);
-    border: 1px solid rgba(0, 0, 0, 0.08);
+    background: var(--wash);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
   }
   .job-filter {
@@ -778,7 +787,7 @@
     font-size: 12px;
   }
   .job-filter > span {
-    color: rgba(0, 0, 0, 0.55);
+    color: var(--static);
     text-transform: uppercase;
     letter-spacing: 0.4px;
     font-size: 10px;
@@ -788,9 +797,9 @@
   .job-filter input {
     padding: 6px 10px;
     font-size: 13px;
-    border: 1px solid rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--hairline);
     border-radius: 4px;
-    background: white;
+    background: var(--ink);
     min-width: 160px;
   }
   .job-filter-clear {
@@ -798,13 +807,13 @@
     padding: 6px 12px;
     font-size: 12px;
     background: transparent;
-    color: rgba(0, 0, 0, 0.6);
-    border: 1px solid rgba(0, 0, 0, 0.18);
+    color: var(--static);
+    border: 1px solid var(--hairline);
     border-radius: 4px;
     cursor: pointer;
   }
   .job-filter-clear:hover {
-    background: rgba(0, 0, 0, 0.04);
+    background: var(--wash);
   }
   .job-actions {
     display: flex;
@@ -818,28 +827,8 @@
     display: flex;
     gap: 12px;
   }
-  .btn-primary,
-  .btn-secondary {
-    padding: 8px 16px;
-    border-radius: 6px;
-    font: inherit;
-    cursor: pointer;
-    border: 1.5px solid var(--brew-amber);
-  }
-  .btn-primary {
-    background: var(--brew-amber);
-    color: var(--brew-malt);
-  }
-  .btn-primary:disabled {
-    opacity: 0.6;
-    cursor: progress;
-  }
-  .btn-secondary {
-    background: transparent;
-    color: var(--brew-malt);
-  }
   .new-job-form {
-    background: var(--brew-amber-bg, rgba(212, 165, 91, 0.08));
+    background: var(--brew-amber-bg);
     border: 1.5px solid var(--brew-amber);
     border-radius: 8px;
     padding: 16px;
@@ -864,7 +853,7 @@
   }
   .form-row label span {
     font-size: 12px;
-    color: var(--muted, #666);
+    color: var(--static);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -872,22 +861,22 @@
   .form-row select {
     padding: 6px 10px;
     border-radius: 4px;
-    border: 1px solid var(--border, #ccc);
-    background: white;
+    border: 1px solid var(--border);
+    background: var(--ink);
     font: inherit;
     min-width: 220px;
   }
   .form-error {
-    color: #b00020;
+    color: var(--err);
     margin: 0;
   }
   .kind-description {
     margin: 0;
     padding: 8px 12px;
-    background: var(--brew-amber-bg, rgba(212, 165, 91, 0.05));
+    background: var(--brew-amber-bg);
     border-left: 3px solid var(--brew-amber);
     border-radius: 2px;
-    color: var(--brew-malt, #3d2c1a);
+    color: var(--brew-malt);
     font-size: 13px;
     line-height: 1.45;
   }
@@ -897,7 +886,7 @@
     padding: 1px 6px;
     border-radius: 3px;
     background: var(--brew-amber);
-    color: white;
+    color: var(--on-band);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -905,13 +894,13 @@
     vertical-align: middle;
   }
   .hint {
-    color: var(--muted, #888);
+    color: var(--static);
     font-size: 11px;
     margin-top: 4px;
   }
   .step-preview {
-    background: rgba(255, 255, 255, 0.6);
-    border: 1px dashed var(--brew-amber, #d4a55b);
+    background: var(--ink);
+    border: 1px dashed var(--brew-amber);
     border-radius: 6px;
     padding: 8px 12px;
     font-size: 13px;
@@ -919,7 +908,7 @@
   .step-preview > summary {
     cursor: pointer;
     font-weight: 500;
-    color: var(--brew-malt, #3d2c1a);
+    color: var(--brew-malt);
     list-style: none;
   }
   .step-preview > summary::-webkit-details-marker { display: none; }
@@ -949,27 +938,27 @@
     border-radius: 3px;
   }
   .step-preview-list li:nth-child(odd) {
-    background: rgba(212, 165, 91, 0.06);
+    background: var(--warn-wash);
   }
   .step-preview-tier {
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--muted, #888);
+    color: var(--static);
   }
   .step-preview-kind {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: var(--mono);
     font-size: 11px;
-    color: var(--brew-malt, #3d2c1a);
-    background: rgba(212, 165, 91, 0.18);
+    color: var(--brew-malt);
+    background: var(--warn-wash);
     padding: 1px 6px;
     border-radius: 3px;
   }
-  .step-preview-title { color: var(--text, #1c1917); }
+  .step-preview-title { color: var(--text); }
   .step-preview-signoff {
     font-size: 11px;
-    color: #2563eb;
-    background: rgba(37, 99, 235, 0.08);
+    color: var(--signal);
+    background: var(--signal-wash);
     padding: 1px 6px;
     border-radius: 3px;
   }

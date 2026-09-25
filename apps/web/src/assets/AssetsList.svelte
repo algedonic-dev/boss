@@ -5,6 +5,8 @@
   // panel that we're deferring to phase 2.
 
   import { navigate, href } from '../router';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
@@ -13,16 +15,11 @@
   import type { Asset, AssetsSummary, AssetLifecyclePhase } from './types';
 
   const PHASE_ORDER: ReadonlyArray<AssetLifecyclePhase> = [
-    'received', 'triaging', 'refurbing', 'qa', 'ready',
-    'shipped', 'installed', 'out-for-service', 'decommissioned',
+    'received', 'shipped', 'installed', 'out-for-service', 'decommissioned',
   ];
   const PHASE_LABEL: Record<AssetLifecyclePhase, string> = {
     registered: 'Registered',
     received: 'Received',
-    triaging: 'In triage',
-    refurbing: 'Refurb',
-    qa: 'QA',
-    ready: 'Ready',
     shipped: 'Shipped',
     installed: 'Installed',
     'out-for-service': 'In service',
@@ -90,8 +87,15 @@
 <div class="catalog theme-exec">
   <PageHeader
     eyebrow={getLabel('nav.assets_label', 'Assets')}
-    title={`${totalDevices.toLocaleString()} ${getLabel('assets.page_title', 'tracked assets')}`}
-    subtitle={`${installedCount.toLocaleString()} installed · ${(summary?.open_tickets_total ?? 0).toLocaleString()} open tickets · ${(summary?.warranty_expiring_30d ?? 0).toLocaleString()} warranties expiring (30d)`}
+    title={error
+      ? // Every header figure falls back to 0 under a failed read, and
+        // "0 tracked assets · 0 installed" read as an empty registry
+        // (sweep c3e4edcc) — the warehouse header's shape, 8b1deea2.
+        `${getLabel('nav.assets_label', 'Assets')} unavailable`
+      : `${totalDevices.toLocaleString()} ${getLabel('assets.page_title', 'tracked assets')}`}
+    subtitle={error
+      ? "Couldn't load the assets or their summary"
+      : `${installedCount.toLocaleString()} installed · ${(summary?.open_tickets_total ?? 0).toLocaleString()} open tickets · ${(summary?.warranty_expiring_30d ?? 0).toLocaleString()} warranties expiring (30d)`}
   />
 
   {#if isCapped(devicesPage)}
@@ -135,6 +139,7 @@
         <button
           type="button"
           class="filter-button {phaseFilter === 'all' ? 'filter-button-active' : ''}"
+          aria-pressed={phaseFilter === 'all'}
           onclick={() => (phaseFilter = 'all')}
         >
           All ({totalDevices.toLocaleString()})
@@ -145,6 +150,7 @@
             <button
               type="button"
               class="filter-button {phaseFilter === phase ? 'filter-button-active' : ''}"
+              aria-pressed={phaseFilter === phase}
               onclick={() => (phaseFilter = phase)}
             >
               {PHASE_LABEL[phase]} ({count.toLocaleString()})
@@ -158,7 +164,7 @@
       {#if loading}
         <p class="empty">Loading…</p>
       {:else if error}
-        <p class="empty">Couldn't load assets: {error}</p>
+        <p class="empty load-failed" role="alert">Couldn't load assets: {error}</p>
       {:else if visible.length === 0}
         <p class="empty">{getLabel('assets.empty_state', 'No assets match.')}</p>
       {:else}
@@ -177,21 +183,13 @@
           <tbody>
             {#each visible as d (d.asset_id)}
               <tr
-                class="data-table-row-link"
-                onclick={() =>
-                  navigate(entityHref('asset', d.asset_id))}
+                use:rowLink={{
+                  onActivate: () => navigate(entityHref('asset', d.asset_id)),
+                  label: `Asset ${d.asset_id}`,
+                }}
               >
                 <td class="mono">
-                  <a
-                    href={entityHref('asset', d.asset_id)}
-                    onclick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(entityHref('asset', d.asset_id));
-                    }}
-                  >
-                    {d.asset_id}
-                  </a>
+                  <Link to={entityHref('asset', d.asset_id)}>{d.asset_id}</Link>
                 </td>
                 <td class="mono">{d.sku ?? '—'}</td>
                 <td>{PHASE_LABEL[d.phase]}</td>

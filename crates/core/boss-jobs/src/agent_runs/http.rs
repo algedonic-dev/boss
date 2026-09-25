@@ -39,7 +39,7 @@ use boss_policy_client::CurrentUser;
 use crate::trust::{can_read, is_trusted};
 
 use super::port::{AgentRunError, AgentRunLog};
-use super::types::{AgentRun, NewAgentRun, RunFilter, RunSummary, summarize};
+use super::types::{AgentRunView, NewAgentRun, RunFilter, RunSummary, summarize};
 
 pub struct AgentRunsApiState {
     pub log: Arc<dyn AgentRunLog>,
@@ -62,21 +62,6 @@ pub fn router(state: AgentRunsApiState) -> Router {
 fn err_response(e: AgentRunError) -> Response {
     match e {
         AgentRunError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
-        // 409, the status every other refused-by-state write on this
-        // service answers with (a terminal step, incomplete sign-offs):
-        // the report was well-formed, and the record's state — the
-        // actor's spend against its cap — is what refused it. The body
-        // is the decision, not a bare string, so a caller can show it.
-        AgentRunError::Denied { reason } => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "run refused against the actor's budget",
-                "budget": { "kind": "deny", "reason": reason },
-                "hint": "the refusal is on the log as agents.run.denied; \
-                         the window rolls an hour after the spend it counted",
-            })),
-        )
-            .into_response(),
         AgentRunError::Storage(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
@@ -114,7 +99,8 @@ impl From<RunQuery> for RunFilter {
 pub struct RecordResponse {
     /// `false` means this `run_id` was already held — a retried report.
     pub recorded: bool,
-    pub run: AgentRun,
+    /// The held row with its derived basis — see [`AgentRunView`].
+    pub run: AgentRunView,
 }
 
 /// What `GET /api/agent-runs/cost` answers with: the roll-up plus the
@@ -138,7 +124,9 @@ async fn list_runs(
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.log.list_runs(&q.into()).await {
-        Ok(runs) => Json(runs).into_response(),
+        Ok(runs) => {
+            Json(runs.into_iter().map(AgentRunView::from).collect::<Vec<_>>()).into_response()
+        }
         Err(e) => err_response(e),
     }
 }
@@ -163,7 +151,7 @@ async fn record_run(
             StatusCode::OK,
             Json(RecordResponse {
                 recorded: out.recorded,
-                run: out.run,
+                run: out.run.into(),
             }),
         )
             .into_response(),
@@ -257,6 +245,8 @@ mod tests {
             // these tests see the shape the surface actually serves: a
             // total-only run, priced at the blend, saying so.
             blended_input_share_ppm: Some(875_000),
+            cache_read_usd_micros_per_mtok: None,
+            cache_write_usd_micros_per_mtok: None,
         }]
     }
 
@@ -473,6 +463,73 @@ mod tests {
         assert_eq!(row["usd_micros"], 1_007_940, "body: {body}");
         assert_eq!(row["priced_by"], "opus-5[1m]", "body: {body}");
         assert!(row["input_tokens"].is_null(), "body: {body}");
+        // And the row SAYS so, as the roll-up does (backlog 93fdb119):
+        // until this key rode on the row, a per-row surface could tell
+        // blended from measured only by re-deriving the server's rule
+        // from `input_tokens` and `usd_micros` itself.
+        assert_eq!(row["pricing_basis"], "blended", "body: {body}");
+    }
+
+    /// The POST's answer is a single run too, and a caller reading it
+    /// (`boss dispatch --report`) must be able to take the basis off it
+    /// rather than recompute it. All three answers, from one rule: a
+    /// measured split, a blend, and no figure at all — which is `null`,
+    /// never `split`, because there is no number to describe.
+    #[tokio::test]
+    async fn a_recorded_run_names_the_basis_of_its_own_figure() {
+        let user = Some(header("platform-admin", AccessTier::Operator));
+        let report = |run_id: &str, model: &str, tokens: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "run_id": run_id,
+                "actor_id": "agent-claude",
+                "model": model,
+                "started_at": "2026-09-15T22:00:00Z",
+                "finished_at": "2026-09-15T22:10:00Z",
+                "outcome": "success",
+            });
+            if let (Some(obj), Some(t)) = (body.as_object_mut(), tokens.as_object()) {
+                obj.extend(t.clone());
+            }
+            body
+        };
+        let cases = [
+            (
+                report(
+                    "run-split",
+                    "opus-5[1m]",
+                    serde_json::json!({"input_tokens": 1000, "output_tokens": 200}),
+                ),
+                serde_json::json!("split"),
+            ),
+            (
+                report(
+                    "run-blend",
+                    "opus-5[1m]",
+                    serde_json::json!({"total_tokens": 1000}),
+                ),
+                serde_json::json!("blended"),
+            ),
+            (
+                report(
+                    "run-unpriced",
+                    "a-model-no-card-row-covers",
+                    serde_json::json!({"input_tokens": 1000, "output_tokens": 200}),
+                ),
+                serde_json::Value::Null,
+            ),
+        ];
+        for (body, want) in cases {
+            let (status, out) = post("/api/agent-runs", body, user.clone()).await;
+            assert_eq!(status, StatusCode::OK, "body: {out}");
+            let out: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+            let run = &out["run"];
+            assert!(
+                run.as_object()
+                    .is_some_and(|o| o.contains_key("pricing_basis")),
+                "the key is always present, null included: {out}"
+            );
+            assert_eq!(run["pricing_basis"], want, "{out}");
+        }
     }
 
     /// The roll-up a surface reads, saying what its figure rests on.
@@ -585,13 +642,15 @@ mod tests {
         assert!(out["summary"].get("by_actor").is_none(), "body: {body}");
     }
 
-    /// A refused run answers 409 with the decision in the body — the
-    /// status every other refused-by-state write on this service uses
-    /// — and an admitted one carries its decision on the run. Through
-    /// the door, so the wire shape is what is pinned: a caller reads
-    /// `budget.kind` off either answer.
+    /// An over-cap run is RECORDED and carries its budget reading
+    /// (backlog e6b2066f). Until then it answered 409 and left no row,
+    /// and once runs are priced from what they consumed that refusal
+    /// would have dropped real spend from the record; David's direction
+    /// is that a budget is a signal, not a limit. Through the door, so
+    /// the wire shape is what is pinned: a caller reads `budget.kind`
+    /// off the run either way.
     #[tokio::test]
-    async fn a_refused_run_is_a_409_carrying_the_decision() {
+    async fn an_over_cap_run_is_recorded_carrying_its_deny_reading() {
         // A cap of zero is a declared cap: the agent is switched off.
         let log = InMemoryAgentRuns::new(card()).with_budgeted_agent(
             "agent-claude",
@@ -632,11 +691,12 @@ mod tests {
                 .to_bytes(),
         )
         .into_owned();
-        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(status, StatusCode::OK, "body: {body}");
         let out: serde_json::Value = serde_json::from_str(&body).expect("JSON");
-        assert_eq!(out["budget"]["kind"], "deny", "body: {body}");
+        assert_eq!(out["recorded"], true, "body: {body}");
+        assert_eq!(out["run"]["budget"]["kind"], "deny", "body: {body}");
         assert!(
-            out["budget"]["reason"]
+            out["run"]["budget"]["reason"]
                 .as_str()
                 .is_some_and(|r| r.contains("0 of 0")),
             "body: {body}"

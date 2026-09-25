@@ -8,8 +8,8 @@
 
   // EVERY CLAIM THIS PAGE MAKES IS MARKED (design 59a776c5). A
   // `data-claim` is a promise that src/marketing/claims.ts names the row
-  // that answers it, and that check-the-claims refuses when the two
-  // disagree. Adding an assertion to this page means adding a mark and a
+  // that answers it, and the web suite refuses when the two disagree
+  // (src/marketing/the-landing-page-claims.test.ts, backlog e1524f57). Adding an assertion to this page means adding a mark and a
   // row; an UNMARKED assertion is invisible to the check, which is why
   // the checker also fingerprints the prose and says so when the words
   // move but the claim set does not.
@@ -54,9 +54,9 @@
     max-width: 1100px;
     margin: 0 auto;
     padding: 1.5rem 1.5rem 3rem;
-    color: #2a1d10;
+    color: var(--fog);
     box-sizing: border-box;
-    font-family: var(--font-display, 'Iowan Old Style', 'Palatino Linotype', Georgia, serif);
+    font-family: var(--font-display);
   }
   .hero {
     margin-bottom: 1.5rem;
@@ -70,18 +70,18 @@
   .tagline {
     font-size: 1.25rem;
     margin: 0 0 1rem;
-    color: #7a3f1f;
+    color: var(--warn);
   }
   .lede {
     font-size: 1rem;
     line-height: 1.55;
     max-width: 60ch;
-    color: #4a392b;
+    color: var(--fog);
   }
   .cta {
     margin-top: 2rem;
     padding-top: 1rem;
-    border-top: 1px solid #c5a880;
+    border-top: 1px solid var(--busy);
     display: flex;
     align-items: baseline;
     justify-content: space-between;
@@ -89,7 +89,7 @@
     font-size: 0.95rem;
   }
   .cta-link {
-    color: #7a3f1f;
+    color: var(--warn);
     text-decoration: none;
     font-weight: 600;
   }
@@ -97,7 +97,7 @@
     text-decoration: underline;
   }
   .docs a {
-    color: #7a6855;
+    color: var(--static);
     font-size: 0.85rem;
     text-decoration: none;
   }

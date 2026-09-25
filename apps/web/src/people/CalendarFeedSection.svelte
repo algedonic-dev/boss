@@ -78,7 +78,7 @@
     {#if feedState.kind === 'loading'}
       <p class="empty">Loading…</p>
     {:else if feedState.kind === 'error'}
-      <p class="empty">Couldn't load token ({feedState.message}).</p>
+      <p class="empty load-failed" role="alert">Couldn't load token ({feedState.message}).</p>
     {:else if feedState.kind === 'none'}
       <button class="btn" disabled={busy} onclick={() => void rotate()}>
         Generate calendar URL
@@ -89,7 +89,7 @@
         <input
           readonly
           value={absUrl}
-          style="flex:1; font-family:var(--font-mono, monospace); font-size:13px; padding:6px 8px"
+          style="flex:1; font-family:var(--font-mono); font-size:13px; padding:6px 8px"
           onfocus={(e: FocusEvent) => (e.target as HTMLInputElement).select()}
         />
         <button class="btn" onclick={() => void copy(absUrl)}>

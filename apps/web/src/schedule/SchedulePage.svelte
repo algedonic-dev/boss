@@ -5,6 +5,8 @@
   import { formatDate } from '@boss/web-kit/ui/date';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
+  import { okRead, type ReadState } from '../data/readState';
 
   type AvailabilityKind =
     | 'available' | 'pto' | 'sick' | 'holiday' | 'training' | 'blocked';
@@ -62,20 +64,20 @@
   }
 
   const AVAIL_COLOR: Record<AvailabilityKind, { bg: string; fg: string }> = {
-    available: { bg: '#dcfce7', fg: '#166534' },
-    pto:       { bg: '#fecaca', fg: '#991b1b' },
-    sick:      { bg: '#fef3c7', fg: '#92400e' },
-    holiday:   { bg: '#e9d5ff', fg: '#6b21a8' },
-    training:  { bg: '#dbeafe', fg: '#1e40af' },
-    blocked:   { bg: '#e7e5e4', fg: '#44403c' },
+    available: { bg: 'var(--ok-wash)', fg: 'var(--ok)' },
+    pto:       { bg: 'var(--err-wash)', fg: 'var(--err)' },
+    sick:      { bg: 'var(--warn-wash)', fg: 'var(--warn)' },
+    holiday:   { bg: 'var(--signal-wash)', fg: 'var(--signal)' },
+    training:  { bg: 'var(--signal-wash)', fg: 'var(--signal)' },
+    blocked:   { bg: 'var(--ink-raised)', fg: 'var(--static)' },
   };
   const ASSIGN_COLOR: Record<AssignmentKind, { bg: string; fg: string }> = {
-    wo:          { bg: '#fef3c7', fg: '#78350f' },
-    pm:          { bg: '#fed7aa', fg: '#9a3412' },
-    install:     { bg: '#bae6fd', fg: '#075985' },
-    training:    { bg: '#dbeafe', fg: '#1e3a8a' },
-    'diag-call': { bg: '#c7d2fe', fg: '#3730a3' },
-    travel:      { bg: '#e5e7eb', fg: '#374151' },
+    wo:          { bg: 'var(--warn-wash)', fg: 'var(--warn)' },
+    pm:          { bg: 'var(--warn-wash)', fg: 'var(--warn)' },
+    install:     { bg: 'var(--signal-wash)', fg: 'var(--signal)' },
+    training:    { bg: 'var(--signal-wash)', fg: 'var(--signal)' },
+    'diag-call': { bg: 'var(--signal-wash)', fg: 'var(--signal)' },
+    travel:      { bg: 'var(--ink-raised)', fg: 'var(--static)' },
   };
 
   function timeRange(startIso: string, endIso: string): string {
@@ -102,7 +104,8 @@
   /// (packet 3fba9c35, the false-empty sweep).
   let loadFailed = $state<string | null>(null);
   let loading = $state(true);
-  let empNames = $state<Map<string, string>>(new Map());
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
 
   let weekStart = $derived(addDays(startOfWeek(appNow()), weekOffset * 7));
   let weekEnd = $derived(addDays(weekStart, 7));
@@ -149,19 +152,20 @@
     };
   });
 
+  // Names only the techs on the grid, one row each, and says so when a
+  // name cannot load. Until backlog 1e73bd93 this read the WHOLE roster
+  // and dropped a refusal or a network error, so the techs silently
+  // became ids (see ../data/ownerNames.ts). Keyed on the id list as a
+  // string so paging to a week with the same techs does not re-ask.
+  let techKey = $derived(personIdsOf((data?.rows ?? []).map((r) => r.employee_id)).join('\n'));
   $effect(() => {
+    const ids = techKey ? techKey.split('\n') : [];
     let cancelled = false;
     (async () => {
-      try {
-        const r = await fetch('/api/people');
-        if (r.ok) {
-          const body = (await r.json()) as Array<{ id: string; name: string }>;
-          const m = new Map<string, string>();
-          for (const e of body) m.set(e.id, e.name);
-          if (!cancelled) empNames = m;
-        }
-      } catch {
-        // ignore
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
       }
     })();
     return () => {
@@ -194,14 +198,14 @@
   <div style="display:flex; gap:8px; margin-bottom:16px; align-items:center">
     <button
       type="button"
-      class="step-btn"
+      class="btn"
       onclick={() => (weekOffset = weekOffset - 1)}
     >
       ← Prev week
     </button>
     <button
       type="button"
-      class="step-btn"
+      class="btn"
       onclick={() => (weekOffset = 0)}
       style={`font-weight:${weekOffset === 0 ? 600 : 400}`}
     >
@@ -209,12 +213,12 @@
     </button>
     <button
       type="button"
-      class="step-btn"
+      class="btn"
       onclick={() => (weekOffset = weekOffset + 1)}
     >
       Next week →
     </button>
-    <span style="margin-left:auto; font-size:12px; color:#78716c">
+    <span style="margin-left:auto; font-size:12px; color:var(--static)">
       {formatDate(from)} → {formatDate(addDays(weekEnd, -1).toISOString())}
     </span>
   </div>
@@ -228,19 +232,24 @@
   {:else if !data || data.rows.length === 0}
     <p class="empty">No techs have availability or assignments this week.</p>
   {:else}
+    {#if namesRead.kind === 'failed'}
+      <p class="load-failed" role="alert" style="font-size:12px; margin-bottom:12px">
+        Couldn't load tech names — {namesRead.error}. Techs show as ids.
+      </p>
+    {/if}
     <div style="overflow-x:auto">
       <table class="data-table" style="min-width:900px; border-collapse:collapse">
         <thead>
           <tr>
             <th
-              style="min-width:140px; position:sticky; left:0; background:#fafaf9; z-index:1"
+              style="min-width:140px; position:sticky; left:0; background:var(--ink-raised); z-index:1"
             >
               Tech
             </th>
             {#each days as d, i (i)}
               <th style="text-align:left; min-width:130px">
-                <div style="font-size:11px; color:#78716c">{DAY_LABELS[i]}</div>
-                <div class="mono" style="font-size:11px; color:#a8a29e">
+                <div style="font-size:11px; color:var(--static)">{DAY_LABELS[i]}</div>
+                <div class="mono" style="font-size:11px; color:var(--static)">
                   {d.toISOString().slice(5, 10)}
                 </div>
               </th>
@@ -252,7 +261,7 @@
             {@const cells = cellsForRow(row)}
             <tr>
               <td
-                style="position:sticky; left:0; background:#fafaf9; z-index:1"
+                style="position:sticky; left:0; background:var(--ink-raised); z-index:1"
               >
                 <EntityLink
                   kind="employee"
@@ -262,10 +271,10 @@
               </td>
               {#each cells as blocks, i (i)}
                 <td
-                  style="vertical-align:top; padding:4px; border-left:1px solid #f5f5f4"
+                  style="vertical-align:top; padding:4px; border-left:1px solid var(--hairline)"
                 >
                   {#if blocks.length === 0}
-                    <span style="color:#d6d3d1; font-size:10px">·</span>
+                    <span style="color:var(--text-faint); font-size:10px">·</span>
                   {:else}
                     <div style="display:flex; flex-direction:column; gap:2px">
                       {#each blocks as b, j (`${b.id}-${j}`)}

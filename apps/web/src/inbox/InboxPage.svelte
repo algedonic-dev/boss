@@ -12,6 +12,7 @@
   import { href, navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
+  import { postEach, postWrite, type BulkOutcome } from './writes';
 
   /// `needs-you` is the default view, and the reason this file changed.
   ///
@@ -46,6 +47,26 @@
   let subject = $state('');
   let body = $state('');
   let sending = $state(false);
+
+  /// A write the server refused, said where it was asked (page audit
+  /// 5477d9eb; ./writes.ts has the history). Mark read's answer rides
+  /// on its row, keyed by message id; Send's rides in the modal, which
+  /// stays open so nothing typed is lost.
+  let markReadRefusals = $state<Readonly<Record<string, string>>>({});
+  let sendRefusal = $state<string | null>(null);
+
+  /// The page's OUT third (page audit 5477d9eb, GAP 8; backlog
+  /// 5963a322). One Mark read at a time was the only way a message
+  /// left view — used once in the audit window against 201 messages —
+  /// while POST /api/messages/{id}/archive sat unused. Archive takes a
+  /// row out of the inbox (the read leaves archived rows out, 8578b91e);
+  /// the bulk bar applies Mark read to every shown unread row, or
+  /// Archive to the checked ones, one per-row write each, and says how
+  /// many landed. A refusal lands on its row, as Mark read's does.
+  let archiveRefusals = $state<Readonly<Record<string, string>>>({});
+  let selected = $state<ReadonlySet<string>>(new Set());
+  let bulkBusy = $state(false);
+  let bulkNote = $state<{ text: string; refused: boolean } | null>(null);
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
@@ -105,16 +126,99 @@
     }),
   );
 
-  async function markRead(m: Message): Promise<void> {
-    if (m.read_at !== null) return;
-    try {
-      await fetch(`/api/messages/${encodeURIComponent(m.id)}/read`, {
-        method: 'POST',
-      });
-      await refreshInbox();
-    } catch {
-      // ignore
+  /// What the bulk bar acts on is always what is SHOWN: a row checked
+  /// under one filter and hidden by the next is not archived unseen.
+  let visibleUnread = $derived(visible.filter((m) => m.read_at === null));
+  let selectedShown = $derived(visible.filter((m) => selected.has(m.id)));
+  let allShownSelected = $derived(
+    visible.length > 0 && visible.every((m) => selected.has(m.id)),
+  );
+
+  /// True once the message is read. A refusal lands on the row and
+  /// answers false; an admitted write clears any earlier refusal.
+  async function markRead(m: Message): Promise<boolean> {
+    if (m.read_at !== null) return true;
+    const out = await postWrite(`/api/messages/${encodeURIComponent(m.id)}/read`);
+    markReadRefusals = Object.fromEntries(
+      Object.entries(markReadRefusals).filter(([id]) => id !== m.id),
+    );
+    if (out.kind === 'refused') {
+      markReadRefusals = { ...markReadRefusals, [m.id]: out.reason };
+      return false;
     }
+    await refreshInbox();
+    return true;
+  }
+
+  /// The entity link marks the message read, then goes. It AWAITS the
+  /// write: fired unawaited, a refusal would answer on a page already
+  /// left, which is the swallow this replaces (129da587). A refused
+  /// write keeps the viewer here, where the row says why, and the row
+  /// offers the same link without the write.
+  async function openEntity(m: Message, path: string): Promise<void> {
+    if (await markRead(m)) navigate(href(path));
+  }
+
+  /// A refusal map with `done` cleared and `refused` added.
+  function settle(
+    prior: Readonly<Record<string, string>>,
+    out: BulkOutcome,
+  ): Readonly<Record<string, string>> {
+    const cleared = Object.fromEntries(
+      Object.entries(prior).filter(([id]) => !out.done.includes(id)),
+    );
+    return { ...cleared, ...out.refused };
+  }
+
+  /// "Marked 2 of 3 read — 1 refused; each row says why."
+  function noteFor(said: string, out: BulkOutcome): typeof bulkNote {
+    const refused = Object.keys(out.refused).length;
+    return {
+      text: said + (refused ? ` — ${refused} refused; each row says why.` : '.'),
+      refused: refused > 0,
+    };
+  }
+
+  async function archive(m: Message): Promise<void> {
+    const out = await postEach([m.id], (id) => `/api/messages/${encodeURIComponent(id)}/archive`);
+    archiveRefusals = settle(archiveRefusals, out);
+    if (out.done.length) await refreshInbox();
+  }
+
+  async function markAllRead(): Promise<void> {
+    const ids = visibleUnread.map((m) => m.id);
+    bulkBusy = true;
+    bulkNote = null;
+    const out = await postEach(ids, (id) => `/api/messages/${encodeURIComponent(id)}/read`);
+    markReadRefusals = settle(markReadRefusals, out);
+    bulkNote = noteFor(`Marked ${out.done.length} of ${ids.length} read`, out);
+    bulkBusy = false;
+    await refreshInbox();
+  }
+
+  async function archiveSelected(): Promise<void> {
+    const ids = selectedShown.map((m) => m.id);
+    bulkBusy = true;
+    bulkNote = null;
+    const out = await postEach(ids, (id) => `/api/messages/${encodeURIComponent(id)}/archive`);
+    archiveRefusals = settle(archiveRefusals, out);
+    selected = new Set([...selected].filter((id) => !out.done.includes(id)));
+    bulkNote = noteFor(`Archived ${out.done.length} of ${ids.length}`, out);
+    bulkBusy = false;
+    await refreshInbox();
+  }
+
+  function toggleSelected(id: string, on: boolean): void {
+    selected = on
+      ? new Set([...selected, id])
+      : new Set([...selected].filter((s) => s !== id));
+  }
+
+  function selectAllShown(on: boolean): void {
+    const shown = new Set(visible.map((m) => m.id));
+    selected = on
+      ? new Set([...selected, ...shown])
+      : new Set([...selected].filter((s) => !shown.has(s)));
   }
 
   function formatAge(iso: string): string {
@@ -134,27 +238,31 @@
   async function send(): Promise<void> {
     if (!recipientId || !subject || !body || !userId) return;
     sending = true;
-    try {
-      const r = await fetch('/api/messages/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sender_id: userId,
-          recipient_id: recipientId,
-          subject,
-          body,
-        }),
-      });
-      if (r.ok) {
-        composing = false;
-        recipientId = '';
-        subject = '';
-        body = '';
-        await refreshInbox();
-      }
-    } finally {
-      sending = false;
+    sendRefusal = null;
+    const out = await postWrite('/api/messages/send', {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sender_id: userId,
+        recipient_id: recipientId,
+        subject,
+        body,
+      }),
+    });
+    sending = false;
+    if (out.kind === 'refused') {
+      sendRefusal = out.reason;
+      return;
     }
+    composing = false;
+    recipientId = '';
+    subject = '';
+    body = '';
+    await refreshInbox();
+  }
+
+  function openCompose(): void {
+    sendRefusal = null;
+    composing = true;
   }
 </script>
 
@@ -181,7 +289,7 @@
          sees Compose disabled with the sign-in note, not a live modal
          whose Send 403s. -->
     <WriteGate>
-      <button class="hr-action-btn" onclick={() => (composing = true)}>Compose</button>
+      <button class="btn btn-sm btn-primary" onclick={openCompose}>Compose</button>
     </WriteGate>
   </div>
 
@@ -237,15 +345,18 @@
             placeholder="Write your message..."
           ></textarea>
         </div>
+        {#if sendRefusal !== null}
+          <p class="compose-refused" role="alert">Not sent — {sendRefusal}</p>
+        {/if}
         <div class="compose-actions">
           <button
-            class="hr-action-btn"
+            class="btn btn-primary"
             onclick={send}
             disabled={sending || !recipientId || !subject || !body}
           >
             {sending ? 'Sending...' : 'Send'}
           </button>
-          <button class="hr-detail-btn" onclick={() => (composing = false)}>Cancel</button>
+          <button class="btn" onclick={() => (composing = false)}>Cancel</button>
         </div>
       </div>
     </div>
@@ -281,6 +392,16 @@
     </aside>
 
     <section class="list-section">
+      <!-- Above the list, not in it: a bulk write that empties the
+           filter still says what it did. -->
+      {#if bulkNote !== null}
+        <p
+          class="inbox-bulk-note {bulkNote.refused ? 'inbox-bulk-note-refused' : ''}"
+          role={bulkNote.refused ? 'alert' : 'status'}
+        >
+          {bulkNote.text}
+        </p>
+      {/if}
       {#if inbox.kind === 'loading'}
         <p class="empty">Loading…</p>
       {:else if inbox.kind === 'failed'}
@@ -289,16 +410,50 @@
           Couldn't load your inbox — {inbox.error}
         </p>
         <div style="padding:0 32px">
-          <button class="hr-action-btn" onclick={() => void refreshInbox()}>Retry</button>
+          <button class="btn btn-sm" onclick={() => void refreshInbox()}>Retry</button>
         </div>
       {:else if visible.length === 0}
         <p class="empty">No messages match those filters.</p>
       {:else}
+        <!-- The bulk bar acts on what is shown (backlog 5963a322). -->
+        <WriteGate>
+          <div class="inbox-bulk">
+            <label class="inbox-bulk-all">
+              <input
+                type="checkbox"
+                checked={allShownSelected}
+                onchange={(e) => selectAllShown(e.currentTarget.checked)}
+              />
+              Select all shown
+            </label>
+            <button
+              class="inbox-mark-read"
+              onclick={() => void markAllRead()}
+              disabled={bulkBusy || visibleUnread.length === 0}
+            >
+              Mark all read ({visibleUnread.length})
+            </button>
+            <button
+              class="inbox-mark-read"
+              onclick={() => void archiveSelected()}
+              disabled={bulkBusy || selectedShown.length === 0}
+            >
+              Archive selected ({selectedShown.length})
+            </button>
+          </div>
+        </WriteGate>
         <div class="inbox-list">
           {#each visible as m (m.id)}
             {@const isUnread = m.read_at === null}
             <div class="inbox-row {isUnread ? 'inbox-row-unread' : ''}">
               <div class="inbox-row-header">
+                <input
+                  type="checkbox"
+                  class="inbox-select"
+                  aria-label="Select {m.subject}"
+                  checked={selected.has(m.id)}
+                  onchange={(e) => toggleSelected(m.id, e.currentTarget.checked)}
+                />
                 <span class="inbox-kind inbox-kind-{m.kind}">
                   {m.kind === 'signal' ? '⚡' : '✉'}
                 </span>
@@ -315,7 +470,24 @@
                     Mark read
                   </button>
                 {/if}
+                <button
+                  class="inbox-mark-read inbox-archive"
+                  onclick={() => void archive(m)}
+                  title="Archive: take it out of the inbox"
+                >
+                  Archive
+                </button>
               </div>
+              {#if markReadRefusals[m.id]}
+                <p class="inbox-write-refused" role="alert">
+                  Not marked read — {markReadRefusals[m.id]}
+                </p>
+              {/if}
+              {#if archiveRefusals[m.id]}
+                <p class="inbox-write-refused" role="alert">
+                  Not archived — {archiveRefusals[m.id]}
+                </p>
+              {/if}
               <div class="inbox-subject {isUnread ? 'inbox-subject-bold' : ''}">
                 {m.subject}
               </div>
@@ -333,12 +505,23 @@
                       class="inbox-entity-link"
                       onclick={(e) => {
                         e.preventDefault();
-                        void markRead(m);
-                        navigate(href(path));
+                        void openEntity(m, path);
                       }}
                     >
                       {m.entity_ref.entity_type}: {m.entity_ref.entity_id}
                     </a>
+                    {#if markReadRefusals[m.id]}
+                      <a
+                        href={href(path)}
+                        class="inbox-entity-link inbox-open-anyway"
+                        onclick={(e) => {
+                          e.preventDefault();
+                          navigate(href(path));
+                        }}
+                      >
+                        Open without marking read
+                      </a>
+                    {/if}
                   {:else}
                     <span class="mono">
                       {m.entity_ref.entity_type}: {m.entity_ref.entity_id}

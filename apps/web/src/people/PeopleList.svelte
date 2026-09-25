@@ -11,18 +11,24 @@
   import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
   import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import OrgTreeNode from './OrgTreeNode.svelte';
+  import { classLabel, employmentTone, type Employee } from './types';
   import {
-    employmentTone,
-    humanizeClassCode,
-    type Department,
-    type Employee,
-    type EmploymentStatus,
-  } from './types';
-  import { expiringCerts, tenureYears } from './utils';
-  import { href } from '../router';
+    departmentBuckets,
+    expiringCerts,
+    statusBuckets,
+    tenureYears,
+    type CodeFilter,
+  } from './utils';
+  import { countedLabel, rosterHeader, rosterRead } from './roster-counts';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
+  import { href, navigate } from '../router';
 
-  type DeptFilter = Department | 'all';
-  type StatusFilter = EmploymentStatus | 'all';
+  /// Status: a status code, `null` for the rows with no status yet
+  /// ("unknown"), or All. Department: a department code, `null` for the
+  /// rows with no department, or All.
+  type StatusFilter = CodeFilter;
+  type DeptFilter = CodeFilter;
 
   let roster = $state<Employee[]>([]);
   /// Non-null when the roster load failed — rendered instead of the
@@ -30,8 +36,8 @@
   /// 3fba9c35, the false-empty sweep).
   let loadFailed = $state<string | null>(null);
   let loading = $state(true);
-  let dept = $state<DeptFilter>('all');
-  let status = $state<StatusFilter>('active');
+  let dept = $state<DeptFilter>({ kind: 'all' });
+  let status = $state<StatusFilter>({ kind: 'code', code: 'active' });
   let query = $state('');
 
   $effect(() => {
@@ -61,22 +67,46 @@
 
   let activeRoster = $derived(roster.filter((e) => e.status === 'active'));
 
-  let headcountByDept = $derived.by(() => {
-    const m = new Map<Department, number>();
-    for (const e of activeRoster)
-      if (e.department) m.set(e.department, (m.get(e.department) ?? 0) + 1);
-    return m;
-  });
-
   let expiring90 = $derived(expiringCerts(90, roster));
 
+  // The header and the filter buttons count only a roster that was
+  // read — backlog 47eadca3: they counted the `[]` it starts as, so a
+  // loading or failed read printed "0 active employees" and Active (0)
+  // above an honest "Couldn't load the roster".
+  let read = $derived(rosterRead(loading, loadFailed));
+  let header = $derived(rosterHeader(read, activeRoster.length, expiring90.length));
+
+  // The Status buttons come from the (employee, status) Classes (loaded
+  // at boot by App.svelte), plus Unknown when a row has no status —
+  // backlog 01c268d6: the hand-written Active / On leave pair left
+  // terminated and null-status rows reachable only under All, uncounted.
+  let statusButtons = $derived(statusBuckets(roster, classesFor('employee', 'status')));
+
+  // Department and role labels come from the same registry, by
+  // display_name — backlog 8a331c9b: every code went through
+  // humanizeClassCode, so `operations` printed Operations where its
+  // Class says Operations / IT. classLabel humanizes only a code the
+  // registry lacks, or every code while it is still loading.
+  let departmentClasses = $derived(classesFor('employee', 'department'));
+  let roleClasses = $derived(classesFor('employee', 'role'));
+
+  // The rows the Status selection admits. The Department buttons count
+  // these, not the active rows — backlog 1410f145: counted from active
+  // rows they contradicted the table under On leave or All, and a
+  // department of on-leave or terminated people had no button.
+  let statusAdmitted = $derived.by(() => {
+    if (status.kind === 'all') return roster;
+    const code = status.code;
+    return roster.filter((e) => e.status === code);
+  });
+  let deptButtons = $derived(departmentBuckets(statusAdmitted, dept, departmentClasses));
+
   let visible = $derived(
-    roster.filter((e) => {
-      if (status !== 'all' && e.status !== status) return false;
-      if (dept !== 'all' && e.department !== dept) return false;
+    statusAdmitted.filter((e) => {
+      if (dept.kind === 'code' && e.department !== dept.code) return false;
       if (query) {
         const q = query.toLowerCase();
-        const hay = `${e.id} ${e.name} ${e.email} ${humanizeClassCode(e.role)}`.toLowerCase();
+        const hay = `${e.id} ${e.name} ${e.email} ${classLabel(e.role, roleClasses)}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -104,23 +134,13 @@
     sort.sorted(visible, {
       id: (e) => e.id,
       name: (e) => e.name,
-      role: (e) => humanizeClassCode(e.role),
+      role: (e) => classLabel(e.role, roleClasses),
       dept: (e) => `${e.department ?? ''} ${e.name ?? ''}`,
       tenure: (e) => tenureYears(e),
       skills: (e) => e.skills.length,
       location: (e) => e.location,
       status: (e) => e.status,
     }),
-  );
-
-  let DEPTS = $derived(
-    Array.from(
-      new Set(
-        activeRoster
-          .map((e) => e.department)
-          .filter((d): d is Department => d !== null),
-      ),
-    ).sort(),
   );
 
   // Tree view — group employees by manager_id so the hierarchy
@@ -155,8 +175,8 @@
 <div class="catalog theme-exec">
   <PageHeader
     eyebrow="People"
-    title={`${activeRoster.length} active employees`}
-    subtitle={`${expiring90.length} certifications expiring in 90 days`}
+    title={header.title}
+    subtitle={header.subtitle}
   />
 
   <div class="catalog-layout">
@@ -175,24 +195,29 @@
       </FilterGroup>
 
       <FilterGroup label="Status">
-          <FilterButton active={status === 'active'} onclick={() => (status = 'active')}>
-              Active ({roster.filter((e) => e.status === 'active').length})
-          </FilterButton>
-          <FilterButton active={status === 'on-leave'} onclick={() => (status = 'on-leave')}>
-              On leave ({roster.filter((e) => e.status === 'on-leave').length})
-          </FilterButton>
-          <FilterButton active={status === 'all'} onclick={() => (status = 'all')}>
-            All ({roster.length})
+          {#each statusButtons as b (b.code ?? '')}
+            <FilterButton
+              active={status.kind === 'code' && status.code === b.code}
+              onclick={() => (status = { kind: 'code', code: b.code })}
+            >
+              {countedLabel(b.label, b.count, read)}
+            </FilterButton>
+          {/each}
+          <FilterButton active={status.kind === 'all'} onclick={() => (status = { kind: 'all' })}>
+            {countedLabel('All', roster.length, read)}
           </FilterButton>
       </FilterGroup>
 
       <FilterGroup label="Department">
-          <FilterButton active={dept === 'all'} onclick={() => (dept = 'all')}>
-            All ({activeRoster.length})
+          <FilterButton active={dept.kind === 'all'} onclick={() => (dept = { kind: 'all' })}>
+            {countedLabel('All', statusAdmitted.length, read)}
           </FilterButton>
-          {#each DEPTS as d (d)}
-            <FilterButton active={dept === d} onclick={() => (dept = d)}>
-                {humanizeClassCode(d)} ({headcountByDept.get(d) ?? 0})
+          {#each deptButtons as b (b.code ?? '')}
+            <FilterButton
+              active={dept.kind === 'code' && dept.code === b.code}
+              onclick={() => (dept = { kind: 'code', code: b.code })}
+            >
+              {countedLabel(b.label, b.count, read)}
             </FilterButton>
           {/each}
       </FilterGroup>
@@ -238,15 +263,20 @@
           </thead>
           <tbody>
             {#each sortedVisible as e (e.id)}
-              <tr class="data-table-row-link">
+              <tr
+                use:rowLink={{
+                  onActivate: () => navigate(entityHref('employee', e.id)),
+                  label: `${e.name} (${e.id})`,
+                }}
+              >
                 <td class="mono">
                   <Link to={entityHref('employee', e.id)}>
                     {e.id}
                   </Link>
                 </td>
                 <td>{e.name}</td>
-                <td class="prose-cell">{humanizeClassCode(e.role)}</td>
-                <td>{humanizeClassCode(e.department)}</td>
+                <td class="prose-cell">{classLabel(e.role, roleClasses)}</td>
+                <td>{classLabel(e.department, departmentClasses)}</td>
                 <td class="num">{tenureYears(e).toFixed(1)}y</td>
                 <td class="num">{e.skills.length}</td>
                 <td>{e.location}</td>

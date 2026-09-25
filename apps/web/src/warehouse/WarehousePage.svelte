@@ -23,7 +23,18 @@
     type StockStatus,
   } from '../parts/types';
   import type { WarehouseStatus } from './types';
-  import { href } from '../router';
+  import { warehouseHeader } from './header';
+  import {
+    countLabel,
+    failedRead,
+    failedWithReason,
+    listView,
+    loadingRead,
+    okRead,
+    type ReadState,
+  } from '../data/readState';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
+  import { href, navigate } from '../router';
 
   type Tab = 'overview' | 'inventory' | 'receiving';
   const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
@@ -35,36 +46,48 @@
   let inventory = $state<InventoryItem[]>([]);
   let purchaseOrders = $state<PurchaseOrder[]>([]);
   let status = $state<WarehouseStatus | null>(null);
-  /// Non-null when the inventory/PO reads failed — rendered instead
-  /// of "0 tracked SKUs" and empty tables, which an outage is not
-  /// (packet 3fba9c35, the false-empty sweep). The status tile keeps
-  /// its own honest "unavailable" render.
-  let loadFailed = $state<string | null>(null);
-  let statusLoading = $state(true);
+  /// One outcome PER READ (packet 3fba9c35 made the failure visible;
+  /// backlog fcd0e29e split it): a single shared `loadFailed` blanked
+  /// the Receiving tab when only items failed, naming purchase orders,
+  /// and one network error rejected all three reads at once. Each starts
+  /// LOADING, not ok: starting as ok claimed an answer that had not
+  /// arrived, so the Inventory and Receiving tabs said "No items/POs
+  /// match that filter." and the header and filters counted zeros for
+  /// the whole loading window (backlog 20410830, 82674b2b, 8b1deea2).
+  let itemsRead = $state<ReadState>(loadingRead);
+  let ordersRead = $state<ReadState>(loadingRead);
+  let statusRead = $state<ReadState>(loadingRead);
   let tab = $state<Tab>('overview');
 
-  async function loadAll(): Promise<void> {
+  /// One GET, settled on its own. A refusal keeps the server's status
+  /// AND its text: warehouse-status answers 503 "not configured" or 502
+  /// naming the failing leg, and the page used to keep neither, so an
+  /// operator could not tell the two apart (backlog 0dcb0200).
+  async function read(url: string): Promise<{ state: ReadState; body: unknown }> {
     try {
-      const [iResp, pResp, sResp] = await Promise.all([
-        fetch('/api/inventory/items'),
-        fetch('/api/inventory/orders'),
-        fetch('/api/inventory/warehouse-status'),
-      ]);
-      if (iResp.ok) {
-        const body = await iResp.json();
-        inventory = Array.isArray(body) ? body : (body.data ?? []);
-      }
-      if (pResp.ok) {
-        const body = await pResp.json();
-        purchaseOrders = Array.isArray(body) ? body : (body.data ?? []);
-      }
-      if (sResp.ok) status = (await sResp.json()) as WarehouseStatus;
-      const down = [iResp, pResp].find((x) => !x.ok);
-      loadFailed = down ? `HTTP ${down.status}` : null;
+      const r = await fetch(url);
+      if (!r.ok) return { state: failedWithReason(r.status, await r.text()), body: null };
+      return { state: okRead, body: await r.json() };
     } catch (e) {
-      loadFailed = e instanceof Error ? e.message : String(e);
+      return { state: failedRead(e instanceof Error ? e.message : String(e)), body: null };
     }
-    statusLoading = false;
+  }
+
+  function rowsOf<T>(body: unknown): T[] {
+    if (Array.isArray(body)) return body as T[];
+    return (body as { data?: T[] } | null)?.data ?? [];
+  }
+
+  async function loadAll(): Promise<void> {
+    const [i, p, s] = await Promise.all([
+      read('/api/inventory/items'),
+      read('/api/inventory/orders'),
+      read('/api/inventory/warehouse-status'),
+    ]);
+    [itemsRead, ordersRead, statusRead] = [i.state, p.state, s.state];
+    if (i.state.kind === 'ok') inventory = rowsOf<InventoryItem>(i.body);
+    if (p.state.kind === 'ok') purchaseOrders = rowsOf<PurchaseOrder>(p.body);
+    if (s.state.kind === 'ok') status = s.body as WarehouseStatus;
   }
 
   $effect(() => {
@@ -79,30 +102,16 @@
     })),
   );
 
-  let headerTitle = $derived(
-    status
-      ? `${status.parts_stock.total_skus} tracked SKUs`
-      : `${inventory.length} tracked SKUs`,
+  let header = $derived(
+    warehouseHeader(
+      { read: statusRead, body: status },
+      {
+        read: itemsRead,
+        skus: inventory.length,
+        belowReorder: inventoryRows.filter((r) => r.available <= r.item.reorder_point).length,
+      },
+    ),
   );
-  // Tenant-aware subtitle: drop the refurb-WIP / ready-for-sale
-  // segments when they're zero. Brewery never has either; used-
-  // device-shop always has both — same code, no per-tenant gate.
-  let headerSubtitle = $derived.by(() => {
-    if (!status) {
-      return `${inventoryRows.filter((r) => r.available <= r.item.reorder_point).length} below reorder point`;
-    }
-    const parts = [
-      `${status.parts_stock.below_reorder_count} below reorder`,
-      `${status.inbound_pos.total_open} open POs`,
-    ];
-    if (status.refurb_wip.total_in_flight > 0) {
-      parts.push(`${status.refurb_wip.total_in_flight} refurb WIP`);
-    }
-    if (status.ready_for_sale_count > 0) {
-      parts.push(`${status.ready_for_sale_count} ready for sale`);
-    }
-    return parts.join(' · ');
-  });
 
   // Inventory filter
   type InvFilter = 'all' | 'critical' | 'low';
@@ -142,6 +151,8 @@
     }),
   );
 
+  let invView = $derived(listView([{ source: 'inventory', state: itemsRead }], invVisible.length));
+
   let invCritical = $derived(
     inventoryRows.filter((r) => r.status === 'critical' || r.status === 'out').length,
   );
@@ -175,6 +186,9 @@
       if (poFilter === 'open') return po.status !== 'received' && po.status !== 'closed';
       return po.status === poFilter;
     }),
+  );
+  let poView = $derived(
+    listView([{ source: 'purchase orders', state: ordersRead }], poVisible.length),
   );
 
   // Create PO modal
@@ -221,7 +235,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <PageHeader eyebrow="Warehouse" title={headerTitle} subtitle={headerSubtitle} />
+  <PageHeader eyebrow="Warehouse" title={header.title} subtitle={header.subtitle} />
 
   <nav class="tabs" role="tablist">
     {#each TABS as t (t.id)}
@@ -238,41 +252,17 @@
   </nav>
 
   {#if tab === 'overview'}
-    {#if statusLoading && !status}
+    {#if statusRead.kind === 'loading' && !status}
       <p class="empty" style="padding:16px">Loading warehouse status…</p>
     {:else if !status}
-      <p class="empty" style="padding:16px">Warehouse status unavailable.</p>
+      <!-- The shared failure marker (sweep c3e4edcc, warehouse gap 3),
+           like the Inventory and Receiving tabs' lines. -->
+      <p class="empty load-failed" role="alert" style="margin:16px 0">
+        Warehouse status unavailable{statusRead.kind === 'failed' ? ` — ${statusRead.error}` : '.'}
+      </p>
     {:else}
       {@const s = status}
       <div class="tab-content" style="padding:16px 0; display:flex; flex-direction:column; gap:16px">
-        {#if s.refurb_wip.total_in_flight > 0 || s.ready_for_sale_count > 0}
-          <!-- Tenant-aware refurb pipeline. Brewery never has
-               either bucket populated → section hides. Used-device-
-               shop always does → section shows. No tenant flag, no
-               per-tenant code path. -->
-          <section class="tab-section">
-            <h3 style="margin-top:0">
-              Refurb pipeline · {s.refurb_wip.total_in_flight.toLocaleString()} in flight ·
-              <span style="color:#065f46">{s.ready_for_sale_count.toLocaleString()}</span>
-              ready for sale
-            </h3>
-            <div style="display:flex; gap:8px; flex-wrap:wrap">
-              {#each s.refurb_wip.by_stage as row (row.stage)}
-                <div
-                  style="flex:1 1 0; min-width:120px; padding:10px 12px; border:1px solid #e7e5e4; border-radius:8px; background:#fafaf9"
-                >
-                  <div style="font-size:11px; color:#78716c; text-transform:uppercase; letter-spacing:0.4px">
-                    {row.stage}
-                  </div>
-                  <div style="font-size:24px; font-weight:600; margin-top:2px">
-                    {row.count.toLocaleString()}
-                  </div>
-                </div>
-              {/each}
-            </div>
-          </section>
-        {/if}
-
         <div style="display:flex; flex-wrap:wrap; gap:16px">
           <Section title="Parts stock">
               {@const ps = s.parts_stock}
@@ -283,7 +273,7 @@
                 <dt>Available</dt><dd><strong>{ps.total_available.toLocaleString()}</strong></dd>
                 <dt>Below reorder</dt>
                 <dd>
-                  <strong style={`color:${ps.below_reorder_count > 0 ? '#dc2626' : '#059669'}`}>
+                  <strong style={`color:${ps.below_reorder_count > 0 ? 'var(--err)' : 'var(--ok)'}`}>
                     {ps.below_reorder_count.toLocaleString()}
                   </strong>
                 </dd>
@@ -299,7 +289,7 @@
                 <dt>In transit</dt><dd><strong>{ip.in_transit_count.toLocaleString()}</strong></dd>
                 <dt>Late</dt>
                 <dd>
-                  <strong style={`color:${ip.late_count > 0 ? '#dc2626' : '#059669'}`}>
+                  <strong style={`color:${ip.late_count > 0 ? 'var(--err)' : 'var(--ok)'}`}>
                     {ip.late_count.toLocaleString()}
                   </strong>
                 </dd>
@@ -316,7 +306,7 @@
                 <dt>In transit</dt><dd><strong>{os.in_transit.toLocaleString()}</strong></dd>
                 <dt>Exception</dt>
                 <dd>
-                  <strong style={`color:${os.exception > 0 ? '#dc2626' : '#059669'}`}>
+                  <strong style={`color:${os.exception > 0 ? 'var(--err)' : 'var(--ok)'}`}>
                     {os.exception.toLocaleString()}
                   </strong>
                 </dd>
@@ -347,7 +337,12 @@
               </thead>
               <tbody>
                 {#each s.parts_stock.below_reorder_items as r (r.part_sku)}
-                  <tr class="data-table-row-link">
+                  <tr
+                    use:rowLink={{
+                      onActivate: () => navigate(entityHref('part', r.part_sku)),
+                      label: `Part ${r.part_sku}`,
+                    }}
+                  >
                     <td class="mono">
                       <Link to={entityHref('part', r.part_sku)}>
                         {r.part_sku}
@@ -371,23 +366,25 @@
       <aside class="catalog-filters">
         <FilterGroup label="Status">
             <FilterButton active={invFilter === 'all'} onclick={() => (invFilter = 'all')}>
-              All ({inventoryRows.length})
+              {countLabel('All', itemsRead, inventoryRows.length)}
             </FilterButton>
             <FilterButton active={invFilter === 'critical'} onclick={() => (invFilter = 'critical')}>
-              Critical / Out ({invCritical})
+              {countLabel('Critical / Out', itemsRead, invCritical)}
             </FilterButton>
             <FilterButton active={invFilter === 'low'} onclick={() => (invFilter = 'low')}>
-              Low ({invLow})
+              {countLabel('Low', itemsRead, invLow)}
             </FilterButton>
         </FilterGroup>
       </aside>
 
       <section class="list-section">
-        {#if loadFailed}
+        {#if invView.kind === 'failed'}
           <p class="empty load-failed" role="alert">
-            Couldn't load inventory — {loadFailed}
+            Couldn't load {invView.source} — {invView.error}
           </p>
-        {:else if invVisible.length === 0}
+        {:else if invView.kind === 'loading'}
+          <p class="empty">Loading {invView.source}…</p>
+        {:else if invView.kind === 'empty'}
           <p class="empty">No items match that filter.</p>
         {:else}
           <table class="data-table data-table-striped">
@@ -404,7 +401,12 @@
             </thead>
             <tbody>
               {#each invSorted as r (r.item.part_sku)}
-                <tr class="data-table-row-link">
+                <tr
+                  use:rowLink={{
+                    onActivate: () => navigate(entityHref('part', r.item.part_sku)),
+                    label: `Part ${r.item.part_sku}`,
+                  }}
+                >
                   <td class="mono">
                     <Link to={entityHref('part', r.item.part_sku)}>
                       {r.item.part_sku}
@@ -428,10 +430,10 @@
       <aside class="catalog-filters">
         <FilterGroup label="PO status">
             <FilterButton active={poFilter === 'open'} onclick={() => (poFilter = 'open')}>
-              Open ({openPoCount})
+              {countLabel('Open', ordersRead, openPoCount)}
             </FilterButton>
             <FilterButton active={poFilter === 'all'} onclick={() => (poFilter = 'all')}>
-              All ({purchaseOrders.length})
+              {countLabel('All', ordersRead, purchaseOrders.length)}
             </FilterButton>
             {#each PO_STATUSES as s (s)}
               {@const c = poCounts.get(s) ?? 0}
@@ -446,12 +448,12 @@
 
       <section class="list-section">
         <div style="margin-bottom:12px; display:flex; gap:8px; align-items:center">
-          <button class="hr-action-btn" onclick={() => (showCreatePo = !showCreatePo)}>
+          <button class="btn btn-sm" onclick={() => (showCreatePo = !showCreatePo)}>
             {showCreatePo ? 'Cancel' : 'Create PO'}
           </button>
           {#if createPoStatus}
             <span
-              style={`font-size:12px; color:${createPoStatus.startsWith('Error') ? '#dc2626' : '#16a34a'}`}
+              style={`font-size:12px; color:${createPoStatus.startsWith('Error') ? 'var(--err)' : 'var(--ok)'}`}
             >
               {createPoStatus}
             </span>
@@ -460,11 +462,11 @@
 
         {#if showCreatePo}
           <div
-            style="padding:12px 16px; border:1px solid #e7e5e4; border-radius:8px; margin-bottom:16px; background:#fafaf9"
+            style="padding:12px 16px; border:1px solid var(--hairline); border-radius:8px; margin-bottom:16px; background:var(--ink-raised)"
           >
             <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:end">
               <div>
-                <label for="cpo-vendor" style="display:block; font-size:11px; font-weight:600; color:#78716c; margin-bottom:2px">Vendor</label>
+                <label for="cpo-vendor" style="display:block; font-size:11px; font-weight:600; color:var(--static); margin-bottom:2px">Vendor</label>
                 <input
                   id="cpo-vendor"
                   class="hr-select"
@@ -474,7 +476,7 @@
                 />
               </div>
               <div>
-                <label for="cpo-sku" style="display:block; font-size:11px; font-weight:600; color:#78716c; margin-bottom:2px">Part SKU</label>
+                <label for="cpo-sku" style="display:block; font-size:11px; font-weight:600; color:var(--static); margin-bottom:2px">Part SKU</label>
                 <select id="cpo-sku" class="hr-select" bind:value={createPoSku} style="width:200px">
                   <option value="">Select part...</option>
                   {#each inventory as item (item.part_sku)}
@@ -483,7 +485,7 @@
                 </select>
               </div>
               <div>
-                <label for="cpo-qty" style="display:block; font-size:11px; font-weight:600; color:#78716c; margin-bottom:2px">Qty</label>
+                <label for="cpo-qty" style="display:block; font-size:11px; font-weight:600; color:var(--static); margin-bottom:2px">Qty</label>
                 <input
                   id="cpo-qty"
                   class="hr-select"
@@ -494,7 +496,7 @@
                 />
               </div>
               <div>
-                <label for="cpo-cost" style="display:block; font-size:11px; font-weight:600; color:#78716c; margin-bottom:2px">Unit cost ($)</label>
+                <label for="cpo-cost" style="display:block; font-size:11px; font-weight:600; color:var(--static); margin-bottom:2px">Unit cost ($)</label>
                 <input
                   id="cpo-cost"
                   class="hr-select"
@@ -505,7 +507,7 @@
                 />
               </div>
               <button
-                class="hr-action-btn"
+                class="btn btn-sm btn-primary"
                 onclick={handleCreatePo}
                 disabled={!createPoVendor || !createPoSku}
               >
@@ -515,11 +517,13 @@
           </div>
         {/if}
 
-        {#if loadFailed}
+        {#if poView.kind === 'failed'}
           <p class="empty load-failed" role="alert">
-            Couldn't load purchase orders — {loadFailed}
+            Couldn't load {poView.source} — {poView.error}
           </p>
-        {:else if poVisible.length === 0}
+        {:else if poView.kind === 'loading'}
+          <p class="empty">Loading {poView.source}…</p>
+        {:else if poView.kind === 'empty'}
           <p class="empty">No POs match that filter.</p>
         {:else}
           <table class="data-table data-table-striped">
@@ -535,7 +539,13 @@
             </thead>
             <tbody>
               {#each poVisible as po (po.id)}
-                <tr id={`po-${po.id}`} class="data-table-row-link">
+                <tr
+                  id={`po-${po.id}`}
+                  use:rowLink={{
+                    onActivate: () => navigate(entityHref('po', po.id)),
+                    label: `Purchase order ${po.id}`,
+                  }}
+                >
                   <td class="mono"><EntityLink kind="po" id={po.id} /></td>
                   <td><EntityLink kind="vendor" id={po.vendor} /></td>
                   <td>{po.status.replace(/-/g, ' ')}</td>

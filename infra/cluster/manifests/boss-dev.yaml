@@ -152,6 +152,23 @@ subjects:
     name: dev-session
     namespace: boss-dev
 ---
+# WHO THE BUILD NODE EVICTS FIRST. Under disk pressure the kubelet ranks
+# pods by "usage exceeds request", then by priority. Gates run at the
+# default 0 and are the one workload a retry recovers; this pod holds
+# the operator's live session, two builders' shells and the warm
+# target/. Measured 2026-09-23: evicted six times in eight days, every
+# time for ephemeral-storage on w-1 while a gate built
+# (the_dev_pod_is_not_the_first_evicted.rs). Never preempts: this
+# orders eviction only, and must not bump a running gate at scheduling.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: boss-dev-session
+value: 1000
+globalDefault: false
+preemptionPolicy: Never
+description: "The interactive dev session outranks gate Jobs under node pressure; never preempts."
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -219,6 +236,7 @@ spec:
       # a hand-carried gate verb on another machine.
       serviceAccountName: dev-session
       automountServiceAccountToken: true
+      priorityClassName: boss-dev-session
       # PID 1 must reap. The dev container's entrypoint is `sleep`,
       # which never wait()s, so daemonized children became unkillable
       # zombies during the ssh door's first bring-up (2026-08-30).
@@ -230,6 +248,10 @@ spec:
         # The workspace volume is group-owned so a non-root build can
         # write to it, matching boss.yaml's posture for boss-auth.
         fsGroup: 1500
+        # Re-own the PVC only when its root is wrong. The default walks
+        # all 40Gi on every mount — the kubelet's own "taking longer than
+        # expected" warning on the 2026-09-23 restart.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: dev
@@ -258,16 +280,37 @@ spec:
           command: ["sleep", "infinity"]
           securityContext:
             allowPrivilegeEscalation: false
-            # SETGID/SETUID and nothing else: the ssh door (02f4a2ee,
-            # David 2026-08-30: "I just want to do the ssh link") needs
-            # to spawn a session as the connecting user. Dropbear over
-            # OpenSSH precisely because sshd's mandatory preauth chroot
-            # would ALSO need SYS_CHROOT — measured on the live pod:
-            # sshd failed chroot(), dropbear failed only setgid, and
-            # this pair is the whole difference.
+            # SETGID/SETUID because the ssh door (02f4a2ee, David
+            # 2026-08-30: "I just want to do the ssh link") spawns a
+            # session as the connecting user, and SYS_CHROOT because
+            # the door is now OpenSSH (design 5fc71f03, backlog
+            # e4cedb46) and sshd's preauth privsep child chroots to
+            # /run/sshd.
+            #
+            # THAT CHROOT IS WHY DROPBEAR WAS HERE. Measured on the
+            # live pod 2026-08-30: sshd failed chroot(), dropbear
+            # failed only setgid, and this one capability was the
+            # whole difference — so the cheaper door was taken. It was
+            # re-measured 2026-09-20 in the dev pod, unchanged:
+            # CapEff 0x00000000000000c0, SETGID + SETUID and nothing
+            # else. What changed is the requirement, not the cost:
+            # Dropbear cannot verify a user certificate against a CA,
+            # and a certificate the edge issues per session is the
+            # whole point of an Access SSH door. One capability, in
+            # exchange for retiring a key that lived forever.
+            #
+            # AUDIT_WRITE because the swap was tried only with ssh -T.
+            # Every INTERACTIVE login authenticated, allocated a pty,
+            # and died 0.1s later: Debian's sshd records a pty login to
+            # the kernel audit subsystem and ends the session when that
+            # write is refused ("linux_audit_write_entry failed:
+            # Operation not permitted"). Reproduced 2026-09-23 against a
+            # debug sshd in the live pod; ssh -T allocates no pty, so it
+            # was the one login that worked. Baseline Pod Security
+            # allows it, like the other three.
             capabilities:
               drop: ["ALL"]
-              add: ["SETGID", "SETUID"]
+              add: ["SETGID", "SETUID", "SYS_CHROOT", "AUDIT_WRITE"]
           ports:
             - {name: ssh, containerPort: 22}
           # The ssh door + session env, declared. Everything in here
@@ -281,8 +324,8 @@ spec:
           # closed and the pod healthy — kubectl exec still works and
           # /work/ssh/postStart.log holds the evidence. Accepted debt:
           # apt runs on every pod start (network dependency); the
-          # upgrade is baking dropbear into boss-ci, worth doing only
-          # if boot flakiness is ever actually observed.
+          # upgrade is baking openssh-server into boss-ci, worth doing
+          # only if boot flakiness is ever actually observed.
           lifecycle:
             postStart:
               exec:
@@ -290,6 +333,11 @@ spec:
                   - bash
                   - -c
                   - |
+                    # Truncated ONCE here, then written O_APPEND by the block
+                    # below AND by dev-claude.sh, which appends its drain
+                    # verdict from inside tmux while this block may still
+                    # hold the file open (backlog 7a581397).
+                    mkdir -p /work/ssh && : > /work/ssh/postStart.log
                     {
                     set -x
                     export DEBIAN_FRONTEND=noninteractive
@@ -297,8 +345,25 @@ spec:
                     printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99-pod-no-sandbox
                     mkdir -p /tmp/apt /work/ssh /root/.ssh /work/home
                     apt-get -o Dir::Cache::archives=/tmp/apt update -qq || true
-                    apt-get -o Dir::Cache::archives=/tmp/apt install -y --no-install-recommends dropbear-bin openssh-sftp-server || true
-                    [ -f /work/ssh/dropbear_ed25519_host_key ] || dropbearkey -t ed25519 -f /work/ssh/dropbear_ed25519_host_key
+                    apt-get -o Dir::Cache::archives=/tmp/apt install -y --no-install-recommends openssh-server openssh-sftp-server || true
+                    # The privsep child needs its user and its chroot
+                    # target. The package's postinst makes both; the
+                    # fallback is here because this whole block is
+                    # best-effort and a half-installed apt must not
+                    # leave a door that refuses every login with
+                    # "Privilege separation user sshd does not exist"
+                    # (measured 2026-09-20: that is sshd's refusal, and
+                    # it comes AFTER the config parse, so a valid
+                    # config is not what is missing).
+                    getent passwd sshd >/dev/null || useradd --system --no-create-home --home-dir /run/sshd --shell /usr/sbin/nologin sshd || true
+                    mkdir -p /run/sshd && chmod 0755 /run/sshd
+                    [ -f /work/ssh/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f /work/ssh/ssh_host_ed25519_key
+                    # The pod's fsGroup (1500) re-modes every PVC file to 0660 at
+                    # mount, and OpenSSH refuses a group-readable host key ("no
+                    # hostkeys available -- exiting"). Dropbear never checked, so
+                    # the first boot after it left had no door at all (incident
+                    # 55d001b0, 2026-09-22). Set before sshd reads it, every boot.
+                    chmod 600 /work/ssh/ssh_host_ed25519_key || true
                     cp /etc/ssh-authorized/authorized_keys /root/.ssh/authorized_keys || true
                     chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys || true
                     # BOTH homes: sessions arrive with HOME=/work/home
@@ -375,8 +440,79 @@ spec:
                     # reads as success), and the whole install is retried
                     # until the binary exists - ten attempts six seconds
                     # apart, each failure named in this log. It runs after
-                    # dropbear so ssh never waits on the WAN.
-                    dropbear -r /work/ssh/dropbear_ed25519_host_key -p 22 -s
+                    # sshd so ssh never waits on the WAN.
+                    #
+                    # THE DOOR'S OWN CONFIG, on the PVC beside its host
+                    # key: the image ships none, and a hand-edited
+                    # /etc/ssh/sshd_config is exactly the imperative
+                    # state a converge silently reverts. Written on
+                    # every boot, so the manifest is the definition.
+                    # Every keyword below was syntax-checked against
+                    # OpenSSH_9.2 - the bookworm package this pod
+                    # installs - on 2026-09-20.
+                    cat > /work/ssh/sshd_config <<'SD'
+                    Port 22
+                    HostKey /work/ssh/ssh_host_ed25519_key
+                    PidFile /work/ssh/sshd.pid
+                    LogLevel INFO
+                    UsePAM no
+                    PermitRootLogin yes
+                    PasswordAuthentication no
+                    KbdInteractiveAuthentication no
+                    PubkeyAuthentication yes
+                    AuthorizedKeysFile /root/.ssh/authorized_keys
+                    AcceptEnv LANG LC_*
+                    Subsystem sftp /usr/lib/openssh/sftp-server
+                    AuthorizedPrincipalsFile /etc/ssh/authorized_principals/%u
+                    SD
+                    # WHO a certificate may log in as. Access issues the session's
+                    # certificate for the email PREFIX (david@algedonic.dev ->
+                    # `david`), and without this map sshd requires that principal
+                    # to equal the login name, so `ssh root@dev.algedonic.dev`
+                    # was refused by construction (incident 55d001b0, measured
+                    # both ways against a throwaway CA in this pod). The names are
+                    # the prefixes infra/cluster/dns/access.toml admits, held equal
+                    # by the_dev_door_is_an_access_ssh_application.rs. On the
+                    # container's own /etc, not the PVC: StrictModes refuses a
+                    # principals file below a group-writable directory, and the
+                    # fsGroup makes every PVC directory one. Key logins ignore it.
+                    mkdir -p /etc/ssh/authorized_principals
+                    printf '%s\n' david > /etc/ssh/authorized_principals/root
+                    chmod 644 /etc/ssh/authorized_principals/root
+                    # THE ACCESS SSH CA, and why the line is conditional.
+                    # TrustedUserCAKeys is what makes the short-lived
+                    # certificate Cloudflare Access issues for one
+                    # session an acceptable credential - the reason this
+                    # door left Dropbear, which cannot verify a
+                    # certificate against a CA at all. The public key is
+                    # David's root ceremony (copy it from the dns
+                    # observation into the Secret the volumes below name);
+                    # until it is there the file is absent, and naming
+                    # an absent file would leave the door authorising by
+                    # the mounted key alone with nothing saying why. So
+                    # the line is written only when the key is, and the
+                    # log says which door is open - no evidence is not a
+                    # pass. The certificate must carry `root` as a
+                    # principal: with no AuthorizedPrincipalsFile sshd
+                    # requires the cert's principal to equal the login
+                    # name, and `ssh root@dev.algedonic.dev` is what
+                    # /it/estate prints.
+                    if [ -s /etc/access-ssh-ca/ca.pub ]; then
+                      echo 'TrustedUserCAKeys /etc/access-ssh-ca/ca.pub' >> /work/ssh/sshd_config
+                      echo "ssh door: Access SSH CA present - dev.algedonic.dev certificates accepted"
+                    else
+                      echo "ssh door: no /etc/access-ssh-ca/ca.pub - Secret boss-dev-access-ssh-ca is empty; dev.algedonic.dev will refuse every certificate (the key door is judged below, once sshd has started)"
+                    fi
+                    # Whether a door is open is a fact about the running daemon,
+                    # not the config above: sshd exits nonzero before it forks on
+                    # a refused start, so its status is the measurement, and the
+                    # refusal carries sshd's own words rather than a paraphrase.
+                    if /usr/sbin/sshd -f /work/ssh/sshd_config -E /work/ssh/sshd.log; then
+                      echo "ssh door: sshd started on :22"
+                    else
+                      echo "ssh door: CLOSED - sshd refused to start (exit $?); its log follows"
+                      tail -n 20 /work/ssh/sshd.log
+                    fi
                     # The pod's fsGroup (1500) re-modes files on the PVC at
                     # every mount, so the bastion key David authorised comes
                     # back 0660 after each roll and ssh refuses it
@@ -409,6 +545,31 @@ spec:
                     # (/work/home/.claude/.credentials.json — placed once by
                     # David; the boot never writes a credential); with either
                     # missing it says so and leaves the pod to ssh, as before.
+                    #
+                    # THE DRAIN RESUMES ITSELF when its switch is on (backlog
+                    # ea83db08, 2026-09-24). A session started with no task
+                    # sits idle, so each roll (four on 2026-09-23/24) ended
+                    # the overnight drain until David typed. When the switch
+                    # file /work/home/.config/boss/drain-on-boot exists — on
+                    # the PVC, so it is turned on or off with touch/rm and no
+                    # deploy — the session's first prompt is the versioned
+                    # standing prompt infra/dev/drain.md, READ AT RUN TIME
+                    # with "$(cat …)": the prompt carries backticks and
+                    # quotes, so it is never inlined here. Without the switch
+                    # the boot is exactly what it was.
+                    #
+                    # FROM ORIGIN/MAIN, not the checkout (backlog 7a581397,
+                    # 2026-09-24). The roll that shipped the switch (#606)
+                    # booted idle, silently: the checkout was still at #605
+                    # (the reclaim sidecar fast-forwards hourly) and drain.md
+                    # was new in #606. A train that edits drain.md would boot
+                    # the previous prompt the same way. So the script fetches
+                    # origin (bounded — a dark forge must not hold the boot),
+                    # reads origin/main:infra/dev/drain.md, falls back to the
+                    # checkout's copy, and APPENDS its verdict to
+                    # postStart.log — naming the copy it used, or, when the
+                    # switch is on and nothing could be read, saying so in
+                    # capitals before it starts the session idle.
                     cat > /work/dev-claude.sh <<'DC'
                     #!/usr/bin/env bash
                     export HOME=/work/home
@@ -416,10 +577,31 @@ spec:
                     export RUSTUP_HOME=/usr/local/rustup
                     export CARGO_TARGET_DIR=/scratch/target
                     cd /work/boss
+                    log=/work/ssh/postStart.log
+                    if [ -e /work/home/.config/boss/drain-on-boot ]; then
+                      timeout 60 git fetch -q origin >> "$log" 2>&1 \
+                        || echo "dev session: git fetch origin failed (exit $?) - reading the origin/main this checkout last fetched" >> "$log"
+                      from="origin/main at $(git rev-parse --short origin/main 2>/dev/null)"
+                      prompt=$(git show origin/main:infra/dev/drain.md 2>/dev/null)
+                      if [ -z "$prompt" ]; then
+                        from="the checkout's copy at $(git rev-parse --short HEAD 2>/dev/null)"
+                        prompt=$(cat /work/boss/infra/dev/drain.md 2>/dev/null)
+                      fi
+                      if [ -n "$prompt" ]; then
+                        echo "dev session: drain-on-boot is ON - the first prompt is infra/dev/drain.md from $from" >> "$log"
+                        exec claude --remote-control boss-dev "$prompt"
+                      fi
+                      echo "dev session: DRAIN-ON-BOOT IS ON BUT NO DRAIN PROMPT COULD BE READ (not at origin/main:infra/dev/drain.md, not at /work/boss/infra/dev/drain.md) - the session starts IDLE and the drain has NOT resumed" >> "$log"
+                    fi
                     exec claude --remote-control boss-dev
                     DC
                     chmod +x /work/dev-claude.sh
                     if [ -x /work/home/.local/bin/claude ] && [ -s /work/home/.claude/.credentials.json ]; then
+                      if [ -e /work/home/.config/boss/drain-on-boot ]; then
+                        echo "dev session: drain-on-boot is ON — dev-claude.sh fetches origin and appends below which drain.md it read (or that it read none)"
+                      else
+                        echo "dev session: drain-on-boot is off — the session starts idle (touch /work/home/.config/boss/drain-on-boot to resume the drain on boot)"
+                      fi
                       if HOME=/work/home tmux new-session -d -s dev -c /work/boss /work/dev-claude.sh; then
                         echo "dev session: started claude --remote-control boss-dev in tmux session dev"
                       else
@@ -428,7 +610,7 @@ spec:
                     else
                       echo "dev session: not started — claude binary or /work/home/.claude/.credentials.json missing; ssh in, run claude once to log in, and the next boot starts it"
                     fi
-                    } > /work/ssh/postStart.log 2>&1 || true
+                    } >> /work/ssh/postStart.log 2>&1 || true
           workingDir: /work
           env:
             # The sidecar, by name rather than by luck. TestDb would
@@ -489,8 +671,17 @@ spec:
           # pod at 4 / 8Gi requested the node holds 16 / 32Gi of
           # requests, and the limits overcommit the way each gate's
           # (20 CPU / 32Gi) already does.
+          #
+          # EPHEMERAL STORAGE, because a request of none made this pod the
+          # kubelet's first eviction under disk pressure (see the
+          # boss-dev-session PriorityClass above). 100Gi is the cold
+          # `cargo test --all-features` target (~74G, measured above) plus
+          # this container's writable layer (~10G at the 2026-09-23
+          # eviction) and pgdata. A request, not a limit: exceeding it
+          # evicts nothing on its own; it only decides the order under
+          # pressure. Beside three gate slots at 90Gi each it fits w-1.
           resources:
-            requests: {cpu: "4", memory: 8Gi}
+            requests: {cpu: "4", memory: 8Gi, ephemeral-storage: 100Gi}
             limits: {cpu: "16", memory: 32Gi}
           volumeMounts:
             - {name: work, mountPath: /work}
@@ -498,6 +689,7 @@ spec:
             - {name: forge-token, mountPath: /etc/forge, readOnly: true}
             - {name: forge-write-token, mountPath: /etc/boss-train, readOnly: true}
             - {name: ssh-authorized, mountPath: /etc/ssh-authorized, readOnly: true}
+            - {name: access-ssh-ca, mountPath: /etc/access-ssh-ca, readOnly: true}
         - name: postgres
           # Matches production's major (the `boss` StatefulSet runs
           # postgres:16). A dev database on a different major is a test
@@ -516,6 +708,20 @@ spec:
             # entrypoint can chmod it 0700 despite the pod's fsGroup
             # setgid bit, which Postgres refuses to start without.
             capabilities: {drop: ["NET_RAW"]}
+          # NO DURABILITY, FOR THE GATE'S REASON (backlog c71cf9d0,
+          # 2026-09-24). PGDATA is the emptyDir below, so a synced file
+          # protects data nobody will read after a restart — and with
+          # fsync on, every DROP DATABASE waits on a forced checkpoint
+          # that must flush the files of every WAL_LOG-copied test
+          # database. Measured on this sidecar that day: one builder
+          # running boss-jobs' 45 *_pg binaries left 50 DROP DATABASE
+          # backends waiting on checkpoints that spent 93s and 69s in
+          # DataFileSync; five builders held it at max_connections
+          # (100, 98 of them drops) and 124 of 225 binary runs failed
+          # with "too many clients" / "pool timed out". The gate
+          # sidecar has run with these flags since afaa90a3. Pinned
+          # beside it by gate_runner_manifests.
+          args: ["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
           env:
             - {name: POSTGRES_USER, value: boss}
             - {name: POSTGRES_PASSWORD, value: boss}
@@ -589,12 +795,13 @@ spec:
           env:
             - {name: CARGO_TARGET_DIR, value: /scratch/target}
             - {name: REPO_DIR, value: /work/boss}
-            # Floors: keep the node-local scratch fs above 50G free
-            # (a cold `cargo test --all-features` needs ~74G of target,
-            # so this reclaims well before a build is starved) and the
-            # 40Gi work PVC above 6G. Worktrees idle longer than 48h are
-            # eligible; anything newer, locked, or dirty is left alone.
-            - {name: BOSS_SCRATCH_FLOOR_GB, value: "50"}
+            # Floors: the node-local scratch floor is the script's own
+            # default, a SHARE of the fs (25%) held above the kubelet's
+            # 15% eviction line — the 50G it was here sat below that
+            # line, so the kubelet always acted first (2026-09-23). The
+            # 40Gi work PVC is kept above 6G. Worktrees idle longer than
+            # 48h are eligible; anything newer, locked, or dirty is left
+            # alone.
             - {name: BOSS_WORK_FLOOR_GB, value: "6"}
             - {name: BOSS_WORKTREE_MAX_AGE_H, value: "48"}
           securityContext:
@@ -678,12 +885,45 @@ spec:
         # absent Secret means a closed door, not a stuck pod.
         - name: ssh-authorized
           secret: {secretName: boss-dev-ssh-authorized-keys, optional: true, defaultMode: 0400}
+        # THE ACCESS SSH CA's PUBLIC KEY (design 5fc71f03, backlog
+        # e4cedb46). Cloudflare Access generates one short-lived-
+        # certificate CA per application; sshd trusts it through
+        # TrustedUserCAKeys, and from then on the edge issues a
+        # certificate good for minutes instead of an operator loading
+        # a key that lives forever.
+        #
+        # THE ROOT CEREMONY, David's, once per application: copy the
+        # CA's public key from the dns observation packet, which
+        # records it as `ssh_ca` (access.toml short_lived_ca = true
+        # makes dns.observe generate it through the API; the dashboard
+        # offers only the account-wide Infrastructure CA, which never
+        # signs for cloudflared access ssh — incident 55d001b0), and
+        # load it here. Public key material, like the authorized_keys
+        # Secret above, so any operator can carry it - but the tree
+        # never holds the value:
+        #   kubectl create secret generic boss-dev-access-ssh-ca \
+        #     -n boss-dev --from-file=ca.pub=<the observation's ssh_ca key>
+        # `optional: true`, the posture every Secret on this pod takes:
+        # an absent Secret is a closed door with a reason in
+        # postStart.log, never a pod stuck in ContainerCreating.
+        - name: access-ssh-ca
+          secret: {secretName: boss-dev-access-ssh-ca, optional: true, defaultMode: 0444}
 ---
-# The ssh door's address: ssh://root@10.20.0.35 — macOS opens Terminal
-# on that URL natively, which is the "launch my terminal from the
-# website" answer (02f4a2ee) without any browser-terminal machinery.
-# Reachable on the LAN directly; off-LAN via the boss-gcp WireGuard
-# jump. Auth is David's ed25519 key only: no passwords, root key login.
+# The ssh door, reachable two ways and declared once. From the
+# internet: the in-cluster Cloudflare Tunnel routes dev.algedonic.dev
+# to this Service BY ITS CLUSTER DNS NAME (infra/cluster/
+# tunnel-origins.toml, `ssh://boss-dev-ssh.boss-dev.svc.cluster.local:22`),
+# behind the Access SSH application declared in
+# infra/cluster/dns/access.toml — which is why a LoadBalancer Service
+# keeps its ClusterIP and why nothing here had to change for the door
+# to move. From the LAN: the MetalLB VIP 10.20.0.35 still answers, on
+# the mounted authorized_keys, as the fallback for a day when the edge
+# is the thing that is broken.
+#
+# The VIP was the ONLY way in until design 5fc71f03 (2026-09-18): a LAN
+# address, so off-LAN meant a jump through the boss-gcp WireGuard
+# bastion, authorised by one long-lived key. /it/estate stopped printing
+# it with backlog e4cedb46; it is kept, not advertised.
 apiVersion: v1
 kind: Service
 metadata:

@@ -17,8 +17,9 @@
 // JS is otherwise verified by a human opening the page.
 
 import { test, expect } from '@playwright/test';
+import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { mountPage } from './_helpers';
+import { mountPage, paintedOrThrew } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 
 const PLUGIN = readFileSync(
@@ -98,7 +99,7 @@ test('a self-carried design doc renders its questions without touching the docs 
   // The step surface deliberately renders OUTSIDE `.app-shell` to take
   // the whole viewport, so it passes its own root.
   await mountPage(page, '/jobs/job-dd-1/steps/step-1', { root: '.step-focus' });
-  await page.waitForTimeout(2000);
+  await paintedOrThrew(page.getByText('New Subject kinds, or Classes of asset?'), errs);
 
   expect(errs, `plugin threw: ${errs.join(' | ')}`).toEqual([]);
   // Both questions on the surface, by their own text.
@@ -160,11 +161,144 @@ test('a step carrying only a pointer says so, and never calls a docs API', async
   );
 
   await mountPage(page, '/jobs/job-dd-1/steps/step-1', { root: '.step-focus' });
-  await page.waitForTimeout(2000);
+  await paintedOrThrew(page.getByText(/carries only a pointer/), errs);
 
   expect(errs, `plugin threw: ${errs.join(' | ')}`).toEqual([]);
   // It names the pointer it was given and the verb that replaces it.
   await expect(page.getByText(/carries only a pointer/)).toBeVisible();
   await expect(page.getByText(/docs\/design\/legacy\.md/)).toBeVisible();
   expect(docsApiCalls, 'nothing may call the deleted docs API').toEqual([]);
+});
+
+// EXHIBITS, IN A REAL BROWSER (design 26a89f11, backlog 73ef81fa).
+//
+// The unit test pins the frame's attributes; this pins what they DO. The
+// review surface runs in the reviewer's authenticated session and any
+// actor may write step metadata, so an exhibit is untrusted markup that
+// must run its own script (a motion prototype is the first customer)
+// and reach NOTHING of the page around it. The exhibit below tries the
+// three things that would matter — this page's DOM, this origin's
+// storage, and the API as the reviewer — and writes what happened into
+// its own body, where the test reads it back through the frame.
+const PROBE =
+  '<p id="r">pending</p>' +
+  '<script>' +
+  'var out = [];' +
+  'try { out.push(parent.document.title !== undefined ? "parent:reachable" : "parent:none"); }' +
+  ' catch (e) { out.push("parent:blocked"); }' +
+  'try { localStorage.getItem("x"); out.push("storage:reachable"); }' +
+  ' catch (e) { out.push("storage:blocked"); }' +
+  'fetch("/api/jobs/exhibit-probe").then(' +
+  ' function () { out.push("fetch:reachable"); },' +
+  ' function () { out.push("fetch:blocked"); }' +
+  ').then(function () { document.getElementById("r").textContent = out.join(" "); });' +
+  '</script>';
+
+async function routeReviewPlugin(page: import('@playwright/test').Page) {
+  await page.route('**/api/jobs/step-plugins', (r) =>
+    r.fulfill({
+      json: [
+        {
+          kind: 'review-design',
+          label: 'Review Design',
+          category: 'platform',
+          version: 1,
+          frontend_url: '/plugins/review-design.js',
+          owning_team: 'platform',
+        },
+      ],
+    }),
+  );
+  await page.route('**/plugins/review-design.js', (r) =>
+    r.fulfill({ contentType: 'application/javascript', body: PLUGIN }),
+  );
+}
+
+test('an exhibit runs its own script in a sandbox that reaches nothing of the page', async ({
+  page,
+}) => {
+  const errs: string[] = [];
+  const apiFromExhibit: string[] = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+
+  const step = {
+    ...STEP,
+    metadata: {
+      ...STEP.metadata,
+      questions: [{ ...STEP.metadata.questions[0], exhibits: ['E1'] }],
+      exhibits: [{ anchor: 'E1', title: 'The isolation probe', html: PROBE }],
+    },
+  };
+
+  await installSmokeMocks(page);
+  await page.route('**/api/jobs/exhibit-probe', (r) => {
+    apiFromExhibit.push(r.request().url());
+    return r.fulfill({ json: { reached: true } });
+  });
+  await page.route('**/api/jobs/job-dd-1', (r) => r.fulfill({ json: { ...JOB, steps: [step] } }));
+  await routeReviewPlugin(page);
+
+  await mountPage(page, '/jobs/job-dd-1/steps/step-1', { root: '.step-focus' });
+
+  const frame = page.frameLocator('iframe[title^="Exhibit E1"]');
+  // Its own script RAN (allow-scripts), and each reach was refused.
+  await expect(frame.locator('#r')).toHaveText('parent:blocked storage:blocked fetch:blocked');
+  expect(apiFromExhibit, 'the exhibit reached the API').toEqual([]);
+  // The bound question names its exhibit beside it.
+  await expect(page.getByRole('button', { name: 'E1' })).toBeVisible();
+  expect(errs, `the surface threw: ${errs.join(' | ')}`).toEqual([]);
+});
+
+// THE FILE_REFS ARM, IN A REAL BROWSER (design 26a89f11, backlog
+// 73ef81fa car 2). An exhibit over the inline bound rides as a
+// `file_ref`; the surface fetches its bytes from the file store as the
+// reviewer, checks them against the recorded sha256, and hands them to
+// the same frame. The same probe must come back with the same three
+// refusals — the by-reference path must not be a way round the sandbox.
+test('a by-reference exhibit is fetched, checked, and runs in the same sandbox', async ({
+  page,
+}) => {
+  const errs: string[] = [];
+  const apiFromExhibit: string[] = [];
+  const fileFetches: string[] = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+
+  const body = Buffer.from(PROBE, 'utf8');
+  const step = {
+    ...STEP,
+    metadata: {
+      ...STEP.metadata,
+      questions: [{ ...STEP.metadata.questions[0], exhibits: ['E2'] }],
+      exhibits: [
+        {
+          anchor: 'E2',
+          title: 'The isolation probe, by reference',
+          file_ref: 'f-probe',
+          sha256: createHash('sha256').update(body).digest('hex'),
+          size_bytes: body.length,
+        },
+      ],
+    },
+  };
+
+  await installSmokeMocks(page);
+  await page.route('**/api/jobs/exhibit-probe', (r) => {
+    apiFromExhibit.push(r.request().url());
+    return r.fulfill({ json: { reached: true } });
+  });
+  await page.route('**/api/files/f-probe', (r) => {
+    fileFetches.push(r.request().url());
+    return r.fulfill({ contentType: 'text/html', body });
+  });
+  await page.route('**/api/jobs/job-dd-1', (r) => r.fulfill({ json: { ...JOB, steps: [step] } }));
+  await routeReviewPlugin(page);
+
+  await mountPage(page, '/jobs/job-dd-1/steps/step-1', { root: '.step-focus' });
+
+  const frame = page.frameLocator('iframe[title^="Exhibit E2"]');
+  await expect(frame.locator('#r')).toHaveText('parent:blocked storage:blocked fetch:blocked');
+  expect(fileFetches.length, 'the bytes were fetched from the file store').toBeGreaterThan(0);
+  expect(apiFromExhibit, 'the exhibit reached the API').toEqual([]);
+  await expect(page.getByText(/sha256 checked against the record/)).toBeVisible();
+  expect(errs, `the surface threw: ${errs.join(' | ')}`).toEqual([]);
 });

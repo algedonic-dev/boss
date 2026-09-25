@@ -27,23 +27,27 @@
 //! not a `match` in Rust — is already true.
 //!
 //! **The budget is consulted here, at the record (backlog 7dd9f28c).**
-//! `boss_core::agent::BudgetDecision::decide` is the ONE rule — the
-//! cybernetics ledger (`boss_events::ledger`) and this recorder both
-//! call it — and the caps it judges against are the `agents` row's
+//! `boss_core::agent::BudgetDecision::decide` is the ONE rule — this
+//! recorder calls it, and so does the claim door's concurrency half
+//! (`crate::agent_budget`); the cybernetics ledger that once called it
+//! too went with boss-cybernetics in train #582 (backlog 05a003da) —
+//! and the caps it judges against are the `agents` row's
 //! (design 6fda05ae gave the actor one id and this module's `model`
 //! column priced the run against what it actually ran, which is what
 //! made the join possible). The recorder measures the actor's priced
 //! spend in the hour before the run STARTED plus its runs in flight at
-//! that instant (`types::measure_load`), admits or refuses
-//! (`port::admit`), and writes the decision down: an `Allow` rides the
-//! row and the event as `budget`, a `Deny` is its own event
-//! (`agents.run.denied`) and no row. So a refusal is as visible as
-//! spend, which is the whole point of the value-shaped decision: on
-//! 2026-09-08 a session ran out of credit and the only signal was the
-//! work stopping. HONEST LIMIT: this record is written at FINISH, so
-//! "admitted" here is a judgement of a run that already happened — the
-//! refusal is a fact the desk can act on, not a gate that stopped the
-//! spend. Stopping it needs a run that opens at start (below).
+//! that instant (`types::measure_load`), judges it (`port::admit`),
+//! and writes the judgement down: `Allow` or `Deny`, it rides the row
+//! and the event as `budget`. A `Deny` is a READING, not a refusal
+//! (backlog e6b2066f): until then it was its own event
+//! (`agents.run.denied`) and NO row, and once a run was priced from
+//! what it consumed — about five times the old figure — that would
+//! have dropped real runs from the record of what they cost. David's
+//! direction (2026-09-23) is that budgets give protocols a cost
+//! signal and do not limit building, so the record keeps every run and
+//! says which ones were over. It was never a gate anyway: this record
+//! is written at FINISH, so the judgement is of a run that already
+//! happened.
 //!
 //! **Not in scope, deliberately.** One sibling packet borders this one
 //! and this module is additive to it:
@@ -60,9 +64,61 @@
 /// four readers depend on it agreeing: `boss gate` stamps it on a
 /// gate-run, `boss dispatch` writes it onto the step it claims
 /// (backlog dd6d44b7), the dispatcher rules read it back off the
-/// `step.done.<kind>` marker, and the step PUT carries it forward
-/// (backlog b91a2103) so a wholesale metadata write cannot erase it.
+/// `step.done.<kind>` marker, and the step PUT refuses a metadata body
+/// that omits it (e39a9d2a; it carried it forward by hand from
+/// b91a2103) so a wholesale metadata write cannot erase it.
 pub const EDGE_KEY: &str = "agent_run";
+
+/// Whether a claim hands a step to a DIFFERENT holder — the one case in
+/// which the claim clears [`EDGE_KEY`] (backlog 9562f6df).
+///
+/// Freshness of the edge belongs at the claim: a step that came free
+/// with the previous run still named, and was then claimed outside
+/// `boss dispatch` (a person in the UI), kept naming that run, and the
+/// delivery rule would land it off a completion it did not do. Both
+/// release doors — `boss step release` and
+/// `jobs.reclaim_abandoned_step` — already null the edge as they free
+/// the step; this is the same decision for every door that frees a step
+/// WITHOUT nulling it, taken where the executor actually changes.
+///
+/// NOT on every claim: a re-claim by the holder is idempotent by design,
+/// and the holder spelled by one of its aliases (design 6fda05ae) is the
+/// holder — the CAS respelling it is not a change of executor.
+/// `boss dispatch` claims first and writes the new run's edge after, so
+/// clearing here never races the edge a dispatch is about to write.
+pub fn claim_changes_holder(old_holder: Option<&str>, claimant: &str, aliases: &[String]) -> bool {
+    match old_holder {
+        None => true,
+        Some(h) => h != claimant && !aliases.iter().any(|a| a == h),
+    }
+}
+
+/// Does this claim announce a `step.assigned.<kind>` marker? Only when
+/// [`claim_changes_holder`] says the executor changed — the same answer
+/// the run edge takes — and the step has a kind to name the topic by
+/// (backlog 735ddc03: an alias respelled to the registered id kept its
+/// edge but still announced an assignment).
+pub fn assignment_marker_due(
+    old_holder: Option<&str>,
+    claimant: &str,
+    aliases: &[String],
+    kind: &str,
+) -> bool {
+    !kind.is_empty() && claim_changes_holder(old_holder, claimant, aliases)
+}
+
+/// `metadata` without the run edge — every other key untouched.
+pub fn without_edge(metadata: &serde_json::Value) -> serde_json::Value {
+    match metadata.as_object() {
+        Some(obj) => serde_json::Value::Object(
+            obj.iter()
+                .filter(|(k, _)| k.as_str() != EDGE_KEY)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => metadata.clone(),
+    }
+}
 
 pub mod events;
 pub mod http;
@@ -74,7 +130,7 @@ pub mod postgres;
 pub mod rebuild;
 pub mod types;
 
-pub use events::{AGENT_RUN_DENIED, AGENT_RUN_RECORDED};
+pub use events::AGENT_RUN_RECORDED;
 pub use in_memory::InMemoryAgentRuns;
 pub use port::{AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit};
 #[cfg(feature = "postgres")]
@@ -82,6 +138,85 @@ pub use postgres::PgAgentRuns;
 #[cfg(feature = "postgres")]
 pub use rebuild::rebuild_agent_runs;
 pub use types::{
-    ADMISSION_WINDOW, AgentRun, GroupSpend, NewAgentRun, PricingBasis, RateCardRow, RunFilter,
-    RunOutcome, RunSummary, TokenUsage, measure_load, price_run, pricing_basis, summarize,
+    ADMISSION_WINDOW, AgentRun, AgentRunView, EFFORT_APPLIED_FROM_SHA, EFFORT_RECORDED_FROM_SHA,
+    EffortEra, GroupSpend, NewAgentRun, PricingBasis, RateCardRow, RunFilter, RunOutcome,
+    RunSummary, TokenUsage, effort_applied_from, measure_load, price_run, pricing_basis, summarize,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three holders a claim can meet (9562f6df): nobody, the
+    /// claimant under either spelling, and someone else.
+    #[test]
+    fn only_a_different_holder_is_a_change() {
+        let aliases = vec!["claude@algedonic.dev".to_string()];
+        assert!(claim_changes_holder(None, "agent-claude", &aliases));
+        assert!(!claim_changes_holder(
+            Some("agent-claude"),
+            "agent-claude",
+            &aliases
+        ));
+        assert!(!claim_changes_holder(
+            Some("claude@algedonic.dev"),
+            "agent-claude",
+            &aliases
+        ));
+        assert!(claim_changes_holder(
+            Some("emp-someone"),
+            "agent-claude",
+            &aliases
+        ));
+    }
+
+    /// ONE PREDICATE FOR BOTH ANSWERS (backlog 735ddc03). The claim
+    /// route decided "did the holder change" twice: alias-aware for the
+    /// run edge, exact-string for the `step.assigned.<kind>` marker. So
+    /// a claim that only RESPELLED the holder — an alias rewritten to
+    /// the registered id — kept its run edge (no change) and still
+    /// announced an assignment (a change). The marker now asks the same
+    /// question, and a kindless step still emits none.
+    #[test]
+    fn an_assignment_is_announced_only_when_the_holder_changes() {
+        let aliases = vec!["claude@algedonic.dev".to_string()];
+        assert!(assignment_marker_due(
+            None,
+            "agent-claude",
+            &aliases,
+            "task"
+        ));
+        assert!(assignment_marker_due(
+            Some("emp-someone"),
+            "agent-claude",
+            &aliases,
+            "task"
+        ));
+        assert!(
+            !assignment_marker_due(
+                Some("claude@algedonic.dev"),
+                "agent-claude",
+                &aliases,
+                "task"
+            ),
+            "a respelled holder is not an assignment"
+        );
+        assert!(!assignment_marker_due(
+            Some("agent-claude"),
+            "agent-claude",
+            &aliases,
+            "task"
+        ));
+        assert!(!assignment_marker_due(None, "agent-claude", &aliases, ""));
+    }
+
+    #[test]
+    fn without_edge_drops_the_edge_and_nothing_else() {
+        let md = serde_json::json!({ EDGE_KEY: "run-1", "notes": "kept" });
+        assert_eq!(without_edge(&md), serde_json::json!({ "notes": "kept" }));
+        assert_eq!(
+            without_edge(&serde_json::Value::Null),
+            serde_json::Value::Null
+        );
+    }
+}

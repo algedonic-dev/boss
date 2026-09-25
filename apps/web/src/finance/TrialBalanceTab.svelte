@@ -21,6 +21,7 @@
     lockPeriod,
     loadEntriesForAccount,
     loadEntryDetail,
+    loadEntryIdForFact,
     loadPeriods,
     loadTrialBalance,
     reverseEntry,
@@ -32,13 +33,61 @@
     type TrialBalanceRow,
   } from './ledger';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import { listView, okRead, type ReadState } from '../data/readState';
   import AccountDrillDown from './AccountDrillDown.svelte';
+  import EntryDetail from './EntryDetail.svelte';
+
+  // The entry a link opened: /ux/finance?entry=<id> (NewJournalEntryPage
+  // lands there after a post; entity-href's ledger-entry kind) or
+  // ?fact=<id> (entity-href's fact kind), resolved to the entry that
+  // fact posted. Empty is none; an entry wins over a fact (2ab44d55).
+  type Props = {
+    linkedEntryId?: string;
+    linkedFactId?: string;
+    onCloseLinked?: () => void;
+  };
+  let { linkedEntryId = '', linkedFactId = '', onCloseLinked = () => {} }: Props = $props();
+
+  /// A fact's entry as read: a fact that posted no entry and a read
+  /// that failed are different answers, and the page says which.
+  type FactEntry =
+    | { kind: 'loading' }
+    | { kind: 'failed'; error: string }
+    | { kind: 'none' }
+    | { kind: 'found'; entryId: string };
+  let factEntry = $state<FactEntry>({ kind: 'loading' });
+
+  $effect(() => {
+    const factId = linkedFactId;
+    if (linkedEntryId || !factId) return;
+    let cancelled = false;
+    factEntry = { kind: 'loading' };
+    (async () => {
+      const res = await loadEntryIdForFact(factId);
+      if (cancelled) return;
+      factEntry =
+        res.read.kind === 'failed'
+          ? { kind: 'failed', error: res.read.error }
+          : res.entryId
+            ? { kind: 'found', entryId: res.entryId }
+            : { kind: 'none' };
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
 
   let asOf = $state('');
   let tb = $state<TrialBalanceResponse | null>(null);
   let tbLoading = $state(true);
-  let periods = $state<Period[]>([]);
+  let periods = $state<ReadonlyArray<Period>>([]);
+  let periodsRead = $state<ReadState>(okRead);
   let periodsLoading = $state(true);
+  /// A failed periods read is checked before the row count, so an
+  /// outage cannot paint "No periods yet." (backlog 1a2b67c9).
+  let periodsView = $derived(
+    listView([{ source: 'ledger periods', state: periodsRead }], periods.length),
+  );
   let selectedAccount = $state<string | null>(null);
   let selectedEntryId = $state<string | null>(null);
   let tbTick = $state(0);
@@ -70,9 +119,10 @@
     let cancelled = false;
     periodsLoading = true;
     (async () => {
-      const rows = await loadPeriods();
+      const res = await loadPeriods();
       if (!cancelled) {
-        periods = rows;
+        periods = res.periods;
+        periodsRead = res.read;
         periodsLoading = false;
       }
     })();
@@ -158,6 +208,29 @@
 </script>
 
 <div class="trial-balance-tab finance-print-area">
+  {#if linkedEntryId || linkedFactId}
+    <div class="tb-linked-entry">
+      <Section title="Journal entry">
+        <div class="tb-controls">
+          <button type="button" class="secondary" onclick={onCloseLinked}>Close</button>
+        </div>
+        {#if linkedEntryId}
+          <EntryDetail entryId={linkedEntryId} {factSourceKind} />
+        {:else if factEntry.kind === 'loading'}
+          <p class="empty">Loading the entry for fact {linkedFactId}…</p>
+        {:else if factEntry.kind === 'failed'}
+          <p class="empty load-failed" role="alert">
+            Couldn't load the entry for fact {linkedFactId} — {factEntry.error}
+          </p>
+        {:else if factEntry.kind === 'none'}
+          <p class="empty">No journal entry for fact {linkedFactId}.</p>
+        {:else}
+          <EntryDetail entryId={factEntry.entryId} {factSourceKind} />
+        {/if}
+      </Section>
+    </div>
+  {/if}
+
   <Section title="Trial balance">
       <div class="tb-controls">
         <label class="tb-asof">
@@ -193,7 +266,7 @@
       {#if tbLoading && !tb}
         <p class="empty">Loading trial balance…</p>
       {:else if !tb}
-        <p class="empty">Ledger unavailable.</p>
+        <p class="empty load-failed" role="alert">Ledger unavailable.</p>
       {:else}
         {@const visibleRows = tb.rows.filter((r) => r.debit_total_cents > 0 || r.credit_total_cents > 0)}
         <table class="tb-table">
@@ -271,7 +344,11 @@
       </div>
       {#if periodsLoading}
         <p class="empty">Loading periods…</p>
-      {:else if periods.length === 0}
+      {:else if periodsView.kind === 'failed'}
+        <p class="empty load-failed" role="alert">
+          Couldn't load {periodsView.source} — {periodsView.error}
+        </p>
+      {:else if periodsView.kind === 'empty'}
         <p class="empty">No periods yet.</p>
       {:else}
         <table class="tb-periods">

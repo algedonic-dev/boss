@@ -1,6 +1,6 @@
 <script lang="ts">
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import { putStep } from './stepWrite';
+  import { saveStep } from './stepWrite';
   // Production-consume step surface — drains raw ingredients
   // consumed by a brewing batch. The brewer confirms the
   // ingredients_consumed list (typically pre-populated by the
@@ -74,18 +74,18 @@
     saving = true;
     writeError = null;
     try {
+      // The keys this surface owns, through the merge door; an emptied
+      // batch id is sent as null and deleted, where it used to be
+      // cleared by omission from a wholesale PUT (backlog e39a9d2a).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
         status: status ?? step.status,
         metadata: {
-          ...step.metadata,
           ingredients_consumed: draws,
           batch_id: batchId || undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      const res = await saveStep(jobId, step.id, body);
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -175,7 +175,7 @@
   <div class="step-actions">
     {#if !terminal && isPending(step.status)}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('active')}
         disabled={saving}
       >
@@ -184,7 +184,7 @@
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || draws.length === 0}
         title={draws.length === 0
@@ -208,21 +208,21 @@
     text-align: left;
     font-weight: 600;
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border, #e5e7eb);
-    color: var(--text-muted, #6b7280);
+    border-bottom: 1px solid var(--border);
+    color: var(--static);
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
   .step-line-items td {
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-line-items .col-qty { width: 110px; }
   .step-line-items .col-sku { width: 180px; }
   .step-line-items .col-desc {}
   .step-line-items .desc {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
   .step-line-items input[type="number"] {
     width: 100%;
@@ -231,15 +231,15 @@
     font-size: 13px;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    border: 1px solid var(--border, #d1d5db);
+    border: 1px solid var(--border);
     border-radius: 3px;
   }
   .step-empty {
     padding: 8px 12px;
-    color: var(--text-muted, #9ca3af);
+    color: var(--static);
     font-size: 13px;
     font-style: italic;
-    background: var(--bg-soft, #f9fafb);
+    background: var(--ink-raised);
     border-radius: 4px;
     margin: 6px 0;
   }

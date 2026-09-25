@@ -17,9 +17,12 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::gate::{AbandonedPlace, abandoned_places, api, queue_order, rows};
+use crate::gate::{AbandonedPlace, abandoned_places, api, queue_order};
+// The one rows helper: a read that is not a list refuses rather than
+// printing an empty yard (backlog 7b7e0529).
+use crate::train::rows;
 
 fn md_str<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get("metadata")
@@ -43,6 +46,69 @@ fn at_step(v: &Value) -> String {
         .and_then(|s| s.get("title").and_then(Value::as_str))
         .unwrap_or("—")
         .to_string()
+}
+
+/// One IN TRANSIT line: the train, and the step it stands at with that
+/// step's status beside the title. `at_step` alone printed
+/// `at: In transit — cluster converged` for a READY step and was read as
+/// done (648a68a9); the phrase is the server's (`yard::standing_at`),
+/// so this line and the yard cannot disagree. `at_step` itself stays the
+/// bare title — the shed and the residue sweep compare it to one.
+///
+/// AT THE MERGE the line is spelled from the completed `ci` step and its
+/// verdict (`yard::awaiting_merge`) — the live one on the train when
+/// the conductor noticed it move — because "DEPARTED — merged into main
+/// (ready, not yet done)" still read as departed for red trains that
+/// would never merge (f7bd1e9d, 02801b05; a2d4d842).
+fn in_transit_line(t: &Value) -> String {
+    let title = t.get("title").and_then(Value::as_str).unwrap_or("?");
+    let steps: Vec<&Value> = t
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let slug_of = |s: &Value| {
+        s.get("spec_slug")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let ci = steps
+        .iter()
+        .find(|s| slug_of(s).as_deref() == Some("ci"))
+        .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"));
+    let at = steps
+        .iter()
+        .find_map(|s| {
+            let status = s.get("status").and_then(Value::as_str)?;
+            if !matches!(status, "ready" | "active") {
+                return None;
+            }
+            if slug_of(s).as_deref() == Some("merged")
+                && let Some(ci) = ci
+            {
+                let ci_md = |k: &str| {
+                    ci.get("metadata")
+                        .and_then(|m| m.get(k))
+                        .and_then(Value::as_str)
+                };
+                let verdict = md_str(t, "ci_verdict_latest");
+                let verdict = if verdict.is_empty() {
+                    ci_md("result").unwrap_or("unknown")
+                } else {
+                    verdict
+                };
+                return Some(boss_jobs::yard::awaiting_merge(
+                    verdict,
+                    ci_md("checks"),
+                    ci_md("train_gate"),
+                ));
+            }
+            let step = s.get("title").and_then(Value::as_str).unwrap_or("?");
+            Some(boss_jobs::yard::standing_at(step, status))
+        })
+        .unwrap_or_else(|| "—".to_string());
+    format!("    {title}  at: {at}")
 }
 
 /// One GATING line for a running gate-run. A car's run is its branch. A
@@ -206,6 +272,139 @@ fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
     out
 }
 
+/// Pairs of dock cars that cannot BOTH board — `(branch, branch, files)`,
+/// each pair once, branch-sorted.
+///
+/// THE CHECK EXISTED; THE READER DID NOT (backlog 5c567c27). On
+/// 2026-09-20 three cars, each told to stay additive and each green
+/// alone, could not board together — two touched WorldMap.svelte — and
+/// the pipeline stopped for nine and a half hours with a full dock. The
+/// packet asked for a dock-time check naming the pair when the second car
+/// parks. The conductor has computed exactly that on every reconcile tick
+/// since 12a25f3e (`preview_dock`: pairwise `git merge-tree` across the
+/// parked set, onto each car's `metadata.merge_preview.conflicts_with`)
+/// and nothing read it. A check nobody reads is a check that is not
+/// running, so this is the read — of the packets orient has already
+/// fetched, no second call and no copy of the conductor's judgement.
+///
+/// ONE TICK, BOTH AT THE DOCK. The preview is rewritten only for cars
+/// still parked-ready, so a car that boarded or is held keeps the
+/// preview of the dock it last saw (measured 2026-09-23: five cars
+/// stamped 09:50 still named a branch whose 10:10 preview no longer named
+/// them). Two previews pair only when both cars are open and parked
+/// (`boss_jobs::car::is_parked`, the dock's shared predicate) and both
+/// were measured over the SAME `anchored.parked_set` — one measurement,
+/// stale-not-wrong the moment either input moves.
+fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
+    let set_of = |c: &Value| {
+        c.pointer("/metadata/merge_preview/anchored/parked_set")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let dock: std::collections::BTreeMap<String, (String, &Value)> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .filter_map(|c| Some((md_str(c, "branch").to_string(), (set_of(c)?, c))))
+        .collect();
+    let mut out: Vec<(String, String, Vec<String>)> = dock
+        .iter()
+        .flat_map(|(branch, (set, c))| {
+            c.pointer("/metadata/merge_preview/conflicts_with")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |e| {
+                    let other = e.get("branch").and_then(Value::as_str)?;
+                    let files: Vec<String> = e
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    (branch.as_str() < other).then(|| (branch.clone(), other.to_string(), files))
+                })
+                .filter(|(_, other, _)| dock.get(other).is_some_and(|(s, _)| s == set))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Dock cars that no longer merge onto main — `(branch, files, main)`,
+/// branch-sorted, `main` the short sha the verdict was measured against.
+///
+/// THE OTHER HALF OF THE SAME PREVIEW (backlog 20d0d717). `preview_dock`
+/// writes `merge_preview.vs_main` beside `conflicts_with` on every tick,
+/// and after 5c567c27 gave the pairs a reader this half still had none:
+/// on 2026-09-23 car 5fba0bda carried `vs_main.clean=false` while this
+/// verb called it only FRESHNESS-stale — behind main, which a re-gate
+/// answers, rather than conflicting with it, which only a rerail does.
+///
+/// THE PAIRS' DISCIPLINE, FOR ONE CAR. A verdict is read only off an
+/// open, parked car whose preview was measured over the dock's CURRENT
+/// parked set — the set of the newest preview on the dock, because a
+/// change of set rewrites every parked-ready car's preview in one tick.
+/// A car carrying an older set was not in the last measurement (held,
+/// or left and back), so its verdict is stale, not wrong, and unread.
+fn conflicts_with_main(cars: &[Value]) -> Vec<(String, Vec<String>, String)> {
+    let preview = |c: &Value, key: &str| {
+        c.pointer(&format!("/metadata/merge_preview/{key}"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let dock: Vec<&Value> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .collect();
+    let Some(current) = dock
+        .iter()
+        .filter_map(|c| {
+            Some((
+                preview(c, "checked_at")?,
+                preview(c, "anchored/parked_set")?,
+            ))
+        })
+        .max()
+        .map(|(_, set)| set)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Vec<String>, String)> = dock
+        .iter()
+        .filter(|c| preview(c, "anchored/parked_set").as_ref() == Some(&current))
+        .filter(|c| {
+            c.pointer("/metadata/merge_preview/vs_main/clean")
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+        .map(|c| {
+            let files = c
+                .pointer("/metadata/merge_preview/vs_main/files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            let main: String = preview(c, "anchored/main")
+                .unwrap_or_else(|| "?".to_string())
+                .chars()
+                .take(8)
+                .collect();
+            (md_str(c, "branch").to_string(), files, main)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The two gate-run reads behind the STRANDED and HELD GREENS lanes,
 /// composed here so the test that pins their shape reads the strings
 /// the server will.
@@ -282,14 +481,26 @@ fn held_greens(gate_runs: &[Value], car_branches: &BTreeSet<String>) -> Vec<(Str
 ///
 /// Each line carries what the operator's next move needs: the branch,
 /// the packet, how long nobody has held it, whether a car is owed, and
-/// the verb that recovers it. The recovery is the BARE verb on purpose —
-/// a re-gate REUSES the open packet (`reusable_packet`) and an empty
-/// `ParkIntent` stamps nothing, so the `park_*` keys already on the
-/// packet survive; only a branch that has LANDED has them cleared
+/// the verb that recovers it. The recovery carries no `--park-*` flag on
+/// purpose — a re-gate REUSES the open packet (`reusable_packet`) and an
+/// empty `ParkIntent` stamps nothing, so the `park_*` keys already on
+/// the packet survive; only a branch that has LANDED has them cleared
 /// (610537b2). Pinned by gate.rs's
 /// `a_bare_regate_stamps_nothing_so_a_reused_packets_intent_survives`,
 /// because this is advice a tired operator will follow verbatim.
-fn abandoned_report(places: &[AbandonedPlace]) -> Vec<String> {
+///
+/// IT CARRIES `--rebase`, AND A LANDED PLACE GETS NO RECOVERY AT ALL
+/// (backlog e9cdd83f, 2026-09-24). The bare verb this line printed was
+/// refused for its base — the waiters had died before train #601 moved
+/// main — and the hand rebase that followed moved the head, so the next
+/// `boss gate` matched no packet and filed two NEW gate-runs with no
+/// intent. `--rebase` replays inside the verb after the packet is
+/// matched. And orient went on advising a re-gate of both after their
+/// branches had landed, which with park intent is the twin-car trap:
+/// `landed` names, by packet, the places whose work main already holds
+/// ([`superseded_by_main`]), and each is reported as superseded, with
+/// what closes it and no verb to run.
+fn abandoned_report(places: &[AbandonedPlace], landed: &BTreeMap<String, String>) -> Vec<String> {
     if places.is_empty() {
         return Vec::new();
     }
@@ -321,15 +532,55 @@ fn abandoned_report(places: &[AbandonedPlace]) -> Vec<String> {
             "    {branch}  packet {}  {idle}{owed}",
             &p.packet[..8.min(p.packet.len())],
         ));
-        if !p.branch.is_empty() {
+        if let Some(how) = landed.get(&p.packet) {
+            // Closed by the conductor's reap of a gate-run past its Job
+            // deadline, measured on opened_at — the one path that closed
+            // both of 2026-09-24's (as lost, 04:30Z). Named, not run:
+            // this verb is read-only.
             out.push(format!(
-                "      recover: boss gate {} --wait  — reuses this packet and keeps its \
-                 park intent (a bare re-gate stamps nothing over it)",
+                "      LANDED — {how}: superseded, nothing to recover. Do not re-gate it \
+                 (with park intent that files a twin car); the conductor settles the packet \
+                 as lost once it is {}h old.",
+                crate::train::GATE_DEADLINE_HOURS
+            ));
+        } else if !p.branch.is_empty() {
+            out.push(format!(
+                "      recover: boss gate {} --wait --rebase  — reuses this packet and keeps \
+                 its park intent; --rebase replays onto origin/main INSIDE the verb, after \
+                 the packet is matched on the head it queued at (a hand rebase first moves \
+                 the head and files a new packet with no intent)",
                 p.branch
             ));
         }
     }
     out
+}
+
+/// PURE: has main already taken the work an abandoned place queued?
+/// The `how` of the landing when it has, `None` otherwise.
+///
+/// `verdict_for` is `boss merged`'s rules applied to one target (the
+/// adapter in [`run`] is `merged::verdict(&merged::observe(..))`), and
+/// the words are `gate::landing`'s — the one tested merged-check and the
+/// one phrasing, called rather than re-derived (26b3d203). Asked of the
+/// QUEUED head first, because a train deletes the branches it lands and
+/// a deleted branch reads Unknown by name; then of the branch, because a
+/// head that moved on and landed supersedes the one queued. Only a
+/// Merged answer supersedes — Unknown is "could not tell", never "no",
+/// and leaves the recovery in place, where `boss gate`'s own landed
+/// guard still stands between it and a twin.
+fn superseded_by_main(
+    place: &AbandonedPlace,
+    verdict_for: impl Fn(&str) -> crate::merged::Verdict,
+) -> Option<String> {
+    // `origin/<branch>` is what `resolve_sha` records when the forge did
+    // not answer — a name, not a head, so it is not asked about.
+    let head =
+        (!place.sha.is_empty() && !place.sha.starts_with("origin/")).then_some(place.sha.as_str());
+    let branch = (!place.branch.is_empty()).then_some(place.branch.as_str());
+    head.into_iter().chain(branch).find_map(|target| {
+        crate::gate::landing(&verdict_for(target), &[], &place.branch, &place.sha).map(|l| l.how)
+    })
 }
 
 fn bases_behind(checks: &[(String, Option<i32>)]) -> Vec<&str> {
@@ -401,24 +652,127 @@ pub(crate) fn shed_lines(cars: &[Value]) -> Vec<String> {
                 Some(i) => format!("{branch} (holds {})", &i[..i.len().min(8)]),
                 None => branch.to_string(),
             };
-            let branch = holds.as_str();
-            match shed_place(c) {
-                Shed::ProbePending { last: None } => {
-                    format!("    {branch}: probe pending (the forge runs it on arrival)")
-                }
-                Shed::ProbePending { last: Some(why) } => {
-                    format!("    {branch}: probe FAILING — {}", clipped(&why))
-                }
-                Shed::ProbeNotYet { said } => {
-                    format!("    {branch}: probe says NOT YET — {}", clipped(&said))
-                }
-                Shed::WaitingOn(ev) => format!("    {branch}: waiting on: {}", clipped(&ev)),
-                Shed::Unproven => format!(
-                    "    {branch}: UNPROVEN — no probe, no event; nothing mechanical can settle it (boss prove --probe)"
-                ),
-            }
+            format!("    {holds}: {}", shed_text(c))
         })
         .collect()
+}
+
+/// What a landed car's proof is waiting on, in one clause — the shed's
+/// line and MY WORK's carried row say it in the same words, because
+/// they are one fact read twice (bc416f60).
+fn shed_text(car: &Value) -> String {
+    match shed_place(car) {
+        Shed::ProbePending { last: None } => {
+            "probe pending (the forge runs it on arrival)".to_string()
+        }
+        Shed::ProbePending { last: Some(why) } => format!("probe FAILING — {}", clipped(&why)),
+        // A streak past the bound is named, not folded into the
+        // plain line: a probe that can never pass answers exit 75
+        // exactly like a patient one (adef5ddf). A car that
+        // DECLARED what it waits on is exempt from the bound, and
+        // named instead once its own event is seen (b461341d) —
+        // one predicate, the shed's.
+        Shed::ProbeNotYet { said } => {
+            let md = car.get("metadata").unwrap_or(&Value::Null);
+            match boss_jobs::car::starved(md) {
+                Some(boss_jobs::car::Starved::Undeclared(s)) => format!(
+                    "probe NOT YET for {}h straight ({} runs) — past {}h, \
+                     read the probe against the tree: it may never pass — {}",
+                    s.hours,
+                    s.runs,
+                    boss_jobs::regions::NOT_YET_STARVED_HOURS,
+                    clipped(&said)
+                ),
+                Some(boss_jobs::car::Starved::SeenWhileNotYet { on, seen_at }) => format!(
+                    "probe NOT YET though what it waits on ({}) was seen \
+                     in the record at {seen_at} — read the probe against the tree — {}",
+                    clipped(&on),
+                    clipped(&said)
+                ),
+                None => match (boss_jobs::car::waits_on(md), actor_wait(md)) {
+                    // A named actor's act is theirs with or without an
+                    // observer (3881f5c9) — the shed's own predicate.
+                    (_, Some(whose)) => {
+                        format!("probe says NOT YET, {whose} — {}", clipped(&said))
+                    }
+                    // A declaration nothing observes (e9b164a1):
+                    // exempt from the bound AND never contradicted,
+                    // so the line names the missing check.
+                    (Some(w), None) if w.seen.is_none() => format!(
+                        "probe says NOT YET, waiting on {} — no seen check, \
+                         so nothing can say it arrived (boss car waits-on --seen) — {}",
+                        clipped(&w.on),
+                        clipped(&said)
+                    ),
+                    (Some(w), None) => format!(
+                        "probe says NOT YET, waiting on {} — {}",
+                        clipped(&w.on),
+                        clipped(&said)
+                    ),
+                    (None, None) => format!("probe says NOT YET — {}", clipped(&said)),
+                },
+            }
+        }
+        Shed::WaitingOn(ev) => match actor_wait(car.get("metadata").unwrap_or(&Value::Null)) {
+            Some(whose) => format!("{whose} — {}", clipped(&ev)),
+            None => format!("waiting on: {}", clipped(&ev)),
+        },
+        Shed::Unproven => "UNPROVEN — no probe, no event; nothing mechanical can settle it \
+             (boss prove --probe)"
+            .to_string(),
+    }
+}
+
+/// "waiting on <actor>: <act>" when the car's wait is a named actor's
+/// act the shed counts as theirs (`boss_jobs::car::owned_wait`), else
+/// `None` — a world wait keeps the clauses above, which name its
+/// observer or the lack of one.
+fn actor_wait(md: &Value) -> Option<String> {
+    boss_jobs::car::owned_wait(md)
+        .filter(|o| matches!(o.owner, boss_jobs::car::WaitOwner::Actor(_)))
+        .map(|o| format!("waiting on {}: {}", o.owner, clipped(&o.on)))
+}
+
+/// The backlog-items an OPEN car already carries, keyed by item id, each
+/// with the clause MY WORK prints in place of the item's age: LANDED
+/// (at `Proven in prod` — merged, and what its proof waits on) or IN
+/// FLIGHT (the step the car stands at). A landed car wins over an
+/// in-flight one for the same item. Closed cars carry nothing: a merged
+/// car's close is what completes the item's step (the chain
+/// complete-feedback-branch-on-car-merged), so its row is gone anyway.
+///
+/// WHY (bc416f60). Measured 2026-09-22, working the queue oldest-first:
+/// six of the twelve oldest steps on the agent were build steps whose
+/// cars had merged three to five days earlier and stood in the shed,
+/// their probes honestly answering not-yet on a real-world event. The
+/// chain was correct — an item closes when its car proves — but MY
+/// WORK drew each one as an unstarted build of its filing age, first in
+/// line, and telling them apart cost a git-log grep per packet (nine
+/// of them from train #567, 2026-09-23). The car already holds the
+/// answer; this is that answer read at the queue, with no new write.
+pub(crate) fn carried_items(cars: &[Value]) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for c in cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+    {
+        let item = md_str(c, "backlog_item");
+        if item.is_empty() {
+            continue;
+        }
+        let branch = md_str(c, "branch");
+        let step = at_step(c);
+        if step == "Proven in prod" {
+            out.insert(
+                item.to_string(),
+                format!("LANDED (car {branch}), awaiting proof: {}", shed_text(c)),
+            );
+        } else {
+            out.entry(item.to_string())
+                .or_insert_with(|| format!("IN FLIGHT (car {branch} at {step})"));
+        }
+    }
+    out
 }
 
 /// The ORPHANS listing lines for a set of forge heads, bounded to
@@ -590,7 +944,21 @@ fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
 /// by workflow, groups and rows both oldest first, each group headed
 /// by its count and closed by one hint line. Pure so the shape is
 /// testable; the caller prints the section heading from the count.
-pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+///
+/// A row whose packet a car already carries (`carried`, from
+/// `carried_items`) prints what the car says in place of its age, and
+/// sorts after its group's unstarted rows: oldest-first is a rule for
+/// choosing work to START, and a carried item is not that (bc416f60).
+pub(crate) fn my_work_lines(
+    rows: &[Value],
+    carried: &std::collections::BTreeMap<String, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let carried_by = |r: &Value| {
+        r.get("job_id")
+            .and_then(Value::as_str)
+            .and_then(|j| carried.get(j))
+    };
     let mut seen = BTreeSet::new();
     let mut keyed: Vec<(Option<chrono::NaiveDate>, &Value)> = rows
         .iter()
@@ -614,6 +982,7 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
     // never mistaken for today's.
     keyed.sort_by_key(|(opened, r)| {
         (
+            carried_by(r).is_some(),
             opened.is_none(),
             *opened,
             r.get("job_id")
@@ -633,7 +1002,11 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
     }
     let mut out = Vec::new();
     for (kind, rows) in groups {
-        out.push(format!("    {kind} — {}", rows.len()));
+        let held = rows.iter().filter(|(_, r)| carried_by(r).is_some()).count();
+        out.push(match held {
+            0 => format!("    {kind} — {}", rows.len()),
+            n => format!("    {kind} — {} ({n} already carried by a car)", rows.len()),
+        });
         let mut slugs: Vec<&str> = Vec::new();
         for (opened, r) in rows {
             let job = r.get("job_id").and_then(Value::as_str).unwrap_or("");
@@ -642,9 +1015,6 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 .pointer("/step/spec_slug")
                 .and_then(Value::as_str)
                 .unwrap_or("?");
-            if !slugs.contains(&slug) {
-                slugs.push(slug);
-            }
             let title: String = r
                 .get("job_title")
                 .and_then(Value::as_str)
@@ -652,6 +1022,18 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 .chars()
                 .take(MY_WORK_TITLE_CHARS)
                 .collect();
+            // A carried row's hint is the carried one: "build = a change
+            // to build" is exactly the misreading this line exists to stop.
+            if let Some(state) = carried_by(r) {
+                out.push(format!(
+                    "      {id8} {kind} {slug} {} — {state}",
+                    title.trim_end()
+                ));
+                continue;
+            }
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
             let age = match opened {
                 Some(d) => format!("{}d", crate::census::age_days(d, now)),
                 None => "age ?".to_string(),
@@ -661,7 +1043,14 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
                 title.trim_end()
             ));
         }
-        let hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
+        let mut hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
+        if held > 0 {
+            hints.push(
+                "carried = its car holds the work; the item closes itself when that car \
+                 proves — do not build it again"
+                    .to_string(),
+            );
+        }
         if !hints.is_empty() {
             out.push(format!("      → {}", hints.join("; ")));
         }
@@ -674,9 +1063,74 @@ pub(crate) fn my_work_lines(rows: &[Value], now: chrono::DateTime<chrono::Utc>) 
 /// `operator:unidentified`, which would answer 0 and read as an empty
 /// queue — the wrong-target trap (CLAUDE.md §Doors), with the two ways
 /// to name yourself on the line.
+/// The OVERDUE block MY WORK leads with (backlog 078ddcb0): the OPEN
+/// alarms the dispatcher's `jobs.agent_step_overdue` filed for a step
+/// held by one of `identities` past the wait its workflow declares,
+/// longest wait first. Empty when there is none, so a section with no
+/// late work reads exactly as it did.
+///
+/// WHY THE ALARM AND NOT A RECOMPUTATION. The bound lives on the rule
+/// row and the wait on the packet; an assignments row carries neither.
+/// Re-deriving "late" here would be a second judgement that can
+/// disagree with the alarm the operator is also shown, so this reads
+/// the alarm — one definition, whose keys are the handler's own
+/// constants. The cost is up to an hour's lag behind the hourly tick,
+/// and the alarm packet exists either way.
+pub(crate) fn overdue_lines(alarms: &[Value], identities: &[String]) -> Vec<String> {
+    use boss_dispatcher_handlers::handlers::jobs_agent_step_overdue as od;
+    let md = |a: &Value, k: &str| a.pointer(&format!("/metadata/{k}")).cloned();
+    let text = |a: &Value, k: &str| {
+        md(a, k)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let mut mine: Vec<&Value> = alarms
+        .iter()
+        .filter(|a| a.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|a| identities.iter().any(|i| *i == text(a, od::ASSIGNEE_KEY)))
+        .collect();
+    if mine.is_empty() {
+        return Vec::new();
+    }
+    let waited = |a: &Value| md(a, od::WAITED_KEY).and_then(|v| v.as_f64());
+    mine.sort_by(|a, b| {
+        waited(b)
+            .partial_cmp(&waited(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut out = vec![format!(
+        "    OVERDUE — {} real-work step(s) held past the wait its workflow declares — \
+         move these FIRST:",
+        mine.len()
+    )];
+    for a in mine {
+        let packet = text(a, od::PACKET_KEY);
+        let alarm = a.get("id").and_then(Value::as_str).unwrap_or("?");
+        let title: String = text(a, od::TITLE_KEY)
+            .chars()
+            .take(MY_WORK_TITLE_CHARS)
+            .collect();
+        let number = |k: &str| md(a, k).map_or_else(|| "?".to_string(), |v| v.to_string());
+        out.push(format!(
+            "      {} {} {} {} — waited {}h on {}, bound {}h (alarm {})",
+            &packet[..packet.len().min(8)],
+            text(a, od::WORKFLOW_KEY),
+            text(a, od::SLUG_KEY),
+            title.trim_end(),
+            number(od::WAITED_KEY),
+            text(a, od::ASSIGNEE_KEY),
+            number(od::BOUND_KEY),
+            &alarm[..alarm.len().min(8)],
+        ));
+    }
+    out
+}
+
 pub(crate) fn my_work_section(
     identities: Option<&[String]>,
     rows: &[Value],
+    cars: &[Value],
+    alarms: &[Value],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
     let Some(ids) = identities else {
@@ -693,26 +1147,50 @@ pub(crate) fn my_work_section(
         [one] => one.clone(),
         [first, rest @ ..] => format!("{first} (+ {})", rest.join(", ")),
     };
-    let lines = my_work_lines(rows, now);
+    let carried = carried_items(cars);
+    let lines = my_work_lines(rows, &carried, now);
+    // Late real work leads, above every group (078ddcb0). An alarm with
+    // no row behind it still prints: the alarm is up to an hour behind
+    // the queue, and a late step is worth a line either way.
+    let overdue = overdue_lines(alarms, ids);
     if lines.is_empty() {
-        return vec![format!(
+        let mut out = vec![format!(
             "  MY WORK — nothing: no ready/active step is assigned to {who}"
         )];
+        out.extend(overdue);
+        return out;
     }
     let count = lines
         .iter()
         .filter(|l| l.starts_with("      ") && !l.starts_with("      →"))
         .count();
+    // Counted by step id, as the lines are: one step read under two
+    // identities is one step.
+    let held = rows
+        .iter()
+        .filter(|r| {
+            r.get("job_id")
+                .and_then(Value::as_str)
+                .is_some_and(|j| carried.contains_key(j))
+        })
+        .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let tail = match held {
+        0 => String::new(),
+        n => format!("; {n} already carried by a car, listed last"),
+    };
     let mut out = vec![format!(
-        "  MY WORK — {count} ready/active step(s) assigned to {who} — yours to move, oldest first"
+        "  MY WORK — {count} ready/active step(s) assigned to {who} — yours to move, oldest first{tail}"
     )];
+    out.extend(overdue);
     out.extend(lines);
     out
 }
 
 /// The REGIONS header — the IT system map's KPI cards, one line
 /// each, from `GET /api/yard/regions` (design 0524fc95, car 1). The
-/// server owns these numbers now: the count, the clear/busy/troubled
+/// server owns these numbers now: the count, the clear/attention/troubled
 /// state and the trend are ONE definition in `boss_jobs::regions`, the
 /// same one the map reads, so this verb and the yard cannot disagree
 /// about how many trains are in transit or what the time at CI is. The
@@ -723,10 +1201,17 @@ pub(crate) fn my_work_section(
 /// `clear` is printed upper-case so trouble reads as trouble. The
 /// `window_hours` the server answered rides the heading, because a
 /// rate without its window is not a number.
+///
+/// ONE VOCABULARY, EACH STATE WITH ITS BAND (design 62de32ae): clear /
+/// attention / troubled, a non-clear state followed by how long the
+/// record says it has held ("TROUBLED for 16m") and the declared band
+/// that decided it, read against its number ("[oldest 5d > the 3-day
+/// triage band]"); the count carries its unit, a bound says whether it
+/// is a capacity or a threshold, and the region's KPI leads the trend.
 pub(crate) fn region_lines(map: &Value) -> Vec<String> {
     let hours = map.get("window_hours").and_then(Value::as_i64).unwrap_or(0);
     let mut out = vec![format!(
-        "  REGIONS — the IT system map over the last {hours}h (count · state · trend)"
+        "  REGIONS — the IT system map over the last {hours}h (count · state · kpi · trend)"
     )];
     let regions = map
         .get("regions")
@@ -739,24 +1224,88 @@ pub(crate) fn region_lines(map: &Value) -> Vec<String> {
             Some(Value::Number(n)) => n.to_string(),
             _ => "?".to_string(),
         };
-        let bound = r
-            .get("bound")
-            .and_then(Value::as_i64)
-            .map(|b| format!(" of {b}"))
-            .unwrap_or_default();
+        let unit = r.get("unit").and_then(Value::as_str).unwrap_or("");
+        let bound = match (
+            r.get("bound").and_then(Value::as_i64),
+            r.get("bound_kind").and_then(Value::as_str),
+        ) {
+            (Some(b), Some("threshold")) => format!(" {unit} · threshold {b}"),
+            (Some(b), _) => format!(" of {b} {unit}"),
+            (None, _) => format!(" {unit}"),
+        };
+        let band = r.get("band").filter(|b| !b.is_null());
         let state = r.get("state").and_then(Value::as_str).unwrap_or("?");
         let state = if state == "clear" {
             state.to_string()
         } else {
-            state.to_uppercase()
+            let held = band
+                .and_then(|b| b.get("held"))
+                .and_then(Value::as_str)
+                .map(|h| format!(" for {h}"))
+                .unwrap_or_default();
+            format!("{}{held}", state.to_uppercase())
+        };
+        let decided = band
+            .and_then(|b| b.get("reads"))
+            .and_then(Value::as_str)
+            .map(|reads| format!("[{reads}] "))
+            .unwrap_or_default();
+        let kpi: Vec<&str> = r
+            .get("kpi")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("text").and_then(Value::as_str))
+            .collect();
+        let kpi = if kpi.is_empty() {
+            String::new()
+        } else {
+            format!("{} · ", kpi.join(" · "))
         };
         let why = r.get("why").and_then(Value::as_str).unwrap_or("");
         out.push(format!(
-            "    {name:<12} {count:>5}{bound:<6} {state:<9} {}  — {why}",
+            "    {name:<12} {count:>5}{bound:<32} {state:<18} {kpi}{}  — {decided}{why}",
             trend_text(r.get("trend").unwrap_or(&Value::Null))
         ));
     }
+    out.extend(plant_line(map));
     out
+}
+
+/// THE PLANT (design 62de32ae, decision 11): the machinery that serves
+/// every region — the host runners — on one line after the regions. A
+/// failed or unknown machine carries its why, because no region's state
+/// carries a plant machine's failure; a running or idle one is its word.
+/// `None` for an older payload with no `plant`, which is not an empty
+/// plant.
+fn plant_line(map: &Value) -> Option<String> {
+    let plant = map.get("plant")?.as_array()?;
+    if plant.is_empty() {
+        return Some(format!("    {:<12} no machine declared", "plant"));
+    }
+    let machines: Vec<String> = plant
+        .iter()
+        .map(|m| {
+            let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+            let state = m.get("state").and_then(Value::as_str).unwrap_or("?");
+            let why = m.get("why").and_then(Value::as_str).unwrap_or("");
+            match state {
+                "running" | "idle" => format!("{name} {state}"),
+                _ => format!("{name} {} ({why})", state.to_uppercase()),
+            }
+        })
+        .collect();
+    Some(format!(
+        "    {:<12} {} {} serving every region: {}",
+        "plant",
+        plant.len(),
+        if plant.len() == 1 {
+            "machine"
+        } else {
+            "machines"
+        },
+        machines.join(" · ")
+    ))
 }
 
 /// `dock wait 1.5h (was 2.0h)` / `arrivals 17/day (was 12/day)` /
@@ -777,6 +1326,93 @@ fn trend_text(t: &Value) -> String {
         }
     };
     format!("{metric} {} (was {})", one("current"), one("previous"))
+}
+
+/// The THIRDS header — the HUD frame's rows and its machine cell, read
+/// off the SAME `/api/yard/regions` payload the map's HUD reads (design
+/// 00774ca8, decision 9: "`boss orient` prints the same block. No client
+/// adds anything up"). One line per third, in the payload's order:
+/// its balance (net per day, then its two rates and their unit), then
+/// stuck and waiting side by side, never summed. Then the machines.
+///
+/// Every unknown prints as `?` and a floor as `≥ n ?` — the three
+/// pictures the HUD draws — so an unread edge never reads as a balanced
+/// one. A server older than the block says so in one line.
+pub(crate) fn third_lines(map: &Value) -> Vec<String> {
+    let hours = map.get("window_hours").and_then(Value::as_i64).unwrap_or(0);
+    let thirds = map.get("thirds").and_then(Value::as_array);
+    let Some(thirds) = thirds.filter(|t| !t.is_empty()) else {
+        return vec!["  THIRDS — unavailable: the server sends no thirds block".to_string()];
+    };
+    let rate = |v: Option<&Value>| match v.and_then(Value::as_f64) {
+        Some(x) => format!("{x:.1}"),
+        None => "?".to_string(),
+    };
+    let mut out = vec![format!(
+        "  THIRDS — the whole system over the last {hours}h (balance · stuck · waiting)"
+    )];
+    for t in thirds {
+        let name = t.get("third").and_then(Value::as_str).unwrap_or("?");
+        let b = t.get("balance").unwrap_or(&Value::Null);
+        let net = match b.get("net").and_then(Value::as_f64) {
+            Some(x) if x > 0.0 => format!("+{x:.1}/day"),
+            Some(x) => format!("{x:.1}/day"),
+            None => "?/day".to_string(),
+        };
+        let unit = b.get("unit").and_then(Value::as_str).unwrap_or("");
+        let why = b
+            .get("why")
+            .and_then(Value::as_str)
+            .map(|w| format!(" — {w}"))
+            .unwrap_or_default();
+        let s = t.get("stuck").unwrap_or(&Value::Null);
+        let count = |k: &str| s.get(k).and_then(Value::as_u64);
+        let unknown = s
+            .get("unknown")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let stuck = match (count("stuck"), unknown) {
+            (Some(n), 0) => format!("stuck {n}"),
+            (Some(n), _) => format!("stuck ≥{n} ?"),
+            (None, _) => "stuck ?".to_string(),
+        };
+        let waiting = count("waiting").map_or_else(|| "?".to_string(), |n| n.to_string());
+        out.push(format!(
+            "    {name:<17} {net:>10} ({} in · {} out {unit}) · {stuck} · waiting {waiting}{why}",
+            rate(b.get("in")),
+            rate(b.get("out")),
+        ));
+    }
+    match map.get("machines").filter(|m| !m.is_null()) {
+        None => out.push("  MACHINES — unavailable: the server sends no machine count".to_string()),
+        Some(m) => {
+            let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+            out.push(format!(
+                "  MACHINES — {} failed · {} unjudged of {} ({} running, {} idle)",
+                n("failed"),
+                n("unknown"),
+                n("total"),
+                n("running"),
+                n("idle")
+            ));
+            for x in m
+                .get("failed_or_unknown")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let s = |k: &str| x.get(k).and_then(Value::as_str).unwrap_or("?");
+                out.push(format!(
+                    "    {:<8} {:<12} {} — {}",
+                    s("state").to_uppercase(),
+                    s("region"),
+                    s("name"),
+                    s("why")
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The BORDERS header — one line per border of the IT world map, from
@@ -812,17 +1448,65 @@ pub(crate) fn border_lines(map: &Value) -> Vec<String> {
         };
         // A waiting count the server could not take is `?`, never 0.
         let waiting = match b.get("waiting") {
-            Some(Value::Number(n)) => format!("{n} waiting"),
+            Some(Value::Number(n)) => format!("{n} waiting{}", classes_text(b)),
             _ => "? waiting".to_string(),
         };
         let why = b.get("why").and_then(Value::as_str).unwrap_or("");
         out.push(format!(
-            "    {hop:<26} {:<24} {waiting:<12} {state:<9} {}  — {why}",
+            "    {hop:<26} {:<24} {waiting:<12} {}{state:<9} {}  — {why}",
             rate_text(b.get("rate").unwrap_or(&Value::Null)),
+            flow_text(b),
             machine_text(b.get("machine").unwrap_or(&Value::Null)),
         ));
     }
     out
+}
+
+/// ` [machine 1 · person 2 · unknown 0 · stuck 1]` — on whom what stands
+/// at the border waits, the server's `holds_by_class` (design 31bade8f
+/// decision 8), every class printed because a zero there is a reading.
+/// Nothing when the payload carries no classes: a queue the server
+/// could not read already prints `? waiting`, and an older server's
+/// payload makes no claim to print.
+fn classes_text(b: &Value) -> String {
+    let Some(c) = b.get("holds_by_class").filter(|c| c.is_object()) else {
+        return String::new();
+    };
+    let n = |k: &str| {
+        c.get(k)
+            .and_then(Value::as_u64)
+            .map_or_else(|| "?".to_string(), |n| n.to_string())
+    };
+    format!(
+        " [machine {} · person {} · unknown {} · stuck {}]",
+        n("machine"),
+        n("person"),
+        n("unknown"),
+        n("stuck")
+    )
+}
+
+/// Whether the rail flows, as the server judged it (design 31bade8f
+/// decision 8): `flowing`, `STILL since <the record's own instant> (the
+/// rule's words)`, or `flow ?` when it cannot be told. The instant is
+/// printed as the server sent it — never a duration this process
+/// computed against its own clock. An older server's payload, which
+/// carries no `flowing` key at all, prints nothing: absent is not
+/// unknown, and neither is a reading.
+fn flow_text(b: &Value) -> String {
+    match b.get("flowing") {
+        None => String::new(),
+        Some(Value::Bool(true)) => "flowing  ".to_string(),
+        Some(Value::Bool(false)) => {
+            let since = b
+                .get("held_since")
+                .and_then(Value::as_str)
+                .unwrap_or("before the read");
+            let why = b.get("flowing_why").and_then(Value::as_str).unwrap_or("");
+            format!("STILL since {since} ({why})  ")
+        }
+        Some(_) => "flow ?  ".to_string(),
+    }
 }
 
 /// `3.0/day (was 5.0/day)`, with a half nobody measured as `—`.
@@ -890,6 +1574,40 @@ pub async fn run(all: bool) -> Result<()> {
         crate::built_from::freshness_line(built, main.as_deref(), ancestry)
     );
 
+    // THE MEMORY INDEX — the session's other instrument, measured
+    // against a declared budget (4ea1b28c). It sits here, beside the
+    // binary's own freshness and above every lane, because it is a
+    // statement about what this session was HANDED rather than about the
+    // yard: an agent reading a truncated index does not know it is
+    // reading one, and the harness that cut it says nothing. Loud when
+    // over, quiet-but-numbered when under, and never fatal.
+    for line in crate::memory_index::report() {
+        println!("{line}");
+    }
+
+    // REPORTING TO — who reads this session's reports, their company
+    // address and their timezone, from the people and locations
+    // registries rather than from agent memory (backlog 2de32950). Beside
+    // the memory index for the same reason: it is about what this
+    // session is handed, and it prints before any lane can fail.
+    for line in crate::reporting_to::section(&http).await {
+        println!("{line}");
+    }
+
+    // THE DOOR — the dev pod's ssh door as the record last judged it,
+    // from the forge's observation of it (backlog e6406701; incident
+    // 55d001b0: both doors dark ~36h and a person found it). Beside
+    // REPORTING TO because it, too, is about the session's own ground:
+    // the door into the pod this verb usually runs in.
+    let door = crate::gate::api(&http, reqwest::Method::GET, crate::door::READ, None)
+        .await
+        .and_then(rows)
+        .map(|r| r.into_iter().next())
+        .map_err(|e| e.to_string());
+    for line in crate::door::lines(&door, boss_clock_client::wall_now()) {
+        println!("{line}");
+    }
+
     // THE REGIONS — the map's numbers, from the server's one definition
     // (design 0524fc95). A server without the read (older than this
     // verb) says so and the approach still prints; the lanes below are
@@ -898,6 +1616,12 @@ pub async fn run(all: bool) -> Result<()> {
     match api(&http, reqwest::Method::GET, "/api/yard/regions", None).await {
         Ok(Some(map)) => {
             for line in region_lines(&map) {
+                println!("{line}");
+            }
+            // The HUD's rows and machine cell, from the same payload
+            // (design 00774ca8): the whole system, after its parts.
+            println!();
+            for line in third_lines(&map) {
                 println!("{line}");
             }
         }
@@ -929,14 +1653,10 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    );
+    )?;
     println!("\n  IN TRANSIT — {} train(s)", trains.len());
     for t in &trains {
-        println!(
-            "    {}  at: {}",
-            t.get("title").and_then(Value::as_str).unwrap_or("?"),
-            at_step(t)
-        );
+        println!("{}", in_transit_line(t));
     }
 
     // Gates running now.
@@ -948,7 +1668,7 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    );
+    )?;
     // A QUEUED run is not gating: it is waiting for a slot and has no
     // Job at all (boss_jobs::yard::QUEUED_AT). Reporting it as GATING
     // would overstate what the node is doing by exactly the number of
@@ -983,7 +1703,28 @@ pub async fn run(all: bool) -> Result<()> {
             println!("    {}", queued_lane_line(g, &trains));
         }
     }
-    for line in abandoned_report(&abandoned) {
+    // Which of them main already holds — asked only when there is a
+    // strand, after the same quiet fetch of main `boss gate`'s landed
+    // guard makes, so the content comparison has main's objects. Every
+    // probe may fail, and a failure is Unknown: the place keeps its
+    // recovery rather than being called landed (backlog e9cdd83f).
+    let landed: BTreeMap<String, String> = if abandoned.is_empty() {
+        BTreeMap::new()
+    } else {
+        let _ = crate::git_auth::command()
+            .args(["fetch", "--quiet", "origin", "main"])
+            .status();
+        abandoned
+            .iter()
+            .filter_map(|p| {
+                superseded_by_main(p, |target| {
+                    crate::merged::verdict(&crate::merged::observe(".", "origin", target))
+                })
+                .map(|how| (p.packet.clone(), how))
+            })
+            .collect()
+    };
+    for line in abandoned_report(&abandoned, &landed) {
         println!("{line}");
     }
 
@@ -1003,7 +1744,7 @@ pub async fn run(all: bool) -> Result<()> {
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_i64);
-    let gate_runs = rows(stranded_body);
+    let gate_runs = rows(stranded_body)?;
     let stranded_cut = cut_note(stranded_total, gate_runs.len());
     // Held greens: read BY THE HOLD, so a hold is seen for as long as it
     // stands, whatever gated after it.
@@ -1012,17 +1753,14 @@ pub async fn run(all: bool) -> Result<()> {
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_i64);
-    let held_runs = rows(held_body);
+    let held_runs = rows(held_body)?;
     let held_cut = cut_note(held_total, held_runs.len());
-    let cars = rows(
-        api(
-            &http,
-            reqwest::Method::GET,
-            "/api/jobs?kind=ship-a-change&limit=800",
-            None,
-        )
-        .await?,
-    );
+    // Every car, paged on `total` (backlog 10776b6c): the shed, the
+    // dock's held and troubled lanes and the stranded cross-ref all read
+    // this list, and one bare `limit=800` page would have dropped the
+    // oldest landed cars out of all four silently once the yard passed
+    // 800.
+    let cars = crate::gate::all_cars(&http).await?;
     let car_branches: BTreeSet<String> = cars
         .iter()
         .map(|c| md_str(c, "branch").to_string())
@@ -1110,7 +1848,7 @@ pub async fn run(all: bool) -> Result<()> {
             None,
         )
         .await?,
-    ));
+    )?);
     match crate::git_auth::command()
         .args(["ls-remote", "--heads", "origin"])
         .output()
@@ -1204,12 +1942,11 @@ pub async fn run(all: bool) -> Result<()> {
         .and_then(|d| d.get("total"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Read once, and refused if it is not a list: "0 car(s) parked"
+    // from a dark door is the empty-yard answer (7b7e0529).
+    let dock = rows(dock)?;
     println!("\n  DOCK — {dock_total} car(s) parked");
-    for c in dock
-        .as_ref()
-        .map(|d| rows(Some(d.clone())))
-        .unwrap_or_default()
-    {
+    for c in &dock {
         println!(
             "    {}",
             c.get("title").and_then(Value::as_str).unwrap_or("?")
@@ -1254,13 +1991,45 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // CANNOT BOTH BOARD — the conductor's merge preview, read (5c567c27).
+    // Each car of a pair merges clean onto main alone; together one is
+    // left at assembly. Named at the first tick after the second parks,
+    // not nine hours later at the boarding that discovers it.
+    let pairs = unboardable_pairs(&cars);
+    if !pairs.is_empty() {
+        println!(
+            "  CANNOT BOTH BOARD — {} pair(s) of dock cars that conflict with each other \
+             (land one, then boss rerail the other onto the main it landed on; rerailing \
+             both at once recreates the conflict):",
+            pairs.len()
+        );
+        for (a, b, files) in &pairs {
+            println!("    {a}  x  {b}  —  {}", files.join(", "));
+        }
+    }
+
+    // CONFLICTS WITH MAIN — the preview's other half, read (20d0d717).
+    // Not FRESHNESS: a car behind main is repaired by a re-gate, a car
+    // that conflicts with it only by a rerail.
+    let off_main = conflicts_with_main(&cars);
+    if !off_main.is_empty() {
+        println!(
+            "  CONFLICTS WITH MAIN — {} dock car(s) that no longer merge onto main \
+             (repair: boss rerail <car>, which stops for you on a real conflict):",
+            off_main.len()
+        );
+        for (branch, files, main) in &off_main {
+            println!("    {branch}  —  {}  (as of main@{main})", files.join(", "));
+        }
+    }
+
     // MY WORK — the actor's own queue, after the dock (65a89769). One
     // read of the agents registry for the aliases, one assignments read
     // per identity; a caller nobody named is refused here and the rest
     // of the approach still prints (identity's read/write split).
     let identities = match crate::identity::caller() {
         Some(c) => {
-            let agents = rows(api(&http, reqwest::Method::GET, "/api/agents", None).await?);
+            let agents = rows(api(&http, reqwest::Method::GET, "/api/agents", None).await?)?;
             Some(my_work_identities(&c.id, &agents))
         }
         None => None,
@@ -1275,10 +2044,36 @@ pub async fn run(all: bool) -> Result<()> {
                 None,
             )
             .await?,
-        ));
+        )?);
+    }
+    // The open overdue-real-work alarms (078ddcb0), which MY WORK leads
+    // with. Read whenever an identity is, and narrowed on the key the
+    // handler writes — a handful at most, so a page that does not hold
+    // the whole `total` is SAID rather than read as all of them.
+    let mut overdue_alarms: Vec<Value> = Vec::new();
+    if identities.is_some() {
+        use boss_dispatcher_handlers::handlers::jobs_agent_step_overdue::STEP_KEY;
+        let body = api(
+            &http,
+            reqwest::Method::GET,
+            &format!("/api/jobs?kind=backlog-item&status=open&metadata_has={STEP_KEY}&limit=200"),
+            None,
+        )
+        .await?;
+        let total = body
+            .as_ref()
+            .and_then(|b| b.get("total"))
+            .and_then(Value::as_u64);
+        overdue_alarms = rows(body)?;
+        if total.is_none_or(|t| t > overdue_alarms.len() as u64) {
+            println!(
+                "  (overdue alarms: read {} of total {total:?} — the OVERDUE block below is partial)",
+                overdue_alarms.len()
+            );
+        }
     }
     println!();
-    for line in my_work_section(identities.as_deref(), &my_rows, now) {
+    for line in my_work_section(identities.as_deref(), &my_rows, &cars, &overdue_alarms, now) {
         println!("{line}");
     }
 
@@ -1289,9 +2084,6 @@ pub async fn run(all: bool) -> Result<()> {
     // so it fetches; like ORPHANS, a failed read prints WHY and skips
     // rather than failing the verb.
     let mut fresh_targets: Vec<String> = dock
-        .as_ref()
-        .map(|d| rows(Some(d.clone())))
-        .unwrap_or_default()
         .iter()
         .map(|c| md_str(c, "branch").to_string())
         .filter(|b| !b.is_empty())
@@ -1356,6 +2148,16 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // BUNDLES (5449111c) — a versioned bundle file the live lineage has
+    // moved past. An author bumps the version FROM THE FILE, so a file
+    // behind live turns "bump the version" into a collision the seed
+    // refuses — and the gate, which reads only files, stays green. Said
+    // here, at session start, before anyone bumps; the judgement is the
+    // boot seed's own decision table, run dry against the live rows.
+    for line in crate::bundle_lineage::bundles_section(&http).await {
+        println!("{line}");
+    }
+
     // THE SHED — landed cars not yet proven, and what each waits on.
     let shed = shed_lines(&cars);
     if shed.is_empty() {
@@ -1404,6 +2206,63 @@ pub async fn run(all: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// `IN TRANSIT` printed `at: In transit — cluster converged` while
+    /// that step was READY (train 8b365d83, 2026-09-22), and was read as
+    /// "the cluster has converged" mid-incident (648a68a9). The line
+    /// carries the step's status beside its title, in the server's own
+    /// words (`boss_jobs::yard::standing_at`), so the terminal and the
+    /// yard say the same thing.
+    #[test]
+    fn a_train_in_transit_names_the_status_of_the_step_it_stands_at() {
+        use serde_json::json;
+        let train = json!({
+            "title": "PR train 2026-09-22 20:01",
+            "steps": [
+                {"spec_slug": "deployed", "title": "In transit — deployed to the playground", "status": "completed"},
+                {"spec_slug": "converged", "title": "In transit — cluster converged", "status": "ready"},
+                {"spec_slug": "arrived", "title": "Train arrived", "status": "pending"},
+            ],
+        });
+        assert_eq!(
+            super::in_transit_line(&train),
+            "    PR train 2026-09-22 20:01  at: In transit — cluster converged (ready, not yet done)"
+        );
+        let nowhere = json!({"title": "PR train x", "steps": []});
+        assert_eq!(super::in_transit_line(&nowhere), "    PR train x  at: —");
+    }
+
+    /// Train f7bd1e9d, 2026-09-24 17:20Z: CI red on a named `CI / web`,
+    /// `merged` READY, main unmoved — and this line still read "DEPARTED
+    /// — merged into main (ready, not yet done)" (a2d4d842). At the merge
+    /// the line is spelled from the completed `ci` step and its verdict,
+    /// in the yard's words (`boss_jobs::yard::awaiting_merge`).
+    #[test]
+    fn a_red_train_at_its_merge_reads_red_and_never_departed() {
+        use serde_json::json;
+        let train = json!({
+            "title": "PR train 2026-09-24 17:17",
+            "metadata": {},
+            "steps": [
+                {"spec_slug": "ci", "title": "Yard inspection — CI verdict", "status": "completed",
+                 "metadata": {"result": "failing",
+                              "checks": "CI / build-image (pull_request):SUCCESS, CI / locomotive (pull_request):SUCCESS, CI / web (pull_request):FAILURE, CI / reclaim (pull_request):SUCCESS",
+                              "train_gate": "train gate: running"}},
+                {"spec_slug": "merged", "title": "DEPARTED — merged into main", "status": "ready"},
+                {"spec_slug": "deployed", "title": "In transit — deployed to the playground", "status": "pending"},
+            ],
+        });
+        assert_eq!(
+            super::in_transit_line(&train),
+            "    PR train 2026-09-24 17:17  at: CI verdict RED (CI / web (pull_request) failed) — not merged"
+        );
+        let mut green = train.clone();
+        green["metadata"]["ci_verdict_latest"] = json!("green");
+        assert_eq!(
+            super::in_transit_line(&green),
+            "    PR train 2026-09-24 17:17  at: CI verdict green — not merged yet"
+        );
+    }
+
     /// A TRAIN's gate-run (128b5496) in the GATING lane is the train being
     /// tested, not a car being gated. On 2026-09-14 `boss orient` listed
     /// `train/20260914-1641` and a car branch as two indistinguishable
@@ -1686,6 +2545,122 @@ mod tests {
             json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "why": "later" } }),
         );
         assert!(matches!(shed_place(&bare), Shed::ProbeNotYet { .. }));
+    }
+
+    /// A NOT-YET THAT HAS LASTED DAYS IS NAMED AS SUCH (backlog adef5ddf):
+    /// the line carries the streak and says the probe is ours to read,
+    /// because exit 75 from a probe that can never pass reads exactly like
+    /// a patient one. A short streak keeps the plain line.
+    #[test]
+    fn a_not_yet_streak_past_the_bound_is_named_on_the_line() {
+        let streak = |since: &str, runs: u64| {
+            landed(
+                "fix/starved",
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": {
+                    "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                    "probe": "bash x.sh", "why": "NOT YET: grep found 0",
+                    "not_yet_since": since, "not_yet_runs": runs,
+                } }),
+            )
+        };
+        let line = &shed_lines(&[streak("2026-09-19T05:50:00Z", 86)])[0];
+        assert!(
+            line.contains("NOT YET for 97h straight (86 runs)") && line.contains("read the probe"),
+            "{line}"
+        );
+        let line = &shed_lines(&[streak("2026-09-23T01:00:00Z", 7)])[0];
+        assert!(
+            line.contains("probe says NOT YET — NOT YET: grep"),
+            "{line}"
+        );
+        assert!(!line.contains("straight"), "{line}");
+    }
+
+    /// A DECLARED WAIT (backlog b461341d): the same 97h streak reads as
+    /// the world's, naming what it waits on — and as ours once the
+    /// declared event was seen while the probe still said not yet.
+    #[test]
+    fn a_declared_wait_names_what_it_waits_on_and_is_ours_once_seen() {
+        let declared = |seen_at: Value| {
+            landed(
+                "fix/declared",
+                json!({ "proof_probe": "bash x.sh",
+                    "waits_on": {"on": "a cut-a-release packet David opens", "seen": "true"},
+                    "proof_attempt": {
+                    "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                    "probe": "bash x.sh", "why": "NOT YET: no tag",
+                    "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+                    "waits_on_seen_at": seen_at,
+                } }),
+            )
+        };
+        let line = &shed_lines(&[declared(Value::Null)])[0];
+        assert!(
+            line.contains("probe says NOT YET, waiting on a cut-a-release packet David opens"),
+            "{line}"
+        );
+        assert!(!line.contains("straight"), "{line}");
+        let line = &shed_lines(&[declared(json!("2026-09-23T06:00:00Z"))])[0];
+        assert!(
+            line.contains("was seen in the record at 2026-09-23T06:00:00Z"),
+            "{line}"
+        );
+        assert!(!line.contains("no seen check"), "{line}");
+    }
+
+    /// A DECLARED WAIT WITH NO OBSERVER SAYS SO (backlog e9b164a1): a
+    /// `seen` of null exempts the car from the streak bound and hands
+    /// the judgement to nothing, so the line names the missing check
+    /// and the verb that writes one, rather than reading as patience.
+    #[test]
+    fn a_declared_wait_with_no_seen_check_names_the_missing_observer() {
+        let line = &shed_lines(&[landed(
+            "fix/unobserved",
+            json!({ "proof_probe": "bash x.sh",
+                "waits_on": {"on": "a new Stripe sponsorship charge", "seen": null},
+                "proof_attempt": {
+                "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                "probe": "bash x.sh", "why": "NOT YET: no charge",
+                "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+            } }),
+        )])[0];
+        assert!(
+            line.contains("waiting on a new Stripe sponsorship charge")
+                && line.contains("no seen check")
+                && line.contains("boss car waits-on"),
+            "{line}"
+        );
+    }
+
+    /// A NAMED ACTOR'S ACT IS THAT ACTOR'S MOVE (backlog 3881f5c9): the
+    /// same line the shed's region reads — `boss_jobs::car::owned_wait`
+    /// — so an act declared on `emp-david` names him, with or without a
+    /// probe, and is not accused of missing an observer. The dev-door
+    /// car (no probe, a prose event) was the one car the live shed
+    /// called ours on 2026-09-24.
+    #[test]
+    fn a_named_actors_act_names_the_actor_and_asks_for_no_observer() {
+        let waits = json!({"on": "the Access SSH CA ceremony", "owner": "emp-david"});
+        let probed = landed(
+            "fix/probed",
+            json!({ "proof_probe": "bash x.sh", "waits_on": waits.clone(),
+                "proof_attempt": {
+                "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
+                "probe": "bash x.sh", "why": "NOT YET: no CA",
+            } }),
+        );
+        let prose = landed(
+            "fix/dev-door",
+            json!({ "proof_event": "David completes the ceremony", "waits_on": waits }),
+        );
+        let lines = shed_lines(&[probed, prose]);
+        for line in &lines {
+            assert!(
+                line.contains("waiting on emp-david: the Access SSH CA ceremony")
+                    && !line.contains("no seen check"),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -2001,13 +2976,17 @@ mod tests {
     /// nobody has held it, and the recovery that keeps the park intent.
     #[test]
     fn an_abandoned_place_is_reported_as_troubled_with_its_recovery() {
-        let lines = abandoned_report(&[AbandonedPlace {
-            packet: "fafe8ba4-0000-0000-0000-000000000000".to_string(),
-            branch: "fix/two-operator-verbs-stop-lying".to_string(),
-            queued_at: "2026-09-10T22:40:00Z".to_string(),
-            idle_secs: Some(11 * 60),
-            park_intent: true,
-        }]);
+        let lines = abandoned_report(
+            &[AbandonedPlace {
+                packet: "fafe8ba4-0000-0000-0000-000000000000".to_string(),
+                branch: "fix/two-operator-verbs-stop-lying".to_string(),
+                sha: "0448698fcfef9aa8728f9b3381c1de2a89911447".to_string(),
+                queued_at: "2026-09-10T22:40:00Z".to_string(),
+                idle_secs: Some(11 * 60),
+                park_intent: true,
+            }],
+            &BTreeMap::new(),
+        );
         let all = lines.join("\n");
         assert!(all.contains("ABANDONED"), "{all}");
         assert!(all.contains("fix/two-operator-verbs-stop-lying"), "{all}");
@@ -2023,12 +3002,138 @@ mod tests {
         );
     }
 
+    /// THE RECOVERY REBASES IN THE SAME VERB (backlog e9cdd83f). A waiter
+    /// that died has usually been dead long enough for main to move, and
+    /// the bare re-gate this line used to print was then refused for its
+    /// base. Rebasing by hand moved the head, and the next `boss gate`
+    /// matched no open packet (`reusable_packet` keys on the head), so it
+    /// filed a NEW gate-run with no `park_*` keys beside the old one —
+    /// measured 2026-09-24 on 91594262 and 03af83b4, repaired by hand.
+    /// `--rebase` replays inside the verb AFTER the packet is matched on
+    /// the head it queued at, so the packet and its intent are the ones
+    /// that run.
+    #[test]
+    fn a_recovery_rebases_inside_the_verb_so_the_packet_and_its_intent_are_kept() {
+        let lines = abandoned_report(
+            &[AbandonedPlace {
+                packet: "91594262-0000-0000-0000-000000000000".to_string(),
+                branch: "fix/x".to_string(),
+                sha: "0448698fcfef9aa8728f9b3381c1de2a89911447".to_string(),
+                queued_at: "2026-09-24T01:26:24Z".to_string(),
+                idle_secs: Some(160 * 60),
+                park_intent: true,
+            }],
+            &BTreeMap::new(),
+        );
+        let all = lines.join("\n");
+        assert!(
+            all.contains("recover: boss gate fix/x --wait --rebase"),
+            "the recovery replays onto main in the verb, never by hand: {all}"
+        );
+    }
+
+    /// A LANDED STRAND IS SUPERSEDED, NOT RECOVERABLE (backlog e9cdd83f).
+    /// On 2026-09-24 orient went on advising a re-gate of 91594262 and
+    /// 03af83b4 after both branches had landed; following that line with
+    /// park intent is how a twin car is filed (610537b2). The place is
+    /// still reported — it is an open packet — but as superseded, with
+    /// what closes it, and no verb to run.
+    #[test]
+    fn an_abandoned_place_whose_work_landed_is_superseded_with_no_recovery() {
+        let place = AbandonedPlace {
+            packet: "03af83b4-0000-0000-0000-000000000000".to_string(),
+            branch: "fix/a-car-names-every-item-it-answers".to_string(),
+            sha: "27ebe999aaaa".to_string(),
+            queued_at: "2026-09-24T01:24:28Z".to_string(),
+            idle_secs: Some(160 * 60),
+            park_intent: true,
+        };
+        let landed = BTreeMap::from([(
+            place.packet.clone(),
+            "main already holds its version of every file it changed".to_string(),
+        )]);
+        let all = abandoned_report(&[place], &landed).join("\n");
+        assert!(all.contains("03af83b4"), "still reported: {all}");
+        assert!(all.contains("LANDED"), "{all}");
+        assert!(
+            all.contains("main already holds its version of every file it changed"),
+            "names how it was judged landed: {all}"
+        );
+        assert!(
+            !all.contains("recover:"),
+            "no re-gate for landed work: {all}"
+        );
+        assert!(
+            all.contains(&format!("{}h", crate::train::GATE_DEADLINE_HOURS)),
+            "names what closes it: {all}"
+        );
+    }
+
+    /// LANDED IS JUDGED BY `boss merged`'s RULES, on the head the place
+    /// queued at and then on the branch — never re-derived here. The
+    /// queued head is asked first because a branch deleted by the train
+    /// that landed it reads Unknown by ref; the branch second because a
+    /// head that moved on and landed supersedes the one queued. Only a
+    /// Merged answer supersedes: NotMerged and Unknown leave the recovery
+    /// in place, where the gate's own landed guard still stands.
+    #[test]
+    fn superseded_asks_the_queued_head_then_the_branch_and_only_merged_counts() {
+        use crate::merged::{How, Verdict};
+        let place = AbandonedPlace {
+            packet: "p".to_string(),
+            branch: "fix/x".to_string(),
+            sha: "0448698f".to_string(),
+            queued_at: String::new(),
+            idle_secs: None,
+            park_intent: true,
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let by_head = superseded_by_main(&place, |t| {
+            asked.borrow_mut().push(t.to_string());
+            if t == "0448698f" {
+                Verdict::Merged(How::ContentPresent)
+            } else {
+                Verdict::NotMerged
+            }
+        });
+        assert!(by_head.is_some());
+        assert_eq!(asked.borrow().as_slice(), ["0448698f"]);
+
+        let by_branch = superseded_by_main(&place, |t| {
+            if t == "fix/x" {
+                Verdict::Merged(How::Ancestor)
+            } else {
+                Verdict::Unknown("branch absent".into())
+            }
+        });
+        assert!(by_branch.is_some());
+
+        assert_eq!(
+            superseded_by_main(&place, |_| Verdict::Unknown("no main".into())),
+            None
+        );
+        assert_eq!(superseded_by_main(&place, |_| Verdict::NotMerged), None);
+
+        // A symbolic head (`origin/<branch>`, what `resolve_sha` records
+        // when the forge could not answer) is not a head to ask about.
+        let symbolic = AbandonedPlace {
+            sha: "origin/fix/x".to_string(),
+            ..place.clone()
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let _ = superseded_by_main(&symbolic, |t| {
+            asked.borrow_mut().push(t.to_string());
+            Verdict::NotMerged
+        });
+        assert_eq!(asked.borrow().as_slice(), ["fix/x"]);
+    }
+
     /// NO STRAND, NO SECTION — and no alarm language for a healthy
     /// queue. An empty report prints nothing: the queue lane above
     /// already says how many places are held.
     #[test]
     fn a_healthy_queue_reports_no_abandoned_section() {
-        assert!(abandoned_report(&[]).is_empty());
+        assert!(abandoned_report(&[], &BTreeMap::new()).is_empty());
     }
 
     /// A RECOVERY LINE THAT NAMES NO BRANCH IS NOT ADVICE. A packet with
@@ -2037,13 +3142,17 @@ mod tests {
     /// would run `boss gate  --wait` and fail on an empty argument.
     #[test]
     fn a_place_with_no_branch_is_named_without_a_verb_to_run() {
-        let lines = abandoned_report(&[AbandonedPlace {
-            packet: "c0ffee00-0000-0000-0000-000000000000".to_string(),
-            branch: String::new(),
-            queued_at: "2026-09-10T22:40:00Z".to_string(),
-            idle_secs: Some(600),
-            park_intent: false,
-        }]);
+        let lines = abandoned_report(
+            &[AbandonedPlace {
+                packet: "c0ffee00-0000-0000-0000-000000000000".to_string(),
+                branch: String::new(),
+                sha: String::new(),
+                queued_at: "2026-09-10T22:40:00Z".to_string(),
+                idle_secs: Some(600),
+                park_intent: false,
+            }],
+            &BTreeMap::new(),
+        );
         let all = lines.join("\n");
         assert!(
             all.contains("c0ffee00"),
@@ -2058,13 +3167,17 @@ mod tests {
     /// than guessed.
     #[test]
     fn an_unreadable_place_is_reported_without_inventing_an_age() {
-        let lines = abandoned_report(&[AbandonedPlace {
-            packet: "deadbeef-0000-0000-0000-000000000000".to_string(),
-            branch: "fix/x".to_string(),
-            queued_at: "yesterday".to_string(),
-            idle_secs: None,
-            park_intent: false,
-        }]);
+        let lines = abandoned_report(
+            &[AbandonedPlace {
+                packet: "deadbeef-0000-0000-0000-000000000000".to_string(),
+                branch: "fix/x".to_string(),
+                sha: String::new(),
+                queued_at: "yesterday".to_string(),
+                idle_secs: None,
+                park_intent: false,
+            }],
+            &BTreeMap::new(),
+        );
         let all = lines.join("\n");
         assert!(
             all.contains("unreadable") || all.contains("unknown"),
@@ -2160,6 +3273,144 @@ mod tests {
             vec![("fix/a".to_string(), 7, "no reason recorded".to_string())],
             "seven refusals are still seven refusals with no reason on the car"
         );
+    }
+
+    // ---- CANNOT BOTH BOARD (5c567c27) ---------------------------------
+
+    /// A parked car carrying the conductor's merge preview as
+    /// `preview_dock` writes it: `(branch, files)` it conflicts with,
+    /// measured over the parked set `set`.
+    fn previewed(branch: &str, review: &str, set: &str, co: &[(&str, &[&str])]) -> Value {
+        let mut c = car(branch, "open", review, json!({}));
+        let co: Vec<Value> = co
+            .iter()
+            .map(|(b, f)| json!({ "branch": b, "files": f }))
+            .collect();
+        c["metadata"]["merge_preview"] = json!({
+            "vs_main": { "clean": true },
+            "conflicts_with": co,
+            "anchored": { "main": "m", "parked_set": set },
+            "checked_at": "2026-09-23T10:10:55Z",
+        });
+        c
+    }
+
+    /// THE PAIR IS NAMED ONCE, with its files. On 2026-09-20 three cars
+    /// each green alone could not board together (WorldMap.svelte in two
+    /// of them) and the pipeline stopped nine and a half hours; the
+    /// conductor's merge preview had been measuring exactly that pair on
+    /// every tick since 12a25f3e and nothing read it. A conflict is
+    /// symmetric, so both cars carry it — one line, not two.
+    #[test]
+    fn two_dock_cars_that_conflict_with_each_other_are_one_named_pair() {
+        let cars = vec![
+            previewed("fix/b", "ready", "s1", &[("fix/a", &["WorldMap.svelte"])]),
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["WorldMap.svelte"])]),
+            previewed("fix/clean", "ready", "s1", &[]),
+        ];
+        assert_eq!(
+            unboardable_pairs(&cars),
+            vec![(
+                "fix/a".to_string(),
+                "fix/b".to_string(),
+                vec!["WorldMap.svelte".to_string()],
+            )]
+        );
+    }
+
+    /// A PREVIEW IS STALE, NOT WRONG, WHEN ITS SET MOVED. The conductor
+    /// rewrites only the cars still parked-ready, so a car that boarded,
+    /// or is held, keeps the preview of the dock it last saw. Only two
+    /// previews measured over the SAME parked set (one tick) may pair,
+    /// and only two cars still at the dock — a pair with a car that has
+    /// left is a conflict nobody will meet. Measured live 2026-09-23:
+    /// five cars stamped at 09:50 still named a branch whose own 10:10
+    /// preview no longer named them.
+    #[test]
+    fn a_pair_from_another_tick_or_with_a_car_that_left_is_not_named() {
+        let cars = vec![
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["x.rs"])]),
+            previewed("fix/b", "ready", "s2", &[("fix/a", &["x.rs"])]),
+            previewed("fix/c", "ready", "s3", &[("fix/gone", &["y.rs"])]),
+            previewed("fix/gone", "completed", "s3", &[("fix/c", &["y.rs"])]),
+        ];
+        assert!(unboardable_pairs(&cars).is_empty());
+    }
+
+    /// No preview is no verdict — a car the conductor never measured
+    /// pairs with nothing, rather than reading as either side of one.
+    #[test]
+    fn a_car_without_a_preview_pairs_with_nothing() {
+        let cars = vec![
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["x.rs"])]),
+            car("fix/b", "open", "ready", json!({})),
+        ];
+        assert!(unboardable_pairs(&cars).is_empty());
+    }
+
+    // ---- CONFLICTS WITH MAIN (20d0d717) -------------------------------
+
+    /// A parked car whose preview, measured over `set` at `at`, says it no
+    /// longer merges onto main on `files`.
+    fn off_main(branch: &str, review: &str, set: &str, at: &str, files: &[&str]) -> Value {
+        let mut c = previewed(branch, review, set, &[]);
+        c["metadata"]["merge_preview"]["vs_main"] = json!({ "clean": false, "files": files });
+        c["metadata"]["merge_preview"]["anchored"]["main"] = json!("1d917084abcdef00");
+        c["metadata"]["merge_preview"]["checked_at"] = json!(at);
+        c
+    }
+
+    /// THE VERDICT THE CONDUCTOR ALREADY MEASURED IS NAMED, with its
+    /// files and the main it was measured on. Car 5fba0bda carried
+    /// `vs_main.clean=false` on 2026-09-23 while orient called it only
+    /// FRESHNESS-stale — a re-gate cannot fix a conflict with main.
+    #[test]
+    fn a_dock_car_that_conflicts_with_main_is_named_with_its_files() {
+        let cars = vec![
+            off_main(
+                "fix/my-work",
+                "ready",
+                "s1",
+                "2026-09-23T10:10:55Z",
+                &["orient.rs"],
+            ),
+            previewed("fix/clean", "ready", "s1", &[]),
+        ];
+        assert_eq!(
+            conflicts_with_main(&cars),
+            vec![(
+                "fix/my-work".to_string(),
+                vec!["orient.rs".to_string()],
+                "1d917084".to_string(),
+            )]
+        );
+    }
+
+    /// Only the dock's CURRENT measurement is read: a car whose preview
+    /// carries an older parked set (held, or measured before the dock
+    /// moved) and a car no longer at the dock are both silent — the
+    /// same rule the pairs above obey (5c567c27).
+    #[test]
+    fn a_stale_or_departed_main_conflict_is_not_named() {
+        // `previewed` stamps 10:10:55, so fix/now carries the newest set.
+        let cars = vec![
+            previewed("fix/now", "ready", "s2", &[]),
+            off_main(
+                "fix/old-set",
+                "ready",
+                "s1",
+                "2026-09-23T09:50:00Z",
+                &["a.rs"],
+            ),
+            off_main(
+                "fix/boarded",
+                "completed",
+                "s2",
+                "2026-09-23T10:10:55Z",
+                &["b.rs"],
+            ),
+        ];
+        assert!(conflicts_with_main(&cars).is_empty());
     }
 
     // ---- MY WORK (65a89769) --------------------------------------------
@@ -2262,7 +3513,7 @@ mod tests {
                 "s-inspect",
             ),
         ];
-        let lines = my_work_lines(&rows, now);
+        let lines = my_work_lines(&rows, &carried_items(&[]), now);
         let all = lines.join("\n");
         assert_eq!(
             lines.len(),
@@ -2304,7 +3555,7 @@ mod tests {
             "s-dr",
         );
         bare.as_object_mut().unwrap().remove("opened_on");
-        let l = my_work_lines(&[bare], now).join("\n");
+        let l = my_work_lines(&[bare], &carried_items(&[]), now).join("\n");
         assert!(l.contains("(age ?)"), "{l}");
         assert!(l.contains("--answers"), "{l}");
     }
@@ -2329,20 +3580,210 @@ mod tests {
             "2026-09-17",
             "s",
         )];
-        let full = my_work_section(Some(&ids), &one, now).join("\n");
+        let full = my_work_section(Some(&ids), &one, &[], &[], now).join("\n");
         assert!(
             full.starts_with(
                 "  MY WORK — 1 ready/active step(s) assigned to claude@algedonic.dev (+ agent-claude)"
             ),
             "{full}"
         );
-        let empty = my_work_section(Some(&ids), &[], now).join("\n");
+        let empty = my_work_section(Some(&ids), &[], &[], &[], now).join("\n");
         assert!(empty.contains("MY WORK — nothing"), "{empty}");
         assert!(empty.contains("claude@algedonic.dev"), "{empty}");
-        let refused = my_work_section(None, &[], now).join("\n");
+        let refused = my_work_section(None, &[], &[], &[], now).join("\n");
         assert!(refused.contains("MY WORK — REFUSED"), "{refused}");
         assert!(refused.contains("BOSS_ACTOR"), "{refused}");
         assert!(refused.contains(".config/boss/actor"), "{refused}");
+    }
+
+    /// An item a car already carries is not unstarted work, and MY WORK
+    /// must not draw it as its filing age (bc416f60). Measured
+    /// 2026-09-22: of the twelve oldest steps on the agent, six were
+    /// build steps whose cars had merged days earlier and stood in the
+    /// shed, their probes honestly answering "not yet" — and they read
+    /// as 3-to-5-day-old unstarted builds, first in an oldest-first
+    /// queue. The car already says so; the queue now reads it: landed
+    /// (with what the proof waits on) or in flight (with where), listed
+    /// after the group's unstarted rows, counted in the heading.
+    #[test]
+    fn an_item_a_car_already_carries_reads_as_carried_not_as_its_age() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-22T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let landed_item = "ea67ad87-0000-4000-8000-000000000000";
+        let flight_item = "75198b15-0000-4000-8000-000000000000";
+        let fresh_item = "a12736b1-0000-4000-8000-000000000000";
+        let rows = vec![
+            asg(
+                landed_item,
+                "backlog-item",
+                "build",
+                "Old and landed",
+                "2026-09-17",
+                "s1",
+            ),
+            asg(
+                flight_item,
+                "backlog-item",
+                "build",
+                "Old and parked",
+                "2026-09-18",
+                "s2",
+            ),
+            asg(
+                fresh_item,
+                "backlog-item",
+                "build",
+                "Newer, untouched",
+                "2026-09-20",
+                "s3",
+            ),
+        ];
+        let mut shed = landed(
+            "fix/landed",
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 75, "not_yet": true, "why": "not yet: no real prune since convergence" } }),
+        );
+        shed["metadata"]["backlog_item"] = json!(landed_item);
+        let mut parked = car("fix/parked", "open", "ready", json!({}));
+        parked["metadata"]["backlog_item"] = json!(flight_item);
+        // A closed car carries nothing: its item's step is the chain's.
+        let mut gone = landed("fix/gone", json!({}));
+        gone["status"] = json!("closed");
+        gone["metadata"]["backlog_item"] = json!(fresh_item);
+        let cars = vec![shed, parked, gone];
+
+        let carried = carried_items(&cars);
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        let lines = my_work_lines(&rows, &carried, now);
+        let all = lines.join("\n");
+        assert_eq!(
+            lines[0],
+            "    backlog-item — 3 (2 already carried by a car)"
+        );
+        // The untouched item leads, with its age; the carried follow.
+        assert_eq!(
+            lines[1],
+            "      a12736b1 backlog-item build Newer, untouched (2d)"
+        );
+        assert_eq!(
+            lines[2],
+            "      ea67ad87 backlog-item build Old and landed — LANDED (car fix/landed), \
+             awaiting proof: probe says NOT YET — not yet: no real prune since convergence"
+        );
+        assert_eq!(
+            lines[3],
+            "      75198b15 backlog-item build Old and parked — IN FLIGHT (car fix/parked at Open for review)"
+        );
+        // A carried row carries no age: its filing date is not its state.
+        assert!(!lines[2].contains("(5d)"), "{}", lines[2]);
+        assert!(all.contains("carried = "), "{all}");
+
+        // The section says how many of its count are carried.
+        let ids = vec!["claude@algedonic.dev".to_string()];
+        let section = my_work_section(Some(&ids), &rows, &cars, &[], now).join("\n");
+        assert!(
+            section.starts_with(
+                "  MY WORK — 3 ready/active step(s) assigned to claude@algedonic.dev — \
+                 yours to move, oldest first; 2 already carried by a car, listed last"
+            ),
+            "{section}"
+        );
+        // A group with nothing carried reads exactly as before.
+        let plain = my_work_lines(&rows[2..], &carried_items(&[]), now);
+        assert_eq!(plain[0], "    backlog-item — 1");
+        assert!(!plain.join("\n").contains("carried"), "{plain:?}");
+    }
+
+    /// An open overdue alarm as the dispatcher's `jobs.agent_step_overdue`
+    /// files it — built from the handler's own key constants, so a
+    /// renamed key breaks this before it prints `?` at an operator.
+    fn overdue_alarm(id: &str, packet: &str, assignee: &str, waited: f64) -> Value {
+        use boss_dispatcher_handlers::handlers::jobs_agent_step_overdue as od;
+        json!({
+            "id": id, "kind": "backlog-item", "status": "open",
+            "metadata": {
+                od::STEP_KEY: format!("{packet}-post"),
+                od::PACKET_KEY: packet,
+                od::WORKFLOW_KEY: "receive-a-payout",
+                od::SLUG_KEY: "post",
+                od::ASSIGNEE_KEY: assignee,
+                od::TITLE_KEY: "Stripe reported a payout",
+                od::WAITED_KEY: waited,
+                od::BOUND_KEY: 4,
+            },
+        })
+    }
+
+    /// MY WORK LEADS with real work an agent has held past its declared
+    /// bound (078ddcb0): measured 2026-09-23, a receive-a-payout `post`
+    /// waited 63.6h on the agent while this section listed it flat among
+    /// ~180 ready steps, oldest first — behind days-old backlog builds.
+    /// The alarm is the definition of late; the section reads it, names
+    /// the caller's alarms above every group, and leaves another actor's
+    /// alone.
+    #[test]
+    fn my_work_leads_with_the_callers_overdue_real_work() {
+        let now = chrono::Utc::now();
+        let ids = vec![
+            "claude@algedonic.dev".to_string(),
+            "agent-claude".to_string(),
+        ];
+        let rows = vec![
+            asg(
+                "75198b15-0000-4000-8000-000000000000",
+                "backlog-item",
+                "build",
+                "Old backlog build",
+                "2026-09-01",
+                "s-old",
+            ),
+            asg(
+                "931c3bfe-e483-4d89-a89c-f2062d4dff16",
+                "receive-a-payout",
+                "post",
+                "Stripe reported a payout",
+                "2026-09-21",
+                "931c3bfe-e483-4d89-a89c-f2062d4dff16-post",
+            ),
+        ];
+        let alarms = vec![
+            overdue_alarm(
+                "a1a1a1a1-0000",
+                "931c3bfe-e483-4d89-a89c-f2062d4dff16",
+                "agent-claude",
+                63.6,
+            ),
+            overdue_alarm("b2b2b2b2-0000", "someone-else", "emp-other", 9.0),
+        ];
+        let section = my_work_section(Some(&ids), &rows, &[], &alarms, now);
+        assert!(
+            section[0].starts_with("  MY WORK — 2 ready/active"),
+            "{section:?}"
+        );
+        assert_eq!(
+            section[1],
+            "    OVERDUE — 1 real-work step(s) held past the wait its workflow declares — \
+             move these FIRST:"
+        );
+        assert_eq!(
+            section[2],
+            "      931c3bfe receive-a-payout post Stripe reported a payout — waited 63.6h \
+             on agent-claude, bound 4h (alarm a1a1a1a1)"
+        );
+        assert_eq!(section[3], "    backlog-item — 1", "{section:?}");
+        let all = section.join("\n");
+        assert!(
+            !all.contains("someone-else"),
+            "another actor's alarm: {all}"
+        );
+
+        // No alarm for the caller: the section reads exactly as before.
+        let quiet = my_work_section(Some(&ids), &rows, &[], &alarms[1..], now);
+        assert_eq!(quiet[1], "    backlog-item — 1", "{quiet:?}");
+        // A closed alarm is not late work.
+        let mut closed = alarms[0].clone();
+        closed["status"] = json!("closed");
+        assert!(overdue_lines(&[closed], &ids).is_empty());
     }
 
     /// `boss orient` reads the map from the server rather than deriving
@@ -2351,7 +3792,10 @@ mod tests {
     /// breaks this before it can print `?` at an operator.
     #[test]
     fn the_regions_header_prints_the_servers_cards() {
-        use boss_jobs::regions::{Region, RegionState, Regions, Trend};
+        use boss_jobs::region_states::Decided;
+        use boss_jobs::regions::{
+            BoundKind, Machine, MachineState, Measure, Region, RegionState, Regions, Trend,
+        };
         let trend = |metric: &str, unit: &str, cur: Option<f64>, prev: Option<f64>| Trend {
             metric: metric.into(),
             unit: unit.into(),
@@ -2366,13 +3810,18 @@ mod tests {
                     name: name.into(),
                     count,
                     bound,
+                    bound_kind: bound.map(|_| BoundKind::Capacity),
+                    unit: "things".into(),
                     state,
                     why: why.into(),
+                    band: None,
                     trend,
+                    kpi: Vec::new(),
                     // orient prints a region as a LINE — its count, its
                     // bound and its why. The machinery (car 5) is a
                     // drawing, so this reader takes none of it.
                     machines: Vec::new(),
+                    places: Vec::new(),
                 }
             };
         let map = Regions {
@@ -2390,7 +3839,7 @@ mod tests {
                     "gates",
                     Some(3),
                     Some(3),
-                    RegionState::Busy,
+                    RegionState::Attention,
                     "3 of 3 bays in use — at the bound",
                     trend("gate duration", "minutes", Some(14.0), None),
                 ),
@@ -2438,32 +3887,94 @@ mod tests {
                     "marshalling",
                     Some(4),
                     None,
-                    RegionState::Busy,
+                    RegionState::Clear,
                     "4 packets standing at 2 stations",
                     trend("served", "per day", Some(6.0), Some(6.0)),
                 ),
             ],
+            // Reading the stuck block is car 3's (backlog 4142d821); these
+            // lines print the regions alone — the thirds and the machine
+            // cell print through `third_lines` (design 00774ca8).
+            stuck: Vec::new(),
+            thirds: Vec::new(),
+            machines: None,
+            // THE PLANT (design 62de32ae, decision 11): machinery that
+            // serves every region, printed on a line of its own after
+            // them — a failed one names its failure, since no region's
+            // state carries it.
+            plant: vec![
+                Machine {
+                    id: "runner:host:forge".into(),
+                    name: "forge runner".into(),
+                    state: MachineState::Failed,
+                    why: "the last converge request was refused".into(),
+                },
+                Machine {
+                    id: "runner:host:boss-gcp".into(),
+                    name: "boss-gcp runner".into(),
+                    state: MachineState::Idle,
+                    why: "last df answered exit 0".into(),
+                },
+            ],
         };
+        // The dock's bound is a threshold, the gates' state was decided
+        // by a declared band that has held 42 minutes, and both carry
+        // their KPI in its units (design 62de32ae).
+        let mut map = map;
+        map.regions[0].bound_kind = Some(BoundKind::Threshold);
+        map.regions[0].unit = "cars parked".into();
+        map.regions[1].unit = "bays in use".into();
+        map.regions[1].band = Some(Decided {
+            id: "gates-at-bound".into(),
+            reads: "every bay in use for 30m".into(),
+            hold_minutes: 30,
+            since: Some("2026-09-24T11:18:00+00:00".into()),
+            held_minutes: Some(42),
+            held: Some("42m".into()),
+        });
+        map.regions[1].kpi = vec![Measure {
+            name: "bays in use".into(),
+            value: Some(3.0),
+            unit: "bays".into(),
+            text: "3 of 3 bays in use".into(),
+        }];
         let lines = region_lines(&serde_json::to_value(&map).unwrap());
         assert_eq!(
             lines.len(),
-            9,
-            "a heading and a card per region:\n{}",
+            10,
+            "a heading, a card per region and the plant:\n{}",
             lines.join("\n")
         );
+        assert_eq!(
+            lines[9],
+            "    plant        2 machines serving every region: forge runner FAILED \
+             (the last converge request was refused) · boss-gcp runner idle",
+        );
+        // An older server sends no plant, and no line is invented for it.
+        let mut older = serde_json::to_value(&map).unwrap();
+        older.as_object_mut().unwrap().remove("plant");
+        assert_eq!(region_lines(&older).len(), 9);
         assert!(lines[0].contains("last 24h"), "{}", lines[0]);
         assert!(
             lines[1].starts_with("    dock ")
-                && lines[1].contains(" 2 of 4 ")
+                && lines[1].contains(" 2 cars parked · threshold 4 ")
                 && lines[1].contains("clear")
                 && lines[1].contains("dock wait 1.5h (was 2.0h)"),
             "{}",
             lines[1]
         );
         assert!(
-            lines[2].contains("BUSY") && lines[2].contains("gate duration 14m (was —)"),
-            "{}",
+            lines[2].contains(" 3 of 3 bays in use ")
+                && lines[2].contains("ATTENTION for 42m")
+                && lines[2].contains("3 of 3 bays in use · gate duration 14m (was —)")
+                && lines[2].contains("— [every bay in use for 30m] 3 of 3 bays"),
+            "the state, how long it held, the KPI and the band that decided it: {}",
             lines[2]
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("BUSY")),
+            "busy is gone from the vocabulary:\n{}",
+            lines.join("\n")
         );
         assert!(
             lines[3].contains("TROUBLED")
@@ -2482,6 +3993,69 @@ mod tests {
             "{}",
             lines[7]
         );
+    }
+
+    /// THE HUD'S BLOCK, PRINTED (design 00774ca8, decision 9): one line
+    /// per third in the payload's order, the net with its two rates and
+    /// unit, stuck beside waiting — a floor as `≥ n ?`, an unread edge as
+    /// `?` with its reason, never 0 — then the machine cell naming every
+    /// failed and unjudged machine. An older server says so.
+    #[test]
+    fn the_thirds_header_prints_the_huds_rows_and_machine_cell() {
+        let map = serde_json::json!({
+            "window_hours": 24,
+            "regions": [],
+            "thirds": [
+                {
+                    "third": "queue-management", "regions": ["receiving", "marshalling"],
+                    "balance": { "unit": "inbound packets", "in": 40.0, "out": 28.0, "net": 12.0,
+                                 "in_count": 40, "out_count": 28, "in_means": "", "out_means": "" },
+                    "stuck": { "third": "queue-management", "stuck": 3, "waiting": 0,
+                               "unknown": ["station q: blind"], "oldest_hours": 170, "regions": [] }
+                },
+                {
+                    "third": "actors-building", "regions": ["shop-floor", "gates", "garage"],
+                    "balance": { "unit": "runs", "in": null, "out": null, "net": null,
+                                 "in_count": null, "out_count": null, "in_means": "", "out_means": "",
+                                 "why": "the agent-run packets could not be read" },
+                    "stuck": { "third": "actors-building", "stuck": 0, "waiting": 0,
+                               "unknown": [], "oldest_hours": null, "regions": [] }
+                }
+            ],
+            "machines": { "running": 12, "idle": 11, "failed": 0, "unknown": 1, "total": 24,
+                          "failed_or_unknown": [
+                              { "region": "marshalling", "id": "station:x", "name": "x",
+                                "state": "unknown", "why": "the flow cube is blind" } ] }
+        });
+        let lines = third_lines(&map);
+        assert!(lines[0].contains("last 24h"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("queue-management")
+                && lines[1].contains("+12.0/day (40.0 in · 28.0 out inbound packets)")
+                && lines[1].contains("stuck ≥3 ?")
+                && lines[1].contains("waiting 0"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("?/day (? in · ? out runs)")
+                && lines[2].contains("stuck 0 ")
+                && lines[2].contains("— the agent-run packets could not be read"),
+            "an unread edge is ?, never 0: {}",
+            lines[2]
+        );
+        assert_eq!(
+            lines[3],
+            "  MACHINES — 0 failed · 1 unjudged of 24 (12 running, 11 idle)"
+        );
+        assert!(
+            lines[4].contains("UNKNOWN") && lines[4].contains("marshalling"),
+            "{}",
+            lines[4]
+        );
+        let older = third_lines(&serde_json::json!({ "window_hours": 24, "regions": [] }));
+        assert_eq!(older.len(), 1);
+        assert!(older[0].contains("unavailable"), "{}", older[0]);
     }
 
     /// AN ACTOR-WORKED BORDER MUST NOT READ AS A DEAD RULE.
@@ -2634,6 +4208,78 @@ mod tests {
             !lines[2].contains(" 0 "),
             "an unknown rail must not print a zero: {}",
             lines[2]
+        );
+    }
+
+    /// MOTION'S FACTS, from the same payload the map draws (design
+    /// 31bade8f decision 8, car M1): whether each rail flows, the
+    /// record's own instant it has been held since, and on whom what
+    /// stands at it waits. The single-server-read protection of 62de32ae
+    /// — orient prints what the map draws, not a second derivation.
+    /// Unknown prints as unknown; a payload from an older server, which
+    /// carries none of the three, prints no claim about them at all.
+    #[test]
+    fn border_lines_print_whether_a_rail_flows_and_on_whom_its_queue_waits() {
+        let rail = |from: &str, extra: Value| {
+            let mut b = serde_json::json!({
+                "from": from, "to": "x",
+                "rate": { "current": 24.0, "previous": 20.0 },
+                "waiting": 3, "state": "clear", "why": "3 packets waiting to cross",
+                "machine": { "name": "the gate runner", "kind": "gate-runner",
+                             "silent_for_minutes": 0, "silent": null },
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+        let map = serde_json::json!({
+            "window_hours": 24,
+            "borders": [
+                rail("still", serde_json::json!({
+                    "flowing": false,
+                    "held_since": "2026-09-19T05:23:00+00:00",
+                    "flowing_why": "quiet 6h > silence past 4× the rail's own mean gap",
+                    "holds_by_class": { "machine": 1, "person": 1, "unknown": 0, "stuck": 1 },
+                })),
+                rail("moving", serde_json::json!({
+                    "flowing": true, "held_since": null,
+                    "flowing_why": "last crossed 5m ago",
+                    "holds_by_class": { "machine": 3, "person": 0, "unknown": 0, "stuck": 0 },
+                })),
+                rail("blind", serde_json::json!({
+                    "waiting": null,
+                    "flowing": null, "held_since": null,
+                    "flowing_why": "its crossings could not be read",
+                    "holds_by_class": null,
+                })),
+                rail("older", serde_json::json!({})),
+            ]
+        });
+        let lines = border_lines(&map);
+        assert_eq!(lines.len(), 5, "{}", lines.join("\n"));
+        let (still, moving, blind, older) = (&lines[1], &lines[2], &lines[3], &lines[4]);
+        assert!(
+            still.contains("STILL since 2026-09-19T05:23:00+00:00")
+                && still.contains("quiet 6h > silence past 4×")
+                && still.contains("3 waiting [machine 1 · person 1 · unknown 0 · stuck 1]"),
+            "{still}"
+        );
+        assert!(
+            moving.contains("flowing")
+                && !moving.contains("STILL")
+                && moving.contains("[machine 3 · person 0 · unknown 0 · stuck 0]"),
+            "{moving}"
+        );
+        // Cannot tell is said as such — never flowing, never a zero.
+        assert!(
+            blind.contains("flow ?") && blind.contains("? waiting") && !blind.contains("[machine"),
+            "{blind}"
+        );
+        // An older server's payload makes no claim either way.
+        assert!(
+            !older.contains("flow") && !older.contains("STILL") && !older.contains("[machine"),
+            "{older}"
         );
     }
 }

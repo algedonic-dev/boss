@@ -11,7 +11,7 @@
 
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { saveStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -76,25 +76,40 @@
   // trim down for the input + restore on save.
   let scheduledAtForInput = $derived(scheduledAt.slice(0, 16));
 
+  // What Schedule still needs (backlog 2f14cdd8, decided 2026-09-24).
+  // The jobs↔calendar hook reserves only when the step goes active
+  // with all three — a when, a positive duration, an assignee — and
+  // answers NoOp otherwise, so a button that enabled on the date alone
+  // made a step active with no reservation and nothing on screen to
+  // say so. The button waits for all three and the line beside it
+  // names what is missing; required-at-done validation is unchanged.
+  let scheduleMissing = $derived(
+    [
+      scheduledAt ? null : 'date/time',
+      typeof durationMinutes === 'number' && durationMinutes > 0 ? null : 'duration',
+      assigneeId ? null : 'assignee',
+    ].filter((m): m is string => m !== null),
+  );
+
   async function persist(status?: string): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // The keys this surface owns, through the merge door; an emptied
+      // field is sent as null and deleted, where it used to be cleared
+      // by omission from a wholesale PUT (backlog e39a9d2a).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
         status: status ?? step.status,
         assignee_id: assigneeId || null,
         metadata: {
-          ...step.metadata,
           location: location || undefined,
           scheduled_at: scheduledAt || undefined,
           duration_minutes:
             typeof durationMinutes === 'number' ? durationMinutes : undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      const res = await saveStep(jobId, step.id, body);
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -184,17 +199,19 @@
   <div class="step-actions">
     {#if !terminal && isPending(step.status)}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('active')}
-        disabled={saving || !scheduledAt}
-        title={!scheduledAt ? 'Pick a date/time first' : ''}
+        disabled={saving || scheduleMissing.length > 0}
       >
         Schedule
       </button>
+      {#if scheduleMissing.length > 0}
+        <span class="step-schedule-missing">Missing: {scheduleMissing.join(', ')}</span>
+      {/if}
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || !scheduledAt}
       >
@@ -216,5 +233,10 @@
   }
   .step-duration {
     flex: 0 0 140px;
+  }
+  .step-schedule-missing {
+    align-self: center;
+    font-size: 0.85em;
+    color: var(--static);
   }
 </style>

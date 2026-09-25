@@ -19,7 +19,7 @@
 //     IT tab's own landing page — rendered under Home chrome.
 //     `sections.test.ts` pins every value now (CLAUDE.md §9a).
 
-import type { Route } from '../router';
+import { notFoundBack, parseRoute, type Route } from '../router';
 import { ROUTE_CATALOG, appForSection, type AppId, type NavItem } from './nav-catalog';
 
 /// Sections that deliberately resolve to the Home app instead of a
@@ -72,8 +72,9 @@ export function appForRoute(route: Route): AppId {
 /// alone can no longer say which row to light: the region does, and
 /// this is the one place that reads it. Without it both would light
 /// the Train Yard's row, and a sidebar row that never highlights is
-/// a row an operator stops trusting.
-export const REGION_SECTIONS: Readonly<Record<string, string>> = {
+/// a row an operator stops trusting. Private for the reason
+/// SECTION_FOR_KIND is: `sectionForRoute` is the one reader.
+const REGION_SECTIONS: Readonly<Record<string, string>> = {
   receiving: 'system-receiving',
   marshalling: 'system-marshalling',
 };
@@ -99,20 +100,44 @@ export function moduleForRoute(route: Route): { id: string; label: string } | nu
   return { id: entry.module, label: entry.label };
 }
 
-/// Which sidebar row a route lights.
+/// Which sidebar row a route lights — the ONE answer, and the only
+/// one this module exports. Most rows are named by the route's kind
+/// (SECTION_FOR_KIND); a few depend on a route PARAMETER, which a
+/// kind-keyed map cannot express (REGION_SECTIONS, a yard floor's
+/// region). A route whose row depends on a parameter gets its branch
+/// HERE, never a second exported lookup.
 export function sectionForRoute(route: Route): string {
   if (route.kind === 'systemYardFloor') {
-    return REGION_SECTIONS[route.region] ?? SECTION_FOR_ROUTE.systemYardFloor!;
+    return REGION_SECTIONS[route.region] ?? SECTION_FOR_KIND.systemYardFloor!;
   }
-  return SECTION_FOR_ROUTE[route.kind];
+  // An unmatched path lights the row of the page its one back link
+  // opens, so it renders in the department it was under: /it/<typo> in
+  // the IT chrome, anything else in Home (design ee3a3a2f Q4). The /it
+  // catch-all returned the yard until then, which is how that chrome
+  // came for free.
+  if (route.kind === 'notFound' && route.path) {
+    return sectionForRoute(parseRoute(notFoundBack(route.path).href));
+  }
+  return SECTION_FOR_KIND[route.kind];
 }
 
-export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
+/// The kind half of `sectionForRoute`: NOT authoritative alone, and so
+/// not exported. It was the public answer (as SECTION_FOR_ROUTE) until
+/// car 4 of design d2154293 retired /it/operate/receiving and
+/// /it/operate/marshalling as pages: both are yard floors now, and
+/// read off this map both light the Train Yard's row — a plausible
+/// wrong answer with no error, which is the failure a reader cannot
+/// see (backlog c6f91515, 2026-09-20). Its companion is
+/// REGION_SECTIONS; its reader is `sectionForRoute`.
+const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   // Renders outside AppShell (or has no sidebar row) — see
   // HOME_CHROME_SECTIONS for the reasons.
   login: 'me',
   stepFocus: 'me',
   home: 'me',
+  // The kind half only: `sectionForRoute` answers by the path's
+  // department, the way it answers a yard floor by its region.
+  notFound: 'me',
   search: 'me',
   me: 'me',
   hr: 'hr',
@@ -147,9 +172,17 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   shipmentDetail: 'shipping',
   support: 'support',
   qa: 'qa',
-  calendar: 'calendar',
-  myCalendar: 'calendar',
-  schedule: 'schedule',
+  // /ux/calendar/me is the `schedule` row's own path (Home, "My
+  // schedule"). It lit `calendar` until 2026-09-24, so it highlighted
+  // Release calendar and was gated on the calendar module — off on the
+  // live instance, so the page was ModuleDisabled (eff0c5e5).
+  myCalendar: 'schedule',
+  // /ux/service/schedule is the service department's week grid of
+  // every tech, not a personal schedule: it lights the Service queue
+  // row and takes that row's module gate. It lit `schedule` until
+  // 2026-09-24, so with the line above two pages lit My schedule
+  // (backlog 3b50fe11).
+  schedule: 'service',
   exec: 'exec',
   warehouse: 'warehouse',
   // The department jobs view: its app is the route's own code, not a
@@ -206,3 +239,18 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   workflowDesign: 'workflows',
   workflowDetail: 'workflows',
 };
+
+/// Every route kind — the map's keys, which the `Record` type holds
+/// complete. Exported so a pin can walk every kind through
+/// `sectionForRoute` without reaching for the map itself.
+export const ROUTE_KINDS: ReadonlyArray<Route['kind']> = Object.keys(
+  SECTION_FOR_KIND,
+) as ReadonlyArray<Route['kind']>;
+
+/// Every section a route can light: the kind's own and each one a
+/// parameter answers for. Derived here, beside both halves, so no
+/// caller has to know there are two (backlog c6f91515).
+export const SECTIONS_PRODUCED: ReadonlySet<string> = new Set([
+  ...Object.values(SECTION_FOR_KIND),
+  ...Object.values(REGION_SECTIONS),
+]);

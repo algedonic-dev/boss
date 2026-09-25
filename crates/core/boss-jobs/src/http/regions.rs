@@ -3,7 +3,7 @@
 //!
 //! Nine regions — dock, gates, track, shed, arrivals, garage,
 //! receiving, marshalling, shop-floor — each with a count, a
-//! clear/busy/troubled
+//! clear/attention/troubled
 //! state and a trend over the window, computed ONCE here from the rows
 //! this process already reads for the yard status, so the map (car 2),
 //! the yard and `boss orient` answer with one voice. The aggregation is
@@ -68,7 +68,9 @@ pub(super) struct MapRows {
     closed_trains: Vec<(Job, Vec<Step>)>,
     cars: Vec<(Job, Vec<Step>)>,
     gate_runs: Vec<Job>,
-    inbound: Option<Vec<Job>>,
+    /// Every inbound row, open ones with their steps — see
+    /// [`read_inbound`].
+    inbound: Option<Vec<(Job, Vec<Step>)>>,
     stations: Option<Vec<StationReading>>,
     /// THE RUNNERS' EVIDENCE (design d2154293, car 5). A runner leaves
     /// no heartbeat this process can read — only the ops-requests it
@@ -90,8 +92,19 @@ pub(super) struct MapRows {
     agent_runs: Option<Vec<(Job, Vec<Step>)>>,
     /// The crews standing on it: the open `work-session` packets.
     sessions: Option<Vec<Job>>,
+    /// THE PUBLISH REGION'S PACKETS (design cb38d806): the newest
+    /// `publish-to-github` packets with their steps — the pull request,
+    /// its scan reading and the mirror heads that say whether anyone
+    /// merged it. NOT windowed: a PR nobody merged is what the region
+    /// exists to show, and it outlives every window. `None` on a failed
+    /// read — a troubled region, never a mirror that reads as current.
+    publish_packets: Option<Vec<(Job, Vec<Step>)>>,
     /// The bound those runs are read against, from the agents registry.
     run_capacity: Option<usize>,
+    /// THE DOCK'S ORDERING EDGES (backlog 4142d821): each predecessor a
+    /// parked car declares, read by id the way the conductor reads it —
+    /// found, absent, or unreadable, one reading per id.
+    predecessors: Vec<(String, crate::car::Predecessor)>,
 }
 
 impl MapRows {
@@ -115,7 +128,9 @@ impl MapRows {
             runner_hosts: self.runner_hosts.as_deref(),
             agent_runs: self.agent_runs.as_deref(),
             sessions: self.sessions.as_deref(),
+            publish_packets: self.publish_packets.as_deref(),
             run_capacity: self.run_capacity,
+            predecessors: &self.predecessors,
             now,
             window_hours,
         }
@@ -153,7 +168,9 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
             runner_hosts: Some(Vec::new()),
             agent_runs: Some(Vec::new()),
             sessions: Some(Vec::new()),
+            publish_packets: Some(Vec::new()),
             run_capacity: None,
+            predecessors: Vec::new(),
         });
     }
     let scope = job_scope_from_predicate(user, &predicate);
@@ -256,6 +273,13 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
         cars.push((job, steps));
     }
 
+    // THE DOCK'S ORDERING EDGES (backlog 4142d821, design cf820810 Q7):
+    // the predecessor each parked car declares, read by id — the question
+    // the conductor asks before it boards the car, asked here so the dock
+    // stops promising a train the conductor will refuse.
+    let predecessors =
+        read_predecessors(state, &regions::declared_edges(&read.status, &cars)).await;
+
     // Gate-runs: rows only. `opened_at`, `closed_at` and `outcome` are
     // on the metadata, which is all the duration and the reds need.
     let gate_runs = match state
@@ -270,6 +294,18 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
         Ok((rows, _)) => rows,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
+
+    // THE OPEN PACKETS, WITH THEIR STEPS, READ ONCE (design 62de32ae
+    // decision 4). The stations are judged over them, and the same steps
+    // say which inbound packets have been taken in — the line between
+    // receiving and marshalling — so the partition costs no second read.
+    // Unread → `None`, which the stations report as unread; the inbound
+    // read then fetches its own steps rather than guess.
+    let active = super::stations::active_rows(state.as_ref()).await;
+    let open_packets =
+        super::stations::resolved_open_packets(state.as_ref(), scope.clone(), &active)
+            .await
+            .ok();
 
     // The receiving yard's inbound packets: the kinds come from the
     // workflow registry (`regions::inbound_kinds`, the receiving page's
@@ -287,12 +323,7 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
                     scope: scope.clone(),
                     ..Default::default()
                 };
-                state
-                    .jobs
-                    .list_jobs(&filter, MAX_LIMIT, 0)
-                    .await
-                    .ok()
-                    .map(|(rows, _)| rows)
+                read_inbound(state, &filter, open_packets.as_deref()).await
             }
             Err(_) => None,
         },
@@ -303,7 +334,7 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
     // its own), bound to the caller as `/api/stations/load` binds them,
     // over the caller's open packets; and each station's counted flow in
     // this window and the previous, from two cube reads. Unread → `None`.
-    let stations = marshalling_stations(state, user, scope.clone(), window_hours).await;
+    let stations = marshalling_stations(state, user, open_packets.as_deref(), window_hours).await;
 
     // THE RUNNERS' EVIDENCE (design d2154293, car 5). A runner leaves
     // no heartbeat this process can read — only the ops-requests it
@@ -362,6 +393,13 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
         None => None,
     };
 
+    // THE PUBLISH REGION (design cb38d806): the newest publish packets,
+    // with steps. No `closed_since` — a pull request nobody merged is
+    // exactly what this region shows, and it outlives any window; the
+    // page cap below is the only bound, and it is generous against a
+    // DAILY cadence.
+    let publish_packets = read_publish_packets(state, scope.clone()).await;
+
     Ok(MapRows {
         read,
         closed_trains,
@@ -373,8 +411,136 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
         runner_hosts,
         agent_runs,
         sessions,
+        publish_packets,
         run_capacity,
+        predecessors,
     })
+}
+
+/// Each declared predecessor, read the way the conductor reads it
+/// (`edge_hold` in boss-cli's conductor): a row that came back is
+/// `Found` with its steps, a row the store does not hold is `Absent`,
+/// and every failure is `Unreadable` — which the dock, like the
+/// conductor, counts as boardable and SAYS it could not judge. One
+/// failed read therefore never fails the map, and never reads as "no
+/// such car" either.
+async fn read_predecessors<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    ids: &[String],
+) -> Vec<(String, crate::car::Predecessor)> {
+    use crate::car::Predecessor;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let reading = match parse_job_id(id) {
+            // The edge is ref-checked and prefix-normalised at the write,
+            // so a stored value that is not an id is a malformed stamp —
+            // not an answer about any Job.
+            None => Predecessor::Unreadable(format!("'{id}' is not a job id")),
+            Some(job_id) => match state.jobs.get_job(&job_id).await {
+                Ok(None) => Predecessor::Absent,
+                Err(e) => Predecessor::Unreadable(e.to_string()),
+                Ok(Some(job)) => match state.jobs.list_steps(&job.id).await {
+                    Ok(steps) => Predecessor::Found(regions::packet_value(&job, &steps)),
+                    Err(e) => Predecessor::Unreadable(e.to_string()),
+                },
+            },
+        };
+        out.push((id.clone(), reading));
+    }
+    out
+}
+
+/// How many publish packets the map reads. The cadence is daily, so
+/// this is a season of them — and a limit is not a filter: the merge
+/// test below reads every mirror head in the page, and a page that
+/// ended mid-history could call a merged PR open. Well clear of that.
+const PUBLISH_TAIL: i64 = 60;
+
+/// The publish packets, newest first, with their steps — the pull
+/// request and its snapshot ride `open-pr`, the scan reading rides
+/// `read-checks`, and the judgement is `judge-checks`'s status. `None`
+/// on any failed read: the region then says the read failed rather
+/// than drawing a mirror with nothing outstanding.
+async fn read_publish_packets<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    scope: crate::port::JobScope,
+) -> Option<Vec<(Job, Vec<Step>)>> {
+    let filter = JobFilter {
+        kind: Some(regions::PUBLISH_KIND.to_string()),
+        scope,
+        ..Default::default()
+    };
+    let (rows, _) = state.jobs.list_jobs(&filter, PUBLISH_TAIL, 0).await.ok()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for job in rows {
+        let steps = state.jobs.list_steps(&job.id).await.ok()?;
+        out.push((job, steps));
+    }
+    Some(out)
+}
+
+/// EVERY ROW A FILTER MATCHES, page after page, each id once.
+///
+/// A limit is not a filter. The receiving read took ONE page of
+/// `MAX_LIMIT` and counted what came back: measured 2026-09-24, 565
+/// backlog-items had closed in two days and ~230 stood open, so a week's
+/// window was past the page and the region's count was a floor that did
+/// not say it was one (the receiving yard's own board said so in words —
+/// "only 500 were read; the counts below are floors"; design 62de32ae
+/// decision 4). Paging by offset over a table that moves can repeat a
+/// row across a boundary, so each id is kept once.
+async fn list_every<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    filter: &JobFilter,
+) -> Result<Vec<Job>, crate::port::JobsError> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows: Vec<Job> = Vec::new();
+    let mut offset: i64 = 0;
+    loop {
+        let (page, total) = state.jobs.list_jobs(filter, MAX_LIMIT, offset).await?;
+        let got = i64::try_from(page.len()).unwrap_or(i64::MAX);
+        rows.extend(page.into_iter().filter(|j| seen.insert(j.id.to_string())));
+        offset = offset.saturating_add(got);
+        if got == 0 || offset >= total {
+            return Ok(rows);
+        }
+    }
+}
+
+/// The receiving yard's inbound packets — every one the filter matches,
+/// never a page of them ([`list_every`]) — with the steps of each OPEN
+/// one: [`regions::taken_in`] reads them to say whether the packet is
+/// still in receiving or has crossed into marshalling (design 62de32ae
+/// decision 4). The steps come from `open`, the open packets this pass
+/// already read; a row that page did not carry is read on its own, so a
+/// packet is never judged on steps nobody read. A CLOSED row (every one
+/// closed within two windows) carries its steps too: it stands in no
+/// region, but its intake step's completion is a crossing of the
+/// receiving -> marshalling border ([`regions::taken_in_at`]), and a
+/// packet taken in and closed inside the window would otherwise be a
+/// crossing nobody counted — the rail used to count the close instead,
+/// a different event on most kinds (design 62de32ae). `None` on any
+/// failed read: an unread intake is troubled, never an empty one.
+async fn read_inbound<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    filter: &JobFilter,
+    open: Option<&[(Job, Vec<Step>)]>,
+) -> Option<Vec<(Job, Vec<Step>)>> {
+    let rows = list_every(state, filter).await.ok()?;
+    let steps_of: std::collections::HashMap<String, &Vec<Step>> = open
+        .into_iter()
+        .flatten()
+        .map(|(j, s)| (j.id.to_string(), s))
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for job in rows {
+        let steps = match steps_of.get(&job.id.to_string()) {
+            Some(steps) if job.status == JobStatus::Open => (*steps).clone(),
+            _ => state.jobs.list_steps(&job.id).await.ok()?,
+        };
+        out.push((job, steps));
+    }
+    Some(out)
 }
 
 /// The shop floor's runs: open ones WITH their steps (a run that
@@ -477,25 +643,21 @@ async fn newest_ops_requests<R: JobsRepository + 'static, B: EventBus + 'static>
 
 /// The station readings the marshalling region is judged on, or `None`
 /// when the registry (or the packets under it) could not be read.
+///
+/// `packets` are the caller's open packets with their steps, resolved
+/// against each kind's active row — the SAME member set the load and
+/// the queue count (this read listed steps raw until backlog 6c06ef65,
+/// so the map drew the agent station 43 short). [`read_map`] reads them
+/// once and hands them here and to the inbound read.
 async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     user: &boss_policy_client::User,
-    scope: crate::port::JobScope,
+    packets: Option<&[(Job, Vec<Step>)]>,
     window_hours: i64,
 ) -> Option<Vec<StationReading>> {
     let reg = state.stations.as_ref()?;
     let specs = effective_stations(state.as_ref(), reg).await.ok()?;
-    let filter = JobFilter {
-        status: Some(JobStatus::Open),
-        scope,
-        ..Default::default()
-    };
-    let (jobs, _) = state.jobs.list_jobs(&filter, MAX_LIMIT, 0).await.ok()?;
-    let mut packets = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let steps = state.jobs.list_steps(&job.id).await.ok()?;
-        packets.push((job, steps));
-    }
+    let packets = packets?;
     // The flow cube over two windows: the previous window's counts are
     // the wider read minus the narrower. Wall clock, as the flow
     // surface reads it — the window has to be the instant the log's
@@ -514,10 +676,17 @@ async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static
             .filter(|spec| spec.name != "loading-dock")
             .filter_map(|spec| {
                 let bound = spec.bind_self(self_id(user))?;
-                let members: Vec<String> = packets
+                let standing: Vec<&Job> = packets
                     .iter()
                     .filter(|(job, steps)| bound.predicate.matches(job, steps))
-                    .map(|(job, _)| job.id.to_string())
+                    .map(|(job, _)| job)
+                    .collect();
+                let members: Vec<String> = standing.iter().map(|job| job.id.to_string()).collect();
+                // The marshalling KPI's ages (design 62de32ae, decision 9),
+                // per member, so the partition can narrow them.
+                let opened = standing
+                    .iter()
+                    .filter_map(|job| Some((job.id.to_string(), regions::opened_at(job)?)))
                     .collect();
                 let over_limit = bound
                     .wip_limit
@@ -534,6 +703,7 @@ async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static
                     members,
                     served,
                     previous_served: served.zip(served_both).map(|(w, b)| b - w),
+                    opened,
                 })
             })
             .collect(),

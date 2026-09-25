@@ -20,7 +20,9 @@
   import { href } from '../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { formatActor } from '../data/actor';
-  import type { Employee } from '../people/types';
+  import { relatedJobsUrl } from './relatedJobs';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
+  import { okRead, type ReadState } from '../data/readState';
 
   type EntityKind = 'account' | 'asset';
 
@@ -72,7 +74,8 @@
   let factsFailed = $state<string | null>(null);
   let jobsFailed = $state<string | null>(null);
   let docsFailed = $state<string | null>(null);
-  let empNames = $state<Map<string, string>>(new Map());
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
   let workflowLabels = $state<Map<string, string>>(new Map());
 
   // --- Facts fetch ---------------------------------------------------------
@@ -119,16 +122,12 @@
 
   // --- Related Jobs fetch --------------------------------------------------
   $effect(() => {
-    const kind = entityKind;
     const id = entityId;
     if (!id) return;
     let cancelled = false;
-    const param = kind === 'account' ? 'account_id' : 'asset_id';
     (async () => {
       try {
-        const r = await fetch(
-          `/api/jobs?${param}=${encodeURIComponent(id)}&limit=50`,
-        );
+        const r = await fetch(relatedJobsUrl(id));
         if (cancelled) return;
         if (!r.ok) {
           jobsFailed = `HTTP ${r.status}`;
@@ -180,18 +179,20 @@
   });
 
   // --- Employee-name lookup (for timeline actor labels) -------------------
+  // Only the people acting on the facts shown (the first 50), one row
+  // each, and a failure is said above the timeline. Until backlog
+  // 1e73bd93 this read the WHOLE roster and dropped a refusal or a
+  // network error, so the actors silently became ids. Machine actors
+  // are never asked about (see ../data/ownerNames.ts).
+  let actorKey = $derived(personIdsOf(facts.slice(0, 50).map((f) => f.actor_id)).join('\n'));
   $effect(() => {
+    const ids = actorKey ? actorKey.split('\n') : [];
     let cancelled = false;
     (async () => {
-      try {
-        const r = await fetch('/api/people');
-        if (!r.ok || cancelled) return;
-        const roster = (await r.json()) as Employee[];
-        if (!cancelled) {
-          empNames = new Map(roster.map((e) => [e.id, e.name ?? ""]));
-        }
-      } catch {
-        /* ignore */
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
       }
     })();
     return () => {
@@ -220,7 +221,7 @@
   });
 
   let openJobs = $derived(
-    jobs.filter((j) => j.status === 'open' || j.status === 'blocked'),
+    jobs.filter((j) => j.status === 'open'),
   );
   let closedJobs = $derived(jobs.filter((j) => j.status === 'closed'));
 
@@ -230,10 +231,6 @@
     'service-ticket': '🔧',
     'contract-renewed': '📋',
     Received: '📦',
-    TriageCompleted: '🔍',
-    RefurbStarted: '🛠',
-    RefurbCompleted: '✅',
-    QAPassed: '🏆',
     Sold: '🤝',
     Installed: '🏥',
     ServiceJobOpened: '⚠️',
@@ -247,10 +244,6 @@
     'service-ticket': 'Service request',
     'contract-renewed': 'Contract renewed',
     Received: 'System received',
-    TriageCompleted: 'Triage completed',
-    RefurbStarted: 'Refurb started',
-    RefurbCompleted: 'Refurb completed',
-    QAPassed: 'QA passed',
     Sold: 'System sold',
     Installed: 'System installed',
     ServiceJobOpened: 'SR opened',
@@ -288,6 +281,11 @@
       {:else if facts.length === 0}
         <div class="kb-empty">No recorded activity yet.</div>
       {:else}
+        {#if namesRead.kind === 'failed'}
+          <div class="kb-empty load-failed" role="alert">
+            Couldn't load the names on the timeline — {namesRead.error}. People show as ids.
+          </div>
+        {/if}
         <div class="kb-timeline">
           {#each facts.slice(0, 50) as fact, i (fact.id ?? `${factKindOf(fact)}-${i}`)}
             {@const kind = factKindOf(fact)}

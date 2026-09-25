@@ -117,6 +117,10 @@ name = "job_metadata_patch_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "repin_writes_the_move_whole_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "step_fields_survive_an_update"
 required-features = ["postgres"]
 
@@ -174,6 +178,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "step_claim_admits_an_aliased_holder_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_claim_clears_the_run_edge_when_the_holder_changes_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -290,4 +298,12 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_inbox_outlives_the_session_that_filled_it_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_rebuild_recovers_the_admission_instant_from_the_log_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_health_reads_the_schema_ledger_pg"
 required-features = ["postgres"]

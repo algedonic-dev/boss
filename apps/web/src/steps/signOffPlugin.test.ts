@@ -87,15 +87,19 @@ function loadBundle(routes: (url: string, init?: RequestInit) => unknown) {
     });
     const result = routes(url, init);
     if (result === undefined) return Promise.reject(new Error(`unrouted: ${url}`));
-    return Promise.resolve({
-      ok: (result as { __status?: number }).__status === undefined,
-      status: (result as { __status?: number }).__status ?? 200,
+    const status = (result as { __status?: number }).__status ?? 200;
+    const res = {
+      ok: status >= 200 && status < 300,
+      status,
       json: async () => result,
       text: async () =>
         typeof (result as { __text?: string }).__text === 'string'
           ? (result as { __text: string }).__text
           : JSON.stringify(result),
-    });
+      // sign() reads a 422 through clone() so the body stays readable.
+      clone: () => res,
+    };
+    return Promise.resolve(res);
   };
   // eslint-disable-next-line no-new-func
   new Function(readFileSync(BUNDLE, 'utf8'))();
@@ -255,6 +259,50 @@ describe('sign-off v2', () => {
     expect(patches.length).toBe(1);
     expect((patches[0]!.body as Record<string, unknown>).decision).toBe('changes-requested');
     expect(calls.filter((x) => x.method === 'PUT').length).toBe(0);
+  });
+
+  // Backlog da322e8f, measured 2026-09-23 23:20Z: page-audit routes a
+  // changes-requested review to `revise`, whose ready_when requires
+  // `steps.review.done`, and this surface never completed the review —
+  // three founder change requests (/ux/parts, /ux/products,
+  // /ux/vendors) sat recorded and went nowhere. The PROTOCOL now says
+  // which reading it means: a step whose metadata carries
+  // `changes_requested_completes: true` (a Workflow metadata_defaults
+  // key) completes on Request changes exactly as on Approve; every
+  // other sign-off keeps the record-and-stay-open behaviour above.
+  test('Request changes completes when the protocol declares it a route', async () => {
+    const { mount, calls } = loadBundle(() => ({}));
+    const step = publishStep();
+    (step.metadata as Record<string, unknown>).approved = 'true';
+    (step.metadata as Record<string, unknown>).changes_requested_completes = true;
+    const c = new FakeNode();
+    mount(c, { step, jobId: 'job-1', onUpdate() {} });
+    buttonNamed(c, 'Request changes')!.fire('click');
+    await settled();
+    const patches = calls.filter((x) => x.method === 'PATCH');
+    expect(patches.length).toBe(1);
+    expect((patches[0]!.body as Record<string, unknown>).decision).toBe('changes-requested');
+    // Recorded first, completed second — the same order as Approve.
+    const puts = calls.filter((x) => x.method === 'PUT');
+    expect(puts.length).toBe(1);
+    expect(puts[0]!.url).toBe('/api/jobs/job-1/steps/step-1');
+    expect((puts[0]!.body as { status: string }).status).toBe('completed');
+    expect(calls.findIndex((x) => x.method === 'PATCH')).toBeLessThan(
+      calls.findIndex((x) => x.method === 'PUT'),
+    );
+    expect(allText(c)).toContain('Completed');
+  });
+
+  test('a completing Request changes waits on required fields like Approve does', () => {
+    const { mount } = loadBundle(() => ({}));
+    const step = publishStep();
+    (step.metadata as Record<string, unknown>).changes_requested_completes = true;
+    const c = new FakeNode();
+    mount(c, { step, jobId: 'job-1', onUpdate() {} });
+    // `approved` is required-at-done and empty: a click that completes
+    // could only 400, so the button waits with the others.
+    expect(buttonNamed(c, 'Request changes')?.disabled).toBe(true);
+    expect(buttonNamed(c, 'Approve')?.disabled).toBe(true);
   });
 });
 
@@ -470,5 +518,72 @@ describe('sign-off v3 — the signature follows the decision', () => {
 
     expect(allText(c)).toContain(`409: ${body}`);
     expect(buttonNamed(c, 'Sign off as platform-admin')).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------
+// The presence ceremony names what failed (backlog f3436d99).
+//
+// The plugin runs its own copy of the ceremony — a bundle cannot import
+// the app's presence.ts — and until this car it dropped the gateway's
+// refusal text at both ends: 'presence ceremony unavailable (502)' said
+// nothing about WHICH of the gateway's steps refused (job fetch, stored
+// passkeys, challenge mint), and 'assertion rejected (410)' hid 'challenge
+// already spent or expired — begin again'. The app's copy carries the
+// text beside the status since 2e893e27; the plugin says the same.
+
+describe('sign-off — the presence ceremony names what failed', () => {
+  const BEGIN = '/api/auth/passkey/assert/begin';
+  const FINISH = '/api/auth/passkey/assert/finish';
+  const presenceGated = (url: string, init?: RequestInit) =>
+    url === SIGN && init?.method === 'POST' ? { __status: 422, required: 'presence' } : undefined;
+  const beginOptions = {
+    challenge_id: 'chal-1',
+    shape_hash: 'h',
+    publicKey: {
+      challenge: 'AAAA',
+      rpId: 'boss.test',
+      allowCredentials: [{ type: 'public-key', id: 'AAAA' }],
+      userVerification: 'required',
+      timeout: 60000,
+    },
+  };
+  const buf = () => new Uint8Array([1, 2, 3]).buffer;
+  const credential = {
+    id: 'cred',
+    rawId: buf(),
+    type: 'public-key',
+    response: { authenticatorData: buf(), clientDataJSON: buf(), signature: buf(), userHandle: null },
+  };
+
+  test('a refused begin shows the gateway text beside the status', async () => {
+    const refusal = 'job fetch: 403 Forbidden';
+    const { mount } = loadBundle(
+      (url, init) =>
+        presenceGated(url, init) ?? (url === BEGIN ? { __status: 502, __text: refusal } : undefined),
+    );
+    const c = new FakeNode();
+    mount(c, { step: bypassStep(), jobId: 'job-1', onUpdate() {} });
+    buttonNamed(c, 'Sign off as platform-admin')!.fire('click');
+    await settled();
+    expect(allText(c)).toContain(`presence ceremony unavailable (502): ${refusal}`);
+  });
+
+  test('a refused finish shows the gateway text beside the status', async () => {
+    const refusal = 'challenge already spent or expired — begin again';
+    const { mount, calls } = loadBundle(
+      (url, init) =>
+        presenceGated(url, init) ??
+        (url === BEGIN ? beginOptions : url === FINISH ? { __status: 410, __text: refusal } : undefined),
+    );
+    (globalThis as unknown as Record<string, unknown>).navigator = {
+      credentials: { get: async () => credential },
+    };
+    const c = new FakeNode();
+    mount(c, { step: bypassStep(), jobId: 'job-1', onUpdate() {} });
+    buttonNamed(c, 'Sign off as platform-admin')!.fire('click');
+    await settled();
+    expect(calls.map((x) => x.url)).toContain(FINISH);
+    expect(allText(c)).toContain(`assertion rejected (410): ${refusal}`);
   });
 });

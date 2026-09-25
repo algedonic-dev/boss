@@ -8,7 +8,7 @@
 // Run via `bun test`.
 
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { parseRoute } from './router';
+import { notFoundBack, parseRoute } from './router';
 
 // `/jobs` reads `window.location.search` for filter query params.
 // Stub a minimal window shape so the test runs in bun's
@@ -52,7 +52,13 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/ux/shipments/ship-1', { kind: 'shipmentDetail', shipmentId: 'ship-1' }],
     ['/ux/support', { kind: 'support' }],
     // Calendar / scheduling
-    ['/ux/calendar', { kind: 'calendar' }],
+    // The launch calendar retired with the second example tenant
+    // (design 2ea444f5, backlog a8991c86): /ux/calendar is an unknown
+    // path now and takes the catch-all; /ux/calendar/me is untouched.
+    ['/ux/calendar', { kind: 'notFound', path: '/ux/calendar' }],
+    // The landing page (the System Model live view) was reachable ONLY
+    // through the catch-all until design ee3a3a2f gave it a door.
+    ['/ux/system-model', { kind: 'home' }],
     ['/ux/calendar/me', { kind: 'myCalendar' }],
     ['/ux/service/schedule', { kind: 'schedule' }],
     // Exec (User Experiences)
@@ -150,6 +156,83 @@ describe('parseRoute — every specific path matches its specific case', () => {
   }
 });
 
+// An unmatched path says so, and names the path (design ee3a3a2f,
+// backlog c4f2ae24). The catch-all used to return the landing page for
+// /ux and the yard for /it, so a dead link rendered a real, working,
+// plausible page and the reader concluded they had misremembered.
+describe('an unmatched path is notFound, naming the path', () => {
+  test('an unknown path is notFound, not the landing page', () => {
+    expect(parseRoute('/no-such-route')).toEqual({ kind: 'notFound', path: '/no-such-route' });
+    expect(parseRoute('/ux/no-such-route')).toEqual({ kind: 'notFound', path: '/ux/no-such-route' });
+  });
+
+  test('an unknown /it path is notFound, not the yard', () => {
+    expect(parseRoute('/it/no-such')).toEqual({ kind: 'notFound', path: '/it/no-such' });
+    // /system retired with the IT consolidation; it is unknown like any other.
+    expect(parseRoute('/it/system/yard').kind).toBe('notFound');
+  });
+
+  test('the path named is the one asked for, mount and all', () => {
+    expect(parseRoute('/dashboard/ux/nope')).toEqual({ kind: 'notFound', path: '/dashboard/ux/nope' });
+  });
+
+  test('the deliberate /it aliases above the catch-all still answer', () => {
+    expect(parseRoute('/it/operate/marshalling').kind).toBe('systemYardFloor');
+    expect(parseRoute('/it/design/codebase').kind).toBe('systemCodebase');
+  });
+
+  test('the one back link goes to the department the path was under', () => {
+    expect(notFoundBack('/it/no-such')).toEqual({ href: '/it', label: 'Back to the IT yard' });
+    expect(notFoundBack('/dashboard/it/no-such/')).toEqual({ href: '/it', label: 'Back to the IT yard' });
+    expect(notFoundBack('/ux/no-such')).toEqual({ href: '/ux', label: 'Back to My Day' });
+    expect(notFoundBack('/items')).toEqual({ href: '/ux', label: 'Back to My Day' });
+  });
+});
+
+// The single-id wildcards were greedy `(.+)`, so a deeper path under a
+// list became a convincing "missing X": /ux/accounts/agreements/<id>
+// rendered the ACCOUNT page for accountId "agreements/<id>", and
+// /ux/sales/opportunities/<id> the JOB page. Narrowed to one segment
+// (design ee3a3a2f Q6); an id holding a slash arrives percent-encoded.
+describe('a single-id wildcard takes one segment', () => {
+  test('the two motivating dead links are notFound, not a missing entity', () => {
+    expect(parseRoute('/ux/accounts/agreements/x').kind).toBe('notFound');
+    expect(parseRoute('/ux/sales/opportunities/x').kind).toBe('notFound');
+  });
+
+  const families = [
+    '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts', '/ux/products', '/ux/finance',
+    '/ux/shipments', '/ux/catalog', '/ux/assets', '/ux/marketing-assets', '/ux/purchase-orders',
+    '/ux/vendor-invoices', '/ux/shop', '/ux/service', '/ux/sales', '/ux/jobs',
+    '/it/registry', '/it/registry/authoring', '/it/registry/step-plugins', '/it/registry/rules',
+  ];
+  for (const f of families) {
+    test(`${f}/a/b is notFound`, () => {
+      expect(parseRoute(`${f}/a/b`)).toEqual({ kind: 'notFound', path: `${f}/a/b` });
+    });
+  }
+
+  test('an encoded slash is one segment, and arrives decoded', () => {
+    expect(parseRoute('/ux/accounts/a%2Fb')).toEqual({ kind: 'account', accountId: 'a/b' });
+    expect(parseRoute('/ux/people/a%2Fb')).toEqual({ kind: 'employee', empId: 'a/b' });
+    expect(parseRoute('/ux/jobs/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
+    expect(parseRoute('/ux/service/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
+    expect(parseRoute('/ux/sales/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
+  });
+
+  test('a malformed escape does not throw; the segment arrives as typed', () => {
+    expect(parseRoute('/ux/accounts/%E0')).toEqual({ kind: 'account', accountId: '%E0' });
+  });
+
+  test('a manual section slug may hold a slash — the content API routes {*slug}', () => {
+    expect(parseRoute('/ux/manual/ops/brewing')).toEqual({ kind: 'manualSection', slug: 'ops/brewing' });
+  });
+
+  test('a job id followed by a lone steps segment is not a job page', () => {
+    expect(parseRoute('/ux/jobs/job-1/steps').kind).toBe('notFound');
+  });
+});
+
 describe('parseRoute — wildcard does not shadow specific cases', () => {
   // Pins the canonical fix for the `/finance/(.+)` wildcard
   // precedence bug: specific cases MUST be declared before the
@@ -170,6 +253,75 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
   });
 });
 
+// The /ux/products search box writes its query back as `q` (backlog
+// 1c2db4c2), so the route must hand it to the page on a reload or a
+// shared link; absent and empty both mean no query.
+describe('products list search from the query string', () => {
+  const at = (search: string) => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search, pathname: '/ux/products' },
+    };
+    return parseRoute('/ux/products') as { kind: string; q?: string };
+  };
+
+  test('a query is carried through', () => {
+    const r = at('?q=pale+ale');
+    expect(r.kind).toBe('products');
+    expect(r.q).toBe('pale ale');
+  });
+
+  test('no query is the empty string, and is still the list route', () => {
+    expect(at('')).toEqual({ kind: 'products', q: '' });
+    expect(at('?q=')).toEqual({ kind: 'products', q: '' });
+  });
+
+  test('a product page does not read the list query', () => {
+    const r = parseRoute('/ux/products/FP-IPA-1-2-BBL');
+    expect(r).toEqual({ kind: 'product', productSku: 'FP-IPA-1-2-BBL' });
+  });
+});
+
+// /ux/finance's tab, entry and fact ride in the query (backlog
+// 2ab44d55): NewJournalEntryPage lands on ?entry=<id> after a post, and
+// the route must hand that to the page rather than drop it.
+describe('finance view from the query string', () => {
+  const at = (search: string) => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search, pathname: '/ux/finance' },
+    };
+    return parseRoute('/ux/finance');
+  };
+
+  test('a posted entry is carried through, onto the Trial Balance', () => {
+    expect(at('?entry=ent-1')).toEqual({
+      kind: 'finance',
+      view: { tab: 'trial-balance', entry: 'ent-1', fact: '' },
+    });
+  });
+
+  test('a fact and a tab are carried through', () => {
+    expect(at('?fact=f-1')).toEqual({
+      kind: 'finance',
+      view: { tab: 'trial-balance', entry: '', fact: 'f-1' },
+    });
+    expect(at('?tab=invoices')).toEqual({
+      kind: 'finance',
+      view: { tab: 'invoices', entry: '', fact: '' },
+    });
+  });
+
+  test('a bare /ux/finance is the Overview', () => {
+    expect(at('')).toEqual({ kind: 'finance', view: { tab: 'overview', entry: '', fact: '' } });
+  });
+
+  test('an invoice page does not read the finance query', () => {
+    expect(at('?entry=ent-1') && parseRoute('/ux/finance/inv-1')).toEqual({
+      kind: 'invoice',
+      invoiceId: 'inv-1',
+    });
+  });
+});
+
 describe('global search results route', () => {
   test('/search carries the query through', () => {
     (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
@@ -187,6 +339,61 @@ describe('global search results route', () => {
     const r = parseRoute('/ux/search');
     expect(r.kind).toBe('search');
     expect((r as { q: string }).q).toBe('');
+  });
+});
+
+// An ABSENT status and an EMPTY one are two different requests. With
+// no `status` the page defaults to open; `status=` is a deep link
+// asking for every status, the same thing the page's own All button
+// sets. EmployeePage links "View this employee's owned jobs" as
+// `/ux/jobs?owner_id=…&status=`, and the router's truthiness check
+// dropped the empty value, so that link showed open jobs only (backlog
+// 03e198e5, found by page-audit 473f4f92 GAP 7).
+describe('jobs list status filter from the query string', () => {
+  const at = (search: string) => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search, pathname: '/ux/jobs' },
+    };
+    return parseRoute('/ux/jobs') as { kind: string; jobStatus?: string };
+  };
+
+  test('an explicit empty status is carried as the empty string (all statuses)', () => {
+    const r = at('?owner_id=emp-1&status=');
+    expect(r.kind).toBe('jobs');
+    expect(r.jobStatus).toBe('');
+  });
+
+  test('an absent status is left unset, so the page defaults to open', () => {
+    const r = at('?owner_id=emp-1');
+    expect('jobStatus' in r).toBe(false);
+  });
+
+  test('a named status is carried through', () => {
+    expect(at('?status=closed').jobStatus).toBe('closed');
+  });
+});
+
+// `filter_subject_kind` was parsed into the route and handed to the
+// page, which captured it and never sent it: no link in the tree
+// produced it and the jobs API's ListJobsQuery has no subject_kind
+// filter, so it narrowed nothing. Deleted rather than implemented just
+// in case (backlog 45ca0f89, found by page-audit 473f4f92 GAP 8).
+describe('jobs list subject filter from the query string', () => {
+  const at = (search: string) => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search, pathname: '/ux/jobs' },
+    };
+    return parseRoute('/ux/jobs') as Record<string, unknown>;
+  };
+
+  test('filter_subject_kind is not a route field: nothing downstream reads it', () => {
+    const r = at('?filter_subject_kind=account&subject_id=account-00001');
+    expect(r.kind).toBe('jobs');
+    expect('jobSubjectKind' in r).toBe(false);
+  });
+
+  test('subject_id still filters the list, the one subject filter the server takes', () => {
+    expect(at('?subject_id=account-00001').jobSubjectId).toBe('account-00001');
   });
 });
 
