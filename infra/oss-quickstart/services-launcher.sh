@@ -57,13 +57,9 @@ SERVICES=(
     # systemd unit.
     "boss-event-relay"
     "boss-jobs-api"
-    # boss-observability is a non-`-api` service: NATS aggregator +
-    # /api/snapshot for the /ops dashboard. Required for /ops to
-    # render anything — without it the gateway's /api/snapshot proxy
-    # returns 502 and the page reads as broken. Brewery deploys
-    # configure [demo_agents] so the snapshot ships synthetic agent
-    # telemetry (with the SPA-side "demo mode" banner on /ops).
-    "boss-observability"
+    # (boss-observability stood here until 2026-09-23 — retired as
+    # superseded-by with its port row, its gateway routes and its
+    # config block, backlog 467175e7 car B.)
     # The views tier + search + ML + the simulator UX. These four
     # were absent from this roster while present in boss-ports — the
     # fact-lives-twice drift (CLAUDE.md §9a) surfacing as 502s on
@@ -180,8 +176,11 @@ done
 # `--plan` prints the decision per service and exits without starting
 # anything: the door the shell test uses, and what an operator asks
 # when a service is missing from a pod ("was it skipped, and why?").
-# (Called in THIS shell, not a subshell: it exports.)
+# The first line under the header names how many modules the tenant
+# runs (modules_on_line — backlog fa77e3d7: prod declared none for days
+# and nothing said so). (Called in THIS shell, not a subshell: it exports.)
 echo "==> tenant modules:"
+modules_on_line
 derive_sim_env
 if [[ "${1:-}" == "--plan" ]]; then
     for svc in "${SERVICES[@]}"; do

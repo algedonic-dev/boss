@@ -54,22 +54,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres")?;
 
-    // Seed the executive-role cache from the Class registry so the
-    // IT-providers gate's `has_global_read` recognises tenant-defined
-    // executives. Skip on missing config or transport failure —
-    // platform-admin + audit-readonly still grant global read.
-    if let Some(url) = &cfg.classes_api_url {
-        let client = boss_classes_client::ReqwestClassesClient::new(url.clone());
-        match boss_classes_client::seed_executive_role_cache(&client).await {
-            Ok(n) => info!(count = n, classes_api_url = %url, "executive role cache seeded"),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to seed executive roles from classes; falling back to platform-admin/audit-readonly only")
-            }
-        }
-    } else {
-        info!("classes_api_url unset; executive role cache disabled");
-    }
-
     // Clock-api URL: env override (BOSS_CLOCK_URL) takes
     // precedence; default goes to the canonical port via
     // boss-ports. Production deploys point at a wall-mode
@@ -117,13 +101,15 @@ async fn main() -> Result<()> {
         publisher,
         clock,
         // Read gate on the whole surface. Same wrapping the other
-        // policy consumers use: sim traffic authorized at the
-        // boundary, real traffic enforced per-role.
-        policy: Some(Arc::new(boss_policy_client::SimBypassPolicyClient::new(
-            Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+        // policy consumers use: on a sim instance a sim caller is
+        // authorized at the boundary; everything else is enforced
+        // per-role (backlog 85e7f10f). Required since backlog 7048afa8:
+        // the surface has no open configuration.
+        policy: boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(
                 std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
-            )),
-        ))),
+            ),
+        )),
     };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
@@ -142,6 +128,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "boss-ledger-api listening");
+    let app = boss_core::machine_gate::mount(app, "ledger", &["/api/ledger/health"]);
     let mut http_cancel = cancel_rx.clone();
     let shutdown = async move {
         let _ = http_cancel.changed().await;

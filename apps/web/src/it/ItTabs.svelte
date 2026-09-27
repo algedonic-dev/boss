@@ -5,37 +5,42 @@
   // adding a tab is a row here, not a new sidebar entry (the sidebar
   // holds exactly six IT rows and this file is why it can).
   import { href, navigate } from '../router';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   export type ItTabGroup = 'operate' | 'registry' | 'design';
 
   const GROUPS: Readonly<Record<ItTabGroup, ReadonlyArray<{ label: string; path: string }>>> = {
+    // Car N3 of design e765b3fc (2026-09-25) took five tabs off this
+    // strip, each now a selection's panel on the Department Map: Yard
+    // status (the track, dock and garage stations), Conductor (the
+    // track), Receiving Yard and Marshalling Yard (those two stations),
+    // and on Design, Feedback and Backlog (receiving; the backlog on
+    // marshalling too). What stays is desk work, not a station.
     operate: [
       { label: 'Incidents', path: '/it/operate' },
-      { label: 'Yard status', path: '/it/operate/yard-status' },
-      { label: 'Conductor', path: '/it/operate/conductor' },
       { label: 'Audit Log', path: '/it/operate/audit' },
       { label: 'Performance', path: '/it/operate/perf' },
       { label: 'Atlas', path: '/it/operate/atlas' },
       { label: 'Bottlenecks', path: '/it/operate/bottlenecks' },
-      // The two queue boards are REGIONS of the world since car 4 of
-      // design d2154293 — the tab walks to the zoomed territory, not
-      // to a page of its own.
-      { label: 'Receiving Yard', path: '/it/yard/receiving' },
-      { label: 'Marshalling Yard', path: '/it/yard/marshalling' },
     ],
     registry: [
       { label: 'Workflows', path: '/it/registry' },
       { label: 'Dispatcher', path: '/it/registry/dispatcher' },
+      // The authoring list of the rules the cascade draws. Rendered bare
+      // until 2026-09-24, reachable only through the cascade's "Edit
+      // rules →" link, and 0 of 784 surface-opens reached it (0a98d93f).
+      { label: 'Rules', path: '/it/registry/rules' },
       { label: 'Step plugins', path: '/it/registry/step-plugins' },
       { label: 'Policy', path: '/it/registry/policy' },
       { label: 'Subjects', path: '/it/registry/subjects' },
       { label: 'Drift', path: '/it/registry/drift' },
+      // The agents registry as a directory (62988516) — who runs work
+      // besides people, beside the other registries.
+      { label: 'Agents', path: '/it/registry/agents' },
     ],
     design: [
       { label: 'Reviews', path: '/it/design' },
       { label: 'Experiments', path: '/it/design/experiments' },
-      { label: 'Feedback', path: '/it/design/feedback' },
-      { label: 'Backlog', path: '/it/design/backlog' },
     ],
   };
 
@@ -46,7 +51,7 @@
 <nav class="it-tabs" aria-label="IT {group}">
   {#each tabs as t (t.path)}
     <a
-      href={href(t.path)}
+      href={safeLinkHref(href(t.path))}
       class:active={t.path === active}
       aria-current={t.path === active ? 'page' : undefined}
       onclick={(e) => {
@@ -62,7 +67,7 @@
     display: flex;
     gap: 0.25rem;
     padding: 0.5rem 1.25rem 0;
-    border-bottom: 1px solid var(--border, #d5d2ca);
+    border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
   }
   .it-tabs a {
@@ -75,11 +80,11 @@
     font-size: 0.85rem;
   }
   .it-tabs a:hover {
-    background: var(--surface-2, #efece5);
+    background: var(--ink-raised);
   }
   .it-tabs a.active {
-    border-color: var(--border, #d5d2ca);
-    background: var(--surface-1, #faf8f4);
+    border-color: var(--border);
+    background: var(--ink);
     font-weight: 600;
   }
 </style>

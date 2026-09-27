@@ -9,8 +9,9 @@
 //
 // That car fixed one page and audited no other. These are the three
 // pages the audit named as suspects. Each is measured here rather
-// than reasoned about: a 503 on the read each one makes at mount,
-// then a second of settling, then the count. None of them carries the
+// than reasoned about: a 503 on the read each one makes at mount, a
+// wait until that read has ARRIVED, then a second of settling, then
+// the count. None of them carries the
 // shape today — FleetPage and SubjectsClassesPage load from onMount
 // (which runs once and tracks nothing), and SystemModelLiveView's two
 // $effects read only `selectedKind` and `spec`, neither of which a
@@ -20,7 +21,7 @@
 // names the page.
 
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { mountPage } from './_helpers';
+import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 
 /// Fail every request to `pattern` with a 503, counting them. Registered
@@ -39,10 +40,9 @@ async function failAndCount(page: Page, pattern: RegExp): Promise<() => number> 
   return () => reads;
 }
 
-// One second is the same settling window the JobsListPage spec uses:
-// the unbounded loop managed 554 reads in it, so a bounded page's
-// count is unambiguous.
-const SETTLE_MS = 1_000;
+// settledReads (in _helpers) waits for the reads a page owes before its
+// settling window opens, so a late first read is not a fixed page
+// (backlog 28a60028).
 
 test.describe('a failed mount-time read is not retried without bound', () => {
   test('bottlenecks reads the Workflow registry once', async ({ page }) => {
@@ -50,11 +50,10 @@ test.describe('a failed mount-time read is not retried without bound', () => {
     const reads = await failAndCount(page, /\/api\/workflows$/);
 
     await mountPage(page, '/it/operate/bottlenecks');
-    await page.waitForTimeout(SETTLE_MS);
 
     // onMount, once. The page's 10s poll re-reads the fleet view, not
     // the registry, so nothing here should climb.
-    expect(reads()).toBe(1);
+    expect(await settledReads(page, reads, 1)).toBe(1);
   });
 
   test('subjects and classes reads the SubjectKind taxonomy once', async ({ page }) => {
@@ -62,24 +61,23 @@ test.describe('a failed mount-time read is not retried without bound', () => {
     const reads = await failAndCount(page, /\/api\/subject-kinds$/);
 
     await mountPage(page, '/it/registry/subjects');
-    await page.waitForTimeout(SETTLE_MS);
 
-    expect(reads()).toBe(1);
+    expect(await settledReads(page, reads, 1)).toBe(1);
   });
 
   test('the live system-model view reads the Workflow registry once', async ({ page }) => {
     await installSmokeMocks(page);
     const reads = await failAndCount(page, /\/api\/workflows$/);
 
-    // The landing page is the router's catch-all, so an unrouted /ux
-    // path is how a mocked mount reaches SystemModelLiveView.
-    await mountPage(page, '/ux/not-a-route');
-    await page.waitForTimeout(SETTLE_MS);
+    // The landing page renders SystemModelLiveView. It was reachable
+    // only through the router's catch-all (an unrouted /ux path) until
+    // design ee3a3a2f gave it /ux/system-model.
+    await mountPage(page, '/ux/system-model');
 
     // A failed registry read leaves `selectedKind` empty, which is
     // what both of this component's $effects key off — so neither
     // re-runs, and the 1s live poll reads /api/jobs/live, not this.
-    expect(reads()).toBe(1);
+    expect(await settledReads(page, reads, 1)).toBe(1);
   });
 
   test('the live system-model view reads a failing Workflow spec a bounded number of times', async ({
@@ -92,9 +90,8 @@ test.describe('a failed mount-time read is not retried without bound', () => {
     // re-run; onMount's own loadSpec call is the second read.
     const reads = await failAndCount(page, /\/api\/workflows\/[^/?]+$/);
 
-    await mountPage(page, '/ux/not-a-route');
-    await page.waitForTimeout(SETTLE_MS);
+    await mountPage(page, '/ux/system-model');
 
-    expect(reads()).toBe(2);
+    expect(await settledReads(page, reads, 2)).toBe(2);
   });
 });

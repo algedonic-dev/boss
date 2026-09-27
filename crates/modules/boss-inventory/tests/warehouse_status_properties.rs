@@ -29,15 +29,14 @@
 //!    ordered by `expected_on` ascending and never exceeds
 //!    `INBOUND_PO_PREVIEW_LIMIT`.
 //!
-//! 6. `prop_build_warehouse_status_passes_through` — cross-service
-//!    summaries (`refurb_wip`, `outbound_shipments`, `ready_for_sale_count`)
-//!    are returned byte-identical to the caller — no silent dropping
-//!    or reshuffling.
+//! 6. `prop_build_warehouse_status_passes_through` — the cross-service
+//!    read (`outbound_shipments`) is returned byte-identical to the
+//!    caller — no silent dropping or reshuffling.
 
 use boss_inventory::types::{InventoryItem, PoStatus, PurchaseOrder, PurchaseOrderLine};
 use boss_inventory::warehouse_status::{
-    INBOUND_PO_PREVIEW_LIMIT, LOW_STOCK_PREVIEW_LIMIT, OutboundShipmentSummary, RefurbWipSummary,
-    build_warehouse_status,
+    INBOUND_PO_PREVIEW_LIMIT, LOW_STOCK_PREVIEW_LIMIT, OutboundShipmentSummary,
+    OutboundShipmentsRead, build_warehouse_status,
 };
 use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use proptest::prelude::*;
@@ -127,6 +126,11 @@ fn arb_pos(n: usize, today: NaiveDate) -> impl Strategy<Value = Vec<PurchaseOrde
     prop::collection::vec(arb_po(today), 0..=n)
 }
 
+/// The shipping leg as it reads when shipping answered.
+fn ok(summary: OutboundShipmentSummary) -> OutboundShipmentsRead {
+    OutboundShipmentsRead::Ok { summary }
+}
+
 fn empty_outbound() -> OutboundShipmentSummary {
     OutboundShipmentSummary {
         label_created: 0,
@@ -135,13 +139,6 @@ fn empty_outbound() -> OutboundShipmentSummary {
         exception: 0,
         delivered_7d: 0,
         recent: Vec::new(),
-    }
-}
-
-fn empty_refurb() -> RefurbWipSummary {
-    RefurbWipSummary {
-        total_in_flight: 0,
-        by_stage: Vec::new(),
     }
 }
 
@@ -165,9 +162,7 @@ proptest! {
         let status = build_warehouse_status(
             &items,
             &[],
-            empty_refurb(),
-            0,
-            empty_outbound(),
+            ok(empty_outbound()),
             as_of(),
         );
         let ps = &status.parts_stock;
@@ -192,9 +187,7 @@ proptest! {
         let status = build_warehouse_status(
             &items,
             &[],
-            empty_refurb(),
-            0,
-            empty_outbound(),
+            ok(empty_outbound()),
             as_of(),
         );
         let ps = &status.parts_stock;
@@ -214,9 +207,7 @@ proptest! {
         let status = build_warehouse_status(
             &items,
             &[],
-            empty_refurb(),
-            0,
-            empty_outbound(),
+            ok(empty_outbound()),
             as_of(),
         );
         let preview = &status.parts_stock.below_reorder_items;
@@ -242,9 +233,7 @@ proptest! {
         let status = build_warehouse_status(
             &[],
             &pos,
-            empty_refurb(),
-            0,
-            empty_outbound(),
+            ok(empty_outbound()),
             as_of(),
         );
         let ipo = &status.inbound_pos;
@@ -276,9 +265,7 @@ proptest! {
         let status = build_warehouse_status(
             &[],
             &pos,
-            empty_refurb(),
-            0,
-            empty_outbound(),
+            ok(empty_outbound()),
             as_of(),
         );
         let recent = &status.inbound_pos.recent;
@@ -296,23 +283,23 @@ proptest! {
 
     #[test]
     fn prop_build_warehouse_status_passes_through(
-        ready_for_sale_count in 0u64..10_000,
+        in_transit in 0i64..10_000,
+        delivered_7d in 0i64..10_000,
     ) {
-        // The cross-service inputs are opaque to the aggregator — it
-        // must return them byte-identical in the response. Regression
+        // The cross-service input is opaque to the aggregator — it
+        // must return it byte-identical in the response. Regression
         // guard against accidental reshuffling / dropping.
-        let refurb = empty_refurb();
-        let outbound = empty_outbound();
+        let outbound = OutboundShipmentSummary {
+            in_transit,
+            delivered_7d,
+            ..empty_outbound()
+        };
         let status = build_warehouse_status(
             &[],
             &[],
-            refurb.clone(),
-            ready_for_sale_count,
-            outbound.clone(),
+            ok(outbound.clone()),
             as_of(),
         );
-        prop_assert_eq!(status.ready_for_sale_count, ready_for_sale_count);
-        prop_assert_eq!(status.refurb_wip, refurb);
-        prop_assert_eq!(status.outbound_shipments, outbound);
+        prop_assert_eq!(status.outbound_shipments, ok(outbound));
     }
 }

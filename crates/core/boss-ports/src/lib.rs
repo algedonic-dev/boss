@@ -186,11 +186,9 @@ pub const SOLO: &[PortSpec] = &[
         prod: 7855,
         scratch: None,
     },
-    PortSpec {
-        name: "observability",
-        prod: 7880,
-        scratch: None,
-    },
+    // 7880 was `observability` until 2026-09-23: boss-observability
+    // retired as superseded-by (backlog 467175e7, car B), its cross-VM
+    // view by a region of the IT world map.
     // Audit-log read surface. boss-events owns the audit_log table
     // and the tail/stream/export router; pre-2026-06 the router
     // was mounted into boss-people-api for convenience. Split out
@@ -439,6 +437,78 @@ mod launcher_roster_agreement {
         assert!(
             stray.is_empty(),
             "{LAUNCHER} launches an -api binary with no row in the port registry (it would bind a port nothing routes to): {stray:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_map_agreement {
+    use super::all;
+    use std::collections::BTreeSet;
+
+    /// The service map the /it/kb page draws (`docs/architecture/
+    /// 02-service-map.mmd`) is a second copy of this table, and it
+    /// drifted with nothing to notice: page audit 8cd38edd (backlog
+    /// f1d84e3f, 2026-09-25) found it drawing a retired tenant engine
+    /// and missing 9 of the 28 services here. The diagram cannot be
+    /// generated from this table without a renderer the gate does not
+    /// have, so it is pinned instead (CLAUDE.md 9a): every service node
+    /// names its registry row as `<name> :<prod port>`, and this test
+    /// names the row a diagram forgot and the node a registry no
+    /// longer has — a stale port reads as both.
+    const SERVICE_MAP: &str = "docs/architecture/02-service-map.mmd";
+
+    /// Every `<name> :<port>` in the text: a lowercase, hyphenated name,
+    /// one space, a colon and the digits. Anything else in a label —
+    /// `NATS`, a `:` inside a sentence — does not have that shape.
+    fn drawn(text: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for (at, _) in text.match_indices(" :") {
+            let digits: String = text[at + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let name: String = text[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                out.insert(format!("{name} :{digits}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_scanner_reads_the_shape_and_nothing_else() {
+        let got = drawn("<small>jobs :7900<br/>sim-control :7011</small> NATS :4222 a : 12 x :y");
+        let want: BTreeSet<String> = ["jobs :7900", "sim-control :7011"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_service_map_draws_every_registry_row_and_nothing_else() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../../{SERVICE_MAP}"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let on_map = drawn(&text);
+        let registry: BTreeSet<String> = all().map(|s| format!("{} :{}", s.name, s.prod)).collect();
+        let missing: Vec<&String> = registry.difference(&on_map).collect();
+        let extra: Vec<&String> = on_map.difference(&registry).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{SERVICE_MAP} disagrees with the port registry — in the registry but not drawn: {missing:?}; drawn but not in the registry: {extra:?}"
         );
     }
 }

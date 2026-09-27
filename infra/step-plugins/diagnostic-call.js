@@ -27,14 +27,35 @@
         }
       }
     }
+    // A string child is a Text node by append's definition (backlog
+    // 4a359b51 — the reason is at sign-off.js's h()).
     for (const child of children.flat()) {
       if (child == null || child === false) continue;
-      el.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+      el.append(child instanceof Node ? child : String(child));
     }
     return el;
   }
 
   const CHANNELS = ['zoom', 'teams', 'meet', 'phone', 'other'];
+
+  // The Join button's href, or null when the box holds no http(s) URL
+  // (backlog 4a359b51). The box is seeded from step metadata any actor
+  // may write, and it was copied into the href verbatim, so a
+  // `javascript:` join_url ran in the operator's session on a click —
+  // CodeQL's diagnostic-call.js:137 on publish PR #245. The scheme is
+  // written here as a literal, never copied from the text; a meeting
+  // link is http(s), so nothing a meeting uses is refused.
+  function meetingHref(text) {
+    let u;
+    try {
+      u = new URL(String(text).trim());
+    } catch (_) {
+      return null;
+    }
+    if (u.protocol === 'https:') return 'https://' + u.href.slice('https://'.length);
+    if (u.protocol === 'http:') return 'http://' + u.href.slice('http://'.length);
+    return null;
+  }
 
   function mount(container, { step, jobId, onUpdate }) {
     const meta = step.metadata || {};
@@ -125,12 +146,14 @@
     const saveDraftBtn = h('button', { className: 'step-btn' }, 'Save draft');
     const waiveBtn = h('button', { className: 'step-btn' }, 'Waive call');
     const completeBtn = h('button', { className: 'step-btn step-btn-primary' }, 'Close call');
-    saveDraftBtn.addEventListener('click', () => save(step.status === 'pending' ? 'active' : step.status));
+    // A draft save leaves a pending step pending: a step becomes Active
+    // only through a claim (design 611fbffd, clause b of backlog 6ef4a36b).
+    saveDraftBtn.addEventListener('click', () => save(null));
     waiveBtn.addEventListener('click', () => save('waived'));
     completeBtn.addEventListener('click', () => save('done'));
 
     function updateDerived() {
-      const url = joinUrlInput.value.trim();
+      const url = meetingHref(joinUrlInput.value);
       if (url) {
         joinBtn.setAttribute('href', url);
         joinBtn.style.display = 'inline-block';
@@ -162,7 +185,15 @@
             ? (meta.ended_at || new Date().toISOString())
             : (meta.ended_at || null),
         };
-        const body = { ...step, job_id: jobId, status: status || step.status, metadata: nextMeta };
+        // A draft save sends NO status and NO holder (backlog 6ef4a36b).
+        // It sent the status drawn at page load (`status || step.status`)
+        // beside the drawn holder, so a page read while the step was
+        // Ready, saved after someone claimed it, sent the release body
+        // `{status: ready, assignee_id: null}` and took the step off its
+        // holder. The server keeps both as they stand; only Waive and
+        // Close call name a status.
+        const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
+        const body = { ...drawn, job_id: jobId, metadata: nextMeta, ...(status ? { status } : {}) };
         await fetch(
           `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
           {

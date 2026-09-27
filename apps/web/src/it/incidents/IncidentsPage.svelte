@@ -6,7 +6,9 @@
   // both where we respond to active incidents and document post
   // mortems for posterity." Two panels answer the two halves:
   //
-  //   * Active incidents — every open incident-post-mortem packet,
+  //   * Active incidents — every open `incident` packet (the one
+  //     incident protocol since backlog 59d15039 folded
+  //     incident-post-mortem and post-mortem into it, 2026-09-24),
   //     with a compact strip of its step states, who holds the current
   //     step, and the link into the packet where the response work
   //     actually happens. This panel is a lens over the queue, not a
@@ -15,8 +17,8 @@
   //     readable document, newest first, each with the terminal it
   //     ended on. This is the "for posterity" half: the packet's
   //     metadata IS the post-mortem, and the renderer is
-  //     semi-structured (postMortemDoc.ts) because the live packets
-  //     already carry two different shapes.
+  //     semi-structured (postMortemDoc.ts) because packets have
+  //     carried different shapes.
   //
   // Failure renders as failure (packet 3fba9c35, the false-empty
   // sweep): an incidents page that reports calm during an outage is
@@ -24,29 +26,112 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../../router';
-  import type { Job, Step } from '../../jobs/types';
-  import { closedOutcome, incidentAt, postMortemSections } from './postMortemDoc';
+  import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+  import type { Step } from '../../jobs/types';
+  import { fetchEvery, wholeOrThrow } from '../../data/paginated';
+  import { workflowSurfaces, type WorkflowSpec } from '../../workflows/workflowTypes';
+  import {
+    closedOutcome,
+    holderOf,
+    incidentAt,
+    openedAtMs,
+    postMortemSections,
+    severityOf,
+    startedAt,
+    type IncidentJob,
+  } from './postMortemDoc';
+  import {
+    durationText,
+    lensNow,
+    loadStepWaits,
+    waitedText,
+    type StepWaits,
+  } from '../../jobs/queueAge';
 
   type LoadState =
     | { kind: 'loading' }
     | { kind: 'failed'; message: string }
-    | { kind: 'ready'; jobs: ReadonlyArray<Job> };
+    | { kind: 'ready'; kinds: ReadonlyArray<string>; jobs: ReadonlyArray<IncidentJob> };
+
+  /// Time at the current step comes from the queue-age lens, a second
+  /// read (the Job read carries no `became_ready_at`). Its failure is
+  /// said on the card — "time at step unreadable" — and never fails the
+  /// queue itself, which the first read alone answers (1a242883).
+  type WaitsState =
+    | { kind: 'loading' }
+    | { kind: 'failed' }
+    | { kind: 'ready'; waits: StepWaits };
 
   let load = $state<LoadState>({ kind: 'loading' });
+  let waits = $state<WaitsState>({ kind: 'loading' });
+
+  /// The surface a protocol row names to be worked on this page. The
+  /// kinds are read off the registry, the way HrPage and QaPage read
+  /// theirs: this page fetched a literal `kind=incident` that the
+  /// 59d15039 fold had to edit by hand, while the incident row declared
+  /// `system-design`, a surface that rendered it nowhere (backlog
+  /// bc3bac66). Taken from the catalog so a renamed id fails the build.
+  const SURFACE = ROUTE_CATALOG['system-incidents'].id;
 
   async function fetchIncidents(): Promise<void> {
     load = { kind: 'loading' };
     try {
-      const res = await fetch('/api/jobs?kind=incident-post-mortem&limit=200');
-      if (!res.ok) throw new Error(`incident-post-mortem jobs: HTTP ${res.status}`);
-      const body = await res.json();
-      const jobs = (Array.isArray(body) ? body : (body.data ?? [])) as Job[];
-      load = { kind: 'ready', jobs };
+      const wr = await fetch('/api/workflows');
+      if (!wr.ok) throw new Error(`workflows registry: HTTP ${wr.status}`);
+      const kinds = ((await wr.json()) as WorkflowSpec[])
+        .filter((k) => workflowSurfaces(k).includes(SURFACE))
+        .map((k) => k.kind);
+      const pages = await Promise.all(
+        // EVERY packet of the kind — the archive of post-mortems is
+        // half the page, and one page of 200 would drop the oldest in
+        // silence once a kind passed 200 (backlog b68a9dde). A read
+        // that stops short fails, naming the kind and how far it got.
+        kinds.map(async (kind) => {
+          const res = await fetchEvery<IncidentJob>(
+            `/api/jobs?kind=${encodeURIComponent(kind)}&full=true`,
+          );
+          try {
+            return wholeOrThrow(res);
+          } catch (e) {
+            throw new Error(`${kind} jobs: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }),
+      );
+      load = { kind: 'ready', kinds, jobs: pages.flat() };
     } catch (e) {
       load = { kind: 'failed', message: e instanceof Error ? e.message : String(e) };
     }
   }
-  onMount(fetchIncidents);
+
+  async function fetchWaits(): Promise<void> {
+    waits = { kind: 'loading' };
+    const r = await loadStepWaits();
+    waits = r.kind === 'ready' ? { kind: 'ready', waits: r.data } : { kind: 'failed' };
+  }
+
+  function refresh(): void {
+    void fetchIncidents();
+    void fetchWaits();
+  }
+  onMount(refresh);
+
+  /// Ages are measured against the server's clock when the lens sent
+  /// one (the stack may run a simulated clock), else the browser's.
+  const now = $derived(waits.kind === 'ready' ? lensNow(waits.waits, Date.now()) : Date.now());
+
+  const timeOpen = (j: IncidentJob): string | null => {
+    const at = openedAtMs(j);
+    return at === null ? null : durationText(now - at);
+  };
+
+  /// "at step 2h", "at step ≥2h" for a lower-bound stamp, or why not.
+  const timeAtStep = (s: Step): string => {
+    if (waits.kind === 'loading') return 'at step …';
+    if (waits.kind === 'failed') return 'time at step unreadable';
+    const w = waits.waits.byStep.get(s.id);
+    if (!w) return 'time at step unknown';
+    return `at step ${waitedText(w, now)}`;
+  };
 
   const jobs = $derived(load.kind === 'ready' ? load.jobs : []);
 
@@ -64,14 +149,14 @@
     ),
   );
 
-  const stepsOf = (j: Job): ReadonlyArray<Step> =>
+  const stepsOf = (j: IncidentJob): ReadonlyArray<Step> =>
     [...(j.steps ?? [])].sort((a, b) => a.sort_order - b.sort_order);
 
   /// The steps a responder can act on right now, with their holders.
-  const workable = (j: Job): ReadonlyArray<Step> =>
+  const workable = (j: IncidentJob): ReadonlyArray<Step> =>
     stepsOf(j).filter((s) => s.status === 'ready' || s.status === 'active');
 
-  const doneCount = (j: Job): number =>
+  const doneCount = (j: IncidentJob): number =>
     stepsOf(j).filter((s) => s.status === 'completed' || s.status === 'skipped').length;
 
   /// Header keys the document body must not repeat.
@@ -80,7 +165,7 @@
 
 <PageHeader
   title="Incidents"
-  subtitle="Respond to active incidents, and read the post-mortems for posterity. Every incident is an incident-post-mortem packet — this page is the lens over that queue."
+  subtitle="Respond to active incidents, and read the post-mortems for posterity. Every incident is an incident packet — this page is the lens over that queue."
 />
 
 {#if load.kind === 'loading'}
@@ -91,8 +176,15 @@
       Could not load the incident queue — {load.message}. This page will not guess:
       an unreadable queue is not an empty one.
     </p>
-    <button class="inc-btn" type="button" onclick={fetchIncidents}>Retry</button>
+    <button class="inc-btn" type="button" onclick={refresh}>Retry</button>
   </div>
+{:else if load.kinds.length === 0}
+  <!-- A registry read that names no kind is an answer, but not "no
+       incidents": nothing COULD be listed here (backlog bc3bac66). -->
+  <p class="inc-msg inc-no-kinds">
+    No protocol declares the {SURFACE} surface, so there is no incident queue to show.
+    A workflow reaches this page by listing "{SURFACE}" in its row's metadata.surfaces.
+  </p>
 {:else}
   <section class="inc-active" aria-label="Active incidents">
     <h2 class="inc-h2">Active incidents <span class="inc-count">{active.length}</span></h2>
@@ -103,11 +195,23 @@
         <article class="inc-card">
           <header class="inc-card-head">
             <h3 class="inc-card-title">{j.title}</h3>
-            {#if incidentAt(j.metadata)}
-              <span class="inc-when">{incidentAt(j.metadata)}</span>
-            {/if}
             <a class="inc-open" href={href(`/jobs/${j.id}`)}>Open packet →</a>
           </header>
+
+          <!-- The facts that make a troubled packet look troubled
+               (1a242883): how bad, since when, and for how long. -->
+          <dl class="inc-facts">
+            <div><dt>priority</dt><dd class="inc-priority">{j.priority}</dd></div>
+            {#if severityOf(j)}
+              <div><dt>severity</dt><dd class="inc-severity">{severityOf(j)}</dd></div>
+            {/if}
+            {#if startedAt(j)}
+              <div><dt>started</dt><dd class="inc-when">{startedAt(j)}</dd></div>
+            {/if}
+            {#if timeOpen(j)}
+              <div><dt>open</dt><dd class="inc-age">{timeOpen(j)}</dd></div>
+            {/if}
+          </dl>
 
           <!-- The compact step-state strip: one segment per step, in
                workflow order, coloured by its status. Hover a segment
@@ -116,7 +220,7 @@
             {#each stepsOf(j) as s (s.id)}
               <span
                 class="inc-strip-step inc-strip-{s.status}"
-                title="{s.title} — {s.status}{s.assignee_id ? ` · ${s.assignee_id}` : ''}"
+                title="{s.title} — {s.status} · {holderOf(s)}"
               ></span>
             {/each}
             <span class="inc-strip-count">{doneCount(j)}/{stepsOf(j).length} steps done</span>
@@ -127,7 +231,8 @@
               Now:
               {#each workable(j) as s, i (s.id)}
                 {i > 0 ? ' · ' : ''}<strong>{s.title}</strong>
-                {s.assignee_id ? `(${s.assignee_id})` : '(unassigned)'}
+                <span class="inc-holder">({holderOf(s)})</span>
+                <span class="inc-at-step">{timeAtStep(s)}</span>
               {/each}
             </p>
           {/if}
@@ -250,6 +355,36 @@
   }
   .inc-when {
     font: 400 11px var(--font-mono);
+    color: var(--static);
+  }
+  .inc-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s1) var(--s4);
+    margin: 0;
+    font-size: 12px;
+  }
+  .inc-facts div {
+    display: flex;
+    gap: var(--s1);
+    align-items: baseline;
+  }
+  .inc-facts dt {
+    font: 400 11px var(--font-mono);
+    color: var(--static);
+  }
+  .inc-facts dd {
+    margin: 0;
+  }
+  .inc-severity {
+    color: var(--warn);
+    font-weight: 600;
+  }
+  .inc-age,
+  .inc-at-step {
+    font: 400 11px var(--font-mono);
+  }
+  .inc-at-step {
     color: var(--static);
   }
   .inc-open {

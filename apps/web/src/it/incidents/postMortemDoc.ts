@@ -1,4 +1,6 @@
-// Semi-structured rendering for incident-post-mortem packets.
+// Semi-structured rendering for incident packets — the post-mortem an
+// incident becomes once it closes. Written for incident-post-mortem,
+// folded into `incident` with it on 2026-09-24 (backlog 59d15039).
 //
 // A post-mortem's findings live in free-form Job metadata, and the
 // shape has already drifted between the live packets (incident_at /
@@ -22,7 +24,7 @@
 // bundles by design (no imports from the SPA), so the ordering is
 // deliberately duplicated there. Change one, change both.
 
-import type { Step } from '../../jobs/types';
+import type { Job, Step } from '../../jobs/types';
 
 export type DocSection = Readonly<{ key: string; label: string; body: string }>;
 
@@ -135,4 +137,82 @@ export function closedOutcome(
   if (lastCompleted) return lastCompleted.title;
   const m = job.metadata['outcome'];
   return typeof m === 'string' && m.trim() !== '' ? m : null;
+}
+
+// ---------------------------------------------------------------------
+// The active card's facts (backlog 1a242883, gap 2 of page-audit
+// 9b9849f5). The card showed a title, a `when` that was blank on every
+// live packet, no severity, no age, and "(unassigned)" for the six of
+// the incident protocol's ten steps that a ROLE holds. CLAUDE.md
+// §Diagnosis: a troubled packet must look troubled.
+// ---------------------------------------------------------------------
+
+/// A Job as the list read sends it: `opened_at` is the server's
+/// admission instant (backlog 6c2eba00), on the wire and not yet on the
+/// shared `Job` type.
+export type IncidentJob = Job & { opened_at?: string | null };
+
+const text = (v: unknown): string | null =>
+  typeof v === 'string' && v.trim() !== '' ? v : null;
+
+/// The severity the raise recorded (`metadata.severity`), or null — the
+/// card shows it beside `priority`, never an invented level.
+export function severityOf(job: IncidentJob): string | null {
+  return text(job.metadata['severity']);
+}
+
+/// When the incident started, in the order the record can answer it:
+/// `started_at` (job metadata, else the first step carrying it — the
+/// `raised` step declares it as a field), the older packets'
+/// incident_at / incident_date, then the opening. Measured on a65ba21e
+/// (2026-09-26): no started_at anywhere, so without the opening
+/// fall-backs the card's When stays blank on real packets.
+export function startedAt(job: IncidentJob): string | null {
+  const stepStart = [...(job.steps ?? [])]
+    .sort((a, b) => a.sort_order - b.sort_order)
+    .map((s) => text(s.metadata?.['started_at']))
+    .find((v) => v !== null);
+  return (
+    text(job.metadata['started_at']) ??
+    stepStart ??
+    incidentAt(job.metadata) ??
+    text(job.opened_at) ??
+    text(job.metadata['opened_at']) ??
+    text(job.opened_on)
+  );
+}
+
+/// The instant "time open" counts from: the server stamp, the metadata
+/// convention, then `opened_on` at midnight UTC. An unparseable stamp
+/// falls through rather than answering NaN.
+export function openedAtMs(job: IncidentJob): number | null {
+  const candidates = [
+    text(job.opened_at),
+    text(job.metadata['opened_at']),
+    text(job.opened_on) === null ? null : `${job.opened_on}T00:00:00Z`,
+  ];
+  const ms = candidates
+    .map((c) => (c === null ? NaN : Date.parse(c)))
+    .find((n) => !Number.isNaN(n));
+  return ms ?? null;
+}
+
+/// Who a step is waiting on: the assignee, else the role, station or
+/// department its audience names (the projected `authority_role` /
+/// `station` keys, and the `audience` block itself for a department,
+/// which projects no key yet — f5ebd2e1). "unassigned" only when the
+/// step declares none of them.
+export function holderOf(step: Step): string {
+  if (step.assignee_id) return step.assignee_id;
+  const m = step.metadata ?? {};
+  const role = text(m['authority_role']);
+  if (role) return `role ${role}`;
+  const station = text(m['station']);
+  if (station) return `station ${station}`;
+  const audience = m['audience'];
+  const dept =
+    typeof audience === 'object' && audience !== null
+      ? text((audience as Record<string, unknown>)['department'])
+      : null;
+  return dept ? `department ${dept}` : 'unassigned';
 }

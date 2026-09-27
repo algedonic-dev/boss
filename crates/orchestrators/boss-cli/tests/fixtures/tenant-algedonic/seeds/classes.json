@@ -12,7 +12,7 @@
   {"subject_kind": "employee", "code": "support-agent", "display_name": "Support agent", "member_attribute": "role", "sort_order": 11},
   {"subject_kind": "employee", "code": "drafting-agent", "display_name": "Drafting agent (marketing, proposals)", "member_attribute": "role", "sort_order": 12},
 
-  {"subject_kind": "invoice", "code": "sponsorship", "display_name": "Sponsorship", "member_attribute": "revenue_category", "sort_order": 10},
-  {"subject_kind": "invoice", "code": "support", "display_name": "Support engagement", "member_attribute": "revenue_category", "sort_order": 20},
-  {"subject_kind": "invoice", "code": "hosting", "display_name": "Hosted instance", "member_attribute": "revenue_category", "sort_order": 30}
+  {"subject_kind": "invoice", "code": "sponsorship", "display_name": "Sponsorship", "member_attribute": "revenue_category", "sort_order": 10, "metadata": {"gl_account": "4200"}},
+  {"subject_kind": "invoice", "code": "support", "display_name": "Support engagement", "member_attribute": "revenue_category", "sort_order": 20, "metadata": {"gl_account": "4300"}},
+  {"subject_kind": "invoice", "code": "hosting", "display_name": "Hosted instance", "member_attribute": "revenue_category", "sort_order": 30, "metadata": {"gl_account": "4400"}}
 ]

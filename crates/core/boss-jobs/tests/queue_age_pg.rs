@@ -38,6 +38,7 @@ fn packet(id: &str, owner: &str, title: &str) -> Job {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 8, 29).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: None,
         metadata: serde_json::json!({}),
@@ -111,7 +112,11 @@ async fn the_stamp_is_written_once_and_survives_annotation_and_claim() {
     repo.claim_step_at(
         &StepId::from_uuid(Uuid::parse_str(STEP_PROMOTED).unwrap()),
         "claude@algedonic.dev",
-        t("2026-09-02T08:00:00Z"),
+        &boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::automation("test"),
+        )
+        .with_timestamp(t("2026-09-02T08:00:00Z")),
         &[],
     )
     .await

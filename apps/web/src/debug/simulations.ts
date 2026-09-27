@@ -91,8 +91,9 @@ async function closeStep(
       assignee_id: DEBUG_OWNER,
       sort_order: sortOrder,
       blocked_by: [],
-
-      completed_on: today(),
+      // No completed_on: the server dates a step born completed from its
+      // own clock (the sim clock on a simulated instance), and refuses a
+      // body that names one (backlog f3e78bdf).
       metadata: step.metadata,
       notes: null,
     }),

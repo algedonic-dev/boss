@@ -10,9 +10,11 @@
 // (backlog cc76f755, 2026-09-18).
 //
 // WHICH PACKETS ARE THE DEPARTMENT'S is the server's question, not
-// this file's: `GET /api/jobs?department=<code>` narrows to the kinds
-// whose active workflow row declares `metadata.department = <code>`.
-// A packet carries no department; its workflow does. Before that
+// this file's: `GET /api/jobs?department=<code>` keeps the packets
+// whose own `metadata.department` is `<code>` (a retro, a page audit,
+// the items an audit files) and, for a packet naming none, those of
+// the kinds whose active workflow row declares it (backlog 481d7939,
+// `DepartmentFilter` in boss-jobs). Before that
 // parameter existed the listing ignored it and answered the
 // unfiltered count (1944 on prod), which is the reading this page
 // must never make — so the loader keeps `total` and the page reports
@@ -38,6 +40,7 @@
 
 import { fetchRemote, type Remote } from '../data/remote';
 import type { Job, Step } from '../jobs/types';
+import { lensNow, waitedText, type StepWaits } from '../jobs/queueAge';
 
 /** The OUT third is the last thirty days of departures. */
 export const OUT_WINDOW_DAYS = 30;
@@ -61,6 +64,56 @@ export function thirdOf(job: Pick<Job, 'status' | 'steps'>): Third {
     (s) => s.status === 'active' || s.status === 'completed' || s.status === 'skipped',
   );
   return moved ? 'working' : 'in';
+}
+
+/** Where a live packet stands: the titles of the steps that can be
+ *  taken now (ready or active), in the workflow's order. A terminal
+ *  packet waits on nothing, and a live one with no open step answers
+ *  '' rather than naming a step it is not at. Backlog 4d4dc204: a
+ *  payout sat at `post` for 2.6 days and the finance page could not
+ *  say so — a third says a packet is live; this says where. */
+export function waitingAt(job: Pick<Job, 'status' | 'steps'>): string {
+  return openSteps(job)
+    .map((s) => s.title || s.kind)
+    .join(' · ');
+}
+
+/** The steps a live packet stands at (ready or active), in workflow
+ *  order — none for a terminal packet. `waitingAt` names them and
+ *  `waitedFor` ages them, so the two columns line up step for step. */
+function openSteps(job: Pick<Job, 'status' | 'steps'>): ReadonlyArray<Step> {
+  if (job.status === 'closed' || job.status === 'cancelled') return [];
+  return (job.steps ?? [])
+    .filter((s) => s.status === 'ready' || s.status === 'active')
+    .slice()
+    .sort((a, b) => a.sort_order - b.sort_order);
+}
+
+/** Since when: how long each step `waitingAt` names has stood ready or
+ *  active, joined the same way. The instant is the queue-age lens's
+ *  (`jobs/queueAge.ts`), joined by step id, because the listing does
+ *  not carry it — boss-jobs port.rs keeps it "A LENS, NOT A FIELD"
+ *  (backlog 66a5d5be: the finance audit asked for "2.6 days at post"
+ *  and the page could say only "at post"). A fallback stamp prints as
+ *  `≥` — a floor; a step the lens has no row for says `unknown`; a
+ *  failed lens says `unreadable` in the cell as well as on the page's
+ *  own failure line. Never an age the lens did not give. */
+export function waitedFor(
+  job: Pick<Job, 'status' | 'steps'>,
+  waits: Remote<StepWaits>,
+  fallbackNowMs: number,
+): string {
+  const open = openSteps(job);
+  if (open.length === 0) return '';
+  if (waits.kind === 'loading') return '…';
+  if (waits.kind === 'failed') return 'unreadable';
+  const now = lensNow(waits.data, fallbackNowMs);
+  return open
+    .map((s) => {
+      const w = waits.data.byStep.get(s.id);
+      return w ? waitedText(w, now) : 'unknown';
+    })
+    .join(' · ');
 }
 
 export type Thirds = Readonly<{

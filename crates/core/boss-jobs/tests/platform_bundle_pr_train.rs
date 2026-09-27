@@ -69,6 +69,59 @@ fn the_conductors_steps_declare_the_conductor_as_their_audience() {
     }
 }
 
+/// The `cancelled` terminal is materialised as an ABORT, and that is
+/// the only reason the conductor's cancel can complete it.
+///
+/// WHY (backlog 5186c5e1). Its `ready_when` waits on the `empty`
+/// marker, which a train that boarded cars never carries — and
+/// `cancel_train` (boss-cli train/conductor.rs) completes it anyway,
+/// without the marker, after it has closed the PR and released the
+/// cars. The step API opens a Pending step by hand only where its own
+/// predicate holds (backlog 570e72bd), EXCEPT a terminal whose
+/// materialised `outcome_kind` is `aborted`, which completes from any
+/// open state. So this row, and nothing else, is what lets a cancel
+/// finish: a version without it answers the cancel 409 and the train
+/// is left half-cancelled. (The conductor now also refuses such a
+/// train before its first write; this pin keeps the protocol from
+/// becoming one.)
+#[test]
+fn the_cancelled_terminal_is_an_abort() {
+    let train = bundled("pr-train");
+    let spec = train
+        .steps
+        .iter()
+        .find(|s| s.title == "cancelled")
+        .expect("pr-train carries a `cancelled` terminal");
+    assert_eq!(
+        spec.terminal.as_ref().map(|t| t.outcome.as_str()),
+        Some("cancelled"),
+        "`cancelled` is a terminal with outcome `cancelled`"
+    );
+    assert!(
+        spec.ready_when.contains("job.metadata.empty"),
+        "precondition of this pin: the machine's own road waits on the `empty` marker, which \
+         a cancelled train that boarded cars does not carry — got {:?}",
+        spec.ready_when
+    );
+    let steps = materialize_steps(
+        &train,
+        &Subject::new("custom", "train/20260925-0222"),
+        JobId::new(),
+        &serde_json::Value::Object(Default::default()),
+        StepId::new,
+    );
+    let cancelled = steps
+        .iter()
+        .find(|s| s.spec_slug.as_deref() == Some("cancelled"))
+        .expect("`cancelled` materialised");
+    assert_eq!(
+        cancelled.metadata.get("outcome_kind"),
+        Some(&serde_json::json!("aborted")),
+        "the materialised row the step API reads says `aborted`, so the conductor's cancel \
+         completes it from any open state"
+    );
+}
+
 /// Materialised, the conductor's steps are born the conductor's: the
 /// dispatcher's assignee-already-set guard passes them over, and
 /// neither arm of the assignment query lists them for a person or an
@@ -108,4 +161,66 @@ fn a_materialised_train_is_born_the_conductors() {
             .unwrap_or_else(|| panic!("`{slug}` materialised"));
         assert_eq!(step.assignee_id, None, "`{slug}` is a marker, nobody's");
     }
+}
+
+/// A MERGED TRAIN WHOSE MERGE MAIN LOST ENDS ON EVIDENCE (backlog
+/// f9256445, design d812f1b7 D1). Train 2026-09-25 20:04 merged as
+/// c85941b4; by 20:11:14Z forge main was back at 777a5888 and no later
+/// cluster commit could ever descend from the merge, so `converged`
+/// waited for ever: `arrived` needs `converged`, and `cancelled` (closed
+/// UNMERGED, and waiting on the `empty` marker) would record something
+/// false about a PR the forge reports merged.
+///
+/// `merge-lost` is the third ending: an ABORT (the delivery did not
+/// complete, and an abort completes from any open state — so its four
+/// REQUIRED fields are its gate: nobody reaches it without the reading),
+/// ready only after `merged` and on the conductor's own marker.
+#[test]
+fn a_merge_main_lost_is_an_abort_that_carries_its_reading() {
+    let train = bundled("pr-train");
+    let spec = train
+        .steps
+        .iter()
+        .find(|s| s.title == "merge-lost")
+        .expect("pr-train carries a `merge-lost` terminal");
+    assert_eq!(spec.kind, "outcome");
+    assert_eq!(
+        spec.terminal.as_ref().map(|t| t.outcome.as_str()),
+        Some("merge-lost")
+    );
+    assert!(
+        spec.ready_when.contains("steps.merged.done")
+            && spec
+                .ready_when
+                .contains("job.metadata.merge_lost = \"true\""),
+        "only a merged train can lose its merge, and only the conductor's marker says so: {:?}",
+        spec.ready_when
+    );
+    let required: Vec<&str> = spec
+        .fields
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        required,
+        ["merge_ref", "main_at_read", "read_at", "evidence"],
+        "the four fields the arm reads are its gate"
+    );
+    let steps = materialize_steps(
+        &train,
+        &Subject::new("custom", "train/20260925-2004"),
+        JobId::new(),
+        &serde_json::Value::Object(Default::default()),
+        StepId::new,
+    );
+    let lost = steps
+        .iter()
+        .find(|s| s.spec_slug.as_deref() == Some("merge-lost"))
+        .expect("`merge-lost` materialised");
+    assert_eq!(
+        lost.metadata.get("outcome_kind"),
+        Some(&serde_json::json!("aborted"))
+    );
+    assert_eq!(lost.assignee_id, None, "a terminal is a marker, nobody's");
 }

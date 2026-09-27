@@ -77,6 +77,13 @@
     >
       <span class="sdc-title">What this step is deciding</span>
       <span class="sdc-source">{sourceLabel[resolved.source]}</span>
+      <!-- Context read from the job is no key of the step, so no passkey
+           on the step signs it; the sign-off plugin says so and this
+           panel, drawn above ApprovalSurface, now does too (backlog
+           7c53b1bf, review of car fcda5f8b). -->
+      {#if resolved.source !== 'step'}
+        <span class="sdc-unsigned">not signed</span>
+      {/if}
       <span class="sdc-toggle">{collapsed ? 'show' : 'hide'}</span>
     </button>
     {#if !collapsed}
@@ -88,10 +95,10 @@
 
 <style>
   .step-decision-context {
-    border: 1px solid var(--border, #e7e5e4);
-    border-left: 3px solid var(--accent, #2563eb);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
     border-radius: 6px;
-    background: var(--card, #fff);
+    background: var(--card);
     margin-bottom: 12px;
   }
   .sdc-head {
@@ -110,22 +117,31 @@
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .sdc-source {
     font-size: 11px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
     flex: 1 1 auto;
+  }
+  /* The plugin's step-signoff-context-unsigned, in this panel's scope. */
+  .sdc-unsigned {
+    padding: 0 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    border-radius: var(--radius);
   }
   .sdc-toggle {
     font-size: 11px;
-    color: var(--accent, #2563eb);
+    color: var(--accent);
   }
   .sdc-body {
     padding: 0 12px 10px;
     font-size: 13px;
     line-height: 1.6;
-    color: var(--text, #1c1917);
+    color: var(--text);
     word-break: break-word;
     max-height: 22em;
     overflow-y: auto;
@@ -139,14 +155,14 @@
     margin: 0 0 8px;
   }
   .sdc-body :global(pre) {
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
     padding: 8px 10px;
     border-radius: 5px;
     overflow-x: auto;
     font-size: 12px;
   }
   .sdc-body :global(code) {
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
     padding: 1px 4px;
     border-radius: 3px;
     font-size: 0.9em;
@@ -158,7 +174,7 @@
   }
   .sdc-body :global(th),
   .sdc-body :global(td) {
-    border: 1px solid var(--border, #e7e5e4);
+    border: 1px solid var(--border);
     padding: 3px 8px;
     text-align: left;
   }

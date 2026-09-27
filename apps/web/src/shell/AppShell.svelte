@@ -10,18 +10,19 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
-  import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { departmentLabel } from '@boss/web-kit/nav';
   import { departments } from '@boss/web-kit/session/departments.svelte';
   import { href, navigate } from '../router';
   import {
     ROUTE_CATALOG,
     departmentJobsPath,
+    inPerspective,
     type AppId,
     type NavItem,
     type NavGroup,
   } from './nav-catalog';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   // NavItem / NavGroup / ROUTE_CATALOG live in ./nav-catalog so both
   // this shell and App.svelte read the same registry — and so the
@@ -131,7 +132,7 @@
     finance: ['finance', 'vendors'],
     warehouse: ['warehouse', 'parts'],
     distribution: ['shipping'],
-    production: ['products', 'calendar'],
+    production: ['products'],
     maintenance: ['catalog', 'assets'],
     people: ['people'],
   };
@@ -143,40 +144,36 @@
     return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
-  // Work group is role-keyed: each role gets a tailored 3-5 item
-  // list of the surfaces they personally operate from. The same
-  // visible() filter still applies, so a brewery manifest that turns
-  // off a module hides it from Work too.
-  const WORK = $derived<NavGroup>({
+  // Work group is All jobs, for every role (backlog 0f9be7c0,
+  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
+  // each role row's `metadata.work` — but visible() drops every entry
+  // whose catalog app is not home, so of any list only `jobs` could
+  // render and a list without it left Work empty. Each department app
+  // has its own sidebar; a role's surfaces are gated there, by the
+  // row's `surfaces`, and Work here is the same filter over one row.
+  const WORK: NavGroup = {
     label: 'Work',
-    items: workForRole(role).map((r) => ROUTE_CATALOG[r]),
-  });
+    items: [ROUTE_CATALOG.jobs],
+  };
 
-  // The IT department — seven rows. Six came from the 2026-08-31
-  // consolidation (packet 1f6d55e0), which established that families
-  // live as tabs on their surface rather than as sidebar rows;
-  // auth-admin stays reachable but unlisted, and the old Run / Define /
-  // Evolve / Platform grouping died with the /system prefix.
+  // The IT department — seven rows. The 2026-08-31 consolidation
+  // (packet 1f6d55e0) established that families live as tabs on their
+  // surface rather than as sidebar rows; auth-admin stays reachable but
+  // unlisted, and the old Run / Define / Evolve / Platform grouping died
+  // with the /system prefix.
   //
-  // The seventh is the Crew Board, and it is a deliberate exception to
-  // that rule rather than a drift back from it: David's decision on
-  // backlog 04c5bbc0 (2026-09-11) read the proposal to make it a tab in
-  // an existing family and overrode it — "Port the Crew Board as a new
-  // sidebar page in IT." The middle third of the operator surface is its
-  // own question, not a sub-view of Operate's incidents.
+  // The map leads, as ONE row: "Department Map" (design e765b3fc, car
+  // N1, David 2026-09-25 — "remove the left nav bar items associated
+  // with navigating to different areas on the map and consolidate to
+  // maybe just Department Map"). Receiving Yard, Marshalling Yard, Train
+  // Yard and Crew Board stood here in flow order (55417146, 04c5bbc0);
+  // each is a station on the map now, selected there. Then the desk
+  // work.
   const IT_GROUPS: ReadonlyArray<NavGroup> = [
     {
       label: 'IT',
       items: [
-        // The three yards and the Crew Board lead, in flow order —
-        // receiving, marshalling, train yard, crew — then the desk
-        // work (design 55417146 on feedback 92921c2f, 2026-09-18).
-        // The Train Yard is third here and still the /it landing:
-        // the landing is catalog order, not this list.
-        ROUTE_CATALOG['system-receiving'],
-        ROUTE_CATALOG['system-marshalling'],
         ROUTE_CATALOG['system-yard'],
-        ROUTE_CATALOG['system-crew'],
         ROUTE_CATALOG['system-incidents'],
         ROUTE_CATALOG.workflows,
         ROUTE_CATALOG['system-design'],
@@ -187,11 +184,15 @@
     },
   ];
 
-  // Home — personal work, whichever domain it belongs to. The
-  // role-keyed Work list lives here rather than being repeated in
-  // every app: "what am I meant to be doing" is one question, and its
-  // answer crosses CRM, Operations and Finance freely.
-  const HOME_GROUPS = $derived<ReadonlyArray<NavGroup>>([
+  // Home — personal work, whichever domain it belongs to: "what am I
+  // meant to be doing" is one question, and its answer (All jobs, My
+  // Day) crosses every department freely.
+  //
+  // Mine lists Home surfaces only. It carried Exec until backlog
+  // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
+  // Exec's catalog app is executive — so it never rendered here; it is
+  // the Executive department's row, under a tab every role is offered.
+  const HOME_GROUPS: ReadonlyArray<NavGroup> = [
     WORK,
     {
       label: 'Mine',
@@ -202,10 +203,9 @@
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.views,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG.exec,
       ],
     },
-  ]);
+  ];
 
   // Every department group ends on its Jobs row — the department's in
   // / working / out over the packets whose workflow declares it
@@ -231,25 +231,17 @@
           ],
   );
 
-  // A surface is in-perspective when its catalog `app` matches the
-  // app this shell is rendering. One comparison against one field —
-  // where this used to be a MODEL_ROUTES set here that had to agree
-  // with a MODEL_KINDS set in App.svelte, keyed off a different
-  // vocabulary (RouteName vs Route['kind']).
-  function inPerspective(i: NavItem): boolean {
-    // A permKey-less NavItem (e.g. a plain sub-page link like Audit
-    // Log / Atlas) carries no app of its own — it belongs to whatever
-    // group it's placed in, so it's always in-perspective.
-    if (i.permKey === undefined) return true;
-    return (ROUTE_CATALOG[i.permKey]?.app ?? 'home') === activeApp;
-  }
-
+  // A surface is in-perspective when its own catalog `app` matches the
+  // app this shell is rendering — inPerspective in ./nav-catalog, where
+  // the test pinning every sidebar list imports it (72a88031). One
+  // comparison against one field, where this used to be a MODEL_ROUTES
+  // set here that had to agree with a MODEL_KINDS set in App.svelte.
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey, roleRow);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk && inPerspective(i);
+      return policyOk && moduleOk && inPerspective(i, activeApp);
     });
   }
 
@@ -306,7 +298,7 @@
             </div>
             {#each items as item (item.id)}
               <a
-                href={item.path}
+                href={safeLinkHref(item.path)}
                 class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
                 onclick={(e) => onLinkClick(e, item.path)}
               >
@@ -336,6 +328,13 @@
           <div class="shell-user-name">{user.name}</div>
           <div class="shell-user-role">{user.role}</div>
         </a>
+      {:else if session.value.kind === 'unresolved'}
+        <!-- Signed in, but the viewer's own people row did not answer.
+             The chrome says so on every page rather than rendering
+             nobody (backlog b4f68a65). -->
+        <p class="load-failed" role="alert" style="font-size:12px">
+          Couldn't load your employee record — {session.value.error}.
+        </p>
       {/if}
     </div>
   </aside>

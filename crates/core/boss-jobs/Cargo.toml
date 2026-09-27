@@ -50,6 +50,10 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
 async-stream = "0.3"
+# A calendar-feed token rests as its SHA-256 (scheduling/feed_token.rs,
+# backlog 4aaff4dc); both crates are already boss-core's.
+sha2 = "0.11"
+hex = "0.4"
 anyhow = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
@@ -105,7 +109,23 @@ name = "dispatcher_firings_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "yard_moves_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "estate_readers_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_a_steps_assurance_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_a_steps_plugin_version_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_finished_packets_status_does_not_move_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -117,7 +137,19 @@ name = "job_metadata_patch_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "repin_writes_the_move_whole_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "step_fields_survive_an_update"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_a_packets_protocol_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_every_list_filter_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -137,6 +169,14 @@ name = "rebuild_e2e"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_created_step_replays_at_its_plugin_version_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_step_whose_log_lost_its_plugin_version_is_corrected_once_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "restart_epoch_payroll_clear"
 required-features = ["postgres"]
 
@@ -146,6 +186,14 @@ required-features = ["postgres"]
 
 [[test]]
 name = "scheduling_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_schedule_write_asks_policy"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_calendar_token_rests_as_its_hash_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -173,7 +221,27 @@ name = "step_metadata_patch_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_stale_step_write_erases_nothing_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "an_active_step_keeps_its_holder_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_stale_step_write_is_judged_on_the_whole_row_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "step_claim_admits_an_aliased_holder_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_claim_for_takes_a_ready_step_from_its_executor_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_claim_clears_the_run_edge_when_the_holder_changes_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -213,6 +281,18 @@ name = "a_day_of_jobs_lists_newest_first_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_set_of_packets_reads_in_one_query_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_priority_filter_narrows_the_list_in_postgres_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_jobs_summary_counts_under_the_callers_scope_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "a_node_declares_its_roles_pg"
 required-features = ["postgres"]
 
@@ -237,6 +317,18 @@ name = "rebuild_reproduces_the_partition_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_stamp_dies_when_the_shape_it_signed_leaves_the_step_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_presence_ticket_stamps_its_step_once_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_sign_off_stamp_survives_a_rebuild_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "no_orphan_steps_pg"
 required-features = ["postgres"]
 
@@ -245,11 +337,19 @@ name = "surface_opens_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "tenant_publishes_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "sensors_pg"
 required-features = ["postgres"]
 
 [[test]]
 name = "department_readiness_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "departments_are_published_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -290,4 +390,16 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_inbox_outlives_the_session_that_filled_it_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_rebuild_recovers_the_admission_instant_from_the_log_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_health_reads_the_schema_ledger_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_workflow_version_number_is_never_reused_pg"
 required-features = ["postgres"]

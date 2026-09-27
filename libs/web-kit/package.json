@@ -8,6 +8,7 @@
     "./session/*": "./src/session/*",
     "./nav": "./src/nav.ts",
     "./markdown": "./src/markdown.ts",
+    "./links": "./src/links.ts",
     "./sim-clock": "./src/sim-clock.svelte.ts",
     "./sim-clock-types": "./src/sim-clock-types.ts",
     "./SystemTime.svelte": "./src/SystemTime.svelte",
@@ -19,6 +20,6 @@
     "svelte": "^5.55.9"
   },
   "scripts": {
-    "test:unit": "bun test src/"
+    "test:unit": "bun ../../apps/web/scripts/each-test-file-alone.ts src"
   }
 }

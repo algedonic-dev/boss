@@ -171,7 +171,7 @@ say "checkout $REPO at ${HEAD:0:12} — $MODE (packet ${OPS_REQUEST_ID:-none}, a
 # Signed: an unauthenticated read is handed a smaller world (total: 0)
 # rather than an error, so an empty listing below is a failed read and
 # never "no train has landed".
-TRAINS_URL="$BOSS_JOBS_URL/api/jobs?kind=pr-train&limit=40"
+TRAINS_URL="$BOSS_JOBS_URL/api/jobs?kind=pr-train&limit=40&full=true"
 if ! curl -fsS --max-time 20 -H "x-boss-user: $BOSS_USER" \
         ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
         "$TRAINS_URL" > "$TMP/trains.json" 2>"$TMP/curl.err"; then

@@ -12,6 +12,7 @@
 //      Retry restores the real surface without a reload.
 
 import { expect, test, type Page, type Route } from '@playwright/test';
+import { servePeopleRows } from './_smokeMocks';
 
 const JOB_ID = 'job-swf-1';
 
@@ -51,6 +52,7 @@ async function baseMocks(page: Page, steps: MockStep[], stepTypes: StepTypeRow[]
   };
   await page.route('**/api/**', (r) => json(r, []));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP, EMP2]));
+  await servePeopleRows(page, [EMP, EMP2]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
   await page.route(/\/api\/jobs\/live$/, (r) =>
@@ -111,6 +113,13 @@ test('a rejected approval decision aborts the chain: inline error, no completion
   });
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1$`), (r) => {
     putBodies.push(JSON.parse(r.request().postData() ?? '{}') as Record<string, unknown>);
+    return json(r, steps[0]);
+  });
+  // The decision is metadata, so it goes through the step merge door
+  // (backlog e39a9d2a) — and that is the write refused here.
+  const mergeBodies: Record<string, unknown>[] = [];
+  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1/metadata$`), (r) => {
+    mergeBodies.push(JSON.parse(r.request().postData() ?? '{}') as Record<string, unknown>);
     return json(r, { error: 'decision refused by policy' }, 400);
   });
 
@@ -121,8 +130,9 @@ test('a rejected approval decision aborts the chain: inline error, no completion
   await expect(surface.locator('.step-write-error')).toContainText('decision refused by policy');
   // The rejected decision must not be stamped or completed on top of.
   expect(stampPosts).toBe(0);
-  expect(putBodies.filter((b) => b['status'] === 'completed').length).toBe(0);
-  expect(putBodies.length).toBe(1);
+  expect(putBodies.length).toBe(0);
+  expect(mergeBodies.length).toBe(1);
+  expect(mergeBodies[0]['decision']).toBe('approved');
   // No phantom "Decision: approved" — the choice is still open.
   await expect(surface.getByRole('button', { name: 'Approve' })).toBeVisible();
 });

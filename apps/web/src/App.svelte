@@ -2,17 +2,19 @@
   // Root component — parses the URL, dispatches to the matched
   // page inside AppShell.
   //
-  // Phase 1 wires /me, /jobs, /jobs/:id, /service, /sales,
-  // /assets, /assets/:id. Unmatched URLs fall back to My Day
-  // (same as the React app's default).
+  // An unmatched URL renders the not-found page, naming the path
+  // (design ee3a3a2f) — never a page it did not ask for.
 
   import { onMount } from 'svelte';
-  import { parseRoute, type Route } from './router';
+  import { href, notFoundBack, parseRoute, type Route } from './router';
+  import NotFound from '@boss/web-kit/ui/NotFound.svelte';
+  import { JOBS_DEFAULT_STATUS } from './jobs/filterQuery';
   import { goToLogin } from '@boss/web-kit/session/deadSession';
   import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
+  import { flights, loadFlights } from '@boss/web-kit/session/flights.svelte';
   import { loadDepartments, departments } from '@boss/web-kit/session/departments.svelte';
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
@@ -63,15 +65,12 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import MapPage from './it/yard/MapPage.svelte';
-  import YardStatusPage from './it/yard/YardStatusPage.svelte';
-  import CrewBoardPage from './it/crew/CrewBoardPage.svelte';
   import EstatePage from './it/estate/EstatePage.svelte';
   import FleetPage from './it/monitoring/FleetPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
-  import CalendarPage from './calendar/CalendarPage.svelte';
   import MyCalendarPage from './calendar/MyCalendarPage.svelte';
   import SchedulePage from './schedule/SchedulePage.svelte';
   import ExecPage from './exec/ExecPage.svelte';
@@ -84,7 +83,6 @@
   import WorkflowsPage from './kb/WorkflowsPage.svelte';
   import PerfPage from './it/monitoring/PerfPage.svelte';
   import EventsPage from './it/monitoring/EventsPage.svelte';
-  import ConductorPage from './it/monitoring/ConductorPage.svelte';
   import PoPage from './po/PoPage.svelte';
   import VendorInvoicePage from './po/VendorInvoicePage.svelte';
   import WatchlistPage from './accounts/WatchlistPage.svelte';
@@ -93,17 +91,16 @@
   import LandingPage from './landing/LandingPage.svelte';
   import SearchResultsPage from './search/SearchResultsPage.svelte';
   import ViewsPage from './views/ViewsPage.svelte';
-  import FeedbackTriagePage from './it/feedback/FeedbackTriagePage.svelte';
-  import BacklogBoardPage from './it/backlog/BacklogBoardPage.svelte';
   import CodebaseTrendPage from './it/metrics/CodebaseTrendPage.svelte';
   import ProtocolDriftPage from './it/registry/ProtocolDriftPage.svelte';
+  import AgentsPage from './it/agents/AgentsPage.svelte';
   import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
-  let route = $state<Route>(parseRoute(window.location.pathname));
+  let route = $state<Route>(parseRoute(window.location.pathname, window.location.search));
 
   // Which surfaces get opened (backlog 628f182b): one POST per
   // client-side navigation, the route PATTERN and the time, the actor
@@ -185,11 +182,16 @@
   onMount(() => {
     loadSession();
     loadManifest();
+    // THE VIEWER'S FLIGHTS (design c4c2a607). The gateway inlines them
+    // into index.html, so a page it served already knows; a page it did
+    // not (the dev server, a gateway whose flights read failed) asks the
+    // same endpoint once. A failed read leaves every flight off.
+    if (flights.on === null) void loadFlights();
     loadStepTypeRegistry();
     loadClasses('employee');
     loadDepartments();
     const onPop = () => {
-      route = parseRoute(window.location.pathname);
+      route = parseRoute(window.location.pathname, window.location.search);
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -254,16 +256,24 @@
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}
       <LandingPage />
+    {:else if route.kind === 'notFound'}
+      <!-- An unmatched path says so, and names the path (design
+           ee3a3a2f). Rendered in place, inside the chrome of the
+           department it was under, with one door back into it. It
+           rendered the landing page (or, under /it, the yard) until
+           then, so a dead link looked like a working one that went
+           elsewhere (backlog c4f2ae24). -->
+      {@const back = notFoundBack(route.path)}
+      <div class="theme-exec">
+        <NotFound eyebrow="Not found" title="No page at this address" backHref={href(back.href)} backLabel={back.label}>
+          Nothing in this app answers <code>{route.path}</code>. The link that brought you here is out of date or
+          mistyped.
+        </NotFound>
+      </div>
     {:else if route.kind === 'search'}
       <SearchResultsPage q={route.q} />
     {:else if route.kind === 'views'}
       <ViewsPage />
-    {:else if route.kind === 'systemFeedback'}
-      <ItTabs group="design" active="/it/design/feedback" />
-      <FeedbackTriagePage />
-    {:else if route.kind === 'systemBacklog'}
-      <ItTabs group="design" active="/it/design/backlog" />
-      <BacklogBoardPage />
     {:else if route.kind === 'systemCodebase'}
       <!-- No ItTabs: the Codebase is its own sidebar row since feedback
            9827c699 (David, 2026-09-14), not a tab on Design. -->
@@ -273,17 +283,27 @@
     {:else if route.kind === 'me'}
       <MePage />
     {:else if route.kind === 'jobs'}
-      <JobsListPage
-        initialKind={route.workflow ?? ''}
-        initialKindPrefix={route.workflowPrefix ?? ''}
-        initialStatus={route.jobStatus ?? 'open'}
-        initialOwnerId={route.jobOwnerId ?? ''}
-        initialSubjectKind={route.jobSubjectKind ?? ''}
-        initialSubjectId={route.jobSubjectId ?? ''}
-        initialNewJobOpen={route.newJobOpen ?? false}
-        initialNewJobSubjectKind={route.newJobSubjectKind ?? ''}
-        initialNewJobSubjectId={route.newJobSubjectId ?? ''}
-      />
+      <!-- Keyed on the route, as Finance is: the page takes its filters
+           from these props once, at mount, so a navigation to /ux/jobs?…
+           while it is up (a custom Subject's own packets, a sidebar link)
+           changed the URL and left the page on the filters it had — no
+           read, an empty Subject id box, every row (backlog d0b93b80).
+           The page's own filter writes replaceState and never re-parse
+           the route, so typing does not remount it. -->
+      {#key route}
+        <JobsListPage
+          initialKind={route.workflow ?? ''}
+          initialKindPrefix={route.workflowPrefix ?? ''}
+          initialStatus={route.jobStatus ?? JOBS_DEFAULT_STATUS}
+          initialOwnerId={route.jobOwnerId ?? ''}
+          initialSubjectId={route.jobSubjectId ?? ''}
+          initialNewJobOpen={route.newJobOpen ?? false}
+          initialNewJobKind={route.newJobKind ?? ''}
+          initialNewJobSubjectKind={route.newJobSubjectKind ?? ''}
+          initialNewJobSubjectId={route.newJobSubjectId ?? ''}
+          writesFiltersToUrl
+        />
+      {/key}
     {:else if route.kind === 'jobDetail'}
       <JobDetailPage jobId={route.jobId} />
     {:else if route.kind === 'service'}
@@ -327,11 +347,13 @@
     {:else if route.kind === 'employee'}
       <EmployeePage empId={route.empId} />
     {:else if route.kind === 'parts'}
-      <PartsList />
+      <!-- The warehouse's packets beside its stock, by the catalog
+           entry's department like the two queues above (044dffa1). -->
+      <PartsList department={ROUTE_CATALOG.parts.department ?? ''} />
     {:else if route.kind === 'part'}
       <PartPage partSku={route.partSku} />
     {:else if route.kind === 'products'}
-      <ProductsList />
+      <ProductsList initialQuery={route.q} />
     {:else if route.kind === 'product'}
       <ProductPage sku={route.productSku} />
     {:else if route.kind === 'shipping'}
@@ -341,7 +363,13 @@
     {:else if route.kind === 'support'}
       <SupportPage />
     {:else if route.kind === 'finance'}
-      <FinancePage />
+      <!-- Keyed on the route, so a navigation to /ux/finance?… while the
+           page is up (the sidebar's Finance link, a ledger-entry link)
+           mounts what the link names; the page's own tab clicks
+           replaceState and never re-parse the route (2ab44d55). -->
+      {#key route}
+        <FinancePage view={route.view} department={ROUTE_CATALOG.finance.department ?? ''} />
+      {/key}
     {:else if route.kind === 'newInvoice'}
       <NewInvoicePage />
     {:else if route.kind === 'newJournalEntry'}
@@ -373,29 +401,18 @@
     {:else if route.kind === 'systemDesign'}
       <ItTabs group="design" active="/it/design" />
       <DesignReviewPage />
-    {:else if route.kind === 'systemYard' || route.kind === 'systemYardFloor'}
-      <!-- THE WORLD, and a floor is the SAME world zoomed into that
-           territory (design d2154293, car 3; the map itself is
-           0524fc95 car 2). ONE branch for both routes on purpose: two
-           `{:else if}` arms are two blocks to Svelte, so moving between
-           them tears the SVG down and builds another — the camera is
-           lost and the zoom reads as a page change, which is the thing
-           this car removed. Measured: the mocked spec holds a handle to
-           the SVG node across the click and it came back detached.
-           MapPage keys the floor's panels itself. -->
-      <MapPage region={route.kind === 'systemYardFloor' ? route.region : null} />
-    {:else if route.kind === 'systemCrew'}
-      <!-- No ItTabs: the Crew Board is its own sidebar row, not a tab on
-           an existing family (backlog 04c5bbc0, David 2026-09-11). -->
-      <CrewBoardPage />
+    {:else if route.kind === 'systemYard'}
+      <!-- THE DEPARTMENT MAP (design e765b3fc): the map on top and the
+           selection's panel below it. A selection is a query on this one
+           route, so the map is mounted once and never torn down by a
+           click — the floor pages that were a second route here retired
+           with car N3, their content in the panels. -->
+      <MapPage at={route.at} />
     {:else if route.kind === 'systemEstate'}
       <EstatePage />
     {:else if route.kind === 'systemFleet'}
       <ItTabs group="operate" active="/it/operate/bottlenecks" />
       <FleetPage />
-    {:else if route.kind === 'systemYardStatus'}
-      <ItTabs group="operate" active="/it/operate/yard-status" />
-      <YardStatusPage />
     {:else if route.kind === 'experiments'}
       <ItTabs group="design" active="/it/design/experiments" />
       <ExperimentsPage />
@@ -403,6 +420,7 @@
       <ItTabs group="registry" active="/it/registry/dispatcher" />
       <DispatcherCascadePage />
     {:else if route.kind === 'dispatcherRulesList'}
+      <ItTabs group="registry" active="/it/registry/rules" />
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
@@ -412,10 +430,11 @@
     {:else if route.kind === 'systemRegistryDrift'}
       <ItTabs group="registry" active="/it/registry/drift" />
       <ProtocolDriftPage />
+    {:else if route.kind === 'systemAgents'}
+      <ItTabs group="registry" active="/it/registry/agents" />
+      <AgentsPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
-    {:else if route.kind === 'calendar'}
-      <CalendarPage />
     {:else if route.kind === 'myCalendar'}
       <MyCalendarPage />
     {:else if route.kind === 'schedule'}
@@ -448,9 +467,6 @@
     {:else if route.kind === 'systemMonitoringAtlas'}
       <ItTabs group="operate" active="/it/operate/atlas" />
       <AtlasPage />
-    {:else if route.kind === 'systemMonitoringConductor'}
-      <ItTabs group="operate" active="/it/operate/conductor" />
-      <ConductorPage />
     {:else if route.kind === 'po'}
       <PoPage poId={route.poId} />
     {:else if route.kind === 'vendorInvoice'}

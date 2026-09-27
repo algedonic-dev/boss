@@ -418,11 +418,28 @@ async fn settle_one(
     }
     let on = settled_on.unwrap_or_else(|| stamp.timestamp.date_naive());
 
-    let settled = crate::bank_settlements::mark_settled(pool, id, on)
-        .await
-        .map_err(SettleFailure::Ledger)?;
-
+    // The flip, the fact, its journal entry and the event are ONE
+    // transaction (backlog 016a2763): the flip used to commit on the
+    // pool first, so a refused post (a locked period) or a crash left a
+    // `settled` row with nothing in the log behind it.
     let mut tx = pool.begin().await.map_err(SettleFailure::Storage)?;
+
+    let Some(settled) = crate::bank_settlements::mark_settled_in_tx(&mut tx, id, on)
+        .await
+        .map_err(SettleFailure::Ledger)?
+    else {
+        // A concurrent settle flipped it between the read above and
+        // this UPDATE: that call records the fact and the event, and
+        // this one records nothing.
+        let _ = tx.rollback().await;
+        return match crate::bank_settlements::get(pool, id)
+            .await
+            .map_err(SettleFailure::Ledger)?
+        {
+            Some(current) => Err(SettleFailure::AlreadyFinal(current.status)),
+            None => Err(SettleFailure::NotFound),
+        };
+    };
 
     let payload = serde_json::json!({
         "invoice_id": settled.invoice_id,

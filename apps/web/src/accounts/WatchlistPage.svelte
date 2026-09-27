@@ -7,7 +7,15 @@
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
+  import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
+  import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import type { Account } from './types';
+  import { fetchAccountsPage } from './api';
+  import { isCapped, type Paged } from '../data/paginated';
+  import { loadingRead, readStateOf, type ReadState } from '../data/readState';
+  import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { tierAdmits, tierBuckets, type TierFilter } from './tiers';
 
   type RiskFactors = {
     days_since_last_invoice: number | null;
@@ -30,32 +38,56 @@
     | 'days_since_last_invoice'
     | 'open_ticket_count'
     | 'days_since_last_note';
-  type SortDir = 'asc' | 'desc';
-  type Tier = 'all' | 'platinum' | 'gold' | 'silver';
   type Bucket = 'all' | 'high' | 'mid' | 'low';
 
   type LoadState =
     | { kind: 'loading' }
     | { kind: 'error'; message: string }
-    | { kind: 'ready'; scores: ReadonlyArray<RiskScore> };
+    | { kind: 'denied' }
+    | { kind: 'ready'; scores: ReadonlyArray<RiskScore>; totalScored: number };
 
   let loadState: LoadState = $state<LoadState>({ kind: 'loading' });
   let accounts = $state<Account[]>([]);
+  // The accounts directory is the ONLY source of each row's tier and
+  // city, so its outcome is kept beside the rows (backlog 3122f14a;
+  // page audit 08b0c4f8 GAP 7, 2026-09-23). It was read as "names
+  // only" and a failure was dropped: every tier then read unknown, any
+  // Tier button but All emptied the table under "No accounts match
+  // those filters.", and a city search missed — all without a word.
+  let directoryRead = $state<ReadState>(loadingRead);
+  let directoryPage = $state<Paged<Account> | null>(null);
 
   let query = $state('');
-  let tier = $state<Tier>('all');
+  let tier = $state<TierFilter>({ kind: 'all' });
   let bucket = $state<Bucket>('all');
-  let sortKey = $state<SortKey>('score');
-  let sortDir = $state<SortDir>('desc');
+  // The shared sort (libs/web-kit sort.ts) was extracted FROM this
+  // page's hand-rolled sortKey / sortDir / setSort / arrowFor and never
+  // adopted back, so its headers stayed `<th onclick>` with no tabindex
+  // or key handling and a keyboard could not sort (backlog 8c5664ea;
+  // page audit 08b0c4f8 GAP 13). SortHeader carries tabindex,
+  // Enter/Space and aria-sort; the order is unchanged — a name opens
+  // A to Z, a number largest first, and a null sorts below every value.
+  const sort = createSortState<SortKey>({ key: 'score', dir: 'desc' }, (k) =>
+    k === 'name' ? 'asc' : 'desc',
+  );
 
   $effect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [rResp, pResp] = await Promise.all([
+        const [rResp, pPaged] = await Promise.all([
           fetch('/api/people/accounts/risk-scores?limit=200&min_score=0'),
-          fetch('/api/people/accounts'),
+          fetchAccountsPage(),
         ]);
+        // A REFUSAL IS NOT AN EMPTY WATCHLIST. The server answers a
+        // role without broad account access 403 (it used to answer
+        // `200 {accounts: []}`, painted as "No accounts match those
+        // filters." — backlog 3f0cdca8, page audit 08b0c4f8 GAP 5), so
+        // the page says it may not show this rather than nothing at risk.
+        if (rResp.status === 403) {
+          if (!cancelled) loadState = { kind: 'denied' };
+          return;
+        }
         if (!rResp.ok) throw new Error(`${rResp.status}`);
         // PARSE, DO NOT CAST. This read `(await rResp.json()) as {
         // accounts: RiskScore[] }`, which the compiler trusts and the
@@ -70,11 +102,27 @@
         // a confident, wrong answer, which is worse than saying so.
         const parsed = RiskScoreListSchema.safeParse(await rResp.json());
         if (!parsed.success) throw new Error('unexpected risk-score payload');
-        if (!cancelled)
-          loadState = { kind: 'ready', scores: parsed.data.accounts as RiskScore[] };
-        if (pResp.ok) {
-          const pBody = await pResp.json();
-          if (!cancelled) accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
+        // NO CAST. `as RiskScore[]` let an optional `factors` in the
+        // schema meet an unguarded `s.factors.*` below and compile
+        // (backlog 4b981df2); without it, the schema must produce the
+        // RiskScore this page reads, or svelte-check refuses.
+        if (!cancelled) {
+          loadState = {
+            kind: 'ready',
+            scores: parsed.data.accounts,
+            totalScored: parsed.data.total_scored,
+          };
+        }
+        // A failed directory read does not fail the page — the scores
+        // are its own read and they answered — but it is SAID, and the
+        // filters that need it stand down (below). A capped one is said
+        // too: tier and city are known only for the accounts it held.
+        if (!cancelled) {
+          directoryRead = readStateOf(pPaged);
+          if (pPaged.kind === 'ready') {
+            accounts = [...pPaged.page.data];
+            directoryPage = pPaged.page;
+          }
         }
       } catch (e) {
         if (!cancelled) loadState = { kind: 'error', message: String(e) };
@@ -96,12 +144,6 @@
     if (score >= 25) return 'mid';
     return 'low';
   }
-  function nullableCompare(a: number | null, b: number | null): number {
-    if (a === null && b === null) return 0;
-    if (a === null) return -1;
-    if (b === null) return 1;
-    return a - b;
-  }
   function formatDays(d: number | null): string {
     return d === null ? '—' : `${d}d`;
   }
@@ -109,12 +151,17 @@
   let rows = $derived(
     loadState.kind === 'ready' ? loadState.scores : [],
   );
+  // THE COUNT IS THE SERVER'S, NOT THE PAGE'S. The subtitle said
+  // `rows.length` accounts scored, and the read is capped at 200: a
+  // 200-row page read as 200 scored whatever the true number (backlog
+  // 9269d612; page audit 08b0c4f8 GAP 8). `total_scored` is counted
+  // before the server's limit, so a page short of it is said to be one.
+  let totalScored = $derived(loadState.kind === 'ready' ? loadState.totalScored : 0);
 
   let filtered = $derived(
     rows.filter((r) => {
       const account = accountById.get(r.account_id);
-      const accountTier = account?.tier;
-      if (tier !== 'all' && accountTier !== tier) return false;
+      if (!tierAdmits(tier, account ? account.tier : undefined)) return false;
       if (bucket !== 'all' && scoreTone(r.score) !== bucket) return false;
       if (query) {
         const q = query.toLowerCase();
@@ -125,53 +172,45 @@
     }),
   );
 
-  let sorted = $derived.by(() => {
-    const mult = sortDir === 'asc' ? 1 : -1;
-    return [...filtered].sort((a, b) => {
-      switch (sortKey) {
-        case 'name':
-          return mult * a.account_name.localeCompare(b.account_name);
-        case 'score':
-          return mult * (a.score - b.score);
-        case 'open_ticket_count':
-          return mult * (a.factors.open_ticket_count - b.factors.open_ticket_count);
-        case 'days_since_last_invoice':
-          return (
-            mult *
-            nullableCompare(
-              a.factors.days_since_last_invoice,
-              b.factors.days_since_last_invoice,
-            )
-          );
-        case 'days_since_last_note':
-          return (
-            mult *
-            nullableCompare(
-              a.factors.days_since_last_note,
-              b.factors.days_since_last_note,
-            )
-          );
-      }
-    });
+  let sorted = $derived(
+    sort.sorted(filtered, {
+      name: (r) => r.account_name,
+      score: (r) => r.score,
+      days_since_last_invoice: (r) => r.factors.days_since_last_invoice,
+      open_ticket_count: (r) => r.factors.open_ticket_count,
+      days_since_last_note: (r) => r.factors.days_since_last_note,
+    }),
+  );
+
+  // The Tier buttons come from the (account, tier) Classes, plus No
+  // tier when an account has none (backlog 1be37454; page audit
+  // 08b0c4f8 GAP 11). A hand-written Platinum / Gold / Silver trio hid
+  // any tier a tenant added, and left the untiered account reachable
+  // only under All. Counted over the scored rows whose account the
+  // directory returned — a row it did not return has an unknown tier,
+  // not an absent one, so it counts under All alone.
+  $effect(() => {
+    void loadClasses('account');
   });
+  let tierButtons = $derived(
+    tierBuckets(
+      rows.flatMap((r) => {
+        const a = accountById.get(r.account_id);
+        return a ? [a.tier] : [];
+      }),
+      classesFor('account', 'tier'),
+    ),
+  );
+
+  // With the directory dark every tier is unknown, so a Tier button
+  // could only empty the table and the city is not there to search:
+  // the filter keeps All alone and the search stops offering the city.
+  let directoryFailed = $derived(directoryRead.kind === 'failed');
 
   function bucketCount(b: Exclude<Bucket, 'all'>): number {
     return rows.filter((r) => scoreTone(r.score) === b).length;
   }
 
-  function setSort(k: SortKey): void {
-    if (k === sortKey) {
-      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-    } else {
-      sortKey = k;
-      sortDir = k === 'name' ? 'asc' : 'desc';
-    }
-  }
-
-  function arrowFor(k: SortKey): string {
-    if (sortKey !== k) return '';
-    return sortDir === 'asc' ? ' ↑' : ' ↓';
-  }
 </script>
 
 {#if loadState.kind === 'loading'}
@@ -181,20 +220,52 @@
 {:else if loadState.kind === 'error'}
   <div class="catalog theme-exec">
     <PageHeader eyebrow="Churn watchlist" title="Couldn't load watchlist" />
-    <p class="empty">{loadState.message}</p>
+    <!-- The shared failure marker (sweep c3e4edcc, backlog 94d5d2d2). -->
+    <p class="empty load-failed" role="alert">{loadState.message}</p>
+  </div>
+{:else if loadState.kind === 'denied'}
+  <div class="catalog theme-exec">
+    <PageHeader eyebrow="Churn watchlist" title="Not shown to your role" />
+    <p class="empty">
+      The churn watchlist carries financial and churn signals for every account, so it is shown
+      only to roles with broad account access. This says nothing about whether any account is at
+      risk.
+    </p>
   </div>
 {:else}
   <div class="catalog theme-exec">
     <PageHeader
       eyebrow="Customers"
       title="Churn watchlist"
-      subtitle={`${rows.length} accounts scored · ${filtered.length} shown`}
+      subtitle={`${totalScored} accounts scored · ${filtered.length} shown`}
     />
+
+    {#if totalScored > rows.length}
+      <OverflowBanner
+        showing={rows.length}
+        total={totalScored}
+        noun="scored accounts"
+        hint="The highest scores come first; the buckets, tiers and search cover only these."
+      />
+    {/if}
+
+    {#if isCapped(directoryPage)}
+      <OverflowBanner
+        showing={accounts.length}
+        total={directoryPage!.total}
+        noun="accounts in the directory"
+        hint="Tier and city are known only for those: a scored account past them shows under All alone, and its city is not searched."
+      />
+    {/if}
 
     <div class="catalog-layout">
       <aside class="catalog-filters">
         <FilterGroup label="Search">
-            <SearchInput bind:value={query} placeholder="Account, factor, city…" />
+            <SearchInput
+              bind:value={query}
+              placeholder={directoryFailed ? 'Account, factor…' : 'Account, factor, city…'}
+              label="Search the watchlist"
+            />
         </FilterGroup>
 
         <FilterGroup label="Risk bucket">
@@ -213,61 +284,57 @@
         </FilterGroup>
 
         <FilterGroup label="Tier">
-            <FilterButton active={tier === 'all'} onclick={() => (tier = 'all')}>
+            <FilterButton active={tier.kind === 'all'} onclick={() => (tier = { kind: 'all' })}>
               All
             </FilterButton>
-            <FilterButton active={tier === 'platinum'} onclick={() => (tier = 'platinum')}>
-              Platinum
-            </FilterButton>
-            <FilterButton active={tier === 'gold'} onclick={() => (tier = 'gold')}>
-              Gold
-            </FilterButton>
-            <FilterButton active={tier === 'silver'} onclick={() => (tier = 'silver')}>
-              Silver
-            </FilterButton>
+            {#if directoryFailed}
+              <p class="empty">Tiers unknown — the accounts directory did not load.</p>
+            {:else}
+              {#each tierButtons as b (b.code ?? '')}
+                <FilterButton
+                  active={tier.kind === 'code' && tier.code === b.code}
+                  onclick={() => (tier = { kind: 'code', code: b.code })}
+                >
+                  {b.label} ({b.count})
+                </FilterButton>
+              {/each}
+            {/if}
         </FilterGroup>
       </aside>
 
       <section class="list-section">
-        {#if sorted.length === 0}
+        {#if directoryRead.kind === 'failed'}
+          <p class="empty load-failed" role="alert">
+            Couldn't load the accounts directory — {directoryRead.error}. Tier and city are unknown:
+            the Tier filter shows All alone and search matches account and factor only.
+          </p>
+        {/if}
+        {#if rows.length === 0}
+          <!-- Nothing scored is not a filter's doing: with no rows there
+               is nothing a filter could hide, and "No accounts match
+               those filters." blamed the operator's filters for an empty
+               source (backlog 9289e682; page audit 08b0c4f8 GAP 6 — the
+               live render on 2026-09-23, every filter at All). -->
+          <p class="empty">
+            No accounts have been scored yet — the churn-risk model has written no predictions.
+          </p>
+        {:else if sorted.length === 0}
           <p class="empty">No accounts match those filters.</p>
         {:else}
           <table class="data-table data-table-striped risk-table">
             <thead>
               <tr>
-                <th style="cursor:pointer; user-select:none" onclick={() => setSort('name')}>
-                  Account{arrowFor('name')}
-                </th>
-                <th
-                  class="num"
-                  style="cursor:pointer; user-select:none"
-                  onclick={() => setSort('score')}
-                >
-                  Score{arrowFor('score')}
-                </th>
+                <SortHeader {sort} key="name">Account</SortHeader>
+                <SortHeader {sort} key="score" num={true}>Score</SortHeader>
                 <th>Top factor</th>
-                <th
-                  class="num"
-                  style="cursor:pointer; user-select:none"
-                  onclick={() => setSort('days_since_last_invoice')}
-                >
-                  Days since invoice{arrowFor('days_since_last_invoice')}
-                </th>
-                <th
-                  class="num"
-                  style="cursor:pointer; user-select:none"
-                  onclick={() => setSort('open_ticket_count')}
-                >
-                  Open SRs{arrowFor('open_ticket_count')}
-                </th>
+                <SortHeader {sort} key="days_since_last_invoice" num={true}>
+                  Days since invoice
+                </SortHeader>
+                <SortHeader {sort} key="open_ticket_count" num={true}>Open SRs</SortHeader>
                 <th>Contract</th>
-                <th
-                  class="num"
-                  style="cursor:pointer; user-select:none"
-                  onclick={() => setSort('days_since_last_note')}
-                >
-                  Days since contact{arrowFor('days_since_last_note')}
-                </th>
+                <SortHeader {sort} key="days_since_last_note" num={true}>
+                  Days since contact
+                </SortHeader>
               </tr>
             </thead>
             <tbody>

@@ -44,14 +44,24 @@
 //!    an agent spends, naming the first path, its tier and the level.
 //!    A packet declaring no paths is admitted here; the gate decides
 //!    on the diff. An instance declaring no level enforces nothing.
+//!    THE VENUE DOOR follows the block (backlog 10b07b73; the tenant
+//!    lane, 6a34e9bc): a packet whose `metadata.tenant_repo` names a
+//!    repo an instance serves is briefed as the tenant builder when its
+//!    block names a `car`-lane profile — whose worktree, gate and probe
+//!    are all this tree's — and a repo no instance serves is refused
+//!    ([`venue`]). That run ends `delivered`, and `--report` lands it
+//!    only on the copied `boss tenant check` PASS
+//!    ([`tenant_receipt_verdict`]).
 //! 3. Claims the step as the actor running the verb (`BOSS_ACTOR`;
 //!    unnamed, the claim is refused before anything is filed) through
 //!    the claim door — a Ready→Active compare-and-set that answers 409
 //!    with the holder, so two operators dispatching one step is a
 //!    refusal naming the other, not two runs.
-//! 4. Files the `agent-run` packet with the settings, the actor, the
-//!    worktree and the host on it, and the rendered brief as `brief`
-//!    — the record of what the agent was told.
+//! 4. Files the `agent-run` packet with the settings, the actor and
+//!    the host on it, and the rendered brief as `brief` — the record
+//!    of what the agent was told. Not the worktree: this verb's cwd is
+//!    the dispatcher's, and the builder's own gate stamps the real one
+//!    (backlog a3355e14).
 //! 5. Prints the EXACT prompt: `boss brief`'s rendering (the packet,
 //!    the invariants, the rules document for the profile) and the run
 //!    id — what the operator pastes into the Agent tool today and what
@@ -102,6 +112,11 @@
 //! there stands, and one carrying a different count is refused naming
 //! both figures, rather than printing the held row's price as though
 //! it were this command's answer ([`record_line`], backlog b4fd594e).
+//! And once the run is GREEN, the report frees its worktree's cargo
+//! target on the dev pod scratch, recording the bytes on the run as
+//! `scratch_target` ([`crate::scratch_target`], backlog 4e17c49d); a run
+//! that is not green keeps it for the rescue, and a target the gate's
+//! waiter already freed at the green keeps that record (a3355e14).
 
 use anyhow::{Context, Result, bail};
 use boss_jobs::agent_runs::{PricingBasis, TokenUsage};
@@ -134,16 +149,17 @@ pub(crate) struct Overrides {
 }
 
 /// The block as car 1 projects it onto a materialised step: four
-/// plain keys, all present or the step declares none.
+/// plain keys, all present or the step declares none — read by
+/// `boss_jobs::agent_spec::projected`, the reader the station queue
+/// and the claim door also use (backlog 51aef4dd), so what counts as
+/// "carries a projection" is decided once.
 pub(crate) fn block_on_step(step: &Value) -> Option<Settings> {
-    use boss_jobs::agent_spec::{BUDGET_KEY, EFFORT_KEY, MODEL_KEY, PROFILE_KEY};
-    let md = step.get("metadata")?;
-    let text = |k: &str| md.get(k).and_then(Value::as_str).map(str::to_string);
+    let a = boss_jobs::agent_spec::projected(step.get("metadata")?)?;
     Some(Settings {
-        profile: text(PROFILE_KEY)?,
-        model: text(MODEL_KEY)?,
-        budget_usd: md.get(BUDGET_KEY).and_then(Value::as_f64)?,
-        effort: text(EFFORT_KEY)?,
+        profile: a.profile,
+        model: a.model,
+        budget_usd: a.budget_usd,
+        effort: a.effort.as_str().to_string(),
     })
 }
 
@@ -188,11 +204,82 @@ pub(crate) fn block_in_row(row: &Value, slug: &str) -> Option<Settings> {
 /// packet is pinned to the version it was admitted under, and writing
 /// v3's block onto a v1 packet would make the record state a
 /// declaration that version never made.
+///
+/// Its typed twin is `boss_jobs::agent_spec::resolved`, which the
+/// station queue and the claim door use (backlog 51aef4dd): the same
+/// rule over a `Step` and a `WorkflowSpec` rather than the JSON this
+/// verb reads, sharing `projected` so "carries a projection" is decided
+/// once. The row half stays here because this verb holds the row as
+/// served JSON, not as a parsed spec.
+///
+/// The row half answers only when the pinned step declares the same
+/// fields as the row's step (`boss_jobs::agent_spec::same_contract`,
+/// backlog 09b354e7): otherwise the block was written for a contract
+/// the packet does not run, and [`pinned_skew_refusal`] says so.
 pub(crate) fn settings_for(step: &Value, row: Option<&Value>) -> Option<Settings> {
     block_on_step(step).or_else(|| {
         let slug = step.get("spec_slug").and_then(Value::as_str)?;
-        block_in_row(row?, slug)
+        let row = row?;
+        if !contract_agrees(step, row, slug) {
+            return None;
+        }
+        block_in_row(row, slug)
     })
+}
+
+/// The `fields` a step (packet or row, same serde shape) declares. An
+/// absent key is none, as the serde default reads it; an unreadable one
+/// is `None`, which [`contract_agrees`] counts as disagreement — a
+/// contract it cannot read is not one it can vouch for.
+fn declared_fields(step: &Value) -> Option<Vec<boss_core::job::StepField>> {
+    match step.get("fields") {
+        None | Some(Value::Null) => Some(Vec::new()),
+        Some(v) => serde_json::from_value(v.clone()).ok(),
+    }
+}
+
+/// Whether the packet's pinned `step` and `row`'s step `slug` declare
+/// the same fields — the one rule, `boss_jobs::agent_spec::same_contract`,
+/// that the station queue and the claim door also apply.
+fn contract_agrees(step: &Value, row: &Value, slug: &str) -> bool {
+    let Some(row_step) = row.get("steps").and_then(Value::as_array).and_then(|s| {
+        s.iter()
+            .find(|s| s.get("title").and_then(Value::as_str) == Some(slug))
+    }) else {
+        return false;
+    };
+    match (declared_fields(step), declared_fields(row_step)) {
+        (Some(pinned), Some(active)) => boss_jobs::agent_spec::same_contract(&pinned, &active),
+        _ => false,
+    }
+}
+
+/// The refusal a pinned step gets when the active row declares a block
+/// for a DIFFERENT contract (backlog 09b354e7): it names the step, both
+/// versions and the convert that moves the packet — or a human, since
+/// the step is still workable by one under the version it runs. `None`
+/// when the row's block would not have applied anyway.
+pub(crate) fn pinned_skew_refusal(job: &Value, step: &Value, row: &Value) -> Option<String> {
+    let slug = step.get("spec_slug").and_then(Value::as_str)?;
+    block_in_row(row, slug)?;
+    if contract_agrees(step, row, slug) {
+        return None;
+    }
+    let kind = job.get("kind").and_then(Value::as_str).unwrap_or("?");
+    let packet = crate::envelope::job_id(job).unwrap_or("?");
+    let packet = &packet[..8.min(packet.len())];
+    let version = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(Value::as_i64)
+            .map_or_else(|| "v?".to_string(), |n| format!("v{n}"))
+    };
+    let (pinned, active) = (version(job, "workflow_version"), version(row, "version"));
+    Some(format!(
+        "step `{slug}` of {kind} {pinned} (the version packet {packet} is pinned to) declares no \
+         agent block, and {active}'s `{slug}` declares one for different fields — a run briefed \
+         from {active} would be asked for a contract this step does not have. Move the packet \
+         with `boss job convert {packet} --to {active}`, or give the step to a human"
+    ))
 }
 
 /// The refusal a step with no block gets: it names the fix, in the
@@ -306,6 +393,184 @@ pub(crate) fn declared_paths(job: &Value) -> Vec<String> {
 /// The packet metadata key the door reads.
 pub(crate) const PATHS_KEY: &str = "paths";
 
+/// The packet metadata key that says the deliverable lives in ANOTHER
+/// repository — a tenant repo, named the way `infra/cluster/instances.toml`
+/// names one (`tenant_repo = "david/algedonic-llc"`). Absent, the
+/// deliverable is this tree, which is every packet filed before
+/// backlog 10b07b73.
+pub(crate) const TENANT_REPO_KEY: &str = "tenant_repo";
+
+/// The run-packet key a tenant run records the ref it branched from
+/// under — the instance's `tenant_ref`, which its branch must not be.
+pub(crate) const TENANT_REF_KEY: &str = "tenant_ref";
+
+/// The run-packet key the copied `boss tenant check` receipt rides
+/// under, with the branch and the sha it vouches for (6a34e9bc).
+pub(crate) const TENANT_RECEIPT_KEY: &str = "tenant_receipt";
+
+/// The profile a tenant car is built by (design fd8b5143, backlog
+/// 6a34e9bc): its document, `infra/platform/documents/tenant-builder-
+/// rules.md`, declares the `tenant` lane.
+pub(crate) const TENANT_BUILDER_PROFILE: &str = "tenant-builder";
+
+/// Where a run builds, as THE VENUE DOOR decides it: the profile it is
+/// briefed under, and the instance's tenant source when the deliverable
+/// is a tenant repo rather than this tree.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Venue {
+    pub profile: String,
+    pub tenant: Option<crate::brief::TenantSource>,
+}
+
+/// THE VENUE DOOR (backlog 10b07b73; the tenant lane, design fd8b5143,
+/// backlog 6a34e9bc). Which profile a run is briefed under, given where
+/// the packet says its deliverable lives — or the refusal, naming why.
+///
+/// WHY IT REFUSED. Measured 2026-09-22: a builder dispatched at
+/// 86f32b7d, whose deliverable was registry data in the tenant repo,
+/// was handed a worktree of THIS tree and a brief that was entirely this
+/// tree's gate — uid, cargo bound, phases, `boss gate`, the park flags,
+/// the forge probe. It built in the tenant repo by hand and then could
+/// not end: `reported` opens on a gate's green and a tenant car has no
+/// gate, so the run aged into `died` with its work pushed. From
+/// 10b07b73 such a packet was refused before the claim — and since no
+/// profile built tenant work, it ran twice more (4c158269, ed63e78b)
+/// and landed nothing.
+///
+/// WHAT IT DOES NOW. A car-lane block on a packet declaring a tenant
+/// repo is briefed as [`TENANT_BUILDER_PROFILE`], in the `tenant` lane:
+/// a worktree of the tenant repo, `boss tenant check` for its receipt,
+/// and a run that ends `delivered` on that receipt instead of on a gate
+/// that does not exist. The car lane is otherwise unchanged. The repo
+/// must be one an instance SERVES (`tenant_repo` in
+/// infra/cluster/instances.toml): that is where tenant main is, and the
+/// only route onto it is `merge-tenant-main`, so a repo no instance
+/// declares has nowhere to land and is refused. A `tenant`-lane block
+/// (a step that routes tenant work by declaration) needs the packet to
+/// name its repo; a `step`-lane profile ships no car, so where the
+/// deliverable lives is not its question and it is admitted as before.
+///
+/// A declaration that is present but not a repo name is refused, never
+/// read as absent: a door that cannot read its input and opens anyway
+/// is a clean door that never looked (7b7e0529). A JSON null is the
+/// metadata PATCH's deletion, so it is read as no declaration.
+pub(crate) fn venue(
+    short: &str,
+    slug: &str,
+    profile: &str,
+    lane: &str,
+    job: &Value,
+    sources: &[crate::brief::TenantSource],
+) -> std::result::Result<Venue, String> {
+    use crate::brief::{INSTANCES, LANE_CAR, LANE_TENANT};
+    let this_tree = Venue {
+        profile: profile.to_string(),
+        tenant: None,
+    };
+    if lane != LANE_CAR && lane != LANE_TENANT {
+        return Ok(this_tree);
+    }
+    let served = || {
+        let repos: Vec<&str> = sources.iter().map(|s| s.repo.as_str()).collect();
+        if repos.is_empty() {
+            "none".to_string()
+        } else {
+            repos.join(", ")
+        }
+    };
+    let declared = job
+        .get("metadata")
+        .and_then(|m| m.get(TENANT_REPO_KEY))
+        .filter(|v| !v.is_null());
+    let repo = match declared {
+        None if lane == LANE_TENANT => {
+            return Err(format!(
+                "`{slug}` dispatches profile `{profile}`, briefed in the `tenant` lane, and packet \
+                 {short} declares no metadata.{TENANT_REPO_KEY} — nothing claimed, nothing filed. \
+                 Set it to the repo the deliverable lives in, one {INSTANCES} serves: {}.",
+                served()
+            ));
+        }
+        None => return Ok(this_tree),
+        Some(v) => match v.as_str().map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => r,
+            None => {
+                return Err(format!(
+                    "packet {short}'s metadata.{TENANT_REPO_KEY} cannot be read as a repository \
+                     name (it is {v}) — nothing claimed, nothing filed. Set it to the repo the \
+                     deliverable lives in (one {INSTANCES} serves: {}), or delete it (PATCH the \
+                     key to null) if the change is in this tree.",
+                    served()
+                ));
+            }
+        },
+    };
+    let Some(source) = sources.iter().find(|s| s.repo == repo) else {
+        return Err(format!(
+            "packet {short}'s deliverable is in {repo} (metadata.{TENANT_REPO_KEY}), and no \
+             instance in {INSTANCES} serves that repo — nothing claimed, nothing filed.\n  A \
+             tenant car lands on an instance's tenant main through merge-tenant-main, so a repo \
+             no instance declares has nowhere to land. Served: {}. Correct the declaration, or \
+             delete it (PATCH it to null) if the change is in this tree.",
+            served()
+        ));
+    };
+    Ok(Venue {
+        profile: if lane == LANE_CAR {
+            TENANT_BUILDER_PROFILE.to_string()
+        } else {
+            profile.to_string()
+        },
+        tenant: Some(source.clone()),
+    })
+}
+
+/// [`venue`] over the checkout in `repo`: the lane `profile`'s document
+/// declares and the tenant sources the instances file names. The ONE
+/// reader `boss dispatch` and `boss brief` both ask, so a packet a human
+/// briefs is rendered in the lane the agent will be (CLAUDE.md 9a; the
+/// same promise `dispatch::settings_for` keeps for the block).
+///
+/// The instances file is read only when a repo could matter, so a
+/// packet declaring none costs one lane read. The profile the venue
+/// CHOSE must be served in the tenant lane here: a missing document
+/// would brief it in the car lane with none of its rules, which is the
+/// failure the door exists to end.
+pub(crate) fn venue_in(repo: &Path, job: &Value, slug: &str, profile: &str) -> Result<Venue> {
+    let short = crate::envelope::job_id(job)
+        .map(|id| &id[..8.min(id.len())])
+        .unwrap_or("?");
+    let lane = crate::documents::lane(repo, profile)?;
+    let declares_repo = job
+        .get("metadata")
+        .and_then(|m| m.get(TENANT_REPO_KEY))
+        .is_some();
+    let sources = if declares_repo || lane == crate::brief::LANE_TENANT {
+        let path = repo.join(crate::brief::INSTANCES);
+        crate::brief::tenant_sources(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {} for the tenant repos", path.display()))?,
+        )
+    } else {
+        Vec::new()
+    };
+    let chosen =
+        venue(short, slug, profile, &lane, job, &sources).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if chosen.profile != profile {
+        let served_in = crate::documents::lane(repo, &chosen.profile)?;
+        if served_in != crate::brief::LANE_TENANT {
+            bail!(
+                "packet {short}'s deliverable is a tenant repo, and profile `{}` — the one that \
+                 builds there — is briefed in the `{served_in}` lane here, not `tenant`: {} is \
+                 missing or wrong in this checkout. Nothing claimed, nothing filed.",
+                chosen.profile,
+                crate::documents::path_for(&chosen.profile)
+            );
+        }
+    }
+    Ok(chosen)
+}
+
 /// The jobs API path the instance answers its edit level on.
 pub(crate) const EDIT_LEVEL_PATH: &str = "/api/tenant/edit-level";
 
@@ -317,11 +582,12 @@ pub(crate) const EDIT_LEVEL_PATH: &str = "/api/tenant/edit-level";
 /// not open a run.
 pub(crate) async fn edit_level_at(http: &reqwest::Client, base: &str) -> Result<Option<String>> {
     let url = format!("{base}{EDIT_LEVEL_PATH}");
-    let resp = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("reading the instance's edit level at {url}"))?;
+    // Waits out a jobs-API roll (backlog 034002b3), like every verb.
+    let resp = crate::train::send_through_a_roll(
+        &format!("reading the instance's edit level at {url}"),
+        || http.get(&url),
+    )
+    .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         eprintln!(
@@ -391,7 +657,6 @@ pub(crate) fn run_body(
     step_slug: &str,
     agent: &str,
     settings: &Settings,
-    worktree: &str,
     host: &str,
     brief: &str,
     owner: &str,
@@ -409,22 +674,103 @@ pub(crate) fn run_body(
             "model": settings.model,
             "budget_usd": settings.budget_usd,
             "effort": settings.effort,
-            "worktree": worktree,
+            // No `worktree` (backlog a3355e14): this verb runs in the
+            // DISPATCHER's session, so its cwd is not where the run is
+            // built. The builder's gate stamps its own worktree, and
+            // the green carries it onto `building` as
+            // `gate_run.worktree`.
             "host": host,
             "brief": brief,
         })),
     )
 }
 
-/// The `briefed` completion: `prompt_bytes` over the step's own
-/// metadata (PATCH-on-PUT replaces `metadata` wholesale).
-pub(crate) fn briefed_body(existing: &Value, prompt_bytes: usize) -> Value {
-    let mut md = match existing.get("metadata") {
-        Some(Value::Object(m)) => m.clone(),
-        _ => serde_json::Map::new(),
+/// The `briefed` completion's field, for the step merge door — only the
+/// field, since the door keeps every key the step already holds.
+///
+/// A RUN STEP COMPLETES AS TWO WRITES (backlog e39a9d2a, stage 2 of
+/// design 93d2bddb): its fields through `PATCH …/steps/{id}/metadata`,
+/// then [`completed`] alone through the step PUT. `briefed` and
+/// `reported` were each one PUT of `{status, metadata}`, the metadata a
+/// read-merge-write of the step. Correct under the live rule (the PUT
+/// refuses only a body that OMITS a stored key), but David's decided end
+/// state refuses ANY metadata body, and the merge door is one
+/// transaction against the row as it stands, so it cannot drop a key a
+/// concurrent writer added after the read. Merge FIRST: a required-at-
+/// done field (`reported`'s `summary`) is validated when the step flips.
+pub(crate) fn briefed_writes(prompt_bytes: usize) -> Value {
+    json!({ "prompt_bytes": prompt_bytes.to_string() })
+}
+
+/// How many times `briefed`'s field is written before a read-back that
+/// still misses it is refused: the write, and one more (backlog
+/// e381689d). A lost write is a race, so the second lands; a second
+/// miss is no longer a race and is not retried into silence.
+pub(crate) const BRIEFED_ATTEMPTS: usize = 2;
+
+/// The refusal when `briefed`'s field does not read back after
+/// [`BRIEFED_ATTEMPTS`] writes that each answered success. It names the
+/// run, the step, what the step holds instead, and the two writes that
+/// finish THIS run — the prompt already printed names this run's id, so
+/// a fresh dispatch would orphan it. `briefed` is left open: the
+/// completion was not sent.
+pub(crate) fn briefed_unheld_refusal(
+    run_id: &str,
+    briefed_id: &str,
+    writes: &Value,
+    report: &str,
+) -> String {
+    format!(
+        "run {} is filed and its step claimed, but its `briefed` step does not hold \
+         prompt_bytes after {BRIEFED_ATTEMPTS} writes that each answered success — refusing \
+         to complete it over a record it does not hold (backlog e381689d):\n{report}\
+         `briefed` is left open. To finish this run, record the field and then the status:\n  \
+         boss-api PATCH /api/jobs/{run_id}/steps/{briefed_id}/metadata  body {writes}\n  \
+         boss-api PUT /api/jobs/{run_id}/steps/{briefed_id}  body {{\"status\":\"completed\"}}",
+        &run_id[..8.min(run_id.len())],
+    )
+}
+
+/// The test stubs' step merge door, as the jobs API's: `body`'s keys land
+/// on the step `path` names in the filed run. ONE copy for every stub
+/// that serves a dispatch, because dispatch reads `briefed`'s field back
+/// before completing it (backlog e381689d) and a stub that answered 204
+/// and stored nothing would be refused exactly as run 6b6fe011 now is. A
+/// path naming no step of `run_id` changes nothing.
+#[cfg(test)]
+pub(crate) fn stub_merge(
+    run: &std::sync::Mutex<Option<Value>>,
+    run_id: &str,
+    path: &str,
+    body: &Value,
+) {
+    let Ok(mut guard) = run.lock() else {
+        return;
     };
-    md.insert("prompt_bytes".into(), json!(prompt_bytes.to_string()));
-    json!({ "status": "completed", "metadata": Value::Object(md) })
+    let Some(filed) = guard.as_mut() else {
+        return;
+    };
+    let Some(sid) = path
+        .strip_prefix(&format!("/api/jobs/{run_id}/steps/"))
+        .map(|rest| rest.trim_end_matches("/metadata"))
+    else {
+        return;
+    };
+    for step in filed["steps"].as_array_mut().into_iter().flatten() {
+        if step["id"] == sid
+            && let (Some(md), Some(sent)) = (step["metadata"].as_object_mut(), body.as_object())
+        {
+            for (k, v) in sent {
+                md.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// The second write of a run step's completion: the status alone, so
+/// the PUT carries no metadata to replace or drop.
+pub(crate) fn completed() -> Value {
+    json!({ "status": "completed" })
 }
 
 /// The agent definition a run's declared effort selects — the one
@@ -445,22 +791,173 @@ pub(crate) fn definition_in(repo: &Path, settings: &Settings) -> Option<String> 
     path.is_file().then_some(name)
 }
 
+/// Whether a run gets a git worktree of its own — decided by the LANE
+/// its profile's document declares, never typed on the Agent call
+/// (backlog 65cea113, 2026-09-23).
+///
+/// WHY THE LANE. A `car`-lane profile ships a branch, and two builders
+/// in one tree collide, so it is isolated. A `step`-lane profile ships
+/// no car — the analyst rules open with "No worktree, no branch, no
+/// gate" — and yet every analyst ran worktree-isolated, because that
+/// was whatever the operator typed. Isolation is not free: the
+/// harness then refuses any command it cannot show stays inside the
+/// tree — every heredoc, `mkdir -p … && cat > … <<EOF` into the
+/// scratchpad, a `python3 -` reading stdin — none of which touches
+/// git. The page-march pilot (run d5e0f287) measured that at about
+/// three times the tool calls for one read-only run, on a march that
+/// queues ~94 of them. Same shape as the effort (e720dd00): the
+/// declaration was a noun on the packet and the control was set by
+/// hand, so the declaration now sets the control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Isolation {
+    /// A git worktree of the run's own — `isolation: "worktree"`.
+    Worktree,
+    /// The dispatching session's own directory — no `isolation` key.
+    Shared,
+}
+
+impl Isolation {
+    /// The isolation a lane asks for: the car lane builds a branch in
+    /// a tree of its own; every other lane builds nothing in THIS tree.
+    /// A tenant builder does build a branch — of the tenant repo, in a
+    /// worktree its rules have it add from that repo's checkout — so a
+    /// worktree of this one would only hold its session somewhere it
+    /// must not write (6a34e9bc).
+    pub(crate) fn for_lane(lane: &str) -> Self {
+        if lane == crate::brief::LANE_CAR {
+            Self::Worktree
+        } else {
+            Self::Shared
+        }
+    }
+
+    /// [`Self::for_lane`] of the lane `profile`'s document declares in
+    /// `repo` — the one reader, [`crate::documents::lane`], so a
+    /// profile with no document is isolated as the car lane it is
+    /// briefed under.
+    pub(crate) fn for_profile(repo: &Path, profile: &str) -> Result<Self> {
+        crate::documents::lane(repo, profile).map(|lane| Self::for_lane(&lane))
+    }
+}
+
+/// The isolation as a CONTROL, for the operator who pastes the prompt
+/// by hand — the hook sets it on the call ([`effort_line`]'s twin).
+pub(crate) fn isolation_line(isolation: Isolation) -> String {
+    match isolation {
+        Isolation::Worktree => "Launched with isolation worktree — this profile's lane ships a \
+             car, so the run builds in a git worktree of its own. The PreToolUse hook sets it \
+             on the Agent call; a prompt pasted by hand must pass it."
+            .to_string(),
+        Isolation::Shared => "Launched WITHOUT isolation — this profile's lane builds nothing \
+             in this tree, so a worktree of it would hold none of the run's work, and a \
+             worktree-isolated session refuses every heredoc and compound command it cannot \
+             verify, about three times the tool calls for a read-only run (backlog 65cea113). \
+             The PreToolUse hook drops it from the Agent call; a prompt pasted by hand must not \
+             pass it."
+            .to_string(),
+    }
+}
+
+/// Where `session-start.sh` left the list of definitions THIS session
+/// loaded — the one moment Claude Code reads the directory.
+pub(crate) const SESSION_DEFINITIONS_ENV: &str = "BOSS_SESSION_AGENT_DEFINITIONS";
+
+/// The declarable definitions this checkout holds that the session did
+/// not load (backlog e1c4dc93). Claude Code reads
+/// [`boss_jobs::agent_spec::DEFINITIONS_DIR`] ONCE, at session start;
+/// one that arrives after — the car that added them, an hourly
+/// fast-forward of the pod's checkout — is on disk and unknown to the
+/// running session, so naming it is an immediate `Agent type
+/// 'effort-high' not found`. Pure: both lists are the caller's.
+pub(crate) fn unloaded(on_disk: &[String], loaded: &[String]) -> Vec<String> {
+    boss_jobs::agent_spec::Effort::ALL
+        .iter()
+        .map(|e| boss_jobs::agent_spec::definition_name(e.as_str()))
+        .filter(|name| on_disk.iter().any(|d| d == name) && !loaded.iter().any(|l| l == name))
+        .collect()
+}
+
+/// [`unloaded`] against this checkout and the session's snapshot. No
+/// snapshot — a session that started before the hook wrote one, or a
+/// `boss dispatch` run by hand — means nothing is KNOWN about what the
+/// session loaded, and an unknown is never a refusal.
+pub(crate) fn unloaded_for_session(repo: &Path, snapshot: Option<&Path>) -> Vec<String> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(snapshot) else {
+        return Vec::new();
+    };
+    let loaded: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    let dir = repo.join(boss_jobs::agent_spec::DEFINITIONS_DIR);
+    let on_disk: Vec<String> = boss_jobs::agent_spec::Effort::ALL
+        .iter()
+        .map(|e| boss_jobs::agent_spec::definition_name(e.as_str()))
+        .filter(|name| dir.join(format!("{name}.md")).is_file())
+        .collect();
+    unloaded(&on_disk, &loaded)
+}
+
 /// The last part of the prompt: the run's id, and the one export that
 /// ties the gate the builder launches back to it.
-pub(crate) fn run_section(run_id: &str, settings: &Settings) -> String {
+/// `isolation` is `None` when the profile's lane could not be read:
+/// the section then names none, and the call keeps the caller's own.
+pub(crate) fn run_section(
+    run_id: &str,
+    settings: &Settings,
+    isolation: Option<Isolation>,
+) -> String {
+    let isolation = isolation
+        .map(|i| format!("{}\n", isolation_line(i)))
+        .unwrap_or_default();
     format!(
         "== THE RUN ==\n\n\
          Your run is agent-run {run_id} (profile `{}`, model {}, budget ${}, effort {}).\n\
          Before `boss gate`, in the shell you gate from: export {}={run_id}\n\
          The gate-run then records this run, and a green lands it by itself.\n\
-         {}\n{}\n",
+         {}\n{}\n{}\n{isolation}",
         settings.profile,
         settings.model,
         settings.budget_usd,
         settings.effort,
         crate::gate::AGENT_RUN_ENV,
+        working_dir_line(run_id),
         budget_line(settings.budget_usd),
         effort_line(settings),
+    )
+}
+
+/// How every rules document refers to the directory
+/// [`working_dir_line`] names — one phrase, so a document cannot point
+/// at a place the prompt never names (pinned in `documents`).
+pub(crate) const WORKING_DIR_REFERENCE: &str = "working directory THE RUN names";
+
+/// The run's own working directory, relative to the scratchpad of the
+/// session that launched it: `run-` and the run id's first eight
+/// characters, the spelling every report already uses for a run.
+pub(crate) fn working_dir(run_id: &str) -> String {
+    format!("run-{}", run_id.chars().take(8).collect::<String>())
+}
+
+/// A PLACE FOR WORKING FILES (backlog dd747b4c, 2026-09-24). Every run
+/// a session launches shares that session's scratchpad, and until this
+/// line nothing named a place inside it, so each run wrote at the root
+/// under whatever generic names came to mind. Page-audit runs 36f05857
+/// and a3b88dbf, launched in parallel, both wrote `t1..t5` there, and
+/// the /it run overwrote the receiving run's files between write and
+/// filing: five backlog-items went in under the wrong audit, caught
+/// only because the run re-read its titles. The path is relative
+/// because the scratchpad's absolute path belongs to the harness, which
+/// shows it to the agent and never to this verb.
+pub(crate) fn working_dir_line(run_id: &str) -> String {
+    format!(
+        "Your working directory: {}/ inside your session's scratchpad directory — create it \
+         before your first write. This is the {WORKING_DIR_REFERENCE} in your rules: every \
+         working file (id lists, drafts, field files, commit message, probe, gate script, \
+         logs) goes there, never at the scratchpad root, which every run the session \
+         launches shares (backlog dd747b4c: two parallel runs wrote the same names there and \
+         one filed five items carrying the other's content).",
+        working_dir(run_id)
     )
 }
 
@@ -483,16 +980,22 @@ pub(crate) fn effort_line(settings: &Settings) -> String {
     )
 }
 
-/// The spend cap as the runner takes it (car 3, backlog cb78818d): the
-/// block's `budget_usd` rendered as the `--max-budget-usd` flag a
-/// runner passes to its session, and as a sentence for the operator
-/// who pastes the prompt by hand today. The claim door admitted this
-/// run against the agent's hourly budget with exactly this number, so
-/// the runner's cap and the door's reservation are one value.
+/// The block's `budget_usd`, as the run is told it (car 3, backlog
+/// cb78818d). It was rendered as a `--max-budget-usd` cap the agent
+/// was to stop before; nothing in the tree passed that flag to a
+/// session, and since backlog e6b2066f the number is a reading the
+/// record compares a run against, the same one the claim door's
+/// reservation reads.
 pub(crate) fn budget_line(budget_usd: f64) -> String {
+    // A SIGNAL, NOT A STOP (backlog e6b2066f). This line told every
+    // builder to stop before its budget; once a run is priced from what
+    // it consumed, about five times the old figure, that would have
+    // stopped most of them mid-car, and David's direction (2026-09-23)
+    // is that budgets must not limit building.
     format!(
-        "Spend cap: --max-budget-usd {budget_usd} — the claim door reserved this much of the \
-         agent's hourly budget for the run; stop and report before you pass it."
+        "Budget: ${budget_usd} declared for this run — a cost reading, not a limit. The report \
+         meters your run from its transcript and records the spend against it; do not stop \
+         work to stay under it."
     )
 }
 
@@ -535,6 +1038,10 @@ pub(crate) struct Dispatched {
     /// the definitions — the hook then leaves the call's own type
     /// rather than naming a CPU that does not exist here.
     pub subagent_type: Option<String>,
+    /// The isolation the profile's lane declares (backlog 65cea113);
+    /// `None` when the lane would not read, and the hook then leaves
+    /// the call's own.
+    pub isolation: Option<Isolation>,
 }
 
 /// The cars that name this packet as the item they build — narrowed at
@@ -659,6 +1166,40 @@ pub(crate) fn landed_work_refusal(item_id: &str, cars: &[Value]) -> Option<Strin
     ))
 }
 
+/// THE IN-FLIGHT REFUSAL (5cb6530a). A packet an OPEN, unmerged car
+/// already names is refused before the claim too, naming the car.
+///
+/// Measured 2026-09-23: open cars fc92b86a and 807d47bb named packets
+/// 28dcc735 and 2d1d298e, and `boss dispatch` exited 0 on both, because
+/// the landed-work door above reads only merged cars. But a car exists
+/// only once a gate went green — the auto-park handler files it on the
+/// green — so an open car naming this packet IS the finished fix, parked
+/// or aboard a train, and a second run builds it again. A car that
+/// closed without merging (abandoned) carries nothing, and a landed one
+/// is the landed door's, whose refusal names the proof to run.
+pub(crate) fn in_flight_car_refusal(item_id: &str, cars: &[Value]) -> Option<String> {
+    let car = cars.iter().find(|c| {
+        c.pointer("/metadata/backlog_item").and_then(Value::as_str) == Some(item_id)
+            && c.get("status").and_then(Value::as_str) == Some("open")
+            && !boss_jobs::car::is_landed(c)
+    })?;
+    let branch = car
+        .pointer("/metadata/branch")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let full = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    let id = &full[..full.len().min(8)];
+    let item = &item_id[..item_id.len().min(8)];
+    Some(format!(
+        "this packet's fix is ALREADY A CAR: {id} ({branch}) is open — gated green and parked \
+         or aboard a train, since a car is filed only on a green.\n  \
+         Dispatching it spends an agent run building the same fix again (5cb6530a). Let that \
+         car land; its proof closes this packet.\n    \
+         boss dispatch {item} --force\n      \
+         if the packet asks for MORE than that car carries, say so and build the rest"
+    ))
+}
+
 /// The whole verb against an explicit base — the seam the wire tests
 /// go through. Returns the run and the prompt.
 #[allow(clippy::too_many_arguments)]
@@ -681,7 +1222,6 @@ pub(crate) async fn dispatch_at(
     force: bool,
     actor: &str,
     owner: &str,
-    worktree: &str,
     host: &str,
     source: BriefSource<'_>,
 ) -> Result<Dispatched> {
@@ -744,14 +1284,54 @@ pub(crate) async fn dispatch_at(
     // hosting door above is — an agent that has claimed a step has
     // already started spending. Best-effort on the READ only: a jobs
     // API that cannot answer this one query must not stop a dispatch
-    // it would otherwise admit, so an unreachable read is silence and
-    // the dispatch proceeds. What is never best-effort is the verdict:
-    // a page that DID come back and names a landed car refuses.
-    if !force
-        && let Ok(body) = api_at(Method::GET, cars_for_item_query(&id), None).await
-        && let Some(why) = landed_work_refusal(&id, &crate::gate::rows(body))
-    {
-        bail!("{why}");
+    // it would otherwise admit, so an unreadable read lets the dispatch
+    // proceed. What is never best-effort is the verdict: a page that DID
+    // come back and names a landed car refuses. And the fallback is
+    // SAID, not silent: an answer that is not a list (a proxy's login
+    // page) used to read as "no car names this packet" through the old
+    // empty-reading rows helper, which is a clean door that never looked
+    // (backlog 7b7e0529).
+    if !force {
+        match api_at(Method::GET, cars_for_item_query(&id), None)
+            .await
+            .and_then(crate::train::rows)
+        {
+            Ok(cars) => {
+                if let Some(why) =
+                    landed_work_refusal(&id, &cars).or_else(|| in_flight_car_refusal(&id, &cars))
+                {
+                    bail!("{why}");
+                }
+            }
+            Err(e) => eprintln!(
+                "boss dispatch: could not read the cars that name {id} ({e:#}) — the \
+                 landed-work door is not judged for this dispatch"
+            ),
+        }
+    }
+
+    // WHAT IS ALREADY NAMED (7562d7a0, 65a753b7): the door above refuses
+    // only on a car naming this packet as its item. A fix filed under the
+    // packet's PARENT, or landed as `partial_item` pieces, passed it and
+    // cost three runs on 2026-09-24/25 — but neither is a verdict (see
+    // `prior_work`), so it is read here, SAID before the claim, and put
+    // in front of the builder rather than refused. Forced or not: a
+    // forced dispatch is exactly "build the rest", and the rest is
+    // measured against what landed.
+    let prior = match crate::prior_work::item_of(&job) {
+        Some(item) => {
+            let cars = api_at(
+                Method::GET,
+                crate::prior_work::partial_cars_query(item),
+                None,
+            )
+            .await;
+            Some(crate::prior_work::assemble(repo, item, cars))
+        }
+        None => None,
+    };
+    if let Some(line) = prior.as_ref().and_then(crate::prior_work::warning) {
+        eprintln!("{line}");
     }
 
     // The block: the packet's projection, else the active row's step,
@@ -766,12 +1346,38 @@ pub(crate) async fn dispatch_at(
             let row = api_at(Method::GET, format!("/api/workflows/{kind}"), None)
                 .await
                 .with_context(|| format!("reading the {kind} Workflow row for its agent block"))?;
-            let block = settings_for(step, row.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("{}", no_block_refusal(&kind, &slug)))?;
+            let block = settings_for(step, row.as_ref()).ok_or_else(|| {
+                let why = row
+                    .as_ref()
+                    .and_then(|r| pinned_skew_refusal(&job, step, r))
+                    .unwrap_or_else(|| no_block_refusal(&kind, &slug));
+                anyhow::anyhow!("{why}")
+            })?;
             (block, row)
         }
     };
     let settings = resolve(block, over).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // THE VENUE DOOR (10b07b73; the tenant lane, 6a34e9bc): where the
+    // deliverable lives decides which profile the run is briefed under —
+    // a car-lane block on a tenant-repo packet is briefed as the tenant
+    // builder — or refuses, here: the first point the profile is known,
+    // and still before the claim.
+    let venue = venue_in(repo, &job, &slug, &settings.profile)?;
+    if venue.profile != settings.profile {
+        eprintln!(
+            "boss dispatch: packet {}'s deliverable is in {} (metadata.{TENANT_REPO_KEY}) — `{slug}` \
+             declares `{}`, briefed as `{}` in the tenant lane",
+            &id[..8],
+            venue.tenant.as_ref().map_or("?", |t| t.repo.as_str()),
+            settings.profile,
+            venue.profile
+        );
+    }
+    let settings = Settings {
+        profile: venue.profile.clone(),
+        ..settings
+    };
 
     // CLAIM FIRST. A step someone else holds is a refusal naming the
     // holder, and it must come before anything is filed. The ONE door:
@@ -821,14 +1427,27 @@ pub(crate) async fn dispatch_at(
                     .ok()
                     .flatten(),
             };
-            crate::brief::render(repo, Some(&claimed), &settings.profile, active.as_ref())?
+            crate::brief::render_with(
+                repo,
+                Some(&claimed),
+                &settings.profile,
+                active.as_ref(),
+                crate::documents::supplied_trailer().as_deref(),
+                prior.as_ref(),
+            )?
         }
         BriefSource::Handed { prompt, .. } => prompt.to_string(),
     };
 
-    let mut body = run_body(
-        &id, &title, &slug, actor, &settings, worktree, host, &brief, owner,
-    );
+    let mut body = run_body(&id, &title, &slug, actor, &settings, host, &brief, owner);
+    // A TENANT RUN SAYS SO ON ITS OWN PACKET (6a34e9bc): the repo and the
+    // ref it branched from, as the instance declares them. `--report`
+    // reads `tenant_repo` to know the run lands on a copied check rather
+    // than a gate, and refuses a tenant branch named after the ref.
+    if let Some(t) = &venue.tenant {
+        body["metadata"][TENANT_REPO_KEY] = json!(t.repo);
+        body["metadata"][TENANT_REF_KEY] = json!(t.reference);
+    }
     if let BriefSource::Handed {
         session: Some(session),
         ..
@@ -892,16 +1511,76 @@ pub(crate) async fn dispatch_at(
         .context("the briefed step has no id")?
         .to_string();
 
-    let prompt = format!("{brief}\n{}", run_section(&run_id, &settings));
+    // Read, never fatal: a lane that will not read has already been
+    // refused by the rendered brief, and a handed prompt's dispatch is
+    // not stopped over a control the caller can still set by hand.
+    let isolation = Isolation::for_profile(repo, &settings.profile).ok();
+    let prompt = format!("{brief}\n{}", run_section(&run_id, &settings, isolation));
     if matches!(source, BriefSource::Rendered) {
         print!("{prompt}");
     }
-    api_at(
-        Method::PUT,
-        format!("/api/jobs/{run_id}/steps/{briefed_id}"),
-        Some(briefed_body(&briefed, prompt.len())),
-    )
-    .await
+    // A 2xx IS A CLAIM; THE READ-BACK IS THE FACT (backlog e381689d).
+    // On run 6b6fe011 (2026-09-25) this merge answered 204, a concurrent
+    // whole-row write erased the key 2 ms later, and the completing PUT
+    // below was then refused "prompt_bytes: required field missing" —
+    // leaving the run half-opened with nothing saying why. So the field
+    // is read back before the status is sent; a miss is written once
+    // more, and a second miss is refused by name with `briefed` still
+    // open, never completed over a record it does not hold.
+    let writes = briefed_writes(prompt.len());
+    let mut unheld = None;
+    for _ in 0..BRIEFED_ATTEMPTS {
+        api_at(
+            Method::PATCH,
+            format!("/api/jobs/{run_id}/steps/{briefed_id}/metadata"),
+            Some(writes.clone()),
+        )
+        .await
+        .context("recording prompt_bytes on the run's briefed step")?;
+        let now = api_at(Method::GET, format!("/api/jobs/{run_id}"), None)
+            .await?
+            .with_context(|| {
+                format!("recorded prompt_bytes and could not read run {run_id} back")
+            })?;
+        let held = crate::envelope::steps(&now)
+            .into_iter()
+            .find(|s| s.get("id").and_then(Value::as_str) == Some(briefed_id.as_str()))
+            .and_then(|s| s.get("metadata").cloned())
+            .unwrap_or_else(|| json!({}));
+        let (report, took) = crate::job::confirm_patch(&held, &writes);
+        if took {
+            unheld = None;
+            break;
+        }
+        unheld = Some(report);
+    }
+    if let Some(report) = unheld {
+        bail!(briefed_unheld_refusal(
+            &run_id,
+            &briefed_id,
+            &writes,
+            &report
+        ));
+    }
+    // The completion races the same dispatcher writes the merge did
+    // (run 9aa88562, 11:26:01Z: two within ~25 ms of `briefed` going
+    // ready), and the jobs API now refuses the loser of such a race by
+    // name instead of letting it erase the other write. A status-only
+    // body carries nothing that can be stale, so exactly that refusal
+    // is sent once more; any other error, or a second loss, stands.
+    let complete = || {
+        api_at(
+            Method::PUT,
+            format!("/api/jobs/{run_id}/steps/{briefed_id}"),
+            Some(completed()),
+        )
+    };
+    match complete().await {
+        Err(e) if format!("{e:#}").contains(boss_jobs::step_metadata_write::STEP_CHANGED_ERROR) => {
+            complete().await
+        }
+        answer => answer,
+    }
     .context("completing the run's briefed step")?;
     eprintln!(
         "boss dispatch: run {} open for `{slug}` on {} — {} bytes of prompt printed, \
@@ -914,6 +1593,7 @@ pub(crate) async fn dispatch_at(
         run_id,
         prompt,
         subagent_type: definition_in(repo, &settings),
+        isolation,
     })
 }
 
@@ -945,21 +1625,27 @@ pub(crate) async fn dispatch_at(
 // resolve a queue that does not exist and answer "nothing waiting"
 // instead of erroring — the wrong-target shape CLAUDE.md warns about.
 
-/// The step an inbox hands out: ready, nobody's, and carrying the
-/// agent model — which is exactly what made the packet a member of an
-/// `a.<role>.<model>` station, so the verb selects on the same fact
-/// the queue did rather than a second opinion about it.
+/// The step an inbox hands out: ready, nobody's, and declaring an
+/// agent block — through [`settings_for`], the packet's projection
+/// else `row`'s step (the kind's ACTIVE row). That is exactly what made
+/// the packet a member of an `a.<role>.<model>` station since backlog
+/// 51aef4dd resolved membership against the active row, so the verb
+/// selects on the same fact the queue did rather than a second opinion
+/// about it. Selecting on the projection alone would read a queue of
+/// 47 pinned page-audit packets and take none of them.
 ///
 /// ACTIVE steps are deliberately not candidates although the station
 /// holds them (a queue shows what is being worked as well as what is
 /// waiting): they are somebody's, and the claim would 409.
-pub(crate) fn waiting_step(job: &Value) -> Option<&Value> {
-    crate::envelope::steps(job).into_iter().find(|s| {
+pub(crate) fn waiting_step<'a>(job: &'a Value, row: Option<&Value>) -> Option<&'a Value> {
+    open_unheld(job).find(|s| settings_for(s, row).is_some())
+}
+
+/// Ready steps nobody holds — the candidates [`waiting_step`] judges.
+fn open_unheld(job: &Value) -> impl Iterator<Item = &Value> {
+    crate::envelope::steps(job).into_iter().filter(|s| {
         s.get("status").and_then(Value::as_str) == Some("ready")
             && s.get("assignee_id").and_then(Value::as_str).is_none()
-            && s.get("metadata")
-                .and_then(|m| m.get(boss_jobs::agent_spec::MODEL_KEY))
-                .is_some()
     })
 }
 
@@ -975,7 +1661,6 @@ pub(crate) async fn next_at(
     over: &Overrides,
     actor: &str,
     owner: &str,
-    worktree: &str,
     host: &str,
 ) -> Result<Option<Dispatched>> {
     use reqwest::Method;
@@ -1001,11 +1686,31 @@ pub(crate) async fn next_at(
         })
         .unwrap_or_default();
 
+    let mut rows: std::collections::BTreeMap<String, Option<Value>> =
+        std::collections::BTreeMap::new();
     for id in &members {
         let job = api_at(Method::GET, format!("/api/jobs/{id}"))
             .await?
             .with_context(|| format!("packet {} read returned no body", &id[..8.min(id.len())]))?;
-        let Some(step) = waiting_step(&job) else {
+        // The kind's row is read only when a ready, unheld step cannot
+        // answer alone — the same laziness `dispatch_at` keeps — and
+        // once per kind, however many of its packets the queue holds.
+        let kind = job
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        if waiting_step(&job, None).is_none()
+            && open_unheld(&job).next().is_some()
+            && !rows.contains_key(&kind)
+        {
+            let row = api_at(Method::GET, format!("/api/workflows/{kind}"))
+                .await
+                .with_context(|| format!("reading the {kind} Workflow row for its agent block"))?;
+            rows.insert(kind.clone(), row);
+        }
+        let row = rows.get(&kind).and_then(Option::as_ref);
+        let Some(step) = waiting_step(&job, row) else {
             continue;
         };
         let slug = step
@@ -1031,7 +1736,6 @@ pub(crate) async fn next_at(
             false,
             actor,
             owner,
-            worktree,
             host,
             BriefSource::Rendered,
         )
@@ -1059,9 +1763,6 @@ pub async fn next(
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let owner = crate::owner::for_filing_at(&base).await;
     let host = crate::prove::host();
-    let worktree = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
     let over = Overrides {
         model,
         budget_usd: budget,
@@ -1080,7 +1781,6 @@ pub async fn next(
         &over,
         &actor,
         &owner,
-        &worktree,
         &host,
     )
     .await?;
@@ -1096,7 +1796,18 @@ pub(crate) const REPORTED_SLUG: &str = "reported";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tokens {
     Total(u64),
-    Split { input: u64, output: u64 },
+    Split {
+        input: u64,
+        output: u64,
+    },
+    /// The four counts read from the run's transcript — never typed
+    /// (backlog e6b2066f; [`crate::transcript_usage`]).
+    Metered {
+        input: u64,
+        cache_write: u64,
+        cache_read: u64,
+        output: u64,
+    },
 }
 
 impl Tokens {
@@ -1104,6 +1815,35 @@ impl Tokens {
         match self {
             Tokens::Total(t) => t,
             Tokens::Split { input, output } => input.saturating_add(output),
+            Tokens::Metered {
+                input,
+                cache_write,
+                cache_read,
+                output,
+            } => input
+                .saturating_add(cache_write)
+                .saturating_add(cache_read)
+                .saturating_add(output),
+        }
+    }
+
+    /// The record's own shape for this count — one mapping, so the
+    /// basis a line prints is the one the record derives.
+    pub(crate) fn usage(self) -> TokenUsage {
+        match self {
+            Tokens::Total(total) => TokenUsage::TotalOnly { total },
+            Tokens::Split { input, output } => TokenUsage::Split { input, output },
+            Tokens::Metered {
+                input,
+                cache_write,
+                cache_read,
+                output,
+            } => TokenUsage::Metered {
+                input,
+                cache_write,
+                cache_read,
+                output,
+            },
         }
     }
 }
@@ -1132,7 +1872,28 @@ pub(crate) fn parse_tokens(s: &str) -> std::result::Result<Tokens, String> {
 pub(crate) struct Report {
     pub summary: String,
     pub spend_usd: Option<f64>,
+    /// The count the caller TYPED (`--tokens`), when it typed one.
     pub tokens: Option<Tokens>,
+    /// The run's transcript, read (backlog e6b2066f). When present it
+    /// is the count the record carries ([`Report::counted`]) and the
+    /// typed one rides `detail` beside it for comparison.
+    pub meter: Option<crate::transcript_usage::Metered>,
+}
+
+impl Report {
+    /// The count the record carries: the transcript's four counts when
+    /// the run was metered, else what the caller typed.
+    pub(crate) fn counted(&self) -> Option<Tokens> {
+        match &self.meter {
+            Some(m) => Some(Tokens::Metered {
+                input: m.usage.input,
+                cache_write: m.usage.cache_write,
+                cache_read: m.usage.cache_read,
+                output: m.usage.output,
+            }),
+            None => self.tokens,
+        }
+    }
 }
 
 /// The merging PATCH the report writes onto the run packet: the keys
@@ -1145,29 +1906,27 @@ pub(crate) fn report_patch(r: &Report) -> Value {
     if let Some(d) = r.spend_usd {
         md.insert("spend_usd".into(), json!(d));
     }
-    if let Some(t) = r.tokens {
+    if let Some(t) = r.counted() {
         md.insert("tokens".into(), json!(t.total()));
     }
     Value::Object(md)
 }
 
-/// The `reported` completion: the step's three declared fields
-/// (`summary` required; `spend_usd` and `tokens` are string fields on
-/// the row) over the step's own metadata, since PATCH-on-PUT replaces
-/// `metadata` wholesale.
-pub(crate) fn reported_body(existing: &Value, r: &Report) -> Value {
-    let mut md = match existing.get("metadata") {
-        Some(Value::Object(m)) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
+/// The `reported` completion's fields, for the step merge door: the
+/// step's three declared fields (`summary` required; `spend_usd` and
+/// `tokens` are string fields on the row) and nothing else — the door
+/// keeps what the step already holds (two writes, as [`briefed_writes`]
+/// says why).
+pub(crate) fn reported_writes(r: &Report) -> Value {
+    let mut md = serde_json::Map::new();
     md.insert("summary".into(), json!(r.summary));
     if let Some(d) = r.spend_usd {
         md.insert("spend_usd".into(), json!(d.to_string()));
     }
-    if let Some(t) = r.tokens {
+    if let Some(t) = r.counted() {
         md.insert("tokens".into(), json!(t.total().to_string()));
     }
-    json!({ "status": "completed", "metadata": Value::Object(md) })
+    Value::Object(md)
 }
 
 /// The registered id the run's `agent` signs as, off `GET /api/agents`:
@@ -1211,12 +1970,7 @@ pub(crate) const BUILDING_SLUG: &str = "building";
 /// outcome: the report can arrive before the green, and the row is
 /// insert-once, so a guess made here would be the permanent record.
 pub(crate) fn run_outcome(run: &Value) -> Option<&'static str> {
-    let result = crate::envelope::steps(run)
-        .into_iter()
-        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BUILDING_SLUG))
-        .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"))
-        .and_then(|s| s.pointer("/metadata/result").and_then(Value::as_str))?;
-    match result {
+    match building_result(run)? {
         "gated" | "delivered" => Some("success"),
         "refused" => Some("cancelled"),
         "died" => Some("failed"),
@@ -1248,16 +2002,58 @@ pub(crate) fn run_outcome(run: &Value) -> Option<&'static str> {
 /// completes every other step in its row's declared shape, and a
 /// `--report --refused` spelling would be a second way to write it
 /// and a second thing to keep true.
+///
+/// `refused` names a stop at the operator's direction as well as the
+/// agent's own (backlog 73abfb3a, 2026-09-26): run d71ea876 was stopped
+/// at David's request, its reader did not see that case in "an agent
+/// that stopped", and filed for a `stopped` terminal. `refused` already
+/// records it truly — agent_runs `cancelled`, not `failed` — and the
+/// stop's reason is the --report summary this call just put on the
+/// packet, so a fifth terminal would be a second way to write one fact.
 pub(crate) fn no_terminal_line(short: &str) -> String {
     format!(
         "boss dispatch: run {short} has no terminal yet — `{BUILDING_SLUG}` carries no \
          `result`, so agent_runs would have to assert an outcome the packet does not hold. \
          The report is on the packet. End the run with the outcome it reached — `boss step \
-         complete {short} --step {BUILDING_SLUG} --field result=refused` for an agent that \
-         stopped without building, or `result=delivered` for work that ships no car; a green \
-         gate writes `gated` by itself and the hourly clock writes `died`. Then run --report \
+         complete {short} --step {BUILDING_SLUG} --field result=refused` for a run stopped \
+         without building, whether its agent stopped or it was stopped at the operator's \
+         direction (the report on the packet carries the reason), or `result=delivered` for \
+         work that ships no car; a run whose gate is still running needs nothing, its green \
+         writes `gated` by itself, and the hourly clock writes `died`. Then run --report \
          again and the cost is recorded with the outcome it reached"
     )
+}
+
+/// What `--report` says of a run whose `reported` step is neither open
+/// nor completed — read off the terminal `building` reached, because
+/// `reported` opens only on `gated` or `delivered` (backlog 73abfb3a,
+/// 2026-09-26).
+///
+/// It used to say "it opens on the gate's green" of EVERY such run.
+/// For a run with no terminal that line was untrue — a run stopped at
+/// the operator's direction never gates — and it was printed BEFORE
+/// [`no_terminal_line`], the one line that names the verb which ends
+/// the run. The reader of run d71ea876 acted on the first line and
+/// filed an item asking for a `stopped` terminal that `refused`
+/// already is. So a run with no result gets `None` here and the door
+/// alone; the green is named only where a green is what the run is at.
+pub(crate) fn reported_waiting_line(short: &str, status: &str, run: &Value) -> Option<String> {
+    match building_result(run)? {
+        "gated" => Some(format!(
+            "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} — it opens on the gate's \
+             green; the report rides the packet, run --report again once the run is at reported"
+        )),
+        "delivered" => Some(format!(
+            "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} — `{BUILDING_SLUG}` \
+             closed `delivered`, which opens it; the report rides the packet, run --report \
+             again once the run is at reported"
+        )),
+        ended => Some(format!(
+            "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} and does not open — \
+             `{BUILDING_SLUG}` ended `{ended}`, and `{REPORTED_SLUG}` opens only on `gated` or \
+             `delivered`; the report rides the packet"
+        )),
+    }
 }
 
 /// The car the run produced, off the evidence the landing rule stamped
@@ -1278,20 +2074,25 @@ pub(crate) fn no_terminal_line(short: &str) -> String {
 /// answering "what did this car cost" meant going through the run
 /// packet on every read.
 pub(crate) fn run_branch(run: &Value) -> Option<String> {
+    let non_empty = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    };
     let building = crate::envelope::steps(run)
         .into_iter()
         .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BUILDING_SLUG))?;
-    ["gate_run", "car"].into_iter().find_map(|key| {
-        building
-            .pointer(&format!("/metadata/{key}/branch"))
-            .and_then(Value::as_str)
-            .filter(|b| !b.is_empty())
-            .map(str::to_string)
-    })
+    ["gate_run", "car"]
+        .into_iter()
+        .find_map(|key| non_empty(building.pointer(&format!("/metadata/{key}/branch"))))
+        // A tenant car has neither: its branch is the one its receipt
+        // vouches for, in the tenant repo (6a34e9bc).
+        .or_else(|| non_empty(run.pointer(&format!("/metadata/{TENANT_RECEIPT_KEY}/branch"))))
 }
 
 /// The `agent_runs` record for a run packet: keyed on the run's own id
-/// (idempotent), the CPU as its registered id, the model and packet
+/// (idempotent), the CPU as its registered id, the model its transcript
+/// was billed as (else the one its metadata declared) and the packet
 /// off the run's metadata, started when `briefed` completed (the
 /// instant the build began — the same stamp the silence rule reads)
 /// or when the packet opened, finished at the report. A total-only
@@ -1322,10 +2123,21 @@ pub(crate) fn run_record(
         .map(str::to_string)
         .or_else(|| text("opened_at"))
         .with_context(|| format!("run {run_id} has neither a briefed stamp nor opened_at"))?;
-    let tokens = match r.tokens {
+    let tokens = match r.counted() {
         Some(Tokens::Split { input, output }) => {
             json!({ "input_tokens": input, "output_tokens": output })
         }
+        Some(Tokens::Metered {
+            input,
+            cache_write,
+            cache_read,
+            output,
+        }) => json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        }),
         Some(Tokens::Total(t)) => json!({ "total_tokens": t }),
         // A report with no count is still a record of the run, and it
         // says so: an EXPLICIT null, which the API reads as
@@ -1339,10 +2151,26 @@ pub(crate) fn run_record(
         // point: silence and a stated null are different facts.
         None => json!({ "total_tokens": null }),
     };
+    // WHICH MODEL RAN (backlog 6bb85880): the one the transcript's
+    // turns were billed as, when the run was metered — not the packet's
+    // `model`, which is the agent block's DECLARATION. Until 2026-09-25
+    // the declaration was recorded as the fact: every run said
+    // `opus-5[1m]` and was priced at Opus 5's rates while its turns said
+    // `claude-opus-5-5`. The declaration rides `detail` beside the fact,
+    // so a run on another model than its step asked for is visible. A
+    // model the card has no row for is recorded as it is and reads as
+    // unpriced (the API matches rows exactly), never at a neighbour's
+    // rate.
+    let declared = text("model");
+    let model = r
+        .meter
+        .as_ref()
+        .and_then(|m| m.models.recorded())
+        .or_else(|| declared.clone());
     let mut body = json!({
         "run_id": run_id,
         "actor_id": actor_id,
-        "model": text("model"),
+        "model": model,
         "started_at": started_at,
         "finished_at": finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "outcome": outcome,
@@ -1356,6 +2184,9 @@ pub(crate) fn run_record(
             // column: it is free-form on purpose, and a field can
             // graduate once the comparison says what it needs.
             "effort": text("effort"),
+            // The model the step's agent block asked for; `model` is
+            // the one that ran, when the transcript said (6bb85880).
+            "declared_model": declared,
             "reported_spend_usd": r.spend_usd,
             // No `tokens_reported` flag: the column says it now. The
             // flag existed because a zero could not, and keeping both
@@ -1369,6 +2200,39 @@ pub(crate) fn run_record(
     if let (Some(dst), Some(src)) = (body.as_object_mut(), tokens.as_object()) {
         dst.extend(src.clone());
     }
+    // The call count the record has carried since its first day and no
+    // report ever filled (backlog 2f23f4c6): a metered run's transcript
+    // counts them. An unmetered run leaves the key out, as before.
+    if let (Some(m), Some(dst)) = (&r.meter, body.as_object_mut()) {
+        dst.insert(
+            "tool_calls".into(),
+            json!(u32::try_from(m.profile.tool_calls).unwrap_or(u32::MAX)),
+        );
+    }
+    // Where a metered count came from, and the two readings that make
+    // it checkable (backlog e6b2066f): the final context — the figure a
+    // harness total reports — and the typed count it superseded, both
+    // BESIDE the record and never as it. A 1-hour cache write is priced
+    // at the card's 5-minute rate, so its count says the price is a
+    // floor.
+    if let (Some(m), Some(detail)) = (
+        &r.meter,
+        body.get_mut("detail").and_then(Value::as_object_mut),
+    ) {
+        detail.insert(
+            "metered".into(),
+            json!({
+                "transcript": m.path.display().to_string(),
+                "turns": m.usage.turns,
+                "final_context_tokens": m.usage.final_context,
+                "cache_write_1h_tokens": m.usage.cache_write_1h,
+                "typed_tokens": r.tokens.map(Tokens::total),
+                // The two readings `model` was derived from, verbatim.
+                "model_ids": m.models.billed,
+                "model_identity": m.models.identity,
+            }),
+        );
+    }
     Ok(body)
 }
 
@@ -1378,8 +2242,19 @@ pub(crate) fn run_record(
 /// `None` for a row that states it holds no count.
 pub(crate) fn row_tokens(row: &Value) -> Option<Tokens> {
     let n = |k: &str| row.get(k).and_then(Value::as_u64);
-    match (n("input_tokens"), n("output_tokens")) {
-        (Some(input), Some(output)) => Some(Tokens::Split { input, output }),
+    match (
+        n("input_tokens"),
+        n("output_tokens"),
+        n("cache_read_tokens"),
+        n("cache_write_tokens"),
+    ) {
+        (Some(input), Some(output), Some(cache_read), Some(cache_write)) => Some(Tokens::Metered {
+            input,
+            cache_write,
+            cache_read,
+            output,
+        }),
+        (Some(input), Some(output), _, _) => Some(Tokens::Split { input, output }),
         _ => n("total_tokens").map(Tokens::Total),
     }
 }
@@ -1389,6 +2264,14 @@ pub(crate) fn row_tokens(row: &Value) -> Option<Tokens> {
 pub(crate) fn tokens_phrase(t: Option<Tokens>) -> String {
     match t {
         Some(Tokens::Split { input, output }) => format!("{input} in / {output} out"),
+        Some(Tokens::Metered {
+            input,
+            cache_write,
+            cache_read,
+            output,
+        }) => format!(
+            "{input} in / {cache_write} cache write / {cache_read} cache read / {output} out"
+        ),
         Some(Tokens::Total(total)) => format!("{total} total, unsplit"),
         None => "no count at all".to_string(),
     }
@@ -1398,9 +2281,23 @@ pub(crate) fn tokens_phrase(t: Option<Tokens>) -> String {
 /// own rule ([`boss_jobs::agent_runs::pricing_basis`]), never a second
 /// copy of it here, so a blended figure is never printed as a measured
 /// one (design 91a9bfe7).
-fn price_phrase(priced: Option<u64>, basis: Option<PricingBasis>) -> String {
+fn price_phrase(
+    priced: Option<u64>,
+    basis: Option<PricingBasis>,
+    held: Option<Tokens>,
+    model: Option<&str>,
+) -> String {
     let dollars = |m: u64| format!("${:.4}", m as f64 / 1_000_000.0);
     match (priced, basis) {
+        // Four counts and no price: the one thing missing is a row for
+        // the model (backlog 6bb85880). Say which, and that nothing
+        // stands in for it.
+        (None, _) if matches!(held, Some(Tokens::Metered { .. })) => format!(
+            "unpriced — METERED, but the rate card has no row for `{}` with all four rates: a \
+             model is priced at its own row or not at all, never a neighbour's rate. A price \
+             arrives by migration, read from the published rate",
+            model.unwrap_or("(no model)")
+        ),
         (Some(m), Some(PricingBasis::Blended)) => format!(
             "at {} — BLENDED, not measured: a bare total priced at the model's declared \
              input/output ratio (rate card)",
@@ -1409,6 +2306,10 @@ fn price_phrase(priced: Option<u64>, basis: Option<PricingBasis>) -> String {
         (Some(m), Some(PricingBasis::Split)) => {
             format!("at {} (rate card, measured split)", dollars(m))
         }
+        (Some(m), Some(PricingBasis::Metered)) => format!(
+            "at {} (rate card, METERED: four counts summed from the run's transcript)",
+            dollars(m)
+        ),
         // Priced, but the row carries no count this build can read, so
         // the figure is stated and the claim about it is not: naming a
         // basis here would be guessing one.
@@ -1461,24 +2362,29 @@ pub(crate) fn record_line(
         .and_then(|v| v.get("usd_micros"))
         .and_then(Value::as_u64);
     let held = row.and_then(row_tokens);
-    let usage = match held {
-        Some(Tokens::Split { input, output }) => TokenUsage::Split { input, output },
-        Some(Tokens::Total(total)) => TokenUsage::TotalOnly { total },
-        None => TokenUsage::Unreported,
-    };
+    let usage = held.map_or(TokenUsage::Unreported, Tokens::usage);
     let basis = boss_jobs::agent_runs::pricing_basis(usage, priced);
-    let phrase = price_phrase(priced, basis);
+    let model = row.and_then(|v| v.get("model")).and_then(Value::as_str);
+    let phrase = price_phrase(priced, basis, held, model);
 
     if out.and_then(|o| o.get("recorded")).and_then(Value::as_bool) != Some(false) {
         let mut line =
             format!("boss dispatch: agent_runs holds run {short} for {actor_id} {phrase}");
         match basis {
-            Some(PricingBasis::Blended) => line.push_str(
-                ". Give --tokens IN,OUT when a split exists and it is priced at the two rates \
-                 instead",
+            Some(PricingBasis::Metered) => {}
+            // Already metered; the phrase names the missing row.
+            None if matches!(held, Some(Tokens::Metered { .. })) => {}
+            // A typed count was all the record had: say how to meter
+            // the run instead (backlog e6b2066f).
+            Some(_) => line.push_str(
+                ". Not metered: pass --transcript <the run's subagent transcript> and its four \
+                 counts are priced instead",
             ),
-            _ if priced.is_none() => line.push_str(". The run is recorded in full either way"),
-            _ => {}
+            None if priced.is_none() => line.push_str(
+                ". The run is recorded in full either way; pass --transcript <the run's \
+                 subagent transcript> to meter it",
+            ),
+            None => {}
         }
         return Ok(line);
     }
@@ -1487,7 +2393,7 @@ pub(crate) fn record_line(
         .and_then(|v| v.get("recorded_at"))
         .and_then(Value::as_str)
         .unwrap_or("an earlier report");
-    if held == r.tokens {
+    if held == r.counted() {
         return Ok(format!(
             "boss dispatch: agent_runs already held run {short} for {actor_id} {phrase}, \
              recorded {at}. This report carries the same count, so the row is unchanged — it is \
@@ -1503,17 +2409,168 @@ pub(crate) fn record_line(
          this command's answer; correcting a recorded cost needs a record that can take a \
          correction (backlog b4fd594e)",
         tokens_phrase(held),
-        tokens_phrase(r.tokens),
+        tokens_phrase(r.counted()),
     ))
 }
 
-/// The report, against an explicit base — the seam the wire tests go
-/// through.
+/// A tenant run's receipt as `--report` takes it (design fd8b5143,
+/// backlog 6a34e9bc): the `boss tenant check` output, read from the
+/// file the run wrote it to — copied, never retyped — and the branch
+/// and full sha that output vouches for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TenantReceipt {
+    pub check: String,
+    pub branch: String,
+    pub sha: String,
+}
+
+impl TenantReceipt {
+    /// As it rides the run packet, under [`TENANT_RECEIPT_KEY`].
+    pub(crate) fn to_value(&self) -> Value {
+        json!({ "branch": self.branch, "sha": self.sha, "check": self.check })
+    }
+
+    fn from_value(v: &Value) -> Option<Self> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            check: s("check")?,
+            branch: s("branch")?,
+            sha: s("sha")?,
+        })
+    }
+
+    /// Why this receipt cannot land a run, or `None` when it can: the
+    /// check must PASS in the shape the check prints it, the sha must
+    /// be a full one read from git, and the branch must not be the ref
+    /// the instance lands on — a tenant builder pushes a branch, and
+    /// main moves only through `merge-tenant-main`.
+    fn refusal(&self, tenant_ref: Option<&str>) -> Option<String> {
+        if let Err(why) = crate::tenant::passing_receipt(&self.check) {
+            return Some(format!(
+                "the receipt is not a passing `boss tenant check`: {why}"
+            ));
+        }
+        let full_sha =
+            self.sha.len() == 40 && self.sha.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+        if !full_sha {
+            return Some(format!(
+                "`{}` is not a full commit sha — read it from git (`git rev-parse HEAD` in the \
+                 tenant worktree), never typed",
+                self.sha
+            ));
+        }
+        let branch = self.branch.trim();
+        if branch.is_empty() || Some(branch) == tenant_ref {
+            return Some(format!(
+                "the branch `{branch}` is not a tenant car's: the car is a branch of its own, \
+                 and the instance's `{}` moves only through merge-tenant-main on David's \
+                 approval",
+                tenant_ref.unwrap_or("ref")
+            ));
+        }
+        None
+    }
+}
+
+/// The `result` a run's `building` step was completed with, if it was.
+fn building_result(run: &Value) -> Option<&str> {
+    crate::envelope::steps(run)
+        .into_iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BUILDING_SLUG))
+        .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"))
+        .and_then(|s| s.pointer("/metadata/result").and_then(Value::as_str))
+}
+
+/// THE TENANT RECEIPT DOOR (design fd8b5143, backlog 6a34e9bc). What
+/// `--report` records of a tenant receipt — `Ok(Some)` the receipt to
+/// write, `Ok(None)` nothing — or the refusal, decided before any write.
+///
+/// A tenant car has no gate, so no green can say its tree is sound; the
+/// run lands instead on `delivered` and the check's own output, copied.
+/// That is the whole of the protocol's evidence for the build, so a
+/// tenant run (one whose packet carries `tenant_repo`, written at
+/// dispatch) that reached `delivered` is REFUSED a report without a
+/// receipt that PASSES — the one given, or one an earlier report
+/// already put on the packet. A receipt offered for a run that is not a
+/// tenant run is refused too: it would be recorded against nothing,
+/// which is a flag that looks honoured and was not.
+pub(crate) fn tenant_receipt_verdict(
+    short: &str,
+    run: &Value,
+    given: Option<&TenantReceipt>,
+) -> std::result::Result<Option<Value>, String> {
+    let md = run.get("metadata");
+    let text = |k: &str| {
+        md.and_then(|m| m.get(k))
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+    };
+    let Some(repo) = text(TENANT_REPO_KEY) else {
+        return match given {
+            Some(_) => Err(format!(
+                "run {short} carries no metadata.{TENANT_REPO_KEY}, so it is not a tenant-builder \
+                 run and a tenant receipt would be recorded against nothing — drop \
+                 --tenant-check-file, or report the tenant run it belongs to"
+            )),
+            None => Ok(None),
+        };
+    };
+    let tenant_ref = text(TENANT_REF_KEY);
+    if let Some(r) = given {
+        return match r.refusal(tenant_ref) {
+            Some(why) => Err(format!(
+                "run {short} builds in {repo}, and its receipt is refused — nothing recorded: \
+                 {why}"
+            )),
+            None => Ok(Some(r.to_value())),
+        };
+    }
+    if building_result(run) != Some("delivered") {
+        return Ok(None);
+    }
+    let held = md
+        .and_then(|m| m.get(TENANT_RECEIPT_KEY))
+        .and_then(TenantReceipt::from_value);
+    match held.as_ref().map(|r| r.refusal(tenant_ref)) {
+        Some(None) => Ok(None),
+        held_why => Err(format!(
+            "run {short} ended `delivered` in {repo}, and a tenant run lands on a copied `boss \
+             tenant check` PASS, not on a gate — nothing recorded. {}Pass the check output the \
+             run wrote: --tenant-check-file <its tenant-check.txt> --tenant-branch <branch> \
+             --tenant-sha <full sha>",
+            match held_why {
+                Some(Some(why)) => format!("The receipt on the packet does not stand: {why}. "),
+                _ => "No receipt is on the packet. ".to_string(),
+            }
+        )),
+    }
+}
+
+/// The report, against an explicit base, for a run with no tenant
+/// receipt — the seam the wire tests go through. The verb itself calls
+/// [`report_with_receipt_at`], so this exists only under test.
+#[cfg(test)]
 pub(crate) async fn report_at(
     http: &reqwest::Client,
     base: &str,
     run_ref: &str,
     report: &Report,
+    scratch: Option<&crate::scratch_target::Scratch>,
+    actor: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    report_with_receipt_at(http, base, run_ref, report, None, scratch, actor, now).await
+}
+
+/// [`report_at`] carrying a tenant run's receipt (6a34e9bc).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn report_with_receipt_at(
+    http: &reqwest::Client,
+    base: &str,
+    run_ref: &str,
+    report: &Report,
+    tenant: Option<&TenantReceipt>,
+    scratch: Option<&crate::scratch_target::Scratch>,
     actor: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
@@ -1535,16 +2592,35 @@ pub(crate) async fn report_at(
         );
     }
 
+    // THE TENANT RECEIPT DOOR (6a34e9bc), before any write: a tenant run
+    // that ended `delivered` lands on a copied PASS or not at all.
+    let receipt =
+        tenant_receipt_verdict(short, &run, tenant).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // THE RECORD FIRST: the handback rides the packet whether or not
     // the green has opened `reported` yet (rule 8 of the builder
     // rules: the report arrives at gate launch, ten minutes earlier).
+    let mut patch = report_patch(report);
+    if let Some(r) = &receipt {
+        patch[TENANT_RECEIPT_KEY] = r.clone();
+    }
     api_at(
         Method::PATCH,
         format!("/api/jobs/{run_id}/metadata"),
-        Some(report_patch(report)),
+        Some(patch),
     )
     .await
     .with_context(|| format!("recording the report on run {short}"))?;
+    // The run as it now stands, so the finish record below names the
+    // tenant branch this report just put on it ([`run_branch`]).
+    let run = match &receipt {
+        Some(r) => {
+            let mut held = run.clone();
+            held["metadata"][TENANT_RECEIPT_KEY] = r.clone();
+            held
+        }
+        None => run,
+    };
 
     let reported = crate::envelope::steps(&run)
         .into_iter()
@@ -1558,9 +2634,16 @@ pub(crate) async fn report_at(
             .and_then(Value::as_str)
             .context("the reported step has no id")?;
         api_at(
+            Method::PATCH,
+            format!("/api/jobs/{run_id}/steps/{step_id}/metadata"),
+            Some(reported_writes(report)),
+        )
+        .await
+        .with_context(|| format!("recording the report on `{REPORTED_SLUG}` of run {short}"))?;
+        api_at(
             Method::PUT,
             format!("/api/jobs/{run_id}/steps/{step_id}"),
-            Some(reported_body(&reported, report)),
+            Some(completed()),
         )
         .await
         .with_context(|| format!("completing `{REPORTED_SLUG}` on run {short}"))?;
@@ -1571,12 +2654,63 @@ pub(crate) async fn report_at(
         eprintln!(
             "boss dispatch: run {short} already reported — `{REPORTED_SLUG}` is completed; the record was refreshed"
         );
-    } else {
-        eprintln!(
-            "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {} — it opens on the gate's green; \
-             the report rides the packet, run --report again once the run is at reported",
-            line.status
-        );
+    } else if let Some(waiting) = reported_waiting_line(short, &line.status, &run) {
+        eprintln!("{waiting}");
+    }
+
+    // THE RUN'S SCRATCH TARGET (backlog 4e17c49d): a green run's
+    // worktree target is freed here, at the one moment something knows
+    // the run is finished with it, and what was freed — or why it was
+    // kept — rides the packet. Before the agent_runs record, because a
+    // refusal there must not strand ~20 GB on the scratch; and never
+    // fatal, because the handback is the deliverable
+    // ([`crate::scratch_target`] has the measurement and the guards).
+    if let Some(scratch) = scratch {
+        let (run_v, scratch_v) = (run.clone(), scratch.clone());
+        let (said, record) = tokio::task::spawn_blocking(move || {
+            crate::scratch_target::settle(&run_v, &scratch_v, now)
+        })
+        .await
+        .context("the scratch-target pass did not finish")?;
+        eprintln!("boss dispatch: run {short} {said}");
+        // `None`: the gate's waiter freed it at the green (a3355e14),
+        // and its record — the bytes — is the one to keep.
+        if let Some(record) = record
+            && let Err(e) = api_at(
+                Method::PATCH,
+                format!("/api/jobs/{run_id}/metadata"),
+                Some(json!({ "scratch_target": record })),
+            )
+            .await
+        {
+            eprintln!(
+                "boss dispatch: WARNING — run {short}'s scratch_target could not be recorded on \
+                 the packet ({e:#}); the line above is the only copy"
+            );
+        }
+    }
+
+    // THE WORK PROFILE (backlog 2f23f4c6): where a metered run's tool
+    // time and context went, held beside its record for the IT retro.
+    // Telemetry, so it is written before the terminal check — a
+    // profile needs no outcome — and never fatal: losing it costs the
+    // measurement, and the line says so rather than going quiet.
+    if let Some(m) = &report.meter {
+        let body = serde_json::to_value(&m.profile).context("the work profile serializes")?;
+        match api_at(
+            Method::PUT,
+            format!("/api/agent-runs/{run_id}/profile"),
+            Some(body),
+        )
+        .await
+        {
+            Ok(_) => eprintln!("{}", profile_line(short, &m.profile)),
+            Err(e) => eprintln!(
+                "boss dispatch: WARNING — run {short}'s work profile was not recorded ({e:#}); \
+                 {}",
+                profile_line(short, &m.profile)
+            ),
+        }
     }
 
     // THE FINISH RECORD: what the run cost and how it went, where the
@@ -1592,7 +2726,7 @@ pub(crate) async fn report_at(
         .pointer("/metadata/agent")
         .and_then(Value::as_str)
         .with_context(|| format!("run {short} names no agent"))?;
-    let agents = crate::gate::rows(api_at(Method::GET, "/api/agents".to_string(), None).await?);
+    let agents = crate::train::rows(api_at(Method::GET, "/api/agents".to_string(), None).await?)?;
     let actor_id = resolve_agent(&agents, login).with_context(|| {
         format!(
             "run {short} signs as {login:?}, which no agents row names — register it (an \
@@ -1612,6 +2746,38 @@ pub(crate) async fn report_at(
     Ok(())
 }
 
+/// What a run's work profile says, in one line: where the tool time
+/// and the context went (largest share first), when the first edit
+/// came, and how many searches found nothing (backlog 2f23f4c6).
+pub(crate) fn profile_line(short: &str, p: &boss_jobs::agent_runs::WorkProfile) -> String {
+    let whole = p.by_class.total();
+    let shares = |key: fn(&boss_jobs::agent_runs::ClassTotal) -> u64, of: u64| {
+        let mut named = p.by_class.named().to_vec();
+        named.sort_by_key(|(_, t)| std::cmp::Reverse(key(t)));
+        match of {
+            0 => "none".to_string(),
+            _ => named
+                .iter()
+                .map(|(n, t)| format!("{n} {}%", key(t) * 100 / of))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    };
+    let edit = match p.calls_before_first_edit {
+        Some(n) => format!("first edit after {n} calls"),
+        None => "no edit outside its scratch directory".to_string(),
+    };
+    format!(
+        "boss dispatch: run {short} work profile — {} tool calls; tool time {}; context {}; \
+         {edit}; {} of {} searches empty",
+        p.tool_calls,
+        shares(|t| t.wall_ms, whole.wall_ms),
+        shares(|t| t.result_bytes, whole.result_bytes),
+        p.empty_searches,
+        p.searches,
+    )
+}
+
 /// `boss dispatch --report <run> …` — the handback, by whichever hand
 /// read it. `now` is the finish instant the record carries, read once
 /// at the CLI boundary like every verb's.
@@ -1620,6 +2786,10 @@ pub async fn report(
     summary: String,
     spend_usd: Option<f64>,
     tokens: Option<String>,
+    transcript: Option<std::path::PathBuf>,
+    // A tenant run's receipt (6a34e9bc), read from the check output file
+    // at the CLI boundary.
+    tenant: Option<TenantReceipt>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if summary.trim().is_empty() {
@@ -1637,15 +2807,74 @@ pub async fn report(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let base = crate::gate::resolve_jobs_base(None)?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    report_at(
-        &reqwest::Client::new(),
+    let http = reqwest::Client::new();
+    // METER THE RUN (backlog e6b2066f): its transcript's four counts
+    // are what it consumed, and they supersede a typed count. Read here,
+    // at the CLI boundary, because it is filesystem I/O. The week only
+    // prunes the scan — the run-id phrase is what picks the transcript —
+    // and a report arrives within hours of its run.
+    let run_id = crate::job::fetch_and_resolve(&http, &run_ref).await?;
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    let since = std::time::SystemTime::now()
+        .checked_sub(week)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let root = crate::transcript_usage::projects_root();
+    let meter = match crate::transcript_usage::meter(
+        transcript.as_deref(),
+        root.as_deref(),
+        &run_id,
+        since,
+    ) {
+        Ok(m) => {
+            let u = m.usage;
+            eprintln!(
+                "boss dispatch: metered run {} from {}: model {}, {} turns, {} in / {} cache \
+                 write / {} cache read / {} out = {} processed (final context {}{})",
+                &run_id[..8.min(run_id.len())],
+                m.path.display(),
+                m.models
+                    .recorded()
+                    .unwrap_or_else(|| "unnamed by the transcript".to_string()),
+                u.turns,
+                u.input,
+                u.cache_write,
+                u.cache_read,
+                u.output,
+                u.total(),
+                u.final_context,
+                match tokens {
+                    Some(t) => format!("; the typed --tokens {} is kept beside it", t.total()),
+                    None => String::new(),
+                },
+            );
+            Some(m)
+        }
+        // A named transcript that cannot be read is the caller's error;
+        // a search that found none is a fact about this box, and the
+        // report goes on with what it was given.
+        Err(why) if transcript.is_some() => bail!("{why}"),
+        Err(why) => {
+            eprintln!("boss dispatch: not metered — {why}");
+            None
+        }
+    };
+    // Where this box keeps worktree targets, and which worktree has
+    // which branch — read here, at the boundary, like the transcript.
+    let scratch = tokio::task::spawn_blocking(crate::scratch_target::Scratch::from_env)
+        .await
+        .context("reading the worktree list")?;
+    report_with_receipt_at(
+        &http,
         &base,
-        &run_ref,
+        &run_id,
         &Report {
             summary,
             spend_usd,
             tokens,
+            meter,
         },
+        tenant.as_ref(),
+        Some(&scratch),
         &actor,
         now,
     )
@@ -1667,9 +2896,6 @@ pub async fn run(
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let owner = crate::owner::for_filing_at(&base).await;
     let host = crate::prove::host();
-    let worktree = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
     let over = Overrides {
         model,
         budget_usd: budget,
@@ -1691,7 +2917,6 @@ pub async fn run(
         force,
         &actor,
         &owner,
-        &worktree,
         &host,
         BriefSource::Rendered,
     )
@@ -1912,6 +3137,53 @@ mod tests {
     /// correctly — the link is not the defect — and both were still
     /// `open` at `Proven in prod`, so the arrival rule that closes the
     /// item had nothing to fire on.
+    /// Measured 2026-09-23 (5cb6530a): open cars fc92b86a and 807d47bb
+    /// named packets 28dcc735 and 2d1d298e, and `boss dispatch` exited 0
+    /// on both, because its only refusal read MERGED cars. A car exists
+    /// only once a gate went green (auto-park files it on the green), so
+    /// an open car naming the packet is finished work already parked or
+    /// aboard, and a second run would build it again.
+    #[test]
+    fn a_packet_whose_fix_is_already_an_open_car_is_refused_with_the_car_named() {
+        let item = "28dcc735-0000-0000-0000-000000000000";
+        let parked = json!({
+            "id": "fc92b86a-0000-0000-0000-000000000000",
+            "status": "open",
+            "metadata": { "backlog_item": item, "branch": "fix/the-alias-claim" },
+        });
+        let why = in_flight_car_refusal(item, std::slice::from_ref(&parked)).expect("refused");
+        assert!(why.contains("fc92b86a"), "{why}");
+        assert!(why.contains("fix/the-alias-claim"), "{why}");
+        assert!(why.contains("--force"), "{why}");
+
+        // A car that closed WITHOUT merging (abandoned) carries nothing.
+        let abandoned = json!({
+            "id": "e0000000-0000-0000-0000-000000000000",
+            "status": "closed",
+            "metadata": { "backlog_item": item, "branch": "fix/gave-up", "outcome": "abandoned" },
+        });
+        assert_eq!(in_flight_car_refusal(item, &[abandoned]), None);
+        assert_eq!(in_flight_car_refusal(item, &[]), None);
+
+        // A LANDED car is the landed-work door's, which says more (the
+        // proof to run); this door stays out of its way.
+        let landed = json!({
+            "id": "b0000000-0000-0000-0000-000000000000",
+            "status": "open",
+            "metadata": { "backlog_item": item, "branch": "fix/landed", "merged": "true" },
+        });
+        assert_eq!(in_flight_car_refusal(item, &[landed]), None);
+
+        // THE CONTROL LEG, as for the landed door: a row naming another
+        // packet narrows nothing, even when the server ignored `metadata=`.
+        let other = json!({
+            "id": "d0000000-0000-0000-0000-000000000000",
+            "status": "open",
+            "metadata": { "backlog_item": "aaaaaaaa-0000-0000-0000-000000000000", "branch": "fix/someone-elses" },
+        });
+        assert_eq!(in_flight_car_refusal(item, &[other]), None);
+    }
+
     #[test]
     fn a_packet_whose_car_already_landed_is_refused_with_the_car_named() {
         let item = "f47861a5-2a86-4b8e-bb01-6491377b9499";
@@ -1936,8 +3208,8 @@ mod tests {
         assert!(why.contains("boss prove"), "{why}");
         assert!(why.contains("--force"), "{why}");
 
-        // A car still BUILDING the packet is not landed work: that is
-        // the ordinary in-flight case and must not refuse.
+        // A car that has not merged is not LANDED work, so this door
+        // does not refuse it; the in-flight door does (5cb6530a, below).
         let building = json!({
             "id": "c0000000-0000-0000-0000-000000000000",
             "status": "open",
@@ -2040,7 +3312,6 @@ mod tests {
             "build",
             "claude@algedonic.dev",
             &block(),
-            "/work/boss/.claude/worktrees/agent-a5",
             "boss-dev-0",
             "== THE PACKET ==\nverbatim",
             "emp-david",
@@ -2053,7 +3324,9 @@ mod tests {
             assert!(!md[k].is_null(), "{k} is written");
         }
         assert_eq!(md["budget_usd"], 5.0);
-        assert_eq!(md["worktree"], "/work/boss/.claude/worktrees/agent-a5");
+        // Never the dispatcher's cwd (a3355e14): the only worktree the
+        // run records is the one its gate stamps, carried by the green.
+        assert!(md.get("worktree").is_none(), "{md}");
         assert_eq!(md["host"], "boss-dev-0");
         assert_eq!(md["brief"], "== THE PACKET ==\nverbatim");
         // The API's clock owns the date (no `opened_on` sent, so the
@@ -2068,17 +3341,49 @@ mod tests {
 
     #[test]
     fn briefed_keeps_the_steps_own_keys_and_the_run_section_names_the_export() {
-        let existing = json!({ "metadata": { "authority_role": "platform-admin" } });
-        let body = briefed_body(&existing, 4242);
-        assert_eq!(body["status"], "completed");
-        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
-        assert_eq!(body["metadata"]["prompt_bytes"], "4242");
+        // Only the field, for the merge door; the status goes alone
+        // (e39a9d2a), so neither write carries the step's stored keys.
+        assert_eq!(briefed_writes(4242), json!({ "prompt_bytes": "4242" }));
+        assert_eq!(completed(), json!({ "status": "completed" }));
 
-        let s = run_section("5b1d2c3e-0000-4000-8000-000000000001", &block());
+        let s = run_section("5b1d2c3e-0000-4000-8000-000000000001", &block(), None);
         assert!(s.contains("export BOSS_AGENT_RUN=5b1d2c3e-0000-4000-8000-000000000001"));
         assert!(s.contains("opus-5[1m]") && s.contains("$5") && s.contains("high"));
-        // The cap reaches the runner as the flag it passes (car 3).
-        assert!(s.contains("--max-budget-usd 5"), "{s}");
+        // The budget reaches the run as a reading, never as a stop
+        // (backlog e6b2066f: budgets must not limit building).
+        assert!(s.contains("Budget: $5 declared"), "{s}");
+        assert!(s.contains("not a limit"), "{s}");
+        assert!(!s.contains("stop and report before"), "{s}");
+    }
+
+    /// EVERY RUN GETS A WORKING DIRECTORY OF ITS OWN (backlog dd747b4c).
+    /// Measured 2026-09-24: page-audit runs 36f05857 and a3b88dbf were
+    /// dispatched together, and neither prompt named a place for working
+    /// files, so both wrote `ids.txt`, `t1..t5` and `g1..g5` at the root
+    /// of the scratchpad they share with the session that launched them.
+    /// The second overwrote the first between write and filing, and five
+    /// backlog-items were filed under the receiving audit carrying the
+    /// /it audit's content. The directory is derived from the run id, so
+    /// two runs cannot be handed the same one.
+    #[test]
+    fn the_run_section_names_a_working_directory_derived_from_the_run_id() {
+        const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+        const OTHER: &str = "a3b88dbf-0000-4000-8000-000000000002";
+        assert_eq!(working_dir(RUN), "run-5b1d2c3e");
+        assert_ne!(working_dir(RUN), working_dir(OTHER));
+
+        let s = run_section(RUN, &block(), None);
+        assert!(s.contains("Your working directory: run-5b1d2c3e/"), "{s}");
+        assert!(
+            s.contains("scratchpad"),
+            "it says where the directory lives: {s}"
+        );
+        assert!(s.contains("dd747b4c"), "the line says why: {s}");
+        let other = run_section(OTHER, &block(), None);
+        assert!(other.contains("run-a3b88dbf/") && !other.contains("run-5b1d2c3e"));
+        // The rules documents refer to it by this phrase, so the section
+        // must be the thing that phrase names.
+        assert!(s.contains(WORKING_DIR_REFERENCE), "{s}");
     }
 
     /// The declared effort must reach a CONTROL (backlog e720dd00):
@@ -2092,7 +3397,7 @@ mod tests {
                 ..block()
             };
             let name = boss_jobs::agent_spec::definition_name(effort.as_str());
-            let s = run_section("5b1d2c3e-0000-4000-8000-000000000001", &settings);
+            let s = run_section("5b1d2c3e-0000-4000-8000-000000000001", &settings, None);
             assert!(
                 s.contains(&format!("subagent_type {name}")),
                 "effort {} must name its definition: {s}",
@@ -2107,6 +3412,75 @@ mod tests {
             );
             assert_eq!(subagent_type(&settings), name);
         }
+    }
+
+    /// THE LANE DECIDES THE ISOLATION (backlog 65cea113, 2026-09-23).
+    /// A builder ships a car, so it needs a git tree of its own; an
+    /// analyst ships none — its rules say "No worktree" — yet ran
+    /// worktree-isolated anyway, because isolation was whatever the
+    /// operator typed on the Agent call. Under isolation the harness
+    /// refuses every heredoc and every command it cannot show stays in
+    /// the tree, which the page-march pilot measured at about three
+    /// times the tool calls for a read-only run. The profile's
+    /// document already declares its lane; this reads it.
+    #[test]
+    fn the_run_section_names_the_isolation_the_profiles_lane_declares() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        assert_eq!(
+            Isolation::for_profile(&repo, "builder").expect("builder"),
+            Isolation::Worktree
+        );
+        assert_eq!(
+            Isolation::for_profile(&repo, "analyst").expect("analyst"),
+            Isolation::Shared
+        );
+        // A profile with no document is briefed in the car lane, so it
+        // is isolated the way that lane is — as it was before.
+        assert_eq!(
+            Isolation::for_profile(&repo, "no-such-profile").expect("no document"),
+            Isolation::Worktree
+        );
+
+        const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+        let s = run_section(RUN, &block(), Some(Isolation::Worktree));
+        assert!(s.contains("isolation worktree"), "{s}");
+        let s = run_section(RUN, &block(), Some(Isolation::Shared));
+        assert!(s.contains("WITHOUT isolation"), "{s}");
+        assert!(s.contains("65cea113"), "the line says why: {s}");
+        // Unknown (a lane that would not read) names nothing, and the
+        // call keeps the caller's own choice.
+        let s = run_section(RUN, &block(), None);
+        assert!(!s.contains("isolation"), "{s}");
+    }
+
+    /// A session loads `.claude/agents/*.md` ONCE, at its start
+    /// (backlog e1c4dc93). A definition that arrives after — the car
+    /// that added them, an hourly fast-forward of the pod's checkout —
+    /// is on disk and unknown to that session, so the hook would name
+    /// a `subagent_type` the harness answers `Agent type 'effort-high'
+    /// not found` to. Measured live 2026-09-22: that refusal is loud
+    /// and immediate, so the cost is not a silent fallback but the
+    /// claim and the run this door files BEFORE the Agent call dies.
+    #[test]
+    fn a_definition_the_session_never_loaded_is_named_before_anything_is_filed() {
+        let all: Vec<String> = boss_jobs::agent_spec::Effort::ALL
+            .iter()
+            .map(|e| boss_jobs::agent_spec::definition_name(e.as_str()))
+            .collect();
+        // The whole set loaded: nothing to refuse.
+        assert!(unloaded(&all, &all).is_empty());
+        // A session started before the car that added them.
+        assert_eq!(unloaded(&all, &[]), all);
+        // One arrived since: only that one is named.
+        let older: Vec<String> = all.iter().skip(1).cloned().collect();
+        assert_eq!(unloaded(&all, &older), vec![all[0].clone()]);
+        // A checkout WITHOUT the definitions refuses nothing — that is
+        // `definition_in`'s case, and the caller's own type stands.
+        assert!(unloaded(&[], &[]).is_empty());
+        assert!(unloaded(&[], &all).is_empty());
+        // A name the session loaded that no effort declares is not
+        // this door's business.
+        assert!(unloaded(&["claude".into()], &[]).is_empty());
     }
 
     /// `--tokens` is a total or an input,output split, and the split is
@@ -2142,6 +3516,7 @@ mod tests {
         let split = Report {
             summary: "done".into(),
             spend_usd: Some(4.2),
+            meter: None,
             tokens: Some(Tokens::Split {
                 input: 10,
                 output: 5,
@@ -2176,6 +3551,7 @@ mod tests {
         let total = Report {
             summary: "done".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Total(761_000)),
         };
         let rec = run_record(&run, "agent-claude", &total, at, "success").unwrap();
@@ -2188,6 +3564,74 @@ mod tests {
             run_record(&bare, "agent-claude", &total, at, "success").unwrap()["started_at"],
             "2026-09-18T17:00:00Z"
         );
+
+        // METERED (backlog e6b2066f): the transcript's four counts are
+        // the record, and the typed harness total — the final context
+        // size — rides `detail` beside them, never as them.
+        let metered = Report {
+            summary: "done".into(),
+            spend_usd: None,
+            meter: Some(crate::transcript_usage::Metered {
+                path: "/work/home/.claude/projects/p/s/subagents/agent-a1.jsonl".into(),
+                usage: crate::transcript_usage::Usage {
+                    input: 40,
+                    cache_write: 30_000,
+                    cache_read: 1_470_000,
+                    output: 9_000,
+                    cache_write_1h: 0,
+                    turns: 88,
+                    final_context: 153_121,
+                },
+                models: crate::transcript_usage::RunModels {
+                    billed: vec!["claude-opus-5-5".into()],
+                    identity: Some("claude-opus-5-5[1m]".into()),
+                },
+                profile: boss_jobs::agent_runs::WorkProfile {
+                    tool_calls: 212,
+                    ..Default::default()
+                },
+            }),
+            tokens: Some(Tokens::Total(153_746)),
+        };
+        let rec = run_record(&run, "agent-claude", &metered, at, "success").unwrap();
+        // WHICH MODEL RAN (backlog 6bb85880): the transcript's, not the
+        // block's. The block's word rides `detail` beside it, so a run
+        // on a model other than the one its step declared is visible.
+        assert_eq!(rec["model"], "opus-5-5[1m]");
+        assert_eq!(rec["detail"]["declared_model"], "opus-5[1m]");
+        assert_eq!(
+            rec["detail"]["metered"]["model_ids"],
+            json!(["claude-opus-5-5"])
+        );
+        assert_eq!(
+            rec["detail"]["metered"]["model_identity"],
+            "claude-opus-5-5[1m]"
+        );
+        assert_eq!(rec["input_tokens"], 40);
+        assert_eq!(rec["output_tokens"], 9_000);
+        assert_eq!(rec["cache_read_tokens"], 1_470_000);
+        assert_eq!(rec["cache_write_tokens"], 30_000);
+        assert!(rec.get("total_tokens").is_none(), "derived by the API");
+        assert_eq!(rec["detail"]["metered"]["typed_tokens"], 153_746);
+        assert_eq!(rec["detail"]["metered"]["final_context_tokens"], 153_121);
+        assert_eq!(rec["detail"]["metered"]["turns"], 88);
+        // The column the record always had and nobody filled (backlog
+        // 2f23f4c6): the transcript counts the calls.
+        assert_eq!(rec["tool_calls"], 212);
+        let parsed: boss_jobs::agent_runs::NewAgentRun = serde_json::from_value(rec).unwrap();
+        assert_eq!(parsed.tool_calls, 212);
+        assert_eq!(parsed.tokens.total(), Some(1_509_040));
+        assert_eq!(parsed.model.as_deref(), Some("opus-5-5[1m]"));
+        assert_eq!(report_patch(&metered)["tokens"], 1_509_040);
+
+        // A transcript that names no model leaves the block's word as
+        // the only one there is.
+        let mut silent = metered.clone();
+        if let Some(m) = silent.meter.as_mut() {
+            m.models = crate::transcript_usage::RunModels::default();
+        }
+        let rec = run_record(&run, "agent-claude", &silent, at, "success").unwrap();
+        assert_eq!(rec["model"], "opus-5[1m]");
     }
 
     /// THE CAR THE RUN PRODUCED, AND THE COUNT NOBODY TOOK — the two
@@ -2263,6 +3707,7 @@ mod tests {
         let silent = Report {
             summary: "done".into(),
             spend_usd: None,
+            meter: None,
             tokens: None,
         };
         let rec = run_record(&gated, "agent-claude", &silent, at, "success").unwrap();
@@ -2334,6 +3779,7 @@ mod tests {
         let r = Report {
             summary: "done".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Total(761_000)),
         };
         let rec = run_record(&run(done("refused")), "agent-claude", &r, at, "cancelled").unwrap();
@@ -2442,6 +3888,7 @@ mod tests {
         let r = Report {
             summary: "packet x, branch y, sha z".into(),
             spend_usd: Some(3.5),
+            meter: None,
             tokens: Some(Tokens::Total(1000)),
         };
         let patch = report_patch(&r);
@@ -2451,28 +3898,23 @@ mod tests {
             "a number on the packet, as the schema says"
         );
         assert_eq!(patch["tokens"], 1000);
-        let existing = json!({ "metadata": { "authority_role": "platform-admin" } });
-        let body = reported_body(&existing, &r);
-        assert_eq!(body["status"], "completed");
-        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
-        assert_eq!(body["metadata"]["summary"], "packet x, branch y, sha z");
+        // The step's fields, and only those — the merge door keeps the
+        // step's own keys (e39a9d2a).
         assert_eq!(
-            body["metadata"]["spend_usd"], "3.5",
+            reported_writes(&r),
+            json!({ "summary": "packet x, branch y, sha z", "spend_usd": "3.5",
+                    "tokens": "1000" }),
             "string fields on the row"
         );
-        assert_eq!(body["metadata"]["tokens"], "1000");
         // Nothing is written for what was not given.
         let bare = Report {
             summary: "s".into(),
             spend_usd: None,
+            meter: None,
             tokens: None,
         };
         assert!(report_patch(&bare).get("spend_usd").is_none());
-        assert!(
-            reported_body(&existing, &bare)["metadata"]
-                .get("tokens")
-                .is_none()
-        );
+        assert_eq!(reported_writes(&bare), json!({ "summary": "s" }));
     }
 
     /// A SECOND `--report` on a run already in `agent_runs` writes
@@ -2497,6 +3939,7 @@ mod tests {
         let r = Report {
             summary: "handback".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Split {
                 input: 300_000,
                 output: 17_000,
@@ -2539,6 +3982,7 @@ mod tests {
         let r = Report {
             summary: "handback".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Total(210_000)),
         };
         let line = record_line("54f43757", "agent-claude", Some(&out), &r)
@@ -2563,6 +4007,7 @@ mod tests {
         let r = Report {
             summary: "s".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Split {
                 input: 740_000,
                 output: 21_000,
@@ -2579,21 +4024,66 @@ mod tests {
         let r = Report {
             summary: "s".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Total(210_000)),
         };
         let line = record_line("54f43757", "agent-claude", Some(&blended), &r).expect("recorded");
         assert!(line.contains("BLENDED, not measured"), "{line}");
-        assert!(line.contains("Give --tokens IN,OUT"), "{line}");
+        // The advice is metering now (backlog e6b2066f): a typed split
+        // omits the cache reads that are most of a run.
+        assert!(line.contains("pass --transcript"), "{line}");
+
+        let metered = json!({
+            "recorded": true,
+            "run": {
+                "usd_micros": 1_147_700, "input_tokens": 40, "output_tokens": 9_000,
+                "cache_read_tokens": 1_470_000, "cache_write_tokens": 30_000,
+            },
+        });
+        let line = record_line("54f43757", "agent-claude", Some(&metered), &r).expect("recorded");
+        assert!(line.contains("$1.1477"), "{line}");
+        assert!(line.contains("METERED"), "{line}");
+        assert!(!line.contains("--transcript"), "nothing to advise: {line}");
 
         let unpriced = json!({ "recorded": true, "run": { "total_tokens": null } });
         let r = Report {
             summary: "s".into(),
             spend_usd: None,
+            meter: None,
             tokens: None,
         };
         let line = record_line("54f43757", "agent-claude", Some(&unpriced), &r).expect("recorded");
         assert!(line.contains("unpriced"), "{line}");
         assert!(line.contains("recorded in full either way"), "{line}");
+    }
+
+    /// A METERED run the card cannot price is unpriced BY NAME (backlog
+    /// 6bb85880): its four counts are all there, so the only thing
+    /// missing is a row for the model it ran on — and the line says
+    /// which model, and that no neighbour's rate stands in for it.
+    /// Advising `--transcript` here would send the operator to re-read
+    /// a transcript that was already read.
+    #[test]
+    fn a_metered_run_on_a_model_the_card_does_not_name_is_unpriced_by_name() {
+        let out = json!({
+            "recorded": true,
+            "run": {
+                "model": "opus-9-9", "usd_micros": null,
+                "input_tokens": 40, "output_tokens": 9_000,
+                "cache_read_tokens": 1_470_000, "cache_write_tokens": 30_000,
+            },
+        });
+        let r = Report {
+            summary: "s".into(),
+            spend_usd: None,
+            meter: None,
+            tokens: None,
+        };
+        let line = record_line("54f43757", "agent-claude", Some(&out), &r).expect("recorded");
+        assert!(line.contains("unpriced"), "{line}");
+        assert!(line.contains("`opus-9-9`"), "names the model: {line}");
+        assert!(line.contains("never a neighbour"), "{line}");
+        assert!(!line.contains("--transcript"), "already metered: {line}");
     }
 
     #[test]
@@ -2634,6 +4124,24 @@ mod wire_tests {
     /// One request as the stub reads it: method, path (query stripped),
     /// the full target, and the JSON body.
     type Answer = (&'static str, String);
+
+    /// A step PUT on the run, answered as the END STATE of design
+    /// 93d2bddb answers it (e39a9d2a): a body carrying `metadata` is
+    /// refused, one carrying the status alone lands. One stage stricter
+    /// than the live server — which refuses only a body that OMITS a
+    /// stored key — so the run's completions are pinned to the form that
+    /// survives the tighten, and a slide back to a read-merge-write PUT
+    /// fails here rather than on the day the tighten lands.
+    fn run_step_put(body: &Value) -> Answer {
+        if body.get("metadata").is_some() {
+            (
+                "409 Conflict",
+                r#"{"error":"a step PUT carries no metadata; use the merge door"}"#.into(),
+            )
+        } else {
+            ("204 No Content", String::new())
+        }
+    }
 
     /// The HTTP loop every stub here shares: reads one request per
     /// connection, logs it, and answers with what `route` says.
@@ -2720,7 +4228,28 @@ mod wire_tests {
         claim_conflict: bool,
         level: Option<Option<&'static str>>,
     ) -> (String, Log) {
+        stub_losing(packet, row, claim_conflict, level, 0, 0).await
+    }
+
+    /// `lost`: how many merges onto the run's steps answer 204 and store
+    /// nothing — the shape run 6b6fe011 met on 2026-09-25, when a
+    /// concurrent whole-row write erased `prompt_bytes` after the merge
+    /// door had answered (backlog e381689d). Every other merge is
+    /// stored, so a read-back sees exactly what the door kept.
+    /// `raced`: how many step PUTs on the run answer the 409 the jobs
+    /// API now gives a write whose read another writer moved
+    /// ([`boss_jobs::step_metadata_write::STEP_CHANGED_ERROR`]).
+    async fn stub_losing(
+        packet: Value,
+        row: Value,
+        claim_conflict: bool,
+        level: Option<Option<&'static str>>,
+        lost: usize,
+        raced: usize,
+    ) -> (String, Log) {
         let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let lost = Arc::new(Mutex::new(lost));
+        let raced = Arc::new(Mutex::new(raced));
         serve(move |method, path, target, body| {
             let (status, resp): (&str, String) = match (method, path) {
                     ("GET", p) if p == format!("/api/jobs/{PACKET}") => {
@@ -2768,6 +4297,31 @@ mod wire_tests {
                         }
                     }
                     ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                        let mut left = raced.lock().unwrap();
+                        if *left > 0 {
+                            *left -= 1;
+                            (
+                                "409 Conflict",
+                                json!({
+                                    "error": boss_jobs::step_metadata_write::STEP_CHANGED_ERROR,
+                                    "step_id": "run-briefed",
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            run_step_put(body)
+                        }
+                    }
+                    // The run's step merge door: `briefed`'s fields,
+                    // stored on the step unless this merge is one the
+                    // stub was told to lose.
+                    ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                        let mut left = lost.lock().unwrap();
+                        if *left > 0 {
+                            *left -= 1;
+                        } else {
+                            stub_merge(&run, RUN, p, body);
+                        }
                         ("204 No Content", String::new())
                     }
                     // The edge onto the CLAIMED step (dd6d44b7) — on
@@ -2842,7 +4396,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/work/boss/.claude/worktrees/agent-x",
             "boss-dev-0",
             BriefSource::Rendered,
         )
@@ -2863,6 +4416,9 @@ mod wire_tests {
                 // a packet a merged car already names is refused while
                 // nothing has been claimed and nothing filed.
                 ("GET".to_string(), "/api/jobs".to_string()),
+                // What is already named (7562d7a0): the landed
+                // `partial_item` cars, also read while nothing is held.
+                ("GET".to_string(), "/api/jobs".to_string()),
                 ("GET".to_string(), "/api/workflows/backlog-item".to_string()),
                 (
                     "POST".to_string(),
@@ -2879,6 +4435,16 @@ mod wire_tests {
                     "PATCH".to_string(),
                     format!("/api/jobs/{PACKET}/steps/s-build/metadata")
                 ),
+                ("GET".to_string(), format!("/api/jobs/{RUN}")),
+                // `briefed` completes as TWO writes (e39a9d2a): its
+                // field through the merge door, then the status alone.
+                (
+                    "PATCH".to_string(),
+                    format!("/api/jobs/{RUN}/steps/run-briefed/metadata")
+                ),
+                // …read back before the status is sent (e381689d): a
+                // 204 from the merge door is a claim, the step is the
+                // fact.
                 ("GET".to_string(), format!("/api/jobs/{RUN}")),
                 (
                     "PUT".to_string(),
@@ -2928,9 +4494,9 @@ mod wire_tests {
             "the override, and only it"
         );
         assert_eq!(filed["metadata"]["effort"], "high");
-        assert_eq!(
-            filed["metadata"]["worktree"],
-            "/work/boss/.claude/worktrees/agent-x"
+        assert!(
+            filed["metadata"].get("worktree").is_none(),
+            "the dispatcher's cwd is not the run's worktree (a3355e14)"
         );
         assert_eq!(filed["metadata"]["host"], "boss-dev-0");
         let brief = filed["metadata"]["brief"].as_str().unwrap();
@@ -2946,17 +4512,164 @@ mod wire_tests {
         assert!(brief.contains("# Builder rules"), "the profile's document");
         assert!(prompt.contains(&format!("export BOSS_AGENT_RUN={RUN}")));
 
+        let merged = &calls
+            .iter()
+            .find(|(m, p, _)| m == "PATCH" && p.ends_with("/steps/run-briefed/metadata"))
+            .expect("the briefed field goes through the merge door")
+            .2;
+        assert_eq!(
+            *merged,
+            json!({ "prompt_bytes": prompt.len().to_string() }),
+            "only the field travels; the step's stored keys stay where they are"
+        );
         let briefed = &calls
             .iter()
             .find(|(m, p, _)| m == "PUT" && p.ends_with("/steps/run-briefed"))
             .expect("the briefed step is completed")
             .2;
-        assert_eq!(briefed["status"], "completed");
+        assert_eq!(*briefed, json!({ "status": "completed" }));
+    }
+
+    fn briefed_calls(log: &Log) -> Vec<String> {
+        log.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _)| p.contains("/steps/run-briefed"))
+            .map(|(m, _, _)| m.clone())
+            .collect()
+    }
+
+    async fn dispatch_to(base: &str) -> Result<Dispatched> {
+        dispatch_at(
+            &reqwest::Client::new(),
+            base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+        )
+        .await
+    }
+
+    /// Run 6b6fe011, 2026-09-25 (backlog e381689d): the merge answered
+    /// 204 and the key was not on the step. A merge lost once is a race,
+    /// so it is written again, read back, and only then is the status
+    /// sent.
+    #[tokio::test]
+    async fn a_briefed_field_lost_once_is_written_again_before_the_completion() {
+        let (base, log) = stub_losing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            1,
+            0,
+        )
+        .await;
+        dispatch_to(&base)
+            .await
+            .expect("dispatches on the second write");
         assert_eq!(
-            briefed["metadata"]["prompt_bytes"],
-            prompt.len().to_string()
+            briefed_calls(&log),
+            vec!["PATCH", "PATCH", "PUT"],
+            "the field twice, then the status — never the status over a missing field"
         );
-        assert_eq!(briefed["metadata"]["authority_role"], "platform-admin");
+    }
+
+    /// Reproduced live on run 9aa88562 at 11:26:01Z the same day: the
+    /// dispatcher writes the new run's `briefed` step twice within ~25 ms
+    /// of it going ready, and the completing PUT lands in that window.
+    /// The jobs API now refuses the loser of that race with a named 409
+    /// rather than letting it erase the other write; the status-only
+    /// completion carries nothing that can be stale, so it is sent once
+    /// more on exactly that refusal and on no other.
+    #[tokio::test]
+    async fn a_completion_that_loses_the_race_is_sent_once_more() {
+        let (base, log) = stub_losing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            0,
+            1,
+        )
+        .await;
+        dispatch_to(&base)
+            .await
+            .expect("dispatches on the second completion");
+        assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT", "PUT"]);
+    }
+
+    /// Losing twice is not a race any longer, and it is not retried
+    /// into silence: the refusal is the API's own, named.
+    #[tokio::test]
+    async fn a_completion_that_keeps_losing_is_refused_with_the_apis_reason() {
+        let (base, log) = stub_losing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            0,
+            2,
+        )
+        .await;
+        let err = match dispatch_to(&base).await {
+            Ok(_) => panic!("a completion refused twice must not dispatch"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT", "PUT"]);
+        assert!(
+            err.contains("completing the run's briefed step")
+                && err.contains(boss_jobs::step_metadata_write::STEP_CHANGED_ERROR),
+            "{err}"
+        );
+    }
+
+    /// A merge that never holds is not retried into silence: the run is
+    /// refused by name, `briefed` is left OPEN (no completing PUT is
+    /// sent), and the refusal names the two writes that finish this run.
+    #[tokio::test]
+    async fn a_briefed_field_that_never_holds_is_refused_by_name_and_left_open() {
+        let (base, log) = stub_losing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            BRIEFED_ATTEMPTS,
+            0,
+        )
+        .await;
+        let err = match dispatch_to(&base).await {
+            Ok(_) => panic!("a field the step does not hold must not dispatch"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert_eq!(
+            briefed_calls(&log),
+            vec!["PATCH"; BRIEFED_ATTEMPTS],
+            "no completion over a record the step does not hold"
+        );
+        assert!(err.contains(&RUN[..8]), "names the run: {err}");
+        assert!(
+            err.contains("does not hold prompt_bytes"),
+            "names the field: {err}"
+        );
+        assert!(
+            err.contains("prompt_bytes: wrote a value but the packet has no such key"),
+            "carries what the step holds instead: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "boss-api PATCH /api/jobs/{RUN}/steps/run-briefed/metadata"
+            )) && err.contains(&format!("boss-api PUT /api/jobs/{RUN}/steps/run-briefed")),
+            "names the writes that finish this run: {err}"
+        );
     }
 
     /// A step nobody declared a block for is refused BEFORE the claim —
@@ -2980,7 +4693,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Rendered,
         )
@@ -2999,11 +4711,496 @@ mod wire_tests {
         assert_eq!(writes, 0, "nothing claimed, nothing filed");
     }
 
+    /// THE 09b354e7 CASE: a packet pinned to v2, whose step carries the
+    /// fields v2 declared (none), is NOT dispatched under the active
+    /// row's block when that row's step declares different fields — the
+    /// run would be briefed for a contract its pinned step does not
+    /// have. Refused before the claim, naming the step, both versions
+    /// and the convert that moves the packet.
+    #[tokio::test]
+    async fn a_pinned_step_whose_fields_differ_from_the_active_row_is_refused() {
+        let mut packet = packet_without_projection();
+        packet["workflow_version"] = json!(2);
+        packet["steps"][1]["fields"] = json!([]);
+        let mut row = row_with_block();
+        row["version"] = json!(11);
+        row["steps"][1]["fields"] = json!([
+            { "name": "evidence", "field_type": "text", "required": true },
+        ]);
+        let (base, log) = stub(packet, row, false).await;
+        let err = dispatch_at(
+            &reqwest::Client::new(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("step `build`"), "{text}");
+        assert!(text.contains("v2") && text.contains("v11"), "{text}");
+        assert!(
+            text.contains(&format!("boss job convert {} --to v11", &PACKET[..8])),
+            "{text}"
+        );
+        let writes = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _, _)| m != "GET")
+            .count();
+        assert_eq!(writes, 0, "nothing claimed, nothing filed");
+    }
+
     /// The packet, declaring the paths its change will touch.
     fn packet_declaring(paths: &[&str]) -> Value {
         let mut p = packet_without_projection();
         p["metadata"]["paths"] = json!(paths);
         p
+    }
+
+    /// The packet, declaring that its deliverable lives in a tenant repo.
+    fn packet_in(tenant_repo: Value) -> Value {
+        let mut p = packet_without_projection();
+        p["metadata"][TENANT_REPO_KEY] = tenant_repo;
+        p
+    }
+
+    /// The same row, its `build` step dispatched to a STEP-lane
+    /// profile — one whose deliverable is the step itself.
+    fn row_with_analyst_block() -> Value {
+        let mut r = row_with_block();
+        r["steps"][1]["agent"]["profile"] = json!("analyst");
+        r
+    }
+
+    /// The tenant repo the live instances file serves — read, never
+    /// typed, so this test follows the estate rather than a literal.
+    fn served_repo() -> crate::brief::TenantSource {
+        let text =
+            std::fs::read_to_string(repo().join(crate::brief::INSTANCES)).expect("instances.toml");
+        crate::brief::tenant_sources(&text)
+            .into_iter()
+            .next()
+            .expect("an instance serves a tenant repo")
+    }
+
+    /// THE TENANT LANE (design fd8b5143, backlog 6a34e9bc). A packet
+    /// whose deliverable is a tenant repo was refused for a car-lane
+    /// profile (10b07b73) — correctly, since the builder's brief is
+    /// entirely this tree's gate — and nothing built it instead, so
+    /// 86f32b7d ran twice (4c158269, ed63e78b) and landed nothing. The
+    /// same dispatch now BRIEFS it: claimed, filed and printed as the
+    /// tenant builder, in the tenant lane, with the repo and the ref the
+    /// instance declares on the run for `--report` to read, no worktree
+    /// of this tree, and none of the car lane's gate facts.
+    #[tokio::test]
+    async fn a_car_lane_dispatch_of_a_tenant_repo_packet_is_briefed_in_the_tenant_lane() {
+        let served = served_repo();
+        let (base, log) = stub(packet_in(json!(served.repo)), row_with_block(), false).await;
+        let d = dispatch_at(
+            &reqwest::Client::new(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect("briefed, not refused");
+        assert_eq!(d.run_id, RUN);
+        assert_eq!(
+            d.isolation,
+            Some(Isolation::Shared),
+            "no worktree of this tree: {:?}",
+            d.isolation
+        );
+        let calls = log.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p.ends_with("/claim")),
+            "the step is claimed: {calls:?}"
+        );
+        let filed = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .expect("the run is filed")
+            .2;
+        assert!(
+            filed["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("tenant-builder run:")),
+            "{filed}"
+        );
+        assert_eq!(filed["metadata"][TENANT_REPO_KEY], served.repo.as_str());
+        assert_eq!(filed["metadata"][TENANT_REF_KEY], served.reference.as_str());
+        let brief = filed["metadata"]["brief"].as_str().unwrap();
+        assert!(brief.contains("# Tenant builder rules"), "{brief}");
+        assert!(
+            brief.contains("== THE INVARIANTS — for the `tenant` lane"),
+            "{brief}"
+        );
+        assert!(brief.contains(&served.repo), "names the repo: {brief}");
+        assert!(!brief.contains("# Builder rules"), "{brief}");
+        assert!(
+            !brief.contains("gate uid"),
+            "no car-lane gate facts: {brief}"
+        );
+        assert!(d.prompt.contains("WITHOUT isolation"), "{}", d.prompt);
+    }
+
+    /// A repo no instance serves has nowhere to land — tenant main is
+    /// an instance's, reached only through merge-tenant-main — so the
+    /// packet is refused before the claim, naming what IS served.
+    #[tokio::test]
+    async fn a_tenant_repo_no_instance_serves_is_refused_before_the_claim() {
+        let (base, log) = stub(
+            packet_in(json!("nobody/not-an-instance")),
+            row_with_block(),
+            false,
+        )
+        .await;
+        let err = dispatch_at(
+            &reqwest::Client::new(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("nobody/not-an-instance"), "{text}");
+        assert!(text.contains(crate::brief::INSTANCES), "{text}");
+        assert!(
+            text.contains(&served_repo().repo),
+            "names what is served: {text}"
+        );
+        assert!(text.contains("nothing claimed, nothing filed"), "{text}");
+        assert_eq!(writes_of(&log), 0, "nothing claimed, nothing filed");
+    }
+
+    /// A step-lane profile ships no car, so where the deliverable lives
+    /// is not its question: the same packet is dispatched as any other.
+    #[tokio::test]
+    async fn a_step_lane_dispatch_of_a_tenant_repo_packet_is_admitted() {
+        let (base, _log) = stub(
+            packet_in(json!("david/algedonic-llc")),
+            row_with_analyst_block(),
+            false,
+        )
+        .await;
+        let d = dispatch_at(
+            &reqwest::Client::new(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await
+        .expect("dispatched");
+        assert_eq!(d.run_id, RUN);
+    }
+
+    /// The pure verdict, every arm. A packet declaring nothing is this
+    /// tree's (every packet before this car). A declaration the door
+    /// cannot read is refused in the car lane rather than read as
+    /// absent — a clean door that never looked is the shape 7b7e0529
+    /// removed from the landed-work door.
+    #[test]
+    fn the_venue_verdict_reads_the_declaration_and_the_lane() {
+        let sources = vec![crate::brief::TenantSource {
+            instance: "prod".into(),
+            repo: "acme/acme-co".into(),
+            reference: "main".into(),
+        }];
+        let v = |profile: &str, lane: &str, job: &Value| {
+            venue("39d0b528", "build", profile, lane, job, &sources)
+        };
+        let this_tree = |profile: &str| Venue {
+            profile: profile.into(),
+            tenant: None,
+        };
+        let none = packet_without_projection();
+        let tenant = packet_in(json!("acme/acme-co"));
+
+        // This tree: a car-lane packet declaring nothing, and a step
+        // lane whatever it declares — unchanged.
+        assert_eq!(v("builder", "car", &none), Ok(this_tree("builder")));
+        assert_eq!(v("analyst", "step", &tenant), Ok(this_tree("analyst")));
+        assert_eq!(
+            v("analyst", "step", &packet_in(json!(7))),
+            Ok(this_tree("analyst"))
+        );
+
+        // A served tenant repo: a car-lane block is briefed as the
+        // tenant builder; a tenant-lane block keeps its own profile.
+        let tenant_venue = |profile: &str| Venue {
+            profile: profile.into(),
+            tenant: Some(sources[0].clone()),
+        };
+        assert_eq!(
+            v("builder", "car", &tenant),
+            Ok(tenant_venue(TENANT_BUILDER_PROFILE))
+        );
+        assert_eq!(
+            v(TENANT_BUILDER_PROFILE, "tenant", &tenant),
+            Ok(tenant_venue(TENANT_BUILDER_PROFILE))
+        );
+
+        // A tenant-lane block with no repo named has nothing to build in.
+        let why = v(TENANT_BUILDER_PROFILE, "tenant", &none).expect_err("refused");
+        assert!(
+            why.contains(&format!("metadata.{TENANT_REPO_KEY}")),
+            "{why}"
+        );
+        assert!(why.contains("acme/acme-co"), "names what is served: {why}");
+
+        // A repo no instance serves has nowhere to land.
+        let why = v("builder", "car", &packet_in(json!("other/repo"))).expect_err("refused");
+        assert!(
+            why.contains("other/repo") && why.contains("no instance"),
+            "{why}"
+        );
+
+        for unreadable in [json!(""), json!("  "), json!(7), json!(["acme/acme-co"])] {
+            let p = packet_in(unreadable.clone());
+            for (profile, lane) in [("builder", "car"), (TENANT_BUILDER_PROFILE, "tenant")] {
+                let why = v(profile, lane, &p)
+                    .expect_err(&format!("{unreadable} must refuse, not read as absent"));
+                assert!(why.contains("cannot be read"), "{why}");
+            }
+        }
+        // A JSON null is how the metadata PATCH DELETES a key, so a
+        // null that survives is read as no declaration.
+        assert_eq!(
+            v("builder", "car", &packet_in(Value::Null)),
+            Ok(this_tree("builder"))
+        );
+    }
+
+    /// ONE READER FOR BOTH VERBS (CLAUDE.md 9a): `boss brief` asks the
+    /// same [`venue_in`] the dispatch does, over the same checkout, so a
+    /// human briefing a tenant packet reads the tenant lane the agent
+    /// will — and a repo no instance serves is refused by both.
+    #[test]
+    fn the_brief_and_the_dispatch_read_one_venue_off_the_checkout() {
+        let served = served_repo();
+        let tenant = packet_in(json!(served.repo));
+        let v = venue_in(&repo(), &tenant, "build", "builder").expect("admitted");
+        assert_eq!(v.profile, TENANT_BUILDER_PROFILE);
+        assert_eq!(v.tenant, Some(served));
+        let plain =
+            venue_in(&repo(), &packet_without_projection(), "build", "builder").expect("admitted");
+        assert_eq!(plain.profile, "builder");
+        assert_eq!(plain.tenant, None);
+        assert!(
+            venue_in(
+                &repo(),
+                &packet_in(json!("nobody/else")),
+                "build",
+                "builder"
+            )
+            .is_err()
+        );
+    }
+
+    /// A delivered tenant run, as `--report` reads it: dispatched with
+    /// the instance's repo and ref, `building` completed `delivered`.
+    fn tenant_run(reported_status: &str) -> Value {
+        let mut run = run_packet(reported_status);
+        run["title"] = json!("tenant-builder run: A tenant change");
+        run["metadata"][TENANT_REPO_KEY] = json!("acme/acme-co");
+        run["metadata"][TENANT_REF_KEY] = json!("main");
+        run["steps"][2]["metadata"]["result"] = json!("delivered");
+        run
+    }
+
+    /// A passing receipt, rendered by the check itself over a fresh
+    /// tenant — never a string typed to look like one.
+    fn passing_check() -> String {
+        let dir = boss_testing::scratch_dir("dispatch-tenant-receipt");
+        crate::tenant::init("acme", Some(&dir)).expect("init");
+        crate::tenant::check(&dir).render(&dir)
+    }
+
+    fn receipt(check: String) -> TenantReceipt {
+        TenantReceipt {
+            check,
+            branch: "feat/a-tenant-change".into(),
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+        }
+    }
+
+    /// THE TENANT RECEIPT DOOR, every arm (design fd8b5143, backlog
+    /// 6a34e9bc). A tenant car has no gate, so a `delivered` tenant run
+    /// lands on the check's own PASS or not at all; the refusal comes
+    /// before any write and names the flags that carry the receipt.
+    #[test]
+    fn a_delivered_tenant_run_is_refused_a_report_without_a_passing_receipt() {
+        let run = tenant_run("ready");
+        let pass = receipt(passing_check());
+
+        // Delivered, no receipt given and none on the packet.
+        let why = tenant_receipt_verdict("5b1d2c3e", &run, None).expect_err("refused");
+        assert!(why.contains("--tenant-check-file"), "{why}");
+        assert!(why.contains("No receipt is on the packet"), "{why}");
+
+        // A passing receipt is recorded, whole.
+        let rec = tenant_receipt_verdict("5b1d2c3e", &run, Some(&pass))
+            .expect("admitted")
+            .expect("recorded");
+        assert_eq!(rec["check"], pass.check.as_str());
+        assert_eq!(rec["branch"], "feat/a-tenant-change");
+        assert_eq!(rec["sha"], pass.sha.as_str());
+
+        // One an earlier report put on the packet stands for a retry.
+        let mut held = run.clone();
+        held["metadata"][TENANT_RECEIPT_KEY] = rec.clone();
+        assert_eq!(tenant_receipt_verdict("5b1d2c3e", &held, None), Ok(None));
+        // ...unless what is held does not pass.
+        held["metadata"][TENANT_RECEIPT_KEY]["check"] = json!("it passed, trust me");
+        let why = tenant_receipt_verdict("5b1d2c3e", &held, None).expect_err("refused");
+        assert!(why.contains("does not stand"), "{why}");
+
+        // A FAIL, a short sha, and a branch that IS the ref are refused.
+        let fail = pass.check.replace("— PASS", "— FAIL");
+        for (bad, says) in [
+            (receipt(fail), "not a passing"),
+            (
+                TenantReceipt {
+                    sha: "0123456".into(),
+                    ..pass.clone()
+                },
+                "full commit sha",
+            ),
+            (
+                TenantReceipt {
+                    branch: "main".into(),
+                    ..pass.clone()
+                },
+                "merge-tenant-main",
+            ),
+        ] {
+            let why = tenant_receipt_verdict("5b1d2c3e", &run, Some(&bad)).expect_err("refused");
+            assert!(why.contains(says), "{says}: {why}");
+        }
+
+        // Before the terminal, nothing is demanded yet.
+        let mut building = tenant_run("pending");
+        building["steps"][2] = json!({ "id": "run-building", "spec_slug": "building", "status": "active", "metadata": {} });
+        assert_eq!(
+            tenant_receipt_verdict("5b1d2c3e", &building, None),
+            Ok(None)
+        );
+
+        // A BOSS run needs none, and is refused one it cannot hold.
+        let boss = run_packet("ready");
+        assert_eq!(tenant_receipt_verdict("5b1d2c3e", &boss, None), Ok(None));
+        let why = tenant_receipt_verdict("5b1d2c3e", &boss, Some(&pass)).expect_err("refused");
+        assert!(why.contains("not a tenant-builder run"), "{why}");
+    }
+
+    /// The door on the wire: refused, a delivered tenant run's report
+    /// writes NOTHING — no handback, no `reported`, no cost row; given a
+    /// passing receipt it lands, with the receipt on the packet and the
+    /// tenant branch on the finish record.
+    #[tokio::test]
+    async fn a_tenant_report_lands_only_on_a_copied_pass() {
+        let report = Report {
+            summary: "tenant handback".into(),
+            spend_usd: None,
+            meter: None,
+            tokens: Some(Tokens::Total(1000)),
+        };
+        let at = "2026-09-24T23:00:00Z".parse().unwrap();
+
+        let (base, log) = report_stub(tenant_run("ready")).await;
+        let err = report_with_receipt_at(
+            &reqwest::Client::new(),
+            &base,
+            RUN,
+            &report,
+            None,
+            None,
+            "claude@algedonic.dev",
+            at,
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("--tenant-check-file"),
+            "{err:#}"
+        );
+        assert_eq!(writes_of(&log), 0, "nothing recorded");
+
+        let pass = receipt(passing_check());
+        let (base, log) = report_stub(tenant_run("ready")).await;
+        report_with_receipt_at(
+            &reqwest::Client::new(),
+            &base,
+            RUN,
+            &report,
+            Some(&pass),
+            None,
+            "claude@algedonic.dev",
+            at,
+        )
+        .await
+        .expect("lands");
+        let calls = log.calls.lock().unwrap().clone();
+        let patch = &calls
+            .iter()
+            .find(|(m, p, _)| m == "PATCH" && p.ends_with("/metadata"))
+            .expect("the handback is on the packet")
+            .2;
+        assert_eq!(patch[TENANT_RECEIPT_KEY]["check"], pass.check.as_str());
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.ends_with("/steps/run-reported")),
+            "`reported` completed: {calls:?}"
+        );
+        let rec = &calls
+            .iter()
+            .find(|(m, _, _)| m == "POST")
+            .expect("the finish is recorded")
+            .2;
+        assert_eq!(rec["outcome"], "success");
+        assert_eq!(rec["branch"], "feat/a-tenant-change");
     }
 
     fn writes_of(log: &Log) -> usize {
@@ -3048,7 +5245,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Rendered,
         )
@@ -3084,7 +5280,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Handed {
                 prompt: "p",
@@ -3126,7 +5321,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             handed,
         )
@@ -3153,7 +5347,6 @@ mod wire_tests {
                 false,
                 "claude@algedonic.dev",
                 "emp-david",
-                "/wt",
                 "h",
                 handed,
             )
@@ -3179,7 +5372,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Rendered,
         )
@@ -3244,7 +5436,6 @@ mod wire_tests {
             false,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Rendered,
         )
@@ -3309,6 +5500,10 @@ mod wire_tests {
                     }
                 }
                 ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                    run_step_put(body)
+                }
+                ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                    stub_merge(&run, RUN, p, body);
                     ("204 No Content", String::new())
                 }
                 // The run edge (dd6d44b7): dispatch writes `agent_run`
@@ -3332,7 +5527,6 @@ mod wire_tests {
             true,
             "claude@algedonic.dev",
             "emp-david",
-            "/wt",
             "h",
             BriefSource::Rendered,
         )
@@ -3346,9 +5540,123 @@ mod wire_tests {
             "the run is filed: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|(m, p, _)| m == "GET" && p == "/api/jobs"),
+            !calls
+                .iter()
+                .any(|(m, p, _)| m == "GET" && p.contains("backlog_item")),
             "and --force does not spend the read it would ignore: {calls:?}"
         );
+    }
+
+    /// WHAT IS ALREADY NAMED reaches the one who spends the run (backlog
+    /// 7562d7a0, 65a753b7). Measured 2026-09-24: 56727f95 was dispatched
+    /// with every buildable car of its plan landed as `partial_item`
+    /// cars, which no door reads, and run b072e827 spent itself finding
+    /// that out. Those cars are read BEFORE the claim — so the warning
+    /// is on stderr while nothing is held — and named in the brief,
+    /// between the packet and its invariants.
+    #[tokio::test]
+    async fn the_landed_parts_of_a_packet_are_named_in_its_brief() {
+        let part = json!({
+            "data": [{
+                "id": "0d9163d3-0000-4000-8000-000000000001",
+                "status": "closed",
+                "metadata": {
+                    "partial_item": PACKET,
+                    "branch": "feat/a-correction-names-what-it-corrects",
+                    "merge_ref": "5d1e2f3a4b5c",
+                    "outcome": "merged",
+                    "summary": "POST /api/jobs/{id}/steps/{step_id}/corrections with its three refusals.",
+                },
+            }],
+            "total": 1,
+        });
+        let (base, log) = {
+            let row = row_with_block();
+            let packet = packet_without_projection();
+            let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+            serve(move |method, path, target, body| match (method, path) {
+                ("GET", p) if p == format!("/api/jobs/{PACKET}") => ("200 OK", packet.to_string()),
+                ("GET", "/api/tenant/edit-level") => (
+                    "200 OK",
+                    json!({ "edit_level": Value::Null, "manifest": "t.toml" }).to_string(),
+                ),
+                ("GET", "/api/jobs") if target.contains("partial_item") => {
+                    ("200 OK", part.to_string())
+                }
+                ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+                ("GET", "/api/workflows/backlog-item") => ("200 OK", row.to_string()),
+                ("POST", p) if p.ends_with("/claim") => {
+                    ("200 OK", json!({ "status": "active" }).to_string())
+                }
+                ("POST", "/api/jobs") => {
+                    let mut filed = body.clone();
+                    filed["id"] = json!(RUN);
+                    filed["steps"] = json!([
+                        { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                          "metadata": { "authority_role": "platform-admin" } },
+                    ]);
+                    *run.lock().unwrap() = Some(filed);
+                    ("201 Created", json!({ "id": RUN }).to_string())
+                }
+                ("GET", p) if p == format!("/api/jobs/{RUN}") => {
+                    match run.lock().unwrap().clone() {
+                        Some(r) => ("200 OK", r.to_string()),
+                        None => ("404 Not Found", "no such job".into()),
+                    }
+                }
+                ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                    run_step_put(body)
+                }
+                ("PATCH", p) if p.contains("/steps/") => {
+                    stub_merge(&run, RUN, p, body);
+                    ("204 No Content", String::new())
+                }
+                _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+            })
+            .await
+        };
+        let prompt = dispatch_at(
+            &reqwest::Client::new(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("build"),
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect("a landed part is evidence, not a refusal")
+        .prompt;
+
+        let named = prompt
+            .find("== ALREADY NAMED")
+            .expect("the section is in the brief");
+        let packet = prompt.find("== THE PACKET").expect("the packet");
+        let invariants = prompt.find("== THE INVARIANTS").expect("the invariants");
+        assert!(packet < named && named < invariants, "{prompt}");
+        assert!(
+            prompt.contains(
+                "0d9163d3 feat/a-correction-names-what-it-corrects — merged at 5d1e2f3a4b5c"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.contains("with its three refusals"), "{prompt}");
+
+        let calls = log.calls.lock().unwrap().clone();
+        let read = calls
+            .iter()
+            .position(|(m, p, _)| m == "GET" && p.contains("partial_item"))
+            .expect("the partial cars are read");
+        let claim = calls
+            .iter()
+            .position(|(_, p, _)| p.ends_with("/claim"))
+            .expect("claimed");
+        assert!(read < claim, "read while nothing is held: {calls:?}");
     }
 
     /// The run packet as `--report` reads it, with `reported` in the
@@ -3379,14 +5687,15 @@ mod wire_tests {
     /// The report's stub: the run, the agents registry, and the three
     /// writes answered.
     async fn report_stub(run: Value) -> (String, Log) {
-        serve(move |method, path, target, _body| match (method, path) {
+        serve(move |method, path, target, body| match (method, path) {
             ("GET", p) if p == format!("/api/jobs/{RUN}") => ("200 OK", run.to_string()),
             ("PATCH", p) if p == format!("/api/jobs/{RUN}/metadata") => {
                 ("204 No Content", String::new())
             }
-            ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+            ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
                 ("204 No Content", String::new())
             }
+            ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => run_step_put(body),
             ("GET", "/api/agents") => (
                 "200 OK",
                 json!({ "data": [{ "id": "agent-claude", "aliases": ["claude@algedonic.dev"],
@@ -3398,9 +5707,68 @@ mod wire_tests {
                 json!({ "recorded": true, "run": { "run_id": RUN, "usd_micros": 4_200_000 } })
                     .to_string(),
             ),
+            ("PUT", p) if p == format!("/api/agent-runs/{RUN}/profile") => {
+                ("200 OK", json!({ "run_id": RUN }).to_string())
+            }
             _ => ("404 Not Found", format!("unstubbed {method} {target}")),
         })
         .await
+    }
+
+    /// THE WORK PROFILE RIDES THE REPORT (backlog 2f23f4c6): a metered
+    /// run's profile is PUT beside its record, keyed on the run id —
+    /// telemetry, so it is written whether or not the run has reached
+    /// a terminal — and the record carries its call count.
+    #[tokio::test]
+    async fn a_metered_report_records_the_runs_work_profile_beside_its_record() {
+        let (base, log) = report_stub(run_packet("ready")).await;
+        let profile = boss_jobs::agent_runs::WorkProfile {
+            tool_calls: 57,
+            calls_before_first_edit: Some(21),
+            searches: 20,
+            empty_searches: 1,
+            ..Default::default()
+        };
+        let report = Report {
+            summary: "packet cb78818d, branch feat/x".into(),
+            spend_usd: None,
+            tokens: None,
+            meter: Some(crate::transcript_usage::Metered {
+                path: "/p/s/subagents/agent-a1.jsonl".into(),
+                usage: crate::transcript_usage::Usage {
+                    input: 4,
+                    output: 6,
+                    turns: 2,
+                    ..Default::default()
+                },
+                models: crate::transcript_usage::RunModels::default(),
+                profile: profile.clone(),
+            }),
+        };
+        report_at(
+            &reqwest::Client::new(),
+            &base,
+            RUN,
+            &report,
+            None,
+            "claude@algedonic.dev",
+            "2026-09-18T19:00:00Z".parse().unwrap(),
+        )
+        .await
+        .expect("reports");
+        let calls = log.calls.lock().unwrap().clone();
+        let put = calls
+            .iter()
+            .find(|(m, p, _)| m == "PUT" && p.as_str() == format!("/api/agent-runs/{RUN}/profile"))
+            .unwrap_or_else(|| panic!("no profile PUT among {calls:?}"));
+        let sent: boss_jobs::agent_runs::WorkProfile =
+            serde_json::from_value(put.2.clone()).expect("the body is a WorkProfile");
+        assert_eq!(sent, profile);
+        let rec = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/agent-runs")
+            .expect("the run is recorded too");
+        assert_eq!(rec.2["tool_calls"], 57);
     }
 
     /// The handback, end to end: the packet holds the report, `reported`
@@ -3412,6 +5780,7 @@ mod wire_tests {
         let report = Report {
             summary: "packet cb78818d, branch feat/x, sha abc1234, gate e47f2238".into(),
             spend_usd: Some(4.2),
+            meter: None,
             tokens: Some(Tokens::Split {
                 input: 740_000,
                 output: 21_000,
@@ -3422,6 +5791,7 @@ mod wire_tests {
             &base,
             RUN,
             &report,
+            None,
             "claude@algedonic.dev",
             "2026-09-18T19:00:00Z".parse().unwrap(),
         )
@@ -3438,6 +5808,12 @@ mod wire_tests {
             vec![
                 ("GET".to_string(), format!("/api/jobs/{RUN}")),
                 ("PATCH".to_string(), format!("/api/jobs/{RUN}/metadata")),
+                // `reported` completes as TWO writes (e39a9d2a): its
+                // fields through the step merge door, then the status.
+                (
+                    "PATCH".to_string(),
+                    format!("/api/jobs/{RUN}/steps/run-reported/metadata")
+                ),
                 (
                     "PUT".to_string(),
                     format!("/api/jobs/{RUN}/steps/run-reported")
@@ -3454,13 +5830,16 @@ mod wire_tests {
         );
         assert_eq!(patch["spend_usd"], 4.2);
         assert_eq!(patch["tokens"], 761_000);
-        let put = &calls[2].2;
-        assert_eq!(put["status"], "completed");
-        assert_eq!(put["metadata"]["summary"], patch["report"]);
-        assert_eq!(put["metadata"]["spend_usd"], "4.2");
-        assert_eq!(put["metadata"]["tokens"], "761000");
-        assert_eq!(put["metadata"]["authority_role"], "platform-admin");
-        let rec = &calls[4].2;
+        let merged = &calls[2].2;
+        assert_eq!(merged["summary"], patch["report"]);
+        assert_eq!(merged["spend_usd"], "4.2");
+        assert_eq!(merged["tokens"], "761000");
+        assert!(
+            merged.get("authority_role").is_none(),
+            "only the fields travel; the stored keys stay where they are: {merged}"
+        );
+        assert_eq!(calls[3].2, json!({ "status": "completed" }));
+        let rec = &calls[5].2;
         assert_eq!(rec["run_id"], RUN);
         assert_eq!(rec["actor_id"], "agent-claude");
         assert_eq!(rec["job_id"], PACKET);
@@ -3471,6 +5850,63 @@ mod wire_tests {
         // halves of reliability-vs-cost (backlog 8f1de7bf).
         assert_eq!(rec["detail"]["effort"], "high");
         assert_eq!(rec["outcome"], "success", "`building` reached gated");
+    }
+
+    /// The report frees a green run's worktree target and records the
+    /// bytes on the packet (backlog 4e17c49d) — over a temp root, never
+    /// the pod's /scratch — and the cost record still follows.
+    #[tokio::test]
+    async fn a_green_runs_report_frees_its_scratch_target_and_records_the_bytes() {
+        let mut run = run_packet("ready");
+        run["steps"][2]["metadata"]["gate_run"] = json!({ "branch": "fix/x" });
+        let (base, log) = report_stub(run).await;
+        let root = boss_testing::scratch_dir("dispatch-report-scratch");
+        let seed = root.join("target");
+        std::fs::create_dir_all(seed.join("debug")).unwrap();
+        let target = root.join("target-agent-a1");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/libx.rlib"), vec![1u8; 32 * 1024]).unwrap();
+        let scratch = crate::scratch_target::Scratch {
+            root: root.clone(),
+            seed: seed.clone(),
+            porcelain: Some(
+                "worktree /work/boss\nHEAD 1\nbranch refs/heads/main\n\n\
+                 worktree /work/boss/.claude/worktrees/agent-a1\nHEAD 2\nbranch refs/heads/fix/x\n"
+                    .into(),
+            ),
+        };
+        report_at(
+            &reqwest::Client::new(),
+            &base,
+            RUN,
+            &Report {
+                summary: "handback".into(),
+                spend_usd: None,
+                meter: None,
+                tokens: Some(Tokens::Total(1000)),
+            },
+            Some(&scratch),
+            "claude@algedonic.dev",
+            "2026-09-18T19:00:00Z".parse().unwrap(),
+        )
+        .await
+        .expect("reports");
+        assert!(!target.exists(), "the green run's target is freed");
+        assert!(seed.exists(), "the seed stands");
+        let calls = log.calls.lock().unwrap().clone();
+        let rec = calls
+            .iter()
+            .find_map(|(m, _, b)| (m == "PATCH").then(|| b.get("scratch_target")).flatten())
+            .expect("scratch_target on the packet");
+        assert!(
+            rec["freed_bytes"].as_u64().unwrap_or(0) >= 32 * 1024,
+            "{rec}"
+        );
+        assert_eq!(rec["path"], target.display().to_string());
+        assert!(
+            calls.iter().any(|(m, _, _)| m == "POST"),
+            "the cost record still follows: {calls:?}"
+        );
     }
 
     /// A run that has reached no terminal records no cost row: the
@@ -3492,8 +5928,10 @@ mod wire_tests {
             &Report {
                 summary: "handback".into(),
                 spend_usd: None,
+                meter: None,
                 tokens: Some(Tokens::Total(1000)),
             },
+            None,
             "claude@algedonic.dev",
             "2026-09-18T19:00:00Z".parse().unwrap(),
         )
@@ -3512,6 +5950,62 @@ mod wire_tests {
         );
     }
 
+    /// A run with no terminal is told the verb that ends it, and ONLY
+    /// that (backlog 73abfb3a, 2026-09-26). Run d71ea876 was stopped at
+    /// David's direction before anything was built; its --report printed
+    /// "`reported` is pending — it opens on the gate's green" FIRST, and
+    /// the reader acted on that line and filed an item asking for a
+    /// terminal `refused` already is. A run that never gates never sees
+    /// that green, so the line was untrue of it, and it stood in front
+    /// of the one line that named the door. What the verb prints is
+    /// composed here exactly as `report_with_receipt_at` composes it.
+    #[test]
+    fn a_report_on_a_run_with_no_terminal_names_refused_and_never_the_gates_green() {
+        let mut run = run_packet("pending");
+        run["steps"][2] = json!({ "id": "run-building", "spec_slug": "building",
+                                  "status": "ready", "metadata": {} });
+        let short = &RUN[..8];
+        let printed: Vec<String> = reported_waiting_line(short, "pending", &run)
+            .into_iter()
+            .chain(run_outcome(&run).is_none().then(|| no_terminal_line(short)))
+            .collect();
+        let out = printed.join("\n");
+        assert!(
+            out.contains("result=refused"),
+            "the output must name the terminal that ends a stopped run: {out}"
+        );
+        assert!(
+            out.contains("operator's direction"),
+            "a stop at the operator's direction must see itself in the door: {out}"
+        );
+        assert!(
+            !out.contains("gate's green"),
+            "a run with no terminal is not waiting on a green: {out}"
+        );
+
+        // The gate-green line stays true where it is true: `building`
+        // closed `gated`, and `reported` has not opened yet.
+        let gated = run_packet("pending");
+        let line = reported_waiting_line(short, "pending", &gated).expect("a line for a gated run");
+        assert!(line.contains("gate's green"), "{line}");
+
+        // A run that ships no car has no gate: `delivered` is what opens it.
+        let mut delivered = run_packet("pending");
+        delivered["steps"][2]["metadata"]["result"] = json!("delivered");
+        let line = reported_waiting_line(short, "pending", &delivered)
+            .expect("a line for a delivered run");
+        assert!(!line.contains("gate's green"), "{line}");
+
+        // And a run that ended `refused` is not told to wait on a green
+        // either: `reported` never opens for it.
+        let mut refused = run_packet("pending");
+        refused["steps"][2]["metadata"]["result"] = json!("refused");
+        let line =
+            reported_waiting_line(short, "pending", &refused).expect("a line for a refused run");
+        assert!(!line.contains("gate's green"), "{line}");
+        assert!(line.contains("`refused`"), "{line}");
+    }
+
     /// Before the green, `reported` is pending: the report rides the
     /// packet and the finish is recorded; the step is left for the
     /// green to open. Nothing is written to a step that is not open.
@@ -3521,6 +6015,7 @@ mod wire_tests {
         let report = Report {
             summary: "handback".into(),
             spend_usd: None,
+            meter: None,
             tokens: Some(Tokens::Total(1000)),
         };
         report_at(
@@ -3528,6 +6023,7 @@ mod wire_tests {
             &base,
             RUN,
             &report,
+            None,
             "claude@algedonic.dev",
             "2026-09-18T19:00:00Z".parse().unwrap(),
         )
@@ -3567,8 +6063,10 @@ mod wire_tests {
             &Report {
                 summary: "s".into(),
                 spend_usd: None,
+                meter: None,
                 tokens: None,
             },
+            None,
             "claude@algedonic.dev",
             "2026-09-18T19:00:00Z".parse().unwrap(),
         )
@@ -3624,11 +6122,13 @@ mod wire_tests {
             &Report {
                 summary: "handback".into(),
                 spend_usd: None,
+                meter: None,
                 tokens: Some(Tokens::Split {
                     input: 300_000,
                     output: 17_000,
                 }),
             },
+            None,
             "claude@algedonic.dev",
             "2026-09-19T07:05:00Z".parse().unwrap(),
         )
@@ -3655,6 +6155,21 @@ mod wire_tests {
         /// The waiting one, behind it.
         const WAITING: &str = "22222222-0000-4000-8000-000000000002";
         const INBOX_RUN: &str = "33333333-0000-4000-8000-000000000003";
+        /// Admitted before its kind declared an agent block: its step
+        /// carries the role and no `agent_` key (backlog 51aef4dd).
+        const PINNED: &str = "44444444-0000-4000-8000-000000000004";
+
+        fn pinned_packet() -> Value {
+            json!({
+                "id": PINNED, "kind": "backlog-item", "title": "Pinned before the block",
+                "status": "open", "priority": "standard", "opened_on": "2026-09-19",
+                "metadata": { "detail": "Admitted under a version with no agent block." },
+                "steps": [
+                    { "id": "p-build", "spec_slug": "build", "status": "ready", "title": "Build",
+                      "metadata": { "authority_role": "platform-admin" } },
+                ],
+            })
+        }
 
         fn agent_metadata() -> Value {
             json!({
@@ -3712,6 +6227,9 @@ mod wire_tests {
                     ("GET", p) if p == format!("/api/jobs/{WAITING}") => {
                         ("200 OK", waiting_packet().to_string())
                     }
+                    ("GET", p) if p == format!("/api/jobs/{PINNED}") => {
+                        ("200 OK", pinned_packet().to_string())
+                    }
                     ("GET", "/api/tenant/edit-level") => (
                         "200 OK",
                         json!({ "edit_level": Value::Null, "manifest": "t.toml" }).to_string(),
@@ -3742,12 +6260,19 @@ mod wire_tests {
                         }
                     }
                     ("PUT", p) if p.starts_with(&format!("/api/jobs/{INBOX_RUN}/steps/")) => {
+                        run_step_put(body)
+                    }
+                    ("PATCH", p) if p.starts_with(&format!("/api/jobs/{INBOX_RUN}/steps/")) => {
+                        crate::dispatch::stub_merge(&run, INBOX_RUN, p, body);
                         ("204 No Content", String::new())
                     }
                     // The edge onto the claimed step (dd6d44b7): a
                     // queued dispatch writes it exactly as a hand one
                     // does — one code path, one door.
-                    ("PATCH", p) if p.starts_with(&format!("/api/jobs/{WAITING}/steps/")) => {
+                    ("PATCH", p)
+                        if p.starts_with(&format!("/api/jobs/{WAITING}/steps/"))
+                            || p.starts_with(&format!("/api/jobs/{PINNED}/steps/")) =>
+                    {
                         ("204 No Content", String::new())
                     }
                     _ => ("404 Not Found", format!("unstubbed {method} {target}")),
@@ -3766,7 +6291,6 @@ mod wire_tests {
                 &Overrides::default(),
                 "agent-claude",
                 "emp-david",
-                "/work/boss/.claude/worktrees/agent-x",
                 "boss-dev-0",
             )
             .await
@@ -3853,26 +6377,77 @@ mod wire_tests {
         #[test]
         fn a_waiting_step_is_ready_nobodys_and_carries_the_model() {
             assert_eq!(
-                waiting_step(&waiting_packet()).and_then(|s| s["spec_slug"].as_str()),
+                waiting_step(&waiting_packet(), None).and_then(|s| s["spec_slug"].as_str()),
                 Some("build")
             );
             assert!(
-                waiting_step(&held_packet()).is_none(),
+                waiting_step(&held_packet(), None).is_none(),
                 "active is not waiting"
             );
 
             let mut assigned = waiting_packet();
             assigned["steps"][1]["assignee_id"] = json!("agent-someone");
             assert!(
-                waiting_step(&assigned).is_none(),
+                waiting_step(&assigned, Some(&row_with_block())).is_none(),
                 "ready but held is not waiting — the claim would 409"
             );
 
             let mut no_block = waiting_packet();
             no_block["steps"][1]["metadata"] = json!({ "authority_role": "platform-admin" });
             assert!(
-                waiting_step(&no_block).is_none(),
-                "no agent model is not agent work, which is what the station matched on"
+                waiting_step(&no_block, None).is_none(),
+                "no block on the step and no row in hand is not agent work"
+            );
+        }
+
+        /// THE 51aef4dd CASE, at the inbox: a packet pinned to a version
+        /// with no block, whose ACTIVE row declares one, is a member of
+        /// the agent station — so the inbox must be able to take it, or
+        /// it reads a queue of 47 page-audit packets and takes none.
+        #[test]
+        fn a_step_pinned_before_its_block_waits_when_the_active_row_declares_one() {
+            let pinned = pinned_packet();
+            assert!(waiting_step(&pinned, None).is_none());
+            assert_eq!(
+                waiting_step(&pinned, Some(&row_with_block()))
+                    .and_then(|s| s["spec_slug"].as_str()),
+                Some("build")
+            );
+        }
+
+        /// THE 09b354e7 CASE, at the inbox: the pinned step declares
+        /// fields the active row's step does not, so the active block is
+        /// not its block and the inbox does not take it — the same
+        /// answer the station queue's `agent_spec::resolved` gives.
+        #[test]
+        fn a_pinned_step_whose_fields_differ_is_not_waiting() {
+            let mut row = row_with_block();
+            row["steps"][1]["fields"] = json!([
+                { "name": "evidence", "field_type": "text", "required": true },
+            ]);
+            assert!(waiting_step(&pinned_packet(), Some(&row)).is_none());
+        }
+
+        /// And end to end: the queue names only the pinned packet, and
+        /// the verb reads the kind's row, finds the block, and claims.
+        #[tokio::test]
+        async fn the_inbox_takes_a_packet_pinned_before_its_block() {
+            let (base, log) = inbox_stub(vec![json!({ "id": PINNED })]).await;
+            take_next(&base)
+                .await
+                .expect("dispatches")
+                .expect("the pinned packet is taken");
+            let calls = log.calls.lock().unwrap().clone();
+            let claims: Vec<String> = calls
+                .iter()
+                .filter(|(m, p, _)| m == "POST" && p.contains("/claim"))
+                .map(|(_, p, _)| p.clone())
+                .collect();
+            assert_eq!(
+                claims,
+                vec![format!(
+                    "/api/jobs/{PINNED}/steps/p-build/claim?station={STATION}"
+                )]
             );
         }
     }

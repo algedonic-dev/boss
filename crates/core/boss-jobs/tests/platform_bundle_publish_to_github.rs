@@ -197,3 +197,107 @@ fn publish_to_github_v7_reads_the_checks_back_and_judges_them_before_closing() {
         opened.ready_when
     );
 }
+
+/// v8 (backlog d4bfe548, David 2026-09-24: "Sounds good"). Measured that
+/// day on publish e0558b28: opened 00:00Z, the machine refreshed its
+/// drift at 00:01Z, and its `measure` checklist — `platform-admin`, no
+/// agent block — sat unworked until the operator did it after 03:50Z,
+/// when David asked. No actor was ever dispatched to it, because nothing
+/// on the step said an agent could run it. This names which decided
+/// property broke if someone reshapes it:
+///
+/// (1) `measure` and `review` declare the analyst block — the same
+///     setting as judge-checks — and say so the way every agent-workable
+///     step does: `human_only = false` and a procedure.
+/// (2) The procedure is a RE-MEASUREMENT with the protocol's own
+///     instrument, not a transcription of the machine's `drift_refresh`
+///     (a has_drift of "false" closes the packet, so it must be the
+///     script's own answer), and the review READS each newly public file.
+/// (3) `approve` stays David's sign-off: no agent block on it.
+#[test]
+fn publish_to_github_v8_hands_measure_and_review_to_an_agent_and_keeps_approve_davids() {
+    let wf = bundled("publish-to-github");
+    let step = |title: &str| {
+        wf.steps
+            .iter()
+            .find(|s| s.title == title)
+            .unwrap_or_else(|| panic!("publish-to-github has no `{title}` step"))
+    };
+
+    for title in ["measure", "review"] {
+        let s = step(title);
+        let agent = s.agent.as_ref().unwrap_or_else(|| {
+            panic!("`{title}` declares no agent block, so no agent is dispatched to it")
+        });
+        assert_eq!(agent.profile, "analyst", "{title}");
+        assert_eq!(
+            s.metadata_defaults.get("human_only"),
+            Some(&serde_json::json!(false)),
+            "`{title}` must declare itself agent-workable"
+        );
+        assert!(
+            s.metadata_defaults
+                .get("procedure")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| !p.trim().is_empty()),
+            "`{title}` carries no procedure — the prompt an agent runs is the step's own"
+        );
+    }
+    let procedure = |title: &str| {
+        step(title).metadata_defaults["procedure"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        procedure("measure").contains("infra/prep-github-publish.sh --json"),
+        "measure re-measures with the protocol's own instrument: {}",
+        procedure("measure")
+    );
+    assert!(
+        procedure("review").contains("newly_public_files"),
+        "review reads each newly public file the measurement named: {}",
+        procedure("review")
+    );
+
+    let approve = step("approve");
+    assert!(
+        approve.agent.is_none(),
+        "approve is David's sign-off and must declare no agent block"
+    );
+    assert_eq!(approve.authority_role.as_deref(), Some("platform-admin"));
+}
+
+/// v9 (backlog c6cb678b, 2026-09-24). PR #243 closed `pr-opened` with
+/// its Gate red: the reading had recorded the Gate in_progress and the
+/// judge judged CodeQL's rules alone. The verb now completes
+/// `read-checks` only on every check and reads `failure` for a failing
+/// Gate over a clean scan — which the `!= "success"` guard already
+/// routes to the judge. What this row must add is that the judge JUDGES
+/// it: a disposition list covering only the scan's rules would close a
+/// red Gate as noise by omission. So the procedure names the reading's
+/// `failing` list and asks one disposition per failing check.
+#[test]
+fn publish_to_github_v9_judges_every_failing_check_not_only_the_scan() {
+    let wf = bundled("publish-to-github");
+    let judge = wf
+        .steps
+        .iter()
+        .find(|s| s.title == "judge-checks")
+        .expect("publish-to-github has a judge-checks step");
+    let procedure = judge.metadata_defaults["procedure"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        procedure.contains("code_scanning.failing"),
+        "the judge reads the failing checks off the reading: {procedure}"
+    );
+    assert!(
+        procedure.contains("EVERY FAILING CHECK IS JUDGED"),
+        "the judge disposes of each failing check, not only the scan's rules: {procedure}"
+    );
+    assert!(
+        procedure.contains("unfinished"),
+        "a check that outlasted the ceiling is judged too: {procedure}"
+    );
+}

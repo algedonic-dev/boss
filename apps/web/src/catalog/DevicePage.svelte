@@ -15,6 +15,7 @@
   import { DeviceModelSchema, type DeviceModel } from './schemas';
   import { fetchValidated } from '../data/parseResponse';
   import { href, navigate } from '../router';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type Props = { sku: string };
   let { sku }: Props = $props();
@@ -313,7 +314,6 @@
                 <!-- rowLink pilot: the whole row opens the part's
                      inventory page (same target PartsList rows use). -->
                 <tr
-                  class="data-table-row-link"
                   use:rowLink={{
                     onActivate: () => navigate(entityHref('part', p.part_sku)),
                     label: `${p.name} (${p.part_sku})`,
@@ -377,7 +377,13 @@
               {#each d.documents as doc, i (i)}
                 <tr>
                   <td>{doc.kind.replace(/-/g, ' ')}</td>
-                  <td><a href={doc.url}>{doc.title}</a></td>
+                  <td>
+                    {#if safeLinkHref(doc.url)}
+                      <a href={safeLinkHref(doc.url)}>{doc.title}</a>
+                    {:else}
+                      {doc.title}
+                    {/if}
+                  </td>
                   <td>{doc.audience}</td>
                   <td>{doc.version ?? '—'}</td>
                   <td>{doc.published ? formatDate(doc.published) : '—'}</td>

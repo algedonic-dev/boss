@@ -61,6 +61,7 @@ async fn ensure_open_period(db: &TestDb, year: i32, month: u32) {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_passes_when_audit_log_facts_and_entries_agree() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 4).await;
 
     insert_audit_event(
@@ -75,7 +76,7 @@ async fn deep_check_passes_when_audit_log_facts_and_entries_agree() {
             "account_id": "acct-A",
             "currency": "USD",
             "line_items": [
-                {"description": "Setup", "amount_cents": 100000, "category": "service"},
+                {"description": "Setup", "amount_cents": 100000, "category": "taproom"},
             ],
         }),
     )
@@ -108,6 +109,7 @@ async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
     // guaranteed `FactDivergence::Mismatch` — and the shipped entry-level
     // replay-check never catches it (posting rules ignore the extra keys).
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 8).await;
 
     // The exact clean domain payload the live commerce writer persists.
@@ -118,7 +120,7 @@ async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
         "account_id": "acct-E",
         "currency": "USD",
         "line_items": [
-            {"description": "Setup", "amount_cents": 30000, "category": "service"},
+            {"description": "Setup", "amount_cents": 30000, "category": "taproom"},
         ],
     });
 
@@ -163,6 +165,7 @@ async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_does_not_mutate_live_state() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 5).await;
 
     insert_audit_event(
@@ -177,7 +180,7 @@ async fn deep_check_does_not_mutate_live_state() {
             "account_id": "acct-B",
             "currency": "USD",
             "line_items": [
-                {"description": "Subs", "amount_cents": 50000, "category": "service"},
+                {"description": "Subs", "amount_cents": 50000, "category": "taproom"},
             ],
         }),
     )
@@ -221,6 +224,7 @@ async fn deep_check_does_not_mutate_live_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_flags_fact_only_in_live_when_audit_log_lacks_event() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 6).await;
 
     // Write a fact directly, no audit_log event. The replay would
@@ -234,7 +238,7 @@ async fn deep_check_flags_fact_only_in_live_when_audit_log_lacks_event() {
         "account_id": "acct-C",
         "currency": "USD",
         "line_items": [
-            {"description": "drifted", "amount_cents": 1000, "category": "service"},
+            {"description": "drifted", "amount_cents": 1000, "category": "taproom"},
         ],
     });
     sqlx::query(
@@ -270,6 +274,7 @@ async fn deep_check_flags_fact_only_in_live_when_audit_log_lacks_event() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_flags_fact_only_in_replay_when_live_was_wiped() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 7).await;
 
     insert_audit_event(
@@ -284,7 +289,7 @@ async fn deep_check_flags_fact_only_in_replay_when_live_was_wiped() {
             "account_id": "acct-D",
             "currency": "USD",
             "line_items": [
-                {"description": "Test", "amount_cents": 5000, "category": "service"},
+                {"description": "Test", "amount_cents": 5000, "category": "taproom"},
             ],
         }),
     )
@@ -321,6 +326,7 @@ async fn deep_check_entries_match_when_live_fact_written_by_the_real_writer_path
     // REAL writer path (fact + JE in one tx, then the audit event) and
     // requires the whole deep check green, entries included.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     ensure_open_period(&db, 2026, 9).await;
 
     let payload = serde_json::json!({
@@ -330,7 +336,7 @@ async fn deep_check_entries_match_when_live_fact_written_by_the_real_writer_path
         "account_id": "acct-P",
         "currency": "USD",
         "line_items": [
-            {"description": "Setup", "amount_cents": 42000, "category": "service"},
+            {"description": "Setup", "amount_cents": 42000, "category": "taproom"},
         ],
     });
     let happened_on: chrono::NaiveDate = "2026-09-03".parse().unwrap();

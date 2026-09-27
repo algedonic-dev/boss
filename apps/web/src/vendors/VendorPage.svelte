@@ -1,8 +1,7 @@
 <script lang="ts">
   // Vendor detail — port of apps/web/src/vendors/VendorPage.tsx.
   //
-  // Four-section KB surface per D2 of
-  // examples/used-device-shop/design/procurement-team-needs.md:
+  // Four-section KB surface, the account page's shape on the vendor side:
   //   1. Profile (terms + account team + active contracts)
   //   2. People (contacts directory)
   //   3. Facts (interactions timeline)
@@ -37,6 +36,8 @@
     type VendorContract,
   } from './types';
   import { href } from '../router';
+  import { loadingRead, okRead, readStateOfResponse, type ReadState } from '../data/readState';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
 
   let { vendorLookup } = $props<{ vendorLookup: string }>();
 
@@ -47,46 +48,59 @@
   let loadFailed = $state<string | null>(null);
   let pos = $state<PurchaseOrder[]>([]);
   let vendorInvoices = $state<VendorInvoice[]>([]);
-  let empNames = $state<Map<string, string>>(new Map());
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
   let contacts = $state<VendorContact[]>([]);
   let interactions = $state<VendorInteraction[]>([]);
   let team = $state<VendorAccountTeamMember[]>([]);
   let contracts = $state<VendorContract[]>([]);
   let loading = $state(true);
+  // The three reads the page builds beside the vendor record. Until
+  // backlog 223ebcd6 each refusal was parsed as `[]`, so an inventory
+  // outage said "No purchase orders for this vendor yet" and "$0.00
+  // outstanding" as fact; the outcome now survives and the page says it.
+  let posRead = $state<ReadState>(okRead);
+  let billsRead = $state<ReadState>(okRead);
+  let peopleRead = $state<ReadState>(okRead);
+  // The four vendor CRM reads, the same way (backlog 865d3d51): each
+  // refusal used to arrive as `[]` from vendors/api.ts, so an inventory
+  // outage said "No contacts captured yet." and the like. They start
+  // `loading`, because until they answer no section may say "none".
+  let contactsRead = $state<ReadState>(loadingRead);
+  let interactionsRead = $state<ReadState>(loadingRead);
+  let teamRead = $state<ReadState>(loadingRead);
+  let contractsRead = $state<ReadState>(loadingRead);
 
   let lookup = $derived(decodeURIComponent(vendorLookup));
   let vendor = $derived<Vendor | undefined>(
     vendors.find((v) => v.id === lookup) ?? vendors.find((v) => v.name === lookup),
   );
 
-  // Base data — vendors, POs, invoices, employees. Fetched once per
-  // lookup change.
+  // Base data — vendors, POs, invoices. Fetched once per lookup change.
+  // The employees' names are read below, for the people shown.
   $effect(() => {
     void lookup;
     let cancelled = false;
     loading = true;
     (async () => {
       try {
-        const [vResp, pResp, iResp, peopleResp] = await Promise.all([
+        const [vResp, pResp, iResp] = await Promise.all([
           fetch('/api/inventory/vendors'),
           fetch('/api/inventory/orders'),
           fetch('/api/inventory/vendor-invoices'),
-          fetch('/api/people'),
         ]);
-        const vBody = vResp.ok ? await vResp.json() : [];
-        const pBody = pResp.ok ? await pResp.json() : [];
-        const iBody = iResp.ok ? await iResp.json() : [];
-        const peopleBody = peopleResp.ok ? await peopleResp.json() : [];
+        const vRead = readStateOfResponse('/api/inventory/vendors', vResp);
+        const pRead = readStateOfResponse('/api/inventory/orders', pResp);
+        const iRead = readStateOfResponse('/api/inventory/vendor-invoices', iResp);
+        const vBody = vRead.kind === 'ok' ? await vResp.json() : [];
+        const pBody = pRead.kind === 'ok' ? await pResp.json() : [];
+        const iBody = iRead.kind === 'ok' ? await iResp.json() : [];
         if (!cancelled) {
-          loadFailed = vResp.ok ? null : `HTTP ${vResp.status}`;
+          loadFailed = vRead.kind === 'failed' ? vRead.error : null;
+          posRead = pRead;
+          billsRead = iRead;
           vendors = Array.isArray(vBody) ? vBody : (vBody.data ?? []);
           pos = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
           vendorInvoices = Array.isArray(iBody) ? iBody : (iBody.data ?? []);
-          const names = new Map<string, string>();
-          for (const e of peopleBody as Array<{ id: string; name: string }>) {
-            names.set(e.id, e.name);
-          }
-          empNames = names;
           loading = false;
         }
       } catch (e) {
@@ -105,6 +119,12 @@
   $effect(() => {
     const vid = vendor?.id ?? null;
     let cancelled = false;
+    if (vid) {
+      contactsRead = loadingRead;
+      interactionsRead = loadingRead;
+      teamRead = loadingRead;
+      contractsRead = loadingRead;
+    }
     (async () => {
       const [c, i, t, k] = await Promise.all([
         loadVendorContacts(vid),
@@ -113,10 +133,43 @@
         loadVendorContracts(vid),
       ]);
       if (!cancelled) {
-        contacts = c;
-        interactions = i;
-        team = t;
-        contracts = k;
+        contacts = c.rows;
+        interactions = i.rows;
+        team = t.rows;
+        contracts = k.rows;
+        contactsRead = c.read;
+        interactionsRead = i.read;
+        teamRead = t.read;
+        contractsRead = k.read;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // Names only the employees the page shows — the account team, the
+  // active contracts' signers and the people behind the twenty
+  // interactions listed — one row each, and the failure line below names
+  // the row that failed. Until backlog 1e73bd93 this was a read of the
+  // WHOLE roster riding the vendor's own Promise.all. Machine actors (a
+  // dispatch rule logging an interaction) are never asked about (see
+  // ../data/ownerNames.ts).
+  let peopleKey = $derived(
+    personIdsOf([
+      ...team.map((m) => m.employee_id),
+      ...contracts.filter((c) => c.status === 'active').map((c) => c.signed_by_employee_id),
+      ...interactions.slice(0, 20).map((i) => i.actor_id),
+    ]).join('\n'),
+  );
+  $effect(() => {
+    const ids = peopleKey ? peopleKey.split('\n') : [];
+    let cancelled = false;
+    (async () => {
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        peopleRead = out.read;
       }
     })();
     return () => {
@@ -187,6 +240,29 @@
   let primaryContact = $derived(contacts.find((c) => c.is_primary));
   let activeContracts = $derived(contracts.filter((c) => c.status === 'active'));
 
+  let posUnknown = $derived(posRead.kind === 'failed');
+  let billsUnknown = $derived(billsRead.kind === 'failed');
+  /// A figure built from a read that failed is not a figure.
+  function known(unknown: boolean, figure: string | number): string | number {
+    return unknown ? '?' : figure;
+  }
+  /// A CRM count is a count only once its read has answered.
+  function counted(read: ReadState, n: number): string | number {
+    return known(read.kind !== 'ok', n);
+  }
+  // Each failed side read, with what it leaves unknown on this page.
+  let failedReads = $derived(
+    [
+      { what: 'purchase orders', read: posRead, blanks: 'The PO figures and the Purchase orders section are unknown, not zero.' },
+      { what: 'vendor invoices', read: billsRead, blanks: 'The bill and spend figures and the Vendor invoices section are unknown, not zero.' },
+      { what: 'the account team', read: teamRead, blanks: 'The Account team section is unknown, not empty.' },
+      { what: 'contracts', read: contractsRead, blanks: 'The Active contracts figure and section are unknown, not zero.' },
+      { what: 'contacts', read: contactsRead, blanks: 'The Contacts figure and section are unknown, not zero.' },
+      { what: 'interactions', read: interactionsRead, blanks: 'The Interactions timeline is unknown, not empty.' },
+      { what: 'people', read: peopleRead, blanks: 'Employees below show as ids rather than names.' },
+    ].flatMap((f) => (f.read.kind === 'failed' ? [{ ...f, error: f.read.error }] : [])),
+  );
+
 </script>
 
 {#if loading}
@@ -225,20 +301,26 @@
           {vendor.city}, {vendor.state}
         </div>
         <div class="detail-meta">
-          <Meta label="Open POs">{openPos.length}</Meta>
-          <Meta label="POs lifetime">{vendorPos.length}</Meta>
-          <Meta label="Unpaid bills">{unpaidBills.length}</Meta>
-          <Meta label="Outstanding">{formatMoney({ amount_cents: outstandingCents, currency: 'USD' })}</Meta>
-          <Meta label="Spend lifetime">{formatMoney({ amount_cents: lifetimeSpendCents, currency: 'USD' })}</Meta>
-          <Meta label="Paid lifetime">{formatMoney({ amount_cents: lifetimePaidCents, currency: 'USD' })}</Meta>
-          <Meta label="Last PO">{lastPoDate ?? '—'}</Meta>
-          <Meta label="Last bill">{lastBillDate ?? '—'}</Meta>
+          <Meta label="Open POs">{known(posUnknown, openPos.length)}</Meta>
+          <Meta label="POs lifetime">{known(posUnknown, vendorPos.length)}</Meta>
+          <Meta label="Unpaid bills">{known(billsUnknown, unpaidBills.length)}</Meta>
+          <Meta label="Outstanding">{known(billsUnknown, formatMoney({ amount_cents: outstandingCents, currency: 'USD' }))}</Meta>
+          <Meta label="Spend lifetime">{known(billsUnknown, formatMoney({ amount_cents: lifetimeSpendCents, currency: 'USD' }))}</Meta>
+          <Meta label="Paid lifetime">{known(billsUnknown, formatMoney({ amount_cents: lifetimePaidCents, currency: 'USD' }))}</Meta>
+          <Meta label="Last PO">{known(posUnknown, lastPoDate ?? '—')}</Meta>
+          <Meta label="Last bill">{known(billsUnknown, lastBillDate ?? '—')}</Meta>
           <Meta label="Lead time">{vendor.lead_time_days} days</Meta>
-          <Meta label="Contacts">{contacts.length}</Meta>
-          <Meta label="Active contracts">{activeContracts.length}</Meta>
+          <Meta label="Contacts">{counted(contactsRead, contacts.length)}</Meta>
+          <Meta label="Active contracts">{counted(contractsRead, activeContracts.length)}</Meta>
         </div>
       </div>
     </header>
+
+    {#each failedReads as f (f.what)}
+      <p class="empty load-failed" role="alert">
+        Couldn't load {f.what} — {f.error}. {f.blanks}
+      </p>
+    {/each}
 
     <div class="subject-actions">
       <a
@@ -285,8 +367,12 @@
           {/if}
       </Section>
 
-      <Section title={`Account team (${team.length})`}>
-          {#if team.length === 0}
+      <Section title={`Account team (${counted(teamRead, team.length)})`}>
+          {#if teamRead.kind === 'failed'}
+            <p class="empty load-failed">Couldn't load the account team — {teamRead.error}</p>
+          {:else if teamRead.kind === 'loading'}
+            <p class="empty">Loading the account team…</p>
+          {:else if team.length === 0}
             <p class="empty">No account-team assignments yet.</p>
           {:else}
             <dl class="kv">
@@ -299,7 +385,7 @@
                     label={empNames.get(m.employee_id)}
                   />
                   {#if m.notes}
-                    <span style="color:#78716c; margin-left:8px">· {m.notes}</span>
+                    <span style="color:var(--static); margin-left:8px">· {m.notes}</span>
                   {/if}
                 </dd>
               {/each}
@@ -307,8 +393,12 @@
           {/if}
       </Section>
 
-      <Section title={`Active contracts (${activeContracts.length})`} wide>
-          {#if activeContracts.length === 0}
+      <Section title={`Active contracts (${counted(contractsRead, activeContracts.length)})`} wide>
+          {#if contractsRead.kind === 'failed'}
+            <p class="empty load-failed">Couldn't load contracts — {contractsRead.error}</p>
+          {:else if contractsRead.kind === 'loading'}
+            <p class="empty">Loading contracts…</p>
+          {:else if activeContracts.length === 0}
             <p class="empty">No active contracts on file.</p>
           {:else}
             <table class="data-table">
@@ -349,8 +439,12 @@
     </div>
 
     <!-- Section 2 — People -->
-    <Section title={`Contacts (${contacts.length})`} wide>
-        {#if contacts.length === 0}
+    <Section title={`Contacts (${counted(contactsRead, contacts.length)})`} wide>
+        {#if contactsRead.kind === 'failed'}
+          <p class="empty load-failed">Couldn't load contacts — {contactsRead.error}</p>
+        {:else if contactsRead.kind === 'loading'}
+          <p class="empty">Loading contacts…</p>
+        {:else if contacts.length === 0}
           <p class="empty">
             No contacts captured yet. The legacy single-contact fields show
             <strong>{vendor.contact_name}</strong> ·
@@ -375,7 +469,7 @@
                   <td>
                     {c.name}
                     {#if c.is_primary}
-                      <span style="margin-left:6px; font-size:10px; padding:1px 6px; border-radius:3px; background:#16a34a22; color:#16a34a; font-weight:600">
+                      <span style="margin-left:6px; font-size:10px; padding:1px 6px; border-radius:3px; background:var(--ok-wash); color:var(--ok); font-weight:600">
                         PRIMARY
                       </span>
                     {/if}
@@ -393,8 +487,12 @@
     </Section>
 
     <!-- Section 3 — Facts (interactions) -->
-    <Section title={interactions.length > 20 ? `Interactions (20 of ${interactions.length})` : `Interactions (${interactions.length})`} wide>
-        {#if interactions.length === 0}
+    <Section title={interactions.length > 20 ? `Interactions (20 of ${interactions.length})` : `Interactions (${counted(interactionsRead, interactions.length)})`} wide>
+        {#if interactionsRead.kind === 'failed'}
+          <p class="empty load-failed">Couldn't load interactions — {interactionsRead.error}</p>
+        {:else if interactionsRead.kind === 'loading'}
+          <p class="empty">Loading interactions…</p>
+        {:else if interactions.length === 0}
           <p class="empty">
             No interactions logged yet. Once procurement starts capturing calls, emails,
             and RFQs, they'll appear here as an append-only timeline.
@@ -403,24 +501,24 @@
           <ul class="interaction-timeline" style="list-style:none; padding:0">
             {#each interactions.slice(0, 20) as i (i.id)}
               {@const contactName = contacts.find((c) => c.id === i.vendor_contact_id)?.name ?? null}
-              <li style="border-left:2px solid #e7e5e4; padding:8px 12px; margin-bottom:8px; font-size:13px">
+              <li style="border-left:2px solid var(--hairline); padding:8px 12px; margin-bottom:8px; font-size:13px">
                 <div style="display:flex; gap:8px; align-items:baseline">
-                  <span style="font-size:11px; padding:1px 6px; border-radius:3px; background:#e7e5e4; color:#44403c; font-weight:500">
+                  <span style="font-size:11px; padding:1px 6px; border-radius:3px; background:var(--ink-raised); color:var(--static); font-weight:500">
                     {INTERACTION_KIND_LABEL[i.kind] ?? i.kind}
                   </span>
-                  <span style="color:#78716c">{formatDate(i.occurred_at)}</span>
-                  <span style="color:#44403c">
+                  <span style="color:var(--static)">{formatDate(i.occurred_at)}</span>
+                  <span style="color:var(--static)">
                     by {formatActor(i.actor_id, empNames)}
                   </span>
-                  {#if contactName}<span style="color:#44403c">with {contactName}</span>{/if}
+                  {#if contactName}<span style="color:var(--static)">with {contactName}</span>{/if}
                 </div>
                 <div style="margin-top:4px">{i.body}</div>
                 {#if i.commitments.length > 0}
-                  <ul style="margin-top:6px; font-size:12px; color:#44403c">
+                  <ul style="margin-top:6px; font-size:12px; color:var(--static)">
                     {#each i.commitments as c, idx (idx)}
                       <li>
                         ↳ {c.summary}
-                        {#if c.due_by}<span style="color:#78716c"> — due {c.due_by}</span>{/if}
+                        {#if c.due_by}<span style="color:var(--static)"> — due {c.due_by}</span>{/if}
                         {#if c.linked_po_id}
                           {' · '}
                           <EntityLink kind="po" id={c.linked_po_id} />
@@ -430,7 +528,7 @@
                   </ul>
                 {/if}
                 {#if i.linked_po_id || i.linked_part_sku}
-                  <div style="margin-top:4px; font-size:11px; color:#78716c">
+                  <div style="margin-top:4px; font-size:11px; color:var(--static)">
                     {#if i.linked_po_id}
                       Linked PO: <EntityLink kind="po" id={i.linked_po_id} />
                     {/if}
@@ -447,8 +545,10 @@
     </Section>
 
     <!-- Section 4 — Work -->
-    <Section title={`Purchase orders (${vendorPos.length})`} wide>
-        {#if vendorPos.length === 0}
+    <Section title={`Purchase orders (${known(posUnknown, vendorPos.length)})`} wide>
+        {#if posRead.kind === 'failed'}
+          <p class="empty load-failed">Couldn't load purchase orders — {posRead.error}</p>
+        {:else if vendorPos.length === 0}
           <p class="empty">No purchase orders for this vendor yet.</p>
         {:else}
           <table class="data-table">
@@ -471,8 +571,10 @@
         {/if}
     </Section>
 
-    <Section title={`Vendor invoices (${vendorBills.length})`} wide>
-        {#if vendorBills.length === 0}
+    <Section title={`Vendor invoices (${known(billsUnknown, vendorBills.length)})`} wide>
+        {#if billsRead.kind === 'failed'}
+          <p class="empty load-failed">Couldn't load vendor invoices — {billsRead.error}</p>
+        {:else if vendorBills.length === 0}
           <p class="empty">No invoices received from this vendor yet.</p>
         {:else}
           <table class="data-table">

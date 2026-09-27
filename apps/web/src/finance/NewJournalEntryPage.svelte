@@ -42,7 +42,6 @@
   let loading = $state(true);
   let postedOn = $state(isoToday());
   let memo = $state('');
-  let createdBy = $state('');
   let lines = $state<LineDraft[]>([
     { ...NEW_LINE, side: 'debit' },
     { ...NEW_LINE, side: 'credit' },
@@ -110,7 +109,6 @@
       const result = await createManualEntry({
         posted_on: postedOn,
         memo: memo.trim() || null,
-        created_by: createdBy.trim() || null,
         lines: lines.map((l) => {
           const cents = parseDollarsToCents(l.amount_dollars);
           return {
@@ -154,16 +152,6 @@
               type="text"
               bind:value={memo}
               placeholder="Q1 accrual, depreciation, reclassification…"
-              class="ni-input"
-            />
-          </div>
-          <div class="ni-field">
-            <label for="mje-by">Posted by</label>
-            <input
-              id="mje-by"
-              type="text"
-              bind:value={createdBy}
-              placeholder="admin"
               class="ni-input"
             />
           </div>
@@ -235,7 +223,7 @@
                         type="button"
                         onclick={() => removeLine(i)}
                         class="hr-done-btn"
-                        style="background:#fef2f2; color:#991b1b"
+                        style="background:var(--err-wash); color:var(--err)"
                       >
                         Remove
                       </button>
@@ -245,16 +233,16 @@
               {/each}
             </tbody>
             <tfoot>
-              <tr style="border-top:1px solid #e7e5e4; font-weight:600">
+              <tr style="border-top:1px solid var(--hairline); font-weight:600">
                 <td colspan="2" style="text-align:right">Totals:</td>
                 <td style="text-align:right">
                   {formatUsd(totals.totalDebits)} · {formatUsd(totals.totalCredits)}
                 </td>
                 <td colspan="2">
                   {#if balanced}
-                    <span style="color:#166534">Balanced</span>
+                    <span style="color:var(--ok)">Balanced</span>
                   {:else}
-                    <span style="color:#991b1b">
+                    <span style="color:var(--err)">
                       Off by {formatUsd(Math.abs(totals.totalDebits - totals.totalCredits))}
                     </span>
                   {/if}
@@ -272,7 +260,7 @@
     {#if error}
       <div
         role="alert"
-        style="margin:12px 0; padding:10px 14px; border:1px solid #dc2626; background:#fef2f2; border-radius:6px; color:#991b1b"
+        style="margin:12px 0; padding:10px 14px; border:1px solid var(--troubled); background:var(--err-wash); border-radius:6px; color:var(--err)"
       >
         {error}
       </div>

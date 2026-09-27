@@ -16,7 +16,6 @@ use boss_assets::sse::{self, SseHub};
 use boss_catalog_client::ReqwestCatalogClient;
 use boss_classes_client::{ClassesClient, ReqwestClassesClient};
 use boss_inventory_client::ReqwestInventoryClient;
-use boss_jobs_client::ReqwestJobsClient;
 use boss_nats::NatsEventBus;
 use boss_people_client::{PeopleClient, ReqwestPeopleClient};
 use clap::Parser;
@@ -66,12 +65,10 @@ async fn main() -> Result<()> {
 
     let insights_clients = InsightsClients {
         catalog: Arc::new(ReqwestCatalogClient::new(cfg.catalog_api_url.clone())),
-        jobs: Arc::new(ReqwestJobsClient::new(cfg.jobs_api_url.clone())),
         inventory: Arc::new(ReqwestInventoryClient::new(cfg.inventory_api_url.clone())),
     };
     info!(
         catalog = %cfg.catalog_api_url,
-        jobs = %cfg.jobs_api_url,
         inventory = %cfg.inventory_api_url,
         "device-insights cross-service clients configured"
     );
@@ -177,6 +174,30 @@ async fn run_server<R: AssetsRepository + 'static>(
         clock.clone(),
     )));
 
+    // The one policy client every asset write asks (Update on asset):
+    // the two event doors and the Parts writes. Until 2026-09-26 the
+    // state was built with `policy: None`, so the gate in http.rs
+    // skipped and any caller reaching the port could append asset
+    // events (backlog 54bf2e1e); until 2026-09-27 the field stayed an
+    // `Option` and the Parts router took no client at all (2b49ab60,
+    // d2bea664) — now both take one by type, so this binary cannot
+    // build either surface without it. Same wrapping as people and
+    // ledger: on a sim instance a sim caller is authorized at the
+    // boundary; everything else is enforced per-role (backlog
+    // 85e7f10f).
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new(
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        ),
+    ));
+    // The Parts writes stage their facts stamped by the same publisher
+    // (and so the same sim probe) as the event doors.
+    let parts_app = boss_assets::asset_parts::asset_parts_router(
+        pool.clone(),
+        publisher.clone(),
+        policy.clone(),
+    );
+
     // Start axum HTTP server.
     let state = AssetsApiState {
         assets,
@@ -185,7 +206,7 @@ async fn run_server<R: AssetsRepository + 'static>(
         people_client,
         classes_client: Some(classes_client),
         hub,
-        policy: None,
+        policy,
         insights_clients: Some(insights_clients),
         clock,
     };
@@ -197,7 +218,7 @@ async fn run_server<R: AssetsRepository + 'static>(
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "assets HTTP API listening");
     // The per-asset Parts router rides the same pool.
-    let app = router(state).merge(boss_assets::asset_parts::asset_parts_router(pool.clone()));
+    let app = router(state).merge(parts_app);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -205,6 +226,7 @@ async fn run_server<R: AssetsRepository + 'static>(
     let app = app.layer(axum::middleware::from_fn(
         boss_policy_client::request_context_middleware,
     ));
+    let app = boss_core::machine_gate::mount(app, "assets", &["/api/assets/health"]);
     let mut http_rx = cancel_rx.clone();
     let http_task = tokio::spawn(async move {
         let shutdown = async move {

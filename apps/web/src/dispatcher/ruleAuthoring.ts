@@ -8,7 +8,12 @@
 // DispatcherRules) live in ./types — reused here so one rule-content
 // shape spans the read and write paths.
 
-import type { DispatcherRule, DispatcherRuleDo, DispatcherRules } from './types';
+import type {
+  AuthoredRegistry,
+  DispatcherRule,
+  DispatcherRuleDo,
+  DispatcherRules,
+} from './types';
 
 export type { DispatcherRule, DispatcherRuleDo } from './types';
 
@@ -84,12 +89,23 @@ async function ensureOk(r: Response): Promise<Response> {
   return r;
 }
 
-/** The ACTIVE rules — the same feed the cascade viz reads. */
-export async function listActiveRules(): Promise<ReadonlyArray<DispatcherRule>> {
+/** The ACTIVE rules, and where their whys were read from. */
+export type ActiveRules = Readonly<{
+  rules: ReadonlyArray<DispatcherRule>;
+  /** `null` when the dispatcher served no block (an older build) — read
+   *  it as "could not tell", never as a healthy registry. */
+  authoredRegistry: AuthoredRegistry | null;
+}>;
+
+/** The ACTIVE rules — the same feed the cascade viz reads. The
+ *  `authored_registry` block rides along (backlog f9e34a2c): without it
+ *  every row's `authored: false` under an unset or unreadable
+ *  BOSS_DISPATCHER_RULES reads as drift. */
+export async function listActiveRules(): Promise<ActiveRules> {
   const r = await ensureOk(await fetch('/api/dispatcher/rules'));
   const payload = (await r.json()) as DispatcherRules;
   if (payload.error) throw new Error(payload.error);
-  return payload.rules;
+  return { rules: payload.rules, authoredRegistry: payload.authored_registry ?? null };
 }
 
 /** All versions of one rule, oldest first (draft + active + retired). */

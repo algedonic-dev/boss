@@ -157,6 +157,7 @@ fn fixture_job(id: &str, title: &str) -> Job {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        opened_at: None,
         due_on: Some(NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()),
         closed_on: None,
         metadata: serde_json::json!({"site": "main"}),
@@ -314,7 +315,9 @@ async fn rebuild_reproduces_jobs_and_steps_after_drop() {
     //    doesn't emit a JOB_UPDATED unless status actually changes).
     let mut step1_done = step1.clone();
     step1_done.status = StepStatus::Completed;
-    step1_done.completed_on = Some(NaiveDate::from_ymd_opt(2026, 4, 5).unwrap());
+    // No completed_on: the server dates the flip, and a body that names
+    // a day is refused (f3e78bdf). The replay must reproduce the day the
+    // server stamped, which is what the snapshot compares.
     http_json(
         &app,
         "PUT",

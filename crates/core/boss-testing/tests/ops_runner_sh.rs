@@ -44,21 +44,40 @@ fn write_exec(path: &Path, body: &str) {
 }
 
 /// The stubbed system of record: `bin/curl` serves `jobs.json` on any
-/// GET, copies a PUT's `--data-binary @file` payload to `put.json`,
-/// and a PATCH's to `patch.json` — the request-level `exit` the runner
-/// writes through the job metadata door (f47861a5). A `gh` stub stands
-/// in for the publish verb's `--check` tool probe.
+/// GET (recording the URL it was asked for in `get.url`, so a case can
+/// read the query the runner sent), copies a PUT's `--data-binary
+/// @file` payload to `put.json`, and a PATCH's to `patch.json` — the
+/// request-level `exit` the runner writes through the job metadata door
+/// (f47861a5). A `gh` stub stands in for the publish verb's `--check`
+/// tool probe. Every PATCH is also appended to `STUB_PATCH_LOG` when
+/// set, because one pass may write two (the queue reading, then a
+/// refused completion). A PUT answers `STUB_PUT_CODE` (default 200) on
+/// `-w` and writes `STUB_PUT_BODY` to its `-o` file — the server's
+/// refusal, which is what a refused completion must carry. The FIRST
+/// PUT answers `STUB_PUT_FIRST_CODE` / `STUB_PUT_FIRST_BODY` instead
+/// when set (a race lost once), and every PUT body is appended to
+/// `STUB_PUT_LOG` when set, so a case can count the sends.
 fn stub_sor(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     write_exec(
         &bin.join("curl"),
         "#!/bin/sh\n\
-         m=GET; prev=\n\
-         for a in \"$@\"; do [ \"$prev\" = -X ] && m=\"$a\"; prev=\"$a\"; done\n\
+         m=GET; prev=; o=; w=\n\
+         for a in \"$@\"; do [ \"$prev\" = -X ] && m=\"$a\"; [ \"$prev\" = -o ] && o=\"$a\"; [ \"$prev\" = -w ] && w=1; prev=\"$a\"; done\n\
          for a in \"$@\"; do case \"$a\" in @*)\n\
-             if [ \"$m\" = PATCH ]; then cp \"${a#@}\" \"$STUB_PATCH\"; else cp \"${a#@}\" \"$STUB_PUT\"; fi\n\
+             if [ \"$m\" = PATCH ]; then cp \"${a#@}\" \"$STUB_PATCH\"\n\
+                 if [ -n \"${STUB_PATCH_LOG:-}\" ]; then cat \"${a#@}\" >> \"$STUB_PATCH_LOG\"; echo >> \"$STUB_PATCH_LOG\"; fi\n\
+             else cp \"${a#@}\" \"$STUB_PUT\"\n\
+                 if [ -n \"${STUB_PUT_LOG:-}\" ]; then cat \"${a#@}\" >> \"$STUB_PUT_LOG\"; echo >> \"$STUB_PUT_LOG\"; fi\n\
+                 code=\"${STUB_PUT_CODE:-200}\"; said=\"${STUB_PUT_BODY:-}\"\n\
+                 if [ -n \"${STUB_PUT_FIRST_CODE:-}\" ] && [ ! -e \"$STUB_PUT.first\" ]; then\n\
+                     : > \"$STUB_PUT.first\"; code=\"$STUB_PUT_FIRST_CODE\"; said=\"${STUB_PUT_FIRST_BODY:-}\"; fi\n\
+                 if [ -n \"$o\" ]; then printf '%s' \"$said\" > \"$o\"; fi\n\
+                 if [ -n \"$w\" ]; then printf '%s' \"$code\"; fi\n\
+             fi\n\
              exit 0;; esac; done\n\
+         for a in \"$@\"; do case \"$a\" in http*) printf '%s\\n' \"$a\" > \"$STUB_GET\";; esac; done\n\
          cat \"$STUB_JOBS\"\n",
     );
     write_exec(&bin.join("gh"), "#!/bin/sh\nexit 0\n");
@@ -73,7 +92,7 @@ fn packet_for(root: &Path, host: &str, verb: &str, args: &str) {
     std::fs::write(
         root.join("jobs.json"),
         format!(
-            r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"{host}","verb":"{verb}","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}]}}"#
+            r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"{host}","verb":"{verb}","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}],"total":1}}"#
         ),
     )
     .unwrap();
@@ -111,7 +130,8 @@ fn run(
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", root.join("jobs.json"))
         .env("STUB_PUT", &put)
-        .env("STUB_PATCH", root.join("patch.json"));
+        .env("STUB_PATCH", root.join("patch.json"))
+        .env("STUB_GET", root.join("get.url"));
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -404,6 +424,62 @@ fn every_refusal_path_names_its_reason_on_the_step() {
     );
 }
 
+/// AN ARG IS ONE WORD, OR IT IS REFUSED (security review of fd7090cc,
+/// 2026-09-24). jq's `test` runs Oniguruma in Perl syntax, where `$`
+/// matches before a TRAILING NEWLINE — measured on jq 1.6:
+/// `"target-a\n" | test("^[a-z-]{1,20}$")` is `true`. The argv is then
+/// rebuilt from jq's output one line per word, so that newline became a
+/// SECOND, empty word, and every placeholder after it moved one place —
+/// on an approval verb, the place the signed plan's hash rides. So a
+/// control character anywhere in an arg is refused by name before any
+/// pattern is consulted, and every pattern must match the WHOLE string.
+#[test]
+fn an_arg_carrying_a_newline_or_a_control_character_is_refused() {
+    needs_jq!();
+    let root = scratch("control-chars");
+    stub_sor(&root);
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "echo-word",
+            r#"{"about":"test","hosts":["forge"],"argv":["echo","{1}","{2}"],
+                "params":[{"name":"word","pattern":"^[a-z-]{1,20}$"},
+                          {"name":"tail","pattern":"^[a-z]{1,5}$","optional":true}]}"#,
+        )],
+    );
+    for (args, shown) in [
+        (r#"["target-a\n"]"#, "U+000A"),
+        (r#"["target-a\n","x"]"#, "U+000A"),
+        (r#"["targ\u0001et"]"#, "U+0001"),
+        (r#"["target-a\r"]"#, "U+000D"),
+        (r#"["target-a\u007f"]"#, "U+007F"),
+    ] {
+        packet(&root, "echo-word", args);
+        let (out, payload) = run(&root, &verbs, &[]);
+        let md = payload.unwrap_or_else(|| panic!("{args}: no step completed: {out}"));
+        assert_eq!(md["disposition"], "refused", "{args}: {md} / {out}");
+        let reason = md["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("control character") && reason.contains("word"),
+            "{args}: the refusal names the arg and why: {reason}"
+        );
+        assert!(
+            reason.contains(shown),
+            "{args}: and names the character by code point, not raw: {reason}"
+        );
+        assert!(
+            !reason.chars().any(|c| c == '\n' || c == '\u{1}'),
+            "{args}: the reason itself carries no control character: {reason:?}"
+        );
+    }
+    // And the clean word still runs.
+    packet(&root, "echo-word", r#"["target-a"]"#);
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert_eq!(md["output"], "target-a\n", "{md}");
+}
+
 /// An optional literal that is absent DROPS its placeholder word: the
 /// verb runs with no trailing empty argument (which `echo` would show
 /// as a trailing space), and present it rides through verbatim.
@@ -493,6 +569,36 @@ fn a_read_only_verb_answers_on_boss_gcp() {
     assert_eq!(md["exit_code"], "0", "{md} / {out}");
     assert_eq!(md["runner_host"], "boss-gcp", "{md}");
     assert!(out.contains("answered df"), "{out}");
+}
+
+/// `disk-report` answers on boss-gcp too (backlog d3c7eada, 2026-09-26):
+/// the host's 48 GB root sat under its floor for nine days with only
+/// `df` to read it, so nothing could say what fills it. Run through the
+/// real allowlist with the host-shaped commands stubbed, it answers with
+/// its verdict line rather than a refusal.
+#[test]
+fn disk_report_answers_on_boss_gcp() {
+    needs_jq!();
+    let root = scratch("disk-report-gcp");
+    let bin = stub_sor(&root);
+    for tool in ["sudo", "docker"] {
+        write_exec(&bin.join(tool), "#!/bin/sh\nexit 1\n");
+    }
+    write_exec(
+        &bin.join("du"),
+        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '0\\t%s\\n' \"$last\"\n",
+    );
+    let verbs = real_verbs(&root);
+    packet_for(&root, "boss-gcp", "disk-report", "[]");
+    let (out, payload) = run(&root, &verbs, &[("HOST_ID", "boss-gcp".to_string())]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    assert_eq!(md["runner_host"], "boss-gcp", "{md}");
+    assert!(
+        md["output"].as_str().unwrap_or("").contains("verdict: "),
+        "the report must reach its verdict line: {md}"
+    );
 }
 
 /// ABSENT MEANS REFUSE, so a verb cannot reach a host by forgetting to
@@ -590,10 +696,16 @@ fn the_runner_loads_every_shipped_verb_file() {
     let root = scratch("shipped-directory");
     stub_sor(&root);
     let verbs = real_verbs(&root);
-    let expected: Vec<String> = shipped_verb_files()
+    // Sorted by NAME, the order the runner lists them in (jq's keys),
+    // not by path: `prune-registry-versions-daily.json` sorts before
+    // `prune-registry-versions.json` because `-` is below `.`, while the
+    // name `prune-registry-versions` sorts first — the first pair of verb
+    // names where one is a prefix of the other (backlog 8d77d670).
+    let mut expected: Vec<String> = shipped_verb_files()
         .iter()
         .map(|f| f.file_stem().unwrap().to_string_lossy().into_owned())
         .collect();
+    expected.sort();
     assert!(expected.len() >= 16, "{expected:?}");
     assert!(
         !repo_root().join("infra/ops/verbs.json").exists(),
@@ -891,6 +1003,360 @@ fn an_answered_verbs_duration_is_recorded_on_its_step() {
     );
 }
 
+/// A REFUSED COMPLETION SAYS WHY, ON THE REQUEST (post-mortem
+/// 3c3b202c). On 2026-09-22 from 00:50 to 02:54 UTC both runners
+/// stalled together, the forge's oldest request waiting 7394 s, and
+/// nothing in the system of record named a cause. The cause: ops-request
+/// v2 gated `execute` on `NOT requires_approval OR approve.done`, and
+/// the step PUT's unresolved-blockers guard refused every completion
+/// over the pending `approve` with a 409 (fixed in bd0f3369). The runner
+/// ran each verb, met the 409, counted it `failed` and moved on, so it
+/// re-ran every open request's verb once a minute for two hours. What
+/// the record held about that: nothing. `curl -f` threw away the 409's
+/// body, which named the blocker, so even the journal carried only the
+/// status, and the unit going red was watched by nobody.
+///
+/// So a completion the server REFUSES (it answered, and not 2xx) is
+/// written onto the request through the metadata door, which kept
+/// working all night: the status, the server's own words, when, how
+/// many times, and whether the verb ran anyway. That last one matters
+/// because a refused answer re-runs the verb on the next pass. The
+/// packet then says why it is stuck, and a queue alarm (a45b38c1) can
+/// quote it rather than send someone to a journal.
+/// A VERB WHOSE COMPLETION WAS REFUSED IS NEVER RUN AGAIN BY ITSELF
+/// (backlog 865d37df, post-mortem 3c3b202c). The runner runs a verb
+/// BEFORE its completion PUT, so a refused PUT left the step ready and
+/// the next pass ran the verb again: on 2026-09-22 every open verb re-ran
+/// about 120 times in two hours (58 cluster-converge packets in 66
+/// minutes from one converge request). Those verbs were reads and
+/// converges; ops-request v2 exists for destructive ones. So once the
+/// request carries a refusal whose verb RAN, the runner holds it — skips
+/// it, names the reason — and re-running is an explicit act: clearing
+/// `completion_refused`. At-most-once matters more than completion.
+#[test]
+fn a_verb_whose_completion_was_refused_runs_exactly_once_across_passes() {
+    needs_jq!();
+    let root = scratch("completion-refused-held");
+    stub_sor(&root);
+    let ran = root.join("ran.count");
+    let verb = root.join("verb.sh");
+    write_exec(
+        &verb,
+        &format!("#!/bin/sh\necho x >> \"{}\"\necho did it\n", ran.display()),
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "once",
+            &format!(
+                r#"{{"about":"a verb that must not repeat","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                verb.display()
+            ),
+        )],
+    );
+    let log = root.join("patches.jsonl");
+    let env = vec![
+        ("STUB_PUT_CODE", "409".to_string()),
+        (
+            "STUB_PUT_BODY",
+            r#"{"error":"step has unresolved blockers"}"#.to_string(),
+        ),
+        ("STUB_PATCH_LOG", log.display().to_string()),
+    ];
+    let runs = || {
+        std::fs::read_to_string(&ran)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    // Pass 1: the verb runs, the server refuses its completion, and the
+    // refusal (verb_ran: true) is written onto the request.
+    packet(&root, "once", "[]");
+    let (out, _) = run(&root, &verbs, &env);
+    assert_eq!(runs(), 1, "the first pass runs the verb: {out}");
+    let written = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("completion_refused").is_some())
+        .unwrap_or_else(|| panic!("no refusal written: {out}"));
+    assert_eq!(written["completion_refused"]["verb_ran"], true, "{written}");
+
+    // Passes 2 and 3 see the request AS THE RUNNER LEFT IT.
+    let job = serde_json::json!({"data":[{
+        "id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open",
+        "metadata":{"host":"forge","verb":"once","args":[],
+                    "completion_refused": written["completion_refused"]},
+        "steps":[{"id":"s-execute","spec_slug":"execute","status":"ready",
+                  "metadata":{"authority_role":"platform-admin"}}]}],"total":1});
+    std::fs::write(root.join("jobs.json"), job.to_string()).unwrap();
+    for pass in 2..=3 {
+        let (out, payload) = run(&root, &verbs, &env);
+        assert_eq!(
+            runs(),
+            1,
+            "pass {pass} re-ran a verb whose completion was refused: {out}"
+        );
+        assert!(payload.is_none(), "a held request is not completed: {out}");
+        assert!(
+            out.contains("held after a refused completion")
+                && out.contains("step has unresolved blockers"),
+            "the hold names itself and the server's reason: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_completion_is_written_onto_its_request_with_the_servers_reason() {
+    needs_jq!();
+    let root = scratch("completion-refused");
+    stub_sor(&root);
+    let ok = root.join("ok.sh");
+    write_exec(&ok, "#!/bin/sh\necho ok\n");
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "ok",
+            &format!(
+                r#"{{"about":"a verb that answers","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                ok.display()
+            ),
+        )],
+    );
+    let refusal = r#"{"error":"step has unresolved blockers","step_id":"s-execute","unresolved_blockers":["s-approve=pending"]}"#;
+    let log = root.join("patches.jsonl");
+    let env = |log: &Path| {
+        vec![
+            ("STUB_PUT_CODE", "409".to_string()),
+            ("STUB_PUT_BODY", refusal.to_string()),
+            ("STUB_PATCH_LOG", log.display().to_string()),
+        ]
+    };
+    let refused_patch = |log: &Path, out: &str| -> serde_json::Value {
+        std::fs::read_to_string(log)
+            .unwrap_or_else(|e| panic!("no PATCH at all: {e}; {out}"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("a PATCH body is JSON"))
+            .find(|v| v.get("completion_refused").is_some())
+            .unwrap_or_else(|| panic!("the refused completion never reached the request: {out}"))
+    };
+
+    packet(&root, "ok", "[]");
+    let (out, _) = run(&root, &verbs, &env(&log));
+    assert!(
+        out.contains("step has unresolved blockers"),
+        "the journal line carries the server's reason, not only its status: {out}"
+    );
+    let r = &refused_patch(&log, &out)["completion_refused"];
+    assert_eq!(r["http"], 409, "{r} / {out}");
+    assert!(
+        r["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("s-approve=pending")),
+        "the server's own words ride the request: {r}"
+    );
+    assert_eq!(r["count"], 1, "{r}");
+    assert_eq!(r["verb_ran"], true, "the verb ran before the refusal: {r}");
+    let first = r["first_at"].as_str().unwrap_or_default().to_string();
+    assert!(
+        first.ends_with('Z') && r["last_at"] == first.as_str(),
+        "a first refusal is stamped once, in UTC: {r}"
+    );
+    assert!(
+        out.contains("failed=1"),
+        "a refused completion is still a failed pass, and the unit still goes red: {out}"
+    );
+
+    // The next pass meets the same refusal. The request already carries
+    // the first one, and the record accumulates rather than resets: how
+    // long a request has been jammed is the number a reader wants.
+    std::fs::write(
+        root.join("jobs.json"),
+        r#"{"data":[{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{"host":"forge","verb":"ok","args":[],"completion_refused":{"http":409,"count":4,"first_at":"2026-09-22T00:51:02Z"}},"steps":[{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{"authority_role":"platform-admin"}}]}],"total":1}"#,
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&log);
+    let (out, _) = run(&root, &verbs, &env(&log));
+    let r = &refused_patch(&log, &out)["completion_refused"];
+    assert_eq!(r["count"], 5, "{r} / {out}");
+    assert_eq!(r["first_at"], "2026-09-22T00:51:02Z", "{r}");
+
+    // A completion the server ACCEPTS writes no refusal.
+    packet(&root, "ok", "[]");
+    let _ = std::fs::remove_file(&log);
+    let (out, payload) = run(
+        &root,
+        &verbs,
+        &[("STUB_PATCH_LOG", log.display().to_string())],
+    );
+    assert!(payload.is_some(), "{out}");
+    assert!(
+        !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("completion_refused"),
+        "an accepted completion is not a refusal: {out}"
+    );
+}
+
+/// The `error` the step PUT answers, with 409, when another write moved
+/// the step's metadata between the handler's read and its write —
+/// `boss_jobs::step_metadata_write::STEP_CHANGED_ERROR`, introduced by
+/// car 88123ae0 (branch fix/dispatch-reads-back-the-briefed-step-merge).
+/// Spelled here because that constant is not on main as this is written
+/// and boss-testing does not depend on boss-jobs; the runner carries the
+/// same text, and these cases hold it to this copy (backlog 2a6d0b86).
+const STEP_CHANGED: &str = "step changed while this write was computed — its metadata \
+     is no longer what the write read, so writing it would erase the other write";
+
+fn step_changed_body() -> String {
+    serde_json::json!({
+        "error": STEP_CHANGED,
+        "step_id": "s-execute",
+        "hint": "nothing was written; send the same request again — the handler reads the row afresh",
+    })
+    .to_string()
+}
+
+/// One answering verb, a stub SoR, and a PUT log: the fixture the
+/// step-race cases share.
+fn race_fixture(case: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let root = scratch(case);
+    stub_sor(&root);
+    let ok = root.join("ok.sh");
+    write_exec(&ok, "#!/bin/sh\necho ok\n");
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "ok",
+            &format!(
+                r#"{{"about":"a verb that answers","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                ok.display()
+            ),
+        )],
+    );
+    packet(&root, "ok", "[]");
+    let puts = root.join("puts.jsonl");
+    let patches = root.join("patches.jsonl");
+    (root, verbs, puts, patches)
+}
+
+fn logged(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("a logged body is JSON"))
+        .collect()
+}
+
+/// A COMPLETION THAT LOST THE STEP RACE IS SENT ONCE MORE (backlog
+/// 2a6d0b86, review of car 88123ae0). That car makes the step PUT
+/// refuse, 409 with [`STEP_CHANGED`], a write computed from a read that
+/// another write has since moved, where it used to answer success and
+/// erase the other write. This runner read every non-2xx completion as
+/// final: it recorded `completion_refused`, and because the verb had
+/// run, the request was HELD for a human — over a refusal whose own
+/// words say nothing was written and the same request may be sent
+/// again. So exactly that refusal earns one resend of the same body.
+#[test]
+fn a_completion_that_lost_the_step_race_is_sent_once_more_and_lands() {
+    needs_jq!();
+    let (root, verbs, puts, patches) = race_fixture("step-race-once");
+    let (out, payload) = run(
+        &root,
+        &verbs,
+        &[
+            ("STUB_PUT_FIRST_CODE", "409".to_string()),
+            ("STUB_PUT_FIRST_BODY", step_changed_body()),
+            ("STUB_PUT_LOG", puts.display().to_string()),
+            ("STUB_PATCH_LOG", patches.display().to_string()),
+        ],
+    );
+    let sent = logged(&puts);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the lost completion and exactly one resend: {out}"
+    );
+    assert_eq!(sent[0], sent[1], "the resend is the same body: {out}");
+    assert_eq!(sent[1]["status"], "completed", "{out}");
+    assert!(payload.is_some(), "{out}");
+    assert!(
+        !logged(&patches)
+            .iter()
+            .any(|p| p.get("completion_refused").is_some()),
+        "a race the resend won is not a refused completion — nothing to hold: {out}"
+    );
+    assert!(
+        out.contains("sending the same completion once more"),
+        "the journal says why a second PUT went out: {out}"
+    );
+    assert!(
+        out.contains("answered ok") && out.contains("failed=0"),
+        "the request is answered and the pass is clean: {out}"
+    );
+}
+
+/// ...and a completion that loses it AGAIN is refused by name, never
+/// looped: the refusal is recorded on the request with the server's own
+/// words, exactly as any other refused completion is.
+#[test]
+fn a_completion_that_loses_the_step_race_twice_is_refused_by_name() {
+    needs_jq!();
+    let (root, verbs, puts, patches) = race_fixture("step-race-always");
+    let (out, _) = run(
+        &root,
+        &verbs,
+        &[
+            ("STUB_PUT_CODE", "409".to_string()),
+            ("STUB_PUT_BODY", step_changed_body()),
+            ("STUB_PUT_LOG", puts.display().to_string()),
+            ("STUB_PATCH_LOG", patches.display().to_string()),
+        ],
+    );
+    assert_eq!(logged(&puts).len(), 2, "one resend, never a loop: {out}");
+    assert!(
+        out.contains("lost the step race twice"),
+        "the journal names the second loss: {out}"
+    );
+    let refused = logged(&patches)
+        .into_iter()
+        .find(|p| p.get("completion_refused").is_some())
+        .unwrap_or_else(|| panic!("the second loss is a refused completion: {out}"));
+    assert!(
+        refused["completion_refused"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains(STEP_CHANGED)),
+        "the refusal rides the request in the server's words: {refused}"
+    );
+    assert!(out.contains("failed=1"), "{out}");
+}
+
+/// Any OTHER refused completion is still sent exactly once: only the
+/// refusal that says nothing was written earns a resend.
+#[test]
+fn a_completion_refused_for_another_reason_is_not_resent() {
+    needs_jq!();
+    let (root, verbs, puts, patches) = race_fixture("put-409-other");
+    let (out, _) = run(
+        &root,
+        &verbs,
+        &[
+            ("STUB_PUT_CODE", "409".to_string()),
+            (
+                "STUB_PUT_BODY",
+                r#"{"error":"step has unresolved blockers"}"#.to_string(),
+            ),
+            ("STUB_PUT_LOG", puts.display().to_string()),
+            ("STUB_PATCH_LOG", patches.display().to_string()),
+        ],
+    );
+    assert_eq!(logged(&puts).len(), 1, "never resent: {out}");
+    assert!(!out.contains("once more"), "{out}");
+}
+
 /// A QUEUE WHOSE DEPTH NOBODY READS (backlog 1ffb3305). This runner
 /// walks up to 100 open requests SERIALLY in one oneshot with no
 /// per-verb fairness, so a latency-sensitive verb queues behind
@@ -932,7 +1398,7 @@ fn the_runner_reads_its_own_queue_depth_and_oldest_wait() {
 
     // An empty queue is a reading too, and the one the runner takes
     // most often.
-    std::fs::write(root.join("jobs.json"), r#"{"data":[]}"#).unwrap();
+    std::fs::write(root.join("jobs.json"), r#"{"data":[],"total":0}"#).unwrap();
     let (out, _) = run(&root, &verbs, &[]);
     assert_eq!(
         queue_line(&out),
@@ -985,6 +1451,131 @@ fn the_runner_reads_its_own_queue_depth_and_oldest_wait() {
     );
 }
 
+/// A LIMIT IS NOT A FILTER (backlog 2cfb4562). The reading above was
+/// taken from `?kind=ops-request&status=open&limit=100` — EVERY host's
+/// open requests, one page of them, with the `total` the API answers
+/// beside the rows thrown away. At a depth above 100 the walk silently
+/// ignored the tail and the gauge printed the page as though it were
+/// the whole queue: a queue stuck at 400 reads 100 forever, and any
+/// threshold set above 100 could never be crossed. The same shape was
+/// found the same day in a recorded probe (limit=300 against a live
+/// total of 345, its one qualifying row in the unread tail).
+///
+/// So the query is narrowed to THIS host by the server, the rows are
+/// compared against the `total` it answers, and a reading that could
+/// not see the whole queue says so in a shape no reader can take for
+/// an exact number: `depth=` only when the count is the server's own
+/// for this host, `depth>=` when it is a lower bound, and the oldest
+/// wait likewise — the list is newest first, so the tail it did not
+/// read is exactly where the oldest packets are.
+#[test]
+fn a_queue_the_runner_could_not_see_all_of_is_not_reported_as_exact() {
+    needs_jq!();
+    let root = scratch("queue-truncated");
+    stub_sor(&root);
+    let ok = root.join("ok.sh");
+    write_exec(&ok, "#!/bin/sh\necho ok\n");
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "ok",
+            &format!(
+                r#"{{"about":"a verb that answers","hosts":["forge"],"argv":["{}"],"params":[]}}"#,
+                ok.display()
+            ),
+        )],
+    );
+
+    // The server is asked for THIS host's queue, not every host's
+    // first page: the host rides the containment filter, url-encoded.
+    queue(&root, "ok", &[Some(30)]);
+    let (out, _) = run(&root, &verbs, &[]);
+    let url = std::fs::read_to_string(root.join("get.url"))
+        .unwrap_or_else(|e| panic!("the runner made no list read: {e}; {out}"));
+    assert!(
+        url.contains("metadata=%7B%22host%22%3A%22forge%22%7D"),
+        "the list read is narrowed to this host by the server: {url}"
+    );
+    assert!(
+        !url.split(['?', '&']).any(|kv| kv.trim() == "limit=100"),
+        "the page is not the old 100 cap: {url}"
+    );
+
+    // Two rows on the page, five open: the depth is the server's count
+    // and the walk knows it saw only part of it.
+    queue_of(&root, "ok", &[Some(120), Some(30)], Some(5));
+    let (out, _) = run(&root, &verbs, &[]);
+    let line = queue_line(&out);
+    assert_eq!(
+        field(&line, "depth"),
+        "5",
+        "the depth is the server's total: {line}"
+    );
+    assert!(
+        line.contains("oldest_wait_s>=") && line.contains("truncated"),
+        "the oldest wait of a partial read is a lower bound, and the line says why: {line}"
+    );
+    assert!(
+        !line
+            .split_whitespace()
+            .any(|w| w.starts_with("oldest_wait_s=")),
+        "a lower bound is never printed in the exact shape: {line}"
+    );
+    let patch = read_patch(&root, &out);
+    assert_eq!(
+        patch["queue_depth"], 5,
+        "the request carries the whole queue's depth: {patch}"
+    );
+
+    // No `total` at all: the runner cannot know how much it did not
+    // see, so it REFUSES the exact reading rather than printing the
+    // page as the queue — and the request says "at least", under a key
+    // no reader of `queue_depth` can mistake for the count.
+    queue_of(&root, "ok", &[Some(120), Some(30)], None);
+    let (out, _) = run(&root, &verbs, &[]);
+    let line = queue_line(&out);
+    assert!(
+        line.contains("depth>=2") && line.contains("truncated"),
+        "an unverifiable count is a lower bound, named: {line}"
+    );
+    assert!(
+        !line.split_whitespace().any(|w| w.starts_with("depth=")),
+        "no exact depth without a total to check it against: {line}"
+    );
+    let patch = read_patch(&root, &out);
+    assert!(
+        patch.get("queue_depth").is_none(),
+        "a lower bound is not written as the depth: {patch}"
+    );
+    assert_eq!(patch["queue_depth_at_least"], 2, "{patch}");
+
+    // A server that ignored the host filter answers every host's
+    // `total` — the wrong-target shape (CLAUDE.md §Doors: it answers
+    // instead of erroring). A row for another host on the page is the
+    // evidence, and that total is not this host's depth.
+    std::fs::write(
+        root.join("jobs.json"),
+        r#"{"data":[{"id":"bbbbbbbb-0000-4000-8000-000000000000","status":"open","metadata":{"host":"boss-gcp","verb":"ok","args":[]},"steps":[]}],"total":1}"#,
+    )
+    .unwrap();
+    let (out, _) = run(&root, &verbs, &[]);
+    let line = queue_line(&out);
+    assert!(
+        line.contains("depth>=0") && line.contains("truncated"),
+        "another host's total is not this host's depth: {line}"
+    );
+}
+
+/// The request-level PATCH the last run wrote, or a panic naming what
+/// the run printed instead.
+fn read_patch(root: &Path, out: &str) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(root.join("patch.json"))
+            .unwrap_or_else(|e| panic!("no PATCH on the request's metadata: {e}; {out}")),
+    )
+    .expect("the PATCH body is JSON")
+}
+
 /// The runner's one-line queue reading, or a panic naming what it
 /// printed instead.
 fn queue_line(out: &str) -> String {
@@ -1006,6 +1597,13 @@ fn field(line: &str, key: &str) -> String {
 /// carrying the `opened_at` a live request carries (`Some(age)`
 /// seconds ago) or none at all.
 fn queue(root: &Path, verb: &str, ages_s: &[Option<u64>]) {
+    queue_of(root, verb, ages_s, Some(ages_s.len()));
+}
+
+/// [`queue`], with the `total` the server answers beside the rows set
+/// by hand: `Some(n)` larger than the rows is a page that did not hold
+/// the whole queue, and `None` is a response that carries no `total`.
+fn queue_of(root: &Path, verb: &str, ages_s: &[Option<u64>], total: Option<usize>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1025,7 +1623,10 @@ fn queue(root: &Path, verb: &str, ages_s: &[Option<u64>]) {
         .collect();
     std::fs::write(
         root.join("jobs.json"),
-        format!(r#"{{"data":[{}]}}"#, rows.join(",")),
+        match total {
+            Some(t) => format!(r#"{{"data":[{}],"total":{t}}}"#, rows.join(",")),
+            None => format!(r#"{{"data":[{}]}}"#, rows.join(",")),
+        },
     )
     .unwrap();
 }
@@ -1046,23 +1647,23 @@ fn iso_at(epoch: u64) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-/// A verb that declares `requires_approval` is REFUSED until something
-/// can verify an approval — and the refusal says which verb, and why.
+/// A verb that declares `requires_approval` is REFUSED unless the runner
+/// verified an approval — and the refusal says which verb, and why.
 ///
-/// This is the safety half of design 17835005 (passkey-approved,
-/// machine-executed destructive operations), and it lands BEFORE the
-/// thing that issues approvals, deliberately. The design's own claim is
-/// that the guard matters more than the approval: a verb whose
-/// dangerous outcome is excluded by machine-checkable preconditions can
-/// be handed to the machine, and one that cannot must not be. Declaring
-/// the requirement first means the first such verb is inert on arrival
-/// — the system never gains the power before it gains the gate.
+/// This was the safety half of design 17835005 (passkey-approved,
+/// machine-executed destructive operations), and it landed BEFORE the
+/// thing that issues approvals, deliberately: the guard matters more than
+/// the approval, so the first such verb was inert on arrival. The
+/// approval channel landed later (backlog fd7090cc; its cases are
+/// `ops_runner_approval_sh.rs`), and this case keeps the floor under it:
+/// a request with no approve step at all — nothing any approval could
+/// ride on — is still refused, naming the verb.
 ///
 /// FAIL CLOSED IS THE WHOLE POINT. A runner that cannot check an
 /// approval must refuse, never assume; `commission-a-disk` partitions a
 /// block device, and the failure mode of assuming is a wiped host.
 #[test]
-fn a_verb_requiring_approval_is_refused_while_no_approval_can_be_verified() {
+fn a_verb_requiring_approval_is_refused_without_a_verified_approval() {
     needs_jq!();
     let root = scratch("requires-approval");
     stub_sor(&root);
@@ -1123,13 +1724,17 @@ fn a_verb_that_requires_no_approval_still_runs_beside_one_that_does() {
 }
 
 /// The shipped verb declares it, and the shipped script refuses the
-/// shapes that would aim it at the wrong disk.
+/// shapes that would aim it at the wrong disk — or at a plan nobody
+/// approved.
 ///
-/// The declaration is a one-word difference between a verb that is
-/// inert and a verb that partitions a block device on request, so it
-/// is pinned rather than trusted to review.
+/// The declaration is a one-word difference between a verb that runs
+/// only under a passkey and a verb that partitions a block device on
+/// request, so it is pinned rather than trusted to review. Since backlog
+/// b2d5b546 (2026-09-26) the script takes the approved plan's sha256 as
+/// its last argument, the way merge-tenant-main and reap-terminated-pods
+/// do: without one it is a refusal before any device is looked at.
 #[test]
-fn the_disk_verb_is_inert_and_refuses_an_unstable_target() {
+fn the_disk_verb_requires_approval_and_refuses_an_unstable_target() {
     let root = repo_root();
     let spec: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("infra/ops/verbs/commission-a-disk.json"))
@@ -1138,8 +1743,24 @@ fn the_disk_verb_is_inert_and_refuses_an_unstable_target() {
     .expect("the verb file is JSON");
     assert_eq!(
         spec["requires_approval"], true,
-        "commission-a-disk writes a partition table; it stays inert until an approval can \
-         be verified"
+        "commission-a-disk writes a partition table; it runs only under a verified passkey \
+         approval"
+    );
+    assert_eq!(
+        spec["argv"],
+        serde_json::json!(["infra/forge/commission-a-disk.sh", "{1}", "{2}", "{3}"]),
+        "the runner appends the SIGNED plan's hash as the last arg, and the script must \
+         receive it"
+    );
+    // The allowlist holds the mount path to the script's own shape, so a
+    // request for any other path is refused before a plan is rendered.
+    assert_eq!(
+        spec["params"][1]["pattern"], "^/srv/[A-Za-z0-9][A-Za-z0-9._-]{0,40}$",
+        "one new directory under /srv, nothing else (review of car 0556935a)"
+    );
+    assert_eq!(
+        spec["params"][0]["pattern"], "^/dev/disk/by-id/[A-Za-z0-9._-]{4,120}$",
+        "a by-id name, never a kernel name"
     );
     assert!(
         spec["about"]
@@ -1154,20 +1775,50 @@ fn the_disk_verb_is_inert_and_refuses_an_unstable_target() {
     // are the whole test, which is the right way round for a verb whose
     // only interesting property is what it declines to do.
     let script = root.join("infra/forge/commission-a-disk.sh");
-    let cases: [(&[&str], &str); 4] = [
-        (&["/dev/nvme0n1", "/srv/data"], "stable identity"),
-        (&["nvme0n1", "/srv/data"], "stable identity"),
+    let hash = "0123456789abcdef".repeat(4);
+    let by_id = "/dev/disk/by-id/nvme-NO-SUCH-DEVICE-0000";
+    let cases: [(&[&str], &str); 20] = [
+        (&["/dev/nvme0n1", "/srv/data", &hash], "stable identity"),
+        (&["nvme0n1", "/srv/data", &hash], "stable identity"),
+        (&[by_id, "/srv/data", &hash], "no such device"),
+        // A by-id name for a PARTITION is refused by its name, before it
+        // is resolved (the review of car 0556935a, finding 1: a
+        // `...-part1` of the root NVMe had passed every check).
         (
-            &["/dev/disk/by-id/nvme-NO-SUCH-DEVICE-0000", "/srv/data"],
-            "no such device",
+            &["/dev/disk/by-id/nvme-X-part1", "/srv/data", &hash],
+            "names a partition",
         ),
         (
-            &["/dev/disk/by-id/nvme-NO-SUCH-DEVICE-0000", "relative/path"],
-            "must be absolute",
+            &["/dev/disk/by-id/nvme-X-part12", "/srv/data", &hash],
+            "names a partition",
         ),
+        // The mount path is one new directory under /srv, nothing else
+        // (finding 3): no traversal, no nesting, no other root.
+        (&[by_id, "relative/path", &hash], "mount path must be"),
+        (&[by_id, "/mnt/data", &hash], "mount path must be"),
+        (&[by_id, "/", &hash], "mount path must be"),
+        (&[by_id, "/srv", &hash], "mount path must be"),
+        (&[by_id, "/srv/", &hash], "mount path must be"),
+        (&[by_id, "/srv/.", &hash], "mount path must be"),
+        (&[by_id, "/srv/..", &hash], "mount path must be"),
+        (&[by_id, "/srv/../etc", &hash], "mount path must be"),
+        (&[by_id, "/srv/a/b", &hash], "mount path must be"),
+        (&[by_id, "/srv/.hidden", &hash], "mount path must be"),
+        (&[by_id, "/srv/a b", &hash], "mount path must be"),
+        // No approved plan: the write refuses before it resolves anything.
+        (&[by_id, "/srv/data"], "plan-sha256"),
+        // A hash that is not one — short, upper-case, or not hex.
+        (&[by_id, "/srv/data", &hash[..63]], "64 lowercase hex"),
+        (
+            &[by_id, "/srv/data", &hash.to_uppercase()],
+            "64 lowercase hex",
+        ),
+        (&[by_id, "/srv/data", &"g".repeat(64)], "64 lowercase hex"),
     ];
-    for (args, expected) in cases {
-        let out = Command::new("sh")
+    // Under bash, as the runner runs it (its shebang): the write path
+    // uses arrays and pipefail since the review of car 0556935a.
+    let run = |args: &[&str]| {
+        let out = Command::new("bash")
             .arg(&script)
             .args(args)
             .output()
@@ -1177,8 +1828,12 @@ fn the_disk_verb_is_inert_and_refuses_an_unstable_target() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        (out.status.code(), text)
+    };
+    for (args, expected) in cases {
+        let (code, text) = run(args);
         assert_eq!(
-            out.status.code(),
+            code,
             Some(78),
             "a wrong request is EX_CONFIG, not a failed run: {args:?} -> {text}"
         );
@@ -1186,5 +1841,12 @@ fn the_disk_verb_is_inert_and_refuses_an_unstable_target() {
             text.contains(expected),
             "the refusal says which precondition failed: {args:?} -> {text}"
         );
+        // The plan refuses the same target in the same words: a plan is
+        // rendered only for what the write would do.
+        if args.len() == 3 && !expected.contains("hex") {
+            let (code, text) = run(&["--plan", args[0], args[1]]);
+            assert_eq!(code, Some(78), "--plan {args:?} -> {text}");
+            assert!(text.contains(expected), "--plan {args:?} -> {text}");
+        }
     }
 }

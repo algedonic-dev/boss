@@ -160,7 +160,7 @@ const OPS_REQUEST_WINDOW = 60;
 
 export async function fetchOpsRequests(): Promise<readonly JobLite[] | null> {
   try {
-    const r = await fetch(`/api/jobs?kind=ops-request&limit=${OPS_REQUEST_WINDOW}`);
+    const r = await fetch(`/api/jobs?kind=ops-request&limit=${OPS_REQUEST_WINDOW}&full=true`);
     if (!r.ok) return null;
     const body = (await r.json()) as { data?: JobLite[] };
     return Array.isArray(body.data) ? body.data : null;

@@ -70,7 +70,7 @@ impl AssetsTestApp {
             people_client,
             classes_client: None,
             hub,
-            policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
+            policy: Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>,
             insights_clients: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };
@@ -100,7 +100,7 @@ impl AssetsTestApp {
             people_client,
             classes_client: None,
             hub,
-            policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
+            policy: Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>,
             insights_clients: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };

@@ -1,0 +1,20 @@
+# StepType kinds that have LEFT the bundle (crates/core/boss-jobs/seeds/step_types.toml).
+#
+# steptype-bundle-ratchet refuses any kind that exists on the trunk and is
+# removed on a branch unless a row here names it (backlog adaecf05). The
+# dispatcher reads an unknown kind as decision-shaped, so a removed kind
+# with steps still in flight routes every one of them to a person; the
+# tree cannot see the live registry, so the car measures and writes it
+# down here, where the removal's next reader can check it.
+#
+# One row per retired kind, whitespace-separated, append-only:
+#   kind  car  in_flight  measured_at
+# - car: the car that retires it, as <protocol>:<packet id>
+# - in_flight: pending|ready|active steps of that kind across every open
+#   packet, read from the system of record — the ratchet admits only 0
+# - measured_at: UTC, when that read was taken
+#
+# marketing-launch left with the launch calendar (design 2ea444f5, backlog
+# a8991c86, train #630) before this record existed; its count was measured
+# when the record was opened: GET /api/jobs?status=open, 459 of 459 rows.
+marketing-launch  ship-a-change:32f7ccb2  0  2026-09-26T19:56Z

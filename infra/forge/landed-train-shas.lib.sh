@@ -9,6 +9,28 @@
 # to no open one. Prints NOTHING when it cannot answer, and ALWAYS
 # RETURNS 0.
 #
+#   train_sha_sets <curl-cmd> <jobs-url> <lookback> <log-prefix> <closed-out> <open-out>
+#
+# The SAME read, answered as its two halves rather than their
+# difference: <closed-out> gets the keys CLOSED trains name (the two
+# fields below), <open-out> every sha-shaped token an OPEN train
+# carries. Returns 0 when the record answered, 1 when it could not —
+# the reason in TRAIN_SETS_WHY, both files empty.
+#
+# TWO QUESTIONS, TWO MEANINGS (backlog 8d77d670, the adversarial review
+# of the daily registry prune, M3). `landed_train_shas` answers the
+# DISK SWEEP's question — which images are COLLECTABLE — so it
+# subtracts every sha an open train mentions: closed minus open, the
+# direction that collects less. prune-registry-versions.sh used that
+# same answer as a KEEP set, where subtracting is the direction that
+# keeps LESS: an open train's image, and a landed image an open train
+# still names, were both deletable, unattended, every day. The prune
+# now reads the halves and keeps closed UNION open. Each meaning is
+# pinned where it is used: an_open_trains_sha_is_never_collected_as_landed
+# (the sweep) and an_open_trains_sha_is_kept_by_the_prune (the prune),
+# with the_train_lookup_answers_collectable_and_keep_from_one_read
+# holding both side by side over one reply.
+#
 # WHY THIS EXISTS (backlog 9195a2a6). The forge's routine CI-image pass
 # collected nothing for weeks and was not broken: measured 2026-09-11
 # (ops-request 28d3599c) the system docker daemon held 13
@@ -81,21 +103,22 @@
 # empty-page note above: an unnamed read would not fail, it would
 # silently retire the whole mechanism.
 
-landed_train_shas() {
-    local curl_cmd="$1" jobs_url="$2" lookback="$3" prefix="$4"
+train_sha_sets() {
+    local curl_cmd="$1" jobs_url="$2" lookback="$3" prefix="$4" closed_f="$5" open_f="$6"
     local reply rc=0 trains closed_raw open_raw
-
-    _lts_fallback() { # $1 = why
-        echo "$prefix: the landed-train lookup could not answer ($1), so this pass falls back to the AGE WINDOW alone — it prunes less, never more." >&2
+    TRAIN_SETS_WHY=""
+    : >"$closed_f" 2>/dev/null && : >"$open_f" 2>/dev/null || {
+        TRAIN_SETS_WHY="the key files $closed_f / $open_f cannot be written"
+        return 1
     }
 
     if [ -z "${jobs_url:-}" ]; then
-        _lts_fallback "BOSS_JOBS_URL is not set and there is no safe default: two jobs APIs exist and a read against the wrong one answers 'no trains' instead of erroring"
-        return 0
+        TRAIN_SETS_WHY="BOSS_JOBS_URL is not set and there is no safe default: two jobs APIs exist and a read against the wrong one answers 'no trains' instead of erroring"
+        return 1
     fi
     if ! command -v jq >/dev/null 2>&1; then
-        _lts_fallback "jq is not on this host, so the reply cannot be parsed"
-        return 0
+        TRAIN_SETS_WHY="jq is not on this host, so the reply cannot be parsed"
+        return 1
     fi
 
     # AN UNSIGNED READ SEES A SMALLER WORLD. Same header the ops-request
@@ -110,20 +133,20 @@ landed_train_shas() {
     reply="$("$curl_cmd" -fsS --max-time 20 \
         -H "x-boss-user: $boss_user" \
         ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
-        "$jobs_url/api/jobs?kind=pr-train&limit=$lookback" 2>&1)" || rc=$?
+        "$jobs_url/api/jobs?kind=pr-train&limit=$lookback&full=true" 2>&1)" || rc=$?
     if [ "$rc" -ne 0 ]; then
-        _lts_fallback "reading $jobs_url failed (curl exit $rc): ${reply:-no reply}"
-        return 0
+        TRAIN_SETS_WHY="reading $jobs_url failed (curl exit $rc): ${reply:-no reply}"
+        return 1
     fi
 
     if ! trains="$(printf '%s' "$reply" | jq -r '(.data // []) | length' 2>/dev/null)" \
         || [ -z "$trains" ]; then
-        _lts_fallback "the reply from $jobs_url is not a job listing this can read"
-        return 0
+        TRAIN_SETS_WHY="the reply from $jobs_url is not a job listing this can read"
+        return 1
     fi
     if [ "$trains" -eq 0 ]; then
-        _lts_fallback "$jobs_url listed NO pr-train packets, which is a failed read and not a fact — an unauthenticated or out-of-scope read is handed an empty page rather than an error"
-        return 0
+        TRAIN_SETS_WHY="$jobs_url listed NO pr-train packets, which is a failed read and not a fact — an unauthenticated or out-of-scope read is handed an empty page rather than an error"
+        return 1
     fi
 
     # A LIMIT IS NOT A FILTER: say how much of the record was read, so a
@@ -151,10 +174,6 @@ landed_train_shas() {
     open_raw="$(printf '%s' "$reply" | jq -r '
         (.data // [])[] | select(.status != "closed") | tostring' 2>/dev/null)" || open_raw=""
 
-    local closed_f open_f
-    closed_f="$(mktemp)" || { _lts_fallback "mktemp failed"; return 0; }
-    open_f="$(mktemp)" || { rm -f "$closed_f"; _lts_fallback "mktemp failed"; return 0; }
-
     printf '%s\n' "$closed_raw" \
         | sed 's/.*@//' \
         | grep -oE '^[0-9a-f]{7,40}$' \
@@ -164,6 +183,24 @@ landed_train_shas() {
         | grep -oE '[0-9a-f]{7,40}' \
         | cut -c1-7 \
         | sort -u >"$open_f"
+    return 0
+}
+
+landed_train_shas() {
+    local curl_cmd="$1" jobs_url="$2" lookback="$3" prefix="$4"
+    local closed_f open_f
+
+    _lts_fallback() { # $1 = why
+        echo "$prefix: the landed-train lookup could not answer ($1), so this pass falls back to the AGE WINDOW alone — it prunes less, never more." >&2
+    }
+
+    closed_f="$(mktemp)" || { _lts_fallback "mktemp failed"; return 0; }
+    open_f="$(mktemp)" || { rm -f "$closed_f"; _lts_fallback "mktemp failed"; return 0; }
+    if ! train_sha_sets "$curl_cmd" "$jobs_url" "$lookback" "$prefix" "$closed_f" "$open_f"; then
+        rm -f "$closed_f" "$open_f"
+        _lts_fallback "$TRAIN_SETS_WHY"
+        return 0
+    fi
 
     local landed
     landed="$(comm -23 "$closed_f" "$open_f")"

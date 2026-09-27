@@ -578,6 +578,17 @@ resource = "step-signoff:owner"
 action = "sign-off"
 scope = "all"
 
+# weekly-leadership-review's ceo-review step requires a ceo sign-off.
+# Missing until 2026-09-25 (backlog 292c00c2): the sim-origin bypass
+# signed it in the grant's place, which stops once the bypass is bound
+# (car ab1dba92). Pinned by boss-brewery-engine's
+# every_sign_off_role_is_granted test, which reads both seed files.
+[[grants]]
+role = "ceo"
+resource = "step-signoff:ceo"
+action = "sign-off"
+scope = "all"
+
 # ------------------------------------------------------------------
 # Identity + log access as result sets.
 #
@@ -637,3 +648,57 @@ roles = [
 resource = "ledger"
 action = "read"
 scope = "all"
+
+# ------------------------------------------------------------------
+# Pay.
+#
+# `annual_salary_cents` on every people read went to any signed-in
+# viewer (backlog c7484d0e, 2026-09-23). The roster stays open — the
+# dispatcher's notifier and auto-assign read it by role — and the pay
+# on it is shown only where `compensation` Read is granted, in the
+# grant's scope. People and the books, plus platform-admin from the
+# platform defaults. audit-readonly does NOT hold it: it is also what
+# an anonymous visitor carries.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = ["ceo", "cfo", "controller", "head-of-people"]
+resource = "compensation"
+action = "read"
+scope = "all"
+
+# ------------------------------------------------------------------
+# Schedules.
+#
+# Availability, assignments, shift patterns and the week grid answered
+# any session and any headerless caller (backlog a621d091,
+# 2026-09-25). Every employee reads their own without a grant; the
+# `schedule` grant is what reading anyone else's takes, in its scope.
+# The people who staff the whole brewery read all of it; a manager
+# reads their team (themself and their direct reports). audit-readonly
+# does NOT hold it, for the reason it does not hold pay.
+#
+# The `team` list is every role some employee in employees.json reports
+# to, and nothing else — the leads run the crews whose weeks these
+# reads are for, and a role that manages nobody needs no grant to read
+# itself. Pinned by boss-brewery-engine
+# tests/every_manager_reads_their_teams_schedule.rs.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = ["ceo", "coo", "head-of-people"]
+resource = "schedule"
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = [
+    "cfo", "cto", "controller", "it-director", "head-brewer",
+    "head-of-distribution", "head-of-sales", "head-of-marketing",
+    "packaging-mgr", "warehouse-mgr", "maintenance-mgr", "qa-supervisor",
+    "shift-lead", "packaging-lead", "warehouse-lead", "sales-lead",
+    "taproom-shift-lead", "distribution-lead",
+]
+resource = "schedule"
+action = "read"
+scope = "team"

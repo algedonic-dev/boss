@@ -1,7 +1,7 @@
 //! `infra/dev/wt-web` — the web half of `wt-cargo`: from inside a
 //! worktree it symlinks the operator checkout's `node_modules` at the
-//! three places bun resolves them, then runs the given command there
-//! (backlog ef4394e1).
+//! four places bun resolves them, then runs the given command there
+//! (backlog ef4394e1; the fourth, `apps/simulator`, backlog 5796d7ea).
 //!
 //! A worktree has no `node_modules`, so every web check a builder ran
 //! there (svelte-check, the mocked specs, anything importing zod) failed
@@ -11,7 +11,11 @@
 //! and a stub command on PATH, so nothing touches /work/boss:
 //!
 //!   * links land at `./node_modules`, `apps/web/node_modules`,
-//!     `libs/web-kit/node_modules`, pointing into `WT_WEB_SOURCE`;
+//!     `libs/web-kit/node_modules`, `apps/simulator/node_modules`,
+//!     pointing into `WT_WEB_SOURCE` — the simulator's since the gate
+//!     began type-checking, testing and building it (backlog 5796d7ea),
+//!     because a builder could not run that check in a worktree without
+//!     linking it by hand;
 //!   * a second run changes nothing and says the links already exist;
 //!   * a source dir that does not exist is skipped, by name, and the
 //!     rest still link;
@@ -30,10 +34,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCRIPT: &str = "infra/dev/wt-web";
-const LINKS: [&str; 3] = [
+const LINKS: [&str; 4] = [
     "node_modules",
     "apps/web/node_modules",
     "libs/web-kit/node_modules",
+    "apps/simulator/node_modules",
 ];
 
 struct Fixture {
@@ -55,7 +60,7 @@ impl Fixture {
              echo \"argv=$*\"\n\
              echo \"cwd=$PWD\"\n",
         );
-        // A fake operator checkout: the three node_modules dirs, each
+        // A fake operator checkout: the four node_modules dirs, each
         // with a marker so a test can prove a link resolves INTO it.
         let source = root.join("source");
         for rel in LINKS {
@@ -166,11 +171,11 @@ fn the_script_is_in_the_tree_and_executable() {
     );
 }
 
-/// The happy path: the three links land, resolve into the source tree,
+/// The happy path: the four links land, resolve into the source tree,
 /// are gitignored by the repo's own pattern, and the command runs in
 /// the worktree with its argv intact.
 #[test]
-fn links_the_three_paths_and_execs_its_argv() {
+fn links_the_four_paths_and_execs_its_argv() {
     let f = Fixture::new("links");
     let wt = f.worktree("agent-web");
 

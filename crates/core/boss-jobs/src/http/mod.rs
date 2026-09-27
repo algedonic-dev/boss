@@ -22,21 +22,24 @@ use serde::{Deserialize, Serialize};
 use crate::events;
 use crate::in_memory::compute_job_status;
 use crate::policy_glue::scope_matches;
-use crate::port::{JobFilter, JobScope, JobsRepository, LaunchCalendarRow};
+use crate::port::{DepartmentFilter, JobFilter, JobScope, JobsRepository};
 use crate::registry::{WorkflowError, WorkflowRegistry, WorkflowSpec};
 use crate::step_plugins::{StepPluginError, StepPluginRegistry, StepPluginSpec};
 use crate::step_registry::StepRegistry;
 
-pub mod machine_gate;
-
 mod borders;
 mod census;
+mod flights;
 mod jobs;
 mod kinds;
+mod moves;
 mod plugins;
+mod presence;
 mod queue_age;
 mod refusals;
 mod regions;
+mod routes;
+mod rule_firings;
 mod sim_clock;
 mod stations;
 mod steps;
@@ -46,17 +49,24 @@ mod yard;
 
 use borders::*;
 use census::*;
+use flights::*;
 use jobs::*;
 use kinds::*;
+use moves::*;
 use plugins::*;
 use queue_age::*;
 use refusals::*;
 use regions::*;
+use routes::*;
+use rule_firings::*;
 use sim_clock::*;
 use stations::*;
 use steps::*;
 use terminal_report::*;
 use yard::*;
+
+pub use moves::{MOVER_ACTOR, run_mover};
+pub use presence::PresenceKey;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -92,7 +102,7 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
-    /// metadata (`scheduled_at`, `duration_hours`, `assignee_id`)
+    /// metadata (`scheduled_at`, `duration_minutes`, `assignee_id`)
     /// reserve the assignee's time; conflicts surface as 409.
     /// `None` keeps every existing test path working — the
     /// reservation hook is purely additive.
@@ -140,6 +150,33 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// hour-window spend. `None` is a deployment without the two
     /// registries, where every claim is admitted exactly as before.
     pub agent_budget: Option<Arc<crate::agent_budget::BudgetDoor>>,
+    /// The `schema_migrations` ledger, read on every `/api/jobs/health`
+    /// so `capabilities.schema` says whether the database has been
+    /// migrated to THIS build (design a5323701, backlog 7c298c34).
+    /// `None` is a wiring without a database, where health reports no
+    /// schema at all — absent, not `null`: nothing was tried.
+    pub schema_ledger: Option<Arc<dyn crate::schema_level::SchemaLedger>>,
+    /// The key presence tickets are verified with — the gateway's
+    /// session key, read from the file it signs with (backlog 72fe3640).
+    /// `None` grants presence to nothing: an `x-boss-presence` header is
+    /// then refused, never read on trust, because the machine door lets
+    /// any token holder write one by hand.
+    pub presence_key: Option<Arc<PresenceKey>>,
+    /// THE MOVES RECORD (design e765b3fc §3, car M1): every packet whose
+    /// place on the IT map changed, and the event that moved it — the
+    /// store, the frames this replica's mover publishes to open streams,
+    /// and the mover's status. `None` → 503 on `/api/yard/moves` and its
+    /// stream, and the regions read's `undeclared` stays null.
+    pub yard_moves: Option<Arc<crate::moves::MovesFeed>>,
+    /// NEXT UP's credential rotations (design ea906603 Q3): the
+    /// credentials registry, read-only here. `None` → the regions read's
+    /// `next_up` says the registry could not be read, never that no
+    /// rotation is coming.
+    pub credentials: Option<Arc<dyn crate::credentials::CredentialsRegistry>>,
+    /// NEXT UP's scheduled rules (design ea906603 Q3): the dispatcher's
+    /// `GET /api/dispatcher/schedule`, read as the viewer. `None` → the
+    /// scheduled rules show as unread on the board.
+    pub dispatcher_schedule: Option<Arc<dyn crate::dispatcher_schedule::DispatcherSchedule>>,
 }
 
 impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
@@ -194,6 +231,11 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             dispatcher_firings: None,
             delivery: None,
             agent_budget: None,
+            schema_ledger: None,
+            presence_key: None,
+            yard_moves: None,
+            credentials: None,
+            dispatcher_schedule: None,
         }
     }
 }
@@ -221,7 +263,14 @@ async fn list_job_edges<R: JobsRepository, B: EventBus>(
 pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: JobsApiState<R, B>,
 ) -> Router {
-    let shared = Arc::new(state);
+    router_shared(Arc::new(state))
+}
+
+/// The router over state already shared — so the binary can hand the
+/// same state to the loops that run beside the routes ([`run_mover`]).
+pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
+    shared: Arc<JobsApiState<R, B>>,
+) -> Router {
     // One layer over the whole router rather than a call at each of
     // `steps.rs`'s ~15 refusal sites, so a refusal added later cannot
     // silently go uncounted. It passes everything that is not a step
@@ -229,7 +278,7 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
     let refusals =
         axum::middleware::from_fn_with_state(shared.clone(), record_step_write_refusals::<R, B>);
     Router::new()
-        .route("/api/jobs/health", get(health))
+        .route("/api/jobs/health", get(health::<R, B>))
         .route(
             "/api/jobs/step-write-refusals",
             get(list_step_write_refusals::<R, B>),
@@ -243,12 +292,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             post(sim_clock_restart_epoch::<R, B>),
         )
         .route("/api/jobs/sim-clock/stream", get(sim_clock_stream::<R, B>))
-        .route(
-            "/api/jobs/phase-distribution",
-            get(jobs_phase_distribution::<R, B>),
-        )
-        .route("/api/jobs/launch-calendar", get(launch_calendar::<R, B>))
         .route("/api/jobs/assignments", get(list_assignments::<R, B>))
+        // The flights read (design c4c2a607, backlog 73c31776): the
+        // codes on for the CALLER, judged from the open packets that
+        // carry a `flight` block against their pinned protocol rows. A
+        // code it does not list is off.
+        .route("/api/flights/mine", get(flights_mine::<R, B>))
         // The queue-age lens (2a0b034e): how long every outstanding
         // obligation — ready/active step on an open packet — has
         // waited. Read-only, own row shape; Job and Step untouched.
@@ -272,6 +321,20 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // above; a border whose flow cannot be computed answers unknown,
         // never zero.
         .route("/api/yard/borders", get(yard_borders::<R, B>))
+        // Every dispatcher rule's newest firing and its dead-letters —
+        // the rules list's second reading of the record the borders
+        // read, so a stalled rule no longer paints like an idle one
+        // (backlog 43c4451a).
+        .route("/api/yard/rule-firings", get(yard_rule_firings::<R, B>))
+        // THE MOVES RECORD (design e765b3fc §3, car M1): every packet
+        // whose place on the map changed and the event that moved it,
+        // as a page after a seq and as a stream that resumes from one.
+        .route("/api/yard/moves", get(yard_moves::<R, B>))
+        .route("/api/yard/moves/stream", get(yard_moves_stream::<R, B>))
+        // THE ROUTES (design e765b3fc §2b, car R2): every line the map
+        // may draw, derived from the protocols, the declared hand-offs
+        // and the moves record — each with the sources that support it.
+        .route("/api/yard/routes", get(yard_routes::<R, B>))
         .route("/api/jobs", get(list_jobs::<R, B>))
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
@@ -282,7 +345,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
-        .route("/api/jobs/{id}/convert", post(convert_job::<R, B>))
+        // Move a packet to another version of its protocol (POST), or
+        // preview the move without writing (GET) — design 7cf202a9.
+        .route(
+            "/api/jobs/{id}/convert",
+            get(preview_convert_job::<R, B>).post(convert_job::<R, B>),
+        )
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
         // The instance's hosting edit level, off the tenant manifest
         // (a479faf7): the word the dispatch door and the gate's
@@ -359,6 +427,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/{id}/steps/{step_id}/metadata",
             patch(patch_step_metadata::<R, B>),
         )
+        // A correction beside a completed step — the one writer of the
+        // job's append-only `corrections` list (design 4105b020).
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/corrections",
+            post(post_step_correction::<R, B>),
+        )
         .route(
             "/api/jobs/{id}/steps/{step_id}/claim",
             post(claim_step::<R, B>),
@@ -430,6 +504,13 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/step-plugins/{kind}/in-flight-count",
             get(in_flight_plugin_count::<R, B>),
         )
+        // The one-time repair for steps whose STEP_CREATED said plugin
+        // version 0 under a stamped row (backlog 5a670a71): GET is the
+        // dry run, POST appends one correcting STEP_UPDATED per step.
+        .route(
+            "/api/jobs/repairs/step-plugin-version",
+            get(preview_plugin_version_repair::<R, B>).post(run_plugin_version_repair::<R, B>),
+        )
         .with_state(shared)
         .layer(refusals)
 }
@@ -443,12 +524,46 @@ const STORAGE: &str = "postgres";
 #[cfg(not(feature = "postgres"))]
 const STORAGE: &str = "in-memory";
 
-async fn health() -> Json<boss_core::startup::HealthResponse> {
-    Json(boss_core::startup::health_response(
-        "boss-jobs-api",
-        env!("CARGO_PKG_VERSION"),
-        STORAGE,
-    ))
+/// `GET /api/jobs/health` — the standard payload, plus the schema
+/// reading when a ledger is wired. The ledger is read on THIS request,
+/// never cached: a startup read goes stale the moment the database is
+/// repointed or restored (design a5323701 D2). A failed or slow read is
+/// `schema: null` and the answer is still 200 — the process IS serving;
+/// what it could not do is vouch for its database.
+async fn health<R: JobsRepository, B: EventBus>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+) -> Json<boss_core::startup::HealthResponse> {
+    let response =
+        boss_core::startup::health_response("boss-jobs-api", env!("CARGO_PKG_VERSION"), STORAGE);
+    let capabilities = match state.schema_ledger.as_ref() {
+        Some(ledger) => response
+            .capabilities
+            .with_schema(crate::schema_level::read(ledger).await),
+        None => response.capabilities,
+    };
+    Json(boss_core::startup::HealthResponse {
+        capabilities,
+        ..response
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Step plugin stamp (shared by create_job and add_step)
+// ---------------------------------------------------------------------------
+
+/// Stamp `step` with the plugin version its row will be stored at,
+/// BEFORE its STEP_CREATED is built, so the event carries what the row
+/// stores and a replay rebuilds it (backlog aba364fe, determinism). A
+/// non-zero version the caller supplied is kept, as the insert keeps
+/// it; a zero asks the port the same question the insert would.
+pub(super) async fn stamp_step_plugin_version<R: JobsRepository>(
+    jobs: &R,
+    step: &mut Step,
+) -> Result<(), crate::port::JobsError> {
+    if step.step_plugin_version == 0 {
+        step.step_plugin_version = jobs.active_step_plugin_version(&step.kind).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +655,227 @@ pub(super) fn job_scope_from_predicate(
     }
 }
 
+/// The scope within which this caller may READ packets: policy Read on
+/// `job`, the same question the list's `scope_predicate` asks, answered
+/// as a `Scope` so a single row can be judged by [`scope_matches`] the
+/// way every job write judges its row.
+///
+/// WHY EVERY PACKET READ ASKS IT (backlog 046832d3, found by the triage
+/// of e5f7b51e). The list scoped its rows and every write checked its
+/// row, but the detail, its events, its stream, its steps, the
+/// assignments queue and the refusal table took no caller at all — so
+/// an anonymous request read every packet it could name. A caller the
+/// policy DENIES is refused here, 403, before any id is looked up, so
+/// the refusal is the same for a real packet and an absent one. That
+/// includes a request with no `x-boss-user`: the extractor makes it
+/// `guest`, which the platform grants only `workflow` Read — the same
+/// caller the list hands nothing. Whether a headerless sibling should
+/// be trusted instead is e84de48e's decision, not this door's.
+///
+/// A policy service that could not be ASKED is not a denial: it
+/// answers 503 + Retry-After through `PolicyClientError`'s one
+/// rendering, as every policy error arm in this crate does (backlog
+/// 45553536 — it was a 403 "reading packets is refused:
+/// policy-unreachable" for a minute of the #689 rollout).
+#[allow(
+    clippy::result_large_err,
+    reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
+)]
+pub(super) async fn job_read_scope<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> Result<boss_policy_client::Scope, Response> {
+    match state
+        .policy
+        .check(user, Action::Read, Resource::job())
+        .await
+    {
+        Ok(Decision::Allow { scope }) => Ok(scope),
+        Ok(Decision::Deny { reason }) => Err((
+            StatusCode::FORBIDDEN,
+            format!("reading packets is refused: {reason}"),
+        )
+            .into_response()),
+        Err(e) => Err(e.into_response()),
+    }
+}
+
+/// The 404 a packet read answers both for a packet that does not exist
+/// and for one outside the caller's scope — ONE value, so the two can
+/// never drift into telling a scoped caller which ids are real.
+pub(super) fn packet_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "job not found").into_response()
+}
+
+/// Whether `step` is the caller's own work: handed to them, or
+/// claimable by the role they HOLD — the same rule the assignments
+/// queue's `roles=` selector applies (unassigned, or already Active, and
+/// workable), keyed on `user.role` rather than on a role the request
+/// names. Only an identified caller has work of its own.
+///
+/// WHY A PACKET READ ASKS IT (review of 0c0405ac, 2026-09-25). A
+/// `self`- or territory-scoped role works steps on packets it does not
+/// own: a role's claimable steps sit on packets its manager owns. The first cut of 046832d3 kept only assigned rows in the queue
+/// and admitted no such packet to the single reads, so My Day's
+/// claimable pool vanished and the rows it kept named a packet that
+/// answered 404 — the web opens a step THROUGH the packet read. One
+/// predicate for both, so the queue never shows a row the caller then
+/// cannot open.
+///
+/// A step handed to the caller counts at any status, so the packet
+/// still opens after the caller completes it (the page re-reads it);
+/// a role's claim counts only while the step is workable AND its packet
+/// is open (`packet_open`).
+///
+/// WHY THE PACKET'S STATUS (backlog aba2bb26, the re-review of car
+/// 94469495). The queue's SQL asks for an open packet and this did not,
+/// so a role-claimable Ready step left behind on a closed or cancelled
+/// packet opened that packet to every holder of the role, forever. A
+/// closed packet is nobody's pool; what the caller was handed stays
+/// theirs.
+pub(super) fn step_is_callers(
+    user: &boss_policy_client::User,
+    packet_open: bool,
+    step: &Step,
+) -> bool {
+    let Some(me) = self_id(user) else {
+        return false;
+    };
+    if step.assignee_id.as_deref() == Some(me) {
+        return true;
+    }
+    let workable = matches!(step.status, StepStatus::Ready | StepStatus::Active);
+    let claimable = step.assignee_id.is_none() || step.status == StepStatus::Active;
+    packet_open
+        && workable
+        && claimable
+        && step
+            .metadata
+            .get("authority_role")
+            .and_then(serde_json::Value::as_str)
+            == Some(user.role.as_str())
+}
+
+/// Whether `user` may read this packet: it is inside `scope`, or one of
+/// its steps is the caller's own work ([`step_is_callers`]).
+pub(super) fn packet_readable(
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    job: &Job,
+    steps: &[Step],
+) -> bool {
+    let open = job.status == JobStatus::Open;
+    scope_matches(user, scope, job) || steps.iter().any(|s| step_is_callers(user, open, s))
+}
+
+/// Whether `user` may write `step` — whose packet is `job` — under the
+/// `scope` its `(Update, step)` grant carries: the packet is inside that
+/// scope, or the step AS STORED is already the caller's own work
+/// ([`step_is_callers`]). A step whose packet did not read (`None`) is
+/// writable only under an unrestricted grant or by the one it was handed
+/// to.
+///
+/// WHY EVERY STEP WRITE ASKS IT (backlog 0a8a2463, the re-review of car
+/// 94469495). The step write doors checked only `(Update, step)` and
+/// dropped the scope that grant carries, so a `self`-scoped caller who
+/// knew a job id (the live board lists them) and a step id could PUT
+/// `assignee_id` to itself on another owner's Ready step, or release an
+/// Active one and claim it — and the step, now the caller's, opened the
+/// whole packet through [`packet_readable`]. A write may not make
+/// readable what the caller could not already read, so it is judged on
+/// the STORED step, before any body is laid over it.
+pub(super) fn step_writable(
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    job: Option<&Job>,
+    step: &Step,
+) -> bool {
+    match job {
+        Some(job) => {
+            scope_matches(user, scope, job)
+                || step_is_callers(user, job.status == JobStatus::Open, step)
+        }
+        None => {
+            matches!(scope, boss_policy_client::Scope::All) || step_is_callers(user, false, step)
+        }
+    }
+}
+
+/// The answer a step write outside the caller's reach gets: exactly the
+/// one a step that does not exist gets, so the refusal cannot be used to
+/// tell which step ids are real — the step-write twin of
+/// [`packet_not_found`].
+pub(super) fn step_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "step not found").into_response()
+}
+
+/// The packet `job_id` names, if `user` may read it under `scope`
+/// ([`packet_readable`]); otherwise [`packet_not_found`], exactly as if
+/// it did not exist. The steps are read only when the scope alone does
+/// not admit the packet.
+#[allow(
+    clippy::result_large_err,
+    reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
+)]
+pub(super) async fn readable_job<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    job_id: &boss_core::job::JobId,
+) -> Result<Job, Response> {
+    let job = match state.jobs.get_job(job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(packet_not_found()),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    };
+    if scope_matches(user, scope, &job) {
+        return Ok(job);
+    }
+    if self_id(user).is_none() {
+        return Err(packet_not_found());
+    }
+    match state.jobs.list_steps(job_id).await {
+        Ok(steps) if packet_readable(user, scope, &job, &steps) => Ok(job),
+        Ok(_) => Err(packet_not_found()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    }
+}
+
+/// Which of these packets `user` may read under `scope` — the per-row
+/// filter a collection read applies (the assignments queue, the refusal
+/// table), judged by the same [`scope_matches`] as a single row.
+/// `Scope::All` reads none; otherwise the whole set is read at once
+/// (`JobsRepository::get_jobs`), because `all_assigned` answers up to
+/// 50,000 rows and the first cut read each packet separately (review
+/// of 0c0405ac, finding #6).
+#[allow(
+    clippy::result_large_err,
+    reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
+)]
+pub(super) async fn readable_job_ids<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    ids: impl IntoIterator<Item = boss_core::job::JobId>,
+) -> Result<std::collections::HashSet<boss_core::job::JobId>, Response> {
+    let ids: std::collections::HashSet<_> = ids.into_iter().collect();
+    if matches!(scope, boss_policy_client::Scope::All) {
+        return Ok(ids);
+    }
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    let ids: Vec<_> = ids.into_iter().collect();
+    match state.jobs.get_jobs(&ids).await {
+        Ok(jobs) => Ok(jobs
+            .iter()
+            .filter(|job| scope_matches(user, scope, job))
+            .map(|job| job.id)
+            .collect()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    }
+}
+
 /// The id a station predicate's [`crate::station_queue::SELF`]
 /// placeholder binds to for this request, or `None` when the caller is
 /// not an identified actor.
@@ -598,6 +934,28 @@ pub(super) fn stamp_close_instant(job: &mut Job, now: &chrono::DateTime<chrono::
     } else {
         job.metadata = serde_json::json!({ "closed_at": now.to_rfc3339() });
     }
+}
+
+/// The answer to a steps read that failed: a 500 NAMING THE PACKET.
+///
+/// Every handler that reads a packet's steps used to answer this with
+/// `list_steps(..).unwrap_or_default()`, and an empty step list is a
+/// well-formed, confident claim — "this packet has no steps" — so the
+/// failure shrank whatever the handler counted or listed and the 200
+/// said nothing (backlog f6c97006, after c11e9d3c found the shape in
+/// the station queue). The lint `a-steps-read-failure-is-not-empty`
+/// refuses the shape under `http/`; this is what a handler returns in
+/// its place. The adapter's own error rides along, but the packet id is
+/// written here because the Postgres error does not carry it.
+pub(super) fn steps_unreadable(
+    job_id: &boss_core::job::JobId,
+    e: &crate::port::JobsError,
+) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("the steps of packet {job_id} could not be read: {e}"),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

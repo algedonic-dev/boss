@@ -31,8 +31,157 @@ pub enum JobsError {
     /// the 204-that-wrote-nothing defect (job 903e6b90) reborn. The
     /// adapters refuse instead, atomically with the row check, and the
     /// handler turns this into the 409 the caller can act on.
-    #[error("step {id} is {status} — a terminal step's metadata is frozen")]
+    ///
+    /// The judged whole-row write refuses with it too: a write over a
+    /// terminal row it read afresh that would move a column the row
+    /// freezes ([`terminal_write_moves_frozen`], backlog 6ec22d71).
+    #[error("step {id} is {status} — what a terminal step recorded is frozen")]
     TerminalStep { id: StepId, status: String },
+    /// A whole-row job write would move a finished (closed or
+    /// cancelled) packet's status. The job PUT judges the row it READ;
+    /// a close that commits between that read and this write is only
+    /// visible here, so the adapters refuse atomically with the row
+    /// check rather than write a stale open copy over the close
+    /// (backlog 570e72bd, road 5).
+    #[error("job {id} is {status} — a finished packet's status does not move")]
+    TerminalJob { id: JobId, status: String },
+    /// A whole-row step write was computed from a read of a version the
+    /// row no longer is: another writer (the merge door, a claim, a
+    /// completion) wrote it between that read and this write. Written,
+    /// the stale copy would erase the other write while this one
+    /// answered success — measured on run 6b6fe011, 2026-09-25 (backlog
+    /// e381689d), and judged on every column since backlog 6ec22d71.
+    /// Refused atomically with the row check instead; the caller
+    /// re-reads and re-sends.
+    #[error(
+        "step {id} changed since this write read it — the row is no longer the version the write was computed from"
+    )]
+    StepChanged { id: StepId },
+    /// A sign-off stamp attests a shape the row no longer has: the
+    /// sign-off door built it over the step it READ, and a write moved
+    /// the row before the append took the lock (backlog 4174c4a9, the
+    /// review of car e1a62aa5). Written, it would sit alive on the
+    /// wrong shape — no edit ever voided it, because it landed after
+    /// the edit — and a later write that put the row back on the signed
+    /// shape (a claim dropping the run edge) would make it count.
+    /// Refused atomically with the row lock instead; the approver reads
+    /// the step again and signs what is there.
+    #[error(
+        "step {id} moved since the stamp was built — it signs shape {signed}, the step is {current}"
+    )]
+    StampOffShape {
+        id: StepId,
+        signed: String,
+        current: String,
+    },
+    /// A presence stamp carries a ticket nonce already on a stamp of
+    /// this step, live or voided (backlog 3977b3d2). A ticket is bound
+    /// to one step and one shape and lives 120 s; the sign-off door
+    /// answers a re-send idempotently only while its stamp is LIVE, so
+    /// an A-B-A edit inside those 120 s let a captured ticket write a
+    /// fresh live stamp no passkey touched. The step's own stamps are
+    /// the record of the tickets it consumed — refused under the row
+    /// lock with the shape check, and nothing is written.
+    #[error("step {id} has already been stamped with presence ticket nonce {nonce}")]
+    NonceSpent { id: StepId, nonce: String },
+}
+
+/// The nonce `stamp` would spend, if a stamp already on the step spent
+/// it — live or voided, since a void kills the signature and not the
+/// ticket (backlog 3977b3d2). `None` for a stamp with no nonce (session
+/// assurance): there is no ticket to spend. The one judgement both
+/// adapters' `append_sign_off` make under their lock.
+pub(crate) fn spent_nonce(
+    on_step: &[boss_core::job::SignOffStamp],
+    stamp: &boss_core::job::SignOffStamp,
+) -> Option<String> {
+    let nonce = stamp.presence_nonce.as_ref()?;
+    on_step
+        .iter()
+        .any(|s| s.presence_nonce.as_ref() == Some(nonce))
+        .then(|| nonce.clone())
+}
+
+/// The version a step row was at when it was read — the judgement a
+/// read-modify-write step writer's write is held to
+/// ([`JobsRepository::update_step_if_unchanged_at`], backlog 6ec22d71).
+///
+/// EVERY write to the row moves it, by any writer and whatever column
+/// it touched, and a read never does. That is the whole contract, and
+/// it is why this is a version and not a value: car 88123ae0 judged
+/// the write on the metadata it read, so a claim — status and holder,
+/// no metadata — was erased by an assignment PUT computed a moment
+/// before it, and a metadata number beyond f64 precision, written by
+/// hand, never compared equal to the reader's parsed copy and wedged
+/// the step.
+///
+/// The Pg adapter's is the row's `xmin`, the id of the transaction that
+/// last wrote it: no column to maintain, no writer that can forget to
+/// bump it, and nothing a rebuild has to reproduce — it is a
+/// concurrency token, never state, so it is in no event and no
+/// projection, and a read taken before a rebuild is simply refused
+/// after it. `updated_at` was the alternative and is not one: it is the
+/// write's own `now`, which the simulation clock can hold still, so two
+/// writes can share it. The in-memory adapter's is a counter bumped by
+/// every write under its lock. Opaque to callers — compare, never
+/// compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StepVersion(i64);
+
+impl StepVersion {
+    pub(crate) fn new(raw: i64) -> Self {
+        Self(raw)
+    }
+}
+
+/// PURE: whether writing `write` over the TERMINAL row `row` would move
+/// a column the row freezes — the columns the whole-row write keeps
+/// under its terminal CASE (Pg) or copies back (in-memory): status,
+/// completion date, who and when, metadata, the authored fields, and
+/// what was completed (title, holder, notes; backlog 42e7c6b9).
+///
+/// A write that would is refused rather than written (backlog
+/// 6ec22d71): the row would keep its values, but the write's
+/// `jobs.step.updated` carries the write's, and `rebuild.rs`
+/// replays that event verbatim — so the rebuilt row would differ from
+/// the live one. One definition for both adapters (CLAUDE.md §9a).
+/// Compared on the parsed `Step` both sides hold, so a value the
+/// reader's copy cannot represent exactly (a number beyond f64) does
+/// not read as a change: the caller's copy of a terminal row came from
+/// the same parse.
+pub fn terminal_write_moves_frozen(row: &Step, write: &Step) -> bool {
+    row.status != write.status
+        || row.completed_on != write.completed_on
+        || row.completed_by != write.completed_by
+        || row.completed_at != write.completed_at
+        || row.metadata != write.metadata
+        || row.fields != write.fields
+        || row.title != write.title
+        || row.assignee_id != write.assignee_id
+        || row.notes != write.notes
+}
+
+/// What [`JobsRepository::create_job_with_steps_at`] did with the id it
+/// was handed (backlog 9d2af748).
+///
+/// The admission handler checks for an existing packet before it
+/// materializes anything (558396ff), but a read is a moment: two first
+/// admissions under one id can both read "none" and both reach the
+/// adapter. The job row's `ON CONFLICT (id) DO NOTHING` let only one
+/// in, while the loser still inserted its steps — materialized with
+/// fresh ids, so their own guard never fired — hung them on the
+/// winner's packet, and the handler recorded a `step.ready` for each
+/// and answered 201. The adapter is the only place that knows which
+/// admission won, so it says: the handler records nothing more and
+/// answers the packet that exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Admission {
+    /// The job row was inserted, and every step and event with it.
+    Admitted,
+    /// The id already named a packet: no job, no step and no event was
+    /// written.
+    AlreadyAdmitted,
 }
 
 /// Optional filters for listing jobs.
@@ -44,15 +193,18 @@ pub struct JobFilter {
     /// both match `kind_prefix = "refurb"`).
     pub kind_prefix: Option<String>,
     /// Keep only packets whose `kind` is IN this set — and `Some(vec![])`
-    /// keeps NOTHING. The department listing's filter (backlog
-    /// cc76f755, 2026-09-18): jobs carry no department column; the
-    /// workflow row does (`metadata.department`), so the HTTP handler
-    /// resolves a department to the kinds declaring it and asks for
-    /// exactly those. An empty set answering the unfiltered count
-    /// would be the trap the packet was filed on — measured on prod,
-    /// `?department=sales` answered 1944, the unfiltered total,
-    /// because nothing read the parameter at all.
+    /// keeps NOTHING. Born as the department listing's filter (backlog
+    /// cc76f755, 2026-09-18), which has its own field now
+    /// (`department`); the regions read's inbound kind set still asks
+    /// for exactly a set of kinds. An empty set answering the
+    /// unfiltered count would be the trap cc76f755 was filed on —
+    /// measured on prod, `?department=sales` answered 1944, the
+    /// unfiltered total, because nothing read the parameter at all.
     pub kinds: Option<Vec<String>>,
+    /// Keep only the packets IN one department — the `?department=`
+    /// listing's filter. See [`DepartmentFilter`] for which packets
+    /// that is; `None` is no filter.
+    pub department: Option<DepartmentFilter>,
     pub status: Option<JobStatus>,
     /// A retention window on TERMINAL packets: keep everything still
     /// live, plus anything closed on or after this date. Drop
@@ -136,6 +288,46 @@ pub struct JobFilter {
     pub partition: Option<Partition>,
 }
 
+/// Which packets are IN a department — `GET /api/jobs?department=`.
+///
+/// A department is declared as data in two places, and a packet is in
+/// the one its OWN `metadata.department` names, or — when it names
+/// none — the one its kind's active workflow row declares
+/// (`crate::department::carried`, the same rule for both). One packet,
+/// one department: the packet's word is the more specific, so it wins.
+///
+/// Why the packet's word counts at all (backlog 481d7939, measured
+/// 2026-09-23): the kinds every department has — `department-retro`,
+/// `page-audit`, the `backlog-item`s a page audit files — are platform
+/// rows that declare no department, because they serve all of them;
+/// each packet carries the department it is about, and its schema
+/// requires it. Joined over kinds alone, the warehouse's retro and two
+/// page-audits answered `?department=warehouse` with total 0, and the
+/// finance retro was absent from finance's view. Membership stays data
+/// — the handler resolves `declaring_kinds` from the registry and the
+/// packet carries its own word — never a list of kinds in code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepartmentFilter {
+    /// The department code asked for.
+    pub code: String,
+    /// The kinds whose ACTIVE workflow row declares `code`
+    /// (`crate::department::kinds_declaring`). Empty is a real answer —
+    /// no kind declares it — and then only packets naming it match.
+    pub declaring_kinds: Vec<String>,
+}
+
+impl DepartmentFilter {
+    /// Whether a packet of `kind` carrying `metadata` is in this
+    /// department. The Postgres adapter spells the same rule as a
+    /// `CASE` over the same two sources; each is pinned by a test.
+    pub fn keeps(&self, kind: &str, metadata: &serde_json::Value) -> bool {
+        match crate::department::carried(metadata) {
+            Some(own) => own == self.code,
+            None => self.declaring_kinds.iter().any(|k| k == kind),
+        }
+    }
+}
+
 /// The policy-scope slice applied to a listing. Mirrors the shapes
 /// of `boss_policy_client::Predicate` that translate cleanly to SQL;
 /// `DepartmentIs` is absent because Jobs don't carry a department
@@ -161,23 +353,14 @@ pub enum JobScope {
     AccountIn(Vec<String>),
 }
 
-/// One row in the launch-calendar projection. Flat shape the frontend
-/// renders directly — the caller doesn't need to fetch the full Job.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct LaunchCalendarRow {
-    pub job_id: JobId,
-    pub title: String,
-    pub owner_id: Option<String>,
-    pub subject_id: Option<String>,
-    pub status: JobStatus,
-    /// Min sort_order of any non-done step = current tier. Null means
-    /// every step is terminal but the Job isn't closed yet.
-    pub current_tier: Option<i32>,
-    /// `launch_date` from the tier-4 `marketing-launch` step's metadata.
-    /// Null when the step exists but the date hasn't been set yet.
-    pub launch_date: Option<chrono::NaiveDate>,
-    /// Channel label from the launch step ("email" / "webinar" / etc.).
-    pub launch_channel: Option<String>,
+/// Every packet pinned to one Workflow row, `(kind, version)`, in ANY
+/// status: how many, and the lowest id among them, so a refusal can
+/// name one a reader can open (backlog ce8b7d66). Both adapters pick
+/// the same packet — the lowest UUID — so they agree row for row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedJobs {
+    pub count: i64,
+    pub first: Option<JobId>,
 }
 
 /// One cohort's block in the per-kind terminal report — Tier 1 of
@@ -437,6 +620,28 @@ pub struct AssignmentRow {
     pub step: Step,
 }
 
+impl AssignmentRow {
+    /// The row for `step` on `job` — the one place the envelope's
+    /// context is copied onto a queue row.
+    pub fn of(job: &Job, step: Step) -> Self {
+        AssignmentRow {
+            job_id: job.id,
+            job_title: job.title.clone(),
+            due_on: job.due_on,
+            opened_on: job.opened_on,
+            workflow: job.kind.clone(),
+            workflow_version: job.workflow_version,
+            subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
+            subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
+            priority: job.priority,
+            partition: job.partition,
+            tags: job.tags.clone(),
+            red_trains: crate::yard::red_trains_of(&job.metadata),
+            step,
+        }
+    }
+}
+
 /// One outstanding obligation — a `ready` or `active` step on an
 /// `open` packet — and the instant it has been waiting since. The row
 /// type of the queue-age lens (`GET /api/jobs/queue-age`, packet
@@ -587,6 +792,45 @@ pub struct EstateBatchOutcome {
     pub roles_inserted: usize,
 }
 
+/// Which rows of one event kind [`JobsRepository::recent_events_by_kind`]
+/// reads: an exact payload `scope`, and a half-open `[since, until)`
+/// window on the event's timestamp — every filter applied where the
+/// limit is. All absent reads the whole kind.
+///
+/// `latest_per` names a top-level payload key: set, the window answers
+/// only the NEWEST row of each distinct value of that key (a row
+/// without the key is one group of its own), grouped inside the window
+/// and before the limit, and the page's `total` counts GROUPS. Backlog
+/// 725532ab: `scope=host` still let forge's fifteen-minute rows spend
+/// the whole page, so boss-gcp's daily comparison was unreadable about
+/// half of every day; "the newest word from each host" is a question
+/// about hosts, and only a read that groups by host answers it whole.
+///
+/// `host` selects ONE host's series: a row whose payload `host` is it,
+/// or — for a row with no `host` stamp, which every observation is
+/// (4579f9b5) — whose first node's `id` is it, the identity
+/// compare_host stamps a comparison from. Backlog 111996f5: the estate
+/// alarm needs a daily host's last THREE comparisons, which neither the
+/// scope (forge's fifteen-minute rows spend the page) nor `latest_per`
+/// (one row per host) can answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventWindow {
+    pub scope: Option<String>,
+    pub host: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub latest_per: Option<String>,
+}
+
+/// One page of an event series, newest first, as the raw rows
+/// `{event_id, timestamp, source, kind, payload}`, and how many rows
+/// its WINDOW holds — so `rows.len() < total` says there is more.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventPage {
+    pub rows: Vec<serde_json::Value>,
+    pub total: i64,
+}
+
 /// The fact one declaration leaves: `node.declared`, once per node the
 /// batch changed (its row inserted, or a role landed on it), carrying
 /// the declaration, what landed, and `declared_by` from the stamp.
@@ -645,10 +889,10 @@ pub trait JobsRepository: Send + Sync {
         self.create_job_at(job, Utc::now(), &[]).await
     }
 
-    /// A job with no steps of its own — the brewery engine's
-    /// `?materialize_steps=false` path, which posts its
-    /// deterministic-UUID steps afterwards, and every test that
-    /// builds a bare job. The one-transaction contract is
+    /// A job with no steps of its own — every test that builds a bare
+    /// job. (The HTTP `?materialize_steps=false` opt-out, whose sim
+    /// caller posted its own steps afterwards, is refused since
+    /// afbf4f73.) The one-transaction contract is
     /// [`JobsRepository::create_job_with_steps_at`]'s; this is that
     /// call with nothing to add.
     async fn create_job_at(
@@ -659,6 +903,7 @@ pub trait JobsRepository: Send + Sync {
     ) -> Result<(), JobsError> {
         self.create_job_with_steps_at(job, &[], now, events, &[])
             .await
+            .map(|_| ())
     }
 
     /// Admit a job WITH its materialized steps: the job row, every
@@ -682,9 +927,39 @@ pub trait JobsRepository: Send + Sync {
     /// each, the event the rebuilder (`rebuild.rs`) reproduces the
     /// row from. A length mismatch is refused before any write: a
     /// short zip would record fewer events than rows and the replayed
-    /// projection would hold fewer steps than the live one. The
-    /// replay guard is per row, as before: a job or step whose id
-    /// already exists inserts nothing and records nothing.
+    /// projection would hold fewer steps than the live one.
+    ///
+    /// THE JOB ROW DECIDES FOR THE WHOLE GRAPH (backlog 9d2af748). A job
+    /// id that already names a packet inserts nothing — not the job,
+    /// not one step, not one event — and answers
+    /// [`Admission::AlreadyAdmitted`]. The guard was per row until then,
+    /// and steps are materialized with fresh ids on every admission, so
+    /// a second admission under one id hung a second copy of every step
+    /// on the packet that existed. Two first admissions racing past the
+    /// handler's existence check are ordered by the job row's unique
+    /// index; the one that loses writes nothing. Pinned on both
+    /// adapters: `a_packet_admitted_twice_under_one_id_exists_once`
+    /// (in-memory, and the handler's answer) and
+    /// `a_packet_is_created_whole_or_not_at_all_pg` (the race itself).
+    /// Each step row is stamped with its plugin version by the rule
+    /// [`JobsRepository::add_step_at`] states.
+    ///
+    /// A BIRTH-BY-JOB SUBJECT IS MINTED HERE, AND THAT IS
+    /// ADAPTER-SCOPED (backlog 82448947). A subject kind whose
+    /// SubjectKind row carries `metadata.birth = "job"` (`workflow`,
+    /// `custom`) has no domain table: the job about it IS its birth
+    /// record. The Postgres adapter mints its `subjects` identity row
+    /// in the same transaction as the job insert, insert-if-absent;
+    /// a domain kind, or a retired one, mints nothing. Pinned by
+    /// `birth_by_workflows_pass_gate_and_create_mints_identity` in
+    /// `tests/subject_existence_pg.rs`.
+    ///
+    /// The in-memory adapter does NOT implement this: it has no
+    /// identity table to mint into, and this trait has no read of
+    /// one, so the mint is invisible through the port and no port-level
+    /// test can hold it — the Pg test is its only pin. What returns is
+    /// the same either way. A new adapter that keeps subject
+    /// identities must mint them here and say so.
     async fn create_job_with_steps_at(
         &self,
         job: &Job,
@@ -692,9 +967,29 @@ pub trait JobsRepository: Send + Sync {
         now: DateTime<Utc>,
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
-    ) -> Result<(), JobsError>;
+    ) -> Result<Admission, JobsError>;
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError>;
+
+    /// The packets `ids` name, in no particular order; an id that names
+    /// no packet is simply absent from the answer, and a repeated id is
+    /// one packet. The collection reads that cut their rows to a
+    /// caller's scope judge every row's packet with it (backlog
+    /// 046832d3). The default reads each one; the Postgres adapter
+    /// overrides it with one `= ANY($1)` query.
+    async fn get_jobs(&self, ids: &[JobId]) -> Result<Vec<Job>, JobsError> {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(*id) {
+                continue;
+            }
+            if let Some(job) = self.get_job(id).await? {
+                out.push(job);
+            }
+        }
+        Ok(out)
+    }
 
     /// Resolve a lowercase hex id prefix to the ids it matches, capped
     /// at two — enough for the caller to tell none from one from many
@@ -705,13 +1000,30 @@ pub trait JobsRepository: Send + Sync {
     /// store only reports what matched.
     async fn resolve_job_id_prefix(&self, prefix: &str) -> Result<Vec<JobId>, JobsError>;
 
+    /// A write with no read behind it: `read` is the status it writes.
     async fn update_job(&self, job: &Job) -> Result<(), JobsError> {
-        self.update_job_at(job, Utc::now(), &[]).await
+        self.update_job_at(job, job.status, Utc::now(), &[]).await
     }
 
+    /// Replace the Job's row with `job`, recording `events` with it.
+    /// `read` is the status the writer judged the row in.
+    ///
+    /// A compare-and-set on a FINISHED status: a row stored Closed or
+    /// Cancelled keeps it, and a write whose `status` differs is refused
+    /// as [`JobsError::TerminalJob`] with nothing written or recorded
+    /// (backlog 570e72bd). A write that keeps the finished status (a
+    /// retitle after the close) lands only when its writer READ the row
+    /// finished: one that read it open and closes it has lost to a close
+    /// that committed after its read, and written, its body would erase
+    /// what that close stamped — the outcome — and record JOB_CLOSED a
+    /// second time. That is refused the same way (backlog 29a7ea09: the
+    /// job PUT's hand close, the one close site `close_job_at` did not
+    /// take). The job PUT judged the row it read; only the store sees a
+    /// close that committed after that read.
     async fn update_job_at(
         &self,
         job: &Job,
+        read: JobStatus,
         now: DateTime<Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
@@ -743,6 +1055,60 @@ pub trait JobsRepository: Send + Sync {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
+
+    /// Close the Job, writing ONLY the fields a close owns: `status`
+    /// becomes `closed`, `closed_on` is set, and `owned`'s top-level
+    /// keys (`closed_at`, and `outcome` when the close names one) merge
+    /// into `metadata` against the row as it stands. Every other key
+    /// and every other envelope field is left exactly as the row holds
+    /// it at write time.
+    ///
+    /// It is also a compare-and-set on the status: only an OPEN row
+    /// closes. A row already Closed (another closer won), Cancelled or
+    /// Draft is left untouched and the answer is `Ok(None)` — nothing
+    /// written, nothing recorded. `Some` carries the post-close row.
+    ///
+    /// WHY (backlog 29a7ea09): the two closers of a step write — the
+    /// declared-terminal close and the all-steps-terminal catch-all —
+    /// were each GET → mutate → whole-row `update_job_at`. Measured on
+    /// car 6b23d135 at 2026-09-24T22:18:10Z: the terminal close wrote
+    /// `outcome=disproved`, then the catch-all, holding a copy read
+    /// before that write committed, wrote its whole row back and the
+    /// outcome was gone. Any key another writer merged between a
+    /// closer's read and its write was lost the same way, silently — a
+    /// conservation break in the system of record.
+    ///
+    /// Records, in the same transaction, JOB_UPDATED built from the
+    /// POST-close row (full row state, what the rebuild consumes, as
+    /// `merge_job_metadata_at`'s is) and then whatever `markers` builds
+    /// from that same row (the status-changed and closed markers).
+    async fn close_job_at(
+        &self,
+        id: &JobId,
+        closed_on: chrono::NaiveDate,
+        owned: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<Option<Job>, JobsError>;
+
+    /// Append one entry to the Job's reserved `corrections` list
+    /// (`crate::corrections`, design 4105b020), atomically against the
+    /// row as it stands, and return the post-append Job with the index
+    /// the entry landed at. A non-list under the key, or a non-object
+    /// metadata, folds to an empty list first.
+    ///
+    /// Append, never read-modify-write: two corrections landing at once
+    /// must both survive, which a caller-side GET → push → PATCH cannot
+    /// promise. Records, in the same transaction, JOB_UPDATED (full row
+    /// state, what the rebuild consumes — so it must be built from the
+    /// post-append row, as `merge_job_metadata_at`'s is) and
+    /// STEP_CORRECTED naming the step (the entry's `step`) and index.
+    async fn append_step_correction_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError>;
 
     /// Every machine the estate declares.
     ///
@@ -804,12 +1170,19 @@ pub trait JobsRepository: Send + Sync {
     /// This is the same rule `TailQuery::simulated` states in
     /// boss-events: a filter has to be where the LIMIT is applied, or
     /// it does not really filter.
+    ///
+    /// The window's `since` (inclusive) and `until` (exclusive) obey the
+    /// same rule, in time rather than cadence (backlog bf362f25): a
+    /// post-mortem thirty hours on could not reach the rows it needed
+    /// through a reader that only ever served the newest page. The
+    /// page's `total` counts the whole window, so a caller compares its
+    /// rows against it instead of mistaking a full page for the answer.
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError>;
+    ) -> Result<EventPage, JobsError>;
 
     /// The station flow cube over `[since, now]` — how many
     /// obligations of each `(job kind, step kind, spec slug, authority
@@ -855,16 +1228,29 @@ pub trait JobsRepository: Send + Sync {
     /// immutability is what makes "in-flight packets stay on the
     /// version they were admitted under" true rather than aspirational.
     ///
-    /// So conversion gets its own door, and the door is narrow: it
-    /// changes exactly one column, and the caller is expected to have
+    /// So conversion gets its own door. The caller is expected to have
     /// asked [`crate::protocol_conversion::convertibility_for_packet`]
-    /// first. Widening `update_job` instead would have let any PUT
-    /// re-pin a packet by accident, which is the failure this shape
-    /// exists to prevent (bfc74b3a).
+    /// first, and hands over what the move writes
+    /// ([`crate::repin::plan`]). Widening `update_job` instead would have
+    /// let any PUT re-pin a packet by accident, which is the failure
+    /// this shape exists to prevent (bfc74b3a).
+    ///
+    /// ONE TRANSACTION, because a move is true of the packet only whole
+    /// (design 7cf202a9 Q2/Q3; backlog 1e973965 measured the door that
+    /// moved the column alone): the pinned version, `record` appended
+    /// to the reserved `repins` list, each re-projected step row, each
+    /// inserted one — recorded as JOB_UPDATED, a STEP_UPDATED per
+    /// rewritten row and a STEP_CREATED per inserted one (the state the
+    /// rebuild replays), and the `jobs.job.repinned` marker carrying
+    /// `record`. A re-projected row that finished between the caller's
+    /// read and this write keeps everything but its `sort_order`: a
+    /// completed step keeps the text it ran under, whoever raced.
     async fn repin_workflow_version_at(
         &self,
         id: &JobId,
         to_version: i32,
+        plan: &crate::repin::RepinPlan,
+        record: &serde_json::Value,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
@@ -881,6 +1267,27 @@ pub trait JobsRepository: Send + Sync {
         self.add_step_at(step, Utc::now(), &[]).await
     }
 
+    /// Write one step row, recording `events` with it; a step whose id
+    /// already exists inserts nothing and records nothing.
+    ///
+    /// THE ROW IS STAMPED WITH ITS PLUGIN VERSION (backlog 82448947).
+    /// A step written with `step_plugin_version = 0` is stored at the
+    /// version of the step plugin active for its `kind` at the write,
+    /// and at 0 when no plugin serves the kind; a non-zero version the
+    /// caller supplies is kept (a replay seeding its own). The stamp
+    /// is a snapshot, so a plugin republished or retired later never
+    /// moves which bundle an existing step renders against. Every
+    /// adapter stamps from the step-plugin registry it reads: the
+    /// Postgres adapter from the `step_plugins` table inside the
+    /// insert's transaction, the in-memory adapter from the registry
+    /// given to `InMemoryJobs::with_step_plugins` — none given is an
+    /// empty registry, so it keeps the caller's value, as Postgres
+    /// does over a table with no active row. The stamp changes what
+    /// [`JobsRepository::get_step`] returns, and one body of
+    /// assertions holds both adapters to it:
+    /// `tests/the_adapters_agree_on_a_steps_plugin_version_pg.rs`.
+    /// [`JobsRepository::create_job_with_steps_at`] writes each of its
+    /// steps by the same rule.
     async fn add_step_at(
         &self,
         step: &Step,
@@ -890,6 +1297,23 @@ pub trait JobsRepository: Send + Sync {
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError>;
 
+    /// [`JobsRepository::get_step`] with the [`StepVersion`] the row was
+    /// at, read in the same statement — the read a judged write
+    /// ([`JobsRepository::update_step_if_unchanged_at`]) is computed
+    /// from (backlog 6ec22d71).
+    async fn get_step_versioned(
+        &self,
+        id: &StepId,
+    ) -> Result<Option<(Step, StepVersion)>, JobsError>;
+
+    /// [`JobsRepository::list_steps`] with each row's [`StepVersion`],
+    /// for the writers that judge a list read: the readiness
+    /// re-evaluator and the terminal close's skip (backlog 6ec22d71).
+    async fn list_steps_versioned(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Vec<(Step, StepVersion)>, JobsError>;
+
     async fn update_step(&self, step: &Step) -> Result<(), JobsError> {
         self.update_step_at(step, Utc::now(), &[]).await
     }
@@ -897,6 +1321,50 @@ pub trait JobsRepository: Send + Sync {
     async fn update_step_at(
         &self,
         step: &Step,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError>;
+
+    /// [`JobsRepository::update_step_at`] for a write computed from a
+    /// READ: `read` is the [`StepVersion`] the caller's copy of the step
+    /// was read at ([`JobsRepository::get_step_versioned`] /
+    /// [`JobsRepository::list_steps_versioned`]), and the write lands
+    /// only while the live row is still that version — no writer has
+    /// touched ANY column since. Otherwise it is refused with
+    /// [`JobsError::StepChanged`] and nothing — row or events — is
+    /// written.
+    ///
+    /// WHY (backlog e381689d, measured 2026-09-25 on run 6b6fe011).
+    /// `boss dispatch` merged `prompt_bytes` onto a step through the
+    /// merge door (204, and its STEP_UPDATED carries the key) at
+    /// 11:01:14.649Z; the dispatcher's assignment PUT, whose handler had
+    /// read the step a moment BEFORE, wrote the whole row back at
+    /// 11:01:14.651Z with the metadata it had read, and answered 204
+    /// too. The key was gone and both writers had been told success.
+    /// Every read-modify-write step writer has that shape, so every one
+    /// in the service writes through this door; the check rides the
+    /// write's own statement, so no window is left between them.
+    ///
+    /// ON EVERY COLUMN, AND OVER A TERMINAL ROW TOO (backlog 6ec22d71).
+    /// The first version of this door compared the METADATA read, and
+    /// exempted a terminal row because its metadata is frozen. Two
+    /// reviews reproduced what that left on 2026-09-25: a claim moves
+    /// status and holder and no metadata, so the assignment PUT computed
+    /// a moment before it wrote `ready` and its own holder back over the
+    /// claim; and a stale write over a row that went `completed`
+    /// answered Ok, the row kept its values under the terminal CASE,
+    /// and a `jobs.step.updated` carrying the stale ones was recorded
+    /// anyway — which `rebuild.rs::upsert_step` replays verbatim, so
+    /// replay demoted the step. Now any write since the read refuses,
+    /// and a terminal row read at this version still refuses
+    /// ([`JobsError::TerminalStep`]) a write that would move a column
+    /// it freezes ([`terminal_write_moves_frozen`]) — so no event is
+    /// ever recorded for a value the row refused. An idempotent re-send
+    /// over a fresh read of a terminal row moves nothing and lands.
+    async fn update_step_if_unchanged_at(
+        &self,
+        step: &Step,
+        read: StepVersion,
         now: DateTime<Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
@@ -932,11 +1400,72 @@ pub trait JobsRepository: Send + Sync {
     /// else is `ClaimConflict` naming the holder. Like
     /// `append_sign_off`, this write path owns its fields — the
     /// generic step UPDATE racing a claim cannot un-decide it.
+    ///
+    /// WHO COUNTS AS "THE CURRENT HOLDER" IS ADAPTER-SCOPED (backlog
+    /// 28dcc735). The Postgres adapter reads the claimant's aliases
+    /// from `actor_aliases` inside the claim transaction, admits a
+    /// holder spelled by any of them, and rewrites `assignee_id` to
+    /// the claimant's registered id (backlog d7fef617: steps nominated
+    /// with an agent's login refused the agent's own claim). It is
+    /// directional: an alias claiming a step the registered id holds
+    /// is refused. Pinned by
+    /// `tests/step_claim_admits_an_aliased_holder_pg.rs`.
+    ///
+    /// The in-memory adapter does NOT implement this: it has no alias
+    /// source and compares spellings exactly, so a port-level test
+    /// cannot catch a regression of the alias admission. Deliberately
+    /// so — an alias store there would be a second identity registry
+    /// to keep in step with the table. Pinned by
+    /// `in_memory::tests::an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source`.
+    /// A new adapter must decide which of the two it is and say so
+    /// here.
+    ///
+    /// A CLAIM THAT MOVES THE SHAPE VOIDS WHAT IT MOVED (backlog
+    /// 4174c4a9). Dropping the run edge changes the metadata, which is
+    /// inside `step_shape_hash`, so the claim is an edit of the signed
+    /// content: both adapters void every live stamp under the lock when
+    /// it does, and record the `jobs.step.stamps_invalidated` event —
+    /// built from `stamp`, after the caller's `events` — in the claim's
+    /// own write. `stamp.timestamp` is the claim's instant.
+    ///
+    /// `actor` IS THE HOLDER THE CLAIM INSTALLS, not necessarily the
+    /// caller (design 611fbffd): the route passes the nominee of a claim
+    /// made on someone else's behalf, and signs the events in `stamp` as
+    /// the caller. Both adapters treat it only as the holder, so the
+    /// alias rules above apply to the nominee.
+    ///
+    /// This is [`Self::claim_step_displacing_at`] displacing no one.
     async fn claim_step_at(
         &self,
         step_id: &StepId,
         actor: &str,
-        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError> {
+        self.claim_step_displacing_at(step_id, actor, &[], stamp, events)
+            .await
+    }
+
+    /// [`Self::claim_step_at`], where a READY step held by one of
+    /// `displaceable` is claimable as though nobody held it (backlog
+    /// 5d1c0b7a). Materialisation hands every `individual`-audience
+    /// step to its declared executor, so a claim FOR someone else —
+    /// which only that executor or a `step-assign` holder may make
+    /// (design 611fbffd) — met a Ready step already held, and a CAS
+    /// admitting only NULL or the new holder refused it on every real
+    /// step. The route alone decides who is displaceable (the declared
+    /// executor read from the pinned Workflow row, and the caller); the
+    /// adapter only admits them. An ACTIVE step is never displaced: it
+    /// was claimed, and changes hands only through a release. Both
+    /// adapters compare `displaceable` by exact spelling — no alias
+    /// admission there, unlike `actor` in the Pg adapter — because a
+    /// materialised holder is the Workflow row's own spelling.
+    async fn claim_step_displacing_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<Step, JobsError>;
 
@@ -945,11 +1474,32 @@ pub trait JobsRepository: Send + Sync {
     /// never writes `sign_offs`, so a concurrent read-modify-write
     /// (dispatcher auto-assign, predicate re-eval) cannot clobber a
     /// stamp that landed between its read and its write.
+    ///
+    /// The stamp lands only on the shape it signs: under the row's lock,
+    /// a row whose `step_shape_hash` is not `stamp.shape_hash` refuses
+    /// with [`JobsError::StampOffShape`] and nothing — stamp or events —
+    /// is written (backlog 4174c4a9). The sign-off door builds the stamp
+    /// from an earlier read, and this is the one place a write between
+    /// the two can be seen.
+    ///
+    /// A stamp carrying a `presence_nonce` already on ANY stamp of the
+    /// step — live or voided — refuses with [`JobsError::NonceSpent`],
+    /// judged under the same lock (backlog 3977b3d2): a ticket stamps its
+    /// step once.
+    ///
+    /// THE LOG REPRODUCES THE STAMP (backlog f146a13a). The append
+    /// records a `jobs.step.updated` built from the row as its own
+    /// UPDATE left it, from `event_stamp`, in the same write and BEFORE
+    /// the caller's `events` — the rule `merge_step_metadata_at` and the
+    /// re-pin already follow. The signed-off marker the door passes is
+    /// the fact of the signing; the rebuild replays the state event, so
+    /// a stamp no later edit carried is no longer lost by a replay.
+    /// `event_stamp.timestamp` is the write's instant (`updated_at`).
     async fn append_sign_off(
         &self,
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
-        now: DateTime<Utc>,
+        event_stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
 
@@ -959,6 +1509,44 @@ pub trait JobsRepository: Send + Sync {
     /// Same delivery guarantees as the in-write recording; its own
     /// small transaction.
     async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError>;
+
+    /// The plugin version a step of `kind` written now is stamped with:
+    /// the version of the step plugin active for the kind in THIS
+    /// adapter's registry, 0 when none serves it — the same lookup a
+    /// step insert applies to a step written at 0.
+    ///
+    /// A writer stamps the step with this BEFORE it builds the step's
+    /// STEP_CREATED, so the event carries what the row stores (backlog
+    /// aba364fe, determinism). Both handlers built the event from the
+    /// caller's 0 while the Pg insert stamped the row, and the
+    /// rebuilder replays the payload: on 2026-09-25 every plugin-served
+    /// STEP_CREATED in the live log said 0, and 144 steps with no later
+    /// STEP_UPDATED would have rebuilt at 0 from rows at 1 or 3.
+    /// Pinned by `tests/a_created_step_replays_at_its_plugin_version_pg.rs`.
+    async fn active_step_plugin_version(&self, kind: &str) -> Result<i32, JobsError>;
+
+    /// The one-time repair door for steps whose log says plugin version
+    /// 0 while the row holds the stamped one (backlog 5a670a71; the
+    /// contract is [`crate::plugin_version_repair`]). Scans every step
+    /// whose log-derived version differs from its row, judges each
+    /// under the row's lock, and — only when `write` — appends ONE
+    /// STEP_UPDATED built from the row for each step whose divergence
+    /// is exactly that defect, stamped by `stamp`. Everything else is
+    /// listed as refused and left alone.
+    ///
+    /// Default: refused. An adapter that keeps no event log has no
+    /// divergence to find, and an empty report would read as "the log
+    /// agrees" — a confident answer to a question it cannot ask.
+    async fn repair_step_plugin_versions(
+        &self,
+        write: bool,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::plugin_version_repair::RepairReport, JobsError> {
+        let _ = (write, stamp);
+        Err(JobsError::Storage(
+            "this adapter keeps no event log, so it cannot compare one with its rows".into(),
+        ))
+    }
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError>;
 
@@ -1012,22 +1600,7 @@ pub trait JobsRepository: Send + Sync {
                         .and_then(|v| v.as_str())
                         .is_some_and(|r| roles.iter().any(|x| x == r));
                 if assignee_match || role_match {
-                    out.push(AssignmentRow {
-                        job_id: job.id,
-                        job_title: job.title.clone(),
-                        due_on: job.due_on,
-                        opened_on: job.opened_on,
-                        workflow: job.kind.clone(),
-                        workflow_version: job.workflow_version,
-                        subject_kind: boss_core::primitives::Subject::kind(&job.subject)
-                            .to_string(),
-                        subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
-                        priority: job.priority,
-                        partition: job.partition,
-                        tags: job.tags.clone(),
-                        red_trains: crate::yard::red_trains_of(&job.metadata),
-                        step,
-                    });
+                    out.push(AssignmentRow::of(job, step));
                     if out.len() >= limit as usize {
                         return Ok(out);
                     }
@@ -1069,21 +1642,7 @@ pub trait JobsRepository: Send + Sync {
                 {
                     continue;
                 }
-                out.push(AssignmentRow {
-                    job_id: job.id,
-                    job_title: job.title.clone(),
-                    due_on: job.due_on,
-                    opened_on: job.opened_on,
-                    workflow: job.kind.clone(),
-                    workflow_version: job.workflow_version,
-                    subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
-                    subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
-                    priority: job.priority,
-                    partition: job.partition,
-                    tags: job.tags.clone(),
-                    red_trains: crate::yard::red_trains_of(&job.metadata),
-                    step,
-                });
+                out.push(AssignmentRow::of(job, step));
                 if out.len() >= limit as usize {
                     return Ok(out);
                 }
@@ -1175,45 +1734,37 @@ pub trait JobsRepository: Send + Sync {
         version: i32,
     ) -> Result<i64, JobsError>;
 
+    /// Every Job pinned to one Workflow row — open, closed or
+    /// cancelled alike, because a closed packet ran under that text
+    /// and its record goes on reading it. Discarding a draft asks this
+    /// first and refuses a row any packet is pinned to (backlog
+    /// ce8b7d66): an experiment admits packets to its draft candidate,
+    /// and `boss job convert --to vN` can move one onto a draft, so a
+    /// draft is not always pre-history.
+    async fn jobs_pinned_to_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<PinnedJobs, JobsError>;
+
     /// Group Jobs by kind and return `(kind, count)` pairs, optionally
     /// scoped to a specific status. Used by the operating-model view
     /// to drive the per-phase live counts without pulling the whole
     /// job list over the wire. Returns every kind present in the
     /// table (no zero-fills) — callers map the list into their own
     /// `{kind: count}` shape.
+    ///
+    /// `scope` is the caller's read scope, applied exactly as
+    /// `list_jobs` applies `JobFilter::scope`, so a caller's counts are
+    /// the totals the list hands that caller (backlog 19f08bd6 — the
+    /// summary counted every packet for any caller, a guest included).
+    /// `JobScope::All` is the unscoped count the public landing window
+    /// (`/api/jobs/live`) asks for by design.
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,
+        scope: &JobScope,
     ) -> Result<Vec<(String, i64)>, JobsError>;
-
-    /// For each open Job, compute its "current tier" — the min
-    /// sort_order of any non-terminal step on the Job. Group by
-    /// `(kind, current_tier)` and return the counts. The tier number
-    /// is the step index the Job is currently working on; -1 means
-    /// every step is terminal (completed/skipped) but the Job itself
-    /// hasn't been closed yet.
-    ///
-    /// Drives the live histogram on the operating-model view so a
-    /// Workflow bar can show "how many refurbs are in Acquire vs.
-    /// Refurbish vs. Certify right now." Caller maps tier → phase
-    /// via its own Workflow-specific mapping.
-    async fn jobs_tier_distribution(
-        &self,
-        status: Option<JobStatus>,
-    ) -> Result<Vec<(String, i32, i64)>, JobsError>;
-
-    /// Projection backing the launch-calendar surface and the exec
-    /// next-30-days panel per examples/used-device-shop/design/marketing-needs.md E2. Returns every
-    /// open/in-flight `marketing-motion` Job joined to its tier-4
-    /// `marketing-launch` step so the caller can render a forward
-    /// calendar. `from` / `to` bound the launch_date window; Jobs
-    /// whose launch step has no date yet are returned with `launch_date
-    /// = None` so the UI can bucket them under "unscheduled".
-    async fn list_launch_calendar(
-        &self,
-        from: chrono::NaiveDate,
-        to: chrono::NaiveDate,
-    ) -> Result<Vec<LaunchCalendarRow>, JobsError>;
 
     // ----- Cross-job dependency resolution (D10) -----
 

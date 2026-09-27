@@ -16,6 +16,7 @@
     type FileRef,
     type ResourceKind,
   } from './files';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type Props = Readonly<{
     targetKind: ResourceKind;
@@ -126,7 +127,8 @@
       this surface on.
     </p>
   {:else if error}
-    <p class="files-error">Couldn't load attachments — {error}</p>
+    <!-- The shared failure marker (sweep c3e4edcc) sets the ink. -->
+    <p class="files-error load-failed" role="alert">Couldn't load attachments — {error}</p>
   {:else if files.length === 0}
     <p class="files-empty">No attachments yet.</p>
   {:else}
@@ -134,16 +136,16 @@
       {#each files as f (f.id)}
         <li class="files-item">
           {#if isImage(f.mime)}
-            <a class="files-thumb" href={downloadHref(f.id)} target="_blank" rel="noopener">
-              <img src={downloadHref(f.id)} alt={f.filename} />
+            <a class="files-thumb" href={safeLinkHref(downloadHref(f.id))} target="_blank" rel="noopener">
+              <img src={safeLinkHref(downloadHref(f.id))} alt={f.filename} />
             </a>
           {:else}
-            <a class="files-icon" href={downloadHref(f.id)} target="_blank" rel="noopener">
+            <a class="files-icon" href={safeLinkHref(downloadHref(f.id))} target="_blank" rel="noopener">
               <span aria-hidden="true">📎</span>
             </a>
           {/if}
           <div class="files-meta">
-            <a class="files-filename" href={downloadHref(f.id)} target="_blank" rel="noopener">
+            <a class="files-filename" href={safeLinkHref(downloadHref(f.id))} target="_blank" rel="noopener">
               {f.filename}
             </a>
             <div class="files-sub">
@@ -188,11 +190,8 @@
   }
   .files-empty,
   .files-error {
-    color: var(--text-muted);
+    color: var(--static);
     font-size: 0.9rem;
-  }
-  .files-error {
-    color: var(--danger);
   }
   .files-list {
     list-style: none;
@@ -209,7 +208,7 @@
     padding: 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background: var(--ink);
   }
   .files-thumb img {
     width: 48px;
@@ -225,7 +224,7 @@
     align-items: center;
     justify-content: center;
     font-size: 1.5rem;
-    background: var(--surface-muted);
+    background: var(--ink-raised);
     border-radius: 4px;
     text-decoration: none;
   }
@@ -243,21 +242,21 @@
   }
   .files-sub {
     font-size: 0.8rem;
-    color: var(--text-muted);
+    color: var(--static);
     margin-top: 2px;
   }
   .files-delete {
     background: transparent;
     border: 1px solid var(--border);
-    color: var(--text-muted);
+    color: var(--static);
     padding: 4px 10px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 0.85rem;
   }
   .files-delete:hover {
-    color: var(--danger);
-    border-color: var(--danger);
+    color: var(--err);
+    border-color: var(--err);
   }
   .files-drop {
     display: flex;
@@ -267,12 +266,12 @@
     border: 2px dashed var(--border);
     border-radius: 6px;
     cursor: pointer;
-    color: var(--text-muted);
+    color: var(--static);
     transition: background-color 120ms ease, border-color 120ms ease;
   }
   .files-drop:hover,
   .files-drop-over {
-    background: var(--surface-muted);
+    background: var(--ink-raised);
     border-color: var(--accent);
     color: var(--text);
   }

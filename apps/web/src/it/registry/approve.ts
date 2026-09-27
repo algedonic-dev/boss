@@ -149,7 +149,7 @@ export function parsePublishRequests(raw: unknown): ReadonlyArray<PublishRequest
 export const PUBLISH_REQUESTS_QUERY = `/api/jobs?kind=ops-request&metadata=${encodeURIComponent(JSON.stringify({ verb: PUBLISH_VERB }))}`;
 
 export function loadPublishRequests(limit = 40): Promise<Exclude<Remote<ReadonlyArray<PublishRequest>>, { kind: 'loading' }>> {
-  return fetchRemote(`${PUBLISH_REQUESTS_QUERY}&limit=${limit}`, parsePublishRequests);
+  return fetchRemote(`${PUBLISH_REQUESTS_QUERY}&limit=${limit}&full=true`, parsePublishRequests);
 }
 
 /** This kind's latest request — by `opened_at`, not API order; an

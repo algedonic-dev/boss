@@ -18,7 +18,7 @@
 
 import { test, expect } from '@playwright/test';
 import { mountPage } from './_helpers';
-import { installApiFloor } from './_smokeMocks';
+import { installApiFloor, servePeopleRows } from './_smokeMocks';
 
 const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
 
@@ -71,6 +71,7 @@ test.describe('full-page step route without a plugin', () => {
     await installApiFloor(page);
     await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
     await page.route(/\/api\/people$/, (r) => r.fulfill({ json: [EMP] }));
+    await servePeopleRows(page, [EMP]);
     await page.route(/\/api\/session$/, (r) =>
       r.fulfill({ json: { username: EMP.email, employee_id: EMP.id, role: EMP.role } }));
     await page.route(new RegExp(`/api/jobs/${JOB_ID}$`), (r) => r.fulfill({ json: JOB }));
@@ -90,11 +91,19 @@ test.describe('full-page step route without a plugin', () => {
 
   test('completing sends the declared field, so the API can accept it', async ({ page }) => {
     let body: Record<string, unknown> | null = null;
+    let merged: Record<string, unknown> | null = null;
     await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/${STEP_ID}$`), async (route) => {
       if (route.request().method() === 'GET') return route.fulfill({ json: STEP });
       if (route.request().method() !== 'PUT') return route.fallback();
       body = route.request().postDataJSON() as Record<string, unknown>;
       return route.fulfill({ json: {} });
+    });
+    // The declared field rides the step merge door, before the PUT
+    // (backlog e39a9d2a).
+    await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/${STEP_ID}/metadata$`), async (route) => {
+      if (route.request().method() !== 'PATCH') return route.fallback();
+      merged = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: STEP });
     });
 
     await mountPage(page, `/jobs/${JOB_ID}/steps/${STEP_ID}`, { root: '.step-focus' });
@@ -109,10 +118,15 @@ test.describe('full-page step route without a plugin', () => {
     await complete.click();
 
     await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
+    const sent = body as unknown as { status: string; metadata?: unknown };
     expect(sent.status).toBe('completed');
-    expect(sent.metadata['disposition']).toBe('design');
-    // The gate that keeps the step waiting on a person must survive.
-    expect(sent.metadata['authority_role']).toBe('platform-admin');
+    // The PUT carries no metadata, so it has nothing to drop.
+    expect(sent.metadata).toBeUndefined();
+    const m = merged as unknown as Record<string, unknown>;
+    expect(m['disposition']).toBe('design');
+    // The gate that keeps the step waiting on a person survives because
+    // the merge never names it — it stays on the row as stored, where a
+    // wholesale PUT had to carry it back by hand.
+    expect('authority_role' in m).toBe(false);
   });
 });

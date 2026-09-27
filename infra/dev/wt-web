@@ -11,8 +11,12 @@
 # bun install --ignore-scripts, one gave up on svelte-check. wt-cargo
 # closed the same gap for cargo with one command; this is that door
 # for the web. Nothing is installed: the links point at packages the
-# operator's checkout already has, at the three places bun resolves
-# them (./node_modules, apps/web/node_modules, libs/web-kit/node_modules).
+# operator's checkout already has, at the four places bun resolves
+# them (./node_modules, apps/web/node_modules, libs/web-kit/node_modules,
+# apps/simulator/node_modules). The fourth since the gate began
+# type-checking, testing and building the simulator (backlog 5796d7ea):
+# without it a builder could not run that check here without linking
+# by hand.
 #
 # Usage: wt-web <command…>          (run from inside the worktree)
 #        wt-web bun test src/it/yard/
@@ -50,7 +54,7 @@ fi
 if [ $# -eq 0 ]; then report_fd=1; else report_fd=2; fi
 say() { echo "wt-web: $*" >&"$report_fd"; }
 
-for rel in node_modules apps/web/node_modules libs/web-kit/node_modules; do
+for rel in node_modules apps/web/node_modules libs/web-kit/node_modules apps/simulator/node_modules; do
     src=$source/$rel
     dst=$root/$rel
     if [ ! -d "$src" ]; then

@@ -11,6 +11,7 @@ import {
   disciplineLabel,
   etaPhase,
   fetchYard,
+  CARS_QUERY,
   itemAnswer,
   trainEta,
   trainOutcome,
@@ -416,6 +417,97 @@ describe('fetchYard against the station endpoint', () => {
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
   }
+
+  // THE PUBLISH LANE READ A STATION NOBODY DECLARED (backlog 31c371b3,
+  // 2026-09-22). From a031da14 (2026-08-31) the lane fetched
+  // `/api/stations/publish-dock/queue`, and no stations row by that name
+  // was ever authored — not in a migration, not in
+  // infra/platform/stations/ — so the read 404'd on every load and the
+  // lane drew empty, which reads exactly like "nothing is publishing".
+  // The packets it wanted are publish-request Jobs, a platform workflow
+  // every instance publishes, so the lane reads them where they live.
+  test('the publishing lane reads open publish-request packets, not an undeclared station', async () => {
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/api/stations/loading-dock/queue')) return json(envelope());
+      if (url.includes('kind=publish-request'))
+        return json({
+          data: [
+            {
+              id: 'p1', kind: 'publish-request', title: 'Publish fix/y', status: 'open',
+              opened_on: '2026-09-22', metadata: { branch: 'fix/y', requested_by: 'pod' },
+              steps: [],
+            },
+          ],
+          total: 1,
+        });
+      if (url.includes('/api/stations/')) return json('no active station', 404);
+      return json({ data: [] });
+    }) as typeof fetch;
+    const y = await fetchYard();
+    expect(y?.publishing.map(r => [r.id, r.branch, r.state, r.note])).toEqual([
+      ['p1', 'fix/y', 'publishing', 'pod'],
+    ]);
+    expect(urls.filter(u => u.includes('/api/stations/'))).toEqual(['/api/stations/loading-dock/queue']);
+    expect(urls.filter(u => u.includes('kind=publish-request'))).toEqual([
+      '/api/jobs?kind=publish-request&status=open&limit=50',
+    ]);
+  });
+
+  // THE SHED DREW 5 UNDER SHED 11 (review of 2026-09-24; car E of design
+  // 62de32ae): a car landed two days ago and still awaiting its proof
+  // was not among the newest 200. Then the newest-200 page itself lost
+  // rows: ship-a-change held 978 packets on 2026-09-27 (backlog
+  // b68a9dde). The floor now reads ONE list — every live car and every
+  // car closed since yesterday — to the list's own total.
+  test('the floor reads every live and recent car to the total, each car once', async () => {
+    const urls: string[] = [];
+    const car = (id: string, status: string) => ({
+      id, kind: 'ship-a-change', title: id, status, opened_on: '2026-09-20',
+      metadata: { branch: `fix/${id}` }, steps: [s('proven', status === 'open' ? 'ready' : 'completed')],
+    });
+    const cars = [car('old-open', 'open'), car('new-open', 'open'), car('new-closed', 'closed')];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/api/stations/loading-dock/queue')) return json(envelope());
+      if (url.includes('kind=ship-a-change')) {
+        const q = new URL(url, 'http://x').searchParams;
+        const offset = Number(q.get('offset'));
+        return json({ data: cars.slice(offset, offset + Number(q.get('limit'))), total: cars.length });
+      }
+      return json({ data: [] });
+    }) as typeof fetch;
+    const y = await fetchYard();
+    expect(urls.filter((u) => u.includes('kind=ship-a-change'))).toEqual([
+      `${CARS_QUERY}&full=true&limit=1000&offset=0`,
+    ]);
+    expect(CARS_QUERY).toBe('/api/jobs?kind=ship-a-change&closed_within=1');
+    // `cars` is the open ones; each is there once, the old one included.
+    expect(y?.cars.map((c) => c.id).sort()).toEqual(['new-open', 'old-open']);
+    expect(y?.awaitingProof.map((c) => c.id).sort()).toEqual(['new-open', 'old-open']);
+  });
+
+  test('a car read that stops short of its total is no yard, not a yard missing cars', async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/stations/loading-dock/queue')) return json(envelope());
+      // A server that says 978 and hands back the same two rows at
+      // every offset: the read cannot reach its total.
+      if (url.includes('kind=ship-a-change'))
+        return json({
+          data: [
+            { id: 'a', kind: 'ship-a-change', title: 'a', status: 'open', opened_on: '2026-09-20' },
+            { id: 'b', kind: 'ship-a-change', title: 'b', status: 'open', opened_on: '2026-09-20' },
+          ],
+          total: 978,
+        });
+      return json({ data: [] });
+    }) as typeof fetch;
+    expect(await fetchYard()).toBeNull();
+  });
 
   test('when the endpoint serves, the dock reads its own station row', async () => {
     stub(() => json(envelope({ total: 1, data: [dockJob('s1')] })));
@@ -1157,7 +1249,7 @@ describe('awaitingProof', () => {
 // that used to live here — a superseded red, a same-day green answering
 // it, which run is a branch's latest, the freshness window — are pinned
 // in `stranded.rs` and `yard.rs` instead. What is left for this lens is
-// the publish-dock rows, the mapping of the server's four lanes onto the
+// the publish-request rows, the mapping of the server's four lanes onto the
 // approach order, and the contract that a missing status is ADDITIVE.
 // ---------------------------------------------------------------------
 
@@ -1184,11 +1276,6 @@ function ship(branch: string, over: Partial<JobLite> = {}): JobLite {
   };
 }
 
-const publishEnv = (jobs: readonly JobLite[]): StationQueueEnvelope => ({
-  station: 'publish-dock', kind: 'batch', discipline: ['priority', 'age'],
-  over_limit: false, total: jobs.length, data: jobs,
-});
-
 /** The server's verdict lanes, as the status payload carries them. */
 const lanes = (over: Partial<ApproachLanes> = {}): ApproachLanes => ({
   stranded: [],
@@ -1206,20 +1293,20 @@ const publishRequest = (branch: string, over: Partial<JobLite> = {}): JobLite =>
 
 describe('the approach lane', () => {
   test('open publish-requests ride in front, with the requester on the row', () => {
-    const rows = approach(publishRows(publishEnv([publishRequest('fix/y')])), lanes());
+    const rows = approach(publishRows([publishRequest('fix/y')]), lanes());
     expect(rows.map(r => ({ state: r.state, note: r.note, verdict: r.verdict }))).toEqual([
       { state: 'publishing', note: 'pod', verdict: null },
     ]);
   });
 
   test('a closed publish-request is done asking — no row', () => {
-    const rows = approach(publishRows(publishEnv([publishRequest('fix/y', { status: 'closed' })])), lanes());
+    const rows = approach(publishRows([publishRequest('fix/y', { status: 'closed' })]), lanes());
     expect(rows).toEqual([]);
   });
 
   test('the four server lanes stand in order: publishing, red, gate exit, green, held', () => {
     const rows = approach(
-      publishRows(publishEnv([publishRequest('fix/pub')])),
+      publishRows([publishRequest('fix/pub')]),
       lanes({
         garage: [{ branch: 'fix/red', failed_check: 'test', since: '2026-08-31', packet_id: 'g-red', sha: 'r'.repeat(40) }],
         limbo: [{ branch: 'fix/lost', verdict: 'lost', since: '2026-08-31', packet_id: 'g-lost', sha: null }],
@@ -1287,9 +1374,9 @@ describe('the approach lane', () => {
     expect(unreadable.map(r => [r.state, r.verdict])).toEqual([['gate-lost', 'unreadable']]);
   });
 
-  test('no status is ADDITIVE: the station rows still draw and the gate lanes read empty', () => {
+  test('no status is ADDITIVE: the publish rows still draw and the gate lanes read empty', () => {
     // The status endpoint being down must never take the page with it.
-    const rows = approach(publishRows(publishEnv([publishRequest('fix/y')])), null);
+    const rows = approach(publishRows([publishRequest('fix/y')]), null);
     expect(rows.map(r => r.state)).toEqual(['publishing']);
     expect(approach([], null)).toEqual([]);
   });

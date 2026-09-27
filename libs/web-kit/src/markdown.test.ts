@@ -43,6 +43,16 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown('[d](data:text/html,x)')).not.toContain('href=');
   });
 
+  test('a protocol-relative or backslash link is another site, and stays text', () => {
+    // `//host` and `/\host` both leave the site in a browser, so a packet
+    // could carry a link that reads as ours and lands elsewhere (d9af15ba).
+    expect(renderMarkdown('[x](//evil.example/login)')).not.toContain('href=');
+    expect(renderMarkdown('[x](/\\evil.example/login)')).not.toContain('href=');
+    // Relative paths still link — a doc points at its neighbours.
+    expect(renderMarkdown('[n](./next.md)')).toContain('href="./next.md"');
+    expect(renderMarkdown('[p](../up.md)')).toContain('href="../up.md"');
+  });
+
   test('plain paragraphs join their wrapped lines', () => {
     const html = renderMarkdown('one line\nwrapped onward\n\nsecond para');
     expect(html).toContain('<p>one line wrapped onward</p>');

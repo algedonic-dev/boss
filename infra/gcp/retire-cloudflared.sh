@@ -164,7 +164,7 @@ say "hostnames the in-cluster connector must serve (${INSTANCES#"$REPO"/}): ${HO
     || refuse "BOSS_JOBS_URL is not set, so the hand-over cannot be read off the system of record and this bound cannot be evaluated. There is no safe default (the runner's unit pins it). Nothing was stopped."
 ACTOR="${BOSS_OPS_ACTOR:-automation:ops-runner}"
 BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
-CONVERGE_URL="$BOSS_JOBS_URL/api/jobs?kind=$CONVERGE_KIND&limit=40"
+CONVERGE_URL="$BOSS_JOBS_URL/api/jobs?kind=$CONVERGE_KIND&limit=40&full=true"
 if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" "$CONVERGE_URL" > "$TMP/converges.json" 2> "$TMP/curl.err"; then
     say "REFUSED — the system of record did not answer the converge read ($CONVERGE_URL):"
     sed 's/^/    /' "$TMP/curl.err" >&2

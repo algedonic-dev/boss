@@ -64,7 +64,11 @@ platform_owner() {
         [ -n "$port" ] && people="${JOBS_API%:*}:$port"
     fi
     [ -n "$people" ] || return 0
-    curl -sf --max-time 5 "$people/api/people?role=platform-admin&status=active" 2>/dev/null \
+    # Signed, as the packet POST below is: the roster answers a caller
+    # by grant and refuses one with no identity (backlog cda177ef).
+    curl -sf --max-time 5 \
+        -H 'x-boss-user: {"id":"automation:install-smoke","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}' \
+        "$people/api/people?role=platform-admin&status=active" 2>/dev/null \
         | jq -r '[.[] | {id, hire_date: (.hire_date // "~")}] | sort_by(.hire_date, .id) | .[0].id // empty' 2>/dev/null
     return 0
 }

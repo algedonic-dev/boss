@@ -294,7 +294,7 @@ const CONVERGE_WINDOW = 6;
 
 export async function fetchConverges(): Promise<readonly JobLite[] | null> {
   try {
-    const r = await fetch(`/api/jobs?kind=maintenance-cluster-converge&limit=${CONVERGE_WINDOW}`);
+    const r = await fetch(`/api/jobs?kind=maintenance-cluster-converge&limit=${CONVERGE_WINDOW}&full=true`);
     if (!r.ok) return null;
     const body = (await r.json()) as { data?: JobLite[] };
     return Array.isArray(body.data) ? body.data : null;

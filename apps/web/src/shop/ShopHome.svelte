@@ -20,6 +20,13 @@
     packageLabel,
     priceLabel,
   } from './brewery-products';
+  import {
+    failedRead,
+    loadingRead,
+    readStateOfResponse,
+    type ReadState,
+  } from '../data/readState';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type InventoryRow = Readonly<{
     part_sku: string;
@@ -27,14 +34,26 @@
     allocated: number;
   }>;
 
+  const ITEMS_URL = '/api/inventory/items';
+
   let stock = $state<Map<string, number>>(new Map());
+  // The stock read's outcome (backlog aaeb02d6). A failed read used to
+  // `return` or fall into a bare catch, so every card said "check
+  // availability" — what a healthy read says of a SKU with no inventory
+  // row — and nothing on the page said a read had failed. The catalog
+  // still renders either way; the failure is one named line above it.
+  let stockRead = $state<ReadState>(loadingRead);
 
   $effect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch('/api/inventory/items');
-        if (!r.ok) return;
+        const r = await fetch(ITEMS_URL);
+        const read = readStateOfResponse(ITEMS_URL, r);
+        if (read.kind !== 'ok') {
+          if (!cancelled) stockRead = read;
+          return;
+        }
         const body = (await r.json()) as InventoryRow[] | { data: InventoryRow[] };
         const rows = Array.isArray(body) ? body : (body.data ?? []);
         if (cancelled) return;
@@ -48,9 +67,11 @@
           }
         }
         stock = m;
-      } catch {
-        // Silent — render the catalog with "—" availability rather
-        // than blocking the page on a transient inventory blip.
+        stockRead = read;
+      } catch (e) {
+        if (!cancelled) {
+          stockRead = failedRead(`${ITEMS_URL}: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
     })();
     return () => {
@@ -79,6 +100,12 @@
       </p>
     </div>
   </header>
+
+  {#if stockRead.kind === 'failed'}
+    <p class="load-failed" role="alert">
+      Couldn't load stock levels — {stockRead.error}. Availability below is unknown, not sold out.
+    </p>
+  {/if}
 
   <section class="shop-grid">
     {#each BREWERY_PRODUCTS as p (p.sku)}
@@ -117,7 +144,7 @@
           </div>
         </button>
         <a
-          href={to}
+          href={safeLinkHref(to)}
           onclick={(e) => e.stopPropagation()}
           class="shop-card-cta"
         >
@@ -130,8 +157,8 @@
 
 <style>
   .brewery-image {
-    background: linear-gradient(135deg, #c2410c 0%, #7c2d12 100%);
-    color: rgba(255, 255, 255, 0.92);
+    background: var(--band);
+    color: var(--on-band);
     padding: 18px 16px;
     min-height: 90px;
     display: flex;
@@ -151,8 +178,8 @@
     font: inherit;
   }
   .shop-card-limited {
-    background: rgba(0, 0, 0, 0.35);
-    color: #fef3c7;
+    background: var(--busy);
+    color: var(--on-busy);
     padding: 2px 8px;
     border-radius: 4px;
     font-size: 11px;
@@ -164,8 +191,8 @@
     font-size: 13px;
     font-weight: 500;
   }
-  .shop-card-avail-in { color: #16a34a; }
-  .shop-card-avail-low { color: #ca8a04; }
-  .shop-card-avail-out { color: #dc2626; }
-  .shop-card-avail-unknown { color: #78716c; }
+  .shop-card-avail-in { color: var(--ok); }
+  .shop-card-avail-low { color: var(--warn); }
+  .shop-card-avail-out { color: var(--err); }
+  .shop-card-avail-unknown { color: var(--static); }
 </style>

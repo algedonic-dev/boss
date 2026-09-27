@@ -33,10 +33,17 @@
 //! whose session it is, and an expiring session now expires — it
 //! does not quietly become somebody else's.
 //!
+//! Which access it carries is the deployment's answer, [`GuestAccess`]
+//! (design 2830b6b7, 2026-09-25): none, a basic `visitor` (the OSS
+//! default — what the install grants that role), or `audit-readonly`
+//! where an instance opts in to the system-audit read. A guest never
+//! writes under either.
+//!
 //! Onboarding (admin-only):
 //! - `POST /api/auth/onboard {email, password}` — creates a
-//!   credential row. Caller must be authenticated as a role with
-//!   `policy:auth-admin` (which platform-admin / ceo / coo carry).
+//!   credential row. Caller's session role must pass
+//!   `boss_core::roles::can_administer_auth` — platform-admin or
+//!   break-glass, and nothing else (backlog 34242f9a).
 //! - `POST /api/auth/issue-reset {email}` — issues a one-time
 //!   reset token (returns it to the admin; admin shares with the
 //!   user out-of-band).
@@ -149,7 +156,11 @@ impl CredentialStore {
         Ok(())
     }
 
-    pub fn upsert(&self, email: &str, password: &str) -> Result<()> {
+    /// Create or overwrite `email`'s credential. `Ok(true)` when it
+    /// created one, `Ok(false)` when it replaced one — decided under the
+    /// write lock, so the auth-admin event that reports it cannot race
+    /// another writer (backlog 17ae5248).
+    pub fn upsert(&self, email: &str, password: &str) -> Result<bool> {
         let email = email.to_lowercase();
         let now = Utc::now();
         let salt = generate_salt();
@@ -158,6 +169,7 @@ impl CredentialStore {
             .map_err(|e| anyhow!("argon2 hash: {e}"))?
             .to_string();
         let mut inner = self.inner.write().map_err(|_| anyhow!("store poisoned"))?;
+        let created = !inner.by_email.contains_key(&email);
         let entry = inner
             .by_email
             .entry(email.clone())
@@ -171,7 +183,8 @@ impl CredentialStore {
         entry.password_hash = hash;
         entry.last_rotated = now;
         entry.reset_token = None;
-        save_locked(&inner)
+        save_locked(&inner)?;
+        Ok(created)
     }
 
     pub fn remove(&self, email: &str) -> Result<bool> {
@@ -326,14 +339,30 @@ pub(crate) struct BootstrapScope {
     pub(crate) direct_report_ids: Vec<String>,
 }
 
-pub(crate) async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Option<BootstrapScope> {
-    let upstream =
-        std::env::var("BOSS_PEOPLE_UPSTREAM").unwrap_or_else(|_| boss_ports::url("people"));
-    let url = format!(
+/// The bootstrap lookup's URL, or `None` when the email is not ONE
+/// people path segment (backlog 385c02a5). The request is signed as the
+/// gateway's provisioning actor, so an email formatted in raw — `../`,
+/// a slash, a `%2e%2e` the URL parser reads as a climb — would pick
+/// which privileged people path it reached. It runs only after a
+/// verified password or IdP claim, but the check costs nothing: the
+/// passkey calls' own [`crate::passkey::is_people_segment`]. A refused
+/// email is no lookup, which the callers already answer as no Employee.
+fn bootstrap_url(upstream: &str, email: &str) -> Option<String> {
+    if !crate::passkey::is_people_segment(email) {
+        tracing::warn!(email = %email, "refused a bootstrap lookup for an email that is not one path segment");
+        return None;
+    }
+    Some(format!(
         "{}/api/people/by-email/{}/bootstrap",
         upstream.trim_end_matches('/'),
         email,
-    );
+    ))
+}
+
+pub(crate) async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Option<BootstrapScope> {
+    let upstream =
+        std::env::var("BOSS_PEOPLE_UPSTREAM").unwrap_or_else(|_| boss_ports::url("people"));
+    let url = bootstrap_url(&upstream, email)?;
     let resp = http
         .get(&url)
         .header(
@@ -347,6 +376,117 @@ pub(crate) async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Opti
         return None;
     }
     resp.json::<BootstrapScope>().await.ok()
+}
+
+/// The role the session for `email`'s employee row carries — the row's
+/// `row_role` only when it means something here, otherwise the
+/// visitor (`boss_core::roles::employee_session_role`). Both logins that
+/// mint from an employee row, password and OIDC, ask this, so neither
+/// can mint a role the other would not.
+///
+/// Until backlog e0996bca (2026-09-25) both minted `scope.role` as-is,
+/// so a blank role or one no `role` Class holds became a session role
+/// off the read-only floor, and the edge let it write. A platform role
+/// or a blank one is settled without the registry, so the operator's
+/// login never waits on it. A tenant role the registry cannot vouch
+/// for BECAUSE IT CANNOT ANSWER is refused with a 503 and no session:
+/// minting it as-is would be the defect, and minting a visitor would
+/// leave a real employee read-only for a whole session with nothing to
+/// say why — the silent downgrade the removed demo-mode mint made.
+///
+/// A row naming break-glass is a visitor too, settled before the
+/// registry is asked: that role is minted by `break_glass.rs`'s
+/// hardware-key ceremony and by nothing else (backlog 8f45e0b4).
+///
+/// Both outcomes a person would want explained are on the record, not
+/// only in a warn line (8f45e0b4 item 3): the 503 is recorded here as
+/// `auth.login.denied` with `reason: role_unconfirmed` — here rather
+/// than by each caller, so the two logins cannot record it differently
+/// — and a downgrade comes back as [`SessionRole::downgrade`] for the
+/// caller's `auth.login.succeeded`, which is emitted where the session
+/// is minted.
+pub(crate) async fn session_role(
+    audit: &crate::audit::AuthAudit,
+    method: crate::audit::AuthMethod,
+    idp: Option<&str>,
+    email: &str,
+    row_role: &str,
+) -> Result<SessionRole, Response> {
+    use boss_classes_client::ClassesClient;
+    use boss_core::roles::{employee_session_role, settled_session_role};
+
+    let role = match settled_session_role(row_role) {
+        Some(settled) => settled,
+        None => {
+            let url =
+                std::env::var("BOSS_CLASSES_URL").unwrap_or_else(|_| boss_ports::url("classes"));
+            let classes = boss_classes_client::ReqwestClassesClient::new(url);
+            let class_ref = boss_core::primitives::ClassRef::new("employee", row_role);
+            match classes.class_exists_on(&class_ref, "role").await {
+                Ok(registered) => employee_session_role(row_role, registered),
+                Err(e) => {
+                    audit.login_denied(
+                        Some(email),
+                        method,
+                        crate::audit::DeniedReason::RoleUnconfirmed,
+                        idp,
+                    );
+                    tracing::warn!(
+                        email,
+                        row_role,
+                        error = %e,
+                        "login REFUSED: the Class registry could not say whether the \
+                         employee's role is a live role Class"
+                    );
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "{email} authenticated, but the Class registry could not \
+                             confirm the role `{row_role}` ({e}); no session was \
+                             issued. Try again once the registry answers."
+                        ),
+                    )
+                        .into_response());
+                }
+            }
+        }
+    };
+    let downgraded_from = if role != row_role {
+        tracing::warn!(
+            email,
+            row_role,
+            session_role = role,
+            "the employee row's role is blank, reserved or not a live role Class; \
+             the session carries the read-only visitor role"
+        );
+        Some(row_role.to_string())
+    } else {
+        None
+    };
+    Ok(SessionRole {
+        role: role.to_string(),
+        downgraded_from,
+    })
+}
+
+/// The answer [`session_role`] gives: the role the session carries, and
+/// the row's role when the session carries less than it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionRole {
+    pub(crate) role: String,
+    pub(crate) downgraded_from: Option<String>,
+}
+
+impl SessionRole {
+    /// The `downgrade` for this mint's `auth.login.succeeded`, if any.
+    pub(crate) fn downgrade(&self) -> Option<crate::audit::Downgrade<'_>> {
+        self.downgraded_from
+            .as_deref()
+            .map(|from| crate::audit::Downgrade {
+                from,
+                to: &self.role,
+            })
+    }
 }
 
 // --------------------------------------------------------------------
@@ -370,7 +510,10 @@ pub struct LocalAuthState {
     pub mail: std::sync::Arc<dyn crate::mail::MailTransport>,
     /// Origin the reset link points at, e.g. `https://boss.example`.
     pub public_url: String,
-    /// Last accepted `forgot` per email, for rate limiting.
+    /// Last reset mail per email, for rate limiting — claimed by the
+    /// public `forgot` AND the admin `issue_reset` (backlog 17ae5248),
+    /// because the inbox a window protects is the same whichever door
+    /// asked. The name predates the second door.
     ///
     /// In-process and therefore a HEURISTIC, not a guarantee: with a
     /// second gateway in front of the same store it does not hold.
@@ -382,11 +525,79 @@ pub struct LocalAuthState {
     /// OIDC runtime when the IdP is configured (idm-kanidm.md).
     /// None → the oidc routes answer honestly that they are off.
     pub oidc: Option<std::sync::Arc<crate::oidc::OidcRuntime>>,
-    /// Whether this deployment offers the read-only guest session.
-    /// Off unless the deployment declares itself a demo — a tenant
-    /// running BOSS on real data does not hand out a session that
-    /// reads every projection.
-    pub guest_access: bool,
+    /// Whether this deployment offers the read-only guest session, and
+    /// which read it hands a stranger. Off unless the deployment says
+    /// otherwise — a tenant running BOSS on real data does not hand out
+    /// a session at all.
+    pub guest_access: GuestAccess,
+}
+
+/// What an anonymous visitor is handed on this deployment — design
+/// 2830b6b7, decided 2026-09-25 ("Guests read what the install
+/// declares, and never write"). One answer with three values, not a
+/// flag plus a role: two keys would admit `off` with a role, a pair
+/// that means nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestAccess {
+    /// No guest button, no guest session — the operating instance
+    /// (David: "boss.algedonic.dev won't support any guests").
+    Off,
+    /// The OSS default: a `visitor` session, which reads only what the
+    /// install grants that role as policy data — on every read that
+    /// asks policy. Not every read does yet: the employee roster does
+    /// (backlog cda177ef), but many module services' reads (accounts,
+    /// assets, invoices, inventory, shipments, products, customers,
+    /// campaigns, the catalog) still answer any session, this one
+    /// included, until each is given its check.
+    Basic,
+    /// An instance's explicit opt-in to the system-audit read: an
+    /// `audit-readonly` session, Read on every shipped resource (the
+    /// playground: "anonymous guests with the system-audit policy
+    /// grant").
+    Audit,
+}
+
+impl GuestAccess {
+    /// Parse `BOSS_GUEST_ACCESS`. Unset, empty or `0` is Off; `basic`
+    /// is Basic, and so is `1` — the value every install already set to
+    /// turn guests on, which therefore moves to the basic default
+    /// without an edit; `audit` is Audit. Anything else is refused,
+    /// naming the value: the variable carries an ANSWER, never a role
+    /// name, so no instance can mint `platform-admin` for strangers by
+    /// typo, and a bare `true` has not said which read it gives them.
+    pub fn from_env_value(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("") | Some("0") => Ok(Self::Off),
+            Some("1") | Some("basic") => Ok(Self::Basic),
+            Some("audit") => Ok(Self::Audit),
+            Some(other) => Err(format!(
+                "BOSS_GUEST_ACCESS={other:?} is not one of 0, basic (or 1), audit — \
+                 this gateway offers no guest session until it is"
+            )),
+        }
+    }
+
+    /// [`Self::from_env_value`], with a refused value answered as Off
+    /// and the refusal logged — the gateway still starts (a typo in a
+    /// guest setting must not take sign-in down with it), offers no
+    /// guest, and says why rather than going quiet.
+    pub fn from_env_or_off(value: Option<&str>) -> Self {
+        Self::from_env_value(value).unwrap_or_else(|why| {
+            tracing::warn!("{why}");
+            Self::Off
+        })
+    }
+
+    /// The role a guest session carries here; `None` when this
+    /// deployment mints no guest. Both roles are on
+    /// `boss_core::roles::READ_ONLY_FLOOR_ROLES`.
+    pub fn role(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Basic => Some(boss_core::roles::VISITOR_ROLE),
+            Self::Audit => Some(boss_core::roles::AUDIT_READONLY_ROLE),
+        }
+    }
 }
 
 // --------------------------------------------------------------------
@@ -464,8 +675,20 @@ pub async fn login(
                 .into_response();
         }
     };
+    let role = match session_role(
+        &state.audit,
+        crate::audit::AuthMethod::Password,
+        None,
+        &email,
+        &scope.role,
+    )
+    .await
+    {
+        Ok(role) => role,
+        Err(refusal) => return refusal,
+    };
     sess.employee_id = Some(scope.id);
-    sess.role = Some(scope.role);
+    sess.role = Some(role.role.clone());
     sess.department = scope.department;
     sess.territory_account_ids = scope.territory_account_ids;
     sess.direct_report_ids = scope.direct_report_ids;
@@ -477,6 +700,7 @@ pub async fn login(
         &email,
         sess.employee_id.as_deref(),
         crate::audit::AuthMethod::Password,
+        role.downgrade(),
     );
 
     let cookie_value = sess.encode(&state.session_key);
@@ -504,17 +728,18 @@ pub async fn login(
         .into_response()
 }
 
-/// The guest's fixed identity. It is a real address on the demo
-/// tenant's domain rather than something like `anonymous@local`
-/// because it shows up in the audit log as an actor, and an actor
-/// in the log should be a name you can look up.
-pub const GUEST_EMAIL: &str = "guest@algedonic.dev";
+/// The guest's fixed identity, spelled once in `boss_core::roles`
+/// because the policy service must recognise it too (backlog
+/// b8e75382: it refuses policy authority to the ids this gateway
+/// mints for anonymous visitors).
+pub use boss_core::roles::GUEST_EMAIL;
 
 #[derive(Serialize)]
 pub struct GuestAvailability {
     pub enabled: bool,
     pub email: &'static str,
-    pub role: &'static str,
+    /// The role a guest would carry here; `null` when none is minted.
+    pub role: Option<&'static str>,
 }
 
 /// `GET /api/auth/guest` — does this deployment offer guest
@@ -524,37 +749,40 @@ pub struct GuestAvailability {
 /// Unauthenticated by necessity: the caller is on the sign-in page.
 /// It discloses nothing a visitor cannot learn by clicking.
 pub async fn guest_available(State(state): State<Arc<LocalAuthState>>) -> Response {
+    let role = state.guest_access.role();
     Json(GuestAvailability {
-        enabled: state.guest_access,
+        enabled: role.is_some(),
         email: GUEST_EMAIL,
-        role: boss_core::roles::AUDIT_READONLY_ROLE,
+        role,
     })
     .into_response()
 }
 
 /// `POST /api/auth/guest` — mint the read-only session.
 ///
-/// Both the identity and the role are constants: nothing the
-/// caller sends influences either, because the request body of an
-/// unauthenticated endpoint is not evidence of anything. Writes
-/// are refused downstream by `audit-readonly`'s policy rules —
-/// this handler grants a role, it does not enforce one.
+/// The identity is a constant and the role is the deployment's
+/// ([`GuestAccess`]): nothing the caller sends influences either,
+/// because the request body of an unauthenticated endpoint is not
+/// evidence of anything. Either role is on the read-only floor
+/// (`boss_core::roles::is_read_only_floor`); writes are refused
+/// downstream by policy and by the floor guards — this handler
+/// grants a role, it does not enforce one.
 ///
 /// `employee_id` stays `None`. A guest is not on the payroll, and
 /// giving them an Employee row to satisfy a session field would
 /// put a person who does not exist into the org chart, headcount
 /// and directory.
 pub async fn guest(State(state): State<Arc<LocalAuthState>>) -> Response {
-    if !state.guest_access {
+    let Some(role) = state.guest_access.role() else {
         return (
             StatusCode::NOT_FOUND,
             "guest access is not enabled on this deployment",
         )
             .into_response();
-    }
+    };
 
     let mut sess = Session::new(GUEST_EMAIL, session::DEFAULT_TTL_SECONDS);
-    sess.role = Some(boss_core::roles::AUDIT_READONLY_ROLE.to_string());
+    sess.role = Some(role.to_string());
 
     // Counted, deliberately (§Policy & auth): an
     // unauthenticated endpoint that mints real read access gets a
@@ -634,18 +862,24 @@ pub struct OnboardRequest {
 
 /// `POST /api/auth/onboard` — admin-only. Creates a credential
 /// row for an existing Employee email. Verified via the caller's
-/// role (must be platform-admin / ceo / coo).
+/// role (`can_administer_auth`: platform-admin or break-glass).
 pub async fn onboard(
     State(state): State<Arc<LocalAuthState>>,
     headers: HeaderMap,
     Json(req): Json<OnboardRequest>,
 ) -> Response {
-    if !is_admin(&headers, &state.session_key) {
+    let Some(admin) = admin_session(&headers, &state.session_key) else {
         return (StatusCode::FORBIDDEN, "admin only").into_response();
-    }
-    if let Err(e) = state.store.upsert(&req.email, &req.password) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
-    }
+    };
+    let created = match state.store.upsert(&req.email, &req.password) {
+        Ok(created) => created,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    // Who wrote which credential, and whether it replaced one: before
+    // this an overwrite through this door named nobody (17ae5248).
+    state
+        .audit
+        .credential_written(&req.email.to_lowercase(), created, actor_of(&admin));
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"email": req.email})),
@@ -672,11 +906,25 @@ pub async fn issue_reset(
     headers: HeaderMap,
     Json(req): Json<IssueResetRequest>,
 ) -> Response {
-    if !is_admin(&headers, &state.session_key) {
+    let Some(admin) = admin_session(&headers, &state.session_key) else {
         return (StatusCode::FORBIDDEN, "admin only").into_response();
+    };
+    let email = req.email.trim().to_lowercase();
+    // `forgot`'s window, claimed after the admin check so a refused
+    // caller cannot spend it. The admin is authenticated, so the
+    // refusal is said out loud rather than swallowed (17ae5248).
+    if !claim_reset_window(&state, &email) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "a reset was mailed to {email} within the last {}s; the link in it still works",
+                RESET_WINDOW.as_secs()
+            ),
+        )
+            .into_response();
     }
     let ttl = 60 * 60; // 1h
-    match state.store.issue_reset_token(&req.email, ttl) {
+    match state.store.issue_reset_token(&email, ttl) {
         Ok(token) => {
             // Mail it; do not return it. Returning the token was
             // correct while this was admin-only and the admin was the
@@ -685,8 +933,14 @@ pub async fn issue_reset(
             // handler that answers with a credential is one routing
             // mistake away from handing anyone anyone else's reset.
             let mail = crate::mail::reset_mail(&req.email, &token, &state.public_url);
-            if let Err(e) = state.mail.send(&mail).await {
+            let sent = state.mail.send(&mail).await;
+            state
+                .audit
+                .reset_issued(&email, sent.is_ok(), actor_of(&admin));
+            if let Err(e) = sent {
                 tracing::warn!(error = %e, "reset token issued but mail failed");
+                // Nothing reached the inbox, so the window is not spent.
+                release_reset_window(&state, &email);
                 return (
                     StatusCode::BAD_GATEWAY,
                     "token issued but could not be sent; check the mail transport",
@@ -699,7 +953,60 @@ pub async fn issue_reset(
             })
             .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Err(e) => {
+            release_reset_window(&state, &email);
+            (StatusCode::BAD_REQUEST, format!("{e}")).into_response()
+        }
+    }
+}
+
+/// How long one reset mail per address holds off the next, whichever
+/// door sent it.
+const RESET_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Claim `email`'s reset window: `true` if no reset mail went to it in
+/// the last [`RESET_WINDOW`], and the claim is recorded atomically with
+/// the check. Shared by `forgot` and `issue_reset`.
+fn claim_reset_window(state: &LocalAuthState, email: &str) -> bool {
+    let mut seen = match state.forgot_seen.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let now = std::time::Instant::now();
+    seen.retain(|_, t| now.duration_since(*t) < RESET_WINDOW);
+    if seen.contains_key(email) {
+        return false;
+    }
+    seen.insert(email.to_string(), now);
+    true
+}
+
+/// Hand back a claim whose reset sent nothing. Only the admin door
+/// does this; `forgot` keeps its claim even for an unknown address,
+/// because releasing it there would tell a prober which is which.
+fn release_reset_window(state: &LocalAuthState, email: &str) {
+    let mut seen = match state.forgot_seen.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    seen.remove(email);
+}
+
+/// The caller's session when it may administer auth — `is_admin`'s
+/// verdict plus the session it judged, so an admin act can name its
+/// actor.
+fn admin_session(headers: &HeaderMap, key: &[u8]) -> Option<Session> {
+    if !is_admin(headers, key) {
+        return None;
+    }
+    extract_session(headers, key)
+}
+
+fn actor_of(s: &Session) -> crate::audit::AdminActor<'_> {
+    crate::audit::AdminActor {
+        email: &s.username,
+        employee_id: s.employee_id.as_deref(),
+        role: s.role.as_deref(),
     }
 }
 
@@ -728,20 +1035,10 @@ pub async fn forgot(
     Json(req): Json<ForgotRequest>,
 ) -> Response {
     let email = req.email.trim().to_lowercase();
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-    {
-        let mut seen = match state.forgot_seen.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let now = std::time::Instant::now();
-        seen.retain(|_, t| now.duration_since(*t) < WINDOW);
-        if seen.contains_key(&email) {
-            tracing::info!(%email, "forgot: within the rate-limit window; ignoring");
-            return StatusCode::NO_CONTENT.into_response();
-        }
-        seen.insert(email.clone(), now);
+    if !claim_reset_window(&state, &email) {
+        tracing::info!(%email, "forgot: within the rate-limit window; ignoring");
+        return StatusCode::NO_CONTENT.into_response();
     }
 
     let ttl = 60 * 60;
@@ -798,9 +1095,11 @@ fn is_admin(headers: &HeaderMap, key: &[u8]) -> bool {
     let Some(s) = extract_session(headers, key) else {
         return false;
     };
-    // `can_administer_auth`, not `has_global_read`: the same set plus
+    // `can_administer_auth`, not `has_global_read`: platform-admin and
     // the narrow break-glass role, whose auth-administration lever is
     // exactly these endpoints (break-glass-is-a-key-you-hold.md Q4).
+    // It used to be the global-read set plus break-glass, which let
+    // the guest's `audit-readonly` session through (backlog 34242f9a).
     s.role
         .as_deref()
         .map(boss_core::roles::can_administer_auth)
@@ -821,6 +1120,39 @@ mod tests {
         let path = td.path().join("credentials.toml");
         let store = CredentialStore::load(path).unwrap();
         (td, store)
+    }
+
+    /// The email is ONE path segment of the bootstrap lookup, or no
+    /// lookup at all (backlog 385c02a5). Formatted raw, `../` or a
+    /// slash in it steered the gateway's system-signed request to
+    /// another people path; `%2e%2e` is the same climb once the URL
+    /// parser reads it.
+    #[test]
+    fn the_bootstrap_lookup_carries_the_email_as_one_segment_or_not_at_all() {
+        assert_eq!(
+            bootstrap_url("http://people:7910/", "david@algedonic.dev").as_deref(),
+            Some("http://people:7910/api/people/by-email/david@algedonic.dev/bootstrap")
+        );
+        // Sub-addressing is an ordinary email, and `+` is literal in a path.
+        assert_eq!(
+            bootstrap_url("http://p", "ops+alerts@algedonic.dev").as_deref(),
+            Some("http://p/api/people/by-email/ops+alerts@algedonic.dev/bootstrap")
+        );
+        for email in [
+            "",
+            ".",
+            "..",
+            "../admin@x.co",
+            "a/b@x.co",
+            "a\\b@x.co",
+            "%2e%2e",
+            "a%2f..@x.co",
+            "a?role=x@x.co",
+            "a#x@x.co",
+            "a b@x.co",
+        ] {
+            assert_eq!(bootstrap_url("http://p", email), None, "{email:?}");
+        }
     }
 
     /// Captures instead of sending, so a test can assert what was
@@ -853,7 +1185,7 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             audit: crate::audit::AuthAudit::disabled(),
-            guest_access: false,
+            guest_access: GuestAccess::Off,
             oidc: None,
             mail: transport.clone(),
             public_url: "https://boss.test".into(),
@@ -952,14 +1284,14 @@ mod tests {
         );
     }
 
-    fn guest_state(enabled: bool) -> (TempDir, Arc<LocalAuthState>) {
+    fn guest_state(access: GuestAccess) -> (TempDir, Arc<LocalAuthState>) {
         let (td, store) = temp_store();
         let st = Arc::new(LocalAuthState {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             audit: crate::audit::AuthAudit::disabled(),
-            guest_access: enabled,
+            guest_access: access,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
             public_url: "https://boss.test".into(),
@@ -989,7 +1321,7 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
-            guest_access: false,
+            guest_access: GuestAccess::Off,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
             public_url: "https://boss.test".into(),
@@ -1018,6 +1350,178 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // The password login, end to end: credential -> people row -> role
+    // -> session -> auth event, against people-api and Class registry
+    // doubles (backlog 8f45e0b4 item 2, 2026-09-27). Until then no test
+    // reached past the credential check, so the wiring that turns a row
+    // role into a session role was pinned only on the OIDC path.
+    // ----------------------------------------------------------------
+
+    use crate::login_doubles::{
+        CLASSES_VAR, PEOPLE_VAR, UpstreamEnv, asked, mock_classes, mock_people_as,
+    };
+
+    /// What one password login left behind.
+    struct PasswordLogin {
+        status: StatusCode,
+        sess: Option<Session>,
+        events: Vec<boss_core::event::Event>,
+    }
+
+    /// Sign `op@example.com` in by password, its people row carrying
+    /// `row_role` and the registry at `classes`, with the upstream
+    /// addresses held by `env` until it drops.
+    async fn password_login_with_row_role(
+        env: &mut UpstreamEnv,
+        row_role: &'static str,
+        classes: &str,
+    ) -> PasswordLogin {
+        let people = mock_people_as(row_role).await;
+        env.set(PEOPLE_VAR, &people);
+        env.set(CLASSES_VAR, classes);
+        let cap = Arc::new(crate::audit::testing::Captured::default());
+        let (_td, store) = temp_store();
+        // Runtime-generated, as in a_bad_password_lands_a_denied_event.
+        let pw = format!("pw-{}", {
+            use rand::RngExt;
+            rand::rng().random::<u64>()
+        });
+        store.upsert("op@example.com", &pw).expect("seed");
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::spawn(cap.clone()),
+            guest_access: GuestAccess::Off,
+            oidc: None,
+            mail: Arc::new(crate::mail::LogTransport),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+        let resp = login(
+            State(st.clone()),
+            Json(LoginRequest {
+                email: "Op@Example.com".into(),
+                password: pw,
+            }),
+        )
+        .await;
+        let status = resp.status();
+        let sess = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .map(|_| cookie_value(&resp))
+            .and_then(|v| Session::decode(&v, &st.session_key).ok());
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        PasswordLogin {
+            status,
+            sess,
+            events,
+        }
+    }
+
+    /// The control that makes the rest mean something: a row whose role
+    /// a live `role` Class holds signs in by password as that role, with
+    /// the row's employee id, and its succeeded event carries no
+    /// `downgrade`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_login_mints_the_role_a_role_class_holds() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(Some(vec![("role", "quartermaster")])).await;
+        let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::OK);
+        let sess = got.sess.expect("a session is minted");
+        assert_eq!(sess.username, "op@example.com", "email lowercased");
+        assert_eq!(sess.employee_id.as_deref(), Some("emp-op"));
+        assert_eq!(sess.role.as_deref(), Some("quartermaster"));
+        assert!(asked(&counter) > 0, "a tenant role asks the registry");
+        assert_eq!(got.events.len(), 1, "{:?}", got.events);
+        assert_eq!(got.events[0].kind, "auth.login.succeeded");
+        assert_eq!(got.events[0].payload["method"], "password");
+        assert_eq!(got.events[0].payload["employee_id"], "emp-op");
+        assert!(got.events[0].payload.get("downgrade").is_none());
+    }
+
+    /// Backlog e0996bca, on the password path: a row role no live `role`
+    /// Class holds signs in as the visitor — and, since 8f45e0b4 item 3,
+    /// the succeeded event says so rather than a warn line alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_login_with_an_unregistered_row_role_is_a_recorded_visitor() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, _) = mock_classes(Some(vec![("department", "quartermaster")])).await;
+        let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::OK);
+        let sess = got.sess.expect("a session is minted");
+        assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
+        assert_eq!(
+            got.events[0].payload["downgrade"],
+            serde_json::json!({ "from": "quartermaster", "to": "visitor" })
+        );
+    }
+
+    /// Backlog 8f45e0b4 (2026-09-27), the finding this car exists for: a
+    /// row naming break-glass — only SQL can write one — signed in by
+    /// password AS break-glass, holding auth administration, merge
+    /// approval and deploy rollback with no hardware key in the room.
+    /// It is the visitor now; the registry, which would vouch for a
+    /// `break-glass` role Class, is never asked; and the downgrade is
+    /// recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_break_glass_row_signs_in_by_password_as_a_visitor() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(Some(vec![("role", "break-glass")])).await;
+        let got = password_login_with_row_role(&mut env, "break-glass", &classes).await;
+        assert_eq!(got.status, StatusCode::OK);
+        let sess = got.sess.expect("a session is minted");
+        assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
+        assert!(!boss_core::roles::can_administer_auth(
+            sess.effective_role()
+        ));
+        assert!(boss_core::roles::is_read_only_floor(sess.effective_role()));
+        assert_eq!(asked(&counter), 0, "the registry is not asked");
+        assert_eq!(
+            got.events[0].payload["downgrade"],
+            serde_json::json!({ "from": "break-glass", "to": "visitor" })
+        );
+    }
+
+    /// The operator's password login never waits on the registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_platform_admin_signs_in_by_password_while_the_registry_cannot_answer() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(None).await;
+        let got = password_login_with_row_role(&mut env, "platform-admin", &classes).await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.sess.expect("minted").role.as_deref(),
+            Some(boss_core::roles::PLATFORM_ADMIN_ROLE)
+        );
+        assert_eq!(asked(&counter), 0);
+    }
+
+    /// A verified credential whose tenant role the registry cannot
+    /// confirm is refused 503 with no session — and the refusal is an
+    /// `auth.login.denied` on the record (backlog 8f45e0b4 item 3), not
+    /// only a warn line: an authentication decision went against a
+    /// caller who proved their password.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_login_refused_for_a_dark_registry_is_recorded() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(None).await;
+        let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(got.sess.is_none(), "no session is minted");
+        assert!(asked(&counter) > 0);
+        assert_eq!(got.events.len(), 1, "{:?}", got.events);
+        let e = &got.events[0];
+        assert_eq!(e.kind, "auth.login.denied");
+        assert_eq!(e.payload["reason"], "role_unconfirmed");
+        assert_eq!(e.payload["method"], "password");
+        assert_eq!(e.payload["email_claimed"], "op@example.com");
+        assert!(e.payload.get("employee_id").is_none());
+    }
+
     /// Q2: the guest mint is an unauthenticated capability; counting
     /// it is the minimum honest record.
     #[tokio::test]
@@ -1029,7 +1533,7 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
-            guest_access: true,
+            guest_access: GuestAccess::Basic,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
             public_url: "https://boss.test".into(),
@@ -1067,17 +1571,26 @@ mod tests {
         value.to_string()
     }
 
-    /// Nothing the caller sends decides who a guest is, so the only
-    /// thing to assert is that the constants land on the session.
-    #[tokio::test]
-    async fn a_guest_session_is_audit_readonly_and_not_an_employee() {
-        let (_td, st) = guest_state(true);
+    /// Mint a guest on a deployment offering `access` and decode the
+    /// session its cookie carries.
+    async fn minted_guest(access: GuestAccess) -> Session {
+        let (_td, st) = guest_state(access);
         let resp = guest(State(st.clone())).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK, "{access:?} mints");
+        Session::decode(&cookie_value(&resp), &st.session_key).expect("decodes")
+    }
 
-        let sess = Session::decode(&cookie_value(&resp), &st.session_key).expect("decodes");
+    /// Design 2830b6b7 (decided 2026-09-25): the OSS default guest is
+    /// a `visitor` — basic access, whatever the install grants that
+    /// role — and NOT `audit-readonly`, whose Read on every shipped
+    /// resource handed a stranger the employee roster. Nothing the
+    /// caller sends decides who a guest is, so the only thing to assert
+    /// is that the deployment's constants land on the session.
+    #[tokio::test]
+    async fn a_basic_guest_session_is_a_visitor_and_not_an_employee() {
+        let sess = minted_guest(GuestAccess::Basic).await;
         assert_eq!(sess.username, GUEST_EMAIL);
-        assert_eq!(sess.role.as_deref(), Some("audit-readonly"));
+        assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
         assert!(
             sess.employee_id.is_none(),
             "a guest must not carry an Employee identity — that would put a \
@@ -1085,11 +1598,40 @@ mod tests {
         );
     }
 
+    /// The playground's opt-in (David, 2026-09-25: "Playground will
+    /// support anonymous guests with the system-audit policy grant"):
+    /// the same guest identity, carrying `audit-readonly`.
+    #[tokio::test]
+    async fn an_audit_guest_session_is_audit_readonly_and_not_an_employee() {
+        let sess = minted_guest(GuestAccess::Audit).await;
+        assert_eq!(sess.username, GUEST_EMAIL);
+        assert_eq!(
+            sess.role.as_deref(),
+            Some(boss_core::roles::AUDIT_READONLY_ROLE)
+        );
+        assert!(sess.employee_id.is_none());
+    }
+
+    /// Whichever read the deployment chose, the guest is on the
+    /// read-only floor — the predicate every name-keyed write guard
+    /// now asks.
+    #[tokio::test]
+    async fn every_guest_mode_mints_a_read_only_floor_role() {
+        for access in [GuestAccess::Basic, GuestAccess::Audit] {
+            let sess = minted_guest(access).await;
+            let role = sess.role.expect("a guest carries a role");
+            assert!(
+                boss_core::roles::is_read_only_floor(&role),
+                "{access:?} minted {role}, which is off the read-only floor"
+            );
+        }
+    }
+
     /// A tenant running BOSS on their own company's data has not asked
     /// to hand out a session that reads every projection.
     #[tokio::test]
     async fn guest_access_is_refused_unless_the_deployment_offers_it() {
-        let (_td, st) = guest_state(false);
+        let (_td, st) = guest_state(GuestAccess::Off);
         let resp = guest(State(st.clone())).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(
@@ -1099,17 +1641,63 @@ mod tests {
 
         let avail = body_json(guest_available(State(st)).await).await;
         assert_eq!(avail["enabled"], serde_json::json!(false));
+        assert!(
+            avail["role"].is_null(),
+            "a deployment that mints no guest names no guest role: {avail}"
+        );
     }
 
     /// The sign-in page renders its button from this, so the answer
     /// has to track the deployment rather than be assumed.
     #[tokio::test]
     async fn availability_reports_the_identity_it_would_mint() {
-        let (_td, st) = guest_state(true);
-        let avail = body_json(guest_available(State(st)).await).await;
-        assert_eq!(avail["enabled"], serde_json::json!(true));
-        assert_eq!(avail["email"], serde_json::json!(GUEST_EMAIL));
-        assert_eq!(avail["role"], serde_json::json!("audit-readonly"));
+        for (access, role) in [
+            (GuestAccess::Basic, boss_core::roles::VISITOR_ROLE),
+            (GuestAccess::Audit, boss_core::roles::AUDIT_READONLY_ROLE),
+        ] {
+            let (_td, st) = guest_state(access);
+            let avail = body_json(guest_available(State(st)).await).await;
+            assert_eq!(avail["enabled"], serde_json::json!(true), "{access:?}");
+            assert_eq!(avail["email"], serde_json::json!(GUEST_EMAIL));
+            assert_eq!(avail["role"], serde_json::json!(role), "{access:?}");
+        }
+    }
+
+    /// `BOSS_GUEST_ACCESS` takes three answers and no role name. "1"
+    /// keeps meaning what every OSS install already set it to for —
+    /// and so moves them to the basic default without an edit.
+    #[test]
+    fn the_guest_access_env_value_is_one_of_three_answers() {
+        for (raw, want) in [
+            (None, GuestAccess::Off),
+            (Some(""), GuestAccess::Off),
+            (Some("0"), GuestAccess::Off),
+            (Some("1"), GuestAccess::Basic),
+            (Some("basic"), GuestAccess::Basic),
+            (Some("audit"), GuestAccess::Audit),
+        ] {
+            assert_eq!(GuestAccess::from_env_value(raw), Ok(want), "{raw:?}");
+        }
+    }
+
+    /// Anything else is refused BY NAME, and the gateway runs with no
+    /// guests: a role name cannot be passed through the environment,
+    /// so no instance can mint `platform-admin` for strangers by typo,
+    /// and a bare `true` has not said which read it gives them.
+    #[test]
+    fn an_unrecognised_guest_access_value_is_named_and_offers_no_guest() {
+        for raw in [
+            "true",
+            "yes",
+            "Audit",
+            "platform-admin",
+            "audit-readonly",
+            "visitor",
+        ] {
+            let why = GuestAccess::from_env_value(Some(raw)).expect_err(raw);
+            assert!(why.contains(raw), "the refusal names {raw:?}: {why}");
+            assert_eq!(GuestAccess::from_env_or_off(Some(raw)), GuestAccess::Off);
+        }
     }
 
     /// Regression. `me` used to 401 a session with no `employee_id`
@@ -1119,7 +1707,7 @@ mod tests {
     /// to the sign-in page they just left.
     #[tokio::test]
     async fn me_answers_for_a_guest_session() {
-        let (_td, st) = guest_state(true);
+        let (_td, st) = guest_state(GuestAccess::Basic);
         let minted = guest(State(st.clone())).await;
 
         let mut headers = HeaderMap::new();
@@ -1214,6 +1802,170 @@ mod tests {
         );
     }
 
+    // ---- who may administer auth (backlog 34242f9a) ------------------
+    //
+    // `is_admin` admitted every `has_global_read` role, and that set
+    // includes `audit-readonly` — the role `guest()` hands any
+    // anonymous visitor on a guest-enabled deployment, and the seeded
+    // `emp-audit` external auditor's. So a guest could set a known
+    // password on any employee's email and sign in as them, or mail
+    // reset links outside `forgot`'s rate limit.
+
+    fn admin_gate_state() -> (TempDir, Arc<LocalAuthState>, Arc<CapturingTransport>) {
+        admin_gate_state_offering(GuestAccess::Audit)
+    }
+
+    fn admin_gate_state_offering(
+        access: GuestAccess,
+    ) -> (TempDir, Arc<LocalAuthState>, Arc<CapturingTransport>) {
+        let (td, store) = temp_store();
+        let cap = Arc::new(CapturingTransport::default());
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::disabled(),
+            guest_access: access,
+            oidc: None,
+            mail: cap.clone(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+        (td, st, cap)
+    }
+
+    /// Runtime-generated, like `a_bad_password_lands_a_denied_event`:
+    /// no credential-shaped literal in the test binary.
+    fn fresh_password() -> String {
+        use rand::RngExt;
+        format!("pw-{}", rand::rng().random::<u64>())
+    }
+
+    fn cookie_headers(cookie: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{}={cookie}", session::COOKIE_NAME)).unwrap(),
+        );
+        headers
+    }
+
+    /// A session signed with the state's own key, as `login` would
+    /// mint it for an employee holding `role`.
+    fn session_headers(st: &LocalAuthState, role: &str, employee_id: &str) -> HeaderMap {
+        let mut sess = Session::new(format!("{employee_id}@example.com"), 60);
+        sess.role = Some(role.to_string());
+        sess.employee_id = Some(employee_id.to_string());
+        cookie_headers(&sess.encode(&st.session_key))
+    }
+
+    async fn try_onboard(st: &Arc<LocalAuthState>, headers: HeaderMap, email: &str) -> Response {
+        onboard(
+            State(st.clone()),
+            headers,
+            Json(OnboardRequest {
+                email: email.into(),
+                password: fresh_password(),
+            }),
+        )
+        .await
+    }
+
+    async fn try_issue_reset(
+        st: &Arc<LocalAuthState>,
+        headers: HeaderMap,
+        email: &str,
+    ) -> Response {
+        issue_reset(
+            State(st.clone()),
+            headers,
+            Json(IssueResetRequest {
+                email: email.into(),
+            }),
+        )
+        .await
+    }
+
+    /// The live shape of the defect: a cookie minted by `guest()`
+    /// itself, not a hand-built one, so the role it carries is exactly
+    /// the one an anonymous visitor would present — in each guest mode
+    /// a deployment can offer (design 2830b6b7).
+    #[tokio::test]
+    async fn a_guest_session_may_not_onboard_or_reset_a_credential() {
+        for access in [GuestAccess::Basic, GuestAccess::Audit] {
+            a_guest_of_this_mode_may_not_onboard_or_reset(access).await;
+        }
+    }
+
+    async fn a_guest_of_this_mode_may_not_onboard_or_reset(access: GuestAccess) {
+        let (_td, st, cap) = admin_gate_state_offering(access);
+        let victim_pw = fresh_password();
+        st.store
+            .upsert("victim@example.com", &victim_pw)
+            .expect("seed");
+
+        let minted = guest(State(st.clone())).await;
+        assert_eq!(minted.status(), StatusCode::OK);
+        let guest_cookie = cookie_value(&minted);
+
+        let over = try_onboard(&st, cookie_headers(&guest_cookie), "victim@example.com").await;
+        assert_eq!(over.status(), StatusCode::FORBIDDEN, "overwrite refused");
+        let new = try_onboard(&st, cookie_headers(&guest_cookie), "new@example.com").await;
+        assert_eq!(new.status(), StatusCode::FORBIDDEN, "create refused");
+        let reset = try_issue_reset(&st, cookie_headers(&guest_cookie), "victim@example.com").await;
+        assert_eq!(reset.status(), StatusCode::FORBIDDEN, "reset refused");
+
+        assert!(
+            st.store.verify("victim@example.com", &victim_pw).is_ok(),
+            "the victim's password must be untouched"
+        );
+        assert!(!st.store.contains("new@example.com"), "nothing created");
+        assert!(cap.sent.lock().expect("lock").is_empty(), "no mail sent");
+    }
+
+    /// The seeded `emp-audit` external auditor carries the same role
+    /// through an ordinary login; its contract is read-only too.
+    #[tokio::test]
+    async fn an_audit_readonly_login_may_not_onboard_or_reset_a_credential() {
+        let (_td, st, cap) = admin_gate_state();
+        let victim_pw = fresh_password();
+        st.store
+            .upsert("victim@example.com", &victim_pw)
+            .expect("seed");
+        let auditor = || session_headers(&st, boss_core::roles::AUDIT_READONLY_ROLE, "emp-audit");
+
+        let over = try_onboard(&st, auditor(), "victim@example.com").await;
+        assert_eq!(over.status(), StatusCode::FORBIDDEN);
+        let reset = try_issue_reset(&st, auditor(), "victim@example.com").await;
+        assert_eq!(reset.status(), StatusCode::FORBIDDEN);
+
+        assert!(st.store.verify("victim@example.com", &victim_pw).is_ok());
+        assert!(cap.sent.lock().expect("lock").is_empty());
+    }
+
+    /// The control that makes the two refusals above mean something:
+    /// the same cookie plumbing, carrying an admitted role, is let
+    /// through — so a 403 there is the gate's answer, not a cookie
+    /// the handler failed to read.
+    #[tokio::test]
+    async fn the_named_auth_administrators_may_onboard_and_reset() {
+        for role in [
+            boss_core::roles::PLATFORM_ADMIN_ROLE,
+            boss_core::roles::BREAK_GLASS_ROLE,
+        ] {
+            let (_td, st, cap) = admin_gate_state();
+            let created =
+                try_onboard(&st, session_headers(&st, role, "emp-op"), "u@example.com").await;
+            assert_eq!(created.status(), StatusCode::CREATED, "{role} onboards");
+            assert!(st.store.contains("u@example.com"));
+
+            let reset =
+                try_issue_reset(&st, session_headers(&st, role, "emp-op"), "u@example.com").await;
+            assert_eq!(reset.status(), StatusCode::OK, "{role} issues a reset");
+            assert_eq!(cap.sent.lock().expect("lock").len(), 1, "{role}: one mail");
+        }
+    }
+
     #[test]
     fn reset_token_for_unknown_email_fails_cleanly() {
         let (_td, store) = temp_store();
@@ -1223,5 +1975,204 @@ mod tests {
                 .consume_reset_token("ghost@example.com", "x", "y")
                 .is_err()
         );
+    }
+
+    // ---- the admin doors leave a record (backlog 17ae5248) -----------
+    //
+    // `onboard` upserted a credential and `issue_reset` mailed a reset
+    // with no call on `state.audit`: a credential created OR
+    // OVERWRITTEN through the auth-admin door named nobody, and an
+    // admin reset — exactly the act an audit trail exists for — left
+    // no trace. `issue_reset` also had none of `forgot`'s per-email
+    // window, so an administrator could mail a reset on every call.
+    //
+    // Helper names here are distinct from the ones car
+    // fix/auth-admin-refuses-audit-readonly adds to this module, so
+    // the two cars assemble on one train.
+
+    fn audited_admin_state() -> (
+        TempDir,
+        Arc<LocalAuthState>,
+        Arc<CapturingTransport>,
+        Arc<crate::audit::testing::Captured>,
+    ) {
+        let (td, store) = temp_store();
+        let mail = Arc::new(CapturingTransport::default());
+        let rec = Arc::new(crate::audit::testing::Captured::default());
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::spawn(rec.clone()),
+            guest_access: GuestAccess::Off,
+            oidc: None,
+            mail: mail.clone(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+        (td, st, mail, rec)
+    }
+
+    /// A platform-admin session signed with the state's own key, as
+    /// `login` would mint it.
+    fn platform_admin_cookie(st: &LocalAuthState) -> HeaderMap {
+        let mut sess = Session::new("admin@example.com", 60);
+        sess.role = Some(boss_core::roles::PLATFORM_ADMIN_ROLE.to_string());
+        sess.employee_id = Some("emp-admin".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                session::COOKIE_NAME,
+                sess.encode(&st.session_key)
+            ))
+            .unwrap(),
+        );
+        headers
+    }
+
+    /// Runtime-generated: no credential-shaped literal in the binary.
+    fn runtime_password() -> String {
+        use rand::RngExt;
+        format!("pw-{}", rand::rng().random::<u64>())
+    }
+
+    async fn admin_resets(st: &Arc<LocalAuthState>, email: &str) -> Response {
+        issue_reset(
+            State(st.clone()),
+            platform_admin_cookie(st),
+            Json(IssueResetRequest {
+                email: email.into(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn onboard_records_who_wrote_which_credential_and_never_the_password() {
+        let (_td, st, _mail, rec) = audited_admin_state();
+        let first = runtime_password();
+        let second = runtime_password();
+        for pw in [&first, &second] {
+            let resp = onboard(
+                State(st.clone()),
+                platform_admin_cookie(&st),
+                Json(OnboardRequest {
+                    email: "New@Example.com".into(),
+                    password: pw.clone(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let events = crate::audit::testing::drain(&rec, 2).await;
+        assert_eq!(events.len(), 2, "one event per credential write");
+        for e in &events {
+            assert_eq!(e.kind, "auth.credential.written");
+            assert_eq!(e.payload["email"], "new@example.com");
+            assert_eq!(e.payload["actor"], "admin@example.com");
+            assert_eq!(e.payload["actor_employee_id"], "emp-admin");
+            assert_eq!(e.payload["actor_role"], "platform-admin");
+            let raw = e.payload.to_string();
+            assert!(
+                !raw.contains(&first) && !raw.contains(&second),
+                "no password in the payload: {raw}"
+            );
+        }
+        assert_eq!(events[0].payload["outcome"], "created");
+        assert_eq!(
+            events[1].payload["outcome"], "overwritten",
+            "an upsert over an existing credential says so"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_reset_records_who_issued_it_and_never_the_token() {
+        let (_td, st, mail, rec) = audited_admin_state();
+        st.store
+            .upsert("user@example.com", &runtime_password())
+            .expect("seed");
+
+        let resp = admin_resets(&st, "user@example.com").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = mail.sent.lock().expect("lock")[0].body.clone();
+        let token = body
+            .split("reset=")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .expect("the mail carries the token")
+            .to_string();
+
+        let events = crate::audit::testing::drain(&rec, 1).await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.kind, "auth.reset.issued");
+        assert_eq!(e.payload["email"], "user@example.com");
+        assert_eq!(e.payload["actor"], "admin@example.com");
+        assert_eq!(e.payload["mailed"], true);
+        assert!(
+            !e.payload.to_string().contains(&token),
+            "no token in the payload"
+        );
+    }
+
+    /// `forgot`'s window, shared: one reset mail per address per 60 s
+    /// whichever door asked, because the inbox being protected is the
+    /// same inbox. The admin is authenticated, so the refusal is said
+    /// out loud (429) rather than swallowed as `forgot` must.
+    #[tokio::test]
+    async fn issue_reset_honours_the_per_email_window_forgot_keeps() {
+        let (_td, st, mail, rec) = audited_admin_state();
+        st.store
+            .upsert("user@example.com", &runtime_password())
+            .expect("seed");
+
+        let first = admin_resets(&st, "user@example.com").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let again = admin_resets(&st, "USER@example.com").await;
+        assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(mail.sent.lock().expect("lock").len(), 1, "one mail");
+
+        // The same window `forgot` claims: a public forgot inside it is
+        // silently ignored, as it always was.
+        let fg = forgot(
+            State(st.clone()),
+            Json(ForgotRequest {
+                email: "user@example.com".into(),
+            }),
+        )
+        .await;
+        assert_eq!(fg.status(), StatusCode::NO_CONTENT);
+        assert_eq!(mail.sent.lock().expect("lock").len(), 1, "still one");
+
+        let events = crate::audit::testing::drain(&rec, 1).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "auth.reset.issued")
+                .count(),
+            1,
+            "a refused reset issues nothing and records no issue"
+        );
+    }
+
+    /// A reset that sent nothing does not spend the window: an admin
+    /// who asks before onboarding, onboards, and asks again is not
+    /// made to wait a minute for a mail that never went.
+    #[tokio::test]
+    async fn a_reset_that_sent_nothing_does_not_spend_the_window() {
+        let (_td, st, mail, _rec) = audited_admin_state();
+        let early = admin_resets(&st, "late@example.com").await;
+        assert_eq!(early.status(), StatusCode::BAD_REQUEST, "onboard first");
+
+        st.store
+            .upsert("late@example.com", &runtime_password())
+            .expect("seed");
+        let resp = admin_resets(&st, "late@example.com").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(mail.sent.lock().expect("lock").len(), 1);
     }
 }

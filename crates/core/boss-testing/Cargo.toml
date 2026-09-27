@@ -50,6 +50,12 @@ boss-ports = { path = "../boss-ports" }
 # (the script and the rule), so the test compiles the rule's regex and
 # runs it over the script's real output (CLAUDE.md §9a).
 regex = "1"
+# Test-only, for `the_sim_switch_reads_one_way.rs`: BOSS_SIM_ENABLED is
+# read by the launcher's shell `sim_enabled` and by this crate's
+# `sim_enabled_value`, so the test runs both on one table of inputs
+# (CLAUDE.md §9a; backlog d65bd066). boss-policy-client dev-depends on
+# boss-testing in turn; both edges are dev-only.
+boss-policy-client = { path = "../boss-policy-client" }
 
 [[test]]
 name = "migrate_sh"
@@ -57,6 +63,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "fixture_smoke"
+required-features = ["postgres"]
+
+[[test]]
+name = "test_db_releases"
 required-features = ["postgres"]
 
 [[test]]

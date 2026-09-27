@@ -1,0 +1,76 @@
+# Read the mirror PR's checks AGAIN, and what became of every publish
+# PR, every fifteen minutes (backlog c6cb678b, 2026-09-24; the cadence
+# and the name since backlog 663589cd, 2026-09-26 — until then this was
+# `reread-publish-checks-hourly`, and the seed retires that name).
+#
+# THE FIRST DEFECT (c6cb678b). `read-publish-checks-on-read-checks-ready`
+# files the read once, the moment open-pr completes; the verb waits for
+# the code-scanning checks (~13 minutes) and stops, because since
+# d167e7d7 it must not hold the forge's serial ops-runner for the
+# mirror's full Gate, whose own `timeout-minutes` is 180. Until this
+# rule the verb then COMPLETED the step with the Gate recorded
+# in_progress, and nothing ever read the Gate again: PR #243's Gate
+# concluded failure at 04:18Z, the publish packet closed `pr-opened` at
+# 04:41Z over a clean judgement of CodeQL's three rules, and the publish
+# region turned red 25 hours later on the PR's age, naming no check.
+# Now a check still running is `not yet` (exit 75) and this rule is
+# what reads it again; past the verb's ceiling (four hours after the PR
+# opened) the step completes `unfinished`, naming what never ended.
+#
+# THE SECOND (663589cd, David 2026-09-26: "I closed the PR because it
+# was red and we don't seem to have a way to correct red PRs ... Not
+# sure why the alarm would stay going off this whole time"). What
+# GitHub says of a publish PR — open, merged, closed, and its checks
+# NOW — was asked only by the daily mirror-drift verb, so the region
+# said "#244 has been open 46 hours (GitHub read it open at
+# 2026-09-26T00:00:55Z)" 22 hours after #244 was known unmergeable, and
+# a close was not seen for up to a day. The verb this rule files now
+# asks that on every run (infra/forge/publish-pr-state.sh, the pass
+# --measure shares), so a close or merge reaches the region within a
+# quarter hour, and a PR whose checks went red after its reading was
+# taken is read red.
+#
+# NO GUARD, and that is decided, not forgotten. The verb is the
+# idempotence: with no publish packet waiting and no PR standing it
+# answers `nothing to do` and writes nothing — `refresh-publish-drift-
+# daily` is the worked example, and `cadence_roster::unreadable_guard_
+# repair` names it as the shape for a conditional spawner. A guard
+# asking "is a PR open" is a question the silence roster cannot read,
+# so this rule would declare a cadence it does not keep.
+#
+# FIFTEEN MINUTES, and the cost stated. A person's close or merge is an
+# instant, and the region's alarm is only as current as the last read,
+# so the grain is set by how long a stale alarm may stand — minutes,
+# not the hour the Gate's own grain allowed. The cost: 96 ops-requests
+# a day on the forge's runner, almost all answering `nothing to do` in
+# one jobs-API read, and at most two unauthenticated GitHub reads per
+# standing PR per firing (8 an hour against the public API's 60).
+# Finer re-reads a PR GitHub has not changed.
+#
+# The request carries NO `for_publish`: a clock firing has no packet
+# in its payload to name. So the answer rule's failure mode cannot
+# annotate the step from one of these; a failing re-read is on its own
+# ops-request, and the verb's ceiling is what keeps the step from
+# waiting unread past four hours.
+[[rule]]
+name = "reread-publish-pr-every-15-minutes"
+version = 1
+why = """
+A TIMER, the standing exemption: "fifteen minutes passed" is no
+packet's event, and what this re-reads sits outside BOSS — a publish
+PR's checks still running on GitHub, or a person closing or merging it
+there — and GitHub has no path into the LAN to say so. Measured
+2026-09-24 (backlog c6cb678b): PR #243's Gate concluded failure after
+the one read the step-ready rule files had completed read-checks with
+the Gate in_progress. Measured 2026-09-26 (backlog 663589cd): PR #244
+was closed red by David and the region alarmed on it for 22 hours,
+because only the daily drift verb asked GitHub. It adds no routing: it
+files the same ops-request the step-ready rule files, and what happens
+next is the publish protocol's own row (read-checks -> judge-checks ->
+pr-opened). No authority widened: the verb holds no credential and
+writes only publish packets' own readings, steps and `pr_state`.
+"""
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-09-26" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"github-mirror-checks\"", title = "\"re-read the mirror PRs and their checks from the forge — what GitHub says of each publish PR\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"read-publish-checks\"", "metadata.area" = "\"platform\"" }

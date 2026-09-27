@@ -9,6 +9,7 @@
 //! Hexagonal: the domain defines a `JobsRepository` port (trait).
 //! Postgres, in-memory, and other adapters implement the same trait.
 
+pub mod active_holder;
 pub mod agent_budget;
 pub mod agent_runs;
 pub mod agent_spec;
@@ -21,27 +22,44 @@ pub mod cadence;
 pub mod cadence_seed;
 pub mod calendar_hook;
 pub mod car;
+pub mod car_disprove;
+pub mod car_retire;
+pub mod car_unland;
 pub mod channels;
+pub mod corrections;
 pub mod credentials;
 pub mod decision_record;
 pub mod delivery;
 pub mod delivery_policy_seed;
 pub mod department;
 pub mod dispatcher_firings;
+pub mod dispatcher_schedule;
 pub mod escalation;
 pub mod estate_seed;
 pub mod events;
 pub mod experiments;
+pub mod field_writer;
 pub mod flake;
+pub mod flights;
 pub mod http;
 pub mod human_only;
 pub mod in_memory;
 pub mod job_edges;
+pub mod job_outcome;
 pub mod jobs_config;
 pub mod landing;
+pub mod list_every;
+pub mod me;
 pub mod metadata_containment;
 pub mod metadata_key;
+pub mod moves;
+pub mod next_up;
+pub mod opened_by;
+pub mod origin;
 pub mod orphan_steps;
+pub mod outranks;
+pub mod owned_wait_queue;
+pub mod plugin_version_repair;
 pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
@@ -51,9 +69,13 @@ pub mod protocol_conversion;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod refusals;
+pub mod region_states;
 pub mod regions;
 pub mod registry;
+pub mod repin;
+pub mod routes;
 pub mod scheduling;
+pub mod schema_level;
 pub mod station_flow;
 pub mod station_lint;
 pub mod station_projection;
@@ -62,7 +84,9 @@ pub mod station_queue;
 pub mod station_reach;
 pub mod station_seed;
 pub mod stations;
+pub mod step_metadata_write;
 pub mod stranded;
+pub mod thirds;
 pub mod trust;
 pub mod workflow_lint;
 pub mod workflow_quarantine;
@@ -81,9 +105,10 @@ pub mod step_plugins;
 pub mod step_registry;
 pub mod subject_existence;
 pub mod surface_opens;
+pub mod tenant_publishes;
 
 pub use in_memory::InMemoryJobs;
-pub use port::{JobFilter, JobsError, JobsRepository};
+pub use port::{Admission, JobFilter, JobsError, JobsRepository};
 #[cfg(feature = "postgres")]
 pub use postgres::PgJobs;
 #[cfg(feature = "postgres")]

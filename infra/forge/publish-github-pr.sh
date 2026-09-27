@@ -22,10 +22,14 @@
 #      a snapshot whose tree IS forge main's tree is the honest backup;
 #   4. pushes it to the dauld fork as publish/<date> (recreating the
 #      fork once if it is gone), opens the PR against algedonic-dev/boss
-#      as dauld, and completes the packet's open-pr step with pr_url.
+#      as dauld, and completes the packet's open-pr step with pr_url;
+#   5. closes each OLDER open publish/<date> PR from the fork as
+#      superseded by today's, which contains it (backlog d4bfe548) —
+#      so there is only ever one PR to merge.
 #
 # THE MERGE ON GITHUB STAYS DAVID'S — the second gate. Nothing here
-# touches the mirror's main.
+# touches the mirror's main; the only PRs it closes are its own older
+# publish snapshots.
 #
 # THE TOKEN. dauld's GitHub token is provisioned by David's token admin
 # at $BOSS_GITHUB_TOKEN_FILE (default /etc/boss-publish/github.token,
@@ -56,11 +60,10 @@ set -euo pipefail
 
 TOKEN_FILE="${BOSS_GITHUB_TOKEN_FILE:-/etc/boss-publish/github.token}"
 STATE_DIR="${BOSS_PUBLISH_STATE_DIR:-/var/lib/boss-publish}"
-# WHERE THE FORGE REPOSITORY IS — derived, not asserted. See the block
-# below the helpers; these are its inputs.
-FORGE_COMPOSE="${BOSS_FORGE_COMPOSE:-/opt/forgejo/docker-compose.yml}"
-FORGE_REPO_SLUG="${BOSS_FORGE_REPO_SLUG:-david/boss}"
-FORGE_DATA_FALLBACK="${BOSS_FORGE_DATA_FALLBACK:-/opt/forgejo/data}"
+# WHERE THE FORGE REPOSITORY IS — derived, not asserted, by
+# infra/forge/forge-repo-path.sh (sourced below the helpers), which
+# reads BOSS_FORGE_REPO_PATH, BOSS_FORGE_COMPOSE, BOSS_FORGE_REPO_SLUG
+# and BOSS_FORGE_DATA_FALLBACK.
 # THE MIRROR — where it is spelled: infra/estate/estate.toml, rendered
 # onto this host as /etc/boss/sor.env (infra/lib/sor.sh), never here.
 # Both overrides are taken FIRST and the file is read only when one is
@@ -104,7 +107,11 @@ MIRROR_URL="${_mirror_url:-${BOSS_MIRROR_URL}.git}"
 # deleted, two minutes and one train later; publish/2026-09-08 survived
 # because it also existed on the forge. So the snapshot goes to the forge
 # FIRST, under the same branch name, and the mirror carries it from
-# there. This verb runs as root under the ops-runner, and a root push
+# there. Since backlog 21d54f4a (2026-09-26) that mirror is gone: the
+# forge converge's infra/forge/offsite-push.sh pushes main and publish/*
+# to the same fork with a plain push that neither forces nor prunes, and
+# deleted the Forgejo push mirror. The forge-first push stays, so the
+# forge holds every snapshot it published. This verb runs as root under the ops-runner, and a root push
 # into Forgejo's repository would leave root-owned objects the forge's
 # own user cannot collect — so the push runs as the host user whose
 # login shell carries the forge credential helper (the converge's own
@@ -115,16 +122,23 @@ MIRROR_URL="${_mirror_url:-${BOSS_MIRROR_URL}.git}"
 # /etc/boss/sor.env (infra/lib/sor.sh) with the product repository's
 # path — the same owner every image repo lives under.
 # THE CREDENTIAL IS THE CONVERGE'S OWN. The push runs as $FORGE_PUSH_AS
-# over Forgejo's HTTP, and that user has no credential helper: measured
-# 2026-09-19 04:55Z on ops-request 3d9d5f58 (the second approved publish)
-# — `could not read Username for 'http://10.20.0.15:3000'` after the
-# ownership refusal of the first was fixed. What the converge fetches
-# through is the checkout's `forgejo` remote, whose URL carries the
-# credential as userinfo (cluster-deploy-lib.sh derives every tenant URL
-# from it, redacting it in every message). So with no BOSS_FORGE_PUSH_URL
-# the push target is that remote's URL, read AS THE OWNER (the checkout
-# is theirs); the bare sor.env URL is the fallback only when the checkout
-# has no such remote, and the userinfo never reaches a message.
+# over Forgejo's HTTP. Measured 2026-09-19 04:55Z on ops-request 3d9d5f58
+# (the second approved publish): that user then had NO credential helper
+# — `could not read Username for 'http://10.20.0.15:3000'` — and the
+# converge's credential rode the checkout's `forgejo` remote URL as
+# userinfo, so the push target became that remote's URL, read AS THE
+# OWNER. That shape is the one that leaked (design 1c90d183, backlog
+# c4cbc6b5: a git error printed the URL into the forge-converge
+# journal). Since then the credential is a 0600 file of the owner's
+# behind a git credential helper in the owner's GLOBAL config, scoped to
+# the forge's URL, and forge-converge's deposit (credential-deposit.sh)
+# strips the remote's userinfo once that helper authenticates. So the
+# URL read here carries no credential; the push authenticates because
+# it runs as the owner, whose helper answers for the forge. The URL is
+# still the remote's — the one the converge fetches through — and the
+# bare sor.env URL is the fallback only when the checkout has no such
+# remote. A remote that still carries userinfo (a host the deposit has
+# not converted) is pushed to as it stands and redacted in every message.
 FORGE_PUSH_AS="${BOSS_FORGE_PUSH_AS-david}"
 FORGE_CHECKOUT="${BOSS_FORGE_CHECKOUT:-/home/david/boss}"
 redact_url() { sed -E 's#://[^/@[:space:]]+@#://<redacted>@#g'; }
@@ -163,86 +177,13 @@ say() { echo "$me: $*"; }
 refuse() { echo "$me: REFUSED — $*" >&2; exit 2; }
 fail() { echo "$me: FAILED — $*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------
-# WHERE THE FORGE REPOSITORY IS — derived from the thing that declares
-# it, not asserted by this file.
-# ---------------------------------------------------------------------
-# Until 2026-09-11 this was one hardcoded default,
-# /opt/forgejo/data/git/repositories/david/boss.git, and that string
-# appeared EXACTLY ONCE in the tree — here — with the only other
-# references being test overrides that substitute a tmpdir. So it had
-# never been run against the real host, and the verb's real run had
-# never succeeded: ops-request 04975694 ran `--check` on the forge and
-# the repository path was its one and only failure (backlog ed84b5d9).
-#
-# Forgejo runs on that host as a container (codeberg.org/forgejo/forgejo
-# :16.0.2, measured on ops-request aa0118a6, 2026-09-11) and its compose
-# file DECLARES which host directory is mounted at the container's
-# /data. That declaration is the one definition of where the
-# repositories live, so read it (CLAUDE.md §9a: one definition, never a
-# second copy in a shell default). Inside /data, the repository root is
-# Forgejo's OWN `[repository] ROOT` from app.ini when that is readable;
-# git/repositories is only the image's default.
-#
-# Every layer is reported by --check, labelled with where it came from,
-# so the next reader never has to guess which one answered.
-# BOSS_FORGE_REPO_PATH overrides the lot.
-
-# The host directory bound to the container's /data. Compose's short
-# syntax (`- ./data:/data[:ro]`) and long syntax (`source:`/`target:`)
-# both appear in Forgejo's published examples, so both are read. A NAMED
-# volume (`forgejo-data:/data`) is not a host path and is declined.
-compose_data_dir() {
-    local compose="$1" here host
-    [ -r "$compose" ] || return 1
-    here=$(cd "$(dirname "$compose")" 2>/dev/null && pwd) || return 1
-    host=$(sed -n -E 's@^[[:space:]]*-[[:space:]]*"?([^":[:space:]]+):/data(:[a-zA-Z,]+)?"?[[:space:]]*$@\1@p' "$compose" | sed -n 1p)
-    if [ -z "$host" ]; then
-        host=$(awk '
-            /^[[:space:]]*-?[[:space:]]*source:[[:space:]]*[^[:space:]]+[[:space:]]*$/ {
-                s = $NF; gsub(/"/, "", s)
-            }
-            /^[[:space:]]*target:[[:space:]]*\/data[[:space:]]*$/ {
-                if (s != "") { print s; exit }
-            }' "$compose")
-    fi
-    case "$host" in
-        /*)       printf '%s\n' "$host" ;;
-        ./*|../*) printf '%s\n' "$here/${host#./}" ;;
-        *)        return 1 ;;
-    esac
-}
-
-# Forgejo's own [repository] ROOT, read off app.ini under the data dir
-# and translated from the container's /data to the host directory. Only
-# the [repository] section's ROOT — app.ini has other ROOT-ish keys.
-forge_repo_root() {
-    local data="$1" ini root
-    ini="$data/gitea/conf/app.ini"
-    if [ -r "$ini" ]; then
-        root=$(awk '
-            /^[[:space:]]*\[/ { sec = $0 }
-            sec ~ /^[[:space:]]*\[repository\]/ && /^[[:space:]]*ROOT[[:space:]]*=/ {
-                sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit
-            }' "$ini")
-        case "$root" in
-            /data/*) printf '%s\n' "$data${root#/data}"; return 0 ;;
-        esac
-    fi
-    printf '%s\n' "$data/git/repositories"
-}
-
-if [ -n "${BOSS_FORGE_REPO_PATH:-}" ]; then
-    FORGE_REPO="$BOSS_FORGE_REPO_PATH"
-    FORGE_REPO_FROM="BOSS_FORGE_REPO_PATH in the environment"
-elif FORGE_DATA=$(compose_data_dir "$FORGE_COMPOSE"); then
-    FORGE_REPO_ROOT=$(forge_repo_root "$FORGE_DATA")
-    FORGE_REPO="$FORGE_REPO_ROOT/$FORGE_REPO_SLUG.git"
-    FORGE_REPO_FROM="derived: $FORGE_COMPOSE mounts $FORGE_DATA at the container's /data, repository root $FORGE_REPO_ROOT, slug $FORGE_REPO_SLUG"
-else
-    FORGE_REPO="$FORGE_DATA_FALLBACK/git/repositories/$FORGE_REPO_SLUG.git"
-    FORGE_REPO_FROM="fallback — $FORGE_COMPOSE is not readable, so the host's /data mount could not be read and this path is a GUESS at the image default; name the real one with BOSS_FORGE_REPO_PATH"
-fi
+# WHERE THE FORGE REPOSITORY IS — derived from the compose file that
+# declares it, in the one definition every reader of the repository by
+# path shares (moved out of this file 2026-09-26, backlog 21d54f4a,
+# when offsite-push.sh became the second reader). Sets FORGE_REPO and
+# FORGE_REPO_FROM; its header carries the history.
+# shellcheck source=infra/forge/forge-repo-path.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/forge-repo-path.sh"
 
 # EVERY READ OF THE FORGE REPOSITORY GOES THROUGH THIS ONE CHANNEL,
 # --check and the run alike, so --check can never pass on a repository
@@ -479,6 +420,21 @@ if [ "${1:-}" = "--measure" ]; then
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     [ -w "$STATE_DIR" ] || refuse "state dir $STATE_DIR is not writable (BOSS_PUBLISH_STATE_DIR)"
 
+    # 0. THE PULL REQUESTS' STATE, ASKED OF GITHUB (backlog a5d4322c).
+    #    On 2026-09-22 the publish region called #239 open for 86 hours
+    #    and itself TROUBLED over it; GitHub said #239 had merged three
+    #    days earlier. Nothing in the pipeline had ever asked. It runs
+    #    BEFORE the open-packet lookup below because a publish packet
+    #    closes at judge-checks, long before its PR merges — the PRs to
+    #    ask about are on closed packets. The pass itself lives in
+    #    publish-pr-state.sh, one definition shared with
+    #    read-publish-checks.sh, which asks it every fifteen minutes
+    #    (backlog 663589cd: once a day left a closed PR alarming for 22h).
+    GITHUB_API="${BOSS_GITHUB_API:-https://api.github.com}"
+    # shellcheck source=infra/forge/publish-pr-state.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/publish-pr-state.sh"
+    publish_pr_states "publish-github-pr --measure"
+
     # 1. The packet. ANY open publish-to-github packet, at whatever step
     #    it is held — unlike a publish, which needs open-pr ready. One
     #    mirror, one open packet (the daily rule's guard), so the first
@@ -600,7 +556,7 @@ check_inputs || refuse "inputs incomplete (see above); nothing was fetched or pu
 # 1. The packet. One mirror, one open publish packet (149's guard), and
 #    its open-pr must be ready or active — a rule fired on readiness.
 if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
-        "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20" > "$workdir/jobs" 2> "$workdir/err"; then
+        "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
 fi
 target=$(jq -c '
@@ -752,12 +708,12 @@ chmod -R a+rX "$CLONE" 2>/dev/null || true
 forge_push_cmd="git -c 'safe.directory=$CLONE' -C '$CLONE' push -q --force '$FORGE_PUSH_URL' '$snapshot:refs/heads/$BRANCH'"
 if [ -n "$FORGE_PUSH_AS" ]; then
     runuser -l "$FORGE_PUSH_AS" -c "$forge_push_cmd" 2>"$workdir/err" \
-        || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN) as $FORGE_PUSH_AS: $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' '). Without it on the forge, the push mirror prunes the PR's head at the next train"
-    say "pushed publish/${BRANCH#publish/} to the forge as $FORGE_PUSH_AS ($FORGE_PUSH_URL_SHOWN) — the mirror carries it"
+        || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN) as $FORGE_PUSH_AS: $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' '). Without it on the forge, the off-site push (offsite-push.sh) cannot carry it"
+    say "pushed publish/${BRANCH#publish/} to the forge as $FORGE_PUSH_AS ($FORGE_PUSH_URL_SHOWN) — the off-site push carries it too"
 else
     bash -c "$forge_push_cmd" 2>"$workdir/err" \
         || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN): $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' ')"
-    say "pushed publish/${BRANCH#publish/} to the forge ($FORGE_PUSH_URL_SHOWN) — the mirror carries it"
+    say "pushed publish/${BRANCH#publish/} to the forge ($FORGE_PUSH_URL_SHOWN) — the off-site push carries it too"
 fi
 
 g -c "credential.helper=$helper" push -q --force fork "$snapshot:refs/heads/$BRANCH" 2>"$workdir/err" \
@@ -776,14 +732,103 @@ else
     say "opened $pr_url"
 fi
 
+# 4b. ONE PULL REQUEST AT A TIME (backlog d4bfe548, David 2026-09-24).
+#     Every snapshot's parent is the mirror's main, which moves only
+#     when David merges, so today's PR CONTAINS every older open one.
+#     Measured 04:05Z that day: #242 (packet d2967a9c, closed
+#     `pr-opened`) still open on GitHub while #243 carried all of it and
+#     more, and #239-#242 had all stood open at once — four PRs to read
+#     where one said everything. So each OLDER open `publish/<date>` PR
+#     from our fork is closed with a comment naming today's, AFTER
+#     today's is open. Only our fork's heads, only `publish/` dates
+#     sorting before today's: a newer PR, somebody else's branch, or a
+#     non-publish PR from the fork is never ours to close.
+#
+#     Order, for a re-run: the older packet is annotated FIRST
+#     (`pr_superseded`, the intent), then the PR closed, then GitHub
+#     read back and ITS answer written as `pr_state` (the effect — the
+#     same key and shape `--measure` writes, which the publish region
+#     reads). Any failure stops the run before open-pr completes, so a
+#     re-run reuses today's PR and meets whatever is still open. A PR no
+#     packet recorded is closed all the same and said so by URL.
+gh_t pr list --repo "$MIRROR_SLUG" --state open --limit 100 \
+        --json number,url,headRefName,headRepositoryOwner > "$workdir/open-prs" 2>"$workdir/err" \
+    || fail "the PR is open at $pr_url, but listing the mirror's open pull requests failed — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' '); open-pr on ${job_id:0:8} stays ready and a re-run reuses the PR"
+jq_doc_file "$workdir/open-prs" && jq -e 'type == "array"' "$workdir/open-prs" > /dev/null 2>&1 \
+    || fail "the PR is open at $pr_url, but gh answered the open-PR listing with no list — nothing older was read, so nothing was closed; open-pr on ${job_id:0:8} stays ready"
+jq -c --arg owner "$FORK_OWNER" --arg branch "$BRANCH" --arg url "$pr_url" '
+    .[] | select(((.headRepositoryOwner.login // "") | ascii_downcase) == ($owner | ascii_downcase))
+        | select((.headRefName // "") | startswith("publish/"))
+        | select(.headRefName < $branch and .url != $url)
+        | {number, url, head: .headRefName}' "$workdir/open-prs" > "$workdir/older" \
+    || fail "the open-PR listing could not be read as pull requests"
+: > "$workdir/superseded"
+if [ -s "$workdir/older" ]; then
+    curl -fsS -H "x-boss-user: $BOSS_USER" \
+            "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/published" 2>"$workdir/err" \
+        || fail "jobs API unreachable at $BASE while recording superseded PRs — $(cat "$workdir/err"); nothing older was closed"
+    while IFS= read -r row; do
+        old_n=$(printf '%s' "$row" | jq -r '.number')
+        old_url=$(printf '%s' "$row" | jq -r '.url')
+        old_head=$(printf '%s' "$row" | jq -r '.head')
+        old_job=$(jq -r --arg url "$old_url" 'first((if type == "object" and has("data") then .data else . end)
+            | .[] | select(any((.steps // [])[]; .spec_slug == "open-pr" and (.metadata.pr_url // "") == $url))
+            | .id) // empty' "$workdir/published")
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        if [ -n "$old_job" ]; then
+            jq -n --arg old "$old_url" --arg new "$pr_url" --arg job "$job_id" --arg ts "$ts" \
+                '{pr_superseded: {pr_url: $old, by_pr_url: $new, by_packet: $job, at: $ts,
+                                  by: "publish-github-pr"}}' > "$workdir/sup"
+            curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+                    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                    --data-binary @"$workdir/sup" \
+                    "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
+                || fail "recording on ${old_job:0:8} that $pr_url supersedes $old_url failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); $old_url was not closed"
+        fi
+        gh_t pr close "$old_n" --repo "$MIRROR_SLUG" \
+                --comment "Superseded by $pr_url — today's snapshot of forge main, which carries everything in this one ($old_head) and every commit since. Closed by machine (BOSS publish-to-github, ops verb publish-github-pr, packet $job_id); the one PR to merge is the newest." \
+                > /dev/null 2>"$workdir/err" \
+            || fail "closing $old_url as superseded by $pr_url — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        # A close is a claim until GitHub is read saying so.
+        gh_t api "repos/$MIRROR_SLUG/pulls/$old_n" > "$workdir/closed" 2>"$workdir/err" \
+            || fail "asked GitHub to close $old_url, and it could not be read back — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        jq_doc_file "$workdir/closed" \
+            || fail "asked GitHub to close $old_url, and the read-back answered nothing parseable"
+        old_state=$(jq -r '.state // "no state"' "$workdir/closed")
+        [ "$old_state" = "closed" ] \
+            || fail "asked GitHub to close $old_url as superseded by $pr_url, and it still reads $old_state"
+        if [ -n "$old_job" ]; then
+            # `unmerged_reason`: a closed-unmerged publish says why
+            # (backlog 663589cd), the same key publish-pr-state.sh writes.
+            jq -c --arg url "$old_url" --arg new "$pr_url" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+                {pr_state: {pr_url: $url, number, state, merged: (.merged == true),
+                            merged_at, closed_at, read_at: $ts,
+                            read_by: "publish-github-pr (superseded)",
+                            unmerged_reason: "superseded by \($new)"}}' \
+                "$workdir/closed" > "$workdir/pr-state"
+            curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+                    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                    --data-binary @"$workdir/pr-state" \
+                    "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
+                || fail "$old_url is closed on GitHub, but writing its state onto ${old_job:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+            say "superseded $old_url ($old_head) — closed on GitHub, recorded on ${old_job:0:8}"
+        else
+            say "superseded $old_url ($old_head) — closed on GitHub; no publish packet recorded it, so the close comment is its only record"
+        fi
+        printf '%s\n' "$old_url" >> "$workdir/superseded"
+    done < "$workdir/older"
+fi
+
 # 5. Complete open-pr with pr_url. Merge, never replace (the
 #    ops-runner's rule): PUT swaps metadata wholesale.
 printf '%s' "$target" | jq -c --arg url "$pr_url" --arg snap "$snapshot" \
-        --arg fh "$forge_head" --arg mh "$mirror_head" --arg br "$FORK_OWNER:$BRANCH" '
+        --arg fh "$forge_head" --arg mh "$mirror_head" --arg br "$FORK_OWNER:$BRANCH" \
+        --rawfile sup "$workdir/superseded" '
     {status: "completed",
      metadata: ((.step.metadata // {})
                 + {pr_url: $url, snapshot_commit: $snap, forge_head: $fh,
-                   mirror_head: $mh, head: $br, published_by: "publish-github-pr"})}' \
+                   mirror_head: $mh, head: $br, published_by: "publish-github-pr",
+                   superseded_prs: ($sup | split("\n") | map(select(. != "")))})}' \
     > "$workdir/payload"
 if ! curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
         ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \

@@ -26,6 +26,11 @@ pub struct StepEvent<'a> {
     /// STRONGER routing signal than a role — a role says someone like
     /// you should do this, an assignee says you specifically.
     pub assignee_id: Option<&'a str>,
+    /// The parent job's owner, when the event names one — `step.done`
+    /// carries it (`job_owner_id`) so a wait-is-over signal reaches the
+    /// person waiting on the packet when the step names no role
+    /// (backlog 58f0b536). `""` and absent both read as `None`.
+    pub job_owner_id: Option<&'a str>,
     pub metadata: &'a serde_json::Map<String, Value>,
 }
 
@@ -60,6 +65,10 @@ impl<'a> StepEvent<'a> {
             .get("assignee_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
+        let job_owner_id = obj
+            .get("job_owner_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let completed_on = obj
             .get("completed_on")
             .and_then(|v| v.as_str())
@@ -79,6 +88,7 @@ impl<'a> StepEvent<'a> {
             subject_id,
             completed_on,
             assignee_id,
+            job_owner_id,
             metadata,
         })
     }
@@ -433,6 +443,52 @@ pub(crate) fn rows_or_refuse<T: serde::de::DeserializeOwned>(
     serde_json::from_value(rows.clone()).map_err(|e| format!("{what}: rows not in shape: {e}"))
 }
 
+/// The one row a single-row read answered, or a refusal naming the
+/// reading and what the body carried instead — the single-row
+/// neighbour of [`rows_or_refuse`], and the one place this crate
+/// decides what such a body means.
+///
+/// WHY THIS EXISTS (backlog f2eac973). Seven reads spelled
+/// `.get("data").cloned().unwrap_or(job)`: unwrap an envelope, else take
+/// the body. Measured against the servers, no envelope is ever sent —
+/// `GET /api/jobs/{id}` answers a flattened `JobDetail` and `GET
+/// /api/credentials/{id}` a bare `CredentialRow` — so the hedge never
+/// fired and its fallback was the only live path: ANY 200 body was the
+/// row. `maintenance.sweep.inspect` and `dns.observe` then failed a kind
+/// check on it and returned `Ok(())`, a ready step skipped without a
+/// word. The helper therefore does not unwrap an envelope either (that
+/// would be the same guess, kept); it reads the row bare and requires
+/// the one field every such row carries, a non-empty string `id`. An
+/// envelope, an error body, `null` or a list all refuse, and the
+/// refusal lists the body's top-level keys so the next reader does not
+/// have to re-fetch it to learn what came back.
+///
+/// The refusal is a `String` for the same reason as `rows_or_refuse`:
+/// the caller picks the class, and at every current site that is
+/// `HandlerError::Downstream` — a bad answer from the far side, which a
+/// redelivery can outlive.
+pub(crate) fn row_or_refuse(body: Value, what: &str) -> Result<Value, String> {
+    if body
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Ok(body);
+    }
+    let carried = match &body {
+        Value::Object(m) => format!(
+            "keys [{}]",
+            m.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Array(_) => "a list".to_string(),
+        Value::Null => "null".to_string(),
+        _ => "a scalar".to_string(),
+    };
+    Err(format!(
+        "{what} answered no row (no string `id`; the body carried {carried})"
+    ))
+}
+
 /// Every open Job of `kind`, steps inline, paged on the list's `total`
 /// so a packet sorted past one page is still found — a capped page is
 /// a false negative that grows with the board's age.
@@ -460,17 +516,45 @@ pub(crate) async fn open_jobs(
     kind: Option<&str>,
     rule_name: &str,
 ) -> Result<Vec<Value>, HandlerError> {
-    const PAGE: usize = 500;
     let kind_q = match kind {
         Some(k) => format!("kind={k}&"),
         None => String::new(),
     };
+    jobs_where(
+        client,
+        jobs_base,
+        &format!("{kind_q}status=open"),
+        rule_name,
+    )
+    .await
+}
+
+/// The same paged walk over any `/api/jobs` filter — `filter` is the
+/// query string without `limit`/`offset`. The open board is one filter
+/// of it; the owed-proof obligation reads CLOSED cars by the key they
+/// carry (`kind=ship-a-change&metadata_has=proof_owed`, b9005734), which
+/// no open-only walk can reach.
+///
+/// Every row comes back with its steps WHOLE (`full=true`). The list
+/// is going slim by default, a step's `metadata` only when asked
+/// (backlog 9b473d4a), and the walk's callers read it off the listed
+/// rows — the claimed step's `agent_model`, the matched field, the
+/// triage disposition a retraction names, a decision's content — so
+/// one flag here keeps the "steps inline" this crate's doc promises,
+/// for every caller.
+pub(crate) async fn jobs_where(
+    client: &reqwest::Client,
+    jobs_base: &str,
+    filter: &str,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    const PAGE: usize = 500;
     let mut rows: Vec<Value> = Vec::new();
     loop {
         let body = get_json(
             client,
             &format!(
-                "{}/api/jobs?{kind_q}status=open&limit={PAGE}&offset={}",
+                "{}/api/jobs?{filter}&full=true&limit={PAGE}&offset={}",
                 jobs_base.trim_end_matches('/'),
                 rows.len()
             ),
@@ -528,35 +612,268 @@ pub(crate) async fn write_json(
     Ok(())
 }
 
+/// The writes that complete step `sid` on packet `jid` carrying
+/// `fields`, in order: the fields through the step's MERGE door, then
+/// the status alone through the step PUT. Paths only — the caller
+/// prefixes its base. Empty `fields` is the flip alone. Pure, so the
+/// shape is pinned without a socket.
+///
+/// WHY TWO WRITES AND NOT THE ONE PUT EVERY HANDLER HERE USED TO SEND
+/// (backlog e39a9d2a, stage 2 of design 93d2bddb). A handler read the
+/// step, merged its own keys into what it read, and PUT `{status,
+/// metadata}` back. The step PUT replaces metadata wholesale, so that
+/// read-merge-write is correct only while nothing writes the step
+/// between the handler's read and its PUT: stage 1 refuses such a PUT
+/// 409 when it omits a key someone added meanwhile, and David's decided
+/// end state refuses ANY metadata body on the PUT — the tighten is one
+/// block in `update_step`, waiting on writers like these. The merge
+/// door lands the keys against the row as it stands, so it can neither
+/// race nor shed a key it does not name, and a handler no longer needs
+/// the step's metadata at all to write its own. It goes FIRST because
+/// required-at-done fields are judged when the step flips; if the flip
+/// is then refused the step stays open carrying the fields, and a
+/// redelivery merges the same keys again — the outcome a refused PUT
+/// left. The same shape as `boss_jobs::car::StepWrite` (the auto-park
+/// path) and boss-cli's `train::step_completion_writes`.
+pub(crate) fn step_completion_writes(
+    jid: &str,
+    sid: &str,
+    fields: serde_json::Map<String, Value>,
+) -> Vec<(reqwest::Method, String, Value)> {
+    let path = format!("/api/jobs/{jid}/steps/{sid}");
+    let merge = (!fields.is_empty()).then(|| {
+        (
+            reqwest::Method::PATCH,
+            format!("{path}/metadata"),
+            Value::Object(fields),
+        )
+    });
+    merge
+        .into_iter()
+        .chain(std::iter::once((
+            reqwest::Method::PUT,
+            path,
+            serde_json::json!({ "status": "completed" }),
+        )))
+        .collect()
+}
+
+/// Complete step `sid` on packet `jid` with `fields`: the
+/// [`step_completion_writes`], each through [`write_json`] against
+/// `base`, stopping at the first refusal.
+pub(crate) async fn complete_step(
+    client: &reqwest::Client,
+    base: &str,
+    jid: &str,
+    sid: &str,
+    fields: serde_json::Map<String, Value>,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    for (method, path, body) in step_completion_writes(jid, sid, fields) {
+        write_json(client, method, &format!("{base}{path}"), &body, rule_name).await?;
+    }
+    Ok(())
+}
+
 /// The step a machine completes to close a `backlog-item` alarm it
 /// raised. The kind routes on `triage.disposition`, and `stale` is the
 /// terminal whose title is literally "Closed — the claim no longer
 /// holds" (infra/platform/workflows/backlog-item.toml).
 pub(crate) const TRIAGE_SLUG: &str = "triage";
 
-/// The `triage` step of one alarm packet, as (id, existing metadata).
+/// The id of the `triage` step of one alarm packet.
 ///
 /// Lived in `cadence_silence` until `estate.recover` closed alarms the
 /// same way (backlog ef421cd3) — one definition of "the step that
-/// closes an alarm", not a second copy (CLAUDE.md §9a). The existing
-/// metadata rides back because PUT on a step REPLACES top-level
-/// metadata, and `authority_role` living there is what keeps the step
-/// gated.
-pub(crate) fn triage_step(job: &Value) -> Option<(String, serde_json::Map<String, Value>)> {
+/// closes an alarm", not a second copy (CLAUDE.md §9a). It used to hand
+/// back the step's metadata too, for a completion PUT that replaced it
+/// wholesale; a completion now merges its own keys through the step
+/// merge door ([`complete_step`], e39a9d2a), so nothing needs it.
+pub(crate) fn triage_step(job: &Value) -> Option<String> {
     job.get("steps")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(TRIAGE_SLUG))
-        .and_then(|s| {
-            let id = s.get("id").and_then(Value::as_str)?.to_string();
-            let meta = s
-                .get("metadata")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            Some((id, meta))
-        })
+        .and_then(|s| s.get("id").and_then(Value::as_str).map(str::to_string))
+}
+
+/// The routed steps a machine may complete to withdraw an alarm once a
+/// person has triaged it — the two whose fields carry a `stale`
+/// disposition (infra/platform/workflows/backlog-item.toml: `measure`
+/// since 2802ba8c, `build` since 6c114a23). The design route has none:
+/// `draft-design` needs a design id and `design-review` is a decision.
+const WITHDRAWING_SLUGS: [&str; 2] = ["measure", "build"];
+
+/// How a machine withdraws an alarm it raised once the condition has
+/// cleared (backlog a2d8bad3).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Retraction {
+    /// Complete this step with `disposition = stale`, through
+    /// [`complete_step`] — the step's own keys are not carried, because
+    /// the merge door keeps every key it is not sent (e39a9d2a).
+    Complete { slug: String, step_id: String },
+    /// No step the machine may complete: say on the PACKET that the
+    /// condition cleared, and why it is still open.
+    Annotate { why_open: String },
+}
+
+/// THE step a recovered alarm withdraws at — one definition for every
+/// machine that closes its own alarm (CLAUDE.md §9a).
+///
+/// WHY IT IS NOT ALWAYS `triage` (backlog a2d8bad3). Both closers
+/// completed the triage step, which is right only while nobody has
+/// routed the alarm. Once a person triaged it, that step was already
+/// complete, the jobs API refused the PUT as a write to a terminal
+/// step, and the machine had no other exit: alarm a6a4ae18 (CADENCE
+/// SILENT: ops-request/github-mirror), routed to `build` on 2026-09-20,
+/// had its cadence back on 2026-09-21 and sat open with `build` ready,
+/// its measurement frozen at the raise, until a person closed it on
+/// 2026-09-23.
+///
+/// So the machine withdraws at the step the packet is WAITING ON:
+/// - `triage`, while it is open — unchanged;
+/// - a READY `measure` or `build`, the step the route opened, which
+///   carries `stale` for exactly this — the claim no longer holds;
+/// - otherwise it annotates. An ACTIVE step has an executor on it, and
+///   completing a dispatched run's step fires
+///   `agent-run-delivers-when-its-step-is-done`, which lands the run as
+///   `delivered` for work it did not deliver; the design route has no
+///   withdrawal at all. The executor, or the person deciding, reads the
+///   note and closes it — a machine alarm a human has touched can still
+///   tell the human it is over.
+///
+/// A human's route is not overridden by this: the `stale` completion is
+/// stamped `cleared_by`, which both raisers' settled-suppression reads
+/// as a machine clear, so a condition that returns re-raises instead of
+/// hiding behind the close — and a HUMAN's close still holds for its
+/// settle window, exactly as before.
+///
+/// `None` is a packet with no triage step, which is not an alarm this
+/// crate can judge.
+pub(crate) fn retraction(job: &Value) -> Option<Retraction> {
+    let steps: Vec<&Value> = job
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let slug_of = |s: &Value| {
+        s.get("spec_slug")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let status_of = |s: &Value| s.get("status").and_then(Value::as_str).map(str::to_string);
+    let triage_id = triage_step(job)?;
+    let triage = steps
+        .iter()
+        .find(|s| slug_of(s).as_deref() == Some(TRIAGE_SLUG))?;
+    // A triage with no status is read as open: the listing always
+    // carries one, and the older fixtures do not.
+    if !matches!(
+        status_of(triage).as_deref(),
+        Some("completed") | Some("skipped")
+    ) {
+        return Some(Retraction::Complete {
+            slug: TRIAGE_SLUG.to_string(),
+            step_id: triage_id,
+        });
+    }
+    let routed = triage
+        .pointer("/metadata/disposition")
+        .and_then(Value::as_str)
+        .unwrap_or("an unrecorded route");
+    for slug in WITHDRAWING_SLUGS {
+        let Some(step) = steps.iter().find(|s| slug_of(s).as_deref() == Some(slug)) else {
+            continue;
+        };
+        match status_of(step).as_deref() {
+            Some("ready") => {
+                return Some(Retraction::Complete {
+                    slug: slug.to_string(),
+                    step_id: step.get("id").and_then(Value::as_str)?.to_string(),
+                });
+            }
+            Some("active") => {
+                return Some(Retraction::Annotate {
+                    why_open: format!(
+                        "triage routed it to `{routed}` and `{slug}` is active — an executor \
+                         holds it, and the machine does not complete a step from under its \
+                         executor"
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    Some(Retraction::Annotate {
+        why_open: format!(
+            "triage routed it to `{routed}`, and no step that route has open carries a \
+             withdrawal the machine may complete"
+        ),
+    })
+}
+
+/// The fields that withdraw a recovered alarm at the step
+/// [`retraction`] names, for a machine that judged the condition from a
+/// reading: `stale` — the backlog-item terminal "the claim no longer
+/// holds" — with the evidence, who cleared it and when. ONLY these: they
+/// ride the step merge door ([`complete_step`]), which keeps every key
+/// the step holds (e39a9d2a).
+///
+/// One definition, since the queue alarm, the flight overdue and the
+/// agent-step overdue each carried the same body a copy apiece, each
+/// with the step's own metadata cloned in for a PUT that replaced it.
+pub(crate) fn withdrawal_fields(
+    evidence: &str,
+    cleared_by: &str,
+    at: &str,
+) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("disposition".into(), Value::String("stale".into()));
+    m.insert(
+        "evidence".into(),
+        Value::String(format!(
+            "{evidence} Closed by machine from the reading, not by judgement."
+        )),
+    );
+    m.insert("cleared_by".into(), Value::String(cleared_by.into()));
+    m.insert(RECOVERED_AT.into(), Value::String(at.into()));
+    m
+}
+
+/// The packet-metadata key a recovery is stamped under — the same key
+/// `estate.recover` has written onto the packets it closes since
+/// ef421cd3, so a reader asks one question of every alarm.
+pub(crate) const RECOVERED_AT: &str = "recovered_at";
+
+/// The merge that tells a person the condition is over when the machine
+/// may not close the packet itself ([`Retraction::Annotate`]).
+pub(crate) fn recovery_note(
+    evidence: &str,
+    cleared_by: &str,
+    recovered_at: &str,
+    why_open: &str,
+) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(RECOVERED_AT.into(), Value::String(recovered_at.into()));
+    m.insert("recovered_by".into(), Value::String(cleared_by.into()));
+    m.insert(
+        "recovery".into(),
+        Value::String(format!(
+            "RECOVERED — {evidence} Still open because {why_open}. The condition this alarm \
+             was raised for no longer holds; close it as `stale` unless the route it took is \
+             still wanted without it (backlog a2d8bad3)."
+        )),
+    );
+    m
+}
+
+/// The merge that withdraws a [`recovery_note`] when the condition comes
+/// back: `null` deletes a key on `PATCH /api/jobs/{id}/metadata`, and a
+/// packet whose condition returned must not go on saying RECOVERED.
+pub(crate) fn relapse_patch() -> Value {
+    serde_json::json!({RECOVERED_AT: null, "recovered_by": null, "recovery": null})
 }
 
 #[cfg(test)]
@@ -606,6 +923,44 @@ mod tests {
             .expect_err("a row out of shape refuses");
         assert!(why.contains("GET /api/things"), "{why}");
         assert!(why.contains("not in shape"), "{why}");
+    }
+
+    /// Backlog f2eac973 — the single-row neighbour of 833e2d0a. Every
+    /// single-row door these handlers read (`GET /api/jobs/{id}`, a
+    /// flattened `JobDetail`; `GET /api/credentials/{id}`, a bare
+    /// `CredentialRow`) answers the row BARE, so the old
+    /// `.get("data").cloned().unwrap_or(job)` hedged for an envelope no
+    /// server sends and its fallback was the only live path: any 200
+    /// body was read as the row, and a kind check then skipped it
+    /// silently. A row is what carries its `id`; everything else —
+    /// an error body, an envelope, null, a list — refuses and says
+    /// what it did carry.
+    #[test]
+    fn a_single_row_read_with_no_id_refuses_and_a_bare_row_is_the_answer() {
+        let job = json!({ "id": "j-1", "kind": "maintenance-sweep", "steps": [] });
+        assert_eq!(
+            row_or_refuse(job.clone(), "GET /api/jobs/j-1").expect("a bare row is the answer"),
+            job,
+            "the row comes back whole"
+        );
+        for dark in [
+            json!({ "error": "forbidden" }),
+            json!({ "data": { "id": "j-1" } }),
+            json!({ "id": "" }),
+            json!({ "id": 7 }),
+            json!(null),
+            json!([{ "id": "j-1" }]),
+        ] {
+            let why = row_or_refuse(dark.clone(), "GET /api/jobs/j-1")
+                .expect_err("a body with no row id is a refusal");
+            assert!(why.contains("GET /api/jobs/j-1"), "{why}");
+            assert!(why.contains("no row"), "{why}");
+        }
+        // The refusal names what the body DID carry, so the next
+        // reader does not re-derive it (CLAUDE.md §Diagnosis).
+        let why = row_or_refuse(json!({ "error": "forbidden" }), "GET /api/jobs/j-1")
+            .expect_err("refuses");
+        assert!(why.contains("error"), "{why}");
     }
 
     /// The judgement AT THE CONSUMING LAYER. `open_jobs` is the board
@@ -674,6 +1029,171 @@ mod tests {
         assert!(
             text.contains("a check that is not running"),
             "the floor's own sentence, stated here and not per handler: {text}"
+        );
+    }
+
+    /// A step as the jobs API lists it back, for the retraction tests.
+    fn step(slug: &str, status: &str, metadata: Value) -> Value {
+        json!({"id": format!("s-{slug}"), "spec_slug": slug, "status": status, "metadata": metadata})
+    }
+
+    fn alarm(steps: Vec<Value>) -> Value {
+        json!({"id": "alarm-1", "status": "open", "steps": steps})
+    }
+
+    /// Nobody has routed it: the machine withdraws it where it has
+    /// always withdrawn it, at `triage`. A fixture with no `status` at
+    /// all is read as open — the shape every pre-existing test uses.
+    #[test]
+    fn an_untriaged_alarm_is_withdrawn_at_its_triage_step() {
+        for triage in [
+            step(
+                "triage",
+                "ready",
+                json!({"authority_role": "platform-admin"}),
+            ),
+            step(
+                "triage",
+                "active",
+                json!({"authority_role": "platform-admin"}),
+            ),
+            json!({"id": "s-triage", "spec_slug": "triage", "metadata": {"authority_role": "platform-admin"}}),
+        ] {
+            let job = alarm(vec![step("filed", "completed", json!({})), triage]);
+            match retraction(&job) {
+                Some(Retraction::Complete { slug, step_id }) => {
+                    assert_eq!(slug, TRIAGE_SLUG);
+                    assert_eq!(step_id, "s-triage");
+                }
+                other => panic!("an untriaged alarm completes triage, got {other:?}"),
+            }
+        }
+    }
+
+    /// Backlog a2d8bad3 — THE WORKED EXAMPLE, a6a4ae18. The alarm was
+    /// triaged to `build` on 2026-09-20 and its cadence came back on
+    /// 2026-09-21; the sweep's only exit was the triage step, already
+    /// complete, so the jobs API refused the PUT and the alarm sat open
+    /// with `build` ready until a person closed it on 2026-09-23. The
+    /// step the packet is WAITING ON is `build`, and `build` carries a
+    /// `stale` disposition for exactly this — the claim no longer holds.
+    #[test]
+    fn an_alarm_routed_to_build_is_withdrawn_at_its_ready_build_step() {
+        let job = alarm(vec![
+            step("filed", "completed", json!({})),
+            step(
+                "triage",
+                "completed",
+                json!({"disposition": "build", "evidence": "routed by a human"}),
+            ),
+            step("measure", "skipped", json!({})),
+            step("draft-design", "skipped", json!({})),
+            step("design-review", "skipped", json!({})),
+            step(
+                "build",
+                "ready",
+                json!({"authority_role": "platform-admin", "agent_profile": "builder"}),
+            ),
+        ]);
+        match retraction(&job) {
+            Some(Retraction::Complete { slug, step_id }) => {
+                assert_eq!(slug, "build");
+                assert_eq!(step_id, "s-build");
+            }
+            other => panic!("a ready build is where the alarm withdraws, got {other:?}"),
+        }
+    }
+
+    /// The verify route withdraws at `measure`, which carries the same
+    /// `stale` disposition (2802ba8c).
+    #[test]
+    fn an_alarm_routed_to_verify_is_withdrawn_at_its_ready_measure_step() {
+        let job = alarm(vec![
+            step("triage", "completed", json!({"disposition": "verify"})),
+            step("measure", "ready", json!({})),
+            step("build", "skipped", json!({})),
+        ]);
+        assert!(matches!(
+            retraction(&job),
+            Some(Retraction::Complete { slug, .. }) if slug == "measure"
+        ));
+    }
+
+    /// An executor HOLDS an active build: completing it from under a
+    /// dispatched run fires `agent-run-delivers-when-its-step-is-done`
+    /// and lands the run as `delivered` for work it did not deliver. So
+    /// the machine does not complete it — it says on the packet that
+    /// the condition cleared, and the executor's verify-the-claim reads
+    /// that.
+    #[test]
+    fn a_build_an_executor_holds_is_annotated_not_completed() {
+        let job = alarm(vec![
+            step("triage", "completed", json!({"disposition": "build"})),
+            step("build", "active", json!({})),
+        ]);
+        match retraction(&job) {
+            Some(Retraction::Annotate { why_open }) => {
+                assert!(why_open.contains("`build`"), "{why_open}");
+                assert!(why_open.contains("active"), "{why_open}");
+            }
+            other => panic!("a held build is annotated, got {other:?}"),
+        }
+    }
+
+    /// The design route has no withdrawal on it: `draft-design` needs a
+    /// design id and `design-review` is a decision a person owns. The
+    /// machine completes neither, and tells them instead.
+    #[test]
+    fn a_design_route_is_annotated_because_no_step_on_it_can_withdraw() {
+        let job = alarm(vec![
+            step("triage", "completed", json!({"disposition": "design"})),
+            step("draft-design", "completed", json!({"design_id": "d-1"})),
+            step("design-review", "ready", json!({})),
+            step("build", "pending", json!({})),
+        ]);
+        match retraction(&job) {
+            Some(Retraction::Annotate { why_open }) => {
+                assert!(why_open.contains("design"), "{why_open}");
+            }
+            other => panic!("a design route is annotated, got {other:?}"),
+        }
+    }
+
+    /// No triage step is not an alarm this crate can judge.
+    #[test]
+    fn a_packet_with_no_triage_step_has_no_retraction() {
+        assert_eq!(
+            retraction(&alarm(vec![step("filed", "completed", json!({}))])),
+            None
+        );
+    }
+
+    /// The note says it is over and why the packet is still open, and
+    /// the relapse patch deletes exactly the keys the note wrote — a
+    /// packet whose condition came back must not go on saying
+    /// RECOVERED.
+    #[test]
+    fn the_recovery_note_and_its_relapse_patch_name_the_same_keys() {
+        let note = recovery_note(
+            "the cadence is arriving again",
+            "cadence.silence.sweep",
+            "2026-09-21T00:00:00+00:00",
+            "triage routed it to `design`",
+        );
+        assert_eq!(note[RECOVERED_AT], "2026-09-21T00:00:00+00:00");
+        assert_eq!(note["recovered_by"], "cadence.silence.sweep");
+        let text = note["recovery"].as_str().expect("a sentence");
+        assert!(text.contains("the cadence is arriving again"), "{text}");
+        assert!(text.contains("triage routed it to `design`"), "{text}");
+        let relapse = relapse_patch();
+        let relapse = relapse.as_object().expect("an object");
+        assert_eq!(
+            relapse.keys().collect::<Vec<_>>(),
+            note.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            relapse.values().all(Value::is_null),
+            "null deletes on PATCH"
         );
     }
 
@@ -751,8 +1271,18 @@ mod lane_pin {
              `\"input_channel\": super::common::lane_label(InputChannel::<lane>)` inside \
              an inline object."
         );
+        // Nine since `ops.queue.alarm` (a45b38c1), which files
+        // `ops_queue:<host>` stamped `Telemetry`; ten since
+        // `jobs.agent_step_overdue` (078ddcb0), whose alarm per late
+        // real-work step is stamped `Telemetry` too; eleven since
+        // `jobs.flight_overdue` (73c31776), whose stale-flight alarm is
+        // `Telemetry` for the same reason; twelve since the door alarm
+        // (`estate.alarm`'s `door_dark`, e6406701), stamped `Telemetry`
+        // like the estate alarms beside it; thirteen since `ops.judge`'s
+        // WATCH alarm (backlog 8d77d670), a watched unattended verb that
+        // did not do its job, stamped `PipelineFailure` like the chain's.
         assert_eq!(
-            filings, 8,
+            filings, 13,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \
@@ -774,5 +1304,42 @@ mod lane_pin {
         // A filer with nothing to keep still records the lane.
         let bare = with_lane(serde_json::Value::Null, InputChannel::PipelineFailure);
         assert_eq!(bare["input_channel"], "pipeline-failure");
+    }
+
+    /// Backlog e39a9d2a: a completion is the fields through the step
+    /// merge door FIRST (required-at-done fields are judged at the
+    /// flip), then a PUT whose body carries the status and nothing
+    /// else — the one form that survives the step PUT refusing any
+    /// metadata body.
+    #[test]
+    fn a_completion_merges_its_fields_then_flips_the_status_alone() {
+        use serde_json::json;
+        let mut fields = serde_json::Map::new();
+        fields.insert("disposition".into(), json!("stale"));
+        let writes = step_completion_writes("j1", "s1", fields);
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    reqwest::Method::PATCH,
+                    "/api/jobs/j1/steps/s1/metadata".to_string(),
+                    json!({ "disposition": "stale" }),
+                ),
+                (
+                    reqwest::Method::PUT,
+                    "/api/jobs/j1/steps/s1".to_string(),
+                    json!({ "status": "completed" }),
+                ),
+            ]
+        );
+        assert_eq!(
+            step_completion_writes("j1", "s1", serde_json::Map::new()),
+            vec![(
+                reqwest::Method::PUT,
+                "/api/jobs/j1/steps/s1".to_string(),
+                json!({ "status": "completed" }),
+            )],
+            "no fields is the flip alone — never an empty merge"
+        );
     }
 }

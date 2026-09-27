@@ -73,13 +73,22 @@ impl Subject {
 }
 
 /// Lifecycle status of a Job.
+///
+/// Four words: `draft` and `open` are live, `closed` and `cancelled`
+/// are terminal. `Blocked` and `PendingSignOff` were retired on
+/// 2026-09-24 (backlog 3c3dc8f3): nothing ever set either — a step
+/// paused on a dependency is a `Pending` step on an `Open` Job, and
+/// completion refuses an unsigned step — and on the day they went,
+/// 0 of 16,963 Jobs and 0 of 97,909 `jobs.job.*` audit events (the
+/// whole log, 2026-09-16 onward) carried either word. What they did
+/// do was render as two status filters that could only ever answer
+/// "No jobs match." A retired word now fails to deserialize, and the
+/// `jobs.status` CHECK refuses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobStatus {
     Draft,
     Open,
-    Blocked,
-    PendingSignOff,
     Closed,
     Cancelled,
 }
@@ -161,6 +170,27 @@ pub struct Job {
     pub status: JobStatus,
     pub priority: Priority,
     pub opened_on: NaiveDate,
+    /// The instant the packet was admitted — server-stamped at
+    /// `POST /api/jobs`, immutable afterwards (the adapters keep it
+    /// out of every UPDATE, the same way they keep `partition` out).
+    ///
+    /// `opened_on` is a DATE, so the finest honest answer it supports
+    /// is a whole day; every surface that asks "how long has this been
+    /// waiting" — the ops-runner's `oldest_wait_s`, dock wait and gate
+    /// duration on the region map, the overdue alarms, the silence
+    /// sweep — needs the instant. Until backlog 6c2eba00 that instant
+    /// was `metadata.opened_at`, written by whoever filed the packet:
+    /// a convention the doors happen to follow, absent on anything
+    /// filed by a caller that does not know it. The metadata stamp is
+    /// still written for the readers already on it; this is the field
+    /// that cannot be absent by accident.
+    ///
+    /// `None` on packets that predate the column and whose
+    /// `jobs.job.created` event the back-fill could not find. An
+    /// absent stamp is the honest answer there — a projection of the
+    /// log, never an invention (design f2cdff23, question `backfill`).
+    #[serde(default)]
+    pub opened_at: Option<chrono::DateTime<chrono::Utc>>,
     pub due_on: Option<NaiveDate>,
     pub closed_on: Option<NaiveDate>,
     pub metadata: serde_json::Value,
@@ -203,6 +233,11 @@ impl Job {
             status: JobStatus::Draft,
             priority,
             opened_on,
+            // Server-stamped at admission, not by a constructor: a
+            // `Job::new` in a sim or replay path has no admission
+            // instant to report, and inventing one here would be the
+            // habit this field replaces.
+            opened_at: None,
             due_on: None,
             closed_on: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
@@ -296,6 +331,59 @@ pub struct StepField {
     /// field authored before this existed already meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covers: Option<String>,
+    /// For an `array` field of `{anchor, …}` elements: the name of
+    /// another array field on the same step whose anchors an element
+    /// here may BIND, by carrying a key of that same name holding a list
+    /// of them. Checked at every write that touches either field (the
+    /// step merge door) and again at done: a bound anchor the other
+    /// field does not carry is refused, naming it. Registry data for the
+    /// relation design 26a89f11 decided — a design question binds the
+    /// exhibits it is asked about (`questions` binds `exhibits`), and a
+    /// binding to an exhibit nobody attached would render as a question
+    /// pointing at nothing. None (the default) means no binding, which is
+    /// what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binds: Option<String>,
+    /// For an `array` field: the most UTF-8 bytes any one STRING value of
+    /// an element may hold, checked at every write that touches the field
+    /// and again at done. A design exhibit's `html` rides inline in step
+    /// metadata up to a bound (design 26a89f11: 256 KB), and a bound
+    /// stated nowhere is a bound nobody holds. It measures the string, not
+    /// its JSON encoding, so the number an author reads off `ls -l` is the
+    /// number the refusal names. None (the default) means unbounded, which
+    /// is what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_value_max_bytes: Option<u64>,
+    /// For an `array` field: keys of which every element must carry
+    /// EXACTLY ONE, as a non-empty string — the "one of" twin of
+    /// `item_keys`, which names keys an element carries ALL of. Carrying
+    /// two is refused at every write that touches the field (a record
+    /// that says two things about one element is ambiguous whoever reads
+    /// it); carrying none is refused at done, the way a missing item key
+    /// is. Registry data for design 26a89f11's second arm: an exhibit is
+    /// `{anchor, title}` plus its bytes inline as `html` OR, over the
+    /// inline bound, a `file_ref` into the file store — never both, and
+    /// never neither. Empty (the default) means no such choice, which is
+    /// what every field authored before this existed already meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub item_one_of: Vec<String>,
+    /// The ONE party that may write this key while the step is open
+    /// (design f623e425, David 2026-09-25; backlog 6c9183de). A key a
+    /// human signs — an ops-request approve step's `plan`, `verb`,
+    /// `host`, `args`, `rendered_plan_sha256` — was writable by anyone
+    /// with Update on the step, so the passkey could be asked to sign
+    /// content the runner never rendered. A declared writer is a
+    /// credential PRINCIPAL (`runner:ops`), and the step doors admit a
+    /// change to the key only from a caller the server resolved from a
+    /// presented credential for that principal — never from the
+    /// self-asserted `x-boss-user` id, which every machine-door caller
+    /// can type (`field_writer` holds the rule). Registry data, so a
+    /// protocol adopts it by writing a row, never by a branch in the
+    /// step handler. None (the default) means any caller the policy
+    /// admits, which is what every field authored before this existed
+    /// already meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
 }
 
 /// Who supplies a step field's value — the enforcement point follows
@@ -387,6 +475,46 @@ pub struct SignOffStamp {
     /// stamps and on every stamp written before presence existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_nonce: Option<String>,
+    /// When the stamp DIED: the instant of the edit that took the shape
+    /// it signed off the step (design 87329a13, option C decided
+    /// 2026-09-25). A dead stamp stays on the step — it is the record of
+    /// what was signed — and never counts again, even if the content
+    /// comes back byte for byte: that A-B-A revived a withdrawn passkey
+    /// approval (backlog c085256d). Written by the server in the edit's
+    /// own write, never by a caller; absent on a live stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voided_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `jobs.step.stamps_invalidated` event that voided it — the
+    /// event lists this stamp, and the rebuild applies the void from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voided_by_event: Option<uuid::Uuid>,
+}
+
+impl SignOffStamp {
+    /// Whether `other` is this same stamp — the same act of signing,
+    /// told apart by everything the stamp recorded when it was made. A
+    /// void is carried from one copy of a stamp to another by this.
+    pub fn same_stamp(&self, other: &SignOffStamp) -> bool {
+        self.authority_id == other.authority_id
+            && self.role == other.role
+            && self.stamped_at == other.stamped_at
+            && self.shape_hash == other.shape_hash
+            && self.presence_nonce == other.presence_nonce
+    }
+}
+
+/// [`Step::apply_voids`] over a bare list of stamps — for a reader that
+/// holds a row's stamps without the rest of its step (the rebuild).
+pub fn apply_voids(stamps: &mut [SignOffStamp], from: &[SignOffStamp]) {
+    for st in stamps.iter_mut().filter(|st| st.voided_at.is_none()) {
+        if let Some(dead) = from
+            .iter()
+            .find(|d| d.voided_at.is_some() && d.same_stamp(st))
+        {
+            st.voided_at = dead.voided_at;
+            st.voided_by_event = dead.voided_by_event;
+        }
+    }
 }
 
 /// Hash of a step's completion-relevant content — what a sign-off
@@ -394,6 +522,18 @@ pub struct SignOffStamp {
 /// keys) so hashing is insertion-order independent. Fields that
 /// don't change what is being agreed to (status, assignee, sort
 /// order, plugin pin) are deliberately excluded.
+///
+/// A KEY IS WRITTEN JSON-ENCODED, as a value is (security review of
+/// backlog fd7090cc, 2026-09-24). It was written raw, so a key carrying
+/// `:` and `,` could spell its neighbours — `{"zz":1,"zzz":2}` and
+/// `{"zz:1,zzz":2}` hashed alike, and a stamp over one shape verified on
+/// the other. An encoded key ends where its closing quote does.
+/// infra/ops/ops-runner.sh computes this same hash in jq and is pinned
+/// equal to it by ops_runner_approval_sh.rs (CLAUDE.md §9a). Changing
+/// the form re-hashes every step, so a stamp taken on a still-open step
+/// before this landed no longer matches and must be taken again. The
+/// server never re-judges a completed step's stamps; the ops-runner
+/// does, on an approve step, but its approvals expire in ten minutes.
 pub fn step_shape_hash(title: &str, metadata: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
     fn canonical(v: &serde_json::Value, out: &mut Vec<u8>) {
@@ -403,7 +543,8 @@ pub fn step_shape_hash(title: &str, metadata: &serde_json::Value) -> String {
                 keys.sort();
                 out.push(b'{');
                 for k in keys {
-                    out.extend_from_slice(k.as_bytes());
+                    let encoded = serde_json::Value::String(k.clone()).to_string();
+                    out.extend_from_slice(encoded.as_bytes());
                     out.push(b':');
                     canonical(&m[k], out);
                     out.push(b',');
@@ -482,8 +623,10 @@ pub struct Step {
     pub fields: Vec<StepField>,
     /// Stamps collected so far. A stamp attests the step *in the
     /// shape it had when stamped* (`shape_hash`); completion counts
-    /// only stamps whose hash matches the current shape. Stale stamps
-    /// stay recorded — they are provenance, not validity.
+    /// only [`Step::live_stamps`] — never voided, on the current shape.
+    /// The edit that moves the shape voids every live stamp for good
+    /// (design 87329a13). Dead stamps stay recorded — they are
+    /// provenance, not validity.
     #[serde(default)]
     pub sign_offs: Vec<SignOffStamp>,
     #[serde(default)]
@@ -581,19 +724,85 @@ impl Step {
         self
     }
 
-    /// True when every required role has a stamp attesting the step's
-    /// *current* shape. Stale stamps (collected before a
-    /// later edit) don't count.
+    /// [`step_shape_hash`] of this step as it stands.
+    pub fn shape_hash(&self) -> String {
+        step_shape_hash(&self.title, &self.metadata)
+    }
+
+    /// THE ONE RULE for which stamps count (design 87329a13): a stamp is
+    /// live when it was never voided AND it attests the step's current
+    /// shape. The completion's sign-off contract, the 409 that names the
+    /// roles still owed, and the sign-off door's idempotent re-stamp all
+    /// read this, and nothing else decides it — one fact read in three
+    /// places was three chances to disagree (CLAUDE.md §9a).
+    ///
+    /// The void is what the shape compare alone could not say. Until
+    /// 2026-09-25 a stamp counted whenever its hash matched, so content
+    /// taken off the step and put back (A-B-A) revived a withdrawn
+    /// approval (backlog c085256d).
+    pub fn live_stamps(&self) -> impl Iterator<Item = &SignOffStamp> {
+        let current = self.shape_hash();
+        self.sign_offs
+            .iter()
+            .filter(move |st| st.voided_at.is_none() && st.shape_hash == current)
+    }
+
+    /// Every required role that holds no live stamp, in the order the
+    /// step requires them — the 409's `missing_or_stale_roles`.
+    pub fn roles_without_a_live_stamp(&self) -> Vec<&str> {
+        self.sign_offs_required
+            .iter()
+            .filter(|role| !self.live_stamps().any(|st| &st.role == *role))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// True when every required role holds a live stamp.
     pub fn sign_offs_satisfied(&self) -> bool {
-        if self.sign_offs_required.is_empty() {
-            return true;
+        self.roles_without_a_live_stamp().is_empty()
+    }
+
+    /// A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
+    /// 87329a13, option C). Called by every write that can move a
+    /// step's content, with the shape the step had before it: when the
+    /// shape moved, every stamp not already dead is voided — marked
+    /// `voided_at` / `voided_by_event`, never removed — and copies of
+    /// the stamps it voided are returned for the event that records it.
+    /// An unmoved shape voids nothing.
+    ///
+    /// EVERY stamp still alive, not only those on `shape_before`. Under
+    /// this rule a live stamp is always on the current shape, so the two
+    /// are the same set — except for a stamp written before the rule,
+    /// which a past edit left stale without killing. Voiding it too is
+    /// what that edit would have done, and leaving it alive would let a
+    /// later edit back to its shape revive it.
+    pub fn void_stamps_if_moved(
+        &mut self,
+        shape_before: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        by_event: uuid::Uuid,
+    ) -> Vec<SignOffStamp> {
+        if self.shape_hash() == shape_before {
+            return Vec::new();
         }
-        let current = step_shape_hash(&self.title, &self.metadata);
-        self.sign_offs_required.iter().all(|role| {
-            self.sign_offs
-                .iter()
-                .any(|st| &st.role == role && st.shape_hash == current)
-        })
+        self.sign_offs
+            .iter_mut()
+            .filter(|st| st.voided_at.is_none())
+            .map(|st| {
+                st.voided_at = Some(at);
+                st.voided_by_event = Some(by_event);
+                st.clone()
+            })
+            .collect()
+    }
+
+    /// Carry the voids `from` records onto this step's copies of the same
+    /// stamps. A void only ever lands; one this step already records is
+    /// kept as it is, and nothing is added, removed or revived — so a
+    /// write carrying a stale copy of the stamps cannot bring a dead one
+    /// back, and a replayed event cannot move a void it did not make.
+    pub fn apply_voids(&mut self, from: &[SignOffStamp]) {
+        apply_voids(&mut self.sign_offs, from);
     }
 
     pub fn with_blocked_by(mut self, blocked_by: Vec<StepId>) -> Self {
@@ -637,6 +846,39 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, back);
+    }
+
+    /// `opened_at` is a FIELD, not a filer habit (backlog 6c2eba00,
+    /// design f2cdff23). It is server-stamped at admission, so
+    /// `Job::new` leaves it absent; and it is `#[serde(default)]`, so
+    /// every `jobs.job.created` payload written before the promotion
+    /// still deserializes — a rebuild over an old slice must not fail,
+    /// and must not invent an instant nobody observed.
+    #[test]
+    fn job_opened_at_is_absent_until_something_stamps_it() {
+        let mut job = Job::new(
+            "test-kind",
+            Subject::new("asset", "sys-001"),
+            "Test job",
+            "emp-42",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 16).unwrap(),
+        );
+        assert_eq!(job.opened_at, None, "Job::new must not invent an instant");
+
+        let at = "2026-09-20T17:40:16.732718729Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        job.opened_at = Some(at);
+        let v = serde_json::to_value(&job).unwrap();
+        assert!(v.get("opened_at").is_some(), "the stamp rides the wire");
+        let back: Job = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.opened_at, Some(at), "sub-second resolution survives");
+
+        let mut pre = v;
+        pre.as_object_mut().unwrap().remove("opened_at");
+        let back: Job = serde_json::from_value(pre).unwrap();
+        assert_eq!(back.opened_at, None);
     }
 
     #[test]
@@ -725,12 +967,31 @@ mod tests {
 
     #[test]
     fn job_status_kebab_case() {
-        let s = JobStatus::PendingSignOff;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#""pending-sign-off""#);
+        for (s, wire) in [
+            (JobStatus::Draft, r#""draft""#),
+            (JobStatus::Open, r#""open""#),
+            (JobStatus::Closed, r#""closed""#),
+            (JobStatus::Cancelled, r#""cancelled""#),
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, wire);
+            let back: JobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+        }
+    }
 
-        let back: JobStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, JobStatus::PendingSignOff);
+    /// `blocked` and `pending-sign-off` were retired (backlog 3c3dc8f3):
+    /// no Job and no `jobs.job.*` event ever held either. A retired word
+    /// must be REFUSED where it arrives — a query parameter answers 400
+    /// naming the four live statuses — never read as some other status,
+    /// because a filter that silently widens or narrows is a wrong
+    /// answer that looks like a result.
+    #[test]
+    fn a_retired_job_status_is_refused_not_read_as_another() {
+        for retired in [r#""blocked""#, r#""pending-sign-off""#] {
+            let parsed = serde_json::from_str::<JobStatus>(retired);
+            assert!(parsed.is_err(), "{retired} still parses: {parsed:?}");
+        }
     }
 
     #[test]
@@ -791,6 +1052,30 @@ mod tests {
         assert_eq!(FilledBy::default(), FilledBy::Executor);
     }
 
+    /// `writer` (design f623e425): absent reads as no declared writer —
+    /// every field authored before it keeps its meaning and its bytes —
+    /// and a declared one survives the round trip the registry row and
+    /// the STEP_CREATED payload both take.
+    #[test]
+    fn step_field_writer_is_absent_by_default_and_round_trips() {
+        let f: StepField = serde_json::from_value(serde_json::json!({
+            "name": "plan",
+            "field_type": "string",
+        }))
+        .unwrap();
+        assert_eq!(f.writer, None);
+        assert!(serde_json::to_value(&f).unwrap().get("writer").is_none());
+
+        let declared = StepField {
+            writer: Some("runner:ops".into()),
+            ..f
+        };
+        let json = serde_json::to_value(&declared).unwrap();
+        assert_eq!(json["writer"], serde_json::json!("runner:ops"));
+        let back: StepField = serde_json::from_value(json).unwrap();
+        assert_eq!(back, declared);
+    }
+
     #[test]
     fn step_field_filled_by_round_trips_kebab_case() {
         let f = StepField {
@@ -800,6 +1085,10 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         };
         let json = serde_json::to_value(&f).unwrap();
         assert_eq!(json["filled_by"], serde_json::json!("filer"));
@@ -813,10 +1102,170 @@ mod tests {
             filled_by: FilledBy::Executor,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
             ..f
         };
         let json = serde_json::to_value(&exec).unwrap();
         assert_eq!(json["filled_by"], serde_json::json!("executor"));
+    }
+
+    /// `binds` and `item_value_max_bytes` (design 26a89f11, exhibits)
+    /// default to absent — every field authored before them reads as
+    /// unbound and unbounded — and round-trip when a protocol states
+    /// them, so a registry row carries the contract it was authored with.
+    #[test]
+    fn step_field_binds_and_value_bound_default_absent_and_round_trip() {
+        let bare: StepField = serde_json::from_value(serde_json::json!({
+            "name": "questions",
+            "field_type": "array",
+        }))
+        .unwrap();
+        assert_eq!(bare.binds, None);
+        assert_eq!(bare.item_value_max_bytes, None);
+        assert!(bare.item_one_of.is_empty());
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("binds").is_none() && json.get("item_value_max_bytes").is_none());
+        assert!(json.get("item_one_of").is_none());
+
+        let stated: StepField = serde_json::from_value(serde_json::json!({
+            "name": "exhibits",
+            "field_type": "array",
+            "binds": "other",
+            "item_value_max_bytes": 262144,
+            "item_one_of": ["html", "file_ref"],
+        }))
+        .unwrap();
+        assert_eq!(stated.binds.as_deref(), Some("other"));
+        assert_eq!(stated.item_value_max_bytes, Some(262_144));
+        assert_eq!(stated.item_one_of, vec!["html", "file_ref"]);
+        let back: StepField =
+            serde_json::from_value(serde_json::to_value(&stated).unwrap()).unwrap();
+        assert_eq!(back, stated);
+    }
+
+    fn stamped_step(meta: serde_json::Value) -> Step {
+        let mut s = Step::new(JobId::new(), "sign-off", "Approve", 0)
+            .with_sign_offs_required(vec!["cto".into()]);
+        s.metadata = meta;
+        s.sign_offs.push(SignOffStamp {
+            authority_id: "emp-a".into(),
+            role: "cto".into(),
+            stamped_at: chrono::Utc::now(),
+            shape_hash: s.shape_hash(),
+            assurance: Assurance::Presence,
+            presence_nonce: Some("n1".into()),
+            voided_at: None,
+            voided_by_event: None,
+        });
+        s
+    }
+
+    /// A-B-A (backlog c085256d, design 87329a13): the stamp dies when X
+    /// leaves the step and stays dead when X comes back — the shape
+    /// compare alone said it counted again.
+    #[test]
+    fn a_stamp_voided_by_a_shape_change_stays_dead_when_the_shape_returns() {
+        let x = serde_json::json!({"decision": "approved"});
+        let mut s = stamped_step(x.clone());
+        assert!(s.sign_offs_satisfied());
+        let before = s.shape_hash();
+        s.metadata = serde_json::json!({"decision": "changes-requested"});
+        let event = uuid::Uuid::new_v4();
+        let at = chrono::Utc::now();
+        let voided = s.void_stamps_if_moved(&before, at, event);
+        assert_eq!(voided.len(), 1);
+        assert_eq!(voided[0].voided_by_event, Some(event));
+        assert_eq!(s.sign_offs[0].voided_at, Some(at));
+        s.metadata = x;
+        assert_eq!(s.shape_hash(), before, "back on the signed shape");
+        assert!(!s.sign_offs_satisfied(), "a dead stamp does not count");
+        assert_eq!(s.roles_without_a_live_stamp(), vec!["cto"]);
+        assert_eq!(s.live_stamps().count(), 0);
+    }
+
+    /// An unmoved shape voids nothing, and a second move re-voids nothing
+    /// already dead — the first void is the one on record.
+    #[test]
+    fn only_a_moved_shape_voids_and_a_void_is_written_once() {
+        let mut s = stamped_step(serde_json::json!({"k": 1}));
+        let same = s.shape_hash();
+        assert!(
+            s.void_stamps_if_moved(&same, chrono::Utc::now(), uuid::Uuid::new_v4())
+                .is_empty()
+        );
+        let first = uuid::Uuid::new_v4();
+        s.metadata = serde_json::json!({"k": 2});
+        assert_eq!(
+            s.void_stamps_if_moved(&same, chrono::Utc::now(), first)
+                .len(),
+            1
+        );
+        let moved = s.shape_hash();
+        s.metadata = serde_json::json!({"k": 3});
+        assert!(
+            s.void_stamps_if_moved(&moved, chrono::Utc::now(), uuid::Uuid::new_v4())
+                .is_empty(),
+            "nothing left alive to void"
+        );
+        assert_eq!(s.sign_offs[0].voided_by_event, Some(first));
+    }
+
+    /// A stamp written before the rule, stale but never voided (its shape
+    /// is neither the old nor the new one), dies at the next move too —
+    /// otherwise an edit back to ITS shape would revive it.
+    #[test]
+    fn a_stale_stamp_from_before_the_rule_dies_at_the_next_move() {
+        let mut s = stamped_step(serde_json::json!({"k": 1}));
+        s.metadata = serde_json::json!({"k": 2});
+        let before = s.shape_hash();
+        s.metadata = serde_json::json!({"k": 3});
+        let voided = s.void_stamps_if_moved(&before, chrono::Utc::now(), uuid::Uuid::new_v4());
+        assert_eq!(voided.len(), 1, "{voided:?}");
+        s.metadata = serde_json::json!({"k": 1});
+        assert!(!s.sign_offs_satisfied());
+    }
+
+    /// Voids carry by identity and only ever land: a copy of the stamps
+    /// that predates the void cannot lift it, and an unrelated stamp is
+    /// untouched.
+    #[test]
+    fn apply_voids_lands_a_void_and_never_lifts_one() {
+        let mut row = stamped_step(serde_json::json!({"k": 1}));
+        let mut other = row.sign_offs[0].clone();
+        other.authority_id = "emp-b".into();
+        row.sign_offs.push(other);
+        let stale_copy = row.sign_offs.clone();
+
+        let mut dead = row.sign_offs[0].clone();
+        dead.voided_at = Some(chrono::Utc::now());
+        dead.voided_by_event = Some(uuid::Uuid::new_v4());
+        row.apply_voids(std::slice::from_ref(&dead));
+        assert_eq!(row.sign_offs[0].voided_at, dead.voided_at);
+        assert!(
+            row.sign_offs[1].voided_at.is_none(),
+            "another signer's stamp"
+        );
+
+        row.apply_voids(&stale_copy);
+        assert_eq!(
+            row.sign_offs[0].voided_at, dead.voided_at,
+            "a live copy lifts nothing"
+        );
+    }
+
+    /// A stamp written before the fields existed reads as live.
+    #[test]
+    fn a_stamp_without_void_fields_reads_as_live_and_serializes_without_them() {
+        let st: SignOffStamp = serde_json::from_value(serde_json::json!({
+            "authority_id": "emp-a", "role": "cto",
+            "stamped_at": "2026-09-25T07:00:00Z", "shape_hash": "h"
+        }))
+        .unwrap();
+        assert!(st.voided_at.is_none() && st.voided_by_event.is_none());
+        let back = serde_json::to_value(&st).unwrap();
+        assert!(back.get("voided_at").is_none() && back.get("voided_by_event").is_none());
     }
 
     #[test]
@@ -832,6 +1281,20 @@ mod tests {
         let b = serde_json::json!({"qty": 6});
         assert_ne!(step_shape_hash("t", &a), step_shape_hash("t", &b));
         assert_ne!(step_shape_hash("t", &a), step_shape_hash("u", &a));
+    }
+
+    /// A KEY IS ENCODED, SO NO TWO SHAPES SHARE A CANONICAL FORM
+    /// (security review of fd7090cc, 2026-09-24). Keys were written raw,
+    /// `key:value,`, so a key carrying `:` and `,` could spell a
+    /// neighbour: `{"zz":1,"zzz":2}` and `{"zz:1,zzz":2}` both became
+    /// `{zz:1,zzz:2,}`, and a sign-off stamp over one shape verified on
+    /// the other. infra/ops/ops-runner.sh recomputes this hash in jq and
+    /// is pinned equal to it by ops_runner_approval_sh.rs.
+    #[test]
+    fn shape_hash_keys_cannot_collide_with_a_neighbouring_key() {
+        let a = serde_json::json!({"zz": 1, "zzz": 2});
+        let b = serde_json::json!({"zz:1,zzz": 2});
+        assert_ne!(step_shape_hash("t", &a), step_shape_hash("t", &b));
     }
 
     #[test]

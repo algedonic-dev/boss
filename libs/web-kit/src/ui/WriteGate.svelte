@@ -22,6 +22,7 @@
   import type { Snippet } from 'svelte';
   import { session } from '../session/session.svelte';
   import { loginUrlFor } from '../session/deadSession';
+  import { safeLinkHref } from '../links';
 
   type Props = Readonly<{ children: Snippet }>;
   let { children }: Props = $props();
@@ -40,7 +41,7 @@
 </fieldset>
 {#if session.readonly}
   <p class="write-gate-note">
-    Read-only session — <a href={loginHref}>sign in</a> to act.
+    Read-only session — <a href={safeLinkHref(loginHref)}>sign in</a> to act.
   </p>
 {/if}
 
@@ -63,7 +64,7 @@
   .write-gate-note {
     margin: 6px 0 0;
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .write-gate-note a {
     color: inherit;

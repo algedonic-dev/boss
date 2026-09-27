@@ -13,6 +13,7 @@
 // empty estate (the false-empty family).
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { sinceText } from '../yard/yard-floor';
 
 export type EstateNode = Readonly<{
   id: string;
@@ -68,71 +69,170 @@ export type ComparisonCounts = Readonly<{
 export type Comparison = Readonly<{
   observed_at: string;
   scope: string;
+  /** The host a SELF-SCOPED comparison is about — compare_host stamps
+   *  it (estate_compare.rs, the raiser's series key); the cluster and
+   *  door comparisons carry none, and neither does a literal built
+   *  before this key was read, hence optional. */
+  host?: string | null;
   counts: ComparisonCounts;
+}>;
+
+// THE HOST COMPARISON (backlog 2d8d983b; page audit 2cff1d6e, GAP 1).
+// Until this read the page rendered the cluster's verdict only, while
+// every host row carried a finding: measured 2026-09-23, each forge
+// row 15:17Z-16:17Z drift 1 (memory declared 30, observed 31), and
+// boss-gcp's 10:25Z row disk_tight 1 (13 G free against a 17 G floor)
+// plus drift 1. None of it reached the estate surface.
+//
+// SCOPED, not taken from the unscoped page of 20 the rest of the
+// section reads (75027a93): forge compares every 15 minutes and
+// boss-gcp once a day, so a mixed page spent by the five-minute series
+// held boss-gcp's row about one hour in twenty-four.
+//
+// AND GROUPED PER HOST ON THE SERVER (backlog 725532ab). Scoped alone,
+// a daily host still fell off: measured 2026-09-25 07:50Z, the page of
+// 50 held 50 of 768 host rows, all forge's, and boss-gcp's 10:25Z row
+// was gone — so the page rendered a coverage line saying how far back
+// it reached, a truthful statement of a missing answer. `latest_per=
+// host` asks the question the section renders — each host's newest
+// word — and its `total` counts HOSTS, so one read is the whole answer
+// whenever rows == total, and the page owes every declared host a line.
+export const HOST_COMPARISONS_READ = '/api/estate/comparisons?scope=host&latest_per=host&limit=50';
+
+/** The host series read grouped: each host's newest row, and how many
+ *  hosts the server counted (null from a reader that did not say). */
+export type HostComparisonPage = Readonly<{
+  rows: readonly Comparison[];
+  total: number | null;
+}>;
+
+/** One line of the host comparison: a host and its newest comparison,
+ *  or null when the read holds none for a host the registry declares. */
+export type HostLine = Readonly<{ host: string | null; cmp: Comparison | null }>;
+
+// THE LOOPS (backlog 0d9b2960; page audit 2cff1d6e, GAP 10). The
+// estate is kept by loops — the hosts converge themselves, observe
+// their units and the other hosts, the forge watches the cluster from
+// outside, the runners answer ops-requests — and every run leaves a
+// packet. This page showed none of them, so "did the loop run" had no
+// answer here while ~2,000 packets of each kind sat in the log. The
+// newest TERMINAL of each loop is that answer (outcome and age); an
+// open packet is a run in flight, or one that never finished.
+//
+// PER HOST where the packet names one, and only there. Measured
+// 2026-09-24: an ops-request carries `metadata.host`; the forge and
+// boss-gcp converges stamp `node_id` on their run step; the watchdog,
+// the cluster converge and both observers name no host (observe-host
+// runs on BOTH the forge and boss-gcp under one kind, and neither
+// packet says which). The page says "not named on the packet" rather
+// than guess one from a unit file it cannot read.
+
+/** A loop the page reads by kind. Pinned to infra/platform/workflows by
+ *  estate.test.ts, so a renamed kind is a red test rather than a row
+ *  that reads "never finished" forever. */
+export type EstateLoop = Readonly<{ kind: string; label: string }>;
+
+export const ESTATE_LOOPS: readonly EstateLoop[] = [
+  { kind: 'maintenance-forge-converge', label: 'forge converge' },
+  { kind: 'maintenance-boss-gcp-converge', label: 'boss-gcp converge' },
+  { kind: 'maintenance-cluster-converge', label: 'cluster converge' },
+  { kind: 'maintenance-cluster-watchdog', label: 'cluster watchdog' },
+  { kind: 'maintenance-estate-observe-host', label: 'observe hosts' },
+  { kind: 'maintenance-estate-observe-units', label: 'observe units' },
+];
+
+/** The ops-request loop is read once per host that DECLARES it answers
+ *  them — the `ops-runner` role (infra/estate/roles.toml: "which hosts
+ *  should be answering ... so silence has something to be silence
+ *  from"). Its packets carry `metadata.host`, so the split is the
+ *  server's filter, not this page's. */
+export const OPS_REQUEST_KIND = 'ops-request';
+export const OPS_RUNNER_ROLE = 'ops-runner';
+
+/** The success terminals of the loops above; every other terminal they
+ *  declare (failed, refused) renders as trouble. Held to the workflow
+ *  files by estate.test.ts. */
+export const LOOP_OK_OUTCOMES: ReadonlySet<string> = new Set(['completed', 'answered']);
+
+/** One packet of a loop, reduced to what "did it run" needs. */
+export type LoopPacket = Readonly<{
+  id: string;
+  status: string;
+  /** `metadata.outcome`, stamped on close; null while open. */
+  outcome: string | null;
+  /** When it closed (a terminal) or opened (an open packet). */
+  at: string | null;
+  /** The host the packet names, or null when it names none. */
+  host: string | null;
+}>;
+
+export type LoopPlan = Readonly<{ kind: string; label: string; host: string | null }>;
+
+export type LoopRow = LoopPlan & Readonly<{
+  /** Ready-and-null is a kind with no closed packet at all. */
+  latest: Remote<LoopPacket | null>;
+  open: Remote<readonly LoopPacket[]>;
 }>;
 
 export type EstateState = Readonly<{
   nodes: Remote<readonly EstateNode[]>;
   observations: Remote<readonly Observation[]>;
   comparisons: Remote<readonly Comparison[]>;
+  hostComparisons: Remote<HostComparisonPage>;
+  loops: readonly LoopRow[];
 }>;
 
-// The dev session door. HARDCODED FALLBACK, and loudly so: the estate
-// registry DECLARES this door — service_instances row `boss-dev-ssh`
-// in migration 202608310030-the-dev-session-has-an-ssh-door.sql:
-// Dropbear in the boss-dev pod, LoadBalancer 10.20.0.35 port 22,
-// key-only, root — but the jobs API serves only
-// /api/estate/nodes|observations|comparisons today (boss-jobs
-// http/mod.rs); there is no service-instances read endpoint. So the
-// row lives twice, and a fact that lives twice gets an equality test:
-// estate.test.ts pins the literal below to that migration, so a drift
-// is a red test, not a dead link. When a read endpoint lands, these
-// constants die and the launch block renders from the registry like
-// everything else on the page. Tracked on the estate reader item
-// d471a8ce.
-export type SshDoor = Readonly<{ user: string; host: string }>;
-export const DEV_SSH_DOOR: SshDoor = { user: 'root', host: '10.20.0.35' };
-export const DEV_SSH_LABEL = `${DEV_SSH_DOOR.user}@${DEV_SSH_DOOR.host}`;
-export const DEV_SSH_URL = `ssh://${DEV_SSH_LABEL}`;
+// THE DEV WORKSPACE DOOR (design 5fc71f03, David 2026-09-18; backlog
+// e4cedb46). One hostname, from anywhere, behind a Cloudflare Access
+// SSH application that issues a certificate good for one session.
+//
+// It replaces a MetalLB VIP on the LAN, reached from outside through
+// the boss-gcp WireGuard bastion on a key that lived forever — a jump
+// this page had to spell out in three forms, because ssh:// cannot
+// carry a ProxyJump. None of that is needed now, so none of it is
+// here; the VIP still answers and is no longer advertised
+// (infra/cluster/manifests/boss-dev.yaml, Service boss-dev-ssh).
+//
+// HARDCODED, and loudly so, for the same reason the VIP was: the
+// hostname is DECLARED — the tunnel route in
+// infra/cluster/tunnel-origins.toml and the application in
+// infra/cluster/dns/access.toml — but the jobs API serves only
+// /api/estate/nodes|observations|comparisons (boss-jobs http/mod.rs),
+// so no read reaches either file. A fact that lives twice gets an
+// equality test (CLAUDE.md §9a): the Rust test
+// the_dev_door_is_an_access_ssh_application.rs holds the literal below
+// to the route the connector serves, so a drift is a red test rather
+// than a terminal block that opens nothing. When the estate reader
+// lands (d471a8ce) this constant dies and the block renders from the
+// registry like everything else on the page.
+export const DEV_DOOR_HOST = 'dev.algedonic.dev';
 
-/** A declared node that can carry a jump: the bastion's address is the
- *  one field the route cannot do without, so the type says so. */
-export type BastionNode = EstateNode & Readonly<{ address: string }>;
+/** One line of the terminal setup, with the reason it is there: a
+ *  command an operator pastes blind is a command they cannot judge. */
+export type DoorStep = Readonly<{ what: string; command: string; why: string }>;
 
-/** The live node the registry declares as the bastion (role=bastion —
- *  boss-gcp, the WireGuard hub, since 202609050510). 10.20.0.35 is a
- *  LAN address; from outside the VPN the only way to it is through
- *  this node. Null when none is declared, retired, or address-less:
- *  the page then renders no route at all, never a broken one. */
-export function bastionOf(nodes: readonly EstateNode[]): BastionNode | null {
-  const isLiveBastion = (n: EstateNode): n is BastionNode =>
-    !n.retired && n.role === 'bastion' && n.address !== null;
-  return nodes.find(isLiveBastion) ?? null;
-}
-
-export type BastionRoutes = Readonly<{
-  /** Open a shell on the bastion. No username: the viewer's ssh config supplies it. */
-  shellUrl: string;
-  /** The second hop, typed on the bastion. */
-  hopCommand: string;
-  /** Both hops in one line, from anywhere. */
-  jumpCommand: string;
-  /** ~/.ssh/config lines that make the primary ssh:// link work from anywhere. */
-  sshConfig: string;
-}>;
-
-/** The three ways through the bastion to the door, spelled verbatim.
- *  An ssh:// URL cannot express a ProxyJump, so the jump is offered as
- *  a command and as config rather than as a link. `<you>` is left for
- *  the viewer: the bastion account is theirs, not the page's. */
-export function bastionRoutes(bastionAddress: string, door: SshDoor = DEV_SSH_DOOR): BastionRoutes {
-  const target = `${door.user}@${door.host}`;
-  return {
-    shellUrl: `ssh://${bastionAddress}`,
-    hopCommand: `ssh ${target}`,
-    jumpCommand: `ssh -J <you>@${bastionAddress} ${target}`,
-    sshConfig: `Host ${door.host}\n  ProxyJump <you>@${bastionAddress}`,
-  };
+/** The one-time terminal setup for the dev door, in order. Steps 1 and
+ *  2 are done once per machine; step 3 is every session — and after
+ *  step 2, so is any other ssh to the name (scp, rsync, ProxyJump),
+ *  because the stanza teaches ssh itself how to reach it. */
+export function devDoorSteps(host: string = DEV_DOOR_HOST): readonly DoorStep[] {
+  return [
+    {
+      what: 'Install cloudflared, once per machine',
+      command: 'cloudflared --version',
+      why: 'it is the client half of the tunnel: ssh talks to it, it talks to the edge. Not found means not installed — take it from Cloudflare downloads, or your package manager, and run this again.',
+    },
+    {
+      what: 'Teach ssh the route, once per machine',
+      command: `grep -qsF 'Match host ${host} ' ~/.ssh/config || cloudflared access ssh-config --hostname ${host} --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config`,
+      why: `it appends a ProxyCommand stanza for ${host}; ssh then reaches it like any other host. The sed drops cloudflared's "Add to your …/.ssh/config:" banner, which ssh cannot parse, and the grep makes a second run a no-op.`,
+    },
+    {
+      what: 'Open the workspace',
+      command: `ssh root@${host}`,
+      why: 'the browser asks who you are, Access issues a certificate for the session, and the pod accepts it. Nothing long-lived is stored.',
+    },
+  ];
 }
 
 function asArray(raw: unknown): readonly unknown[] {
@@ -189,6 +289,7 @@ export function parseComparisons(raw: unknown): readonly Comparison[] {
     return [{
       observed_at: typeof p.observed_at === 'string' ? p.observed_at : '',
       scope: p.scope,
+      host: typeof p.host === 'string' ? p.host : null,
       counts: {
         observed: n('observed'),
         participating_declared: n('participating_declared'),
@@ -213,16 +314,129 @@ export function latestByScope(rows: readonly Observation[]): ReadonlyMap<string,
   return out;
 }
 
+/** One host's newest reading in the host observation series. */
+export type HostReading = Readonly<{
+  host: string;
+  node: ObservedNode;
+  observed_at: string;
+  observer: string;
+}>;
+
+/** Newest reading per HOST in the `host` series — rows arrive
+ *  newest-first, so the first row naming a host is its latest word —
+ *  in host order (backlog 3d1678ba; page audit 2cff1d6e, GAP 2).
+ *  latestByScope kept one row for the whole series, and forge observes
+ *  itself every ~15 minutes while boss-gcp does once a day, so
+ *  boss-gcp's reading showed for at most one forge interval: measured
+ *  2026-09-23, its 10:25Z row held 13 G free against a 17 G floor and
+ *  the page never drew it. Keyed on nodes[].id, which is the host each
+ *  observe-host.sh row reports about itself. */
+export function latestHostReadings(rows: readonly Observation[]): readonly HostReading[] {
+  const out = new Map<string, HostReading>();
+  for (const r of rows) {
+    if (r.scope !== 'host') continue;
+    for (const n of r.nodes) {
+      // parseObservations passes nodes through unvalidated; a row with
+      // no id names no host to key on.
+      if (typeof n.id !== 'string') continue;
+      if (!out.has(n.id)) out.set(n.id, { host: n.id, node: n, observed_at: r.observed_at, observer: r.observer });
+    }
+  }
+  return [...out.values()].sort((a, b) => a.host.localeCompare(b.host));
+}
+
 export function latestComparison(rows: readonly Comparison[], scope: string): Comparison | null {
   return rows.find((r) => r.scope === scope) ?? null;
 }
 
+/** The host series' page as the reader serves it (`{data, total}`),
+ *  kept to host rows whatever came back. */
+export function parseHostComparisons(raw: unknown): HostComparisonPage {
+  const rows = parseComparisons(raw).filter((c) => c.scope === 'host');
+  const total = (raw as { total?: unknown } | null)?.total;
+  return {
+    rows,
+    total: typeof total === 'number' ? total : null,
+  };
+}
+
+/** Whether the read is every host there is: the server counted, and the
+ *  page holds that many (a limit below the host count shows as rows <
+ *  total). An empty answer is whole either way — there is no tail. */
+export function hostPageIsWhole(page: HostComparisonPage): boolean {
+  const groups = latestPerHost(page.rows).length;
+  if (page.total === null) return groups === 0;
+  return groups >= page.total;
+}
+
+/** The hosts that owe a self-scoped comparison: every live declared
+ *  node OUTSIDE the cluster — the complement of the cluster compare's
+ *  participation rule (estate_compare.rs: role `talos-*`, not retired),
+ *  since a cluster node is compared in the cluster verdict instead. */
+export function declaredHosts(nodes: readonly EstateNode[]): readonly string[] {
+  return nodes.filter((n) => !n.retired && !n.role.startsWith('talos-')).map((n) => n.id);
+}
+
+/** Every line the host comparison renders: the newest row of each host
+ *  the read returned, plus a comparison-less line for each declared
+ *  host it did not, in host order. An unread registry leaves the rows
+ *  alone — it declares nothing the page could owe a line to. */
+export function hostLines(nodes: Remote<readonly EstateNode[]>, page: HostComparisonPage): readonly HostLine[] {
+  const latest = latestPerHost(page.rows);
+  const seen = new Set(latest.map((c) => c.host ?? null));
+  const owed = nodes.kind === 'ready' ? declaredHosts(nodes.data).filter((h) => !seen.has(h)) : [];
+  const lines: readonly HostLine[] = [
+    ...latest.map((c) => ({ host: c.host ?? null, cmp: c })),
+    ...owed.map((h) => ({ host: h, cmp: null })),
+  ];
+  return [...lines].sort((a, b) => (a.host ?? '').localeCompare(b.host ?? ''));
+}
+
+/** What a declared host with no row reads. Only a whole read may say
+ *  the host has none; otherwise the absence is the read's, and it says
+ *  how much of the series it holds. */
+export function missingHostText(page: HostComparisonPage): string {
+  if (hostPageIsWhole(page)) return 'no host comparison recorded';
+  const held = latestPerHost(page.rows).length;
+  return page.total === null
+    ? `not among the ${held} hosts this read returned, which did not say how many there are`
+    : `not among the ${held} of ${page.total} hosts this read returned`;
+}
+
+/** The line under a read that is not every host, or null when it is:
+ *  a truncated answer is never presented as whole. */
+export function hostCoverText(page: HostComparisonPage): string | null {
+  if (hostPageIsWhole(page)) return null;
+  const held = latestPerHost(page.rows).length;
+  const count = page.total === null
+    ? `${held} hosts and did not say how many there are`
+    : `${held} of ${page.total} hosts`;
+  return `The host read returned ${count}: a host past it has no comparison shown here.`;
+}
+
+/** Newest comparison per host — rows arrive newest-first, so the first
+ *  row naming a host is its latest word — in host order, so a refresh
+ *  does not reshuffle the lines. */
+export function latestPerHost(rows: readonly Comparison[]): readonly Comparison[] {
+  const out = new Map<string, Comparison>();
+  for (const r of rows) {
+    const key = r.host ?? '';
+    if (!out.has(key)) out.set(key, r);
+  }
+  return [...out.values()].sort((a, b) => (a.host ?? '').localeCompare(b.host ?? ''));
+}
+
 /** Zero everywhere-it-matters is the good state and says so; anything
- *  else names what disagrees. */
+ *  else names what disagrees. A self-scoped (host) comparison counts
+ *  no declared total and observes only itself, so its words differ in
+ *  those two places and nowhere else. */
 export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } {
   const k = c.counts;
+  const selfScoped = c.host != null;
   const problems: string[] = [];
-  if (k.observed_not_declared > 0) problems.push(`${k.observed_not_declared} in the cluster but undeclared`);
+  if (k.observed_not_declared > 0) {
+    problems.push(`${k.observed_not_declared} ${selfScoped ? 'observed but not declared' : 'in the cluster but undeclared'}`);
+  }
   if (k.declared_not_observed > 0) problems.push(`${k.declared_not_observed} declared but not seen`);
   if (k.drift > 0) problems.push(`${k.drift} drifted from declaration`);
   // Headroom, not paperwork: a machine out of room stops the pipeline,
@@ -230,16 +444,88 @@ export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } 
   if ((k.disk_tight ?? 0) > 0) problems.push(`${k.disk_tight} short of disk`);
   if ((k.disk_unmeasured ?? 0) > 0) problems.push(`${k.disk_unmeasured} with no free-space reading`);
   if (problems.length === 0) {
+    if (selfScoped) return { ok: true, text: `${k.observed} observed — no drift` };
     return { ok: true, text: `${k.observed} observed, ${k.participating_declared} declared — no drift` };
   }
   return { ok: false, text: problems.join('; ') };
 }
 
+const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+export function parseLoopPackets(raw: unknown): readonly LoopPacket[] {
+  return asArray(raw).map((r) => {
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== 'string' || typeof o.status !== 'string') {
+      throw new Error('jobs row missing id/status');
+    }
+    const md = (o.metadata ?? {}) as Record<string, unknown>;
+    const steps = Array.isArray(o.steps) ? (o.steps as Record<string, unknown>[]) : [];
+    const run = steps.find((s) => s.spec_slug === 'run');
+    const runMd = (run?.metadata ?? {}) as Record<string, unknown>;
+    const open = o.status === 'open';
+    return {
+      id: o.id,
+      status: o.status,
+      outcome: open ? null : str(md.outcome),
+      at: open ? (str(o.opened_at) ?? str(md.opened_at)) : (str(md.closed_at) ?? str(o.closed_on)),
+      host: str(md.host) ?? str(runMd.node_id),
+    };
+  });
+}
+
+/** The rows the page reads: every declared loop, then the ops-request
+ *  loop per live host declaring the runner role. With the registry
+ *  unreadable the runner row is kept, unfiltered — "did ANY runner
+ *  answer" is still a question the log can settle. */
+export function loopPlan(nodes: Remote<readonly EstateNode[]>): readonly LoopPlan[] {
+  const loops = ESTATE_LOOPS.map((l) => ({ ...l, host: null }));
+  if (nodes.kind !== 'ready') return [...loops, { kind: OPS_REQUEST_KIND, label: 'ops-request', host: null }];
+  const runners = nodes.data.filter((n) => !n.retired && n.roles.includes(OPS_RUNNER_ROLE));
+  return [...loops, ...runners.map((n) => ({ kind: OPS_REQUEST_KIND, label: 'ops-request', host: n.id }))];
+}
+
+/** Newest terminal = the first closed row (the listing is newest-opened
+ *  first); open = every open packet of the kind, typically none or one. */
+export function loopQueries(kind: string, host: string | null): { latest: string; open: string } {
+  const narrow = host === null ? '' : `&metadata=${encodeURIComponent(JSON.stringify({ host }))}`;
+  return {
+    latest: `/api/jobs?kind=${encodeURIComponent(kind)}&status=closed&limit=1&full=true${narrow}`,
+    open: `/api/jobs?kind=${encodeURIComponent(kind)}&status=open&full=true${narrow}`,
+  };
+}
+
+/** The host a row is about, from the query or the packet — never
+ *  guessed (see THE LOOPS above). */
+export function loopHost(row: LoopRow): string {
+  if (row.host) return row.host;
+  const fromLatest = row.latest.kind === 'ready' ? (row.latest.data?.host ?? null) : null;
+  const fromOpen = row.open.kind === 'ready' ? (row.open.data.find((p) => p.host)?.host ?? null) : null;
+  return fromLatest ?? fromOpen ?? 'not named on the packet';
+}
+
+/** How long ago, to the minute — a five-minute loop dated "today"
+ *  answers nothing. The board's own reading (yard-floor sinceText). */
+export function loopAge(at: string | null, now: Date): string {
+  return at ? `${sinceText(at, now.getTime())} ago` : 'undated';
+}
+
+async function fetchLoop(plan: LoopPlan): Promise<LoopRow> {
+  const q = loopQueries(plan.kind, plan.host);
+  const [latest, open] = await Promise.all([
+    fetchRemote(q.latest, (raw) => parseLoopPackets(raw)[0] ?? null),
+    fetchRemote(q.open, parseLoopPackets),
+  ]);
+  return { ...plan, latest, open };
+}
+
 export async function fetchEstate(): Promise<EstateState> {
-  const [nodes, observations, comparisons] = await Promise.all([
-    fetchRemote('/api/estate/nodes', parseNodes),
+  const nodesRead = fetchRemote('/api/estate/nodes', parseNodes);
+  const [nodes, observations, comparisons, hostComparisons, loops] = await Promise.all([
+    nodesRead,
     fetchRemote('/api/estate/observations?limit=20', parseObservations),
     fetchRemote('/api/estate/comparisons?limit=20', parseComparisons),
+    fetchRemote(HOST_COMPARISONS_READ, parseHostComparisons),
+    nodesRead.then((n) => Promise.all(loopPlan(n).map(fetchLoop))),
   ]);
-  return { nodes, observations, comparisons };
+  return { nodes, observations, comparisons, hostComparisons, loops };
 }

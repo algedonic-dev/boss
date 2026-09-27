@@ -194,7 +194,9 @@
     });
     kids.flat().forEach((c) => {
       if (c === null || c === undefined || c === false) return;
-      el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      // A string child is a Text node by append's definition (backlog
+      // 4a359b51 — the reason is at sign-off.js's h()).
+      el.append(c instanceof Node ? c : String(c));
     });
     return el;
   }

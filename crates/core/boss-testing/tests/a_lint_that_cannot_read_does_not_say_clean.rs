@@ -58,6 +58,11 @@
 //! 1 in 3000 with the pipeline pinned to one contended cpu. The roster
 //! test refuses that shape; the lints use here-strings, which are written
 //! whole before grep starts and are not pipelines.
+//!
+//! tree-wide pin — two of its tests walk every shell under infra/, which
+//! no changed-file map attributes to this crate, so every scoped gate
+//! runs it whatever its scope (`tree_wide_pins` in infra/gate.sh; found
+//! unmarked by backlog bc978312, ~4 s).
 
 use boss_testing::repo_root;
 use std::path::{Path, PathBuf};
@@ -653,6 +658,180 @@ fn steptype_bundle_ratchet_allows_a_widened_enum_and_still_refuses_a_shrunk_one(
         out.contains("field_type"),
         "the failure must say what it refused:\n{out}"
     );
+}
+
+/// Every `[[step_type]]` block of a bundle as `(text, declares a
+/// required field)`, a block running to the next header or the end of
+/// the file — read out of the real bundle so the cases below cannot
+/// drift from its idiom.
+fn kind_blocks(bundle: &str) -> Vec<(String, bool)> {
+    let mut blocks: Vec<String> = Vec::new();
+    for line in bundle.split_inclusive('\n') {
+        if line.starts_with("[[step_type]]") {
+            blocks.push(String::new());
+        }
+        if let Some(b) = blocks.last_mut() {
+            b.push_str(line);
+        }
+    }
+    blocks
+        .into_iter()
+        .map(|b| {
+            let required = b.lines().any(|l| l.trim() == "required = true");
+            (b, required)
+        })
+        .collect()
+}
+
+/// The `kind = "…"` a `[[step_type]]` block declares.
+fn kind_name(block: &str) -> String {
+    block
+        .lines()
+        .find_map(|l| l.strip_prefix("kind = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a step_type block declares its kind")
+        .to_string()
+}
+
+/// The retired-kinds record the ratchet reads, relative to the repo root.
+const RETIRED_KINDS: &str = "infra/lint/steptype-retired-kinds.txt";
+
+/// Remove the first all-optional kind from a fixture's bundle, commit it,
+/// and hand back the kind's name — the shape of every retirement case.
+fn retire_an_all_optional_kind(fx: &Fixture, retired_rows: Option<&str>) -> String {
+    let path = fx.dir.join("crates/core/boss-jobs/seeds/step_types.toml");
+    let bundle = std::fs::read_to_string(&path).expect("readable");
+    let (optional, _) = kind_blocks(&bundle)
+        .into_iter()
+        .find(|(b, required)| !required && b.contains("[[step_type.fields]]"))
+        .expect("the bundle declares a kind whose every field is optional");
+    let kind = kind_name(&optional);
+    boss_testing::write_file(&path, &bundle.replacen(&optional, "", 1));
+    if let Some(rows) = retired_rows {
+        fx.write(RETIRED_KINDS, &rows.replace("{kind}", &kind));
+    }
+    fx.commit("retire an all-optional kind");
+    kind
+}
+
+/// A KIND LEAVES THE BUNDLE ONLY AS A RECORDED ACT (backlog adaecf05).
+///
+/// Car 5 of a8991c86 (design 2ea444f5, the `marketing-launch` retirement)
+/// let any kind that declared no required field leave on the reasoning
+/// that an unknown kind validates permissively. True of validation, and
+/// beside the point: 17 kinds on the 2026-09-26 bundle require nothing —
+/// `task`, `outcome`, `trigger` and `sign-off` among them, with 1670
+/// `outcome`, 1246 `task` and 37 `sign-off` steps in flight that day —
+/// and the dispatcher reads an unknown kind as decision-shaped, so every
+/// one of those steps would have been routed to a person by a one-line
+/// deletion the lint waved through. The header even said whether anything
+/// was in flight was "the car's measurement, not this lint's", and no car
+/// was asked to record one.
+///
+/// So a kind may leave only with a row in the retired-kinds record naming
+/// it, the car that retires it, and an in-flight count measured at 0.
+/// Pinned four ways: without a row the removal is refused and the
+/// refusal names the kind and the record; with a row it passes; a row
+/// whose measured count is not 0 is refused; and a kind that declared a
+/// required field is still refused even with a row — it loosens first,
+/// which is legal on its own, and leaves in a later car.
+#[test]
+fn steptype_bundle_ratchet_lets_a_kind_leave_only_with_a_retired_row() {
+    let lint = "steptype-bundle-ratchet";
+
+    let fx = Fixture::new("steptype-retire-unrecorded");
+    let kind = retire_an_all_optional_kind(&fx, None);
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a kind removed with no retired-kinds row must be refused, required field or not — \
+         an in-flight step of an unknown kind is routed to a person:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("`{kind}`")) && out.contains(RETIRED_KINDS),
+        "the refusal must name the kind and the record that would admit it:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-recorded");
+    retire_an_all_optional_kind(
+        &fx,
+        Some(
+            "# kind car in_flight measured_at\n{kind} ship-a-change:0000abcd 0 2026-09-26T19:56Z\n",
+        ),
+    );
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 0,
+        "a kind retired with a row carrying its car and a measured in-flight count of 0 \
+         strands nothing, so the ratchet must let it through:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-in-flight");
+    let kind = retire_an_all_optional_kind(
+        &fx,
+        Some("{kind} ship-a-change:0000abcd 37 2026-09-26T19:56Z\n"),
+    );
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a row that measured steps still in flight admits nothing:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("`{kind}`")) && out.contains("in flight"),
+        "the refusal must name the kind and the count it refused:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-required");
+    let path = fx.dir.join("crates/core/boss-jobs/seeds/step_types.toml");
+    let bundle = std::fs::read_to_string(&path).expect("readable");
+    let (required, _) = kind_blocks(&bundle)
+        .into_iter()
+        .find(|(_, required)| *required)
+        .expect("the bundle declares a kind with a required field");
+    let kind = kind_name(&required);
+    boss_testing::write_file(&path, &bundle.replacen(&required, "", 1));
+    fx.write(
+        RETIRED_KINDS,
+        &format!("{kind} ship-a-change:0000abcd 0 2026-09-26T19:56Z\n"),
+    );
+    fx.commit("remove a kind with a required field");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a kind that required a field promised it to every reader of its done metadata; \
+         removing the kind withdraws that promise with no version to pin against:\n{out}"
+    );
+    assert!(
+        out.contains("is removed here"),
+        "the failure must say what it refused:\n{out}"
+    );
+}
+
+/// The live record's first row is the retirement that opened this door:
+/// `marketing-launch`, measured at 0 in flight. And every row it carries
+/// is one the ratchet would admit — four columns, a count of exactly 0 —
+/// so a malformed row is found here rather than on the day its kind leaves.
+#[test]
+fn the_retired_kinds_record_admits_only_what_it_says() {
+    let body = std::fs::read_to_string(repo_root().join(RETIRED_KINDS))
+        .unwrap_or_else(|e| panic!("{RETIRED_KINDS} is readable: {e}"));
+    let rows: Vec<Vec<&str>> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows.first().map(|r| r[0]),
+        Some("marketing-launch"),
+        "the record's first row is the marketing-launch retirement:\n{body}"
+    );
+    for row in &rows {
+        assert!(
+            row.len() == 4 && row[2] == "0",
+            "a retired-kinds row is `kind car in_flight measured_at` with in_flight 0: {row:?}"
+        );
+    }
 }
 
 #[test]

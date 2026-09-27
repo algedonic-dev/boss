@@ -316,6 +316,44 @@ impl WorkflowSpec {
             created_at: Utc::now(),
         }
     }
+
+    /// The outcome a live step at `sort_order` closes its Job with, if
+    /// it is a declared terminal. A live Step pairs back to its StepSpec
+    /// by index (== `sort_order`, the materializer's contract).
+    pub fn terminal_outcome_at(&self, sort_order: i32) -> Option<&str> {
+        let i = usize::try_from(sort_order).ok()?;
+        self.steps
+            .get(i)?
+            .terminal
+            .as_ref()
+            .map(|t| t.outcome.as_str())
+    }
+
+    /// The outcome a Job whose steps have these `(sort_order,
+    /// completed)` pairs has CLOSED with: the completed declared
+    /// terminal lowest in sort order, in whatever order the pairs
+    /// arrive. This is the ONE statement of that rule (5f99cd11): the
+    /// catch-all close that can race the terminal close (228c9a7d), the
+    /// metadata merge's check of an outcome repair, and `boss job
+    /// outcome` all derive it here, so they cannot name two. The rule
+    /// owns the ordering because its callers read steps from different
+    /// places — the store, and a job GET's JSON — and a copy that
+    /// sorted beside one that did not was how two of them could
+    /// disagree about the same packet.
+    pub fn completed_terminal_outcome(
+        &self,
+        steps: impl IntoIterator<Item = (i32, bool)>,
+    ) -> Option<&str> {
+        steps
+            .into_iter()
+            .filter(|&(_, completed)| completed)
+            .filter_map(|(sort_order, _)| {
+                self.terminal_outcome_at(sort_order)
+                    .map(|outcome| (sort_order, outcome))
+            })
+            .min_by_key(|&(sort_order, _)| sort_order)
+            .map(|(_, outcome)| outcome)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +407,10 @@ fn workflow_design_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             }],
             ..Default::default()
         },
@@ -386,7 +428,16 @@ fn workflow_design_spec() -> WorkflowSpec {
             sign_offs_required: vec!["workflow-approver".into()],
             assurance_required: None,
             authority_role: Some("workflow-approver".into()),
-            metadata_defaults: serde_json::json!({ "authority_role": "workflow-approver" }),
+            // `changes_requested_completes` (backlog da322e8f,
+            // 2026-09-23): the sign-off surface completes a Request
+            // changes only where the step declares it, and
+            // `not-published` needs this step done on changes-requested.
+            // Rides through BOTH copies for the reason the note below
+            // gives.
+            metadata_defaults: serde_json::json!({
+                "authority_role": "workflow-approver",
+                "changes_requested_completes": true,
+            }),
             // 2026-08-31, cdfe2e1a: the decision must LEAVE a record
             // (workflow_lint Phase 5) — required at completion, on the
             // step itself, unlike `sign_off_context` above which
@@ -405,6 +456,10 @@ fn workflow_design_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             }],
             ..Default::default()
         },
@@ -536,6 +591,10 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                 filled_by: boss_core::job::FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             }],
             ..Default::default()
         }
@@ -569,6 +628,10 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
                     covers: None,
+                    binds: None,
+                    item_value_max_bytes: None,
+                    item_one_of: Vec::new(),
+                    writer: None,
                 },
                 boss_core::job::StepField {
                     name: "destroying".into(),
@@ -577,6 +640,10 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                     filled_by: boss_core::job::FilledBy::Executor,
                     item_keys: Vec::new(),
                     covers: None,
+                    binds: None,
+                    item_value_max_bytes: None,
+                    item_one_of: Vec::new(),
+                    writer: None,
                 },
             ],
             ..Default::default()
@@ -1226,7 +1293,9 @@ where
             completed_at: None,
             metadata,
             notes: None,
-            // Snapshot is taken on INSERT in postgres::add_step.
+            // Materialisation stays pure: the admission handler stamps
+            // the active plugin version before it builds STEP_CREATED,
+            // so the event and the row carry one value (aba364fe).
             step_plugin_version: 0,
             embedded_job: None,
         });
@@ -1309,25 +1378,33 @@ fn filer_field_misses(
     if filer_value_missing(value) {
         return vec![field.name.clone()];
     }
-    if field.item_keys.is_empty() {
+    if field.item_keys.is_empty() && field.item_one_of.is_empty() {
         return Vec::new();
     }
     let Some(items) = value.and_then(|v| v.as_array()) else {
         return vec![format!("{} (not an array)", field.name)];
     };
+    let blank = |item: &serde_json::Value, key: &str| {
+        item.get(key)
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.trim().is_empty())
+    };
     items
         .iter()
         .enumerate()
         .flat_map(|(i, item)| {
-            field
+            let keys = field
                 .item_keys
                 .iter()
-                .filter(move |key| {
-                    item.get(key.as_str())
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|s| s.trim().is_empty())
-                })
-                .map(move |key| format!("{}[{i}].{key}", field.name))
+                .filter(move |key| blank(item, key))
+                .map(move |key| format!("{}[{i}].{key}", field.name));
+            // An element carrying none of its one-of keys (design
+            // 26a89f11) is missing its one required choice, named as the
+            // alternatives it could have carried.
+            let choice = (!field.item_one_of.is_empty()
+                && field.item_one_of.iter().all(|k| blank(item, k)))
+            .then(|| format!("{}[{i}].({})", field.name, field.item_one_of.join("|")));
+            keys.chain(choice)
         })
         .collect()
 }
@@ -1709,9 +1786,59 @@ pub fn reevaluate(
     changed
 }
 
+/// What a packet's protocol says about ONE of its steps, read against
+/// the packet as stored (backlog 570e72bd).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolReading {
+    /// No spec step pairs with this step, so no predicate describes it.
+    Unpaired,
+    /// Its `ready_when` holds.
+    Holds { ready_when: String },
+    /// Its `ready_when` does not hold — false, or not yet evaluable (a
+    /// metadata key nothing has written), which is the answer the
+    /// engine acts on too.
+    Waits { ready_when: String },
+}
+
+/// PURE: read step `step_id`'s own `ready_when` against the packet as
+/// stored — the same pairing ([`pair_steps`]), context
+/// ([`build_context`]) and evaluation [`reevaluate`] uses, so a hand
+/// write is judged by exactly the predicate the engine opens the step
+/// by. The step API's gate read only `blocked_by`, the edge list drawn
+/// FROM the predicate, which cannot see a `job.metadata` clause: a
+/// terminal waiting on `steps.review.done AND job.metadata.merged =
+/// "true"` was completable by hand the moment review was done.
+pub fn read_step(
+    spec: &WorkflowSpec,
+    steps: &[Step],
+    subject: &Subject,
+    job_metadata: &serde_json::Value,
+    step_id: &boss_core::job::StepId,
+) -> ProtocolReading {
+    let pairing = pair_steps(spec, steps);
+    let Some(spec_step) = steps
+        .iter()
+        .position(|s| &s.id == step_id)
+        .and_then(|j| pairing.iter().position(|p| *p == Some(j)))
+        .and_then(|i| spec.steps.get(i))
+    else {
+        return ProtocolReading::Unpaired;
+    };
+    let ctx = build_context(spec, steps, &pairing, subject, job_metadata);
+    let ready_when = spec_step.ready_when.clone();
+    match eval_ready_when(&ready_when, &ctx) {
+        Some(true) => ProtocolReading::Holds { ready_when },
+        _ => ProtocolReading::Waits { ready_when },
+    }
+}
+
 /// If the step has an `authority_role`, surface it in metadata so the
 /// sign-off gate in `boss-jobs::http::update_step` can enforce it.
-fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
+///
+/// A re-pin compares what this writes for two versions of one step
+/// (through [`materialize_steps_at`], in `repin::plan`): a key that
+/// differs is one it moves on a step not yet finished (1e973965).
+pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::Value {
     let mut merged = match defaults {
         serde_json::Value::Object(_) => defaults.clone(),
         _ => serde_json::Value::Object(serde_json::Map::new()),
@@ -1796,6 +1923,17 @@ pub trait WorkflowRegistry: Send + Sync {
 
     /// Return a specific historical version. Version 0 is reserved
     /// as "latest active."
+    ///
+    /// NO STATUS FILTER, and that is a recorded open question, not a
+    /// settled rule: a DRAFT row is served too, which is how a packet
+    /// can be pinned to one — experiment admission of its
+    /// `candidate_version` (a draft by design) and `boss job convert
+    /// --to vN` (no status check) both read through here. A draft needs
+    /// only workflow Create/Update authority, not Publish, so whether a
+    /// draft may be a pinned protocol, and under what authority, is the
+    /// experiments design's decision (d8771dec), recorded on backlog
+    /// ce8b7d66. Until it lands, `get_version_serves_a_draft_today`
+    /// (both adapters) pins today's behaviour so the change is explicit.
     async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError>;
 
     /// List every active spec, optionally filtered by category.
@@ -1806,8 +1944,12 @@ pub trait WorkflowRegistry: Send + Sync {
     /// and retired rows.
     async fn list_versions(&self, kind: &str) -> Result<Vec<WorkflowSpec>, WorkflowError>;
 
-    /// Append a new version with `status = Draft`. If no prior rows
-    /// exist, the new row is version 1; otherwise it's max(version)+1.
+    /// Append a new version with `status = Draft`, numbered one above
+    /// every version this kind has SPENT — its live rows and every
+    /// draft ever discarded — so a number, once handed out, names one
+    /// protocol forever (backlog ce8b7d66: MAX over the live rows alone
+    /// reused a discarded draft's number, re-pointing any packet pinned
+    /// to it). A kind with no history starts at 1.
     /// Returns the stored spec (with its assigned version + created_at).
     ///
     /// Every write method takes `actor` + `now` because under 3P a
@@ -1853,7 +1995,11 @@ pub trait WorkflowRegistry: Send + Sync {
     /// route could, and the actual resolution was a raw psql DELETE
     /// the classifier rightly blocks). Records
     /// `jobs.kind.draft_discarded` iff a row was removed; a missing
-    /// row is `NotFound` so a typo cannot read as success.
+    /// row is `NotFound` so a typo cannot read as success. The
+    /// discarded number stays SPENT — no later allocation reuses it —
+    /// and the HTTP route refuses a draft any packet is pinned to
+    /// before it gets here (backlog ce8b7d66; the pin count lives on
+    /// the jobs port, `JobsRepository::jobs_pinned_to_workflow`).
     async fn discard_draft(
         &self,
         kind: &str,
@@ -2018,6 +2164,10 @@ pub struct InMemoryWorkflows {
     /// the same write points, so tests assert the event contract
     /// through the port without a database.
     recorded: Arc<Mutex<Vec<boss_core::event::Event>>>,
+    /// The highest version ever discarded, per kind — the in-memory
+    /// `workflow_discarded_versions`. A discarded number stays spent
+    /// (backlog ce8b7d66), so `max_version` reads this beside the rows.
+    discarded_high_water: Arc<Mutex<HashMap<String, i32>>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2032,6 +2182,7 @@ impl InMemoryWorkflows {
             rows: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_owned: Arc::new(Mutex::new(std::collections::HashSet::new())),
             recorded: Arc::new(Mutex::new(Vec::new())),
+            discarded_high_water: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2066,13 +2217,31 @@ impl InMemoryWorkflows {
         rows.values().cloned().collect()
     }
 
+    /// The highest number this kind has ever spent — live rows AND
+    /// discarded drafts, so an allocation above it never reuses a
+    /// number a packet may be pinned to (backlog ce8b7d66).
     fn max_version(&self, kind: &str) -> Option<i32> {
         let rows = self.rows.lock().unwrap();
-        rows.keys()
-            .filter(|(k, _)| k == kind)
-            .map(|(_, v)| *v)
-            .max()
+        spent_high_water(&rows, &self.discarded_high_water, kind)
     }
+}
+
+/// The in-memory allocator's one question, asked by every path that
+/// assigns a number: the highest version `kind` has spent, over its
+/// live rows and its discarded drafts. Takes the rows already locked,
+/// because the reconcile holds that lock while it allocates.
+fn spent_high_water(
+    rows: &HashMap<(String, i32), WorkflowSpec>,
+    discarded: &Mutex<HashMap<String, i32>>,
+    kind: &str,
+) -> Option<i32> {
+    let live = rows
+        .keys()
+        .filter(|(k, _)| k == kind)
+        .map(|(_, v)| *v)
+        .max();
+    let spent = discarded.lock().unwrap().get(kind).copied();
+    live.max(spent)
 }
 
 #[async_trait]
@@ -2223,12 +2392,19 @@ impl WorkflowRegistry for InMemoryWorkflows {
         };
         if row.status != WorkflowStatus::Draft {
             return Err(WorkflowError::Conflict(format!(
-                "{kind} v{version} is {:?}, not a draft — an active or retired                  version is history; only a draft (which admitted nothing) can                  be discarded",
+                "{kind} v{version} is {:?}, not a draft — an active or retired \
+                 version is history; only a draft (which admitted nothing) can \
+                 be discarded",
                 row.status
             )));
         }
         let spec = rows.remove(&(kind.to_string(), version)).expect("checked");
         drop(rows);
+        // The number stays spent: the next allocation reads above it.
+        let mut high = self.discarded_high_water.lock().unwrap();
+        let entry = high.entry(kind.to_string()).or_insert(version);
+        *entry = (*entry).max(version);
+        drop(high);
         self.record(crate::events::workflow_registry_event(
             crate::events::WORKFLOW_DRAFT_DISCARDED,
             actor,
@@ -2323,7 +2499,12 @@ impl WorkflowRegistry for InMemoryWorkflows {
                     // a malformed default can't sneak a draft into the
                     // active slot.
                     let mut spec = default.clone();
-                    spec.version = 1;
+                    // 1 on a kind that never had a row; above every
+                    // spent number otherwise, so a discarded draft's
+                    // number is never reused (backlog ce8b7d66).
+                    spec.version = spent_high_water(&rows, &self.discarded_high_water, &spec.kind)
+                        .unwrap_or(0)
+                        + 1;
                     spec.status = WorkflowStatus::Active;
                     let key = (spec.kind.clone(), spec.version);
                     rows.insert(key.clone(), spec.clone());
@@ -2351,13 +2532,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
                             // steps stayed the old shape while closure
                             // came to depend on branch steps they never
                             // had.
-                            let next = rows
-                                .keys()
-                                .filter(|(k, _)| k == &default.kind)
-                                .map(|(_, v)| *v)
-                                .max()
-                                .unwrap_or(0)
-                                + 1;
+                            let next =
+                                spent_high_water(&rows, &self.discarded_high_water, &default.kind)
+                                    .unwrap_or(0)
+                                    + 1;
                             let mut retired = existing.clone();
                             retired.status = WorkflowStatus::Retired;
                             rows.insert(key.clone(), retired);
@@ -2411,6 +2589,26 @@ mod pg {
         pub fn new(pool: PgPool) -> Self {
             Self { pool }
         }
+    }
+
+    /// The next version of `kind`: one above every number it has
+    /// SPENT — its live rows and its discarded drafts
+    /// (`workflow_discarded_versions`). Every allocation path asks
+    /// this, inside its own transaction, so a discarded draft's number
+    /// is never handed out again and a packet pinned to it can never
+    /// be re-pointed at a different protocol (backlog ce8b7d66).
+    /// `GREATEST` skips NULLs, so a kind with no history gets 1.
+    async fn next_version(conn: &mut sqlx::PgConnection, kind: &str) -> Result<i32, WorkflowError> {
+        sqlx::query_scalar(
+            "SELECT GREATEST(
+                    (SELECT MAX(version) FROM workflows WHERE kind = $1),
+                    (SELECT MAX(version) FROM workflow_discarded_versions WHERE kind = $1),
+                    0) + 1",
+        )
+        .bind(kind)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| WorkflowError::Storage(e.to_string()))
     }
 
     #[derive(sqlx::FromRow)]
@@ -2566,16 +2764,7 @@ mod pg {
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            // Next version = max(version) + 1, or 1 if no rows. `MAX(...)`
-            // returns a single row with a NULL column when the filter
-            // matches nothing, so decode as `Option<i32>`.
-            let max: (Option<i32>,) =
-                sqlx::query_as("SELECT MAX(version) FROM workflows WHERE kind = $1")
-                    .bind(&spec.kind)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-            let next = max.0.map(|v| v + 1).unwrap_or(1);
+            let next = next_version(&mut tx, &spec.kind).await?;
 
             spec.version = next;
             spec.status = WorkflowStatus::Draft;
@@ -2794,7 +2983,7 @@ mod pg {
             kind: &str,
             version: i32,
             actor: &boss_core::actor::ActorId,
-            _now: DateTime<Utc>,
+            now: DateTime<Utc>,
         ) -> Result<(), WorkflowError> {
             let mut tx = self
                 .pool
@@ -2845,6 +3034,23 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
+            // The number stays spent: `next_version` reads this table,
+            // so the next draft of this kind can never take it
+            // (backlog ce8b7d66).
+            sqlx::query(
+                "INSERT INTO workflow_discarded_versions
+                    (kind, version, discarded_at, discarded_by)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (kind, version) DO NOTHING",
+            )
+            .bind(kind)
+            .bind(version)
+            .bind(now)
+            .bind(actor.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
             let event = crate::events::workflow_registry_event(
                 crate::events::WORKFLOW_DRAFT_DISCARDED,
                 actor,
@@ -2880,13 +3086,7 @@ mod pg {
 
             // Compute next version inside the transaction so a
             // concurrent publish can't race us into a duplicate.
-            let max: (Option<i32>,) =
-                sqlx::query_as("SELECT MAX(version) FROM workflows WHERE kind = $1")
-                    .bind(&spec.kind)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-            let next = max.0.map(|v| v + 1).unwrap_or(1);
+            let next = next_version(&mut tx, &spec.kind).await?;
 
             spec.version = next;
             spec.status = WorkflowStatus::Active;
@@ -3036,16 +3236,18 @@ mod pg {
                             serde_json::to_value(&default.on_complete_create)
                                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
 
-                        let mut inserted = default.clone();
-                        inserted.version = 1;
-                        inserted.status = WorkflowStatus::Active;
-                        inserted.created_at = now;
-
                         let mut tx = self
                             .pool
                             .begin()
                             .await
                             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+                        // 1 on a kind that never had a row; above every
+                        // spent number otherwise (backlog ce8b7d66).
+                        let mut inserted = default.clone();
+                        inserted.version = next_version(&mut tx, &default.kind).await?;
+                        inserted.status = WorkflowStatus::Active;
+                        inserted.created_at = now;
 
                         sqlx::query(
                             "INSERT INTO workflows
@@ -3053,7 +3255,7 @@ mod pg {
                                  subject_kinds, steps, metadata_schema, entitlements, metadata,
                                  on_complete_create, owning_team, authoring_job_id,
                                  created_by, created_at)
-                             VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9,
+                             VALUES ($1, $14, 'active', $2, $3, $4, $5, $6, $7, $8, $9,
                                      $10, $11, $12, 'bootstrap', $13)",
                         )
                         .bind(&default.kind)
@@ -3069,6 +3271,7 @@ mod pg {
                         .bind(&default.owning_team)
                         .bind(default.authoring_job_id)
                         .bind(now)
+                        .bind(inserted.version)
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| WorkflowError::Storage(e.to_string()))?;
@@ -3147,14 +3350,7 @@ mod pg {
                                 .await
                                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-                                let next: i32 = sqlx::query_scalar(
-                                    "SELECT COALESCE(MAX(version), 0) + 1
-                                     FROM workflows WHERE kind = $1",
-                                )
-                                .bind(&default.kind)
-                                .fetch_one(&mut *tx)
-                                .await
-                                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+                                let next = next_version(&mut tx, &default.kind).await?;
 
                                 sqlx::query(
                                     "INSERT INTO workflows
@@ -3225,6 +3421,55 @@ pub use pg::PgWorkflows;
 
 #[cfg(test)]
 mod tests {
+
+    /// 228c9a7d: the outcome a close names is the first COMPLETED
+    /// declared terminal, paired by sort_order — a skipped terminal, a
+    /// completed non-terminal, and an index past the spec name nothing.
+    #[test]
+    fn a_closed_jobs_outcome_is_its_completed_terminals() {
+        let step = |title: &str, outcome: Option<&str>| super::StepSpec {
+            title: title.into(),
+            terminal: outcome.map(|o| super::Terminal { outcome: o.into() }),
+            ..Default::default()
+        };
+        let spec = super::WorkflowSpec::platform_seed(
+            "ship-a-change",
+            "Ship a change",
+            "engineering",
+            vec!["custom".into()],
+            vec![
+                step("review", None),
+                step("merged", Some("merged")),
+                step("disproved", Some("disproved")),
+            ],
+        );
+        assert_eq!(spec.terminal_outcome_at(2), Some("disproved"));
+        assert_eq!(spec.terminal_outcome_at(0), None);
+        assert_eq!(spec.terminal_outcome_at(-1), None);
+        assert_eq!(spec.terminal_outcome_at(3), None);
+        // 6b23d135's shape: review completed, merged skipped, disproved
+        // completed.
+        assert_eq!(
+            spec.completed_terminal_outcome([(0, true), (1, false), (2, true)]),
+            Some("disproved")
+        );
+        assert_eq!(
+            spec.completed_terminal_outcome([(0, true), (1, false), (2, false)]),
+            None
+        );
+        // Two completed terminals name the FIRST by sort_order, whatever
+        // order the caller read the steps in (5f99cd11: the PATCH repair
+        // check's copy sorted and this one did not, so the two could
+        // disagree on the same packet — the rule now owns the order).
+        assert_eq!(
+            spec.completed_terminal_outcome([(0, true), (1, true), (2, true)]),
+            Some("merged")
+        );
+        assert_eq!(
+            spec.completed_terminal_outcome([(2, true), (0, true), (1, true)]),
+            Some("merged")
+        );
+    }
 
     /// The platform bundle says exactly what the code used to say.
     ///
@@ -3460,150 +3705,6 @@ mod tests {
     }
     use super::*;
 
-    /// The `post-mortem` protocol is an ANALYSIS that produces many
-    /// countermeasures, not a single decision handed to the operator.
-    ///
-    /// It exists because an incident retrospective was filed on
-    /// `backlog-item`, whose triage → "Decide the design"
-    /// (`answer-question`) → build shape routed the ENTIRE retrospective
-    /// into the operator's design-decision queue as one verdict. A
-    /// post-mortem is IT-worked analysis whose product is a SET of
-    /// corrective actions, each of which becomes its own packet. So the
-    /// load-bearing assertion here is the negative one: this protocol
-    /// carries NO step that collapses the whole thing into one operator
-    /// decision (no `answer-question`, no approval-surface step whose
-    /// completion the whole flow funnels through). Authored as DATA in
-    /// the bundle, so the assertions follow it there — a new protocol
-    /// never touches Rust (see `the_platform_bundle_matches_the_specs_it
-    /// _replaced`).
-    #[test]
-    fn bundle_post_mortem_is_analysis_into_many_packets_not_one_decision() {
-        let bundled = crate::seed_loader::load_workflows(platform_bundle_path())
-            .expect("the platform bundle parses");
-        let pm = bundled
-            .iter()
-            .find(|k| k.kind == "post-mortem")
-            .expect("post-mortem present in the bundle");
-
-        assert_eq!(pm.version, 1);
-        assert_eq!(pm.status, WorkflowStatus::Active);
-        assert_eq!(pm.category, "platform");
-        assert_eq!(pm.subject_kinds, vec!["custom".to_string()]);
-        assert_eq!(pm.owning_team, "platform");
-
-        let step = |title: &str| {
-            pm.steps
-                .iter()
-                .find(|s| s.title == title)
-                .unwrap_or_else(|| panic!("`{title}` step present in post-mortem"))
-        };
-
-        // Kinds: analysis and countermeasures are IT WORK (`task`), the
-        // close is a `sign-off`, and the escape hatch is an `outcome`.
-        assert_eq!(step("recorded").kind, "trigger");
-        assert_eq!(step("analysis").kind, "task");
-        assert_eq!(step("countermeasures").kind, "task");
-        assert_eq!(step("complete").kind, "sign-off");
-        assert_eq!(step("abandoned").kind, "outcome");
-
-        // The implicit DAG: an edge A → B exists iff B.ready_when
-        // references A. recorded → analysis → countermeasures → complete,
-        // with abandoned branching off analysis.
-        assert_eq!(step("recorded").ready_when, "true", "trigger fires at open");
-        assert!(
-            step("analysis").ready_when.contains("steps.recorded"),
-            "analysis is ready after the trigger"
-        );
-        assert!(
-            step("countermeasures")
-                .ready_when
-                .contains("steps.analysis"),
-            "countermeasures is ready after analysis"
-        );
-        assert!(
-            step("complete")
-                .ready_when
-                .contains("steps.countermeasures"),
-            "complete is ready after countermeasures"
-        );
-        let abandoned_rw = &step("abandoned").ready_when;
-        assert!(
-            abandoned_rw.contains("steps.analysis"),
-            "abandoned branches off analysis (the DAG edge the lint needs)"
-        );
-        assert!(
-            abandoned_rw.contains("job.metadata.abandoned"),
-            "abandoned needs a person-set marker, or the dispatcher auto-completes \
-             it the instant analysis finishes and shuts the Job"
-        );
-
-        // THE POINT OF THE PROTOCOL: no step routes the whole
-        // retrospective to the operator as a single decision. That is
-        // exactly what filing it on `backlog-item` did, via the
-        // `answer-question` "Decide the design" step. Asserted through a
-        // kinds membership check rather than a `kind ==` comparison,
-        // which `infra/lint/no-step-kind-match.sh` refuses even in a
-        // src-file test.
-        let step_kinds: Vec<&str> = pm.steps.iter().map(|s| s.kind.as_str()).collect();
-        assert!(
-            !step_kinds.contains(&"answer-question"),
-            "a post-mortem must NOT collapse into one operator decision — a \
-             countermeasure that needs judgement becomes its OWN design-decision \
-             packet, filed by the countermeasures step, not a step in this Workflow"
-        );
-
-        // `countermeasures` records the filed packets (plural), and its
-        // required field is also what keeps the `complete` sign-off from
-        // arriving blind (viability lint Phase 4).
-        let cms = step("countermeasures");
-        let cms_field = cms
-            .fields
-            .iter()
-            .find(|f| f.name == "countermeasures")
-            .expect("countermeasures step declares a `countermeasures` field");
-        assert!(
-            cms_field.required,
-            "countermeasures must be recorded at done"
-        );
-        assert_eq!(
-            cms_field.field_type, "array",
-            "MANY corrective actions, each its own packet — an array, not one field"
-        );
-
-        // The happy terminal IS the sign-off, and it requires a
-        // `decision` so completion cannot lose the judgement (Phase 5).
-        let complete = step("complete");
-        assert_eq!(
-            complete.terminal.as_ref().map(|t| t.outcome.as_str()),
-            Some("completed"),
-            "reaching the sign-off closes the Job completed"
-        );
-        assert!(
-            complete.fields.iter().any(|f| f.required),
-            "the sign-off must record its decision, not close empty (Phase 5)"
-        );
-
-        // The escape hatch is a real, countable outcome.
-        assert_eq!(
-            step("abandoned")
-                .terminal
-                .as_ref()
-                .map(|t| t.outcome.as_str()),
-            Some("abandoned")
-        );
-
-        // And it is a viable protocol: every step reachable, every
-        // terminal reachable, no blind sign-off, no orphan fork. This
-        // names post-mortem specifically; `the_bundle_is_as_viable_as
-        // _the_code` proves it for the whole bundle.
-        let registry = crate::step_registry::StepRegistry::v1();
-        let findings = crate::workflow_lint::validate_all(std::slice::from_ref(pm), &registry);
-        assert!(
-            findings.is_empty(),
-            "post-mortem has viability findings: {findings:#?}"
-        );
-    }
-
     #[test]
     fn expand_metadata_substitutes_subject_fields_in_string_leaves() {
         let subject = Subject::new("account", "acc-bigseed-0042");
@@ -3660,6 +3761,10 @@ mod tests {
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             },
             StepField {
                 name: "markdown".into(),
@@ -3668,6 +3773,10 @@ mod tests {
                 filled_by: FilledBy::Filer,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             },
             StepField {
                 name: "resolutions".into(),
@@ -3676,6 +3785,10 @@ mod tests {
                 filled_by: FilledBy::Executor,
                 item_keys: Vec::new(),
                 covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
             },
         ];
         step.metadata = serde_json::json!({ "title": "Packet loss" });
@@ -3704,6 +3817,10 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         }];
 
         // An explicit null is not a value.
@@ -3744,6 +3861,10 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         }];
 
         // A title-less element is named by index and key.
@@ -3788,6 +3909,41 @@ mod tests {
         assert!(missing_filer_fields(std::slice::from_ref(&step)).is_empty());
     }
 
+    /// `item_one_of` at admission (design 26a89f11's file_refs arm): a
+    /// required filer field whose element carries NONE of its one-of
+    /// keys is missing its one choice, named as the alternatives. One
+    /// is whole; which one is the filer's call.
+    #[test]
+    fn missing_filer_fields_names_an_element_with_none_of_its_one_of_keys() {
+        use boss_core::job::{FilledBy, StepField};
+        let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
+        step.spec_slug = Some("review".into());
+        step.fields = vec![StepField {
+            name: "exhibits".into(),
+            field_type: "array".into(),
+            required: true,
+            filled_by: FilledBy::Filer,
+            item_keys: vec!["anchor".into()],
+            covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: vec!["html".into(), "file_ref".into()],
+            writer: None,
+        }];
+        step.metadata = serde_json::json!({ "exhibits": [
+            { "anchor": "E1", "html": "<p>x</p>" },
+            { "anchor": "E2", "file_ref": "f-1" },
+            { "anchor": "E3", "html": " " },
+        ]});
+        assert_eq!(
+            missing_filer_fields(std::slice::from_ref(&step)),
+            vec![(
+                "review".to_string(),
+                "exhibits[2].(html|file_ref)".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn missing_filer_fields_ignores_optional_filer_fields() {
         use boss_core::job::{FilledBy, StepField};
@@ -3799,6 +3955,10 @@ mod tests {
             filled_by: FilledBy::Filer,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         }];
         assert!(
             missing_filer_fields(std::slice::from_ref(&step)).is_empty(),
@@ -4176,6 +4336,63 @@ mod tests {
             Err(WorkflowError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// ce8b7d66: a (kind, version) pair names ONE protocol forever. The
+    /// allocator took MAX(version)+1 over the rows that exist, so
+    /// discarding the newest draft freed its number and the next draft
+    /// took it — and every packet already pinned to that pair (an
+    /// experiment admits to a draft, `boss job convert --to vN` moves
+    /// one onto it) silently ran the new text. A discarded number stays
+    /// spent, on every allocation path.
+    #[tokio::test]
+    async fn a_discarded_version_number_is_never_reused() {
+        let reg = InMemoryWorkflows::new();
+        let v1 = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.discard_draft("repair", v1.version, &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let next = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            next.version, 2,
+            "v1 was discarded, so the next draft must be v2, never v1 again"
+        );
+
+        // The authored-publish path allocates too, and must skip it as well.
+        reg.discard_draft("repair", next.version, &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let authored = reg
+            .publish_authored(seed_spec("repair"), JobId::new(), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(authored.version, 3, "v1 and v2 are spent; the next is v3");
+    }
+
+    /// TODAY'S BEHAVIOUR, pinned on purpose — not endorsed. `get_version`
+    /// has no status filter, so a DRAFT row is reachable as a pinned
+    /// protocol: an experiment admits packets to its `candidate_version`
+    /// (a draft by design) and `boss job convert --to vN` checks no
+    /// status. Whether a draft may be a pinned protocol at all, and what
+    /// authority that demands (a draft needs only workflow Create/Update,
+    /// not Publish), is the experiments design's question (d8771dec),
+    /// recorded on backlog ce8b7d66. When that decision lands, this test
+    /// is the one that must change — deliberately.
+    #[tokio::test]
+    async fn get_version_serves_a_draft_today() {
+        let reg = InMemoryWorkflows::new();
+        let d = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let served = reg.get_version("repair", d.version).await.unwrap();
+        assert_eq!(served.status, WorkflowStatus::Draft);
     }
 
     #[tokio::test]

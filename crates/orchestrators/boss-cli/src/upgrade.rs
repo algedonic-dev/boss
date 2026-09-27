@@ -41,7 +41,13 @@ pub async fn run() -> Result<()> {
     println!("  Platform:        {artifact}");
 
     print!("  Downloading latest release...");
-    let tmp_dir = env::temp_dir();
+    // A directory this uid and this process own (backlog c0172bbc). The
+    // artifact name is fixed and `gh` wrote it with --clobber straight
+    // into the shared 1777 temp root, so a leftover from another uid —
+    // root and the gate's 65534 share the dev pod's /tmp — failed the
+    // download with a permission error.
+    let tmp_dir = crate::own_temp::own_temp_path("boss-upgrade");
+    std::fs::create_dir_all(&tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
     let tmp_path = tmp_dir.join(&artifact);
 
     let output = Command::new("gh")
@@ -53,7 +59,7 @@ pub async fn run() -> Result<()> {
             "--pattern",
             &artifact,
             "--dir",
-            tmp_dir.to_str().unwrap_or("/tmp"),
+            tmp_dir.to_str().context("temp path is utf8")?,
             "--clobber",
         ])
         .output()
@@ -104,6 +110,11 @@ pub async fn run() -> Result<()> {
                 );
             }
         }
+    }
+    // The binary has been moved out; what remains is an empty directory
+    // of our own, and failing to remove it is worth a line, not an abort.
+    if let Err(e) = std::fs::remove_dir(&tmp_dir) {
+        println!("  note: could not remove {}: {e}", tmp_dir.display());
     }
 
     let version_output = Command::new(&current_exe)

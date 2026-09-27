@@ -47,10 +47,61 @@ use sqlx::PgPool;
 /// `boss-ml::bootstrap::seed_phase_two_candidates`.
 const CHURN_RISK_MODEL_ID: &str = "mdl-account-churn-risk-v1";
 
+/// Operator tier, or a role with broad account access. NOT a request
+/// with no `x-boss-user`: that arrives as `role=guest` and was admitted
+/// by name here — the full watchlist for nobody, while a signed-in
+/// service tech was refused (backlog 2f4be936; decided under e84de48e,
+/// David 2026-09-25: a request without the identity header is not
+/// trusted).
 fn is_trusted_or_broad(user: &User) -> bool {
-    user.role == "guest"
-        || user.access_tier == AccessTier::Operator
+    user.access_tier == AccessTier::Operator
         || boss_core::roles::has_broad_account_access(&user.role)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_without_the_identity_header_is_refused() {
+        assert!(!is_trusted_or_broad(&User::anonymous()));
+    }
+
+    fn scored(id: &str, score: i32) -> RiskScore {
+        RiskScore {
+            account_id: id.to_string(),
+            account_name: id.to_string(),
+            score,
+            top_factor: "healthy".to_string(),
+            factors: RiskFactors {
+                days_since_last_invoice: None,
+                open_ticket_count: 0,
+                has_active_contract: false,
+                days_since_last_note: None,
+            },
+        }
+    }
+
+    /// Backlog 9269d612 (page audit 08b0c4f8 GAP 8): `total_scored` was
+    /// `filtered.len()` AFTER `.take(limit)`, so it was the page size
+    /// under another name and /watchlist could not tell 200 scored from
+    /// 200 of 350. It counts every score past the cutoff, before the page.
+    #[test]
+    fn total_scored_counts_past_the_limit() {
+        let scores = (0..5).map(|i| scored(&format!("a{i}"), i * 10)).collect();
+        let list = rank(scores, 0, 2);
+        assert_eq!(list.total_scored, 5);
+        let top: Vec<i32> = list.accounts.iter().map(|s| s.score).collect();
+        assert_eq!(top, vec![40, 30], "the page is the highest scores");
+    }
+
+    #[test]
+    fn total_scored_honours_the_cutoff() {
+        let scores = (0..5).map(|i| scored(&format!("a{i}"), i * 10)).collect();
+        let list = rank(scores, 20, 200);
+        assert_eq!(list.total_scored, 3);
+        assert_eq!(list.accounts.len(), 3);
+    }
 }
 
 #[derive(Clone)]
@@ -118,33 +169,41 @@ async fn list_risk_scores(
 ) -> Response {
     // Security gate: account risk scores include financial + churn
     // signals. Only roles with broad account access (exec / VP /
-    // manager) see the cross-account watchlist; everyone else gets an
-    // empty list so the panel
-    // degrades cleanly rather than 403-ing.
+    // manager) see the cross-account watchlist; everyone else is
+    // REFUSED. This used to answer `200 {accounts: []}` "so the panel
+    // degrades cleanly", and /watchlist painted it as "No accounts
+    // match those filters." — a denial read as nothing at risk, the
+    // false-empty class (backlog 3f0cdca8; page audit 08b0c4f8 GAP 5,
+    // 2026-09-23). A refusal the page can name is the clean degrade.
     if !is_trusted_or_broad(&user) {
-        return Json(RiskScoreList {
-            accounts: Vec::new(),
-            total_scored: 0,
-        })
-        .into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "account risk scores are shown only to roles with broad account access",
+        )
+            .into_response();
     }
     let limit = params.limit.clamp(1, 200);
     match read_latest_predictions(&state.pool).await {
-        Ok(mut scores) => {
-            scores.sort_by_key(|s| std::cmp::Reverse(s.score));
-            let filtered: Vec<RiskScore> = scores
-                .into_iter()
-                .filter(|s| s.score >= params.min_score)
-                .take(limit)
-                .collect();
-            let total_scored = filtered.len();
-            Json(RiskScoreList {
-                accounts: filtered,
-                total_scored,
-            })
-            .into_response()
-        }
+        Ok(scores) => Json(rank(scores, params.min_score, limit)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// The highest `limit` scores at or above `min_score`, and how many
+/// there are in all. `total_scored` is counted BEFORE the limit: it was
+/// counted after, so a 200-row page reported 200 scored whatever the
+/// true number (backlog 9269d612; page audit 08b0c4f8 GAP 8), and a cap
+/// read as a count.
+fn rank(mut scores: Vec<RiskScore>, min_score: i32, limit: usize) -> RiskScoreList {
+    scores.sort_by_key(|s| std::cmp::Reverse(s.score));
+    let eligible: Vec<RiskScore> = scores
+        .into_iter()
+        .filter(|s| s.score >= min_score)
+        .collect();
+    let total_scored = eligible.len();
+    RiskScoreList {
+        accounts: eligible.into_iter().take(limit).collect(),
+        total_scored,
     }
 }
 

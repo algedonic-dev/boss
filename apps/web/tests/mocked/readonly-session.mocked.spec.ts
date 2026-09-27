@@ -19,6 +19,7 @@
 //      data 401s still bounce to /login.
 
 import { expect, test, type Page, type Route } from '@playwright/test';
+import { servePeopleRows } from './_smokeMocks';
 
 const JOB_ID = 'job-ro-1';
 
@@ -67,6 +68,7 @@ async function guestIdentity(page: Page): Promise<void> {
 
 async function operatorIdentity(page: Page): Promise<void> {
   await page.route(/\/api\/people$/, (r) => json(r, [OPERATOR]));
+  await servePeopleRows(page, [OPERATOR]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: OPERATOR.id, role: OPERATOR.role }));
 }
@@ -156,7 +158,7 @@ test.describe('the unauthenticated state is reachable and its copy is true', () 
 
     await page.goto(`/ux/jobs/${JOB_ID}`);
 
-    await page.waitForURL(/\/login\?next=/, { timeout: 10_000 });
+    await page.waitForURL(/\/login\?next=/);
     const next = new URL(page.url()).searchParams.get('next');
     expect(next).toBe(`/ux/jobs/${JOB_ID}`);
   });

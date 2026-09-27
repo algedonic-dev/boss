@@ -236,17 +236,32 @@ wait_for_dispatcher() {
 start_sim() {
     exec boss-brewery-sim 2>&1
 }
-# Whether the brewery tick daemon should run. Default: yes — the OSS
-# quickstart and the public brewery demo want live data. The cluster
-# sets BOSS_SIM_ENABLED=false to PARK the sim behind IT delivery
-# reliability (2026-09-05, park packet 59f063de): the tenant is still
-# published so the app keeps its brewery data, but no tick daemon spawns
-# new packets onto the yard. A flag, not a code fork, so only the
-# deployment that decided to pause it is affected.
+# Whether the brewery tick daemon should run: BOSS_SIM_ENABLED is `1` or
+# `true` (ASCII case-insensitive, surrounding whitespace ignored), and
+# ANYTHING ELSE, UNSET INCLUDED, IS OFF. The launcher derives the value
+# from the tenant manifest's `sim` key when the deployment does not set
+# it (derive_sim_env, tenant-modules.sh), so the OSS quickstart and the
+# playground — whose brewery manifest lists `sim = true` — still get
+# live data; prod sets "false" to PARK the sim (2026-09-05, park packet
+# 59f063de) and still publishes the tenant.
+#
+# ONE RULE IN TWO LANGUAGES (backlog d65bd066, 2026-09-27). Every Rust
+# service reads this same variable through
+# boss_policy_client::sim_enabled_value to decide whether to honour the
+# sim bypass. Until this date this function defaulted to ON and read
+# anything not false-like (`yes`, `on`, a typo) as on, while Rust
+# accepted only 1/true — so BOSS_SIM_ENABLED=yes started a tick daemon
+# that every service refused. Off is the safe default: a simulator
+# writing into a real instance is the worse accident. The test
+# the_sim_switch_reads_one_way (crates/core/boss-testing) runs this
+# function and the Rust parser on one table of inputs.
 sim_enabled() {
-    case "${BOSS_SIM_ENABLED:-true}" in
-        false|False|FALSE|0|no|No|NO|off|Off|OFF) return 1 ;;
-        *) return 0 ;;
+    local v="${BOSS_SIM_ENABLED:-}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    case "${v,,}" in
+        1|true) return 0 ;;
+        *) return 1 ;;
     esac
 }
 # When the sim is disabled AND this launch is a tracked background child
@@ -272,7 +287,7 @@ launch_tenant_and_sim() {
             # Tenant published synchronously above; no tick daemon, so no
             # tracked child to add — the launcher simply runs one fewer
             # service and the pod's other long-lived children keep it up.
-            echo "    boss-brewery-sim DISABLED (BOSS_SIM_ENABLED=${BOSS_SIM_ENABLED:-true}) — tenant published, tick daemon parked"
+            echo "    boss-brewery-sim DISABLED (BOSS_SIM_ENABLED=${BOSS_SIM_ENABLED:-unset}) — tenant published, tick daemon parked"
         fi
         return 0
     fi

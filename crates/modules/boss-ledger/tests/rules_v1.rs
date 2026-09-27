@@ -2,6 +2,7 @@
 //! balanced entry; unknown fact kinds + malformed payloads must fail
 //! explicitly rather than producing incorrect postings.
 
+use boss_ledger::revenue_accounts::{self, RevenueAccounts};
 use boss_ledger::rules::{BossRuleSet, evaluate};
 use boss_ledger::types::FactRef;
 use boss_ledger::{JournalLineDraft, LedgerError};
@@ -18,6 +19,44 @@ fn fact<'a>(kind: &'a str, payload: &'a serde_json::Value) -> FactRef<'a> {
     }
 }
 
+/// A tenant's revenue-category Classes, read from its own
+/// `classes.json`: every `(invoice, revenue_category)` row with the
+/// `gl_account` its metadata names (backlog aa860c6d).
+fn revenue_rows(rel: &str) -> Vec<(String, Option<String>)> {
+    let path = boss_testing::repo_root().join(rel);
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    rows.iter()
+        .filter(|r| {
+            r["subject_kind"] == revenue_accounts::SUBJECT_KIND
+                && r["member_attribute"] == revenue_accounts::MEMBER_ATTRIBUTE
+        })
+        .map(|r| {
+            (
+                r["code"].as_str().unwrap().to_string(),
+                revenue_accounts::gl_account_of(&r["metadata"]),
+            )
+        })
+        .collect()
+}
+
+/// The brewery example tenant's seed.
+const BREWERY: &str = "examples/brewery/seeds/classes.json";
+/// Algedonic, LLC's, from the tenant fixture that copies its repository.
+const LLC: &str =
+    "crates/orchestrators/boss-cli/tests/fixtures/tenant-algedonic/seeds/classes.json";
+
+/// The brewery example tenant's categories — what every rule below
+/// evaluates against.
+fn rules() -> BossRuleSet {
+    BossRuleSet::new(RevenueAccounts::from_classes(revenue_rows(BREWERY)))
+}
+
+/// Algedonic, LLC's categories.
+fn llc() -> BossRuleSet {
+    BossRuleSet::new(RevenueAccounts::from_classes(revenue_rows(LLC)))
+}
+
 fn line_for<'a>(draft: &'a [JournalLineDraft], code: &str) -> &'a JournalLineDraft {
     draft
         .iter()
@@ -32,10 +71,10 @@ fn invoice_issued_single_line_is_balanced() {
         "amount_cents": 1_200_000,
         "currency": "USD",
         "line_items": [
-            {"category": "new-sales", "amount_cents": 1_200_000, "currency": "USD"},
+            {"category": "wholesale", "amount_cents": 1_200_000, "currency": "USD"},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
     assert!(draft.is_balanced());
     // RuleSet v1 posts revenue + A/R only; COGS recognition has
     // moved off the invoice path entirely (Model B). The fixed-
@@ -59,27 +98,31 @@ fn invoice_issued_mixed_categories_splits_revenue() {
         "amount_cents": 1_500_000,
         "currency": "USD",
         "line_items": [
-            {"category": "new-sales", "amount_cents": 1_000_000, "currency": "USD"},
-            {"category": "service",   "amount_cents":   300_000, "currency": "USD"},
-            {"category": "service",   "amount_cents":   200_000, "currency": "USD"},
+            {"category": "wholesale", "amount_cents": 1_000_000, "currency": "USD"},
+            {"category": "taproom",   "amount_cents":   300_000, "currency": "USD"},
+            {"category": "taproom",   "amount_cents":   200_000, "currency": "USD"},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1100").debit_cents, 1_500_000i64);
     assert_eq!(line_for(&draft.lines, "4100").credit_cents, 1_000_000i64);
-    // Two service lines roll up into one credit to 4120.
+    // Two taproom lines roll up into one credit to 4120.
     assert_eq!(line_for(&draft.lines, "4120").credit_cents, 500_000i64);
 }
 
 #[test]
 fn invoice_issued_all_revenue_categories_resolve() {
+    // The brewery example tenant's own Classes name these accounts
+    // (examples/brewery/seeds/classes.json, `metadata.gl_account`).
     let cases = [
-        ("new-sales", "4100"),
-        ("used-sales", "4110"),
-        ("service", "4120"),
-        ("parts", "4130"),
-        ("contracts", "4140"),
+        ("wholesale", "4100"),
+        ("retail", "4110"),
+        ("merchandise", "4110"),
+        ("taproom", "4120"),
+        ("event-package", "4130"),
+        ("distribution", "4140"),
+        ("uncategorized", "4140"),
     ];
     for (category, account) in cases {
         let payload = json!({
@@ -88,12 +131,34 @@ fn invoice_issued_all_revenue_categories_resolve() {
             "currency": "USD",
             "line_items": [{"category": category, "amount_cents": 50_000, "currency": "USD"}],
         });
-        let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+        let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
         assert_eq!(
             line_for(&draft.lines, account).credit_cents,
             50_000i64,
             "category {category} should credit {account}"
         );
+    }
+}
+
+/// The used-device shop's five categories left with the shop (backlog
+/// a8991c86, 2026-09-24): the brewery declares no Class for them, so
+/// they refuse. A tenant that still needs one declares it as a Class
+/// naming its `gl_account`.
+#[test]
+fn invoice_issued_with_a_retired_device_shop_category_fails() {
+    for category in ["new-sales", "used-sales", "service", "parts", "contracts"] {
+        let payload = json!({
+            "invoice_id": "inv-retired",
+            "amount_cents": 50_000,
+            "currency": "USD",
+            "line_items": [{"category": category, "amount_cents": 50_000, "currency": "USD"}],
+        });
+        match evaluate(&rules(), &fact("finance.invoice.issued", &payload)) {
+            Err(LedgerError::InvalidPayload { reason, .. }) => {
+                assert!(reason.contains(category), "reason: {reason}");
+            }
+            other => panic!("{category}: expected InvalidPayload, got {other:?}"),
+        }
     }
 }
 
@@ -105,7 +170,7 @@ fn invoice_issued_unknown_category_fails() {
         "currency": "USD",
         "line_items": [{"category": "mystery", "amount_cents": 50_000, "currency": "USD"}],
     });
-    match evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)) {
+    match evaluate(&rules(), &fact("finance.invoice.issued", &payload)) {
         Err(LedgerError::InvalidPayload { reason, .. }) => {
             assert!(reason.contains("mystery"), "reason: {reason}");
         }
@@ -117,7 +182,7 @@ fn invoice_issued_unknown_category_fails() {
 fn invoice_issued_missing_line_items_fails() {
     let payload = json!({"invoice_id": "inv-nolines", "amount_cents": 50_000, "currency": "USD"});
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)),
+        evaluate(&rules(), &fact("finance.invoice.issued", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -125,7 +190,7 @@ fn invoice_issued_missing_line_items_fails() {
 #[test]
 fn invoice_paid_swaps_ar_to_cash() {
     let payload = json!({"invoice_id": "inv-1", "amount_cents": 1_200_000, "currency": "USD"});
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.paid", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.paid", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1000").debit_cents, 1_200_000i64);
     assert_eq!(line_for(&draft.lines, "1100").credit_cents, 1_200_000i64);
@@ -136,7 +201,7 @@ fn payment_received_debits_cash_in_transit() {
     // Two-phase payment part 1: A/R moves into Cash in Transit (1010),
     // not Cash. Bank clearing generator will flip 1010 → 1000 later.
     let payload = json!({"invoice_id": "inv-1", "amount_cents": 1_200_000, "currency": "USD"});
-    let draft = evaluate(&BossRuleSet, &fact("finance.payment.received", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.payment.received", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1010").debit_cents, 1_200_000i64);
     assert_eq!(line_for(&draft.lines, "1100").credit_cents, 1_200_000i64);
@@ -152,7 +217,7 @@ fn payment_settled_drains_cash_in_transit_to_cash() {
         "amount_cents": 1_200_000,
         "currency": "USD",
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.payment.settled", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.payment.settled", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1000").debit_cents, 1_200_000i64);
     assert_eq!(line_for(&draft.lines, "1010").credit_cents, 1_200_000i64);
@@ -166,7 +231,7 @@ fn payment_settled_drains_cash_in_transit_to_cash() {
 #[test]
 fn payment_settled_without_settlement_id_falls_back_to_invoice_memo() {
     let payload = json!({"invoice_id": "inv-9", "amount_cents": 500_000, "currency": "USD"});
-    let draft = evaluate(&BossRuleSet, &fact("finance.payment.settled", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.payment.settled", &payload)).unwrap();
     assert_eq!(draft.memo.as_deref(), Some("Payment settled: inv-9"));
 }
 
@@ -174,7 +239,7 @@ fn payment_settled_without_settlement_id_falls_back_to_invoice_memo() {
 fn payment_received_missing_amount_fails() {
     let payload = json!({"invoice_id": "inv-1", "currency": "USD"});
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.payment.received", &payload)),
+        evaluate(&rules(), &fact("finance.payment.received", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -186,18 +251,14 @@ fn two_phase_payment_round_trip_nets_cash_delta_and_zeros_transit() {
     // gain are equal, and Cash in Transit lands at zero.
     let payload = json!({"invoice_id": "inv-1", "amount_cents": 750_000, "currency": "USD"});
 
-    let recv = evaluate(&BossRuleSet, &fact("finance.payment.received", &payload)).unwrap();
+    let recv = evaluate(&rules(), &fact("finance.payment.received", &payload)).unwrap();
     let settle_payload = json!({
         "invoice_id": "inv-1",
         "settlement_id": "set-1",
         "amount_cents": 750_000,
         "currency": "USD",
     });
-    let settle = evaluate(
-        &BossRuleSet,
-        &fact("finance.payment.settled", &settle_payload),
-    )
-    .unwrap();
+    let settle = evaluate(&rules(), &fact("finance.payment.settled", &settle_payload)).unwrap();
 
     let cash_delta = line_for(&settle.lines, "1000").debit_cents;
     let ar_delta = line_for(&recv.lines, "1100").credit_cents;
@@ -223,7 +284,7 @@ fn payroll_run_posts_compound_entry() {
         "employer_tax_cents": 90_000,
         "employee_count": 5,
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.payroll.run", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.payroll.run", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "6100").debit_cents, 1_000_000i64);
     assert_eq!(line_for(&draft.lines, "6400").debit_cents, 90_000i64);
@@ -247,7 +308,7 @@ fn payroll_run_with_zero_employer_tax_omits_6400_line() {
         "employer_tax_cents": 0,
         "employee_count": 2,
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.payroll.run", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.payroll.run", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert!(draft.lines.iter().all(|l| l.account_code != "6400"));
     assert_eq!(line_for(&draft.lines, "2150").credit_cents, 100_000i64);
@@ -263,7 +324,7 @@ fn payroll_run_rejects_withheld_over_gross() {
         "employer_tax_cents": 0,
         "employee_count": 1,
     });
-    match evaluate(&BossRuleSet, &fact("finance.payroll.run", &payload)) {
+    match evaluate(&rules(), &fact("finance.payroll.run", &payload)) {
         Err(LedgerError::InvalidPayload { reason, .. }) => {
             assert!(reason.contains("withheld"), "reason: {reason}");
         }
@@ -281,7 +342,7 @@ fn payroll_run_rejects_negative_amounts() {
         "employee_count": 1,
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.payroll.run", &payload)),
+        evaluate(&rules(), &fact("finance.payroll.run", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -290,7 +351,7 @@ fn payroll_run_rejects_negative_amounts() {
 fn payroll_run_missing_gross_fails() {
     let payload = json!({"run_id": "pr-1", "withheld_cents": 0, "employer_tax_cents": 0});
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.payroll.run", &payload)),
+        evaluate(&rules(), &fact("finance.payroll.run", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -310,7 +371,7 @@ fn bill_approved_clears_grir_and_lands_ap() {
             { "part_sku": "ING-HOPS-CASCADE-44", "qty": 4, "unit_cost_cents": 50_000 },
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.bill.approved", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.bill.approved", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2110").debit_cents, 450_000i64);
     assert_eq!(line_for(&draft.lines, "2100").credit_cents, 450_000i64);
@@ -319,7 +380,7 @@ fn bill_approved_clears_grir_and_lands_ap() {
 #[test]
 fn bill_paid_settles_ap_from_cash() {
     let payload = json!({"vendor_invoice_id": "vi-1", "amount_cents": 450_000, "currency": "USD"});
-    let draft = evaluate(&BossRuleSet, &fact("finance.bill.paid", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.bill.paid", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2100").debit_cents, 450_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 450_000i64);
@@ -329,7 +390,7 @@ fn bill_paid_settles_ap_from_cash() {
 fn unknown_fact_kind_is_rejected() {
     let payload = json!({});
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.mystery", &payload)),
+        evaluate(&rules(), &fact("finance.mystery", &payload)),
         Err(LedgerError::UnknownFactKind(_))
     ));
 }
@@ -338,7 +399,7 @@ fn unknown_fact_kind_is_rejected() {
 fn posted_on_comes_from_fact_happened_on() {
     let payload = json!({"invoice_id": "inv-1", "amount_cents": 10_000, "currency": "USD"});
     let f = fact("finance.invoice.paid", &payload);
-    let draft = evaluate(&BossRuleSet, &f).unwrap();
+    let draft = evaluate(&rules(), &f).unwrap();
     assert_eq!(draft.posted_on, f.happened_on);
 }
 
@@ -351,7 +412,7 @@ fn manual_entry_passes_lines_through() {
             {"account_code": "2100", "credit_cents": 250_000},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.manual.entry", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.manual.entry", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(draft.memo.as_deref(), Some("Q1 rent accrual"));
     assert_eq!(line_for(&draft.lines, "6200").debit_cents, 250_000i64);
@@ -373,7 +434,7 @@ fn manual_entry_needs_at_least_two_lines() {
         "lines": [{"account_code": "6200", "debit_cents": 100}],
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.manual.entry", &payload)),
+        evaluate(&rules(), &fact("finance.manual.entry", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -387,7 +448,7 @@ fn manual_entry_rejects_line_with_both_sides() {
         ],
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.manual.entry", &payload)),
+        evaluate(&rules(), &fact("finance.manual.entry", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -404,7 +465,7 @@ fn manual_entry_rejects_unbalanced_draft() {
         ],
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.manual.entry", &payload)),
+        evaluate(&rules(), &fact("finance.manual.entry", &payload)),
         Err(LedgerError::Unbalanced { .. })
     ));
 }
@@ -423,13 +484,13 @@ fn invoice_issued_with_sales_tax_credits_2300() {
         "amount_cents": 107_250,
         "currency": "USD",
         "line_items": [
-            {"category": "service", "amount_cents": 100_000, "currency": "USD"},
+            {"category": "taproom", "amount_cents": 100_000, "currency": "USD"},
         ],
         "tax_lines": [
             {"account": "2300", "jurisdiction": "US-CA", "amount_cents": 7_250},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1100").debit_cents, 107_250i64);
     assert_eq!(line_for(&draft.lines, "4120").credit_cents, 100_000i64);
@@ -449,13 +510,13 @@ fn invoice_issued_zero_tax_line_is_omitted() {
         "amount_cents": 100_000,
         "currency": "USD",
         "line_items": [
-            {"category": "new-sales", "amount_cents": 100_000, "currency": "USD"},
+            {"category": "wholesale", "amount_cents": 100_000, "currency": "USD"},
         ],
         "tax_lines": [
             {"account": "2300", "jurisdiction": "US-OR", "amount_cents": 0},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert!(draft.lines.iter().all(|l| l.account_code != "2300"));
 }
@@ -469,10 +530,10 @@ fn invoice_issued_no_tax_lines_key_is_backward_compatible() {
         "amount_cents": 50_000,
         "currency": "USD",
         "line_items": [
-            {"category": "parts", "amount_cents": 50_000, "currency": "USD"},
+            {"category": "event-package", "amount_cents": 50_000, "currency": "USD"},
         ],
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.invoice.issued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1100").debit_cents, 50_000i64);
     assert_eq!(line_for(&draft.lines, "4130").credit_cents, 50_000i64);
@@ -484,11 +545,11 @@ fn invoice_issued_rejects_negative_tax() {
         "invoice_id": "inv-bad",
         "amount_cents": 100_000,
         "currency": "USD",
-        "line_items": [{"category": "service", "amount_cents": 100_000, "currency": "USD"}],
+        "line_items": [{"category": "taproom", "amount_cents": 100_000, "currency": "USD"}],
         "tax_lines": [{"account": "2300", "jurisdiction": "US-CA", "amount_cents": -500}],
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)),
+        evaluate(&rules(), &fact("finance.invoice.issued", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -502,11 +563,11 @@ fn invoice_issued_rejects_unknown_tax_account() {
         "invoice_id": "inv-bad",
         "amount_cents": 100_000,
         "currency": "USD",
-        "line_items": [{"category": "service", "amount_cents": 100_000, "currency": "USD"}],
+        "line_items": [{"category": "taproom", "amount_cents": 100_000, "currency": "USD"}],
         "tax_lines": [{"account": "2320", "jurisdiction": "US-CA", "amount_cents": 100}],
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.invoice.issued", &payload)),
+        evaluate(&rules(), &fact("finance.invoice.issued", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -524,7 +585,7 @@ fn tax_remitted_drains_sales_liability_to_cash() {
         "period_start": "2026-03-01",
         "period_end": "2026-03-31",
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.tax.remitted", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.tax.remitted", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2300").debit_cents, 725_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 725_000i64);
@@ -546,7 +607,7 @@ fn tax_remitted_drains_payroll_liability_2150() {
         "period_start": "2026-01-01",
         "period_end": "2026-03-31",
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.tax.remitted", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.tax.remitted", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2150").debit_cents, 1_800_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 1_800_000i64);
@@ -567,7 +628,7 @@ fn tax_accrued_books_expense_to_liability() {
         "liability_account": "2310",
         "amount_cents": 1_500_000,
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.tax.accrued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.tax.accrued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "6500").debit_cents, 1_500_000i64);
     assert_eq!(line_for(&draft.lines, "2310").credit_cents, 1_500_000i64);
@@ -592,7 +653,7 @@ fn tax_accrued_does_not_judge_the_expense_account() {
         "liability_account": "2900",
         "amount_cents": 100,
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.tax.accrued", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.tax.accrued", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "6910").debit_cents, 100i64);
     assert_eq!(line_for(&draft.lines, "2900").credit_cents, 100i64);
@@ -609,7 +670,7 @@ fn tax_accrued_rejects_zero_amount() {
         "amount_cents": 0,
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.tax.accrued", &payload)),
+        evaluate(&rules(), &fact("finance.tax.accrued", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -624,7 +685,7 @@ fn tax_remitted_rejects_zero_amount() {
         "amount_cents": 0,
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.tax.remitted", &payload)),
+        evaluate(&rules(), &fact("finance.tax.remitted", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -643,7 +704,7 @@ fn keg_deposit_charged_credits_the_liability() {
         "deposit_cents": 36_000,
         "shipped_on": "2026-03-01",
     });
-    let draft = evaluate(&BossRuleSet, &fact("finance.keg_deposit.charged", &payload)).unwrap();
+    let draft = evaluate(&rules(), &fact("finance.keg_deposit.charged", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "1000").debit_cents, 36_000i64);
     assert_eq!(line_for(&draft.lines, "2400").credit_cents, 36_000i64);
@@ -661,7 +722,7 @@ fn keg_deposit_charged_missing_amount_fails() {
         "kegs_out": 4,
     });
     assert!(matches!(
-        evaluate(&BossRuleSet, &fact("finance.keg_deposit.charged", &payload)),
+        evaluate(&rules(), &fact("finance.keg_deposit.charged", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
 }
@@ -677,7 +738,7 @@ fn keg_deposit_charged_rejects_non_positive_inputs() {
         });
         assert!(
             matches!(
-                evaluate(&BossRuleSet, &fact("finance.keg_deposit.charged", &payload)),
+                evaluate(&rules(), &fact("finance.keg_deposit.charged", &payload)),
                 Err(LedgerError::InvalidPayload { .. })
             ),
             "kegs_out={kegs_out} deposit_cents={deposit_cents} must be rejected"
@@ -699,11 +760,7 @@ fn keg_deposit_released_full_return_refunds_everything() {
         "deposit_cents": 36_000,
         "returned_on": "2026-03-15",
     });
-    let draft = evaluate(
-        &BossRuleSet,
-        &fact("finance.keg_deposit.released", &payload),
-    )
-    .unwrap();
+    let draft = evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2400").debit_cents, 36_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 36_000i64);
@@ -729,11 +786,7 @@ fn keg_deposit_released_partial_return_splits_refund_and_forfeiture() {
         "deposit_cents": 30_000,
         "returned_on": "2026-03-20",
     });
-    let draft = evaluate(
-        &BossRuleSet,
-        &fact("finance.keg_deposit.released", &payload),
-    )
-    .unwrap();
+    let draft = evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2400").debit_cents, 30_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 21_000i64);
@@ -750,11 +803,7 @@ fn keg_deposit_released_all_lost_forfeits_everything() {
         "kegs_lost": 5,
         "deposit_cents": 15_000,
     });
-    let draft = evaluate(
-        &BossRuleSet,
-        &fact("finance.keg_deposit.released", &payload),
-    )
-    .unwrap();
+    let draft = evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2400").debit_cents, 15_000i64);
     assert_eq!(line_for(&draft.lines, "4150").credit_cents, 15_000i64);
@@ -778,11 +827,7 @@ fn keg_deposit_released_rounding_remainder_lands_in_forfeiture() {
         "kegs_lost": 1,
         "deposit_cents": 1_000,
     });
-    let draft = evaluate(
-        &BossRuleSet,
-        &fact("finance.keg_deposit.released", &payload),
-    )
-    .unwrap();
+    let draft = evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)).unwrap();
     assert!(draft.is_balanced());
     assert_eq!(line_for(&draft.lines, "2400").debit_cents, 1_000i64);
     assert_eq!(line_for(&draft.lines, "1000").credit_cents, 666i64);
@@ -805,10 +850,7 @@ fn keg_deposit_released_rejects_non_conserving_counts() {
         });
         assert!(
             matches!(
-                evaluate(
-                    &BossRuleSet,
-                    &fact("finance.keg_deposit.released", &payload)
-                ),
+                evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)),
                 Err(LedgerError::InvalidPayload { .. })
             ),
             "out={out} returned={returned} lost={lost} must be rejected"
@@ -824,10 +866,67 @@ fn keg_deposit_released_missing_counts_fail() {
         "deposit_cents": 3_000,
     });
     assert!(matches!(
-        evaluate(
-            &BossRuleSet,
-            &fact("finance.keg_deposit.released", &payload)
-        ),
+        evaluate(&rules(), &fact("finance.keg_deposit.released", &payload)),
         Err(LedgerError::InvalidPayload { .. })
     ));
+}
+
+/// Algedonic, LLC's hosting business invoices in the `hosting`
+/// category, whose Class names 4400 Hosting revenue — the account the
+/// LLC declared live on 2026-09-17. Until aa860c6d the map was a
+/// platform file holding only the brewery's rows, so this line refused.
+#[test]
+fn a_hosting_line_posts_to_the_account_its_class_names() {
+    let payload = json!({
+        "invoice_id": "inv-hosting",
+        "amount_cents": 40_000,
+        "currency": "USD",
+        "line_items": [{"category": "hosting", "amount_cents": 40_000, "currency": "USD"}],
+    });
+    let draft = evaluate(&llc(), &fact("finance.invoice.issued", &payload)).unwrap();
+    assert!(draft.is_balanced());
+    assert_eq!(line_for(&draft.lines, "4400").credit_cents, 40_000);
+    assert_eq!(line_for(&draft.lines, "1100").debit_cents, 40_000);
+}
+
+/// Every revenue-category Class each in-tree tenant declares resolves
+/// to an account — a Class without one could not post an invoice line.
+#[test]
+fn every_revenue_category_a_tenant_declares_resolves_to_an_account() {
+    for (rel, rules) in [(BREWERY, rules()), (LLC, llc())] {
+        let declared = revenue_rows(rel);
+        assert!(!declared.is_empty(), "{rel} declares no revenue category");
+        for (category, _) in declared {
+            let payload = json!({
+                "invoice_id": "inv-each",
+                "amount_cents": 1_000,
+                "currency": "USD",
+                "line_items": [{"category": category, "amount_cents": 1_000, "currency": "USD"}],
+            });
+            if let Err(e) = evaluate(&rules, &fact("finance.invoice.issued", &payload)) {
+                panic!("{rel}: revenue_category Class `{category}` does not post: {e}");
+            }
+        }
+    }
+}
+
+/// A category no Class declares still refuses, by name, for the LLC as
+/// for the brewery: the brewery's `wholesale` is not the LLC's.
+#[test]
+fn an_undeclared_category_still_refuses() {
+    let payload = json!({
+        "invoice_id": "inv-x",
+        "amount_cents": 1_000,
+        "currency": "USD",
+        "line_items": [{"category": "wholesale", "amount_cents": 1_000, "currency": "USD"}],
+    });
+    match evaluate(&llc(), &fact("finance.invoice.issued", &payload)) {
+        Err(LedgerError::InvalidPayload { reason, .. }) => {
+            assert!(
+                reason.contains("unknown revenue category `wholesale`"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected InvalidPayload, got {other:?}"),
+    }
 }

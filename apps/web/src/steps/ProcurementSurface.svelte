@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import { putStep } from './stepWrite';
+  import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { saveStep, startStep } from './stepWrite';
+  import { claimedFor, startable } from './holder';
   import { formatMoney } from '@boss/web-kit/ui/money';
   // Procurement step surface — place a purchase order with a
   // vendor. The ingredient-restock Workflow opens with this step
@@ -80,21 +81,27 @@
     return formatMoney({ amount_cents: cents, currency: 'USD' }, { precision: 'cents' });
   }
 
-  async function persist(status?: string): Promise<void> {
+  /// `status` only when the gesture moves the step — never the page's
+  /// snapshot (backlog 6ef4a36b) — and a Start saves, then claims for the
+  /// stored nominee (design 611fbffd, clause b).
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // The key this surface owns, through the merge door; an emptied
+      // date is sent as null and deleted, where it used to be cleared by
+      // omission from a wholesale PUT (backlog e39a9d2a).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
-        status: status ?? step.status,
+        ...(status ? { status } : {}),
         metadata: {
-          ...step.metadata,
           expected_date: expectedDate || undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(step.assignee_id));
+      }
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -185,10 +192,10 @@
   {/if}
 
   <div class="step-actions">
-    {#if !terminal && isPending(step.status)}
+    {#if startable(step)}
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist('active')}
+        class="btn btn-primary"
+        onclick={() => persist(undefined, true)}
         disabled={saving}
       >
         Start
@@ -196,7 +203,7 @@
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || lineItems.length === 0}
       >
@@ -217,8 +224,8 @@
     text-align: left;
     font-weight: 600;
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border, #e5e7eb);
-    color: var(--text-muted, #6b7280);
+    border-bottom: 1px solid var(--border);
+    color: var(--static);
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -228,7 +235,7 @@
   }
   .step-line-items td {
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-line-items .col-sku { width: 160px; }
   .step-line-items .num {
@@ -237,16 +244,16 @@
     width: 90px;
   }
   .step-line-items .desc {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
   .step-line-items tr.total {
     font-weight: 600;
   }
   .step-line-items tr.total td {
-    border-top: 1px solid var(--border, #d1d5db);
+    border-top: 1px solid var(--border);
     border-bottom: none;
   }
   .muted {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
 </style>

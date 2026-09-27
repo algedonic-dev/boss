@@ -181,11 +181,7 @@ async fn a_completed_workflow_step_publishes_its_slug_on_step_done() {
         req(
             "PUT",
             &format!("/api/jobs/{job_id}/steps/{scope_id}"),
-            serde_json::json!({
-                "status": "completed",
-                "metadata": {"summary": "s", "excludes": "e",
-                             "authority_role": "platform-admin"},
-            }),
+            scope_completion(&scope["metadata"]),
         ),
     )
     .await;
@@ -216,6 +212,13 @@ async fn a_completed_workflow_step_publishes_its_slug_on_step_done() {
     assert_eq!(
         scope_done[0].payload["workflow_kind"], "ship-a-change",
         "step.done must carry the parent job's kind"
+    );
+    // ...and the job's owner: the one waiting on the packet, whom a
+    // `notify_on_done` step's wait-is-over signal reaches when the step
+    // names no role — every pr-train step since v2 (backlog 58f0b536).
+    assert_eq!(
+        scope_done[0].payload["job_owner_id"], "emp-bootstrap-admin",
+        "step.done must carry the parent job's owner"
     );
 }
 
@@ -297,4 +300,15 @@ async fn a_step_without_a_slug_publishes_an_empty_spec_slug() {
         serde_json::Value::String(String::new()),
         "a step with no slug must publish \"\", not null and not absent"
     );
+}
+
+/// The scope completion as a read-merge-write: the step's stored
+/// metadata with the evidence laid over it. The step PUT refuses a
+/// metadata body that omits a stored key (e39a9d2a), so a completer
+/// sends back everything it read.
+fn scope_completion(stored: &serde_json::Value) -> serde_json::Value {
+    let mut metadata = stored.clone();
+    metadata["summary"] = serde_json::json!("s");
+    metadata["excludes"] = serde_json::json!("e");
+    serde_json::json!({"status": "completed", "metadata": metadata})
 }

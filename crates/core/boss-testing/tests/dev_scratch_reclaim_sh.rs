@@ -86,16 +86,48 @@ fn stub_curl(root: &Path) -> PathBuf {
             "done\n",
             "printf '%s %s %s\\n' \"$method\" \"$url\" \"$body\" >> \"$STUB_LOG\"\n",
             // The fast-forward pass asks ONE question of the system of
-            // record — is a gate reading a tree right now — and a test
-            // decides the answer: none open by default, one open with
-            // STUB_OPEN_GATE, and an API that ANSWERS an error (curl's
-            // 22 under -f) with STUB_GATE_RC.
+            // record — is a gate LAUNCHING right now — and a test
+            // decides the answer: none open by default; one open with
+            // STUB_OPEN_GATE, aged by STUB_GATE_AGE_SECS (default 0, a
+            // gate opened this second); a page that reports more open
+            // runs than it returns with STUB_GATE_TOTAL; and an API
+            // that ANSWERS an error (curl's 22 under -f) with
+            // STUB_GATE_RC.
             "case \"$url\" in\n",
+            // The worktree pass's RECORD reads (backlog 9a044141): the
+            // gate-runs launched from a worktree, the cars on a branch
+            // (both narrowed by `metadata=`), and an agent-run by id.
+            // Answered from the JSON document at STUB_RECORD —
+            // `{gate_runs: [...], cars: [...], runs: {id: status}}`,
+            // empty when unset — filtered by the same containment the
+            // real list applies; STUB_RECORD_RC fails every one of
+            // them (7: nothing answered; 22: an error answered).
+            "    *kind=gate-run*metadata=* | *kind=ship-a-change*metadata=* | */api/jobs/run*)\n",
+            "        if [ -n \"${STUB_RECORD_RC:-}\" ]; then exit \"$STUB_RECORD_RC\"; fi\n",
+            "        rec=$(cat \"${STUB_RECORD:-/dev/null}\" 2>/dev/null); [ -n \"$rec\" ] || rec='{}'\n",
+            "        case \"$url\" in\n",
+            "            */api/jobs/run*)\n",
+            "                id=${url##*/api/jobs/}\n",
+            "                jq -c --arg id \"$id\" '(.runs[$id] // \"open\") as $s\n",
+            "                    | {id: $id, kind: \"agent-run\", status: $s,\n",
+            "                       metadata: {outcome: (if $s == \"closed\" then \"landed\" else null end)}}' <<<\"$rec\" ;;\n",
+            "            *)\n",
+            "                m=${url##*metadata=}; m=${m%%&*}; m=$(printf '%b' \"${m//%/\\\\x}\")\n",
+            "                case \"$url\" in *kind=gate-run*) c=gate_runs ;; *) c=cars ;; esac\n",
+            "                jq -c --argjson m \"$m\" --arg c \"$c\" '\n",
+            "                    [(.[$c] // [])[] | select(. as $r | $m | to_entries | all(.value == $r[.key]))]\n",
+            "                    | {total: length, data: [.[] | {id: (.id // \"packet\"), status: (.status // \"open\"),\n",
+            "                                                    metadata: del(.id, .status)}]}' <<<\"$rec\" ;;\n",
+            "        esac\n",
+            "        exit 0 ;;\n",
             "    *kind=gate-run*)\n",
             "        if [ -n \"${STUB_GATE_RC:-}\" ]; then exit \"$STUB_GATE_RC\"; fi\n",
             "        if [ -n \"${STUB_OPEN_GATE:-}\" ]; then\n",
-            "            echo '{\"data\":[{\"id\":\"gate-1\",\"status\":\"open\"}]}'\n",
-            "        else echo '{\"data\":[]}'; fi\n",
+            "            now=$(date -u +%s)\n",
+            "            at=$(date -u -d \"@$((now - ${STUB_GATE_AGE_SECS:-0}))\" +%Y-%m-%dT%H:%M:%S.000000000+00:00)\n",
+            "            jq -nc --arg at \"$at\" --argjson total \"${STUB_GATE_TOTAL:-1}\" \\\n",
+            "               '{total: $total, data: [{id: \"gate-1\", status: \"open\", metadata: {opened_at: $at}}]}'\n",
+            "        else echo '{\"total\":0,\"data\":[]}'; fi\n",
             "        exit 0 ;;\n",
             "esac\n",
             "case \"$method\" in\n",
@@ -158,11 +190,18 @@ fn ls_remote_calls(scratch: &Path) -> String {
 }
 
 fn run(scratch: &Path, extra: &[(&str, &str)]) -> Output {
+    run_with(scratch, &[], extra)
+}
+
+/// `run`, with arguments after the script (a mode such as `--cli`).
+fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
     let bin = stub_curl(scratch);
     stub_git(scratch);
+    stub_df(&bin);
     let installer = stub_installer(scratch);
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("infra/cluster/dev-scratch-reclaim.sh"))
+        .args(args)
         // The CLI leg goes to the stub installer below, never to the
         // registry; the stub's log is what the CLI tests read.
         .env("BOSS_CLI_INSTALLER", &installer)
@@ -173,12 +212,19 @@ fn run(scratch: &Path, extra: &[(&str, &str)]) -> Output {
         .env("REPO_DIR", scratch.join("work").join("repo"))
         .env("WORKTREES_DIR", scratch.join("work").join("wt"))
         .env("BOSS_STALE_TARGET_H", "12")
+        // The floor is a share of the REAL filesystem the fixture sits
+        // on, so a nearly full test host would fire it and reclaim the
+        // fixtures other tests expect kept. Off unless a test asks.
+        .env("BOSS_SCRATCH_FLOOR_PCT", "0")
         // The packet goes to the stub above, never to a real system of
         // record, and a transport failure gives up at once.
         .env("BOSS_JOBS_URL", "http://sor.test:7900")
         .env("BOSS_API_RETRY_DEADLINE", "0")
         .env("STUB_LOG", scratch.join("curl-log.txt"))
         .env("STUB_LS_REMOTE", scratch.join("git-ls-remote.txt"))
+        // What the system of record holds about worktrees, cars and
+        // runs: absent, it holds nothing (see `write_record`).
+        .env("STUB_RECORD", scratch.join("record.json"))
         .env(
             "PATH",
             format!(
@@ -388,6 +434,18 @@ impl Yard {
     /// signal — the commit, the worktree's HEAD, index and reflog, the
     /// directory itself — dated `hours_ago`.
     fn worktree(&self, name: &str, branch: Option<&str>, hours_ago: u64) -> PathBuf {
+        self.worktree_writing(name, branch, hours_ago, "work.txt")
+    }
+
+    /// `worktree`, with its one commit writing `file` — so two trees
+    /// whose work lands on one main do not both add the same path.
+    fn worktree_writing(
+        &self,
+        name: &str,
+        branch: Option<&str>,
+        hours_ago: u64,
+        file: &str,
+    ) -> PathBuf {
         let path = self.root.join("work").join("wt").join(name);
         let p = path.to_str().expect("utf8");
         match branch {
@@ -402,7 +460,7 @@ impl Yard {
                 &["worktree", "add", "-q", "--detach", p, "main"],
             ),
         };
-        boss_testing::write_file(&path.join("work.txt"), name);
+        boss_testing::write_file(&path.join(file), name);
         git(&path, hours_ago, &["add", "."]);
         git(&path, hours_ago, &["commit", "-q", "-m", name]);
         let gitdir = PathBuf::from(git(&path, hours_ago, &["rev-parse", "--absolute-git-dir"]));
@@ -413,7 +471,7 @@ impl Yard {
             }
         }
         touch_at(&gitdir, hours_ago);
-        touch_at(&path.join("work.txt"), hours_ago);
+        touch_at(&path.join(file), hours_ago);
         touch_at(&path, hours_ago);
         path
     }
@@ -438,6 +496,80 @@ impl Yard {
 
     fn origin_main(&self) -> String {
         git(&self.repo, 0, &["rev-parse", "refs/remotes/origin/main"])
+    }
+
+    /// Land `branch` the way the pipeline does (backlog 4a738ca5): an
+    /// earlier train moves the forge's main, `boss gate --rebase`
+    /// replays the branch's commit onto it, and the train SQUASHES the
+    /// car into one commit on main — with a sibling car's change when
+    /// `sibling`, so the commit's patch-id is the union of two cars' and
+    /// equals neither. `later_edit` then lands one more train editing
+    /// every file the car's commit touched, so main no longer holds the
+    /// car's bytes and only the patch-id can say it landed. The forge
+    /// never has a branch of this name and the checkout's head is never
+    /// on origin/main — the shape of 56 of 58 worktree heads measured on
+    /// the pod. The checkout then fetches, as the dev container does.
+    fn train_land(&self, branch: &str, sibling: bool, later_edit: bool) {
+        let tag = branch.replace('/', "-");
+        let clone = self.root.join(format!("train-{tag}"));
+        let forge = self.root.join("forge.git");
+        git(
+            &self.root,
+            0,
+            &[
+                "clone",
+                "-q",
+                forge.to_str().expect("utf8"),
+                clone.to_str().expect("utf8"),
+            ],
+        );
+        boss_testing::write_file(&clone.join(format!("earlier-{tag}.txt")), "earlier\n");
+        git(&clone, 0, &["add", "."]);
+        git(&clone, 0, &["commit", "-q", "-m", "an earlier train"]);
+        git(
+            &clone,
+            0,
+            &[
+                "fetch",
+                "-q",
+                self.repo.to_str().expect("utf8"),
+                &format!("refs/heads/{branch}:refs/heads/car"),
+            ],
+        );
+        // `boss gate --rebase`: the car's commit, replayed onto a main
+        // that has moved — a new sha.
+        git(&clone, 0, &["cherry-pick", "car"]);
+        let touched = git(&clone, 0, &["diff", "--name-only", "HEAD~1", "HEAD"]);
+        if sibling {
+            // The train: the replayed car and a sibling, ONE commit.
+            git(&clone, 0, &["reset", "-q", "--soft", "HEAD~1"]);
+            boss_testing::write_file(&clone.join(format!("sibling-{tag}.txt")), "sibling\n");
+            git(&clone, 0, &["add", "."]);
+            git(&clone, 0, &["commit", "-q", "-m", "train: (2 changes)"]);
+        }
+        if later_edit {
+            for f in touched.lines().filter(|l| !l.is_empty()) {
+                boss_testing::write_file(&clone.join(f), "a later car edited this\n");
+            }
+            git(&clone, 0, &["commit", "-q", "-am", "a later train"]);
+        }
+        git(&clone, 0, &["push", "-q", "origin", "main"]);
+        git(&self.repo, 0, &["fetch", "-q", "origin"]);
+    }
+
+    /// Is `sha` an ancestor of the checkout's origin/main?
+    fn on_origin_main(&self, sha: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.repo)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                sha,
+                "refs/remotes/origin/main",
+            ])
+            .status()
+            .expect("run git")
+            .success()
     }
 }
 
@@ -484,6 +616,14 @@ fn a_clean_worktree_whose_branch_is_gone_from_the_forge_is_removed_with_its_targ
     let recent = yard.worktree("agent-recent", Some("feat/recent"), 1);
     // No branch at all: judged by idleness, and 7 days is the bar.
     let detached_old = yard.worktree("agent-detached-old", None, 24 * 10);
+    // ...and whose head a ref still holds, so removing the checkout
+    // loses no commit (the orphan case is its own test below).
+    let detached_old_head = git(&detached_old, 0, &["rev-parse", "HEAD"]);
+    git(
+        &yard.repo,
+        0,
+        &["update-ref", "refs/pulls/1", &detached_old_head],
+    );
     let detached_new = yard.worktree("agent-detached-new", None, 24 * 2);
     // Its directory is already gone: only the admin entry remains.
     let vanished = yard.worktree("agent-vanished", Some("feat/vanished"), 30);
@@ -635,6 +775,407 @@ fn a_checkout_without_origin_main_skips_the_pass_and_records_why() {
             && put.contains("origin/main")
             && put.contains("\"result\":\"incomplete\""),
         "the packet carries the skip AND why, as an incomplete pass\n{put}\n{text}"
+    );
+}
+
+/// The mtime of a worktree's reflog, as epoch seconds.
+fn reflog_mtime(worktree: &Path) -> u64 {
+    let gitdir = PathBuf::from(git(worktree, 0, &["rev-parse", "--absolute-git-dir"]));
+    std::fs::metadata(gitdir.join("logs/HEAD"))
+        .and_then(|m| m.modified())
+        .expect("reflog mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// ONE repo-wide git operation must not read as activity in every
+/// worktree at once. Measured 2026-09-21 (backlog adce5171): the gone-
+/// branch pass removed nothing and kept 373 of 397 worktrees "with git
+/// activity inside the window", because the idle clock took the MAX of
+/// four signals and one of them — the mtime of `$gitdir/logs/HEAD` —
+/// read EXACTLY 32h on three unrelated worktrees whose own HEAD, index
+/// and directory were 73h, 80h and 101h quiet. Re-measured 2026-09-23:
+/// 154 worktrees' reflogs rewritten inside four seconds at 2026-09-22
+/// 05:43:30Z, beside a write of info/refs and objects/info — a `git gc`,
+/// whose `reflog expire --all` rewrites every worktree's reflog whether
+/// or not an entry expires. The fixture does exactly that, for real,
+/// and the three trees idle past their windows must still go.
+///
+/// What a reflog SAYS is kept as a signal: each entry carries the time
+/// git wrote it, and an expire copies entries without redating them.
+/// So a tree whose only recent act is a reflog entry (a reset that
+/// moved no file this pass reads) is kept.
+#[test]
+fn a_repo_wide_reflog_rewrite_is_not_activity_in_every_worktree() {
+    let root = boss_testing::scratch_dir("boss-dsr-gc-touch");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+
+    let landed = yard.worktree("agent-landed", Some("feat/landed"), 30);
+    yard.land("feat/landed");
+    let abandoned = yard.worktree("agent-abandoned", Some("feat/abandoned"), 60);
+    let detached = yard.worktree("agent-detached", None, 24 * 10);
+    // A detached head the pass may remove is one some ref still holds —
+    // here a forge PR ref, the shape `refs/pulls/<n>` takes on the pod.
+    let detached_head = git(&detached, 0, &["rev-parse", "HEAD"]);
+    git(
+        &yard.repo,
+        0,
+        &["update-ref", "refs/pulls/1", &detached_head],
+    );
+    // Quiet by every file signal for 60h, but its reflog's newest ENTRY
+    // is an hour old: someone is working here.
+    let working = yard.worktree("agent-working", Some("feat/working"), 60);
+    git(&working, 1, &["reset", "-q", "--soft", "HEAD"]);
+    let gitdir = PathBuf::from(git(&working, 0, &["rev-parse", "--absolute-git-dir"]));
+    for p in [gitdir.join("HEAD"), gitdir.join("index"), working.clone()] {
+        touch_at(&p, 60);
+    }
+
+    // The repo-wide operation: what `git gc` runs first.
+    git(&yard.repo, 0, &["reflog", "expire", "--all"]);
+    let now = unix_now();
+    for wt in [&landed, &abandoned, &detached, &working] {
+        assert!(
+            now.saturating_sub(reflog_mtime(wt)) < 600,
+            "precondition: the expire rewrote {}'s reflog, as a gc does",
+            wt.display()
+        );
+    }
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        !landed.exists(),
+        "landed, idle 30h against a 12h grace: a gc's reflog rewrite is not activity\n{text}"
+    );
+    assert!(
+        !abandoned.exists(),
+        "unpushed, idle 60h against 48h: removed despite the gc\n{text}"
+    );
+    assert!(
+        !detached.exists(),
+        "detached, idle 10 days, its head on a ref: removed despite the gc\n{text}"
+    );
+    assert!(
+        working.exists(),
+        "a reflog ENTRY an hour old is activity, whatever the other files say\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("worktree pass: removed 3"),
+        "the totals say so\n{text}"
+    );
+}
+
+/// A detached HEAD whose commit no ref holds is UNPUSHED WORK: the
+/// worktree's own HEAD and reflog are the only things naming it, and
+/// `git worktree remove` deletes both, leaving the commit to the next
+/// gc. Measured 2026-09-23 on the pod: of the 16 detached worktrees the
+/// corrected idle clock makes due, 13 sit on a ref (a forge PR ref, a
+/// branch) and 3 — preflight-2026-09-10b, preflight-3way, preflight-f73
+/// — on none. Those are kept and NAMED, on the log and on the packet,
+/// the way a dirty tree is, so an operator can decide.
+#[test]
+fn a_detached_worktree_whose_head_no_ref_holds_is_kept_and_named() {
+    let root = boss_testing::scratch_dir("boss-dsr-orphan-head");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let orphan = yard.worktree("agent-orphan", None, 24 * 10);
+    // One tree the pass does remove, so it acts and files its packet.
+    let landed = yard.worktree("agent-landed", Some("feat/landed"), 30);
+    yard.land("feat/landed");
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        orphan.exists(),
+        "a commit only this worktree names is never thrown to the gc\n{text}"
+    );
+    assert!(
+        stdout.contains("agent-orphan") && stdout.contains("no ref holds"),
+        "the kept tree is named with why\n{text}"
+    );
+    assert!(
+        stdout.contains("1 with a head no ref holds"),
+        "and counted on the totals line\n{text}"
+    );
+    assert!(!landed.exists(), "the landed tree beside it goes\n{text}");
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    assert!(
+        put.contains("\"worktrees_kept_unreferenced\":\"1\"")
+            && put.contains("\"worktrees_kept_unreferenced_names\":\"agent-orphan"),
+        "the packet names the kept tree too\n{put}\n{text}"
+    );
+}
+
+/// The OLDER pass, `reclaim_work`, fires only under the /work floor and
+/// removed every clean, unlocked worktree whose DIRECTORY was 48h old —
+/// with no reading of what the checkout holds. Clean is not safe for a
+/// detached HEAD: its commits have no ref but the checkout, so the
+/// guard the gone-worktree pass got in adce5171 is owed here too
+/// (backlog 5da0428a, from the 99ce8744 builder, 2026-09-24). Three
+/// days idle puts both trees past this pass's 48h and inside the gone
+/// pass's 168h idle window, so only the floor pass judges them — and
+/// the tree a ref holds going is what shows the floor pass ran.
+#[test]
+fn under_the_work_floor_a_detached_worktree_whose_head_no_ref_holds_is_kept_and_named() {
+    let root = boss_testing::scratch_dir("boss-dsr-floor-orphan");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let orphan = yard.worktree("agent-floor-orphan", None, 24 * 3);
+    let held = yard.worktree("agent-floor-held", None, 24 * 3);
+    let held_head = git(&held, 0, &["rev-parse", "HEAD"]);
+    git(&yard.repo, 0, &["update-ref", "refs/pulls/7", &held_head]);
+
+    // Under the /work floor both ways it can be spelled: today's
+    // BOSS_WORK_FLOOR_GB, and the stub df's STUB_DF_WORK_GB that the
+    // held car 99ce8744 reads once it retires that knob — so this test
+    // holds on either side of that car landing.
+    let out = run(
+        &root,
+        &[("BOSS_WORK_FLOOR_GB", "1000000"), ("STUB_DF_WORK_GB", "1")],
+    );
+    let text = say(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !held.exists(),
+        "a detached tree some ref holds is still the floor pass's to take\n{text}"
+    );
+    assert!(
+        orphan.exists(),
+        "a commit only this worktree names is never thrown to the gc, floor or not\n{text}"
+    );
+    assert!(
+        stdout.contains("agent-floor-orphan") && stdout.contains("no ref holds"),
+        "the kept tree is named with why\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    assert!(
+        put.contains("\"floor_worktrees_removed\":\"1\"")
+            && put.contains("\"floor_worktrees_kept_unreferenced_names\":\"agent-floor-orphan"),
+        "the packet names the kept tree too\n{put}\n{text}"
+    );
+}
+
+/// A fake process table under `root/proc`, read by the pass through
+/// `PROC_ROOT`: `pid1` is what `/proc/1/comm` says (the pod's `pause`
+/// when the sidecar shares the pod's process namespace), and each
+/// `(pid, comm, start)` gets a `stat` line in the kernel's shape, its
+/// start time in field 22. Returns the root to hand the pass.
+fn fake_proc(root: &Path, pid1: &str, procs: &[(u32, &str, u64)]) -> PathBuf {
+    let proc_root = root.join("proc");
+    boss_testing::create_dir(&proc_root.join("1"));
+    boss_testing::write_file(&proc_root.join("1").join("comm"), &format!("{pid1}\n"));
+    for (pid, comm, start) in procs {
+        boss_testing::create_dir(&proc_root.join(pid.to_string()));
+        boss_testing::write_file(
+            &proc_root.join(pid.to_string()).join("stat"),
+            &format!("{pid} ({comm}) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n"),
+        );
+    }
+    proc_root
+}
+
+/// Lock a worktree the way the Claude harness does.
+fn harness_lock(yard: &Yard, wt: &Path, reason: &str) {
+    git(
+        &yard.repo,
+        0,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            reason,
+            wt.to_str().expect("utf8"),
+        ],
+    );
+}
+
+/// A lock is a claim by a PROCESS, and a claim outlives its claimant
+/// unless something checks. The Claude harness locks each agent
+/// worktree `claude agent agent-<id> (pid N start T)` for its session,
+/// and until 2026-09-23 the pass kept every locked tree without asking
+/// whether N still lived. Measured that day (backlog e14a741c): two
+/// lock files named pid 355 start 94472290 while pid 355 had started at
+/// 95092646 — the harness had restarted, the old sessions were gone,
+/// and their trees were kept forever. /proc/<pid>/stat is
+/// world-readable, so the pid AND its start time are compared: gone, or
+/// started at another time, is a stale lock, and the tree is judged
+/// like any other — still behind the window, dirty and unreferenced-
+/// head guards — and NAMED. A live lock (the pid alive with the start
+/// it recorded) is never judged stale, and neither is a lock whose
+/// reason is not the harness's shape: that one is a human's.
+#[test]
+fn a_lock_whose_process_is_gone_or_restarted_is_stale_and_a_live_lock_is_kept() {
+    let root = boss_testing::scratch_dir("boss-dsr-stale-lock");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    // Every tree UNPUSHED and idle 60h against a 48h window: without
+    // its lock, each would go. The locks alone decide.
+    let names = [
+        "agent-live",
+        "agent-restarted",
+        "agent-gone",
+        "agent-human",
+        "agent-stale-dirty",
+    ];
+    let trees: Vec<PathBuf> = names
+        .iter()
+        .map(|n| {
+            let b = format!("feat/{n}");
+            yard.worktree(n, Some(&b), 60)
+        })
+        .collect();
+    let [live, restarted, gone, human, stale_dirty] = [0, 1, 2, 3, 4].map(|i| trees[i].clone());
+    harness_lock(
+        &yard,
+        &live,
+        "claude agent agent-live (pid 355 start 95092646)",
+    );
+    harness_lock(
+        &yard,
+        &restarted,
+        "claude agent agent-restarted (pid 355 start 94472290)",
+    );
+    harness_lock(&yard, &gone, "claude agent agent-gone (pid 4242 start 100)");
+    harness_lock(&yard, &human, "operator: bisecting, leave it");
+    harness_lock(
+        &yard,
+        &stale_dirty,
+        "claude agent agent-stale-dirty (pid 4243 start 100)",
+    );
+    boss_testing::write_file(&stale_dirty.join("notes.txt"), "untracked");
+    for p in [stale_dirty.join("notes.txt"), stale_dirty.clone()] {
+        touch_at(&p, 60);
+    }
+    // The live process's comm carries `) ` itself — a comm is any 15
+    // bytes — so a parser that splits at the FIRST close-paren reads the
+    // wrong field and would call a live lock stale.
+    let proc_root = fake_proc(&root, "pause", &[(355, "x) S 1 2 3", 95092646)]);
+
+    let out = run(&root, &[("PROC_ROOT", proc_root.to_str().expect("utf8"))]);
+    let text = say(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        live.exists(),
+        "a lock whose pid lives with the start it recorded is never stale\n{text}"
+    );
+    assert!(
+        human.exists(),
+        "a lock that is not the harness's shape is a human's, and kept\n{text}"
+    );
+    assert!(
+        !restarted.exists(),
+        "pid 355 now started at another time: the locker is gone, the tree is judged and goes\n{text}"
+    );
+    assert!(
+        !gone.exists(),
+        "no such pid: the locker is gone, the tree is judged and goes\n{text}"
+    );
+    assert!(
+        stale_dirty.exists(),
+        "a stale lock only opens the judgement: a dirty tree is still kept\n{text}"
+    );
+    for name in ["agent-restarted", "agent-gone", "agent-stale-dirty"] {
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.contains(name) && l.contains("stale lock")),
+            "{name}'s stale lock is named in the log\n{text}"
+        );
+    }
+    assert!(
+        stdout.contains("2 locked") && stdout.contains("3 with a stale lock"),
+        "the totals count live and stale locks apart\n{text}"
+    );
+    let listed = git(&yard.repo, 0, &["worktree", "list", "--porcelain"]);
+    assert!(
+        listed.contains("pid 4243 start 100"),
+        "a stale-locked tree the pass KEEPS keeps its lock too — nothing is unlocked but to remove\n{listed}\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    assert!(
+        put.contains("\"worktrees_kept_locked\":\"2\"")
+            && put.contains("\"worktrees_stale_locks\":\"3\"")
+            && put.contains("\"worktrees_stale_lock_names\":\"agent-")
+            && put.contains("agent-restarted")
+            && put.contains("agent-gone")
+            && put.contains("agent-stale-dirty"),
+        "the packet names every stale lock\n{put}\n{text}"
+    );
+}
+
+/// The judgement above is only as good as the process table it reads.
+/// The sidecar sees the dev container's processes because the pod sets
+/// `shareProcessNamespace` (infra/cluster/manifests/boss-dev.yaml), and
+/// then pid 1 is the pod's `pause`. In a namespace of its own, pid 1 is
+/// the sidecar's own entrypoint, every harness pid reads as gone, and
+/// every LIVE agent's lock would read stale — so a view that is not
+/// pod-wide judges no lock at all, and says so.
+#[test]
+fn a_process_table_that_is_not_the_pods_judges_no_lock() {
+    let root = boss_testing::scratch_dir("boss-dsr-unshared-proc");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let locked = yard.worktree("agent-locked", Some("feat/locked"), 30);
+    yard.land("feat/locked");
+    harness_lock(
+        &yard,
+        &locked,
+        "claude agent agent-locked (pid 4242 start 100)",
+    );
+    let proc_root = fake_proc(&root, "sh", &[]);
+
+    let out = run(&root, &[("PROC_ROOT", proc_root.to_str().expect("utf8"))]);
+    let text = say(&out);
+    assert!(
+        locked.exists(),
+        "an unshared process table cannot say a harness pid is gone\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("locks not judged"),
+        "and the pass says why it did not judge\n{text}"
+    );
+}
+
+/// The index is not an activity signal. Measured 2026-09-23 (backlog
+/// e14a741c): five worktrees' index files were written 2026-09-21
+/// 17:11, days after their last commit — a `git status` refreshes the
+/// index's stat cache on a CLEAN tree, and the harness snapshots every
+/// session's status as it starts. Anything the index can hold that
+/// HEAD does not is a staged change, which the dirty guard keeps at any
+/// age; a commit, checkout or reset that writes it also writes a
+/// reflog entry, which is read for what it says. So a clean, landed
+/// tree whose only recent write is its index goes.
+#[test]
+fn an_index_refresh_on_a_clean_tree_is_not_activity() {
+    let root = boss_testing::scratch_dir("boss-dsr-index-refresh");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let landed = yard.worktree("agent-landed", Some("feat/landed"), 30);
+    yard.land("feat/landed");
+    let gitdir = PathBuf::from(git(&landed, 0, &["rev-parse", "--absolute-git-dir"]));
+    touch_at(&gitdir.join("index"), 1);
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        !landed.exists(),
+        "landed, clean, 30h since any commit or reflog entry: an index refreshed an hour ago keeps nothing\n{text}"
     );
 }
 
@@ -868,11 +1409,28 @@ fn a_checkout_without_origin_main_installs_no_cli() {
 // sidecar's missing forge credential (b50a65ef) never comes into it.
 //
 // THE HAZARD IT MUST NOT CAUSE: `boss gate` renders its runner from the
-// tree at launch, and mutating the tree under a running gate is the
+// tree AT LAUNCH, and mutating the tree under a LAUNCHING gate is the
 // never-stash-while-a-gate-runs fault. The quiet is read from the
-// SYSTEM OF RECORD — an open `gate-run` packet — rather than from a
-// lock file, because the gate-runs are already in the record. A reading
-// it cannot take is a DEFER, never a fast-forward taken blind.
+// SYSTEM OF RECORD — a recently-opened `gate-run` packet — rather than
+// from a lock file, because the gate-runs are already in the record. A
+// reading it cannot take is a DEFER, never a fast-forward taken blind.
+//
+// AND LAUNCHING IS NOT RUNNING (backlog 475fbd10, 2026-09-22). `boss
+// gate` takes everything it will ever take from a tree in ONE
+// `read_to_string` of the runner manifest — the first statement of
+// `gate::run`, before the gate-run packet is filed — so a packet older
+// than the launch window belongs to a gate that has already rendered.
+// Deferring on "any open gate-run" was true for 251 of the last 300
+// minutes (84%, measured on the packet; 73% re-measured here from the
+// gate-run history), against 15% for a 120-second launch window, and an
+// hourly pass against an 84%-busy condition lands about one time in
+// six. The checkout sat five commits behind and every door warned.
+//
+// AND THE DEFERRAL HAS AN UPPER BOUND, because one that can repeat
+// forever never errors — it just stops being true, which is the silent
+// -failure class CLAUDE.md names. Past the deadline a deferral stops
+// being a wait and becomes a finding: a problem, a red pass, and the
+// reason on the packet where the refused fast-forward already lands.
 // ---------------------------------------------------------------------
 
 /// The checkout's own HEAD — what the doors run from.
@@ -936,7 +1494,7 @@ fn a_checkout_behind_origin_main_is_fast_forwarded_when_no_gate_is_reading_the_t
 }
 
 #[test]
-fn an_open_gate_run_defers_the_fast_forward() {
+fn a_gate_run_opened_this_second_defers_the_fast_forward() {
     let root = boss_testing::scratch_dir("boss-dsr-ff-gate");
     let _guard = Scratch(root.clone());
     let yard = behind_by_one(&root);
@@ -956,6 +1514,113 @@ fn an_open_gate_run_defers_the_fast_forward() {
     assert!(
         out.status.success(),
         "waiting for the next hour is not a fault\n{text}"
+    );
+}
+
+/// A gate that opened its packet an hour ago read the runner manifest
+/// an hour ago too — `gate::run`'s one `read_to_string` runs BEFORE the
+/// packet is filed. Holding the checkout for it buys nothing and costs
+/// the 84% of the day at least one gate is open (backlog 475fbd10).
+#[test]
+fn a_gate_that_has_already_rendered_its_runner_does_not_defer_the_fast_forward() {
+    let root = boss_testing::scratch_dir("boss-dsr-ff-running");
+    let _guard = Scratch(root.clone());
+    let yard = behind_by_one(&root);
+    let main = yard.origin_main();
+
+    let out = run(
+        &root,
+        &[("STUB_OPEN_GATE", "1"), ("STUB_GATE_AGE_SECS", "3600")],
+    );
+    let text = say(&out);
+    assert_eq!(
+        head_sha(&yard.repo),
+        main,
+        "an hour-old gate has taken everything it will ever take from a tree\n{text}"
+    );
+    assert!(
+        out.status.success(),
+        "and moving the checkout for it is the pass working\n{text}"
+    );
+}
+
+/// A page that reports more open gate-runs than it returns answers a
+/// smaller question (CLAUDE.md — a limit is not a filter): the launch
+/// window cannot be judged from rows that were never sent, so the pass
+/// defers the way it does on any unread check.
+#[test]
+fn a_truncated_gate_run_page_is_a_reading_the_pass_cannot_take() {
+    let root = boss_testing::scratch_dir("boss-dsr-ff-truncated");
+    let _guard = Scratch(root.clone());
+    let yard = behind_by_one(&root);
+    let before = head_sha(&yard.repo);
+
+    // One row returned, three said to be open, and the two unseen ones
+    // could each have launched a second ago.
+    let out = run(
+        &root,
+        &[
+            ("STUB_OPEN_GATE", "1"),
+            ("STUB_GATE_AGE_SECS", "3600"),
+            ("STUB_GATE_TOTAL", "3"),
+        ],
+    );
+    let text = say(&out);
+    assert_eq!(
+        head_sha(&yard.repo),
+        before,
+        "a fast-forward is never taken on a page that answered a smaller question\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("fast-forward deferred"),
+        "the defer and its reason are loud\n{text}"
+    );
+}
+
+/// THE UPPER BOUND. A deferral that can repeat forever never errors; it
+/// just stops being true, and the checkout starves while every door
+/// warns and every write is refused at exit 78. How long it has been
+/// behind is read from GIT ALONE — the committer time of the oldest
+/// commit the checkout is missing — so there is no counter file and no
+/// second copy of a fact (CLAUDE.md §9a).
+#[test]
+fn a_deferral_that_outlives_its_deadline_is_a_problem_on_the_packet() {
+    let root = boss_testing::scratch_dir("boss-dsr-ff-deadline");
+    let _guard = Scratch(root.clone());
+    let yard = behind_by_one(&root);
+    let before = head_sha(&yard.repo);
+
+    let out = run(
+        &root,
+        &[("STUB_OPEN_GATE", "1"), ("BOSS_FF_DEADLINE_SECS", "0")],
+    );
+    let text = say(&out);
+    assert_eq!(
+        head_sha(&yard.repo),
+        before,
+        "the deadline makes a stuck deferral LOUD; it never overrides the hazard\n{text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "and reds the pass, like every other problem here\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("DEFERRED PAST ITS DEADLINE"),
+        "a deferral nobody can see is the failure this bound exists to end\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    assert!(
+        put.contains("\"result\":\"incomplete\"") && put.contains("past its"),
+        "the packet says the checkout stopped catching up\n{put}\n{text}"
+    );
+    assert!(
+        put.contains("\"ff_detail\":\"") && put.contains("behind origin/main for"),
+        "and names how long and what held it — not an exit code to go re-derive\n{put}\n{text}"
     );
 }
 
@@ -1073,4 +1738,793 @@ fn a_fast_forward_git_refuses_is_loud_and_lands_on_the_packet() {
         "and it NAMES THE FILE — without that the reader has an exit code and a sha, and \
          must go to the host's journal to learn which path refused\n{put}\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------
+// The floor sits ABOVE the kubelet's eviction line, and under it the
+// idle builders' targets go first, least recently used.
+//
+// Measured 2026-09-23 from the `free_gb` every gate receipt records for
+// w-1: the node drained from ~600 GB free to ~140 GB over 8–12 hours,
+// the kubelet evicted the dev pod at its 15% line (~139 GiB), and free
+// space jumped straight back to ~600 GB — six evictions in eight days.
+// What refilled it was the builders' per-worktree targets on /scratch.
+// This pass never acted: its floor was 50 GB, ninety below the line the
+// kubelet enforces, so the eviction always came first; and even under
+// the floor it trimmed only the primary target's incremental cache,
+// never the siblings that held the bulk. The floor is now a SHARE of
+// the filesystem, as the kubelet's own threshold is, and under it the
+// sibling targets are reclaimed oldest-touched first until it is met,
+// sparing any touched within the live window — the mtime is the
+// liveness check per dir, as in the stale-target pass.
+// ---------------------------------------------------------------------
+
+/// A cargo-shaped target holding `mib` MiB of real (non-sparse) bytes.
+fn sized_target(root: &Path, name: &str, hours_ago: u64, mib: usize) -> PathBuf {
+    let d = target_dir(root, name, hours_ago);
+    let blob = d.join("debug").join("deps").join("libbig.rlib");
+    std::fs::write(&blob, vec![7u8; mib * 1024 * 1024]).expect("write blob");
+    for p in [
+        blob,
+        d.join("debug").join("deps"),
+        d.join("debug"),
+        d.clone(),
+    ] {
+        touch_at(&p, hours_ago);
+    }
+    d
+}
+
+fn du_kb(path: &Path) -> u64 {
+    let out = Command::new("du")
+        .arg("-sk")
+        .arg(path)
+        .output()
+        .expect("du");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("du -sk prints a number")
+}
+
+/// A `df` that reports the scratch fixture as a filesystem of
+/// `STUB_DF_SIZE_GB` whose free space is `STUB_DF_CAP_KB` minus what
+/// the fixture holds now, with each fixture MiB read as one GB — so a
+/// reclaim of a 3 MiB target shows as 3 GB freed. `STUB_DF_WORK_GB`
+/// sets the /work fixture's free space in whole GB. Any other path is
+/// roomy, so neither floor fires unless a test asks — `run_with`
+/// installs this for every test, because the /work floor now sits at
+/// the gate's floor plus a margin (infra/build-floor.env), and the
+/// real volume a test host's fixtures land on may well be under it.
+fn stub_df(bin: &Path) {
+    boss_testing::write_exec(
+        &bin.join("df"),
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "m=\"${@: -1}\"\n",
+            "if [ \"$m\" = \"${STUB_DF_SCRATCH:-}\" ]; then\n",
+            "    used=$(du -sk \"$m\" | cut -f1)\n",
+            "    free=$(( (STUB_DF_CAP_KB - used) * 1024 ))\n",
+            "    size=$(( STUB_DF_SIZE_GB * 1024 * 1024 ))\n",
+            "elif [ -n \"${STUB_DF_WORK_GB:-}\" ] && [ \"$m\" = \"$WORK_MOUNT\" ]; then\n",
+            "    free=$(( STUB_DF_WORK_GB * 1024 * 1024 )); size=$(( 40 * 1024 * 1024 ))\n",
+            "else\n",
+            "    free=$(( 1 << 40 )); size=$(( 1 << 41 ))\n",
+            "fi\n",
+            "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n",
+            "echo \"stub $size 0 $free 0% $m\"\n",
+        ),
+    );
+}
+
+#[test]
+fn under_the_floor_idle_sibling_targets_go_oldest_first_until_it_is_met() {
+    let root = boss_testing::scratch_dir("boss-dsr-floor-lru");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    let bin = stub_curl(&root);
+    stub_df(&bin);
+    let primary = target_dir(&root, "target", 0);
+    let oldest = sized_target(&root, "target-idle-5h", 5, 3);
+    let older = sized_target(&root, "target-idle-3h", 3, 3);
+    let newer = sized_target(&root, "target-idle-1h", 1, 3);
+    let live = sized_target(&root, "target-building-now", 0, 3);
+
+    // A 20 GB filesystem with a 50% floor = 10 GB; 5.5 GB free now.
+    // Removing the 5h target frees 3 (8.5, still under); the 3h one
+    // frees 3 more (11.5, met) — and there the pass must stop.
+    let cap = du_kb(&root) + 5 * 1024 + 512;
+    let out = run(
+        &root,
+        &[
+            ("BOSS_SCRATCH_FLOOR_PCT", "50"),
+            ("STUB_DF_SCRATCH", root.to_str().expect("utf-8 path")),
+            ("STUB_DF_CAP_KB", &cap.to_string()),
+            ("STUB_DF_SIZE_GB", "20"),
+        ],
+    );
+    let text = say(&out);
+    assert!(
+        !oldest.exists(),
+        "the least recently used idle target goes first\n{text}"
+    );
+    assert!(
+        !older.exists(),
+        "the next oldest goes while still under the floor\n{text}"
+    );
+    assert!(
+        newer.exists(),
+        "the pass stops the moment the floor is met\n{text}"
+    );
+    assert!(
+        live.exists(),
+        "a target touched inside the live window belongs to a build\n{text}"
+    );
+    assert!(
+        primary.exists(),
+        "the primary target is the incremental trim's, never removed whole\n{text}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("target-idle-5h") && stdout.contains("target-idle-3h"),
+        "each reclaimed target is named\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("an acting pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"floor_targets_reclaimed\":\"2\""),
+        "the packet counts what the floor pass took\n{put}\n{text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a met floor is a clean pass\n{text}"
+    );
+}
+
+#[test]
+fn a_floor_share_that_is_not_a_percentage_is_refused() {
+    let root = boss_testing::scratch_dir("boss-dsr-badpct");
+    let _guard = Scratch(root.clone());
+    for bad in ["lots", "101"] {
+        let out = run(&root, &[("BOSS_SCRATCH_FLOOR_PCT", bad)]);
+        assert_eq!(out.status.code(), Some(64), "{bad}: {}", say(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("SCRATCH_FLOOR_PCT"),
+            "{}",
+            say(&out)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// THE FLOOR FOLLOWS THE BUILD (backlog 3f2a08ab, 2026-09-24).
+// ---------------------------------------------------------------------
+// The dev pod was evicted at 01:27Z with the 25% floor in force. The
+// gate receipts' free_gb (GiB free on w-1's ephemeral xfs, read at each
+// verdict) date the drain: 487 at 21:47Z, 378 at 00:01, 284 at 00:53,
+// 218 at 01:14, 159 at 01:20, 136 at the eviction, then 567 at 01:31 —
+// ~430 GiB of it the dev pod's own /scratch. The hourly passes at
+// 21:58, 22:59 and 23:59 took no floor target, and the ~01:00 pass
+// filed nothing, so it found the floor met: from above 232 GiB to 136
+// in under 27 minutes, against a 93 GiB margin and a 60-minute timer.
+// So `wt-cargo` — the event that fills /scratch — runs the floor's
+// sibling pass itself before each build, and this mode is that pass
+// alone: one df above the floor, the idle siblings below it, and none
+// of the hourly pass's other legs.
+
+#[test]
+fn the_scratch_floor_mode_takes_idle_siblings_and_runs_no_other_pass() {
+    let root = boss_testing::scratch_dir("boss-dsr-floor-mode");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    let bin = stub_curl(&root);
+    stub_df(&bin);
+    let primary = target_dir(&root, "target", 0);
+    let oldest = sized_target(&root, "target-idle-5h", 5, 3);
+    let older = sized_target(&root, "target-idle-3h", 3, 3);
+    let newer = sized_target(&root, "target-idle-1h", 1, 3);
+    let live = sized_target(&root, "target-building-now", 0, 3);
+
+    // The same arithmetic as the hourly floor test above: two targets
+    // take the fixture from 5.5 GB free to 11.5, over a 10 GB floor.
+    let cap = du_kb(&root) + 5 * 1024 + 512;
+    let out = run_with(
+        &root,
+        &["--scratch-floor"],
+        &[
+            ("BOSS_SCRATCH_FLOOR_PCT", "50"),
+            ("STUB_DF_SCRATCH", root.to_str().expect("utf-8 path")),
+            ("STUB_DF_CAP_KB", &cap.to_string()),
+            ("STUB_DF_SIZE_GB", "20"),
+        ],
+    );
+    let text = say(&out);
+    assert!(
+        !oldest.exists(),
+        "the oldest idle target goes first\n{text}"
+    );
+    assert!(
+        !older.exists(),
+        "then the next, while under the floor\n{text}"
+    );
+    assert!(newer.exists(), "and it stops when the floor is met\n{text}");
+    assert!(live.exists(), "a live target is a build's\n{text}");
+    assert!(primary.exists(), "the primary is never removed\n{text}");
+    assert!(
+        install_log(&root).is_empty(),
+        "the floor mode must not run the CLI leg — it runs before every build\n{text}"
+    );
+    assert!(
+        ls_remote_calls(&root).is_empty(),
+        "the floor mode must not touch git\n{text}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("worktree pass") && !stdout.contains("stale-target pass"),
+        "the floor mode runs the floor's sibling pass and nothing else\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("an acting floor pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"floor_targets_reclaimed\":\"2\""),
+        "the packet counts what the floor pass took\n{put}\n{text}"
+    );
+    assert!(
+        put.contains("scratch-floor"),
+        "the packet says which pass this was, so a reader can tell a build-triggered \
+         pass from the hourly one\n{put}\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(0), "a met floor is clean\n{text}");
+}
+
+#[test]
+fn above_the_floor_the_scratch_floor_mode_is_silent_and_takes_nothing() {
+    let root = boss_testing::scratch_dir("boss-dsr-floor-mode-quiet");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    let primary = target_dir(&root, "target", 0);
+    // Stale by the hourly pass's 12h — it would take this one. The
+    // floor mode is not the age pass and must leave it alone.
+    let stale = target_dir(&root, "target-landed-yesterday", 30);
+    let out = run_with(&root, &["--scratch-floor"], &[]);
+    let text = say(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(stale.exists(), "above the floor nothing is taken\n{text}");
+    assert!(primary.exists(), "{text}");
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "it runs before every build, so above the floor it says nothing\n{text}"
+    );
+    assert!(
+        curl_log(&root).is_empty(),
+        "a pass that took nothing files nothing\n{text}"
+    );
+    assert!(install_log(&root).is_empty(), "{text}");
+}
+
+// ---------------------------------------------------------------------
+// THE /work FLOOR IS THE GATE'S FLOOR PLUS A MARGIN (backlog 99ce8744).
+// ---------------------------------------------------------------------
+// Measured 2026-09-24 ~23:00Z: /work at 12 GB free of 40. The gate
+// refused below 12 and this pass acted only below 6, so it never fired
+// before a builder's pre-flight was refused, and two builders lowered
+// the gate's floor by hand. Both now read infra/build-floor.env, and
+// the floor here is DERIVED — the gate's plus a margin — so the
+// automatic pass acts first. The gate's half of the pin is in
+// the_build_floor_lives_once.rs.
+
+/// The value of `name` in `infra/build-floor.env`, read the way the
+/// scripts read it: the last `NAME=<number>` line.
+fn build_floor(name: &str) -> u64 {
+    let text = std::fs::read_to_string(repo_root().join("infra/build-floor.env"))
+        .expect("infra/build-floor.env is the one definition of the build floor");
+    text.lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("infra/build-floor.env defines {name} as a whole number"))
+}
+
+fn work_floor() -> u64 {
+    build_floor("GATE_MIN_FREE_GB") + build_floor("WORK_RECLAIM_MARGIN_GB")
+}
+
+#[test]
+fn the_work_floor_is_the_gates_floor_plus_the_margin_and_the_retired_knob_moves_nothing() {
+    let floor = work_floor();
+    for (free, below) in [(floor - 1, true), (floor, false)] {
+        let root = boss_testing::scratch_dir("boss-dsr-work-floor");
+        let _guard = Scratch(root.clone());
+        let _yard = Yard::new(&root);
+        let out = run(
+            &root,
+            &[
+                ("STUB_DF_WORK_GB", &free.to_string()),
+                // The live sidecar still sets this (boss-dev.yaml) and a
+                // manifest edit rolls the pod, so the script must be the
+                // one that stops reading it — else the 6 it names keeps
+                // the reclaim below the gate for as long as the pod runs.
+                ("BOSS_WORK_FLOOR_GB", "6"),
+            ],
+        );
+        let text = say(&out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if below {
+            assert!(
+                stdout.contains(&format!("{free}GB free < {floor}GB floor")),
+                "one GB under the gate's floor plus the margin, the /work pass fires\n{text}"
+            );
+        } else {
+            assert!(
+                stdout.contains(&format!("{free}GB free >= {floor}GB floor")),
+                "at the derived floor the /work pass is met\n{text}"
+            );
+        }
+    }
+}
+
+/// Under the /work floor a LANDED worktree waits only the live window
+/// the floor's target pass keeps (BOSS_LIVE_TARGET_MIN), not the 12h
+/// grace — "the grace yields to the floor, as it already does for
+/// targets". A freshly cut tree (its head still on origin/main, so it
+/// reads as landed) is inside the live window and is kept.
+#[test]
+fn under_the_work_floor_a_landed_worktree_waits_only_the_live_window() {
+    let floor = work_floor();
+    for under in [true, false] {
+        let root = boss_testing::scratch_dir("boss-dsr-work-floor-grace");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let landed = yard.worktree("agent-landed-2h", Some("feat/landed"), 2);
+        yard.land("feat/landed");
+        let fresh = root.join("work").join("wt").join("agent-fresh");
+        git(
+            &yard.repo,
+            0,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/fresh",
+                fresh.to_str().expect("utf8"),
+                "main",
+            ],
+        );
+        let free = if under { floor - 1 } else { floor + 10 };
+        let out = run(&root, &[("STUB_DF_WORK_GB", &free.to_string())]);
+        let text = say(&out);
+        if under {
+            assert!(
+                !landed.exists(),
+                "under the /work floor a landed tree idle 2h goes — the 12h grace yields\n{text}"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("under the /work floor"),
+                "the removal says it was the floor that shortened the wait\n{text}"
+            );
+        } else {
+            assert!(
+                landed.exists(),
+                "above the floor a landed tree keeps its 12h grace\n{text}"
+            );
+        }
+        assert!(
+            fresh.exists(),
+            "a tree cut minutes ago is inside the live window, floor or not\n{text}"
+        );
+    }
+}
+
+/// LANDED IS JUDGED BY CONTENT, NOT BY SHA (backlog 4a738ca5). Measured
+/// 2026-09-25 04:10Z: a pass under the /work floor removed 11 worktrees
+/// and kept 286 as recent while /work sat at 12 GB free of 40 — and of
+/// 58 sampled worktrees only 2 had a head on any origin ref. Builders
+/// commit on local `worktree-agent-*` branches, `boss gate --rebase`
+/// replays the commit onto a new sha, and trains squash-merge, so no sha
+/// the pass read ever reached origin/main: every landed tree read as
+/// UNPUSHED and waited the 48h window instead of the landed one.
+///
+/// Two landed shapes, one per rule `boss merged` already decides by
+/// (crates/orchestrators/boss-cli/src/merged.rs): a car squashed into a
+/// two-car train (its patch-id matches no commit on main, and every file
+/// it changed is byte-identical there — CONTENT), and a car squashed
+/// alone whose file a later car then edited (the bytes differ, the
+/// patch-id matches — PATCH-ID). Beside them, a tree whose work did NOT
+/// land, idle just as long, is kept.
+#[test]
+fn a_worktree_whose_work_landed_by_a_rebase_and_a_squash_is_landed_and_unlanded_work_is_kept() {
+    let floor = work_floor();
+    for under in [true, false] {
+        let root = boss_testing::scratch_dir("boss-dsr-landed-by-content");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let trained = yard.worktree_writing(
+            "agent-trained",
+            Some("worktree-agent-trained"),
+            2,
+            "trained.txt",
+        );
+        yard.train_land("worktree-agent-trained", true, false);
+        let squashed = yard.worktree_writing(
+            "agent-squashed",
+            Some("worktree-agent-squashed"),
+            2,
+            "squashed.txt",
+        );
+        yard.train_land("worktree-agent-squashed", false, true);
+        let unlanded = yard.worktree_writing(
+            "agent-unlanded",
+            Some("worktree-agent-unlanded"),
+            2,
+            "unlanded.txt",
+        );
+        for b in [
+            "worktree-agent-trained",
+            "worktree-agent-squashed",
+            "worktree-agent-unlanded",
+        ] {
+            let head = git(&yard.repo, 0, &["rev-parse", &format!("refs/heads/{b}")]);
+            assert!(
+                !yard.on_origin_main(&head),
+                "precondition: {b}'s head is on no origin ref, as on the pod"
+            );
+        }
+
+        let free = if under { floor - 1 } else { floor + 10 };
+        let out = run(&root, &[("STUB_DF_WORK_GB", &free.to_string())]);
+        let text = say(&out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            unlanded.exists(),
+            "work that is not on origin/main by sha, patch-id or content is unpushed: \
+             idle 2h against 48h, kept, floor or not\n{text}"
+        );
+        if under {
+            assert!(
+                !trained.exists(),
+                "squashed into a two-car train after a rebase: every file it changed is on \
+                 origin/main, so it is landed and waits only the live window\n{text}"
+            );
+            assert!(
+                !squashed.exists(),
+                "squashed alone, then edited by a later car: its patch is on origin/main, \
+                 so it is landed\n{text}"
+            );
+            assert!(
+                stdout.contains("worktree-agent-trained")
+                    && stdout.contains("on origin/main by content"),
+                "the removal says it was the content that showed the landing\n{text}"
+            );
+            assert!(
+                stdout.contains("worktree-agent-squashed")
+                    && stdout.contains("on origin/main by patch-id"),
+                "and which rule showed it\n{text}"
+            );
+            let log = curl_log(&root);
+            let put = log
+                .lines()
+                .find(|l| l.starts_with("PUT "))
+                .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+            assert!(
+                put.contains("\"worktrees_removed_by_content\":\"2\""),
+                "the packet counts the trees only content could call landed\n{put}\n{text}"
+            );
+        } else {
+            assert!(
+                trained.exists() && squashed.exists(),
+                "above the floor a tree landed by content keeps the 12h grace, as one \
+                 landed by sha does\n{text}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// LANDED ON RECORD (backlog 9a044141). Measured 2026-09-25 16:15-16:40Z:
+// /work at 14 GB free against its 18 GB floor, 297 worktrees under
+// .claude/worktrees, 253 of them a named branch with no origin/ ref and
+// a head on no origin ref — and `landed_by_content` called 0 of the 218
+// idle ones landed, because a train squashes N cars into one commit,
+// `boss gate --rebase` replays the car, and a later car edits the same
+// files. So every finished builder's tree waited the 48h unpushed
+// window, even under the floor, where a landed one waits 30 minutes.
+// The system of record holds the answer git cannot see: the gate-runs
+// launched from a worktree (flat `worktree`, `branch`, `agent_run`), the
+// agent-run each names and whether it finished, and the car on a branch
+// with the conductor's `merged` stamp. These tests write the refusals
+// first — a dirty tree, a tree with no landing on record, and a record
+// that cannot be read — because this car changes what gets deleted.
+// ---------------------------------------------------------------------
+
+/// What the stub system of record holds (see `stub_curl`).
+fn write_record(root: &Path, doc: serde_json::Value) {
+    boss_testing::write_file(&root.join("record.json"), &doc.to_string());
+}
+
+fn path_str(p: &Path) -> String {
+    p.to_str().expect("utf8").to_string()
+}
+
+/// One GB under the /work floor: a landed tree waits only the live
+/// window, so a tree idle 2h is due the moment anything calls it landed.
+fn under_the_work_floor() -> String {
+    (work_floor() - 1).to_string()
+}
+
+/// A tree past WORKTREE_MAX_AGE_H with nothing on record: the pass takes
+/// it without asking anyone, so every test here files its packet and the
+/// counts can be read off the run step.
+fn abandoned_tree(yard: &Yard) -> PathBuf {
+    yard.worktree("agent-abandoned", Some("feat/abandoned"), 60)
+}
+
+/// The run step's completion, as the stub saw it.
+fn run_step_put(root: &Path, text: &str) -> String {
+    let log = curl_log(root);
+    log.lines()
+        .find(|l| l.starts_with("PUT "))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"))
+        .to_string()
+}
+
+/// Make a tree dirty — an edit and an untracked file — dated like the
+/// tree itself, so it is the dirt and not recency that keeps it.
+fn dirty(tree: &Path, hours_ago: u64) {
+    boss_testing::write_file(&tree.join("work.txt"), "edited, not committed");
+    boss_testing::write_file(&tree.join("notes.txt"), "untracked");
+    for p in [
+        tree.join("work.txt"),
+        tree.join("notes.txt"),
+        tree.to_path_buf(),
+    ] {
+        touch_at(&p, hours_ago);
+    }
+}
+
+/// REFUSAL 1. A landing on record makes a tree DUE; it never makes a
+/// dirty one removable. The record only shortens the wait — every guard
+/// after it still runs, and `git worktree remove` still has no --force.
+#[test]
+fn a_dirty_worktree_whose_run_finished_on_record_is_kept_and_named() {
+    let root = boss_testing::scratch_dir("boss-dsr-record-dirty");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-dirty", Some("fix/dirty"), 2);
+    dirty(&tree, 2);
+    abandoned_tree(&yard);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [{"worktree": path_str(&tree), "branch": "fix/dirty", "agent_run": "run0dirt"}],
+            "runs": {"run0dirt": "closed"},
+        }),
+    );
+
+    let out = run(&root, &[("STUB_DF_WORK_GB", &under_the_work_floor())]);
+    let text = say(&out);
+    assert!(
+        tree.exists(),
+        "a dirty tree is never removed, whatever the record says\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("agent-dirty (2 dirty"),
+        "the record made it due, so the dirty guard judged it and NAMED it\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"worktrees_kept_dirty\":\"1\"") && put.contains("agent-dirty:2"),
+        "the kept dirty tree is on the packet with its count\n{put}\n{text}"
+    );
+}
+
+/// REFUSAL 2. No landing on record is not a landing. A run still open,
+/// a car still parked, and a tree the record has never heard of all keep
+/// the 48h unpushed window — and the packet says WHY each stays, rather
+/// than folding them into "git activity inside the window".
+#[test]
+fn an_unpushed_worktree_with_no_landing_on_record_is_kept_and_counted() {
+    let root = boss_testing::scratch_dir("boss-dsr-record-none");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let open_run = yard.worktree("agent-open-run", Some("fix/open-run"), 2);
+    let unknown = yard.worktree("agent-unknown", Some("worktree-agent-unknown"), 2);
+    let gone = abandoned_tree(&yard);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [{"worktree": path_str(&open_run), "branch": "fix/open-run", "agent_run": "run0open"}],
+            "cars": [{"id": "c0parked", "branch": "fix/open-run", "status": "open"}],
+            "runs": {"run0open": "open"},
+        }),
+    );
+
+    let out = run(&root, &[("STUB_DF_WORK_GB", &under_the_work_floor())]);
+    let text = say(&out);
+    assert!(
+        open_run.exists(),
+        "a run still open and a car not merged are no landing\n{text}"
+    );
+    assert!(
+        unknown.exists(),
+        "a tree the record has never heard of is no landing either\n{text}"
+    );
+    assert!(
+        !gone.exists(),
+        "past the unpushed window the pass still takes an abandoned tree\n{text}"
+    );
+    let log = curl_log(&root);
+    assert!(
+        log.contains("kind=gate-run")
+            && log.contains("metadata=")
+            && log.contains("kind=ship-a-change")
+            && log.contains("/api/jobs/run0open"),
+        "the record was asked — the gate-runs from the tree, the car on its branch, the run\n{log}\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no landing on record"),
+        "each kept tree says why it stays\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"worktrees_kept_unpushed_no_landing\":\"2\""),
+        "the packet counts the trees kept for want of a landing on record\n{put}\n{text}"
+    );
+}
+
+/// REFUSAL 3. A record that cannot be read FAILS CLOSED: every unpushed
+/// tree keeps its 48h window, exactly as before the record was asked.
+/// Two ways it goes dark — nothing answers (curl 7) and an error answers
+/// (curl 22) — and both trees here DO have a landing on record, so the
+/// dark read is the only thing that keeps them. It is asked once a pass:
+/// a hundred trees must not each wait out a dead API.
+#[test]
+fn a_system_of_record_that_cannot_be_read_keeps_every_unpushed_worktree() {
+    for rc in ["7", "22"] {
+        let root = boss_testing::scratch_dir("boss-dsr-record-dark");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let first = yard.worktree("agent-first", Some("fix/first"), 2);
+        let second = yard.worktree("agent-second", Some("fix/second"), 2);
+        let gone = abandoned_tree(&yard);
+        write_record(
+            &root,
+            serde_json::json!({
+                "cars": [
+                    {"id": "c0first0", "branch": "fix/first", "merged": "true"},
+                    {"id": "c0second", "branch": "fix/second", "merged": "true"},
+                ],
+            }),
+        );
+
+        let out = run(
+            &root,
+            &[
+                ("STUB_DF_WORK_GB", &under_the_work_floor()),
+                ("STUB_RECORD_RC", rc),
+            ],
+        );
+        let text = say(&out);
+        assert!(
+            first.exists() && second.exists(),
+            "curl {rc}: a record that could not be read is no landing — kept\n{text}"
+        );
+        assert!(
+            !gone.exists(),
+            "curl {rc}: and the rest of the pass still runs\n{text}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("could not be read"),
+            "curl {rc}: the dark read is said out loud\n{text}"
+        );
+        let log = curl_log(&root);
+        let asked = log
+            .lines()
+            .filter(|l| l.contains("metadata=") || l.contains("/api/jobs/run"))
+            .count();
+        assert_eq!(
+            asked, 1,
+            "curl {rc}: a dark record is asked once a pass, not once a tree\n{log}\n{text}"
+        );
+        let put = run_step_put(&root, &text);
+        assert!(
+            put.contains("\"worktrees_kept_unpushed_sor_unread\":\"2\"")
+                && put.contains(&format!("curl exit {rc}")),
+            "curl {rc}: the packet counts what the dark read kept, and why\n{put}\n{text}"
+        );
+    }
+}
+
+/// THE CHANGE. A tree whose builder's run FINISHED, whose branch's car
+/// MERGED, or which launched a gate for a car that merged under another
+/// branch name, is landed on record, and under the /work floor waits only
+/// the live window. A landed tree inside the live window is still kept,
+/// and is not even asked about; above the floor the 12h grace holds.
+#[test]
+fn a_worktree_whose_run_finished_or_whose_car_merged_on_record_is_landed() {
+    for under in [true, false] {
+        let root = boss_testing::scratch_dir("boss-dsr-record-landed");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let run_done = yard.worktree("agent-run-done", Some("worktree-agent-run-done"), 2);
+        let car_merged = yard.worktree("agent-car-merged", Some("fix/car-merged"), 2);
+        let via_gate = yard.worktree("agent-via-gate", Some("worktree-agent-via-gate"), 2);
+        let fresh = yard.worktree("agent-fresh", Some("fix/fresh"), 0);
+        write_record(
+            &root,
+            serde_json::json!({
+                "gate_runs": [
+                    {"worktree": path_str(&run_done), "branch": "fix/run-done", "agent_run": "run0done"},
+                    {"worktree": path_str(&via_gate), "branch": "fix/via-gate", "agent_run": "run0via1"},
+                ],
+                "cars": [
+                    {"id": "c0merged", "branch": "fix/car-merged", "merged": "true"},
+                    {"id": "c0viagat", "branch": "fix/via-gate", "status": "closed", "outcome": "merged"},
+                    {"id": "c0fresh0", "branch": "fix/fresh", "merged": "true"},
+                ],
+                "runs": {"run0done": "closed", "run0via1": "open"},
+            }),
+        );
+
+        let free = if under {
+            under_the_work_floor()
+        } else {
+            (work_floor() + 10).to_string()
+        };
+        let out = run(&root, &[("STUB_DF_WORK_GB", &free)]);
+        let text = say(&out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            fresh.exists(),
+            "a tree inside the live window is kept, landed or not\n{text}"
+        );
+        if under {
+            assert!(
+                !run_done.exists(),
+                "its run finished: landed on record, removed after the live window\n{text}"
+            );
+            assert!(
+                !car_merged.exists(),
+                "its branch's car merged: landed on record\n{text}"
+            );
+            assert!(
+                !via_gate.exists(),
+                "it launched a gate for a branch whose car merged: landed on record\n{text}"
+            );
+            assert!(
+                stdout.contains("agent-run run0done") && stdout.contains("is finished"),
+                "the removal names the run the record answered with\n{text}"
+            );
+            assert!(
+                stdout.contains("car c0merged") && stdout.contains("car c0viagat"),
+                "and the car\n{text}"
+            );
+            let put = run_step_put(&root, &text);
+            assert!(
+                put.contains("\"worktrees_removed_by_record\":\"3\""),
+                "the packet counts the trees only the record could call landed\n{put}\n{text}"
+            );
+        } else {
+            assert!(
+                run_done.exists() && car_merged.exists() && via_gate.exists(),
+                "above the floor a tree landed on record keeps the 12h grace\n{text}"
+            );
+            assert!(
+                !curl_log(&root).contains("metadata="),
+                "inside the landed window nothing is asked of the record\n{}\n{text}",
+                curl_log(&root)
+            );
+        }
+    }
 }

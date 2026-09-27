@@ -24,8 +24,7 @@
 //! in; `/proc` is how the sweep sees live git processes. Both are what
 //! the forge host has.
 
-use boss_testing::repo_root;
-use std::io::Write;
+use boss_testing::{feed_stdin, repo_root};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -42,9 +41,7 @@ impl Drop for Scratch {
 }
 
 fn scratch(case: &str) -> (Scratch, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("checkout-lock-{case}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = boss_testing::scratch_dir(&format!("checkout-lock-{case}"));
     (Scratch(dir.clone()), dir)
 }
 
@@ -168,7 +165,8 @@ fn a_stale_index_lock_is_removed_only_when_no_git_process_holds_the_checkout() {
         &[],
     );
     let kept = index_lock.exists();
-    live.stdin.take().unwrap().write_all(b"\n").unwrap();
+    // Only a release; `kept` above is the verdict (backlog fec29a02).
+    feed_stdin(&mut live, b"\n");
     let _ = live.wait();
     assert!(
         kept,
@@ -475,6 +473,7 @@ fn the_runner_answers_its_request_through_the_exit_trap() {
         std::fs::copy(&from, work.join("infra/lib").join(name)).unwrap();
     }
     // …and the run-summary lib it stamps its stage timings through.
+    // mode-bits-ok: a lib the runner sources, never exec'd by path
     std::fs::copy(
         repo_root().join("infra/run-summary.sh"),
         work.join("infra/run-summary.sh"),

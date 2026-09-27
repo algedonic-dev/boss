@@ -145,6 +145,17 @@ impl Resource {
         Self::new("step-plugin")
     }
 
+    /// Starting a step FOR someone else: a claim through the claim door
+    /// that names a holder other than the caller (design 611fbffd,
+    /// answered 2026-09-26). The step's own declared executor needs no
+    /// grant; anyone else needs Update on this. Deliberately not a
+    /// shipped resource — the read-only roles would inherit it — so the
+    /// deploy superuser holds it in `default_rules` and a tenant grants
+    /// its dispatch leads as policy rows.
+    pub fn step_assign() -> Self {
+        Self::new("step-assign")
+    }
+
     // ---- Module-tier shorthands ------------------------------------
     // Helpers stay in core for call-site ergonomics; the tier-purity
     // property is that `Resource::new("specimen")` works for anything
@@ -154,6 +165,26 @@ impl Resource {
     }
     pub fn employee() -> Self {
         Self::new("employee")
+    }
+    /// An employee's pay — the fields on an `employee` row that the
+    /// `employee` grant does NOT carry (backlog c7484d0e, 2026-09-23:
+    /// every roster read had handed every salary to any signed-in
+    /// viewer). Deliberately not a shipped resource: the read-only
+    /// roles inherit Read on those, and one of them is the anonymous
+    /// visitor. Granted per role as policy rows.
+    pub fn compensation() -> Self {
+        Self::new("compensation")
+    }
+    /// An employee's schedule — their availability, assignments, shift
+    /// patterns and week-grid row (backlog a621d091, 2026-09-25: every
+    /// scheduling read answered any session and any headerless
+    /// caller). An employee reads their own without a grant; this
+    /// resource is what anyone else needs, in a scope that covers them.
+    /// Not a shipped resource, for the reason `compensation` is not:
+    /// the read-only roles would inherit it, and one of them is the
+    /// anonymous visitor. Granted per role as policy rows.
+    pub fn schedule() -> Self {
+        Self::new("schedule")
     }
     pub fn invoice() -> Self {
         Self::new("invoice")
@@ -238,6 +269,51 @@ impl Scope {
             other => Err(format!("unknown scope: {other}")),
         }
     }
+
+    /// True when every grant of `other` is also a grant of `self`, as
+    /// SHAPES. A scope is relative to whoever holds it — a granter's
+    /// `team` is its own reports, a grantee's is theirs — so this cannot
+    /// compare rows; it compares breadth. `all` contains everything,
+    /// every scope contains `none` and itself, and `team` (owner is
+    /// the holder or a direct report) contains `self`. `territory` and
+    /// a department are otherwise incomparable, so neither contains the
+    /// other. Used to refuse a grant beyond what the granter holds
+    /// (backlog b8e75382).
+    pub fn contains(&self, other: &Scope) -> bool {
+        match (self, other) {
+            (Self::All, _) | (_, Self::None) => true,
+            (Self::Team, Self::Self_) => true,
+            (a, b) => a == b,
+        }
+    }
+}
+
+/// The id every rule is stored and looked up under. The engine finds a
+/// rule ONLY by this id, so a row whose id is not derived from its own
+/// role, resource and action would be displayed as one grant and
+/// enforced as another (backlog b8e75382, F2). One function, so the
+/// constructor, the engine and the write door's check cannot disagree.
+pub fn rule_id(role: &str, resource: &Resource, action: Action) -> String {
+    format!("{}:{}:{}", role, resource.as_str(), action.as_str())
+}
+
+/// The separator [`rule_id`] joins with. A resource may carry one
+/// (`step-signoff:<role>`), so a role that carries one derives the id of
+/// a different grant — role `reviewer:step-signoff` on `x` and role
+/// `reviewer` on `step-signoff:x` are one id — and a write carrying it
+/// is refused (backlog b8e75382, S1 of the hold review of car a8becd52).
+pub const RULE_ID_SEPARATOR: char = ':';
+
+/// A role a rule id can be derived from without ambiguity.
+pub fn refuse_ambiguous_role(role: &str) -> Result<(), String> {
+    if role.contains(RULE_ID_SEPARATOR) {
+        return Err(format!(
+            "role {role} carries '{RULE_ID_SEPARATOR}', the separator a rule id joins role, \
+             resource and action with, so its id would name a different grant; a role never \
+             carries one"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +334,7 @@ pub struct PolicyRule {
 impl PolicyRule {
     pub fn new(role: impl Into<String>, resource: Resource, action: Action, scope: Scope) -> Self {
         let role = role.into();
-        let id = format!("{}:{}:{}", role, resource.as_str(), action.as_str());
+        let id = rule_id(&role, &resource, action);
         Self {
             id,
             role,
@@ -314,6 +390,37 @@ pub struct User {
 }
 
 impl User {
+    /// The id [`crate::CurrentUser`] gives a request that carried no
+    /// `x-boss-user` header at all.
+    pub const ANONYMOUS_ID: &'static str = boss_core::roles::ANONYMOUS_USER_ID;
+
+    /// The role [`crate::CurrentUser`] gives that request. Named once
+    /// so a door can refuse it by name rather than by spelling it
+    /// (backlog e84de48e: two doors admitted it by spelling it).
+    pub const ANONYMOUS_ROLE: &'static str = boss_core::roles::GUEST_ROLE;
+
+    /// The caller a request with no identity header is: nobody, at
+    /// user tier. No door trusts it (David, 2026-09-25: "Agreed on
+    /// not trusting requests without the identity header"); a policy
+    /// rule may still grant the `guest` role something explicitly, as
+    /// the defaults grant it a workflow read.
+    pub fn anonymous() -> User {
+        User {
+            id: Self::ANONYMOUS_ID.to_string(),
+            role: Self::ANONYMOUS_ROLE.to_string(),
+            access_tier: AccessTier::User,
+            territory_account_ids: vec![],
+            direct_report_ids: vec![],
+            department: None,
+        }
+    }
+
+    /// Whether this is the [`User::anonymous`] caller — or one whose
+    /// header claims its role, which is no more of an identity.
+    pub fn is_anonymous(&self) -> bool {
+        self.role == Self::ANONYMOUS_ROLE
+    }
+
     /// The ambient [`ActorId`](boss_core::actor::ActorId) this request
     /// acts as — used by the request-context middleware as the default
     /// actor for any event a handler emits without naming one. Keyed on
@@ -334,7 +441,7 @@ impl User {
     pub fn ambient_actor(&self) -> Option<boss_core::actor::ActorId> {
         use boss_core::actor::ActorId;
         let id = self.id.as_str();
-        if id == "anonymous" {
+        if id == Self::ANONYMOUS_ID {
             return None;
         }
         // Already a typed automation (`automation:<slug>`).
@@ -365,7 +472,7 @@ fn default_tier() -> AccessTier {
     AccessTier::User
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessTier {
     User,
@@ -585,5 +692,46 @@ mod ambient_actor_tests {
             Some(ActorId::human("emp-032"))
         );
         assert_eq!(user("anonymous").ambient_actor(), None);
+    }
+}
+
+#[cfg(test)]
+mod grant_shape_tests {
+    use super::*;
+
+    /// Backlog b8e75382 (rule 1): a granter may hand out only what it
+    /// holds, compared as breadth because a scope is relative to its
+    /// holder.
+    #[test]
+    fn a_scope_contains_itself_and_narrower_shapes_only() {
+        let dept = Scope::Department("service".into());
+        for s in [
+            Scope::None,
+            Scope::Self_,
+            Scope::Territory,
+            Scope::Team,
+            dept.clone(),
+            Scope::All,
+        ] {
+            assert!(Scope::All.contains(&s), "all contains {s:?}");
+            assert!(s.contains(&s), "{s:?} contains itself");
+            assert!(s.contains(&Scope::None), "{s:?} contains none");
+        }
+        assert!(Scope::Team.contains(&Scope::Self_));
+        assert!(!Scope::Self_.contains(&Scope::Team));
+        assert!(!Scope::Team.contains(&Scope::All));
+        assert!(!Scope::None.contains(&Scope::Self_));
+        assert!(!Scope::Territory.contains(&Scope::Self_));
+        assert!(!dept.contains(&Scope::Department("finance".into())));
+        assert!(!dept.contains(&Scope::Team));
+    }
+
+    /// The id the engine looks a rule up by is the one the constructor
+    /// writes.
+    #[test]
+    fn a_rule_is_stored_under_the_id_the_engine_asks_for() {
+        let r = PolicyRule::new("reviewer", Resource::job(), Action::SignOff, Scope::Self_);
+        assert_eq!(r.id, "reviewer:job:sign-off");
+        assert_eq!(r.id, rule_id(&r.role, &r.resource, r.action));
     }
 }

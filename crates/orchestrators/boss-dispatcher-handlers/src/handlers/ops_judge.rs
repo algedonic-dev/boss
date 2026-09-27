@@ -35,7 +35,24 @@
 //! - `then_verb`, `then_host`, `then_args` — the follow-on ops-request;
 //!   `then_args` is whitespace-separated (a verb param admits none,
 //!   `infra/ops/ops-runner.sh`), rendered as the JSON array the runner's
-//!   argv contract reads off `metadata.args`.
+//!   argv contract reads off `metadata.args`. All three, or none: a rule
+//!   with none is a WATCH (below).
+//!
+//! ## Watch mode (backlog 8d77d670)
+//!
+//! A rule that names no follow-on WATCHES a verb nobody files by hand —
+//! `prune-registry-versions-daily`, a MUTATING delete a clock rule files
+//! every day. Its request closes whether or not the verb did its job
+//! (`answered` means the verb RAN, exit 2 and exit 1 included), and the
+//! silence sweep reads only that a packet arrived, so a refused or
+//! failed run was a closed packet nobody opened. A watch reads every
+//! run and files one urgent alarm (`for_request`-keyed, as below) when
+//! the run: FAILED (non-zero, not 75); was REFUSED by the ops runner (it
+//! also fires on `outcome = "refused"`, which a chain ignores); exited 0
+//! with no line matching `verdict_pattern`; or carries a verdict `when`
+//! is false over. A run whose `when` holds is annotated `judged` and
+//! nothing is filed. The alarm carries the verb, the trouble in words,
+//! the line the run said, and the head of its output.
 //!
 //! ## What it does
 //!
@@ -95,7 +112,7 @@
 //! forget to ask for it, and no future rule file can reintroduce the
 //! defect (CLAUDE.md §9a).
 
-use super::common::{api_client, get_json, open_jobs_of_kind, write_json};
+use super::common::{api_client, get_json, open_jobs_of_kind, row_or_refuse, write_json};
 use super::jobs_complete_linked_step::{FOR_REQUEST, VerbFailure, step_by_slug, verb_failure};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::{self, Value};
@@ -112,21 +129,55 @@ pub(crate) const JUDGED: &str = "judged";
 /// The link a filed follow-on carries back to the request it judged.
 pub(crate) const FOR_CHECK: &str = "for_check";
 
+/// The ops-request a chain files when its `when` holds.
+pub(crate) struct FollowOn {
+    pub verb: String,
+    pub host: String,
+    pub args: Vec<String>,
+}
+
 /// One rule's declaration, parsed off its args. A bad regex or a bad
 /// predicate is rule authoring, identical on every redelivery, so both
-/// are `Permanent`.
+/// are `Permanent`. `then` is `None` for a WATCH (see the module doc).
 pub(crate) struct Judgement {
     pub verb: String,
     pub pattern: regex::Regex,
     pub when_src: String,
     pub when: expr::Expr,
-    pub then_verb: String,
-    pub then_host: String,
-    pub then_args: Vec<String>,
+    pub then: Option<FollowOn>,
 }
+
+/// The three follow-on args: all present (a chain) or all absent (a
+/// watch). Half a follow-on is rule authoring, so `Permanent`.
+const THEN_ARGS: [&str; 3] = ["then_verb", "then_host", "then_args"];
 
 impl Judgement {
     pub(crate) fn from_args(args: &[(String, Value)]) -> Result<Self, HandlerError> {
+        let given: Vec<&str> = THEN_ARGS
+            .into_iter()
+            .filter(|k| boss_dispatcher::rules::handler::arg(args, k).is_some())
+            .collect();
+        let then = match given.len() {
+            0 => None,
+            3 => Some(FollowOn {
+                verb: arg_string(args, "then_verb")?.to_string(),
+                host: arg_string(args, "then_host")?.to_string(),
+                args: arg_string(args, "then_args")?
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            }),
+            _ => {
+                let missing: Vec<&str> = THEN_ARGS
+                    .into_iter()
+                    .filter(|k| !given.contains(k))
+                    .collect();
+                return Err(HandlerError::Permanent(format!(
+                    "a follow-on names all of {THEN_ARGS:?} or none (a watch); this rule gives \
+                     {given:?} and lacks {missing:?}"
+                )));
+            }
+        };
         let verb = arg_string(args, "verb")?.to_string();
         let pattern_src = arg_string(args, "verdict_pattern")?;
         let pattern = regex::Regex::new(pattern_src).map_err(|e| {
@@ -138,20 +189,12 @@ impl Judgement {
         let when = expr::parse(&when_src).map_err(|e| {
             HandlerError::Permanent(format!("when {when_src:?} does not parse: {e}"))
         })?;
-        let then_verb = arg_string(args, "then_verb")?.to_string();
-        let then_host = arg_string(args, "then_host")?.to_string();
-        let then_args = arg_string(args, "then_args")?
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
         Ok(Self {
             verb,
             pattern,
             when_src,
             when,
-            then_verb,
-            then_host,
-            then_args,
+            then,
         })
     }
 }
@@ -215,17 +258,18 @@ pub(crate) fn when_holds(
 /// strings) plus the links a reader follows back.
 pub(crate) fn follow_on_body(
     j: &Judgement,
+    then: &FollowOn,
     judged_id: &str,
     judged: &serde_json::Value,
     verdict: &str,
     ctx: &InvocationContext,
 ) -> serde_json::Value {
     let short = &judged_id[..judged_id.len().min(8)];
-    let args = j.then_args.join(" ");
+    let args = then.args.join(" ");
     let mut metadata = json!({
-        "host": j.then_host,
-        "verb": j.then_verb,
-        "args": j.then_args,
+        "host": then.host,
+        "verb": then.verb,
+        "args": then.args,
         FOR_CHECK: judged_id,
         "judged_verdict": verdict,
         "spawned_by_rule": ctx.rule_name,
@@ -239,9 +283,9 @@ pub(crate) fn follow_on_body(
         "kind": "ops-request",
         "title": format!(
             "{} {args} on {} — filed on {}'s answer (ops-request {short})",
-            j.then_verb, j.then_host, j.verb
+            then.verb, then.host, j.verb
         ),
-        "subject": {"subject_kind": "custom", "id": j.then_host},
+        "subject": {"subject_kind": "custom", "id": then.host},
         "owner_id": format!("rule:{}", ctx.rule_name),
         "priority": "standard",
         "status": "open",
@@ -259,6 +303,7 @@ pub(crate) fn follow_on_body(
 /// answers from Subject history.
 pub(crate) fn chain_refused_alert_body(
     j: &Judgement,
+    follow_on: &FollowOn,
     judged_id: &str,
     judged: &serde_json::Value,
     failure: &VerbFailure,
@@ -266,8 +311,8 @@ pub(crate) fn chain_refused_alert_body(
     ctx: &InvocationContext,
 ) -> serde_json::Value {
     let short = judged_id.get(..8).unwrap_or(judged_id);
-    let then = format!("{} {}", j.then_verb, j.then_args.join(" "));
-    let host = meta_str(judged, "host").unwrap_or(&j.then_host);
+    let then = format!("{} {}", follow_on.verb, follow_on.args.join(" "));
+    let host = meta_str(judged, "host").unwrap_or(&follow_on.host);
     let subject = judged
         .get("subject")
         .filter(|s| {
@@ -313,16 +358,161 @@ pub(crate) fn chain_refused_alert_body(
     })
 }
 
+/// Why a WATCHED run is an alarm (backlog 8d77d670). Each is a run that
+/// did not do its job, in the one place anything reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Trouble {
+    /// The verb RAN and exited non-zero (not 75, the estate's not-yet).
+    Failed(VerbFailure),
+    /// The ops runner refused to run it; the runner's reason, verbatim.
+    RunnerRefused(String),
+    /// Exit 0, and no line of the output matches `verdict_pattern`.
+    NoVerdict,
+    /// The verdict was found, and `when` is false over it.
+    VerdictFalse {
+        verdict: String,
+        groups: serde_json::Value,
+    },
+}
+
+impl Trouble {
+    fn exit(&self) -> Option<&str> {
+        match self {
+            Self::Failed(f) => Some(&f.exit),
+            _ => None,
+        }
+    }
+
+    /// The line an alarm quotes as what the run said.
+    fn line(&self) -> String {
+        match self {
+            Self::Failed(f) => f.line.clone(),
+            Self::RunnerRefused(reason) => reason.clone(),
+            Self::NoVerdict => String::new(),
+            Self::VerdictFalse { verdict, .. } => verdict.clone(),
+        }
+    }
+
+    fn headline(&self, verb: &str, when_src: &str) -> String {
+        match self {
+            Self::Failed(f) => format!("{verb} FAILED (exit {})", f.exit),
+            Self::RunnerRefused(_) => format!("{verb} was REFUSED by the ops runner"),
+            Self::NoVerdict => format!("{verb} answered with no verdict"),
+            Self::VerdictFalse { .. } => format!("{verb}'s verdict fails `{when_src}`"),
+        }
+    }
+
+    fn why(&self, when_src: &str, pattern: &str) -> String {
+        match self {
+            Self::Failed(f) => format!("the verb FAILED (exit {}); its line: {}", f.exit, f.line),
+            Self::RunnerRefused(reason) => {
+                format!("the ops runner REFUSED to run it, so nothing ran: {reason}")
+            }
+            Self::NoVerdict => format!(
+                "it exited 0 with no verdict — no line of its output matches {pattern:?} — and \
+                 no evidence is not a pass"
+            ),
+            Self::VerdictFalse { verdict, groups } => {
+                format!("its verdict fails `{when_src}` over {groups}: {verdict}")
+            }
+        }
+    }
+}
+
+/// The runner's recorded output on the `execute` step, or "".
+fn execute_output(job: &serde_json::Value) -> &str {
+    step_by_slug(job, REPORT_STEP)
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get("output"))
+        .and_then(|o| o.as_str())
+        .unwrap_or("")
+}
+
+/// How much of a watched run's output an alarm carries: its HEAD, where
+/// a verb that puts its verdict first (prune-registry-versions: the
+/// record, then the summary, then the per-version list) says what it
+/// did. The whole output stays on the request's execute step.
+const OUTPUT_HEAD_LINES: usize = 40;
+const OUTPUT_HEAD_CHARS: usize = 4000;
+
+fn output_head(output: &str) -> String {
+    let head = output
+        .lines()
+        .take(OUTPUT_HEAD_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    head.chars().take(OUTPUT_HEAD_CHARS).collect()
+}
+
+/// PURE: the urgent packet a troubled WATCHED run becomes — the verb,
+/// the trouble in words, the line the run said, and the head of its
+/// output. `for_request` is the dedup key, as for a chain's alarm.
+pub(crate) fn watch_alert_body(
+    j: &Judgement,
+    judged_id: &str,
+    judged: &serde_json::Value,
+    trouble: &Trouble,
+    owner: &str,
+    ctx: &InvocationContext,
+) -> serde_json::Value {
+    let short = judged_id.get(..8).unwrap_or(judged_id);
+    let host = meta_str(judged, "host").unwrap_or("?");
+    let subject = judged
+        .get("subject")
+        .filter(|s| {
+            s.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| !id.is_empty())
+        })
+        .cloned()
+        .unwrap_or_else(|| json!({ "subject_kind": "custom", "id": host }));
+    let mut metadata = json!({
+        "area": "platform",
+        FOR_REQUEST: judged_id,
+        "verb": j.verb,
+        "failed": trouble.line(),
+        "output_head": output_head(execute_output(judged)),
+        "reporter": ctx.rule_name,
+        "triggered_by_event_id": ctx.triggering_event_id,
+        "detail": format!(
+            "Filed by {} (backlog 8d77d670): ops-request {short} ran `{}` on {host}, a verb a rule \
+             files with nobody reading the result, and {}. This watch is the one reader of every \
+             run: the request closes whether or not the verb did its job, so without this alarm \
+             a run that did nothing looks exactly like one that did. The full output is on the \
+             request's execute step; its head is in output_head.",
+            ctx.rule_name,
+            j.verb,
+            trouble.why(&j.when_src, j.pattern.as_str())
+        ),
+    });
+    if let (Some(exit), Some(m)) = (trouble.exit(), metadata.as_object_mut()) {
+        m.insert("exit".into(), json!(exit));
+    }
+    json!({
+        "kind": "backlog-item",
+        "title": format!(
+            "{} on ops-request {short}",
+            trouble.headline(&j.verb, &j.when_src)
+        ),
+        "subject": subject,
+        "owner_id": owner,
+        "priority": "urgent",
+        "status": "open",
+        "tags": [],
+        "metadata": super::common::with_lane(metadata, InputChannel::PipelineFailure),
+    })
+}
+
 /// PURE: is `open` the follow-on this judgement already filed for
 /// `judged` — same verb, linked by `for_check` or by a shared
 /// `for_converge`?
 pub(crate) fn already_filed(
-    j: &Judgement,
+    then: &FollowOn,
     judged_id: &str,
     judged: &serde_json::Value,
     open: &serde_json::Value,
 ) -> bool {
-    if meta_str(open, "verb") != Some(&j.then_verb) {
+    if meta_str(open, "verb") != Some(&then.verb) {
         return false;
     }
     if meta_str(open, FOR_CHECK) == Some(judged_id) {
@@ -396,7 +586,7 @@ impl OpsJudge {
             rule,
         )
         .await?;
-        Ok(job.get("data").cloned().unwrap_or(job))
+        row_or_refuse(job, &format!("GET /api/jobs/{id}")).map_err(HandlerError::Downstream)
     }
 
     /// POST the follow-on and read the id the jobs API minted for it —
@@ -411,6 +601,30 @@ impl OpsJudge {
         .await
     }
 
+    /// One alarm per troubled request, keyed `for_request` (the key
+    /// `jobs.complete_linked_step` writes too): an open one is reused, so
+    /// a redelivery after the alarm landed but before the note did files
+    /// no twin. Returns the alarm's id.
+    async fn find_or_file_alarm(
+        &self,
+        judged_id: &str,
+        rule: &str,
+        body: impl FnOnce(&str) -> serde_json::Value,
+    ) -> Result<String, HandlerError> {
+        let open = open_jobs_of_kind(&self.client, self.base(), "backlog-item", rule).await?;
+        match open
+            .iter()
+            .find(|job| meta_str(job, FOR_REQUEST) == Some(judged_id))
+            .and_then(|job| job.get("id").and_then(|v| v.as_str()))
+        {
+            Some(existing) => Ok(existing.to_string()),
+            None => {
+                let owner = super::common::owner_for_filing(self.owner.as_ref(), rule).await;
+                self.file(&body(&owner), rule).await
+            }
+        }
+    }
+
     /// THE FAILED MEASUREMENT (53f54b3f). The verb this rule judges RAN
     /// and FAILED, so its output is a partial reading and the mutating
     /// follow-on is not filed. The alarm goes FIRST and the note names
@@ -422,25 +636,18 @@ impl OpsJudge {
     async fn refuse_to_chain(
         &self,
         j: &Judgement,
+        then: &FollowOn,
         judged_id: &str,
         judged: &serde_json::Value,
         failure: &VerbFailure,
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let rule = ctx.rule_name.as_str();
-        let open = open_jobs_of_kind(&self.client, self.base(), "backlog-item", rule).await?;
-        let alert_id = match open
-            .iter()
-            .find(|job| meta_str(job, FOR_REQUEST) == Some(judged_id))
-            .and_then(|job| job.get("id").and_then(|v| v.as_str()))
-        {
-            Some(existing) => existing.to_string(),
-            None => {
-                let owner = super::common::owner_for_filing(self.owner.as_ref(), rule).await;
-                let body = chain_refused_alert_body(j, judged_id, judged, failure, &owner, ctx);
-                self.file(&body, rule).await?
-            }
-        };
+        let alert_id = self
+            .find_or_file_alarm(judged_id, rule, |owner| {
+                chain_refused_alert_body(j, then, judged_id, judged, failure, owner, ctx)
+            })
+            .await?;
         self.annotate(
             judged_id,
             json!({
@@ -449,8 +656,8 @@ impl OpsJudge {
                      `{} {}` cannot ride it; alarm {alert_id}. The verb's last line: {}",
                     j.verb,
                     failure.exit,
-                    j.then_verb,
-                    j.then_args.join(" "),
+                    then.verb,
+                    then.args.join(" "),
                     failure.line
                 ),
                 "failed": failure.line,
@@ -467,9 +674,49 @@ impl OpsJudge {
             "{} FAILED (exit {}) — {} {} NOT filed; {}",
             j.verb,
             failure.exit,
-            j.then_verb,
-            j.then_args.join(" "),
+            then.verb,
+            then.args.join(" "),
             failure.line
+        );
+        Ok(())
+    }
+
+    /// A WATCH's alarm (backlog 8d77d670): the watched run did not do
+    /// its job, and nothing else reads it. Same ordering as
+    /// `refuse_to_chain`: the alarm first, then the note naming it.
+    async fn raise(
+        &self,
+        j: &Judgement,
+        judged_id: &str,
+        judged: &serde_json::Value,
+        trouble: &Trouble,
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let rule = ctx.rule_name.as_str();
+        let alert_id = self
+            .find_or_file_alarm(judged_id, rule, |owner| {
+                watch_alert_body(j, judged_id, judged, trouble, owner, ctx)
+            })
+            .await?;
+        let mut note = json!({
+            JUDGED: format!(
+                "{rule}: ALARM {alert_id} — {}",
+                trouble.why(&j.when_src, j.pattern.as_str())
+            ),
+            "failed": trouble.line(),
+            "alert": alert_id,
+        });
+        if let (Some(exit), Some(m)) = (trouble.exit(), note.as_object_mut()) {
+            m.insert("failed_exit".into(), json!(exit));
+        }
+        self.annotate(judged_id, note, rule).await?;
+        tracing::warn!(
+            rule = %rule,
+            judged = %judged_id,
+            alert = %alert_id,
+            "watched {}: {}",
+            j.verb,
+            trouble.why(&j.when_src, j.pattern.as_str())
         );
         Ok(())
     }
@@ -517,7 +764,10 @@ impl Handler for OpsJudge {
         if meta_str(&judged, "verb") != Some(&j.verb) {
             return Ok(());
         }
-        if j.verb == j.then_verb && meta_args(&judged) == j.then_args {
+        if let Some(then) = &j.then
+            && j.verb == then.verb
+            && meta_args(&judged) == then.args
+        {
             tracing::debug!(rule = %rule, judged = %judged_id, "answered {} is the follow-on this rule files, not the request it judges", j.verb);
             return Ok(());
         }
@@ -527,6 +777,26 @@ impl Handler for OpsJudge {
             return Ok(());
         }
 
+        // 2b. A RUNNER refusal ran nothing and closed the request
+        //     `refused`. A chain has nothing to read in it; a watch's
+        //     daily bound did not hold, so it is an alarm.
+        let refused = meta_str(&judged, "outcome") == Some("refused")
+            || ctx.event_payload.get("outcome").and_then(|v| v.as_str()) == Some("refused");
+        if refused {
+            if j.then.is_some() {
+                return Ok(());
+            }
+            let reason = step_by_slug(&judged, REPORT_STEP)
+                .and_then(|s| s.get("metadata"))
+                .and_then(|m| m.get("reason"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("the ops runner refused it and recorded no reason")
+                .to_string();
+            return self
+                .raise(&j, judged_id, &judged, &Trouble::RunnerRefused(reason), ctx)
+                .await;
+        }
+
         // 3. THE EXIT, BEFORE THE OUTPUT (53f54b3f). A verb that RAN
         //    and FAILED left a partial measurement, and this rule
         //    spends a MUTATING follow-on on the strength of it. A
@@ -534,20 +804,31 @@ impl Handler for OpsJudge {
         //    merged into the same field still carries a `refused 0`
         //    line, so `when` would hold and the publish would ride a
         //    reading that never finished. Nothing is judged; the alarm
-        //    is filed and the refusal written onto the check.
+        //    is filed and the refusal written onto the check. A watch
+        //    alarms on the same fact, in its own words.
         if let Some(failure) = verb_failure(&judged) {
-            return self
-                .refuse_to_chain(&j, judged_id, &judged, &failure, ctx)
-                .await;
+            return match &j.then {
+                Some(then) => {
+                    self.refuse_to_chain(&j, then, judged_id, &judged, &failure, ctx)
+                        .await
+                }
+                None => {
+                    self.raise(&j, judged_id, &judged, &Trouble::Failed(failure), ctx)
+                        .await
+                }
+            };
         }
 
         // 4. The verdict, off the runner's recorded output.
-        let output = step_by_slug(&judged, REPORT_STEP)
-            .and_then(|s| s.get("metadata"))
-            .and_then(|m| m.get("output"))
-            .and_then(|o| o.as_str())
-            .unwrap_or("");
+        let output = execute_output(&judged);
         let Some((verdict, groups)) = verdict_groups(&j.pattern, output) else {
+            if j.then.is_none() {
+                // No evidence is not a pass: a watched run that answered
+                // without its verdict is a run nobody can vouch for.
+                return self
+                    .raise(&j, judged_id, &judged, &Trouble::NoVerdict, ctx)
+                    .await;
+            }
             tracing::warn!(
                 rule = %rule,
                 judged = %judged_id,
@@ -558,7 +839,28 @@ impl Handler for OpsJudge {
         };
 
         // 5. The decision.
-        if !when_holds(&j.when, &j.when_src, &groups)? {
+        let holds = when_holds(&j.when, &j.when_src, &groups)?;
+        let Some(then) = &j.then else {
+            if !holds {
+                let trouble = Trouble::VerdictFalse { verdict, groups };
+                return self.raise(&j, judged_id, &judged, &trouble, ctx).await;
+            }
+            self.annotate(
+                judged_id,
+                json!({
+                    JUDGED: format!(
+                        "{rule}: watched — {} holds over {groups}; nothing to file; verdict: {verdict}",
+                        j.when_src
+                    ),
+                    "judged_verdict": verdict,
+                }),
+                rule,
+            )
+            .await?;
+            tracing::info!(rule = %rule, judged = %judged_id, "{verdict} — {} holds; watched, nothing to file", j.when_src);
+            return Ok(());
+        };
+        if !holds {
             self.annotate(
                 judged_id,
                 json!({
@@ -578,7 +880,7 @@ impl Handler for OpsJudge {
         let open = open_jobs_of_kind(&self.client, self.base(), "ops-request", rule).await?;
         let filed_id = match open
             .iter()
-            .find(|o| already_filed(&j, judged_id, &judged, o))
+            .find(|o| already_filed(then, judged_id, &judged, o))
             .and_then(|o| o.get("id").and_then(|v| v.as_str()))
         {
             // Filed by an earlier delivery whose note never landed, or
@@ -586,7 +888,7 @@ impl Handler for OpsJudge {
             // the judged request its note.
             Some(existing) => existing.to_string(),
             None => {
-                let body = follow_on_body(&j, judged_id, &judged, &verdict, ctx);
+                let body = follow_on_body(&j, then, judged_id, &judged, &verdict, ctx);
                 self.file(&body, rule).await?
             }
         };
@@ -595,9 +897,9 @@ impl Handler for OpsJudge {
             json!({
                 JUDGED: format!(
                     "{rule}: filed {} {} on {} as ops-request {filed_id} — {} is true over {groups}; verdict: {verdict}",
-                    j.then_verb,
-                    j.then_args.join(" "),
-                    j.then_host,
+                    then.verb,
+                    then.args.join(" "),
+                    then.host,
                     j.when_src
                 ),
                 "judged_verdict": verdict,
@@ -606,7 +908,7 @@ impl Handler for OpsJudge {
             rule,
         )
         .await?;
-        tracing::info!(rule = %rule, judged = %judged_id, filed = %filed_id, "{verdict} — filed {} {} on {}", j.then_verb, j.then_args.join(" "), j.then_host);
+        tracing::info!(rule = %rule, judged = %judged_id, filed = %filed_id, "{verdict} — filed {} {} on {}", then.verb, then.args.join(" "), then.host);
         Ok(())
     }
 }
@@ -1070,10 +1372,17 @@ mod tests {
         a.iter_mut().find(|(k, _)| k == "then_args").unwrap().1 =
             Value::String("  --for-real   forge ".into());
         let j = Judgement::from_args(&a).unwrap();
-        assert_eq!(j.then_args, vec!["--for-real", "forge"]);
+        assert_eq!(j.then.unwrap().args, vec!["--for-real", "forge"]);
         let mut a = args();
         a.iter_mut().find(|(k, _)| k == "then_args").unwrap().1 = Value::String("".into());
-        assert!(Judgement::from_args(&a).unwrap().then_args.is_empty());
+        assert!(
+            Judgement::from_args(&a)
+                .unwrap()
+                .then
+                .unwrap()
+                .args
+                .is_empty()
+        );
     }
 
     /// A verb that FAILED left a partial measurement, and the whole
@@ -1168,11 +1477,212 @@ mod tests {
         assert_eq!(filed[0]["kind"], "backlog-item", "{w:?}");
     }
 
+    // -----------------------------------------------------------------
+    // WATCH MODE (backlog 8d77d670, review H1): a rule with no follow-on
+    // watches an UNATTENDED verb, so a run that did not do its job is an
+    // alarm rather than a closed packet nobody reads.
+    // -----------------------------------------------------------------
+
+    const WATCHED: &str = "prune-registry-versions-daily";
+    /// The prune's closing line, as prune-registry-versions.sh prints it.
+    const WATCH_PATTERN: &str = "OK .* deleted (?P<deleted>[0-9]+) of (?P<planned>[0-9]+) planned";
+    const PRUNE_RECORD: &str =
+        r#"{"verb":"prune-registry-versions","dry_run":false,"planned":8,"deleted":8}"#;
+
+    fn watch_args() -> Vec<(String, Value)> {
+        [
+            ("verb", WATCHED),
+            ("verdict_pattern", WATCH_PATTERN),
+            ("when", "deleted = planned"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.into())))
+        .collect()
+    }
+
+    fn alarms(w: &[(String, String, serde_json::Value)]) -> Vec<serde_json::Value> {
+        posts(w)
+            .into_iter()
+            .filter(|b| b["kind"] == "backlog-item")
+            .collect()
+    }
+
+    fn note_on(w: &[(String, String, serde_json::Value)], id: &str) -> serde_json::Value {
+        w.iter()
+            .find(|(me, p, _)| me == "PATCH" && p == &format!("/api/jobs/{id}/metadata"))
+            .map(|(_, _, b)| b.clone())
+            .unwrap_or_else(|| panic!("{id} was not annotated: {w:?}"))
+    }
+
+    #[test]
+    fn a_rule_without_a_follow_on_is_a_watch_and_half_a_follow_on_is_refused() {
+        let j = Judgement::from_args(&watch_args()).unwrap();
+        assert!(j.then.is_none(), "no then_* args means a watch");
+        let mut half = watch_args();
+        half.push(("then_verb".into(), Value::String("reclaim-disk".into())));
+        let err = Judgement::from_args(&half).err().expect("half a follow-on");
+        assert!(
+            matches!(err, HandlerError::Permanent(ref m) if m.contains("then_host")),
+            "{err:?}"
+        );
+    }
+
+    /// The prune REFUSED (exit 2 — an underivable keep half, a ceiling,
+    /// a 403) or failed part-way (exit 1). The request closed `answered`
+    /// because the verb RAN, so nothing else says so: the watch files one
+    /// urgent alarm naming the verb, the exit, its verdict line and the
+    /// head of its output, where the record sits.
+    #[tokio::test]
+    async fn a_watched_verb_that_failed_files_its_alarm_naming_the_verb_and_output() {
+        let out = format!(
+            "{PRUNE_RECORD}\nprune-registry-versions: REFUSED — the plan deletes 1600 version(s), beyond the ceiling of 1500 per run\nprune-registry-versions:   Nothing was deleted.\n"
+        );
+        let (base, writes) = mock_jobs(vec![request_exit(CHECK, WATCHED, &[], &out, "2")]).await;
+        judge(base).invoke(&watch_args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "one alarm and nothing else: {w:?}");
+        let alarm = &filed[0];
+        assert_eq!(alarm["kind"], "backlog-item");
+        assert_eq!(alarm["priority"], "urgent");
+        let title = alarm["title"].as_str().unwrap();
+        assert!(
+            title.contains(WATCHED) && title.contains("exit 2"),
+            "{title}"
+        );
+        assert!(
+            !title.contains("was not filed"),
+            "a watch files no follow-on, so its alarm must not say one was withheld: {title}"
+        );
+        let m = &alarm["metadata"];
+        assert_eq!(m[FOR_REQUEST], CHECK);
+        assert_eq!(m["verb"], WATCHED);
+        assert_eq!(m["exit"], "2");
+        assert!(m["failed"].as_str().unwrap().contains("REFUSED"), "{m}");
+        assert!(
+            m["output_head"].as_str().unwrap().contains(PRUNE_RECORD),
+            "the alarm carries the head of the output, where the record is: {m}"
+        );
+        let note = note_on(&w, CHECK);
+        assert!(note[JUDGED].as_str().unwrap().contains("exit 2"), "{note}");
+        assert!(note["alert"].is_string(), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_failed_watch_files_one_alarm() {
+        let (base, writes) = mock_jobs(vec![request_exit(
+            CHECK,
+            WATCHED,
+            &[],
+            "prune-registry-versions: FAILED — DELETE boss:deadbee answered 500, not 204; stopping here:\n",
+            "1",
+        )])
+        .await;
+        let h = judge(base);
+        h.invoke(&watch_args(), &ctx()).await.unwrap();
+        h.invoke(&watch_args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(
+            alarms(&w).len(),
+            1,
+            "one alarm across two deliveries: {w:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watched_verb_that_answered_clean_files_nothing_and_says_so() {
+        let out = format!(
+            "{PRUNE_RECORD}\nprune-registry-versions: OK — deleted 8 of 8 planned version(s) across boss boss-ci; df\n"
+        );
+        let (base, writes) = mock_jobs(vec![request(CHECK, WATCHED, &[], &out)]).await;
+        judge(base).invoke(&watch_args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        assert!(
+            posts(&w).is_empty(),
+            "a clean watched run files nothing: {w:?}"
+        );
+        let note = note_on(&w, CHECK);
+        let judged = note[JUDGED].as_str().unwrap();
+        assert!(judged.contains("deleted = planned"), "{judged}");
+        assert!(judged.contains("holds"), "{judged}");
+    }
+
+    /// No evidence is not a pass: an exit 0 with no verdict line, or a
+    /// verdict its predicate refuses, is an alarm for a watch — nothing
+    /// else will read that run.
+    #[tokio::test]
+    async fn a_watched_verb_without_its_verdict_or_failing_it_is_an_alarm() {
+        for (out, why) in [
+            (
+                "prune-registry-versions: list: every line follows\n",
+                "no verdict",
+            ),
+            (
+                "prune-registry-versions: OK — deleted 3 of 8 planned version(s) across boss boss-ci\n",
+                "deleted = planned",
+            ),
+        ] {
+            let (base, writes) = mock_jobs(vec![request(CHECK, WATCHED, &[], out)]).await;
+            judge(base).invoke(&watch_args(), &ctx()).await.unwrap();
+            let w = writes.lock().unwrap().clone();
+            let filed = alarms(&w);
+            assert_eq!(filed.len(), 1, "{why}: {w:?}");
+            let detail = filed[0]["metadata"]["detail"].as_str().unwrap();
+            assert!(detail.contains(why), "{why}: {detail}");
+        }
+    }
+
+    /// A RUNNER refusal ran nothing, carries no exit, and closes the
+    /// request `refused` — which a chain has always ignored and a watch
+    /// must not: a daily verb the runner will not run is a daily bound
+    /// that is not holding.
+    #[tokio::test]
+    async fn a_runner_refusal_of_a_watched_verb_is_an_alarm() {
+        let refused = json!({
+            "id": CHECK,
+            "kind": "ops-request",
+            "status": "closed",
+            "metadata": { "host": "forge", "verb": WATCHED, "outcome": "refused" },
+            "steps": [
+                { "id": "r-execute", "spec_slug": "execute", "status": "completed",
+                  "metadata": { "disposition": "refused",
+                                "reason": "verb prune-registry-versions-daily is not in the allowlist (infra/ops/verbs/)" } },
+            ],
+        });
+        let (base, writes) = mock_jobs(vec![refused]).await;
+        let mut c = ctx();
+        c.event_payload["outcome"] = json!("refused");
+        judge(base.clone()).invoke(&watch_args(), &c).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = alarms(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert!(
+            filed[0]["metadata"]["failed"]
+                .as_str()
+                .unwrap()
+                .contains("not in the allowlist"),
+            "the runner's reason, verbatim: {}",
+            filed[0]
+        );
+        // A CHAIN still ignores a runner refusal, as it always has.
+        let chained = json!({
+            "id": CONVERGE, "kind": "ops-request", "status": "closed",
+            "metadata": { "host": "boss-gcp", "verb": "publish-drift", "outcome": "refused" },
+            "steps": [],
+        });
+        let (base, writes) = mock_jobs(vec![chained]).await;
+        let mut c = ctx();
+        c.event_payload["id"] = json!(CONVERGE);
+        c.event_payload["outcome"] = json!("refused");
+        judge(base).invoke(&args(), &c).await.unwrap();
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn the_handler_is_registered_under_its_name() {
         let h = judge("http://unused".to_string());
         assert_eq!(h.name(), "ops.judge");
-        let emits = boss_dispatcher::cascade::handler_emits()
+        let emits = crate::cascade::handler_emits()
             .get("ops.judge")
             .cloned()
             .expect("the cascade table knows this handler");

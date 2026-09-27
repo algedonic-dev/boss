@@ -3,10 +3,10 @@
 // David: "Do we have a good surface for IT to view post mortems more
 // durably? I think we probably need a new 'Incidents' page that is
 // both where we respond to active incidents and document post mortems
-// for posterity." Two panels: active incident-post-mortem packets
+// for posterity." Two panels: active incident packets
 // (respond), and closed ones rendered as readable documents (the
-// archive). The renderer is SEMI-structured — the two live packets
-// already carry different metadata shapes, and both must render
+// archive). The renderer is SEMI-structured — packets have carried
+// different metadata shapes, and every one must render
 // without dropping content or dumping JSON.
 //
 // The failed-fetch case is pinned per the false-empty sweep (packet
@@ -27,7 +27,7 @@ const json = (r: Route, b: unknown, status = 200) =>
 /// one ready step assigned to an agent.
 const OPEN_JOB = {
   id: 'ipm-open-1',
-  kind: 'incident-post-mortem',
+  kind: 'incident',
   workflow_version: 1,
   subject: { subject_kind: 'custom', id: 'incident-2026-08-22-etcd' },
   title: 'Post-mortem: cp-2 etcd degradation',
@@ -46,7 +46,7 @@ const OPEN_JOB = {
     evidence: 'readyz verbose (etcd failed) captured 18:1xZ.',
   },
   steps: [
-    { id: 's-open-0', job_id: 'ipm-open-1', kind: 'trigger', title: 'Incident opened', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-22', metadata: {} },
+    { id: 's-open-0', job_id: 'ipm-open-1', kind: 'trigger', title: 'Incident raised', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-22', metadata: {} },
     { id: 's-open-1', job_id: 'ipm-open-1', kind: 'task', title: 'Establish the timeline from evidence', assignee_id: 'claude@algedonic.dev', status: 'ready', sort_order: 1, blocked_by: ['s-open-0'], completed_on: null, metadata: { authority_role: 'platform-admin' } },
     { id: 's-open-2', job_id: 'ipm-open-1', kind: 'task', title: 'Did we cause it?', assignee_id: null, status: 'pending', sort_order: 2, blocked_by: ['s-open-1'], completed_on: null, metadata: { authority_role: 'platform-admin' } },
   ],
@@ -61,8 +61,8 @@ const CLOSED_NEW = {
   opened_on: '2026-08-20',
   closed_on: '2026-08-22',
   steps: [
-    { id: 's-cn-0', job_id: 'ipm-closed-new', kind: 'trigger', title: 'Incident opened', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-20', metadata: {} },
-    { id: 's-cn-7', job_id: 'ipm-closed-new', kind: 'outcome', title: 'Post-mortem closed', assignee_id: null, status: 'completed', sort_order: 7, blocked_by: [], completed_on: '2026-08-22', metadata: {} },
+    { id: 's-cn-0', job_id: 'ipm-closed-new', kind: 'trigger', title: 'Incident raised', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-20', metadata: {} },
+    { id: 's-cn-7', job_id: 'ipm-closed-new', kind: 'outcome', title: 'Closed', assignee_id: null, status: 'completed', sort_order: 7, blocked_by: [], completed_on: '2026-08-22', metadata: {} },
   ],
 };
 
@@ -71,7 +71,7 @@ const CLOSED_NEW = {
 /// must render its content as labeled prose, not drop it.
 const CLOSED_OLD = {
   id: 'ipm-closed-old',
-  kind: 'incident-post-mortem',
+  kind: 'incident',
   workflow_version: 1,
   subject: { subject_kind: 'custom', id: 'incident-2026-08-13-sor' },
   title: 'Post-mortem: production DB crash',
@@ -89,15 +89,24 @@ const CLOSED_OLD = {
     outcome: 'Five protocol changes filed',
   },
   steps: [
-    { id: 's-co-0', job_id: 'ipm-closed-old', kind: 'trigger', title: 'Incident opened', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-13', metadata: {} },
-    { id: 's-co-7', job_id: 'ipm-closed-old', kind: 'outcome', title: 'Post-mortem closed', assignee_id: null, status: 'completed', sort_order: 7, blocked_by: [], completed_on: '2026-08-14', metadata: {} },
+    { id: 's-co-0', job_id: 'ipm-closed-old', kind: 'trigger', title: 'Incident raised', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-08-13', metadata: {} },
+    { id: 's-co-7', job_id: 'ipm-closed-old', kind: 'outcome', title: 'Closed', assignee_id: null, status: 'completed', sort_order: 7, blocked_by: [], completed_on: '2026-08-14', metadata: {} },
   ],
 };
 
-const LIST = /\/api\/jobs\?kind=incident-post-mortem/;
+const LIST = /\/api\/jobs\?kind=incident&/;
+const WORKFLOWS = /\/api\/workflows$/;
 
-async function mocks(page: Page) {
+/// The registry rows the page reads its kinds from (backlog bc3bac66):
+/// a protocol belongs on /it/operate when its row declares the
+/// `system-incidents` surface, the way HR and QA read theirs. The
+/// decoy declares another surface and must never be fetched.
+const INCIDENT_ROW = { kind: 'incident', label: 'Incident', subject_kinds: ['custom'], metadata: { surfaces: ['system-incidents'] } };
+const DECOY_ROW = { kind: 'page-audit', label: 'Page audit', subject_kinds: ['custom'], metadata: { surfaces: ['system-design'] } };
+
+async function mocks(page: Page, rows: ReadonlyArray<unknown> = [INCIDENT_ROW, DECOY_ROW]) {
   await installSmokeMocks(page);
+  await page.route(WORKFLOWS, (r) => json(r, rows));
 }
 
 // ---- specs ------------------------------------------------------------
@@ -134,8 +143,9 @@ test('active packets and the archive both render, archive newest first', async (
   await expect(newest.getByText('Summary', { exact: true })).toBeVisible();
   await expect(newest.getByText(/Six queued gates killed/)).toBeVisible();
   await expect(newest.getByText('Evidence', { exact: true })).toBeVisible();
-  // Its outcome — the terminal that fired.
-  await expect(newest.getByText('Post-mortem closed')).toBeVisible();
+  // Its outcome — the terminal that fired. Scoped to the badge: the
+  // terminal is titled `Closed`, and "closed <date>" sits beside it.
+  await expect(newest.locator('.inc-outcome')).toHaveText('Closed');
 
   // Old shape: unknown keys as labeled prose — content survives.
   const oldest = docs.nth(1);
@@ -169,6 +179,75 @@ test('a failed fetch renders as a failure with Retry — never as an empty page'
   await expect(page.locator('.inc-failed')).toHaveCount(0);
 });
 
+/// An open packet in the LIVE shape (a65ba21e, read 2026-09-26): no
+/// started_at on the job or the raised step, metadata.opened_at and
+/// metadata.severity present, the current step held by a ROLE.
+const LIVE_SHAPE = {
+  id: 'inc-live-1',
+  kind: 'incident',
+  workflow_version: 3,
+  subject: { subject_kind: 'custom', id: 'incident-2026-09-26' },
+  title: 'Incident: gate bay stalled',
+  owner_id: 'emp-david',
+  status: 'open',
+  priority: 'urgent',
+  opened_on: '2026-09-26',
+  due_on: null,
+  closed_on: null,
+  tags: [],
+  metadata: {
+    opened_at: '2026-09-26T02:32:07Z',
+    severity: 'degradation (no service outage)',
+  },
+  steps: [
+    { id: 's-live-0', job_id: 'inc-live-1', kind: 'trigger', title: 'Incident raised', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-09-26', metadata: { symptom: 'gates stuck' } },
+    { id: 's-live-1', job_id: 'inc-live-1', kind: 'task', title: 'Establish the timeline from evidence', assignee_id: null, status: 'ready', sort_order: 2, blocked_by: ['s-live-0'], completed_on: null, metadata: { authority_role: 'platform-admin' } },
+  ],
+};
+
+const QUEUE_AGE = /\/api\/jobs\/queue-age$/;
+
+test('the active card shows severity, when it started, time open, time at step and the real audience', async ({ page }) => {
+  await mocks(page);
+  await page.route(LIST, (r) => json(r, { data: [LIVE_SHAPE], total: 1 }));
+  await page.route(QUEUE_AGE, (r) =>
+    json(r, {
+      data: [{ job_id: 'inc-live-1', step_id: 's-live-1', since: '2026-09-26T04:00:00Z', exact: true }],
+      total: 1,
+      now: '2026-09-26T05:10:00Z',
+    }));
+
+  await page.goto('/it/operate');
+
+  const card = page.locator('.inc-active .inc-card');
+  await expect(card).toHaveCount(1);
+  // Severity beside priority (1a242883 b).
+  await expect(card.locator('.inc-priority')).toHaveText('urgent');
+  await expect(card.locator('.inc-severity')).toHaveText('degradation (no service outage)');
+  // When: no started_at anywhere on the live shape, so metadata.opened_at (a).
+  await expect(card.locator('.inc-when')).toHaveText('2026-09-26T02:32:07Z');
+  // Time open, against the server clock the lens sent (c).
+  await expect(card.locator('.inc-age')).toHaveText('2h 37m');
+  // Time at the current step, from became_ready_at (c).
+  await expect(card.locator('.inc-at-step')).toHaveText('at step 1h 10m');
+  // The role that holds it, not "(unassigned)" (d).
+  await expect(card.locator('.inc-holder')).toHaveText('(role platform-admin)');
+  await expect(card.getByText('(unassigned)')).toHaveCount(0);
+});
+
+test('an unreadable queue-age says so on the card and does not fail the queue', async ({ page }) => {
+  await mocks(page);
+  await page.route(LIST, (r) => json(r, { data: [LIVE_SHAPE], total: 1 }));
+  await page.route(QUEUE_AGE, (r) => json(r, 'down', 500));
+
+  await page.goto('/it/operate');
+
+  const card = page.locator('.inc-active .inc-card');
+  await expect(card.locator('.inc-at-step')).toHaveText('time at step unreadable');
+  await expect(card.locator('.inc-severity')).toBeVisible();
+  await expect(page.locator('.inc-failed')).toHaveCount(0);
+});
+
 test('a truly empty queue reads as empty — each panel says so distinctly', async ({ page }) => {
   await mocks(page);
   await page.route(LIST, (r) => json(r, { data: [], total: 0 }));
@@ -177,5 +256,65 @@ test('a truly empty queue reads as empty — each panel says so distinctly', asy
 
   await expect(page.getByText(/No active incidents/)).toBeVisible();
   await expect(page.getByText(/No post-mortems archived yet/)).toBeVisible();
+  await expect(page.locator('.inc-failed')).toHaveCount(0);
+});
+
+// ---- the kinds come from the registry (backlog bc3bac66) ---------------
+//
+// The page used to fetch `kind=incident`, a literal the 59d15039 fold
+// had to edit by hand, while the incident row declared a surface
+// (`system-design`) that renders nothing. Now a protocol reaches this
+// page by declaring `system-incidents` on its row — no page edit.
+
+test('every kind whose row declares system-incidents is read, and no other', async ({ page }) => {
+  const DRILL_ROW = { kind: 'outage-drill', label: 'Outage drill', subject_kinds: ['custom'], metadata: { surfaces: ['system-incidents'] } };
+  await mocks(page, [INCIDENT_ROW, DRILL_ROW, DECOY_ROW]);
+  const asked: string[] = [];
+  await page.route(/\/api\/jobs\?kind=/, (r) => {
+    const kind = new URL(r.request().url()).searchParams.get('kind') ?? '';
+    asked.push(kind);
+    if (kind === 'outage-drill') {
+      return json(r, { data: [{ ...OPEN_JOB, id: 'drill-1', kind: 'outage-drill', title: 'Drill: failover rehearsal' }], total: 1 });
+    }
+    return json(r, { data: kind === 'incident' ? [OPEN_JOB] : [], total: kind === 'incident' ? 1 : 0 });
+  });
+
+  await page.goto('/it/operate');
+
+  const active = page.locator('.inc-active');
+  await expect(active.getByText('Post-mortem: cp-2 etcd degradation')).toBeVisible();
+  await expect(active.getByText('Drill: failover rehearsal')).toBeVisible();
+  expect([...new Set(asked)].sort()).toEqual(['incident', 'outage-drill']);
+});
+
+test('an unreadable registry is a failure, not an empty queue', async ({ page }) => {
+  await installSmokeMocks(page);
+  let up = false;
+  await page.route(WORKFLOWS, (r) =>
+    up ? json(r, [INCIDENT_ROW]) : json(r, 'registry down', 503));
+  let jobReads = 0;
+  await page.route(LIST, (r) => {
+    jobReads += 1;
+    return json(r, { data: [OPEN_JOB], total: 1 });
+  });
+
+  await page.goto('/it/operate');
+
+  await expect(page.locator('.inc-failed')).toContainText('workflows registry: HTTP 503');
+  await expect(page.getByText(/No active incidents/)).toHaveCount(0);
+  expect(jobReads).toBe(0);
+
+  up = true;
+  await page.getByRole('button', { name: 'Retry' }).click();
+  await expect(page.getByText('Post-mortem: cp-2 etcd degradation')).toBeVisible();
+});
+
+test('a registry declaring no incident protocol says so, not "no incidents"', async ({ page }) => {
+  await mocks(page, [DECOY_ROW]);
+
+  await page.goto('/it/operate');
+
+  await expect(page.locator('.inc-no-kinds')).toContainText('No protocol declares the system-incidents surface');
+  await expect(page.getByText(/No active incidents/)).toHaveCount(0);
   await expect(page.locator('.inc-failed')).toHaveCount(0);
 });

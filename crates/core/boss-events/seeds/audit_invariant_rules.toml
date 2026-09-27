@@ -1,8 +1,9 @@
 # Cross-event soft-FK invariant rules.
 # Loaded once by `boss_events::integrity::foreign_ref_rules()` via
 # `include_str!` + `OnceLock`. Same data-as-data shape as D1
-# (step_types.toml), D2 (phase_two_models.toml), D3
-# (revenue_accounts.toml). (D4, tax_liability_accounts.toml, was
+# (step_types.toml) and D2 (phase_two_models.toml). (D3,
+# revenue_accounts.toml, moved onto the tenant's revenue-category
+# Classes on 2026-09-26, aa860c6d; D4, tax_liability_accounts.toml, was
 # collapsed into the tenant's `tax_kinds` rows on 2026-09-19, e021be29.)
 #
 # Adding a new cross-event reference (e.g. a `jobs.job.created.assigned_to`

@@ -10,11 +10,17 @@
   // so the skeleton and the eventual plugin render occupy the same
   // box. Sibling steps below don't shift when the plugin hydrates.
   //
-  // Re-mount semantics: the effect re-runs whenever kind, step,
-  // jobId, or currentUser change — cleanup first, then mount with
-  // the new props. In Boss, step props change only after user action
-  // (save → onUpdate → parent refetch), so the remount flash is
-  // a non-issue.
+  // Re-mount semantics: the effect re-runs when the kind, the step's
+  // ID or the step's STATUS changes — cleanup first, then mount with
+  // the new props — and on nothing else. This comment used to say it
+  // re-ran on every new step object, which was never true of the
+  // effect (the step is read after an await, untracked); what remounted
+  // the plugin on every packet reload was StepSurface's probe, and that
+  // remount wiped an answer David was typing (backlog fec57f5f). A
+  // mounted plugin owns its unsaved input, so a reload carrying the
+  // same step in the same status must leave it alone. A different step
+  // (a click on the rail) or a status move (completed, by this surface
+  // or another actor) is a different thing to show, so it remounts.
 
   import {
     getStepPluginMount,
@@ -42,10 +48,15 @@
   // The plugin contract keeps status as a plain string (bundles are
   // framework-agnostic); the platform surface wants the union.
   let genericStep = $derived({ ...step, status: step.status as StepStatus });
+  // Primitives, so a same-value reload does not re-run the effect.
+  let stepId = $derived(step.id);
+  let stepStatus = $derived(step.status);
 
   $effect(() => {
     if (!container) return;
     void retryNonce;
+    void stepId;
+    void stepStatus;
     const k = kind;
     const currentContainer = container;
     let cancelled = false;
@@ -102,12 +113,12 @@
       No plugin registered for <code class="mono">{kind}</code>.
     </div>
   {:else if loadState.kind === 'failed'}
-    <div class="step-plugin-failed" role="alert">
+    <div class="step-plugin-failed load-failed" role="alert">
       <span>
         The <code class="mono">{kind}</code> surface failed to load
         ({loadState.reason}) — using the generic form below.
       </span>
-      <button class="step-btn" onclick={() => (retryNonce += 1)}>Retry</button>
+      <button class="btn" onclick={() => (retryNonce += 1)}>Retry</button>
     </div>
     <GenericSurface step={genericStep} {jobId} {onUpdate} />
   {/if}

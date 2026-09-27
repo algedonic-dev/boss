@@ -11,16 +11,19 @@
   //   GET /api/events/tail with the current filters. Useful for
   //   pinning a window to inspect / share.
   //
-  // Filters (source, kind substring, limit) compose into query
-  // params for both modes. Single click on a row toggles the
+  // Filters (source, kind substring, actor, limit, and a since/until
+  // window) compose into query params for both modes. Single click on a row toggles the
   // inline JSON payload. Requires operator tier; non-operators
   // get a 403 from the backend which we render inline.
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import FileAttachments from '../../content/FileAttachments.svelte';
+  import { packetOf, windowBound } from './auditRetro';
   import { appNow, appToday } from '@boss/web-kit/sim-clock';
   import { formatDate } from '@boss/web-kit/ui/date';
+  import { actorOf, knownActors as actorsIn } from './auditActor';
+  import { readExport } from './auditExport';
 
   type AuditEntry = {
     event_id: string;
@@ -42,6 +45,21 @@
   const LIVE_BUFFER_CAP = 500;
 
   let loadState: State = $state<State>({ kind: 'loading' });
+
+  // What the live stream is doing, said in one line (backlog 260879f5,
+  // page audit 65a273d5). A dead stream used to look exactly like a
+  // quiet log: the server swallowed a failed read and held the
+  // connection open, and the page acted only on CLOSED, falling to the
+  // poll without a word. The server now sends `event: failed` naming the
+  // error and ends; each state below paints its own line.
+  type LiveState =
+    | { kind: 'off' }
+    | { kind: 'connecting' }
+    | { kind: 'live' }
+    | { kind: 'reconnecting' }
+    | { kind: 'polling'; reason: string }
+    | { kind: 'windowed' };
+  let liveState = $state<LiveState>({ kind: 'off' });
 
   // Size and growth (168b3f25). David, 2026-09-02: "We need size and
   // growth stats on audit log to make sure it isn't growing
@@ -98,15 +116,30 @@
     const t = setInterval(() => void loadStats(), STATS_RELOAD_MS);
     return () => clearInterval(t);
   });
+  // The window a retro or an incident reads (backlog 62a0bbee). The
+  // tail is the newest `limit` rows, at most 500 — about ten minutes of
+  // log — so without a window nothing older was readable here, only
+  // exportable. Both are `datetime-local` values in the zone the rows
+  // are painted in; auditRetro.ts turns them into the UTC instants the
+  // tail takes (`since` inclusive, `until` exclusive). An Until closes
+  // the window, so the live stream is not opened while one is set.
+  let sinceInput = $state('');
+  let untilInput = $state('');
   let sourceFilter = $state('');
   let kindFilter = $state('');
+  // Who acted (backlog 03f79eca) — an EXACT match on the payload's
+  // `_actor`, applied by the server in tail, stream and export alike.
+  let actorFilter = $state('');
   let limit = $state<(typeof LIMIT_CHOICES)[number]>(100);
-  // Provenance filter. Defaults to `real`: the audit log was 89%
-  // simulated when this landed (328,255 of 370,033 rows), so an
-  // unfiltered page is nine-tenths brewery traffic and the operator
-  // events it buries are the reason anyone opens this page. `all`
-  // stays one click away — the default is a lens, not a lie.
-  let provenance = $state<'real' | 'sim' | 'all'>('real');
+  // Provenance filter, applied by the server in tail, stream and export
+  // alike (the stream and the export ignored it until 2026-09-24,
+  // backlog 34ea2ae0). It defaulted to `real` when the log was 89%
+  // simulated (328,255 of 370,033 rows). It defaults to `all` since
+  // 34ea2ae0 landed, decided under page audit 65a273d5: the brewery sim
+  // is parked and simulated traffic belongs to the playground, so this
+  // instance's log is real work and `real` hid nearly nothing while
+  // naming a filter. `real` and `sim` stay one click away.
+  let provenance = $state<'real' | 'sim' | 'all'>('all');
   let autoRefresh = $state(true);
   let expanded = $state<string | null>(null);
   let lastFetched = $state<Date | null>(null);
@@ -116,13 +149,24 @@
   // wallclock default lands after every event and exports an empty file.
   // Populated when the panel opens (the sim clock is loaded by then); the
   // operator can override either date. The export inherits the page's
-  // source + kind filters; the browser saves via Content-Disposition.
+  // source, kind, actor and provenance filters; the page reads the whole
+  // body with fetch and saves it as a Blob, taking only the file NAME
+  // from Content-Disposition (4630ebc0 — it was a navigation the browser
+  // saved by that header).
   function isoDate(d: Date): string {
     return d.toISOString().slice(0, 10);
   }
   let downloadOpen = $state(false);
   let downloadFrom = $state<string>('');
   let downloadTo = $state<string>('');
+  // How the last Save .jsonl ended, said in one line under the panel
+  // (4630ebc0) — it used to end off the page or nowhere.
+  type ExportState =
+    | { kind: 'idle' }
+    | { kind: 'reading' }
+    | { kind: 'saved'; message: string }
+    | { kind: 'failed'; message: string };
+  let exportState = $state<ExportState>({ kind: 'idle' });
 
   function toggleDownload(): void {
     if (!downloadOpen) {
@@ -139,6 +183,8 @@
     const knd = kindFilter.trim();
     if (src) params.set('source', src);
     if (knd) params.set('kind', knd);
+    const act = actorFilter.trim();
+    if (act) params.set('actor', act);
     // The export honours the same lens as the view. A download that
     // silently disagreed with the table above it would be worse than
     // no export.
@@ -157,9 +203,33 @@
       params.set('until', t.toISOString());
     }
     // The export endpoint streams up to 50k rows; for large windows
-    // the operator narrows the range. Direct navigation triggers the
-    // browser download dialog via the response's Content-Disposition.
-    window.location.href = `/api/events/export?${params.toString()}`;
+    // the operator narrows the range. It is READ, not navigated to
+    // (4630ebc0): a navigation replaced the app with a refusal's raw
+    // body, and kept a short file when the stream broke off after its
+    // 200. auditExport.ts names every ending; only a whole body saves.
+    void saveExport(`/api/events/export?${params.toString()}`);
+  }
+
+  async function saveExport(url: string): Promise<void> {
+    exportState = { kind: 'reading' };
+    const out = await readExport(fetch, url);
+    if (out.kind === 'failed') {
+      // The panel stays open, holding the window, for a retry.
+      exportState = { kind: 'failed', message: out.message };
+      return;
+    }
+    const href = URL.createObjectURL(out.blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = out.filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 0);
+    exportState = {
+      kind: 'saved',
+      message: `Saved ${out.filename}: ${out.events.toLocaleString()} ${out.events === 1 ? 'event' : 'events'}.`,
+    };
     downloadOpen = false;
   }
 
@@ -167,17 +237,35 @@
     // Re-run whenever filters or live-mode flag change.
     const src = sourceFilter.trim();
     const knd = kindFilter.trim();
+    const act = actorFilter.trim();
     const lim = limit;
     const prov = provenance;
     const auto = autoRefresh;
+    const since = windowBound(sinceInput);
+    const until = windowBound(untilInput);
 
     let cancelled = false;
+    // Frames this run applied before its snapshot answered (697f9f87).
+    // The tail read and the stream start together below, so either may
+    // answer first, and the server anchors the stream at MAX(id) when it
+    // connects — a frame that beats the snapshot may be a row the
+    // snapshot never carries. Replacing the rows with the snapshot lost
+    // it. So the snapshot MERGES: the early frames not already in it go
+    // on top, exactly where they would sit had the snapshot come first.
+    // Opening the stream only after the snapshot paints was the other
+    // fix, and a worse one: rows landing between the snapshot's query
+    // and the stream's anchor would reach neither.
+    let early: ReadonlyArray<AuditEntry> = [];
+    let snapshotPainted = false;
 
     async function fetchSnapshot(): Promise<void> {
       const params = new URLSearchParams();
       if (src) params.set('source', src);
       if (knd) params.set('kind', knd);
+      if (act) params.set('actor', act);
       if (prov !== 'all') params.set('simulated', prov);
+      if (since) params.set('since', since);
+      if (until) params.set('until', until);
       params.set('limit', String(lim));
       try {
         const r = await fetch(`/api/events/tail?${params.toString()}`, {
@@ -190,7 +278,11 @@
         }
         const body = (await r.json()) as ReadonlyArray<AuditEntry>;
         if (!cancelled) {
-          loadState = { kind: 'ready', rows: body };
+          const inSnapshot = new Set(body.map((r) => r.event_id));
+          const rows = [...early.filter((r) => !inSnapshot.has(r.event_id)), ...body];
+          loadState = { kind: 'ready', rows: rows.slice(0, LIVE_BUFFER_CAP) };
+          early = [];
+          snapshotPainted = true;
           lastFetched = new Date();
         }
       } catch (e) {
@@ -207,30 +299,67 @@
     // recent window immediately, regardless of mode.
     void fetchSnapshot();
 
-    if (!auto) {
+    if (!auto || until) {
       // Snapshot mode — explicit reload only via the user
       // tapping the filter inputs (which retriggers this $effect).
-      // No interval timer.
+      // No interval timer. An Until puts the page here too: the
+      // stream pushes rows as they land, and none that lands now can
+      // fall before it (62a0bbee).
+      liveState = auto ? { kind: 'windowed' } : { kind: 'off' };
       return () => {
         cancelled = true;
       };
     }
 
     // Live mode — SSE pushes new rows as they land. Browser's
-    // EventSource auto-reconnects on transient blips. On a hard
-    // failure (route 404 on older deploys) onerror fires with
-    // CLOSED state; fall back to a 5s snapshot poll.
+    // EventSource auto-reconnects when an open stream ends. Two
+    // failures stop it for good, and both fall back to a 5s snapshot
+    // poll with a line saying so: a refused request (onerror with
+    // CLOSED — a non-200, a route 404 on an older deploy) and the
+    // server's own `failed` frame, which the page answers by closing
+    // the stream so the browser does not re-anchor past the gap.
     const params = new URLSearchParams();
     if (src) params.set('source', src);
     if (knd) params.set('kind', knd);
+    if (act) params.set('actor', act);
+    // The lens the snapshot applies, or a synthetic row lands in a view
+    // the select calls "Real only" (34ea2ae0).
+    if (prov !== 'all') params.set('simulated', prov);
     let es: EventSource | null = null;
     let pollFallbackId: number | null = null;
+    function fallBackToPoll(reason: string): void {
+      es?.close();
+      es = null;
+      if (cancelled) return;
+      liveState = { kind: 'polling', reason };
+      if (pollFallbackId === null) {
+        pollFallbackId = window.setInterval(fetchSnapshot, SNAPSHOT_RELOAD_MS);
+      }
+    }
+    liveState = { kind: 'connecting' };
     try {
       es = new EventSource(`/api/events/stream?${params.toString()}`);
+      es.onopen = () => {
+        if (!cancelled) liveState = { kind: 'live' };
+      };
+      es.addEventListener('failed', (ev) => {
+        const data = (ev as MessageEvent<string>).data;
+        let reason = 'the server reported a failed read and gave no reason';
+        try {
+          const body = JSON.parse(data) as { error?: unknown };
+          if (typeof body.error === 'string' && body.error) reason = body.error;
+        } catch {
+          if (data) reason = data;
+        }
+        fallBackToPoll(reason);
+      });
       es.onmessage = (ev) => {
         if (cancelled) return;
         try {
           const entry = JSON.parse(ev.data) as AuditEntry;
+          if (!snapshotPainted && !early.some((r) => r.event_id === entry.event_id)) {
+            early = [entry, ...early].slice(0, LIVE_BUFFER_CAP);
+          }
           // Prepend new row, dedupe, cap.
           if (loadState.kind === 'ready') {
             const existing = loadState.rows;
@@ -247,16 +376,17 @@
         }
       };
       es.onerror = () => {
-        if (es && es.readyState === EventSource.CLOSED) {
-          es.close();
-          es = null;
-          if (pollFallbackId === null) {
-            pollFallbackId = window.setInterval(fetchSnapshot, SNAPSHOT_RELOAD_MS);
-          }
+        if (!es) return;
+        if (es.readyState === EventSource.CLOSED) {
+          // The browser hands an EventSource neither the status nor
+          // the body of a refused request, so the line cannot say why.
+          fallBackToPoll('the server refused it (the browser does not say why)');
+        } else if (!cancelled) {
+          liveState = { kind: 'reconnecting' };
         }
       };
-    } catch {
-      pollFallbackId = window.setInterval(fetchSnapshot, SNAPSHOT_RELOAD_MS);
+    } catch (e) {
+      fallBackToPoll(e instanceof Error ? e.message : String(e));
     }
 
     return () => {
@@ -274,6 +404,7 @@
     for (const r of loadState.rows) set.add(r.source);
     return [...set].sort();
   });
+  let knownActors = $derived(loadState.kind === 'ready' ? actorsIn(loadState.rows) : []);
 
   function formatTimestamp(iso: string): string {
     const d = new Date(iso);
@@ -308,7 +439,12 @@
     {#if statsState.kind === 'loading'}
       <p class="events-stats-note">Measuring the log…</p>
     {:else if statsState.kind === 'error'}
-      <p class="events-stats-note">Stats unavailable: {statsState.message}</p>
+      <!-- The page's four failure lines — this one, the tail read's, the
+           live stream's "down" and a failed export — each carry the shared
+           marker (FAILURE_MARKER, tests/mocked/_routes.ts), which draws the
+           failed read's rail and is what the outage crawl counts (sweep
+           c3e4edcc). -->
+      <p class="events-stats-note load-failed" role="alert">Stats unavailable: {statsState.message}</p>
     {:else}
       {@const st = statsState.stats}
       <div class="events-stats">
@@ -381,6 +517,19 @@
           />
         </label>
         <label class="events-filter">
+          <span>Actor</span>
+          <input
+            list="events-actors"
+            bind:value={actorFilter}
+            placeholder="e.g. agent-claude"
+          />
+          <datalist id="events-actors">
+            {#each knownActors as a (a)}
+              <option value={a}></option>
+            {/each}
+          </datalist>
+        </label>
+        <label class="events-filter">
           <span>Provenance</span>
           <select bind:value={provenance}>
             <option value="real">Real only</option>
@@ -395,6 +544,14 @@
               <option value={n}>{n}</option>
             {/each}
           </select>
+        </label>
+        <label class="events-filter" title="Rows at or after this time">
+          <span>Since</span>
+          <input type="datetime-local" bind:value={sinceInput} max={untilInput || undefined} />
+        </label>
+        <label class="events-filter" title="Rows before this time — the live stream stops while it is set">
+          <span>Until</span>
+          <input type="datetime-local" bind:value={untilInput} min={sinceInput || undefined} />
         </label>
         <label class="events-filter events-auto">
           <input type="checkbox" bind:checked={autoRefresh} />
@@ -426,7 +583,12 @@
               <span>To</span>
               <input type="date" bind:value={downloadTo} min={downloadFrom} />
             </label>
-            <button type="button" class="events-download-go" onclick={startDownload}>
+            <button
+              type="button"
+              class="events-download-go"
+              onclick={startDownload}
+              disabled={exportState.kind === 'reading'}
+            >
               Save .jsonl
             </button>
             <button
@@ -438,20 +600,48 @@
             </button>
           </div>
           <p class="events-download-hint">
-            Exports up to 50,000 events matching the current source + kind filters
+            Exports up to 50,000 events matching the current source, kind, actor and provenance filters
             in the window above as JSON Lines (one event per line — parseable by
             <code>jq</code>, log forwarders, and most analytics tools).
             Narrow the window for large ranges.
           </p>
         </div>
       {/if}
+      {#if exportState.kind !== 'idle'}
+        <p
+          class="events-download-status events-download-{exportState.kind}"
+          class:load-failed={exportState.kind === 'failed'}
+          role={exportState.kind === 'failed' ? 'alert' : 'status'}
+        >
+          {exportState.kind === 'reading' ? 'Reading the export…' : exportState.message}
+        </p>
+      {/if}
   </Section>
 
   <Section title="Stream" wide>
+      {#if liveState.kind !== 'off'}
+        <p
+          class="events-live events-live-{liveState.kind}"
+          class:load-failed={liveState.kind === 'polling'}
+          role={liveState.kind === 'polling' ? 'alert' : 'status'}
+        >
+          {#if liveState.kind === 'connecting'}
+            Live stream connecting…
+          {:else if liveState.kind === 'live'}
+            Live stream connected. New rows appear at the top as they land.
+          {:else if liveState.kind === 'reconnecting'}
+            Live stream lost; the browser is reconnecting. Rows that land before it is back will not stream — reload to read them.
+          {:else if liveState.kind === 'windowed'}
+            Live stream off: the Until bound closes the window, so no new row can land in it. Clear Until to follow the log.
+          {:else}
+            Live stream down: {liveState.reason}. Re-reading the tail every 5 s.
+          {/if}
+        </p>
+      {/if}
       {#if loadState.kind === 'loading'}
         <p class="empty">Loading…</p>
       {:else if loadState.kind === 'error'}
-        <p class="empty">Failed to load: {loadState.message}</p>
+        <p class="empty load-failed" role="alert">Failed to load: {loadState.message}</p>
       {:else if loadState.rows.length === 0}
         <p class="empty">No events match these filters.</p>
       {:else}
@@ -461,6 +651,7 @@
               <th style="width:10ch">Time</th>
               <th style="width:12ch">Source</th>
               <th>Kind</th>
+              <th style="width:22ch">Actor</th>
             </tr>
           </thead>
           <tbody>
@@ -476,12 +667,20 @@
                 >{formatTimestamp(row.timestamp)}</td>
                 <td class="mono">{row.source}</td>
                 <td class="mono">{row.kind}</td>
+                <td class="mono">{actorOf(row.payload) ?? '—'}</td>
               </tr>
               {#if isOpen}
+                {@const packet = packetOf(row.kind, row.payload)}
                 <tr class="events-payload-row">
-                  <td colspan="3">
+                  <td colspan="4">
                     <pre class="events-payload">{JSON.stringify(row.payload, null, 2)}</pre>
                     <div class="events-event-id">event_id: <code>{row.event_id}</code></div>
+                    <!-- The packet this row belongs to, one click away
+                         rather than an id to copy out of the JSON
+                         (62a0bbee). auditRetro.ts says which key. -->
+                    {#if packet}
+                      <div class="events-packet">packet: <a href="/jobs/{packet}">{packet}</a></div>
+                    {/if}
                     <!--
                       Event-attached files render inline next to the
                       event that produced them. Per design Q6 events
@@ -517,16 +716,16 @@
     font-size: 12px;
   }
   .events-filter span {
-    color: var(--muted, #64748b);
+    color: var(--static);
     font-weight: 500;
   }
   .events-filter input,
   .events-filter select {
     min-width: 160px;
     padding: 4px 6px;
-    border: 1px solid var(--border, #d1d5db);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: white;
+    background: var(--ink);
   }
   .events-auto {
     flex-direction: row;
@@ -537,29 +736,39 @@
     font-size: 13px;
     color: inherit;
   }
+  .events-live {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--static);
+  }
+  /* The down line (polling) is the shared marker's since c3e4edcc. */
+  .events-live-reconnecting {
+    color: inherit;
+    font-weight: 500;
+  }
   .events-freshness {
     font-size: 12px;
-    color: var(--muted, #64748b);
+    color: var(--static);
     margin-left: auto;
   }
   .events-download-btn {
     padding: 6px 12px;
     font-size: 12px;
     font-weight: 500;
-    background: white;
+    background: var(--ink);
     color: inherit;
-    border: 1px solid var(--border, #d1d5db);
+    border: 1px solid var(--border);
     border-radius: 4px;
     cursor: pointer;
   }
   .events-download-btn:hover {
-    background: var(--accent-bg, #eff6ff);
+    background: var(--signal-wash);
   }
   .events-download-panel {
     margin-top: 12px;
     padding: 10px 12px;
-    background: var(--accent-bg, #eff6ff);
-    border: 1px solid var(--border, #d1d5db);
+    background: var(--signal-wash);
+    border: 1px solid var(--border);
     border-radius: 4px;
   }
   .events-download-row {
@@ -572,43 +781,48 @@
     padding: 6px 12px;
     font-size: 12px;
     font-weight: 600;
-    background: #1d4ed8;
-    color: white;
-    border: 1px solid #1e40af;
+    background: var(--signal);
+    color: var(--on-band);
+    border: 1px solid var(--signal);
     border-radius: 4px;
     cursor: pointer;
   }
   .events-download-go:hover {
-    background: #1e40af;
+    background: var(--signal);
   }
   .events-download-cancel {
     padding: 6px 10px;
     font-size: 12px;
     background: transparent;
-    color: var(--muted, #64748b);
+    color: var(--static);
     border: none;
     cursor: pointer;
   }
   .events-download-hint {
     margin: 8px 0 0;
     font-size: 11px;
-    color: var(--muted, #64748b);
+    color: var(--static);
     line-height: 1.5;
   }
   .events-download-hint code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    background: rgba(15, 23, 42, 0.08);
+    background: var(--wash);
     padding: 1px 4px;
     border-radius: 2px;
+  }
+  .events-download-status {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--static);
   }
   .events-table tbody tr.events-row {
     cursor: pointer;
   }
   .events-table tbody tr.events-row:hover {
-    background: var(--accent-bg, #eff6ff);
+    background: var(--signal-wash);
   }
   .events-table tbody tr.events-row-open {
-    background: var(--accent-bg, #eff6ff);
+    background: var(--signal-wash);
     font-weight: 500;
   }
   .events-table .mono {
@@ -616,8 +830,8 @@
     font-size: 12px;
   }
   .events-payload-row td {
-    background: #0b1020;
-    color: #e2e8f0;
+    background: var(--ink-raised);
+    color: var(--fog);
     padding: 0;
   }
   .events-payload {
@@ -636,10 +850,14 @@
     padding-top: 12px;
     border-top: 1px dashed var(--border);
   }
-  .events-event-id {
+  .events-event-id,
+  .events-packet {
     padding: 4px 16px 10px;
     font-size: 11px;
-    color: #94a3b8;
+    color: var(--static);
+  }
+  .events-packet a {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
 
   .events-stats-note { margin: 0; opacity: 0.8; }

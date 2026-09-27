@@ -11,7 +11,10 @@ export type Account = {
   director: string | null;
   city: string | null;
   state: string | null;
-  tier: 'platinum' | 'gold' | 'silver' | null;
+  // An (account, tier) Class code — a tenant adds a tier as one Class
+  // row, so no closed union can name them (backlog d2c9e79f). `null`
+  // is untiered, until classified.
+  tier: string | null;
   customer_since: string | null;
   territory_rep_id: string | null;
 };
@@ -37,6 +40,15 @@ export type Invoice = {
   issued_on: string;
   due_on: string;
   paid_on: string | null;
+};
+
+/// One row of `GET /api/commerce/open-ar` (boss-commerce AccountOpenAr):
+/// an account's open receivables, summed by the service over every
+/// invoice it still owes. Accounts that owe nothing have no row.
+export type AccountOpenAr = {
+  account_id: string;
+  open_ar_cents: number;
+  open_count: number;
 };
 
 export type Job = {

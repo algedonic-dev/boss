@@ -354,3 +354,59 @@ async fn reading_every_queue_does_not_confer_redrawing_one() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri} must be gated");
     }
 }
+
+/// AN UNPUBLISHED STATION VERSION IS ITS AUTHORS' (backlog 1a4a4d03,
+/// second finding). The version reads asked only workflow Read — the
+/// basic guest's shipped grant — and served drafts, whose predicates
+/// can name an assignee before anyone has decided to route that way. A
+/// version that was published is the record of how a queue was drawn,
+/// and stays readable; a draft needs an authoring verb on `workflow`.
+#[tokio::test]
+async fn a_staged_station_is_read_only_by_who_may_author_it() {
+    let (app, _) = app();
+    send(
+        &app,
+        post("/api/stations", "ceo", Some(&viable_draft("desk"))),
+    )
+    .await;
+    send(&app, post("/api/stations/desk/publish", "ceo", None)).await;
+    let mut v2 = viable_draft("desk");
+    v2.version = 2;
+    v2.title = "Staged, never published".into();
+    let (status, _) = send(&app, post("/api/stations", "ceo", Some(&v2))).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let statuses = |body: &Value| -> Vec<(i64, String)> {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["version"].as_i64().unwrap(),
+                    r["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let (status, rows) = send(&app, get("/api/stations/desk/versions", "ceo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        statuses(&rows),
+        vec![(1, "active".to_string()), (2, "draft".to_string())],
+        "the author reads every row"
+    );
+    let (status, rows) = send(&app, get("/api/stations/desk/versions", "reporter")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        statuses(&rows),
+        vec![(1, "active".to_string())],
+        "a reader reads what was published, and no draft"
+    );
+
+    let (status, v1) = send(&app, get("/api/stations/desk/versions/1", "reporter")).await;
+    assert_eq!(status, StatusCode::OK, "{v1}");
+    let (status, body) = send(&app, get("/api/stations/desk/versions/2", "reporter")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = send(&app, get("/api/stations/desk/versions/2", "ceo")).await;
+    assert_eq!(status, StatusCode::OK, "the author reads its draft");
+}

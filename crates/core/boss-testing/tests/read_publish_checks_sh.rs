@@ -28,6 +28,16 @@
 //!   * with a check-run still running, nothing is written until it
 //!     completes, and past the deadline the verb FAILS naming the run
 //!     still in flight — a partial reading, never a clean one;
+//!   * only the code-scanning checks are waited for (backlog d167e7d7):
+//!     a non-scanning check still running — the mirror's full gate —
+//!     does not hold the forge's runner, but it is NOT YET (backlog
+//!     c6cb678b): the partial reading goes on the packet, the step
+//!     stays open, exit 75 — and past the ceiling the step completes
+//!     `unfinished`, naming it;
+//!   * the step's `conclusion` is the verdict over EVERY check: a
+//!     failing gate over a clean scan reads `failure` and is named in
+//!     `failing`, so the judge step reads it (PR #243 closed clean with
+//!     its Gate red);
 //!   * a publish packet whose `open-pr` step recorded no head sha is a
 //!     refusal naming the step, not a read of nothing;
 //!   * `--check` asks only for the tools and the addresses, no network.
@@ -43,9 +53,27 @@ const STEP: &str = "00000000-0000-0000-0000-0000000000cc";
 /// PR #239's head, as `open-pr` recorded it (`snapshot_commit`).
 const HEAD: &str = "12d4a68279752c2c451b147ec8e21c248c8681a3";
 const PR_URL: &str = "https://github.com/algedonic-dev/boss/pull/239";
+/// When #239 opened — the server's stamp on the `open-pr` step, and the
+/// zero the ceiling on a still-running check counts from.
+const PR_OPENED_AT: &str = "2026-09-19T08:22:25Z";
+/// A ceiling no case reaches (#239 opened in 2026-09), for the cases
+/// that measure "not yet" rather than the ceiling.
+const NO_CEILING: (&str, &str) = ("BOSS_CHECKS_CEILING_SECONDS", "9999999999");
 /// The CodeQL check-run's id in the fixture — the annotations URL
 /// GitHub hands back is keyed on it.
 const CODEQL_RUN: &str = "105867839495";
+/// How many polls a case tolerates before the verb gives up. The wait in
+/// a test is counted in POLLS, never wall-clock seconds (backlog
+/// 167f26e3): a three-second deadline stood in for "two or three polls"
+/// until a loaded pod (load 124, 2026-09-23) took seven seconds over ONE
+/// poll, and a case that must see two polls before running out of time
+/// can then see one. A count is the same number on an idle pod and a
+/// loaded one.
+const POLLS: u32 = 3;
+/// The wall-clock deadline in a test, set far past any poll count's
+/// worth of work so it is never the bound a case measures — it only
+/// stops a verb that ignores the poll bound from spinning forever.
+const WALL_SECONDS: &str = "300";
 
 fn fixture(name: &str) -> PathBuf {
     repo_root()
@@ -102,7 +130,8 @@ impl Run {
                 "metadata": {"target": "origin/main"},
                 "steps": [
                     {"id": "00000000-0000-0000-0000-0000000000bb", "spec_slug": "open-pr",
-                     "status": "completed", "metadata": open_pr_metadata},
+                     "status": "completed", "completed_at": PR_OPENED_AT,
+                     "metadata": open_pr_metadata},
                     {"id": STEP, "spec_slug": "read-checks", "status": "ready",
                      "metadata": {"ops_verb": "read-publish-checks"}}
                 ]
@@ -199,10 +228,11 @@ exit 22
             .env("BOSS_JOBS_URL", "http://jobs.invalid")
             .env("BOSS_GITHUB_API", "https://api.github.invalid")
             .env("BOSS_MIRROR_SLUG", "fixture-upstream/mirror")
-            // No waiting in a test: the loop polls at once and the
-            // deadline is the number of polls it tolerates.
+            // No waiting in a test: the loop polls at once, and the
+            // bound is the number of polls it tolerates (see POLLS).
             .env("BOSS_CHECKS_POLL_SECONDS", "0")
-            .env("BOSS_CHECKS_DEADLINE_SECONDS", "3");
+            .env("BOSS_CHECKS_MAX_POLLS", POLLS.to_string())
+            .env("BOSS_CHECKS_DEADLINE_SECONDS", WALL_SECONDS);
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -361,6 +391,14 @@ fn a_completed_prs_checks_and_alerts_are_read_onto_the_packet_and_the_step_compl
         put["metadata"]["ops_verb"], "read-publish-checks",
         "the step's existing metadata is merged, not replaced"
     );
+    // What failed, by name, on the step and on the reading (c6cb678b).
+    assert_eq!(put["metadata"]["failing"], "CodeQL: failure");
+    assert_eq!(put["metadata"]["still_running"], "");
+    assert_eq!(reading["conclusion"], "failure");
+    assert_eq!(
+        reading["failing"],
+        serde_json::json!([{"name": "CodeQL", "conclusion": "failure"}])
+    );
 
     // The answer line is LAST and the rule reads it.
     let last = text.lines().last().unwrap_or("");
@@ -420,10 +458,17 @@ fn a_check_still_running_is_waited_for_and_named_when_the_deadline_passes() {
         last.starts_with("read-publish-checks: FAILED — ") && last.contains("Analyze (rust)"),
         "the failure names the run still in flight: {last}"
     );
-    assert!(
-        run.log().matches("/check-runs").count() >= 2,
-        "the verb polled more than once before giving up:\n{}",
+    assert_eq!(
         run.log()
+            .matches(&format!("/commits/{HEAD}/check-runs"))
+            .count(),
+        POLLS as usize,
+        "the verb polled exactly its bound before giving up, however long each poll took:\n{}",
+        run.log()
+    );
+    assert!(
+        last.contains(&format!("after {POLLS} polls")),
+        "the failure says how long it waited in the unit it was bounded by: {last}"
     );
     // What it saw is on the record, marked partial; the step is not done.
     let reading = run.reading();
@@ -462,6 +507,245 @@ fn an_empty_check_list_is_not_yet_and_the_next_poll_reads_it() {
     );
 }
 
+/// The mirror's own CI check, as `.github/workflows/ci.yml` names its
+/// job (car 5ede7044) — a full `infra/gate.sh` on a cold GitHub runner.
+const MIRROR_GATE: &str = "Gate (infra/gate.sh, full)";
+
+/// #239's three completed check-runs plus the mirror gate, still in
+/// flight — the head a publish PR carries once the mirror runs the gate.
+fn pr239_with_the_gate_running() -> serde_json::Value {
+    let mut checks = fixture_json("check-runs-pr239.json");
+    let runs = checks["check_runs"].as_array_mut().unwrap();
+    let mut gate = runs[1].clone();
+    gate["id"] = serde_json::json!(1);
+    gate["name"] = serde_json::json!(MIRROR_GATE);
+    gate["status"] = serde_json::json!("in_progress");
+    gate["conclusion"] = serde_json::Value::Null;
+    gate["completed_at"] = serde_json::Value::Null;
+    runs.push(gate);
+    checks["total_count"] = serde_json::json!(runs.len());
+    checks
+}
+
+/// The WAIT covers the code-scanning checks only — the check named by
+/// `BOSS_CODE_SCANNING_CHECK` and its `Analyze (…)` jobs (backlog
+/// d167e7d7): a cold full gate on a GitHub runner outlasts the 1500 s
+/// deadline, and waiting on it held the forge's serial ops-runner the
+/// whole time. But a check still running is NOT a reading (backlog
+/// c6cb678b): on PR #243 the step completed with the Gate in_progress,
+/// the Gate concluded failure minutes later, and nothing in BOSS read
+/// it. So the verb answers "not yet" at once — the partial reading on
+/// the packet, the step left open, exit 75 — and the hourly re-read
+/// reads it again.
+#[test]
+fn a_non_scanning_check_still_running_is_not_yet_and_does_not_hold_the_runner() {
+    let run = Run::new("gate-running", open_pr_done());
+    let checks = run.root.join("check-runs-gate-running.json");
+    write_file(&checks, &pr239_with_the_gate_running().to_string());
+    run.route(&format!("/commits/{HEAD}/check-runs"), &checks);
+    run.route_pr239_complete();
+
+    let (code, text) = run.go(&[], &[NO_CEILING]);
+    assert_eq!(code, 75, "a check still running is not yet:\n{text}");
+    assert_eq!(
+        run.log()
+            .matches(&format!("/commits/{HEAD}/check-runs"))
+            .count(),
+        1,
+        "the scanning checks were done on the first poll; nothing waited on the gate:\n{}",
+        run.log()
+    );
+    let reading = run.reading();
+    assert_eq!(reading["complete"], false, "a partial reading says so");
+    assert_eq!(
+        reading["alerts"]["read"], 100,
+        "the scan's counts are on it"
+    );
+    let gate = reading["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == MIRROR_GATE)
+        .unwrap_or_else(|| panic!("the gate is on the reading: {reading}"));
+    assert_eq!(gate["status"], "in_progress", "named as running");
+    assert_eq!(
+        gate["conclusion"],
+        serde_json::Value::Null,
+        "a running check has no conclusion on the record"
+    );
+    assert_eq!(
+        reading["still_running"],
+        serde_json::json!([MIRROR_GATE]),
+        "the reading names what was still running when it was read"
+    );
+    assert!(
+        !run.writes().contains("PUT "),
+        "a check still running completes nothing:\n{}",
+        run.writes()
+    );
+    let last = text.lines().last().unwrap_or("");
+    assert!(
+        last.starts_with("read-publish-checks: not yet: ") && last.contains(MIRROR_GATE),
+        "the not-yet line names what is still running: {last}"
+    );
+    assert!(
+        rule_pattern().captures(last).is_none(),
+        "a not-yet line is never read as an answer: {last}"
+    );
+}
+
+/// #239's completed check-runs with the scan PASSING and the mirror gate
+/// completed with `conclusion` — PR #243's shape once its Gate ended.
+fn pr239_with_a_clean_scan_and_the_gate(conclusion: &str) -> serde_json::Value {
+    let mut checks = pr239_with_the_gate_running();
+    for c in checks["check_runs"].as_array_mut().unwrap() {
+        if c["name"] == "CodeQL" {
+            c["conclusion"] = serde_json::json!("success");
+        }
+        if c["name"] == MIRROR_GATE {
+            c["status"] = serde_json::json!("completed");
+            c["conclusion"] = serde_json::json!(conclusion);
+        }
+    }
+    checks
+}
+
+/// A GATE RED IS A RED READING (backlog c6cb678b). With the scan clean
+/// and every check done, a failing mirror gate makes the step's
+/// `conclusion` `failure` — so `judge-checks` becomes ready and the
+/// packet cannot close `pr-opened` over it — and names the gate in
+/// `failing`. The scan's own conclusion stays the scan's.
+#[test]
+fn a_failing_gate_is_the_readings_verdict_when_the_scan_passed_and_is_named() {
+    let run = Run::new("gate-failed", open_pr_done());
+    let checks = run.root.join("check-runs-gate-failed.json");
+    write_file(
+        &checks,
+        &pr239_with_a_clean_scan_and_the_gate("failure").to_string(),
+    );
+    run.route(&format!("/commits/{HEAD}/check-runs"), &checks);
+    run.route_pr239_complete();
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    let reading = run.reading();
+    assert_eq!(reading["complete"], true);
+    assert_eq!(reading["alerts"]["conclusion"], "success", "the scan's own");
+    assert_eq!(
+        reading["conclusion"], "failure",
+        "the verdict over every check"
+    );
+    assert_eq!(
+        reading["failing"],
+        serde_json::json!([{"name": MIRROR_GATE, "conclusion": "failure"}])
+    );
+    let put = run.step_put();
+    assert_eq!(put["metadata"]["conclusion"], "failure");
+    assert_eq!(
+        put["metadata"]["failing"],
+        format!("{MIRROR_GATE}: failure")
+    );
+    assert!(
+        text.contains(&format!(
+            "read-publish-checks: failing: {MIRROR_GATE}: failure"
+        )),
+        "the run names what failed:\n{text}"
+    );
+    let last = text.lines().last().unwrap_or("");
+    let caps = rule_pattern()
+        .captures(last)
+        .unwrap_or_else(|| panic!("the answer line is last and read: {last}"));
+    assert_eq!(&caps["conclusion"], "failure");
+}
+
+/// And a PASSING gate over a clean scan is a clean reading: the verdict
+/// is not "every check is a failure", it is the checks' own.
+#[test]
+fn a_passing_gate_over_a_clean_scan_reads_success() {
+    let run = Run::new("gate-passed", open_pr_done());
+    let checks = run.root.join("check-runs-gate-passed.json");
+    write_file(
+        &checks,
+        &pr239_with_a_clean_scan_and_the_gate("success").to_string(),
+    );
+    run.route(&format!("/commits/{HEAD}/check-runs"), &checks);
+    run.route_pr239_complete();
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(run.reading()["conclusion"], "success");
+    assert_eq!(run.step_put()["metadata"]["conclusion"], "success");
+    assert_eq!(run.step_put()["metadata"]["failing"], "");
+}
+
+/// THE CEILING. A check still running past `BOSS_CHECKS_CEILING_SECONDS`
+/// after the PR opened (open-pr's `completed_at`) completes the step as
+/// `unfinished`, naming it — the judge step reads that, and the packet
+/// neither waits forever nor closes clean over a check nobody saw end.
+#[test]
+fn a_check_still_running_past_the_ceiling_completes_the_step_unfinished() {
+    let run = Run::new("gate-past-ceiling", open_pr_done());
+    let checks = run.root.join("check-runs-gate-running.json");
+    write_file(&checks, &pr239_with_the_gate_running().to_string());
+    run.route(&format!("/commits/{HEAD}/check-runs"), &checks);
+    run.route_pr239_complete();
+
+    let (code, text) = run.go(&[], &[("BOSS_CHECKS_CEILING_SECONDS", "3600")]);
+    assert_eq!(code, 0, "{text}");
+    let reading = run.reading();
+    assert_eq!(reading["complete"], false);
+    assert_eq!(reading["conclusion"], "unfinished");
+    let put = run.step_put();
+    assert_eq!(put["status"], "completed");
+    assert_eq!(put["metadata"]["conclusion"], "unfinished");
+    assert_eq!(put["metadata"]["still_running"], MIRROR_GATE);
+    let last = text.lines().last().unwrap_or("");
+    let caps = rule_pattern()
+        .captures(last)
+        .unwrap_or_else(|| panic!("the answer line is last and read: {last}"));
+    assert_eq!(&caps["conclusion"], "unfinished");
+}
+
+/// The gate can register before CodeQL does. A head whose only check-run
+/// is a running non-scanning one has no scanning result to read yet —
+/// "not yet", never a reading of an absent scan.
+#[test]
+fn a_running_gate_before_the_scan_registers_is_not_yet() {
+    let run = Run::new("gate-before-scan", open_pr_done());
+    let mut only_gate = pr239_with_the_gate_running();
+    let runs: Vec<serde_json::Value> = only_gate["check_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["name"] == MIRROR_GATE)
+        .cloned()
+        .collect();
+    only_gate["check_runs"] = serde_json::json!(runs);
+    only_gate["total_count"] = serde_json::json!(1);
+    let first = run.root.join("gate-only.once.json");
+    write_file(&first, &only_gate.to_string());
+    run.route(&format!("/commits/{HEAD}/check-runs"), &first);
+    let then = run.root.join("check-runs-gate-running.json");
+    write_file(&then, &pr239_with_the_gate_running().to_string());
+    run.route(&format!("/commits/{HEAD}/check-runs"), &then);
+    run.route_pr239_complete();
+
+    let (code, text) = run.go(&[], &[NO_CEILING]);
+    assert_eq!(
+        code, 75,
+        "the gate is still running once the scan is read:\n{text}"
+    );
+    assert_eq!(
+        run.log()
+            .matches(&format!("/commits/{HEAD}/check-runs"))
+            .count(),
+        2,
+        "the gate alone was not yet; the next poll read the scan:\n{}",
+        run.log()
+    );
+    assert_eq!(run.reading()["alerts"]["conclusion"], "failure");
+}
+
 #[test]
 fn a_packet_whose_open_pr_recorded_no_head_is_refused_naming_the_step() {
     let run = Run::new("no-head", serde_json::json!({"pr_url": PR_URL}));
@@ -472,12 +756,144 @@ fn a_packet_whose_open_pr_recorded_no_head_is_refused_naming_the_step() {
         text.contains("REFUSED") && text.contains("open-pr") && text.contains("snapshot_commit"),
         "the refusal names the step and the missing field:\n{text}"
     );
+    // No CHECKS were read. Since backlog 663589cd every run first asks
+    // GitHub what became of each publish PR (`pulls/<n>`, unanswered by
+    // this stub, so nothing is written) — a question the refusal is not
+    // about.
     assert!(
-        !run.log().contains("api.github.invalid"),
-        "nothing was read from GitHub:\n{}",
+        !run.log().contains("check-runs"),
+        "no checks were read from GitHub:\n{}",
         run.log()
     );
     assert_eq!(run.writes(), "", "nothing was written");
+}
+
+/// WHAT BECAME OF A PUBLISH PR, ASKED ON EVERY RUN (backlog 663589cd,
+/// David 2026-09-26: "I closed the PR because it was red ... Not sure why
+/// the alarm would stay going off this whole time"). Only the daily
+/// --measure asked GitHub, so the region alarmed on #244 for 22 hours
+/// after its close. The re-read rule files this verb every fifteen
+/// minutes, and every run now asks — even with no reading waiting.
+fn a_closed_packet_whose_pr_is_standing(judge_verdict: &str) -> serde_json::Value {
+    serde_json::json!({"data": [{
+        "id": JOB, "title": "publish to github", "status": "closed",
+        "metadata": {"pr_state": {"pr_url": PR_URL, "state": "open", "merged": false,
+                                  "read_at": "2026-09-19T00:00:55Z"}},
+        "steps": [
+            {"id": "00000000-0000-0000-0000-0000000000bb", "spec_slug": "open-pr",
+             "status": "completed", "completed_at": PR_OPENED_AT, "metadata": open_pr_done()},
+            {"id": STEP, "spec_slug": "read-checks", "status": "completed",
+             "metadata": {"conclusion": "failure", "alerts": "1", "rules": "1"}},
+            {"id": "00000000-0000-0000-0000-0000000000dd", "spec_slug": "judge-checks",
+             "status": "completed",
+             "metadata": {"verdict": judge_verdict, "dispositions": [
+                 {"rule": MIRROR_GATE, "disposition": judge_verdict, "reason": "filed"}]}}
+        ]
+    }]})
+}
+
+/// The `pr_state` the pass PATCHed onto the packet.
+fn pr_state_written(run: &Run) -> serde_json::Value {
+    let writes = run.writes();
+    let body = writes
+        .lines()
+        .skip_while(|l| {
+            !l.starts_with(&format!(
+                "PATCH http://jobs.invalid/api/jobs/{JOB}/metadata"
+            ))
+        })
+        .nth(1)
+        .unwrap_or_else(|| panic!("no metadata PATCH on the packet; writes:\n{writes}"));
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["pr_state"].clone()
+}
+
+#[test]
+fn every_run_reads_a_standing_prs_state_and_its_checks_now() {
+    let run = Run::new("pr-state-open", open_pr_done());
+    write_file(
+        &run.root.join("jobs.json"),
+        &a_closed_packet_whose_pr_is_standing("real").to_string(),
+    );
+    let pull = run.root.join("pull-239-open.json");
+    write_file(
+        &pull,
+        &serde_json::json!({"number": 239, "state": "open", "merged": false,
+                            "merged_at": null, "closed_at": null, "head": {"sha": HEAD}})
+        .to_string(),
+    );
+    run.route("/pulls/239", &pull);
+    let checks = run.root.join("check-runs-gate-failed.json");
+    write_file(
+        &checks,
+        &pr239_with_a_clean_scan_and_the_gate("failure").to_string(),
+    );
+    run.route(&format!("/commits/{HEAD}/check-runs"), &checks);
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(
+        code, 0,
+        "no reading waits, so the run ends nothing to do: {text}"
+    );
+    assert!(text.contains("nothing to do"), "{text}");
+    let st = pr_state_written(&run);
+    assert_eq!(st["pr_url"], PR_URL, "{st}");
+    assert_eq!(st["state"], "open", "{st}");
+    assert_eq!(st["read_by"], "read-publish-checks", "{st}");
+    assert_eq!(st["checks"], "failure", "GitHub's checks NOW: {st}");
+    assert_eq!(
+        st["failing"],
+        format!("{MIRROR_GATE}: failure"),
+        "what failed, by name: {st}"
+    );
+    assert!(st.get("unmerged_reason").is_none(), "{st}");
+}
+
+#[test]
+fn a_pr_closed_without_a_merge_is_recorded_with_its_reason() {
+    let run = Run::new("pr-state-closed", open_pr_done());
+    write_file(
+        &run.root.join("jobs.json"),
+        &a_closed_packet_whose_pr_is_standing("real").to_string(),
+    );
+    let pull = run.root.join("pull-239-closed.json");
+    write_file(
+        &pull,
+        &serde_json::json!({"number": 239, "state": "closed", "merged": false,
+                            "merged_at": null, "closed_at": "2026-09-26T22:40:00Z",
+                            "head": {"sha": HEAD}})
+        .to_string(),
+    );
+    run.route("/pulls/239", &pull);
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    let st = pr_state_written(&run);
+    assert_eq!(st["state"], "closed", "{st}");
+    assert_eq!(st["merged"], false, "{st}");
+    let reason = st["unmerged_reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("judged real") && reason.contains(MIRROR_GATE),
+        "the reason the record holds: {st}"
+    );
+    assert!(
+        !run.log().contains("check-runs"),
+        "a closed PR's checks are not asked:\n{}",
+        run.log()
+    );
+
+    // Judged noise and closed anyway: SAID, never a reason invented.
+    let run = Run::new("pr-state-closed-noise", open_pr_done());
+    let mut packet = a_closed_packet_whose_pr_is_standing("noise");
+    packet["data"][0]["steps"][1]["metadata"]["conclusion"] = serde_json::json!("success");
+    write_file(&run.root.join("jobs.json"), &packet.to_string());
+    run.route("/pulls/239", &pull);
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        pr_state_written(&run)["unmerged_reason"],
+        "closed on GitHub without a merge; nothing on the record says why"
+    );
 }
 
 #[test]

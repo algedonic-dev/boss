@@ -40,7 +40,9 @@ A bundle exposes a single contract:
     //   jobId      — owning Job id (you build the PUT URL from it)
     //   onUpdate() — call after a successful write to make the host refetch
     //   currentUser — { id, role } when a user is signed in
-    container.innerHTML = `<div>...</div>`;
+    const title = document.createElement('h3');
+    title.textContent = props.step.title; // text, never markup
+    container.append(title);
     return function cleanup() {
       // optional — called when the host unmounts your surface
     };
@@ -56,6 +58,23 @@ yourself (set `status: "done"` to complete the step), then call
 `apps/web/src/steps/pluginHost.ts`; `StepPluginMount.svelte` calls
 your `mount`. The full decision record is in
 `docs/architecture-decisions.md` §Step UX & frontend.
+
+**Build the surface as nodes, never as an HTML string.** A step's
+title and metadata are written by whoever may write the step, and your
+bundle runs in the reviewer's signed-in session — on sign-off steps,
+the one a passkey signs. `createElement`, `append` (a string handed to
+it is always a Text node) and `textContent` draw text as text;
+`innerHTML`, `insertAdjacentHTML` and an `href` copied from input run
+it. GitHub CodeQL failed a publish on exactly that in two bundles here
+(backlog 4a359b51, 2026-09-27), and
+`apps/web/src/steps/stepPluginHtmlSinks.test.ts` now refuses an HTML
+sink in any bundle in this directory outside the few sites it names
+with their reasons (an escape-first markdown renderer, a sandboxed
+exhibit frame). It refuses a URL sink the same way (backlog 4f1f7698):
+a `setAttribute('href' | 'src', …)`, a `.href =` / `.src =` write, or
+an `href:` / `src:` prop to `h()` passes only when its value is a
+literal starting with one `/`, or when the site is named — as the Join
+button is, because `meetingHref` writes the http(s) scheme itself.
 
 ---
 
@@ -142,52 +161,50 @@ no build step:
       onUpdate();
     }
 
-    function render() {
-      container.innerHTML = `
-        <h2>Pour quality check</h2>
-        <table>
-          <tr><th>SKU</th><th>Foam cm</th><th>Retention s</th>
-              <th>Clarity</th><th>Off-flavors</th></tr>
-          ${checks.map((row, i) => `
-            <tr>
-              <td>${row.sku || ''}</td>
-              <td><input type="number" data-i="${i}" data-k="foam_cm"
-                         value="${row.foam_cm ?? ''}"
-                         ${readOnly ? 'disabled' : ''}></td>
-              <td><input type="number" data-i="${i}" data-k="retention_s"
-                         value="${row.retention_s ?? ''}"
-                         ${readOnly ? 'disabled' : ''}></td>
-              <td><input type="text" data-i="${i}" data-k="clarity"
-                         value="${row.clarity ?? ''}"
-                         ${readOnly ? 'disabled' : ''}></td>
-              <td><input type="text" data-i="${i}" data-k="off_flavors"
-                         value="${(row.off_flavors || []).join(',')}"
-                         ${readOnly ? 'disabled' : ''}></td>
-            </tr>
-          `).join('')}
-        </table>
-        ${readOnly ? '' : `
-          <button data-action="save">Save progress</button>
-          <button data-action="done">Mark done</button>
-        `}
-      `;
+    // Built as nodes, never as an HTML string: a SKU or a clarity note
+    // is metadata anyone may write, and markup would run it. A string
+    // handed to append() is always a Text node.
+    function el(tag, props, ...kids) {
+      const e = document.createElement(tag);
+      Object.entries(props || {}).forEach(([k, v]) => {
+        if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+        else if (v != null && v !== false) e[k] = v;
+      });
+      e.append(...kids.flat().filter((k) => k != null));
+      return e;
+    }
 
-      container.querySelectorAll('input').forEach((el) => {
-        el.addEventListener('input', (e) => {
-          const i = +e.target.dataset.i;
-          const k = e.target.dataset.k;
+    function cell(i, k, type, value) {
+      return el('td', null, el('input', {
+        type, value: value ?? '', disabled: readOnly,
+        oninput: (e) => {
           checks[i] = checks[i] || {};
           checks[i][k] = k === 'off_flavors'
             ? e.target.value.split(',').map((s) => s.trim()).filter(Boolean)
-            : (e.target.type === 'number' ? +e.target.value : e.target.value);
-        });
-      });
+            : (type === 'number' ? +e.target.value : e.target.value);
+        },
+      }));
+    }
 
-      const saveBtn = container.querySelector('[data-action=save]');
-      if (saveBtn) saveBtn.onclick = () => save();
-
-      const doneBtn = container.querySelector('[data-action=done]');
-      if (doneBtn) doneBtn.onclick = () => save('done');
+    function render() {
+      container.replaceChildren(
+        el('h2', null, 'Pour quality check'),
+        el('table', null,
+          el('tr', null, ['SKU', 'Foam cm', 'Retention s', 'Clarity', 'Off-flavors']
+            .map((t) => el('th', null, t))),
+          checks.map((row, i) => el('tr', null,
+            el('td', null, row.sku || ''),
+            cell(i, 'foam_cm', 'number', row.foam_cm),
+            cell(i, 'retention_s', 'number', row.retention_s),
+            cell(i, 'clarity', 'text', row.clarity),
+            cell(i, 'off_flavors', 'text', (row.off_flavors || []).join(',')),
+          )),
+        ),
+        ...(readOnly ? [] : [
+          el('button', { onclick: () => save() }, 'Save progress'),
+          el('button', { onclick: () => save('done') }, 'Mark done'),
+        ]),
+      );
     }
 
     render();
@@ -268,9 +285,6 @@ exists.sh` refuses a row whose JS is absent from this directory.
 | File | Kind | What it does |
 |---|---|---|
 | `checklist.js` | `checklist` | Generic per-item-checked walkthrough; first v1 surface to land via the plugin path. |
-| `marketing-brief.js` | `marketing-brief` | Brief body + target audience + per-employee acknowledgement tracker. |
-| `marketing-launch.js` | `marketing-launch` | Editable launch date + channel + notes, with an embedded ±14-day neighbor calendar. |
-| `marketing-attribution.js` | `marketing-attribution` | Read-only rollup of linked opportunities / revenue influenced / brief ack rate over the configured measurement window. |
 | `sr-triage.js` | `sr-triage` | Mandatory intake fields (account, device, failure, priority) + optional Jira key + triage decision (dispatch / remote / parts-only). |
 | `diagnostic-call.js` | `diagnostic-call` | Call log: schedule, channel, join URL, attendees, notes, optional recording URL. |
 | `review-design.js` | `review-design` | Design-doc-review surface: per-`### Qn:` resolution textareas; gates completion on every open question having a recorded resolution, saved onto the step. |

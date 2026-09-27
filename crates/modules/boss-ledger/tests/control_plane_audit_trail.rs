@@ -34,8 +34,8 @@ fn build_router(db: &TestDb) -> Router {
         pool: db.pool.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     })
 }
 
@@ -112,11 +112,13 @@ async fn lock_and_unlock_emit_audit_trail() {
     let (_, body) = post(app.clone(), "/api/ledger/periods", json!({"year": 2098})).await;
     let id = body["id"].as_str().expect("period id").to_string();
 
-    // Lock.
+    // Lock. The locker is the signed caller, not a body field (backlog
+    // 975c228f); this request is unsigned, so it is the platform
+    // automation the event is stamped with.
     let (status, _) = post(
         app.clone(),
         &format!("/api/ledger/periods/{id}/lock"),
-        json!({"locked_by": "emp-cfo"}),
+        json!({}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -130,7 +132,7 @@ async fn lock_and_unlock_emit_audit_trail() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(payload.0["locked_by"], "emp-cfo");
+    assert_eq!(payload.0["locked_by"], "automation:platform");
     assert!(payload.0["checksum"].is_string(), "event carries checksum");
     assert!(payload.0["actor_id"].is_string());
 
