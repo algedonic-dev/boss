@@ -91,11 +91,48 @@ pub struct ReqwestCalendarClient {
 }
 
 impl ReqwestCalendarClient {
+    /// An unsigned client — enough for the business-calendar reads,
+    /// which are open. Every write the calendar takes asks policy
+    /// (backlog 11721a25), so a writer signs: [`Self::signed_as`].
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::build(base_url.into(), None)
+    }
+
+    /// Sign every request as the sibling service `actor_id`
+    /// (`automation:<service>`), at the deploy superuser's role. The
+    /// service has authorised its own caller before it calls — the
+    /// jobs API's step write, the people API's PTO gate — and names
+    /// that caller in the body's `created_by` / `actor`, which the
+    /// calendar accepts from a sibling and refuses from anyone else
+    /// (`boss_policy_client::writes::recorded_author`). Until 2026-09-27
+    /// this client sent no identity at all, which was the calendar's
+    /// only caller check.
+    pub fn signed_as(self, actor_id: &str) -> Self {
+        let user = serde_json::json!({
+            "id": actor_id,
+            "role": boss_core::roles::PLATFORM_ADMIN_ROLE,
+            "access_tier": "operator",
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+            "department": "platform",
+        });
+        Self::build(self.base_url, Some(user.to_string()))
+    }
+
+    fn build(base_url: String, user: Option<String>) -> Self {
+        // The machine token too, when the process has one mounted: this
+        // client predates `boss_core::http_client::base` and was the one
+        // sibling client that would stop at a port whose gate enforces.
+        let mut headers = reqwest::header::HeaderMap::new();
+        boss_core::machine_token::attach(&mut headers);
+        if let Some(v) = user.and_then(|u| reqwest::header::HeaderValue::from_str(&u).ok()) {
+            headers.insert("x-boss-user", v);
+        }
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .default_headers(headers)
                 .build()
                 .expect("building reqwest client"),
         }
@@ -485,6 +522,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 3);
+    }
+
+    /// Serve ONE request on a loopback port, answering `reply`, and hand
+    /// back the request's head as the server read it.
+    async fn one_request(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut got = Vec::new();
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&got).to_string()
+        });
+        (base, served)
+    }
+
+    /// The calendar refuses a write that carries no caller (backlog
+    /// 11721a25), and a sibling service is not anonymous: it signs as
+    /// its own automation, at the deploy superuser's role, on every
+    /// request its client makes — measured on the wire, not on a field.
+    #[tokio::test]
+    async fn a_signed_client_names_its_service_on_every_request() {
+        let (base, served) = one_request(
+            "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
+             content-length: 45\r\nconnection: close\r\n\r\n\
+             {\"id\":\"6f1e9b99-0000-4000-8000-000000000001\"}",
+        )
+        .await;
+        let client = ReqwestCalendarClient::new(base).signed_as("automation:jobs");
+        client.reserve(req()).await.unwrap();
+        let head = served.await.unwrap().to_ascii_lowercase();
+        let line = head
+            .lines()
+            .find(|l| l.starts_with("x-boss-user:"))
+            .unwrap_or_else(|| panic!("no x-boss-user header in:\n{head}"));
+        let user: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("x-boss-user:").trim()).unwrap();
+        assert_eq!(user["id"], "automation:jobs");
+        assert_eq!(user["role"], boss_core::roles::PLATFORM_ADMIN_ROLE);
+        assert_eq!(user["access_tier"], "operator");
     }
 
     #[test]

@@ -1,39 +1,50 @@
 #!/usr/bin/env bash
-# wt-web — prepare a WORKTREE for web checks by linking the operator
-# checkout's node_modules into it, then run the given command there
-# (backlog ef4394e1, 2026-09-14). The web half of wt-cargo.
+# wt-web — prepare a WORKTREE for web checks by giving it its OWN
+# node_modules, prove Playwright can start there, then run the given
+# command (backlog ef4394e1, 2026-09-14; rebuilt 44f1cd1e, 2026-09-27).
+# The web half of wt-cargo.
 #
 # Why: a worktree has no node_modules, so every web check a builder
 # ran there (svelte-check, the playwright mocked specs, anything that
 # imports zod) failed on the environment before it could fail on the
 # change. On 2026-09-14 three builders each re-derived a different
-# workaround — one symlinked the operator's three dirs, one ran
-# bun install --ignore-scripts, one gave up on svelte-check. wt-cargo
-# closed the same gap for cargo with one command; this is that door
-# for the web. Nothing is installed: the links point at packages the
-# operator's checkout already has, at the three places bun resolves
-# them (./node_modules, apps/web/node_modules, libs/web-kit/node_modules).
+# workaround; this door closed the gap with one command.
+#
+# WHY IT INSTALLS AND NO LONGER LINKS (backlog 44f1cd1e). Until
+# 2026-09-27 this symlinked the operator checkout's four node_modules
+# into the worktree. On that day the operator's apps/web/node_modules/.bin
+# had been rewritten without `playwright`, so the mocked runner's
+# `bun x playwright` found no local bin and fetched the registry's latest
+# (1.63.0) while every spec imported the linked @playwright/test 1.61.0:
+# "two different versions of @playwright/test" before any spec ran, in
+# EVERY worktree at once — and builders had been reporting web checks
+# they could not have run. A link shares one mutable tree among every
+# worktree (a `bun install` run through it writes into the operator's
+# checkout) and answers for the operator's lockfile, not the one the car
+# carries. The gate's own install answers for exactly the tree under
+# test, and it is not slower: bun hardlinks out of its global cache,
+# measured at 128 ms warm (7 ms when nothing changed) in a worktree on
+# the /work volume, 104 MB of links and no bytes copied.
 #
 # Usage: wt-web <command…>          (run from inside the worktree)
 #        wt-web bun test src/it/yard/
 #        wt-web svelte-check --tsconfig apps/web/tsconfig.json
-#        wt-web                     (prepare only; print what it linked)
-# The source checkout is /work/boss (the pod's); WT_WEB_SOURCE overrides
-# it so the pin (crates/core/boss-testing/tests/wt_web_sh.rs) never
-# reads the operator's tree. A source dir that does not exist is
-# skipped, by name. A destination that is already the right link is
-# left as it is; a link pointing elsewhere is re-pointed; a real
-# directory (a bun install someone ran) is left alone, by name.
+#        wt-web                     (prepare only; print what it did)
+#
+# Exits 2 outside a git worktree, 3 when the install fails, 4 when
+# Playwright cannot start — and in each case the command is NOT run and
+# the refusal says NOT RUN, because a web check that could not start is
+# not a web check that passed. Pinned by
+# crates/core/boss-testing/tests/wt_web_sh.rs.
 set -euo pipefail
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "wt-web: not in a git worktree" >&2; exit 2; }
-source=${WT_WEB_SOURCE:-/work/boss}
 
 # AND THIS FILE'S OWN AGE (backlog 0b36dd65, 2026-09-19). Reached
 # through /work/tools/bin, this script comes from the operator's
 # checkout, which nothing keeps on origin/main — two commits behind for
-# most of one day. It warns and links: the linking is idempotent and a
-# builder stopped by a door is worse than a stale link list. The
-# warning goes to stderr whatever the report's fd, so `wt-web` with no
+# most of one day. It warns and proceeds: the install is idempotent and
+# a builder stopped by a door is worse than a stale door. The warning
+# goes to stderr whatever the report's fd, so `wt-web` with no
 # arguments does not mix it into its output.
 here=$(dirname "$(readlink -f "$0")")
 if [ -r "$here/door-freshness.sh" ]; then
@@ -46,33 +57,53 @@ fi
 
 # With a command to run, the report stays out of its stdout (so
 # `wt-web bun test … | grep` sees only bun); with none, the report IS
-# the output.
+# the output. A refusal goes to stderr either way.
 if [ $# -eq 0 ]; then report_fd=1; else report_fd=2; fi
 say() { echo "wt-web: $*" >&"$report_fd"; }
+refuse() {
+    echo "wt-web: REFUSED — $2. Web checks in this worktree are NOT RUN: report them as not run, never as passed." >&2
+    exit "$1"
+}
 
-for rel in node_modules apps/web/node_modules libs/web-kit/node_modules; do
-    src=$source/$rel
+# 1. The links an older wt-web left point INTO the operator's checkout,
+# and an install through them would write there. Remove each LINK —
+# rm on a symlink never follows it — before anything installs.
+for rel in node_modules apps/web/node_modules libs/web-kit/node_modules apps/simulator/node_modules; do
     dst=$root/$rel
-    if [ ! -d "$src" ]; then
-        say "no $src — skipping $rel"
-        continue
-    fi
     if [ -L "$dst" ]; then
-        if [ "$(readlink "$dst")" = "$src" ]; then
-            say "$rel already -> $src"
-        else
-            say "$rel pointed at $(readlink "$dst"); re-pointed -> $src"
-            ln -sfn "$src" "$dst"
-        fi
-        continue
+        say "removed the link $rel -> $(readlink "$dst") (an older wt-web's; this worktree installs its own)"
+        rm -- "$dst"
     fi
-    if [ -e "$dst" ]; then
-        say "$dst exists and is not a symlink — left alone"
-        continue
-    fi
-    mkdir -p "$(dirname "$dst")"
-    ln -s "$src" "$dst"
-    say "linked $rel -> $src"
 done
+
+# 2. The gate's `web install` check, verbatim (infra/gate.sh; the pin
+# holds the two spellings equal): one workspace install from apps/web
+# fills all four node_modules.
+web=$root/apps/web
+[ -f "$web/package.json" ] || refuse 3 "no apps/web/package.json under $root, so there is nothing to install"
+if ! (cd "$web" && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile) >&"$report_fd" 2>&1; then
+    refuse 3 "bun install --frozen-lockfile failed in $web (its output is above)"
+fi
+
+# 3. CAN PLAYWRIGHT START HERE. The mocked runner (apps/web/tests/run-mocked.ts)
+# launches `bun x playwright` from apps/web, and bun x takes the first
+# `playwright` on apps/web/node_modules/.bin — or, finding none, runs the
+# registry's latest from bun's global cache (`--no-install` included:
+# measured 2026-09-27, it answered 1.63.0 from the cached latest), which
+# is a SECOND Playwright beside the @playwright/test every spec imports.
+# So this never asks bun x, which would fetch that second copy to say
+# so: it runs the tree's own bin BY PATH, the one bun x would take
+# first, and holds its answer to the installed package's version. A
+# missing bin is refused by name. It loads no spec: a broken spec is the
+# change's failure, not the environment's, and this door judges only
+# the environment.
+bin=$web/node_modules/.bin/playwright
+pkg=$web/node_modules/@playwright/test/package.json
+want=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg" 2>/dev/null) || want=
+[ -n "$want" ] || refuse 4 "Playwright cannot start: no @playwright/test is installed at $pkg"
+[ -x "$bin" ] || refuse 4 "Playwright cannot start: $bin is missing, so \`bun x playwright\` would run the registry's latest beside the @playwright/test $want every spec imports — two copies fail every spec before it runs"
+got=$("$bin" --version 2>&1) || got="exit $? — $got"
+[ "$got" = "Version $want" ] || refuse 4 "Playwright cannot start: the specs import @playwright/test $want but $bin answers '$got' — two copies fail every spec before it runs"
+say "playwright $want starts ($bin, the bin bun x takes first)"
 
 [ $# -eq 0 ] || exec "$@"

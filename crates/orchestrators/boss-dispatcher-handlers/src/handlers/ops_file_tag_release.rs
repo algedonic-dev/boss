@@ -77,7 +77,7 @@ use serde_json::{Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
 
-use super::common::{api_client, get_json, open_jobs_of_kind, post_json};
+use super::common::{api_client, get_json, jobs_where, open_jobs_of_kind, post_json};
 
 /// The allowlisted verb (infra/ops/verbs/tag-release.json) and the
 /// host that answers it.
@@ -269,20 +269,22 @@ impl Handler for OpsFileTagRelease {
         if already_filed(&open_requests, job_id) {
             return Ok(());
         }
-        let trains = get_json(
+        // EVERY closed train, paged on `total`. "The newest landing" is
+        // a question about all of them, and the listing is ordered by
+        // when a train OPENED, not when it merged — so this was one
+        // `limit=200` page that never read `total`, and past 200 closed
+        // trains (there were ~750 on 2026-09-27) the newest merge could
+        // sit in the unread tail and an older commit be tagged in its
+        // place, without a word (backlog f2eac973). The walk also
+        // refuses a page with no `data` array, retryably: read as zero
+        // trains it became the PERMANENT refusal below (d4698bc2).
+        let trains = jobs_where(
             &self.client,
-            &format!(
-                "{}/api/jobs?kind=pr-train&status=closed&limit=200",
-                self.base()
-            ),
+            self.base(),
+            "kind=pr-train&status=closed",
             &ctx.rule_name,
         )
         .await?;
-        let trains: Vec<Value> = trains
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
         let Some((train_id, merge_ref)) = newest_merged_train(&trains) else {
             return Err(HandlerError::Permanent(format!(
                 "ops.file_tag_release: no closed pr-train with a completed merged step and a \
@@ -518,7 +520,12 @@ mod tests {
                 get(move |Query(q): Query<HashMap<String, String>>| {
                     let by_id = list.clone();
                     async move {
-                        let rows: Vec<Value> = by_id
+                        // Pages the way `GET /api/jobs` does: `limit`
+                        // and `offset` over one stable order (by id
+                        // here), and `total` counts the whole match —
+                        // so a reader that takes one page and stops
+                        // sees only the page (backlog f2eac973).
+                        let mut rows: Vec<Value> = by_id
                             .values()
                             .filter(|j| {
                                 q.get("kind").is_none_or(|k| j["kind"] == json!(k))
@@ -526,7 +533,16 @@ mod tests {
                             })
                             .cloned()
                             .collect();
-                        Json(json!({ "data": rows, "total": rows.len() }))
+                        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                        let num =
+                            |k: &str, d: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+                        let total = rows.len();
+                        let page: Vec<Value> = rows
+                            .into_iter()
+                            .skip(num("offset", 0))
+                            .take(num("limit", 50))
+                            .collect();
+                        Json(json!({ "data": page, "total": total }))
                     }
                 })
                 .post(move |Json(body): Json<Value>| {
@@ -617,6 +633,47 @@ mod tests {
         assert_eq!(filed[0]["metadata"]["train"], "newest");
     }
 
+    /// A LIMIT IS NOT A FILTER (backlog f2eac973). The landed-train
+    /// read was one `status=closed&limit=200` page that never looked at
+    /// `total`, and "the newest landing" is a question about EVERY
+    /// closed train — the listing is ordered by when a train OPENED,
+    /// not when it merged. With the newest merge sitting past row 200,
+    /// the handler tagged an older commit and said nothing. It must
+    /// page to the end and tag the newest.
+    #[tokio::test]
+    async fn the_newest_landing_past_the_first_page_is_the_one_tagged() {
+        let mut jobs = vec![release("1.2.3", "ready")];
+        jobs.extend((0..200).map(|i| {
+            train(
+                &format!("a{i:03}"),
+                "closed",
+                Some("2026-09-18T20:02:11Z"),
+                Some("1e7d7935abcd"),
+            )
+        }));
+        jobs.push(train(
+            "z-newest",
+            "closed",
+            Some("2026-09-19T00:03:40Z"),
+            Some("91e3d219f0ab"),
+        ));
+        let (base, posts) = mock_jobs(jobs).await;
+        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(RELEASE, TAG_STEP))
+            .await
+            .expect("runs");
+        let filed = posts.lock().unwrap().clone();
+        assert_eq!(filed.len(), 1, "{filed:?}");
+        assert_eq!(
+            filed[0]["metadata"]["train"], "z-newest",
+            "the newest landing on page two, not the newest of page one"
+        );
+        assert_eq!(
+            filed[0]["metadata"]["args"],
+            json!(["v1.2.3", "91e3d219f0ab", RELEASE])
+        );
+    }
+
     /// The shared topic carries every task step: another packet's
     /// task, and the release's OTHER task steps, file nothing.
     #[tokio::test]
@@ -693,7 +750,7 @@ mod tests {
         let h = OpsFileTagRelease::with_client(reqwest::Client::new(), "http://unused");
         assert_eq!(h.name(), "ops.file_tag_release");
         assert_eq!(
-            boss_dispatcher::cascade::handler_emits()
+            crate::cascade::handler_emits()
                 .get("ops.file_tag_release")
                 .cloned(),
             Some(vec!["jobs.job.created"]),

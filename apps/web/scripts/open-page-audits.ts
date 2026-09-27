@@ -17,7 +17,7 @@
 // that tests/mocked/_routes.ts does NOT derive from the catalog: it is
 // a hand list of crawled paths, pinned a SUPERSET of the catalog by
 // that drift test, and it carries routes the catalog does not (bare
-// `/`, `/ux/me`, a seeded detail page, `/ux/departments/sales`). The
+// `/`, `/ux/me`, a seeded detail page, `/sales/jobs`). The
 // catalog is the roster; `_routes.ts` is a crawl list held to it.
 //
 // THE DOOR, NOT A SECOND HEADER SHAPE. Every read and write goes
@@ -44,7 +44,7 @@
 // order; then Home's surfaces (cross-cutting, built by IT, carried as
 // department `it`); then IT's own. `product` and `hosting` own no
 // catalog route today (they are Algedonic's departments, and the
-// catalog's `app` codes are pinned against the platform + playground
+// catalog's `owner` codes are pinned against the platform + playground
 // seeds), so they match nothing until a surface is added — the order
 // still names them so that surface lands in its place.
 
@@ -88,19 +88,19 @@ export const FIRST_DEPARTMENTS: ReadonlyArray<string> = [
 /// read answers for. IT builds and owns them.
 export const HOME_DEPARTMENT = 'it';
 
-type CatalogEntry = Readonly<{ label: string; path: string; app?: string }>;
+type CatalogEntry = Readonly<{ label: string; path: string; owner?: string }>;
 
 /// Every catalogued route, once, in catalog order — with the department
-/// the catalog assigns it. Two catalog keys can share a path
-/// (`system-dispatcher-rules` and `system-dispatcher-rule` both answer
-/// /it/registry/rules), so the first entry names it; a parameterised
-/// path is not a page.
+/// the catalog assigns it. If two catalog keys ever share a path the
+/// first entry names it. A parameterised path (`/it/registry/rules/
+/// :ruleName`) IS a page: it used to be filtered out here, which is why
+/// the rule editor — its four writes behind 66+ links — was never
+/// audited even once it had a path of its own (backlog 3071e235).
 export function catalogRoutes(
   catalog: Readonly<Record<string, CatalogEntry>> = ROUTE_CATALOG,
 ): ReadonlyArray<PlannedAudit> {
   const seen = new Set<string>();
   return Object.values(catalog)
-    .filter((e) => !e.path.includes(':'))
     .filter((e) => {
       if (seen.has(e.path)) return false;
       seen.add(e.path);
@@ -108,22 +108,22 @@ export function catalogRoutes(
     })
     .map((e) => ({
       route: e.path,
-      department: departmentFor(e.app),
+      department: departmentFor(e.owner),
       label: e.label,
     }));
 }
 
-function departmentFor(app: string | undefined): string {
-  if (app === undefined || app === 'home' || app === 'simulator') return HOME_DEPARTMENT;
-  return app;
+function departmentFor(owner: string | undefined): string {
+  if (owner === undefined || owner === 'home' || owner === 'simulator') return HOME_DEPARTMENT;
+  return owner;
 }
 
 /// The rank a route sorts by: its place in FIRST_DEPARTMENTS, else
 /// after them (other departments keep catalog order), Home after those,
-/// IT last. `app` is what the catalog said; `department` is what the
+/// IT last. `owner` is what the catalog said; `department` is what the
 /// packet carries — Home's `it` must not sort with IT's own.
-function rank(audit: PlannedAudit, app: string | undefined): number {
-  if (app === 'it') return FIRST_DEPARTMENTS.length + 2;
+function rank(audit: PlannedAudit, owner: string | undefined): number {
+  if (owner === 'it') return FIRST_DEPARTMENTS.length + 2;
   if (audit.department === HOME_DEPARTMENT) return FIRST_DEPARTMENTS.length + 1;
   const i = FIRST_DEPARTMENTS.indexOf(audit.department);
   return i === -1 ? FIRST_DEPARTMENTS.length : i;
@@ -133,9 +133,9 @@ function rank(audit: PlannedAudit, app: string | undefined): number {
 export function marchOrder(
   catalog: Readonly<Record<string, CatalogEntry>> = ROUTE_CATALOG,
 ): ReadonlyArray<PlannedAudit> {
-  const appOf = new Map(Object.values(catalog).map((e) => [e.path, e.app] as const));
+  const ownerOf = new Map(Object.values(catalog).map((e) => [e.path, e.owner] as const));
   return catalogRoutes(catalog)
-    .map((a, i) => ({ a, i, r: rank(a, appOf.get(a.route)) }))
+    .map((a, i) => ({ a, i, r: rank(a, ownerOf.get(a.route)) }))
     .sort((x, y) => x.r - y.r || x.i - y.i)
     .map(({ a }) => a);
 }
@@ -168,7 +168,7 @@ export function plan(
 }
 
 /// One route by name: a catalogued path, or a department's jobs view
-/// (`/ux/departments/<code>`, one surface for every declared
+/// (`/<code>/jobs`, one surface for every declared
 /// department, which has no catalog entry of its own).
 export function routeByName(
   route: string,
@@ -176,10 +176,12 @@ export function routeByName(
 ): PlannedAudit | undefined {
   const listed = catalogRoutes(catalog).find((a) => a.route === route);
   if (listed) return listed;
-  const prefix = departmentJobsPath('');
-  if (route.startsWith(prefix) && route.length > prefix.length) {
-    const code = decodeURIComponent(route.slice(prefix.length));
-    if (!code.includes('/')) {
+  const m = route.match(/^\/([^/]+)\/jobs$/);
+  if (m) {
+    const code = decodeURIComponent(m[1]!);
+    // The one spelling, not a second: a path that is not what
+    // departmentJobsPath would write for its code is not this view.
+    if (departmentJobsPath(code) === route) {
       return { route, department: code, label: `${code} jobs view` };
     }
   }

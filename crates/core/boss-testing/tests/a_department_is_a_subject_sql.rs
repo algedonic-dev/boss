@@ -4,7 +4,7 @@
 //! by David 2026-09-19).
 //!
 //! THE FACT THAT LIVES TWICE (CLAUDE.md §9a). The department codes are
-//! spelled in `apps/web/src/shell/nav-catalog.ts` as the `app` field of
+//! spelled in `apps/web/src/shell/nav-catalog.ts` as the `owner` field of
 //! each catalogued route, and `apps/web/scripts/open-page-audits.ts`
 //! turns that field into the `department` a page-audit packet carries.
 //! On 2026-09-19 forty-seven such packets were opened carrying thirteen
@@ -16,12 +16,17 @@
 //! two frontend files, never typed, and the actual set is read from a
 //! database with every migration applied.
 //!
+//! WHOSE ROSTER IT IS (backlog 7edf0e97, 2026-09-25): these rows are
+//! the brewery's, declared in its seeds/departments.toml and held equal
+//! to the migration below, so a company's instance evicts them at its
+//! first start and holds only the roster its own tenant publishes.
+//!
 //! WHICH ROSTER THE RUNNING SPA ASKS is the third test below (backlog
 //! dc5788ba). Equal rosters prove nothing if the chrome bar reads a
 //! different registry than the one pinned here, and until that car it
 //! did.
 //!
-//! HOME IS NOT A ROW, deliberately. `home` is the fourteenth `app` code
+//! HOME IS NOT A ROW, deliberately. `home` is the fourteenth `owner` code
 //! in the catalog and it is not a department: Home surfaces are
 //! cross-cutting personal work, and IT is the department that builds
 //! them. `open-page-audits.ts` already maps it — `departmentFor` sends
@@ -65,25 +70,26 @@ fn home_department(opener: &str) -> String {
         .to_string()
 }
 
-/// The `app` codes the catalog assigns its routes — every department
-/// code the SPA knows, plus the two non-department codes the opener
-/// maps away.
+/// The `owner` codes the catalog assigns its routes (its `app` field
+/// until car 2 of design 8c3e9599 made one field of two) — every
+/// department code the SPA knows, plus the two non-department codes the
+/// opener maps away.
 fn catalog_apps(catalog: &str) -> BTreeSet<String> {
     let apps: BTreeSet<String> = catalog
-        .split("app: '")
+        .split("owner: '")
         .skip(1)
         .filter_map(|rest| rest.split_once('\'').map(|(code, _)| code.to_string()))
         .collect();
     assert!(
         apps.len() > 5,
-        "{CATALOG} yielded {} app codes — the spelling changed and this test is reading nothing",
+        "{CATALOG} yielded {} owner codes — the spelling changed and this test is reading nothing",
         apps.len()
     );
     apps
 }
 
 /// `departmentFor` in the opener, in Rust: the department a route's
-/// packet carries, given the `app` the catalog assigned it.
+/// packet carries, given the `owner` the catalog assigned it.
 fn department_for(app: &str, home: &str) -> String {
     match app {
         "home" | "simulator" => home.to_string(),
@@ -156,6 +162,66 @@ fn the_spa_reads_the_departments_registry_and_not_the_employee_drawer() {
     );
 }
 
+/// THE ROSTER IS THE BREWERY'S, AND IT LIVES TWICE (backlog 7edf0e97,
+/// CLAUDE.md §9a). The thirteen rows above are what the migration
+/// writes into every database — history, which migrate.sh refuses to
+/// see edited — and `examples/brewery/seeds/departments.toml` declares
+/// them as that tenant's roster, which is what makes them example
+/// reference rows: infra/postgres/example-reference-rows.sh reads the
+/// file, so a company's instance evicts them at its first start and
+/// keeps only the roster its own tenant declares. The two must stay
+/// equal field for field: a row the file lacks would stay on every
+/// company's instance as nobody's department, and a row that differs
+/// would have the brewery's publish KEEP the migration's version and
+/// name the field, on the one instance where the brewery is the tenant.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_brewery_declares_exactly_the_rows_the_migration_seeds() {
+    const SEED: &str = "examples/brewery/seeds/departments.toml";
+    let file: toml::Value = toml::from_str(&read(SEED)).expect("the brewery's roster parses");
+    let declared: BTreeSet<(String, String, String, i64, bool)> = file["department"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{SEED} declares no [[department]] rows"))
+        .iter()
+        .map(|d| {
+            (
+                d["code"].as_str().unwrap().to_string(),
+                d["display_name"].as_str().unwrap().to_string(),
+                d["function"].as_str().unwrap().to_string(),
+                d.get("sort_order")
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(0),
+                d.get("retired").and_then(|v| v.as_bool()).unwrap_or(false),
+            )
+        })
+        .collect();
+
+    let db = TestDb::new().await;
+    let seeded: BTreeSet<(String, String, String, i64, bool)> = sqlx::query(
+        "SELECT id, label, function, sort_order, retired_at IS NOT NULL FROM departments",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("query")
+    .iter()
+    .map(|r| {
+        (
+            r.get::<String, _>(0),
+            r.get::<String, _>(1),
+            r.get::<String, _>(2),
+            i64::from(r.get::<i32, _>(3)),
+            r.get::<bool, _>(4),
+        )
+    })
+    .collect();
+    assert_eq!(seeded.len(), 13, "the migration seeds thirteen rows");
+    assert_eq!(
+        declared, seeded,
+        "{SEED} and migration 20260919181324 disagree — the file is the brewery's declaration \
+         of the migration's rows, and example-reference-rows.sh evicts from a company's \
+         instance exactly what it names"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn home_is_mapped_at_one_place_rather_than_given_a_row() {
     let opener = read(OPENER);
@@ -167,8 +233,8 @@ async fn home_is_mapped_at_one_place_rather_than_given_a_row() {
     assert!(
         opener
             .lines()
-            .any(|l| l.contains("app === 'home'") && l.contains("return HOME_DEPARTMENT")),
-        "{OPENER} no longer maps the catalog's `home` app to a department in one line — \
+            .any(|l| l.contains("owner === 'home'") && l.contains("return HOME_DEPARTMENT")),
+        "{OPENER} no longer maps the catalog's `home` owner to a department in one line — \
          the reason `home` has no row is that this mapping exists"
     );
 

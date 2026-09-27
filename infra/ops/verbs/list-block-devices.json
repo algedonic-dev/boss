@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY: every block device on this host — kernel name, lsblk type, size, model, serial, every /dev/disk/by-id link that resolves to it, what lies below it, the signatures wipefs finds (wipefs -n, which writes nothing), what is mounted on it or below it, and whether it backs / — and which of them commission-a-disk would accept, marked by that verb's OWN judgement: the script sources infra/forge/commission-a-disk.judge.sh, reads each fact with the commands commission-a-disk.sh uses, and counts a by-id name only if it passes that verb's device_by_id pattern and does not end in -partN, so the two cannot disagree. A device whose facts cannot be read is never a candidate, and the run exits 1 naming the read. No params, nothing written. Added 2026-09-27 (backlog 88eda2eb): filing plan-a-disk-commission needs the new drive's by-id name, and until this verb the only way to learn it was a person running ls on the forge (David, 2026-09-26: 'How can we let the system peer into that question so that I don't have to manually ssh in?').",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/list-block-devices.sh"],
+  "params": [],
+  "timeout": 60
+}

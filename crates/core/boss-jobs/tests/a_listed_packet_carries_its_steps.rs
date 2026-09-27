@@ -22,6 +22,21 @@
 //! it is written where they look and held by something that fails —
 //! which is this test, named from `boss-dispatcher-handlers`' crate doc
 //! and from the enrichment site itself.
+//!
+//! A STEP'S METADATA IS ASKED FOR BY NAME (backlog 9b473d4a, design
+//! 3036296f mechanism D, 2026-09-27). Measured that day, 200 open
+//! backlog-item rows weighed 3.6 MB, and 2.2 MB of it was the steps'
+//! `metadata` and `fields` — a procedure's prose copied onto every step
+//! — which truncated a reader twice. `full=false` serves a row's steps
+//! SLIM: every step, with its identity, slug, status, holder and
+//! stamps, and without `metadata` or `fields`. `full=true` serves them
+//! whole, and every reader that reads a listed step's metadata asks for
+//! it — the ops-runner first among them, whose query below is the one
+//! it sends — so the default can flip to slim once every deployed copy
+//! of those readers asks (the server's `STEPS_WHOLE_BY_DEFAULT`). A
+//! slim step has no metadata key at all, never an empty one that reads
+//! as "the step recorded nothing", and the envelope says which shape it
+//! served (`full`).
 
 use std::sync::Arc;
 
@@ -73,6 +88,7 @@ fn request(id: &str, verb: &str) -> Job {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: day(2026, 9, 20),
+        opened_at: None,
         due_on: None,
         closed_on: None,
         metadata: serde_json::json!({ "verb": verb, "host": "forge" }),
@@ -175,7 +191,9 @@ fn execute_of(row: &serde_json::Value) -> &serde_json::Value {
 #[tokio::test]
 async fn a_listed_packet_carries_its_steps() {
     let app = seed().await;
-    let body = list(&app, "kind=ops-request").await;
+    // The ops-runner's own read asks for the whole step (9b473d4a).
+    let body = list(&app, "kind=ops-request&full=true").await;
+    assert_eq!(body["full"], true, "the envelope names the shape: {body}");
     let rows = body["data"].as_array().expect("data array");
     assert_eq!(rows.len(), 2, "both requests listed: {body}");
 
@@ -204,6 +222,61 @@ async fn a_listed_packet_carries_its_steps() {
         exits.contains(&"0") && exits.contains(&"75"),
         "each listed row carries its own step metadata, got {exits:?}"
     );
+}
+
+/// The slim shape (9b473d4a): every step still rides, addressable and
+/// gateable exactly as the runner selects it, and neither of the two
+/// heavy keys does. The job's own metadata is untouched.
+#[tokio::test]
+async fn a_listed_step_carries_no_metadata_when_asked_slim() {
+    let app = seed().await;
+    let query = "kind=ops-request&full=false";
+    let body = list(&app, query).await;
+    assert_eq!(body["full"], false, "the envelope names the shape: {body}");
+    let rows = body["data"].as_array().expect("data array");
+    assert_eq!(rows.len(), 2, "both requests listed: {body}");
+    for row in rows {
+        let step = execute_of(row);
+        assert_eq!(step["status"], "ready", "{row}");
+        assert_eq!(step["job_id"], row["id"], "{row}");
+        assert_eq!(step["title"], "execute", "{row}");
+        assert!(step["id"].is_string(), "{row}");
+        for heavy in ["metadata", "fields"] {
+            assert!(
+                step.get(heavy).is_none(),
+                "a slim step carries no `{heavy}` key at all: {row}"
+            );
+        }
+        assert!(
+            row["metadata"]["verb"].is_string(),
+            "the JOB's metadata still rides: {row}"
+        );
+    }
+}
+
+/// An unflagged read serves the shape its envelope names — whichever
+/// the server's default is — so a reader can always tell a slim step
+/// from a step that recorded nothing. Today that default is WHOLE
+/// (expand, then contract: `STEPS_WHOLE_BY_DEFAULT`), so every reader
+/// still on a copy that never asks keeps what it reads until the flip.
+#[tokio::test]
+async fn an_unflagged_list_serves_the_shape_its_envelope_names() {
+    let app = seed().await;
+    let body = list(&app, "kind=ops-request").await;
+    let full = body["full"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("the envelope names its shape: {body}"));
+    assert!(
+        full,
+        "the default stays whole until every reader asks: {body}"
+    );
+    for row in body["data"].as_array().expect("data array") {
+        assert_eq!(
+            execute_of(row).get("metadata").is_some(),
+            full,
+            "a step's metadata rides exactly when the envelope says full: {row}"
+        );
+    }
 }
 
 /// The knowledge half of backlog d0ee20f8: the fact above is only

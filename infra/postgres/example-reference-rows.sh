@@ -14,7 +14,9 @@
 # types, equipment categories, two production sites, the brewery-
 # shaped starter chart of 33 accounts, its five tax kinds and the 27
 # states it collects sales tax in (40-ledger.sql; backlog 7f163e58),
-# a companies row for each. A
+# the brewery's thirteen departments (20260919181324-a-department-is-a-
+# subject.sql, served as every company's roster until backlog
+# 7edf0e97), a companies row for each. A
 # real company's instance booted with a brewer's books and a refurb
 # shop's org chart (measured on prod, 2026-09-17: "Brewery Taproom"
 # in /api/locations). The migrations cannot be edited — applied files
@@ -23,7 +25,8 @@
 #
 #   1. the example tenants' seeds now carry every one of those rows
 #      (examples/*/seeds/classes.*, locations.toml,
-#      chart_of_accounts.toml, tax.toml), so the playground publishes them
+#      chart_of_accounts.toml, tax.toml, departments.toml), so the
+#      playground publishes them
 #      through its contract and the migration rows become residue;
 #   2. a FRESH instance whose tenant is not an example evicts them at
 #      boot, before any service starts (init.sh, first start only —
@@ -36,9 +39,9 @@
 # THE CANDIDATE SET IS READ, NEVER TYPED. examples/*/seeds/classes.json
 # and classes.toml give (subject_kind, code, member_attribute);
 # locations.toml gives location ids; chart_of_accounts.toml gives
-# account codes; tax.toml gives tax kinds and sales-tax states; each
-# tenant.toml's [meta] tenant_id is its companies
-# row. Whatever the platform needs must therefore NOT be in an
+# account codes; tax.toml gives tax kinds and sales-tax states;
+# departments.toml gives department codes; each tenant.toml's [meta]
+# tenant_id is its companies row. Whatever the platform needs must therefore NOT be in an
 # example's seeds — the `platform-admin` / `audit-readonly` / `owner`
 # / `smoke-tester` roles, the `it` department, employment types and
 # statuses, the `unspecified` account type, the `remote` / `hq` /
@@ -49,6 +52,22 @@
 # example_reference_rows_sql.rs holds that line: after an eviction on
 # the bare schema, what remains is exactly what the platform's own
 # baseline, workflows and schema defaults name.
+#
+# A RETIRED EXAMPLE'S MIGRATION ROWS STAY CANDIDATES (backlog a8991c86,
+# car 6). The migrations outlive the examples they seeded for: when the
+# used-device shop was retired (David, 2026-09-24), 01-registries.sql
+# still seeded its roles, departments, account types, `warehouse-zone`
+# and companies row on every instance, and a candidate set read only
+# from examples/ would have stopped naming them the day that directory
+# was deleted — rows nobody is asked about, on every fresh instance.
+# So the set is also read from retired-examples/<name>/ beside this
+# script, in the same shape (tenant.toml for the companies row, seeds/
+# for the rest) and with the same readers, holding ONLY the rows the
+# migrations seed — the one list here that is declared rather than read
+# off a live seed, and so pinned to the migration by
+# example_reference_rows_sh.rs and example_reference_rows_sql.rs. A
+# retired example is not an example: `boot` keeps rows only for a
+# tenant under examples/.
 #
 # THE INSTANCE'S OWN TENANT IS SUBTRACTED FIRST (backlog 86835bf9).
 # Measured 2026-09-18 on the first --for-real run on prod (ops-request
@@ -80,7 +99,11 @@
 # balance on the account, a tax kind or filing naming it, a registry
 # posting rule naming it, a child account; a tax filing naming the tax
 # kind (a sales-tax rate is referenced by nothing: it is always
-# deletable when present). A child that is itself deletable does not
+# deletable when present); a packet naming the department in
+# metadata.department (the page march's page-audits, the retros), a Job
+# about it, a workflow row declaring it (backlog 7edf0e97 — the three
+# ways GET /api/jobs?department= and the readiness read find a
+# department's work). A child that is itself deletable does not
 # keep its parent, and a tax kind that is itself deletable does not
 # keep its accounts (backlog 7f163e58: until 2026-09-18 the
 # migration's five kinds kept 2150 / 2300 / 2310 / 2320 / 6500 under
@@ -89,8 +112,9 @@
 # `unmapped:<attribute>` — never deleted on a guess.
 #
 # ONE TRANSACTION PER TABLE, in dependency order: companies, locations
-# (with their `subjects` projection rows), tax_kinds (they FK the
-# accounts), sales_tax_rate_by_state, gl_accounts, classes last
+# (with their `subjects` projection rows), departments (with theirs —
+# the migration minted an identity row for each), tax_kinds (they FK
+# the accounts), sales_tax_rate_by_state, gl_accounts, classes last
 # (a location's kind is a class). Each transaction re-judges from the
 # live state with the same CTEs the plan used, so nothing referenced
 # between the plan and the run is deleted.
@@ -128,6 +152,11 @@
 #   BOSS_EXAMPLES_DIR   the examples directory (default: the one beside
 #                       this script's checkout — /opt/boss/examples in
 #                       the image, <checkout>/examples on the forge)
+#   BOSS_RETIRED_EXAMPLES_DIR  the retired examples (default:
+#                       retired-examples/ beside this script, which the
+#                       image ships with it — infra/postgres is copied
+#                       whole). Missing is a refusal (exit 4); empty is
+#                       no retired example.
 
 set -uo pipefail
 
@@ -138,6 +167,7 @@ CANNOT_ANSWER=4
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/../.." && pwd)"
 EXAMPLES="${BOSS_EXAMPLES_DIR:-$REPO/examples}"
+RETIRED="${BOSS_RETIRED_EXAMPLES_DIR:-$SELF_DIR/retired-examples}"
 
 USAGE="usage: $ME seeds [<tenant-dir>] | plan-sql <tenant-dir> | delete-sql <tenant-dir> | boot <tenant-dir>"
 MODE="${1:-}"
@@ -188,10 +218,11 @@ toml_blocks() { # <file> <header>
         END { flush() }' "$1" | jq -s .
 }
 
-# The example tenants: every examples/<name>/ holding a manifest.
-example_dirs() {
+# Every <root>/<name>/ holding a manifest: the example tenants under
+# $EXAMPLES, the retired ones under $RETIRED.
+tenant_dirs() { # <root>
     local d
-    for d in "$EXAMPLES"/*/; do
+    for d in "$1"/*/; do
         d="${d%/}"
         [ -n "$(tenant_id_of "$d")" ] && printf '%s\n' "$d"
     done
@@ -204,7 +235,7 @@ example_dirs() {
 # each file read, relative to <base>. Returns 1 when a seed cannot be
 # parsed — a refusal upstream, never a smaller set.
 dir_sets() { # <tenant dir> <base for source names>
-    local d="$1" base="$2" id classes='[]' locations='[]' accounts='[]' companies='[]' tax_kinds='[]' tax_rates='[]' sources='[]' n
+    local d="$1" base="$2" id classes='[]' locations='[]' accounts='[]' companies='[]' tax_kinds='[]' tax_rates='[]' departments='[]' sources='[]' n
     id=$(tenant_id_of "$d")
     companies=$(jq -c --arg id "$id" '. + [$id]' <<<"$companies")
     if [ -f "$d/seeds/classes.json" ]; then
@@ -234,20 +265,27 @@ dir_sets() { # <tenant dir> <base for source names>
         tax_rates=$(jq -c --argjson n "$n" '. + $n' <<<"$tax_rates")
         sources=$(jq -c --arg s "${d#"$base"/}/seeds/tax.toml" '. + [$s]' <<<"$sources")
     fi
+    if [ -f "$d/seeds/departments.toml" ]; then
+        n=$(toml_blocks "$d/seeds/departments.toml" department | jq -c 'map(.code)') || return 1
+        departments=$(jq -c --argjson n "$n" '. + $n' <<<"$departments")
+        sources=$(jq -c --arg s "${d#"$base"/}/seeds/departments.toml" '. + [$s]' <<<"$sources")
+    fi
     # Every row must carry its key, or the extraction is broken, not
     # the seed.
     jq -n -c \
         --argjson classes "$classes" --argjson locations "$locations" \
         --argjson accounts "$accounts" --argjson companies "$companies" \
-        --argjson tax_kinds "$tax_kinds" --argjson tax_rates "$tax_rates" --argjson sources "$sources" '
+        --argjson tax_kinds "$tax_kinds" --argjson tax_rates "$tax_rates" \
+        --argjson departments "$departments" --argjson sources "$sources" '
         if ($classes | map(select(.subject_kind == null or .code == null)) | length) > 0
         then error("a classes row without subject_kind or code") else . end
         | if ($locations | map(select(. == null)) | length) > 0 then error("a location row without id") else . end
         | if ($accounts | map(select(. == null)) | length) > 0 then error("an account row without code") else . end
         | if ($tax_kinds | map(select(. == null)) | length) > 0 then error("a tax_kind row without kind") else . end
         | if ($tax_rates | map(select(. == null)) | length) > 0 then error("a sales_tax_rate row without state") else . end
+        | if ($departments | map(select(. == null)) | length) > 0 then error("a department row without code") else . end
         | {classes: $classes, locations: $locations, gl_accounts: $accounts, companies: $companies,
-           tax_kinds: $tax_kinds, sales_tax_rates: $tax_rates, sources: $sources}'
+           tax_kinds: $tax_kinds, sales_tax_rates: $tax_rates, departments: $departments, sources: $sources}'
 }
 
 seed_sets() {
@@ -256,7 +294,15 @@ seed_sets() {
         [ -n "$d" ] || continue
         one=$(dir_sets "$d" "$EXAMPLES") || return 1
         all=$(jq -c --argjson one "$one" '. + [$one]' <<<"$all")
-    done < <(example_dirs)
+    done < <(tenant_dirs "$EXAMPLES")
+    # A retired example's rows are named from the directory above
+    # $RETIRED, so a source reads retired-examples/<name>/… and never
+    # passes for a live example's.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        one=$(dir_sets "$d" "$(dirname "$RETIRED")") || return 1
+        all=$(jq -c --argjson one "$one" '. + [$one]' <<<"$all")
+    done < <(tenant_dirs "$RETIRED")
     # Duplicates across tenants (both carry `ceo`) collapse.
     jq -c '{
         classes: (map(.classes) | add | unique_by([.subject_kind, .code]) | sort_by([.subject_kind, .code])),
@@ -265,6 +311,7 @@ seed_sets() {
         companies: (map(.companies) | add | unique | sort),
         tax_kinds: (map(.tax_kinds) | add | unique | sort),
         sales_tax_rates: (map(.sales_tax_rates) | add | unique | sort),
+        departments: (map(.departments) | add | unique | sort),
         sources: (map(.sources) | add)
     }' <<<"$all"
 }
@@ -284,7 +331,7 @@ subtract_tenant() { # <candidate JSON> <tenant dir> -> JSON
     jq -c --argjson t "$declared" --arg id "$id" --arg dir "$dir" '
         ($t.classes | map("\(.subject_kind):\(.code)")) as $tc
         | ($t.locations) as $tl | ($t.gl_accounts) as $ta | ($t.companies) as $tco
-        | ($t.tax_kinds) as $tk | ($t.sales_tax_rates) as $ts
+        | ($t.tax_kinds) as $tk | ($t.sales_tax_rates) as $ts | ($t.departments) as $td
         | {
             classes: (.classes | map(select(("\(.subject_kind):\(.code)") as $k | $tc | index($k) | not))),
             locations: (.locations | map(select(. as $k | $tl | index($k) | not))),
@@ -292,6 +339,7 @@ subtract_tenant() { # <candidate JSON> <tenant dir> -> JSON
             companies: (.companies | map(select(. as $k | $tco | index($k) | not))),
             tax_kinds: (.tax_kinds | map(select(. as $k | $tk | index($k) | not))),
             sales_tax_rates: (.sales_tax_rates | map(select(. as $k | $ts | index($k) | not))),
+            departments: (.departments | map(select(. as $k | $td | index($k) | not))),
             sources,
             declared_by_tenant: {
                 tenant: $id,
@@ -302,6 +350,7 @@ subtract_tenant() { # <candidate JSON> <tenant dir> -> JSON
                 companies: (.companies | map(select(. as $k | $tco | index($k))) | unique),
                 tax_kinds: (.tax_kinds | map(select(. as $k | $tk | index($k))) | unique),
                 sales_tax_rates: (.sales_tax_rates | map(select(. as $k | $ts | index($k))) | unique),
+                departments: (.departments | map(select(. as $k | $td | index($k))) | unique),
                 sources: $t.sources
             }
           }' <<<"$seed"
@@ -329,11 +378,12 @@ if [ "$MODE" = boot ]; then
             echo "keep: tenant $ID is an example (${d#"$EXAMPLES"/}) — its own rows"
             exit 3
         fi
-    done < <(example_dirs)
+    done < <(tenant_dirs "$EXAMPLES")
     echo "evict: tenant $ID is not an example — the example rows are residue"
     exit 0
 fi
 
+[ -d "$RETIRED" ] || { say "CANNOT ANSWER — no retired-examples directory at $RETIRED, so a retired example's migration rows would silently stop being candidates"; exit "$CANNOT_ANSWER"; }
 SEED_JSON=$(seed_sets) || { say "CANNOT ANSWER — could not read the seed key sets under $EXAMPLES"; exit "$CANNOT_ANSWER"; }
 empty=$(printf '%s' "$SEED_JSON" | jq -r 'to_entries[] | select(.key != "sources" and (.value | length) == 0) | .key')
 if [ -n "$empty" ]; then
@@ -440,6 +490,17 @@ loc_judged0 AS (
     FROM locations l WHERE l.id IN (SELECT id FROM loc_cand)
 ),
 loc_judged AS (SELECT id, reasons, cardinality(reasons) = 0 AS deletable FROM loc_judged0),
+dep_cand AS (SELECT jsonb_array_elements_text(s->'departments') AS id FROM seed),
+dep_judged0 AS (
+    SELECT d.id,
+           array_remove(ARRAY[
+               CASE WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.subject_kind = 'department' AND j.subject_id = d.id) THEN 'jobs.subject_id' END,
+               CASE WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.metadata->>'department' = d.id) THEN 'jobs.metadata.department' END,
+               CASE WHEN EXISTS (SELECT 1 FROM workflows w WHERE w.metadata->>'department' = d.id) THEN 'workflows.metadata.department' END
+           ], NULL) AS reasons
+    FROM departments d WHERE d.id IN (SELECT id FROM dep_cand)
+),
+dep_judged AS (SELECT id, reasons, cardinality(reasons) = 0 AS deletable FROM dep_judged0),
 tk_cand AS (SELECT jsonb_array_elements_text(s->'tax_kinds') AS kind FROM seed),
 tk_judged0 AS (
     SELECT k.kind,
@@ -504,6 +565,7 @@ if [ "$MODE" = plan-sql ]; then
 SELECT json_build_object(
     'companies',   $(table_json companies co id co_cand),
     'locations',   $(table_json locations loc_judged id loc_cand),
+    'departments', $(table_json departments dep_judged id dep_cand),
     'tax_kinds',   $(table_json tax_kinds tk_judged kind tk_cand),
     'sales_tax_rates', $(table_json sales_tax_rate_by_state str_judged state str_cand),
     'gl_accounts', $(table_json gl_accounts gl_judged code gl_cand),
@@ -531,6 +593,15 @@ cat <<'SQL'
 , del AS (DELETE FROM locations l USING loc_judged j WHERE l.id = j.id AND j.deletable RETURNING l.id),
 del_subjects AS (DELETE FROM subjects s USING del WHERE s.kind = 'location' AND s.id = del.id RETURNING s.id)
 SELECT json_build_object('table', 'locations', 'deleted', (SELECT coalesce(json_agg(id ORDER BY id), '[]'::json) FROM del), 'subjects_deleted', (SELECT count(*) FROM del_subjects));
+COMMIT;
+SQL
+echo "-- retire-example-reference-rows:delete departments"
+echo "BEGIN;"
+judgement_ctes
+cat <<'SQL'
+, del AS (DELETE FROM departments d USING dep_judged j WHERE d.id = j.id AND j.deletable RETURNING d.id),
+del_subjects AS (DELETE FROM subjects s USING del WHERE s.kind = 'department' AND s.id = del.id RETURNING s.id)
+SELECT json_build_object('table', 'departments', 'deleted', (SELECT coalesce(json_agg(id ORDER BY id), '[]'::json) FROM del), 'subjects_deleted', (SELECT count(*) FROM del_subjects));
 COMMIT;
 SQL
 echo "-- retire-example-reference-rows:delete tax_kinds"

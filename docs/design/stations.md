@@ -8,8 +8,8 @@ question... These are all defined in data, so we can be really
 flexible and interesting. Now that we separated the queuing from the
 dispatching, I think we should have a clean architecture too."
 **Related**: [job-packet-network.md](./job-packet-network.md) ·
-[views-as-queue-lenses.md](./views-as-queue-lenses.md) ·
-[protocol-cadence.md](./protocol-cadence.md) ·
+[views-as-queue-lenses, folded into the decision record](../architecture-decisions.md) ·
+[protocol-cadence, folded into the decision record](../architecture-decisions.md) ·
 the retired operating-system view (pre-network framing, dropped
 2026-08-13 — its Q1/Q2/Q5 resolutions live in Decision history here)
 

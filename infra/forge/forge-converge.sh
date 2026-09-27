@@ -62,6 +62,27 @@ OWNER="${BOSS_FORGE_REPO_OWNER:-david}"
 . "${BOSS_FORGE_CONVERGE_INFRA:-$(dirname "$0")/..}/run-summary.sh"
 run_summary_reset
 
+# THE CHECKOUT'S FORGE CREDENTIAL, FIRST (design 1c90d183, David
+# 2026-09-26; backlog c4cbc6b5). It lived in the userinfo of the
+# `forgejo` remote, and a git error that printed the URL printed it into
+# this unit's journal. It now lives in a 0600 file of the owner's behind
+# a git credential helper scoped to the forge's URL, and the broker
+# rotates it: credential-deposit.sh reads the Secret the broker rule
+# declares through the forge's admin kubeconfig, proves a new value by
+# effect before it replaces the file, strips the remote's userinfo once
+# the helper authenticates, reports the held token's last eight on this
+# run's packet, and records delivery on the rotation packet so the
+# broker may revoke the old token. BEFORE the fetch, because it owes
+# nothing to the forge token: a revoked or broken one cannot stop the
+# step that repairs it. Its exit is carried like install.sh's, so the
+# rest of the converge still runs.
+INFRA="${BOSS_FORGE_CONVERGE_INFRA:-$REPO/infra}"
+FORGE_TOKEN_FILE="${BOSS_FORGE_TOKEN_FILE:-/home/$OWNER/.config/boss/forge-checkout.token}"
+deposit_rc=0
+"$INFRA/forge/credential-deposit.sh" \
+    --rule "$INFRA/dispatcher/rules/broker-rotates-the-forge-host-checkout-token.toml" \
+    --checkout "$REPO" --dest "$FORGE_TOKEN_FILE" --owner "$OWNER" || deposit_rc=$?
+
 # Fetch and check out forge main as the checkout's OWNER, never as root
 # — a root `git` in a david-owned clone leaves root-owned objects that
 # break the owner's later pulls. `-l` gives the owner's login env so the
@@ -104,5 +125,77 @@ run_summary_field node_roles "${BOSS_NODE_ROLES:-}"
 
 # install.sh needs root (writes /etc/systemd/system). This script runs
 # as root; git already finished above, so install.sh's bytes are stable
-# for the duration of its run and it needs no snapshot of its own.
-"$REPO/infra/forge/install.sh"
+# for the duration of its run and it needs no snapshot of its own. Its
+# exit is carried rather than fatal, so main's protection below is
+# converged on every tick even when a unit or the CLI step reds it.
+install_rc=0
+"$REPO/infra/forge/install.sh" || install_rc=$?
+
+# MAIN'S PROTECTION, as the tree declares it (backlog f9256445, car 4 of
+# design d812f1b7; David answered Q2 "yes" on 2026-09-25: direct push and
+# force push off, so only a PR merge moves forge main — declared here,
+# applied by this converge, never set by hand in the Forgejo UI).
+# infra/forge/protect-main.sh is the one definition and carries the
+# reasoning, including the writer this rule CANNOT stop: the rewind of
+# 2026-09-25 was Forgejo's own push-mirror sync (`update by push` as
+# Gitea <gitea@fake.local>), which never passes the pre-receive hook
+# where protection lives, so the conductor's ancestry arm is the only
+# guard against it.
+#
+# THE CREDENTIAL IS THE CHECKOUT'S OWN: the token file the deposit
+# above keeps (the same value the fetch's helper read), copied by root
+# into a root-only header file with a builtin, and deleted on exit. It
+# never reaches an argv or the journal. The deposit runs first on every
+# pass, so the pass that cuts the checkout over already reads the file
+# here; a pass with no file (the deposit refused, and said why on this
+# packet) leaves the header empty and protect-main's own exit 4 names it.
+# NOT the remote URL's userinfo, which forge-auth-header.sh read from
+# #697 until this car deleted it (backlog 85f8a614): the deposit strips
+# that userinfo, after which the reader had nothing to read and would
+# have exited 3 on every run. And NOT `git credential fill`, whose
+# prompt-disabled error named the userinfo in this journal (backlog
+# 164f38c7, 37497977). Whether it may administer the repository is
+# MEASURED by the first write — a 401/403 is named on this run's packet —
+# rather than assumed; nothing here mints or places a credential
+# (CLAUDE.md §Doors, the credential broker). Run after install.sh, which
+# renders the /etc/boss/sor.env that carries BOSS_FORGE_URL.
+protect_rc=0
+auth_hdr="$(mktemp -t forge-auth.XXXXXX)"
+chmod 600 "$auth_hdr"
+trap 'rm -f "$BOSS_CONVERGE_SNAPSHOT" "$auth_hdr"' EXIT
+# The token file is the OWNER's to write and this script runs as root, so
+# root never reads it (review A1 of the re-review of 5ef6db0b,
+# 2026-09-26): a symlink planted there to /etc/boss-ops/kubeconfig was
+# read as root and sent to the forge in this header. A symlink gets no
+# header, which protect-main names; the file is read as the owner, who
+# cannot read what they could not already.
+if [ -L "$FORGE_TOKEN_FILE" ]; then
+    echo "forge-converge: $FORGE_TOKEN_FILE is a symlink, not the deposit's own file; protect-main gets no header" >&2
+elif [ -s "$FORGE_TOKEN_FILE" ] \
+    && FORGE_TOKEN="$(runuser -u "$OWNER" -- cat -- "$FORGE_TOKEN_FILE")"; then
+    printf 'Authorization: token %s\n' "$FORGE_TOKEN" >"$auth_hdr"
+    unset FORGE_TOKEN
+fi
+BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/protect-main.sh" || protect_rc=$?
+
+# THE OFF-SITE COPY, pushed by us and not by Forgejo (backlog 21d54f4a,
+# decided 2026-09-26: no mirror can wipe what it mirrors). Forgejo's push
+# mirror is `git push -f --mirror` whatever its filter, and it was the
+# writer that rewound main on 2026-09-25; infra/forge/offsite-push.sh is
+# the one definition and carries the reasoning. A plain push of main and
+# publish/* to dauld/boss-mirror as offsite-push.json declares — a
+# non-fast-forward is refused and named, never overwritten — read back,
+# and only then the Forgejo push mirror deleted. Same forge header as
+# protect-main (deleting a mirror is the same repository administration);
+# the GitHub token is the publish verb's file, read by git's credential
+# helper, never here.
+offsite_rc=0
+BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/offsite-push.sh" || offsite_rc=$?
+
+# install.sh's verdict first (it is the older and wider one), then the
+# protection's, then the off-site push's, then the deposit's: any reds
+# this run and puts the packet on `failed`.
+[ "$install_rc" -eq 0 ] || exit "$install_rc"
+[ "$protect_rc" -eq 0 ] || exit "$protect_rc"
+[ "$offsite_rc" -eq 0 ] || exit "$offsite_rc"
+exit "$deposit_rc"

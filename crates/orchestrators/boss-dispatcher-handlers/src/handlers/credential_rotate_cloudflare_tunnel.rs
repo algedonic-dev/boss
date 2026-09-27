@@ -99,7 +99,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
+use super::common::{StepEvent, dispatcher_reader_header};
 use super::credential_issuer::{
     CloudflareTunnels, SecretStore, TunnelInfo, WorkloadRestarter, fresh_tunnel_secret_b64,
     installed_tunnel_id, tunnel_credentials_json,
@@ -534,17 +534,18 @@ impl CredentialRotateCloudflareTunnel {
         loop {
             let body = self
                 .get_json(&format!(
-                    "{}/api/jobs?kind={ROTATION_KIND}&status=open&limit={PAGE}&offset={}",
+                    "{}/api/jobs?kind={ROTATION_KIND}&status=open&full=true&limit={PAGE}&offset={}",
                     self.jobs(),
                     rows.len()
                 ))
                 .await?;
             let total = body.get("total").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
-            let page: Vec<JsonValue> = body
-                .get("data")
-                .and_then(JsonValue::as_array)
-                .cloned()
-                .unwrap_or_default();
+            // A page with no `data` array is NO ANSWER. Read as zero
+            // rows it broke the loop on `got == 0` and the sweep ACKed
+            // having looked at nothing (backlog 37fc5837).
+            let page: Vec<JsonValue> =
+                super::common::rows_or_refuse(&body, "the open-rotation read (GET /api/jobs)")
+                    .map_err(HandlerError::Downstream)?;
             let got = page.len();
             rows.extend(page);
             if got == 0 || rows.len() >= total {
@@ -554,10 +555,13 @@ impl CredentialRotateCloudflareTunnel {
         Ok(rows)
     }
 
-    /// PUT one step: merged metadata, and `status: completed` when
-    /// `complete` (PATCH-on-PUT replaces `metadata` wholesale, so the
-    /// existing keys ride along). Already-completed steps are left
-    /// alone — the redelivery path. A slug the packet lacks is
+    /// Write one step: the evidence through the step merge door, then
+    /// `status: completed` alone when `complete` (`common::complete_step`,
+    /// backlog e39a9d2a). This merged the evidence into the step's
+    /// metadata as read and PUT the whole map, which the step PUT
+    /// refuses once anything wrote the step in between, and refuses
+    /// outright in the decided end state. Already-completed steps are
+    /// left alone — the redelivery path. A slug the packet lacks is
     /// skipped: the packet's workflow version decides which phases it
     /// records.
     async fn put_step(
@@ -576,38 +580,38 @@ impl CredentialRotateCloudflareTunnel {
         if step.status == "completed" {
             return Ok(());
         }
-        let mut metadata = step.metadata.clone();
-        for (k, v) in evidence {
-            metadata.insert((*k).to_string(), json!(v));
+        let fields: serde_json::Map<String, JsonValue> = evidence
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), json!(v)))
+            .collect();
+        if complete {
+            return super::common::complete_step(
+                &self.client,
+                self.jobs(),
+                job_id,
+                &step.id,
+                fields,
+                rule_name,
+            )
+            .await;
         }
-        if !complete && metadata == step.metadata {
+        if fields.iter().all(|(k, v)| step.metadata.get(k) == Some(v)) {
             // An annotation that says what the step already says is
             // a write with no information in it.
             return Ok(());
         }
-        let mut body = json!({ "metadata": metadata });
-        if complete {
-            body["status"] = json!("completed");
-        }
-        let url = format!("{}/api/jobs/{job_id}/steps/{}", self.jobs(), step.id);
-        let resp = self
-            .client
-            .put(&url)
-            .header("Content-Type", "application/json")
-            .header("x-boss-user", dispatcher_actor_header(rule_name))
-            .header("x-sim-origin", super::common::sim_origin_value())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("PUT {url}: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "PUT {url} returned {status}: {text}"
-            )));
-        }
-        Ok(())
+        super::common::write_json(
+            &self.client,
+            reqwest::Method::PATCH,
+            &format!(
+                "{}/api/jobs/{job_id}/steps/{}/metadata",
+                self.jobs(),
+                step.id
+            ),
+            &JsonValue::Object(fields),
+            rule_name,
+        )
+        .await
     }
 
     async fn complete_step(
@@ -1852,6 +1856,48 @@ mod tests {
 
     type Captured = std::sync::Arc<Mutex<Vec<(String, JsonValue)>>>;
 
+    /// The two step doors both stubs serve, recorded in order into
+    /// `cap`: the step PUT as (step_id, body) and the step merge door as
+    /// ("{step_id}/metadata", body). The PUT answers as the decided end
+    /// state of design 93d2bddb does (e39a9d2a): a body carrying
+    /// metadata is refused 409 and routed to the merge door.
+    fn step_routes(cap: Captured) -> axum::Router {
+        use axum::extract::Path;
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::patch, routing::put};
+        let merge_cap = cap.clone();
+        Router::new()
+            .route(
+                "/api/jobs/{id}/steps/{step_id}",
+                put(
+                    move |Path((id, sid)): Path<(String, String)>, Json(body): Json<JsonValue>| {
+                        let cap = cap.clone();
+                        async move {
+                            if let Some(refused) =
+                                super::super::listing_stub::end_state_step_put(&id, &sid, &body)
+                            {
+                                return refused;
+                            }
+                            cap.lock().unwrap().push((sid, body));
+                            Json(json!({ "ok": true })).into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{step_id}/metadata",
+                patch(
+                    move |Path((_id, sid)): Path<(String, String)>, Json(body): Json<JsonValue>| {
+                        let cap = merge_cap.clone();
+                        async move {
+                            cap.lock().unwrap().push((format!("{sid}/metadata"), body));
+                            Json(json!({ "ok": true }))
+                        }
+                    },
+                ),
+            )
+    }
+
     /// A rotation packet with the machine phases pending. Returns the
     /// stub's base URL + captured step PUTs as (step_id, body) +
     /// captured rotation-door POSTs as ("{credential_id}/{phase}", body).
@@ -1859,7 +1905,7 @@ mod tests {
         step_statuses: &'static [(&'static str, &'static str)],
     ) -> (String, Captured, Captured) {
         use axum::extract::Path;
-        use axum::{Json, Router, routing::get, routing::post, routing::put};
+        use axum::{Json, Router, routing::get, routing::post};
 
         let captured: Captured = Default::default();
         let cap = captured.clone();
@@ -1883,18 +1929,7 @@ mod tests {
                     Json(json!({ "id": id, "steps": steps }))
                 }),
             )
-            .route(
-                "/api/jobs/{id}/steps/{step_id}",
-                put(
-                    move |Path((_id, sid)): Path<(String, String)>, Json(body): Json<JsonValue>| {
-                        let cap = cap.clone();
-                        async move {
-                            cap.lock().unwrap().push((sid, body));
-                            Json(json!({ "ok": true }))
-                        }
-                    },
-                ),
-            )
+            .merge(step_routes(cap.clone()))
             .route(
                 "/api/credentials/{id}/rotation/{phase}",
                 post(
@@ -2052,9 +2087,10 @@ mod tests {
         );
 
         // Recorded: issue, install, verify, revoke completed in order
-        // with required-at-done evidence, existing metadata kept, and
-        // no secret value anywhere in any body.
-        let puts = captured.lock().unwrap().clone();
+        // with required-at-done evidence, existing metadata kept (by the
+        // merge door: it is never re-sent), and no secret value anywhere
+        // in any body.
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         let order: Vec<&str> = puts.iter().map(|(sid, _)| sid.as_str()).collect();
         assert_eq!(
             order,
@@ -2062,7 +2098,10 @@ mod tests {
         );
         for (_, body) in &puts {
             assert_eq!(body["status"], "completed");
-            assert_eq!(body["metadata"]["kept"], "yes");
+            assert!(
+                body["metadata"].get("kept").is_none(),
+                "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
+            );
             let flat = body.to_string();
             assert!(
                 !flat.contains(&secret_b64),
@@ -2184,7 +2223,7 @@ mod tests {
         assert!(cf.deleted.lock().unwrap().is_empty());
 
         // issue / install / verify completed; revoke ANNOTATED, open.
-        let puts = captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         let order: Vec<&str> = puts.iter().map(|(sid, _)| sid.as_str()).collect();
         assert_eq!(
             order,
@@ -2205,7 +2244,10 @@ mod tests {
             note.contains(REFIRE_RULE),
             "the deferred step names what acts next: {note}"
         );
-        assert_eq!(revoke["metadata"]["kept"], "yes");
+        assert!(
+            revoke["metadata"].get("kept").is_none(),
+            "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
+        );
         assert!(
             revoke["metadata"].get("revoked").is_none(),
             "nothing was revoked, so nothing claims to be: {revoke}"
@@ -2262,12 +2304,11 @@ mod tests {
                 .get("boss", "cloudflare-tunnel-credentials", "credentials.json")
                 .is_some()
         );
-        let order: Vec<String> = captured
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(sid, _)| sid.clone())
-            .collect();
+        let order: Vec<String> =
+            super::super::listing_stub::fold_step_writes(&captured.lock().unwrap())
+                .iter()
+                .map(|(sid, _)| sid.clone())
+                .collect();
         assert_eq!(order, vec!["step-issue", "step-install"]);
         let order: Vec<String> = rotations
             .lock()
@@ -2394,7 +2435,7 @@ mod tests {
         assert_eq!(events[0].1["replaced_orphan"], true);
         assert_eq!(events[3].1["deleted"], json!([]));
         assert_eq!(events[3].1["complete"], true);
-        let puts = _captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&_captured.lock().unwrap());
         let revoke = puts
             .iter()
             .find(|(sid, _)| sid == "step-revoke")
@@ -2478,7 +2519,7 @@ mod tests {
     /// capture as `stub_jobs_api`.
     async fn stub_sweep_api(packets: Vec<JsonValue>) -> (String, Captured, Captured) {
         use axum::extract::{Path, Query};
-        use axum::{Json, Router, routing::get, routing::post, routing::put};
+        use axum::{Json, Router, routing::get, routing::post};
 
         let captured: Captured = Default::default();
         let cap = captured.clone();
@@ -2497,18 +2538,7 @@ mod tests {
                     }
                 }),
             )
-            .route(
-                "/api/jobs/{id}/steps/{step_id}",
-                put(
-                    move |Path((_id, sid)): Path<(String, String)>, Json(body): Json<JsonValue>| {
-                        let cap = cap.clone();
-                        async move {
-                            cap.lock().unwrap().push((sid, body));
-                            Json(json!({ "ok": true }))
-                        }
-                    },
-                ),
-            )
+            .merge(step_routes(cap.clone()))
             .route(
                 "/api/credentials/{id}/rotation/{phase}",
                 post(
@@ -2641,7 +2671,7 @@ mod tests {
         assert!(cf.has_tunnel(NEW_NAME));
 
         // The revoke step is annotated with BOTH facts and left open.
-        let puts = captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         let (sid, revoke) = puts.last().unwrap();
         assert_eq!(sid, "step-revoke");
         assert!(revoke.get("status").is_none(), "left open: {revoke}");
@@ -2707,7 +2737,7 @@ mod tests {
 
         // ONE write: the revoke step completed, cumulative record,
         // the deferral cleared, existing keys kept.
-        let puts = captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         assert_eq!(puts.len(), 1, "{puts:?}");
         let (sid, revoke) = &puts[0];
         assert_eq!(sid, "step-revoke");
@@ -2729,7 +2759,10 @@ mod tests {
                 .starts_with("cleared"),
             "{revoke}"
         );
-        assert_eq!(revoke["metadata"]["kept"], "yes");
+        assert!(
+            revoke["metadata"].get("kept").is_none(),
+            "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
+        );
 
         let events = rotations.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
@@ -2737,6 +2770,32 @@ mod tests {
         assert_eq!(events[0].1["job_id"], JOB);
         assert_eq!(events[0].1["complete"], true);
         assert_eq!(events[0].1["deleted"].as_array().unwrap().len(), 2);
+    }
+
+    /// An open-rotation read with no `data` array is no answer (backlog
+    /// 37fc5837). The paged loop stopped on `got == 0` and returned NO
+    /// ROTATIONS, so the clock door ACKed a sweep that looked at nothing
+    /// and a deferred revoke stayed deferred with nobody told — the
+    /// 833e2d0a defect in this handler's own copy of the walk.
+    #[tokio::test]
+    async fn an_open_rotation_read_with_no_data_array_refuses_by_name() {
+        use crate::handlers::listing_stub::{assert_refused_by_name, no_data_array, serve};
+        let cf = FakeCloudflare::with_tunnels(vec![
+            tun("t-new", NEW_NAME, 2),
+            tun("t-old", "boss-cluster-e202c7c3", 0),
+        ]);
+        let secrets = installed_secret("t-new");
+        let restarter = FakeRestarter::live(cf.clone());
+        let stub = serve(vec![("/api/jobs", no_data_array())]).await;
+
+        let h = handler(stub.base.clone(), cf.clone(), secrets, restarter);
+        let res = h.invoke(&sweep_args(), &clock_ctx()).await;
+        assert!(
+            cf.deleted.lock().unwrap().is_empty(),
+            "nothing revoked blind"
+        );
+        assert_eq!(stub.writes(), Vec::<String>::new());
+        assert_refused_by_name(res, "the open-rotation read");
     }
 
     #[tokio::test]
@@ -2761,7 +2820,7 @@ mod tests {
             .expect("already revoked is not an error");
 
         assert!(cf.deleted.lock().unwrap().is_empty());
-        let puts = captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         assert_eq!(puts.len(), 1);
         let revoke = &puts[0].1;
         assert_eq!(revoke["status"], "completed");
@@ -2800,7 +2859,7 @@ mod tests {
             .expect("deferred again is not an error");
 
         assert!(cf.deleted.lock().unwrap().is_empty());
-        let puts = captured.lock().unwrap().clone();
+        let puts = super::super::listing_stub::fold_step_writes(&captured.lock().unwrap());
         assert_eq!(puts.len(), 1);
         assert!(
             puts[0].1.get("status").is_none(),

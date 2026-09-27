@@ -10,11 +10,12 @@
   // Both are fire-and-forget; KB panels stay empty when the calls
   // fail (offline / missing data / unknown model).
 
-  import { isPending, type StepStatus } from '../jobs/types';
+  import { type StepStatus } from '../jobs/types';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
-  import { putStep } from './stepWrite';
+  import { saveStep, startStep } from './stepWrite';
+  import { claimedFor, startable } from './holder';
 
   type StepData = {
     id: string;
@@ -127,22 +128,27 @@
     failureModes.find((fm) => fm.code === failureCode)?.typical_fix ?? '',
   );
 
-  async function save(newStatus?: string): Promise<void> {
+  /// A Start saves and then claims, for the stored nominee (design
+  /// 611fbffd, clause b) — never a status PUT.
+  async function save(newStatus?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
-      const body: Record<string, unknown> = {
-        ...step,
-        job_id: jobId,
+      // The keys this surface owns, through the merge door; an emptied
+      // field is sent as null and deleted, where it used to be cleared
+      // by omission from a wholesale PUT (backlog e39a9d2a).
+      const body = {
+        ...(newStatus ? { status: newStatus } : {}),
         metadata: {
-          ...step.metadata,
           labor_hours: laborHours,
           work_notes: workNotes || undefined,
           failure_mode_code: failureCode || undefined,
         },
       };
-      if (newStatus) body.status = newStatus;
-      const res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(step.assignee_id));
+      }
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -221,18 +227,18 @@
       {/if}
 
       <div class="step-actions">
-        {#if isPending(step.status)}
+        {#if startable(step)}
           <button
-            class="step-btn step-btn-primary"
-            onclick={() => save('active')}
+            class="btn btn-primary"
+            onclick={() => save(undefined, true)}
             disabled={saving}
           >Start work</button>
         {:else if step.status === 'active'}
-          <button class="step-btn" onclick={() => save()} disabled={saving}>
+          <button class="btn" onclick={() => save()} disabled={saving}>
             Save progress
           </button>
           <button
-            class="step-btn step-btn-primary"
+            class="btn btn-primary"
             onclick={() => save('completed')}
             disabled={saving}
           >Mark complete</button>

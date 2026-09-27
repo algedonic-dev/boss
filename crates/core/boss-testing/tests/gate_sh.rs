@@ -19,11 +19,11 @@
 //!   a trimmed roster is exactly the under-covering gate that let both
 //!   #226 failures through.
 //!
-//! There is ONE CI workflow now: `.forgejo/workflows/ci.yml`. The GitHub
-//! copy (`.github/workflows/ci.yml`) ran only on the public mirror —
-//! which is a backup of source, not part of CI/CD (design 7b59af2c,
-//! 2026-09-08) — and was deleted with it, so the pair it once formed
-//! with the forge file is gone rather than pinned.
+//! The GitHub workflow (`.github/workflows/ci.yml`) was deleted on
+//! 2026-09-08 (design 7b59af2c) and came back on backlog 2328c95e,
+//! because a public green that compiled nothing read as a green gate.
+//! It runs this script in full on the public mirror and gates nothing;
+//! its pins live in `the_mirror_runs_the_one_gate.rs`.
 //!
 //! Every test names the offending entry when it fails.
 
@@ -1001,6 +1001,7 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
         ],
         &dir,
     );
+    // mode-bits-ok: run below as bash <path>, which opens it read-only
     std::fs::copy(root.join("infra/gate.sh"), tree.join("infra/gate.sh"))
         .expect("carry this tree's gate.sh into the scratch clone");
     git(
@@ -1077,6 +1078,9 @@ fn scope_of(receipt: &serde_json::Value) -> Vec<String> {
 /// it reads every migration, whatever its test files are named and
 /// whether or not its manifest declares a `postgres` feature.
 fn stands_up_the_schema(crate_name: &str) -> bool {
+    // not a tree-wide pin: it reads crates/ only to find one named crate's
+    // directory, and what its callers judge is infra/gate.sh's map, which
+    // scopes this crate (backlog bc978312).
     let root = repo_root();
     let manifest = std::fs::read_dir(root.join("crates"))
         .expect("crates/")
@@ -1346,6 +1350,173 @@ fn a_doc_a_test_module_reads_by_repo_path_scopes_the_crate_that_pins_it() {
     );
 }
 
+/// The line `--auto` prints naming the tree-wide pins it will run, if
+/// it printed one.
+fn tree_wide_line(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|l| l.starts_with("gate: tree-wide pins"))
+        .map(str::to_string)
+}
+
+/// THE CAR THAT EARNED THIS (backlog c87ad472). Car 622c6944 changed a
+/// Svelte page and nothing else, so `--auto` derived web + dispatcher
+/// and never ran boss-testing — and the page added a hard-coded public
+/// mirror URL, which `the_public_mirror_url_lives_once` refuses by
+/// scanning `apps/web/src`. A pin that scans the TREE reads paths no
+/// file-level map can attribute to its crate, so it ran first on the
+/// train's assembled gate and struck ~16 cars. A tree-wide pin now
+/// declares itself in its own header and every scoped gate runs it,
+/// whatever the scope.
+#[test]
+fn a_web_only_car_still_runs_the_tree_wide_pins() {
+    // Built, not spelled: a whole repo-path literal in this file names
+    // the scratch page the clone then holds, and the gate's file-input
+    // index would map it to THIS crate — the fixture scoping itself.
+    let page = format!("apps/web/src/{}", "zz-a-scratch-page.svelte");
+    let (stdout, receipt) = auto_scope_of("gate-auto-tree-wide-pins-web", &[&page]);
+    assert!(
+        !scope_of(&receipt).iter().any(|c| c == "boss-testing"),
+        "the fixture is a web-only car, whose derived scope must NOT already hold \
+         boss-testing — else this proves nothing.\nstdout: {stdout}"
+    );
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!("a web-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}")
+    });
+    assert!(
+        line.contains("the_public_mirror_url_lives_once"),
+        "the pin whose absence struck train 11bda216 must be among them: {line}"
+    );
+}
+
+/// …and a car whose scope already holds the pin's crate runs that
+/// crate's whole suite, pins included — naming them again would run
+/// them twice.
+#[test]
+fn a_car_scoped_to_the_pins_crate_does_not_run_them_twice() {
+    let (stdout, receipt) = auto_scope_of(
+        "gate-auto-tree-wide-pins-in-scope",
+        &["crates/core/boss-testing/tests/zz_a_scratch_pin.rs"],
+    );
+    assert!(
+        scope_of(&receipt).iter().any(|c| c == "boss-testing"),
+        "the fixture must scope boss-testing.\nstdout: {stdout}"
+    );
+    if let Some(line) = tree_wide_line(&stdout) {
+        assert!(
+            !line.contains("the_public_mirror_url_lives_once"),
+            "boss-testing is in scope, so its pins ride its own test run: {line}"
+        );
+    }
+}
+
+/// The gateway's two route-coverage pins, by name. Read off the source's
+/// own marker rather than restated as a list of what should be there:
+/// the question is whether the gate runs what the file DECLARES.
+const GATEWAY_ROUTE_PINS: [&str; 2] = [
+    "every_api_path_the_web_fetches_is_routed",
+    "no_service_route_is_shadowed_by_the_catch_all",
+];
+
+/// THE PACKET (backlog cb2157f9). Map car R3 was web-only: it added a
+/// fetch of `/api/yard/routes` to a page and nothing to the gateway, so
+/// `--auto` derived no crate and the gateway's
+/// `every_api_path_the_web_fetches_is_routed` — which reads
+/// `apps/web/src` for exactly this — never ran. The read 404'd at the
+/// human door after train #718 (dc9006f1), the FIFTH time that shape
+/// shipped. The tree-wide mechanism (c87ad472) ran only whole
+/// `tests/*.rs` files, and the gateway's pins are unit tests in the
+/// binary, beside the private route table they probe. A single test
+/// under `src/` now declares itself with a `// tree-wide pin` line
+/// above it, and every scoped gate runs it with its own crate's test
+/// binary.
+#[test]
+fn a_web_only_car_runs_the_gateways_route_coverage_pins() {
+    let page = format!("apps/web/src/{}", "zz-a-scratch-page.svelte");
+    let (stdout, receipt) = auto_scope_of("gate-auto-tree-wide-gateway-pins", &[&page]);
+    assert!(
+        !scope_of(&receipt).iter().any(|c| c == "boss-gateway"),
+        "the fixture is a web-only car, whose derived scope must NOT already hold \
+         boss-gateway — else this proves nothing.\nstdout: {stdout}"
+    );
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!("a web-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}")
+    });
+    for pin in GATEWAY_ROUTE_PINS {
+        assert!(
+            line.contains(pin),
+            "`{pin}` reads apps/web/src, which no changed-file map attributes to \
+             boss-gateway, so a web-only car must run it (backlog cb2157f9): {line}"
+        );
+    }
+}
+
+/// …and a car that changes the gateway runs its whole suite, the two
+/// route pins included, so they are not named a second time.
+#[test]
+fn a_car_scoped_to_the_gateway_runs_its_route_pins_once() {
+    let (stdout, receipt) = auto_scope_of(
+        "gate-auto-tree-wide-gateway-in-scope",
+        &["crates/core/boss-gateway/src/zz_a_scratch.rs"],
+    );
+    assert!(
+        scope_of(&receipt).iter().any(|c| c == "boss-gateway"),
+        "the fixture must scope boss-gateway.\nstdout: {stdout}"
+    );
+    if let Some(line) = tree_wide_line(&stdout) {
+        for pin in GATEWAY_ROUTE_PINS {
+            assert!(
+                !line.contains(pin),
+                "boss-gateway is in scope, so `{pin}` rides its own test run: {line}"
+            );
+        }
+    }
+}
+
+/// THE PACKET's second half (backlog bc978312), measured 2026-09-26: of
+/// the files that `read_dir` a top-level tree joined onto the repo root,
+/// two carried no marker and so never ran on a scoped gate — boss-testing's
+/// `a_lint_that_cannot_read_does_not_say_clean.rs` (two tests walk every
+/// shell under `infra/`) and the `test_db` unit test that walks `crates/`
+/// for a hand-spelled scratch-database prefix. Both now declare
+/// themselves, and `a_tree_walk_declares_itself_tree_wide` refuses the
+/// next one.
+#[test]
+fn the_unmarked_tree_walks_found_by_bc978312_now_run_on_a_web_only_car() {
+    let page = format!("apps/web/src/{}", "zz-a-scratch-page.svelte");
+    let (stdout, _) = auto_scope_of("gate-auto-tree-wide-bc978312", &[&page]);
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!("a web-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}")
+    });
+    for pin in [
+        "a_lint_that_cannot_read_does_not_say_clean",
+        "no_test_file_spells_the_scratch_prefix_itself",
+    ] {
+        assert!(line.contains(pin), "`{pin}` walks a top-level tree: {line}");
+    }
+}
+
+/// A single test named as a cargo FILTER can match nothing — a test
+/// renamed, a module moved from the binary to the library — and a
+/// filtered run that matched nothing is a green run that tested nothing.
+/// The gate refuses that: every named pin must report `ok` in its own
+/// run's output. `gate.sh --self-test` holds the shell half; this holds
+/// that the self-test still asks.
+#[test]
+fn a_tree_wide_pin_that_reports_no_result_is_refused() {
+    let out = gate_cmd(&["--self-test"])
+        .output()
+        .expect("run gate.sh --self-test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success()
+            && stdout.contains("a tree-wide pin that reports no result is refused"),
+        "gate.sh --self-test must prove that a named tree-wide pin with no `ok` line \
+         fails the check.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ---- the hosting door's gate half (a479faf7; design 01c3cc3f reader 3) ----
 
 /// The lint the gate runs the edit level through, by name.
@@ -1382,7 +1553,7 @@ impl LevelTree {
             &tree.join("infra/lint/workspace-declares-what-it-runs.sh"),
             "#!/usr/bin/env bash\nexit 0\n",
         );
-        for web in ["apps/web", "libs/web-kit"] {
+        for web in ["apps/web", "apps/simulator", "libs/web-kit"] {
             boss_testing::create_dir(&tree.join(web));
         }
         let t = LevelTree { dir, tree };
@@ -1481,6 +1652,10 @@ impl LevelTree {
             .env("BOSS_TRUNK_REF", "main")
             .env("GIT_CEILING_DIRECTORIES", "")
             .env("BOSS_JOBS_URL", jobs_url)
+            // The public mirror declares BOSS_ESTATE=none (backlog
+            // 3e63662c), under which the lint reads no level; every case
+            // here is about the level it reads.
+            .env_remove("BOSS_ESTATE")
             .output()
             .expect("run gate.sh --quick")
     }
@@ -1696,5 +1871,615 @@ fn the_doors_list_names_the_mode_that_proves_clippy() {
         "the `Before pushing` door names only the pre-flight. `infra/gate.sh --lint` is \
          the same pre-flight plus a scoped clippy, and clippy is the red class the door \
          exists to prevent (packet 410e21e2). The entry as written:\n{door}"
+    );
+}
+
+/// `--lint` RUNS THE CHECK THE GATE'S FIRST ACT RUNS.
+///
+/// MEASURED on origin/main 1d917084, 2026-09-23 (backlog d8637703).
+/// `scope_self_test` is build-free and was called on only two paths, `-p`
+/// and `--auto` — the gate's own. Gate-run 1f412b9e went red before any
+/// check ran, on `gate.sh scope self-test FAIL: a script boss-testing
+/// executes implies boss-testing -> [boss-jobs boss-testing], wanted
+/// [boss-testing]`, and no receipt was written. The branch had passed
+/// `--lint` twice. A pre-flight that skips the check the gate runs first
+/// vouches for a tree the gate refuses in its first second.
+///
+/// Read out of the `--lint` branch rather than run: `--lint` compiles
+/// (clippy), and `scope_self_test` is silent on success, so a run could
+/// not tell "held" from "never asked". The call must precede the scope
+/// it vouches for — `crates_from_paths` is the map it tests.
+#[test]
+fn lint_runs_the_scope_self_test_before_the_scope_it_vouches_for() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim_end() == "if [ \"$LINT\" -eq 1 ]; then")
+        .expect("infra/gate.sh no longer has a --lint branch");
+    let len = lines[start..]
+        .iter()
+        .position(|l| *l == "fi")
+        .expect("the --lint branch never closes at column 0");
+    let branch = &lines[start..start + len];
+
+    let scope = branch
+        .iter()
+        .position(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("crates_from_paths")
+        })
+        .expect("the --lint branch no longer derives its scope from crates_from_paths");
+    match branch.iter().position(|l| l.trim() == "scope_self_test") {
+        Some(at) => assert!(
+            at < scope,
+            "the --lint branch calls scope_self_test AFTER crates_from_paths — it derives \
+             the clippy scope from a map it has not yet checked:\n{}",
+            branch.join("\n")
+        ),
+        None => panic!(
+            "the --lint branch never calls scope_self_test, so a stale scope fixture passes \
+             the pre-flight and reds the gate before any check runs (gate-run 1f412b9e, \
+             backlog d8637703). The branch reads:\n{}",
+            branch.join("\n")
+        ),
+    }
+}
+
+/// EVERY FUNCTION IS DEFINED ABOVE ITS FIRST TOP-LEVEL CALLER.
+///
+/// bash defines a function when execution reaches its definition, so a
+/// top-level line that calls one defined further down answers `command
+/// not found` — and inside `$(...)` that is an empty string, not an
+/// error, so the surrounding test simply goes the other way. MEASURED on
+/// origin/main 1d917084 (backlog d8637703, reported by builder run
+/// 2094f5d9): the `-p` refusal ran `$(schema_touched)` at :1167 and the
+/// function was defined at :1207, so the refusal printed `schema_touched:
+/// command not found` and silently dropped the line saying a schema
+/// change widened the scope.
+///
+/// Read for EVERY function, not only that one, because the shape is the
+/// file's and not the function's: the script is one long top-level
+/// program with its functions defined inline, where the next one moved
+/// or added is the next instance. Only column-0 definitions (`name() {`
+/// through a column-0 `}`) and only call-shaped uses count — a statement
+/// start, `$(`, `if`, `!`, `then`, `do`, or after `;`, `&`, `|` — so a
+/// function's name inside a sentence an `echo` prints does not (`check`
+/// is one: "nothing to check." is printed above `check()`).
+#[test]
+fn every_gate_function_is_defined_above_its_first_top_level_caller() {
+    let gate = read("infra/gate.sh");
+    let lines: Vec<&str> = gate.lines().collect();
+
+    let def = regex::Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{").expect("definition regex");
+    let mut defined: Vec<(String, usize)> = Vec::new();
+    let mut in_body = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(name) = def.captures(lines[i]).map(|c| c[1].to_string()) else {
+            i += 1;
+            continue;
+        };
+        if !defined.iter().any(|(n, _)| *n == name) {
+            defined.push((name, i));
+        }
+        let end = lines[i..]
+            .iter()
+            .position(|l| *l == "}")
+            .map_or(lines.len() - 1, |n| i + n);
+        in_body[i..=end].iter_mut().for_each(|b| *b = true);
+        i = end + 1;
+    }
+    assert!(
+        defined.len() >= 20,
+        "only {} function definition(s) were read out of infra/gate.sh — the shape this \
+         test reads has changed, and a pin that matches nothing passes while proving nothing",
+        defined.len()
+    );
+
+    let mut called = 0usize;
+    let mut early: Vec<String> = Vec::new();
+    for (name, at) in &defined {
+        let call = regex::Regex::new(&format!(
+            r"(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+|\bif\s+|!\s+){}(?:\s|$|\)|;)",
+            regex::escape(name)
+        ))
+        .expect("call regex");
+        let first = lines.iter().enumerate().find(|(k, l)| {
+            let t = l.trim();
+            !in_body[*k] && !t.starts_with('#') && call.is_match(t)
+        });
+        if let Some((k, l)) = first {
+            called += 1;
+            if k < *at {
+                early.push(format!(
+                    "{name}: called at line {}, defined at line {}: {}",
+                    k + 1,
+                    at + 1,
+                    l.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        called >= 10,
+        "only {called} function(s) were found called at top level — the call shape this \
+         test reads has changed, and a pin that matches nothing passes while proving nothing"
+    );
+    assert!(
+        early.is_empty(),
+        "infra/gate.sh calls a function above its definition, which bash answers with \
+         `command not found` (backlog d8637703):\n{}",
+        early.join("\n")
+    );
+}
+
+/// THE PRE-FLIGHT CHECKS THE TREE IT LIVES IN, SO IT REFUSES TO CLAIM ANOTHER.
+///
+/// Measured 2026-09-22 on one worktree, one commit, one second (backlog
+/// 67adb415): `bash /work/boss/infra/gate.sh --lint` from a builder's
+/// worktree printed "no crate implied by the tree - skipping clippy",
+/// while `bash infra/gate.sh --lint` there said "clippy on boss-testing".
+/// The script `cd`s to its own tree, so an absolute path asked every git
+/// question of the clean main checkout — and then printed "pre-flight:
+/// clean, and clippy saw the crates this tree changed", which is false
+/// and is the sentence a builder reads.
+///
+/// So a caller standing in a DIFFERENT git tree is refused before any
+/// check runs, and the refusal names the command that checks the
+/// caller's tree. A caller inside the script's own tree — the gate
+/// runner, CI, every other test in this file — is untouched.
+#[test]
+fn run_from_another_tree_the_pre_flight_refuses_rather_than_checking_its_own() {
+    let caller = boss_testing::scratch_dir("gate-sh-other-tree");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&caller)
+        .status()
+        .expect("git init");
+    assert!(init.success(), "git init in {}", caller.display());
+
+    let out = gate_cmd(&["--quick"])
+        .current_dir(&caller)
+        .output()
+        .expect("run gate.sh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gate.sh run by absolute path from another git tree must refuse (exit 2), \
+         not check its own tree and call it yours. stderr:\n{stderr}"
+    );
+    let caller_real = std::fs::canonicalize(&caller).expect("canonicalize caller");
+    assert!(
+        stderr.contains(&caller_real.display().to_string())
+            && stderr.contains("bash infra/gate.sh"),
+        "the refusal names the caller's tree and the command that checks it:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The roster runs its lints at once (backlog dc5b6302)
+// ---------------------------------------------------------------------
+//
+// MEASURED 2026-09-24 (a72cd3e5, run d3928d0b): fmt plus 90 lints took
+// 106 s serially, the slowest single lint 10 s, and 117 pre-flights that
+// day spent about 2.3 h of builder time waiting on them. So the roster
+// runs its lints concurrently, bounded, and replays each one's record in
+// roster order. What must NOT change with it is everything a reader of a
+// red gate relies on: the failing lint is named, its own words sit in its
+// own `::group::` block (the block the gate runner lifts into the
+// receipt's failure detail), the run still fails, and every check still
+// carries its own duration.
+
+/// A git repository holding this tree's `infra/gate.sh` and what it
+/// sources, the pinned-first lint, the lints a test plants, and stubs for
+/// everything the gate proper runs by name — `cargo`, `bun`, the three
+/// lints it calls outside the roster, a `df` with plenty — so the only
+/// thing that can decide a verdict is the roster.
+struct RosterTree {
+    dir: std::path::PathBuf,
+    tree: std::path::PathBuf,
+}
+
+impl RosterTree {
+    fn new(tag: &str, lints: &[(&str, &str)]) -> RosterTree {
+        let dir = boss_testing::scratch_dir(&format!("gate-roster-{tag}"));
+        let tree = dir.join("tree");
+        boss_testing::create_dir(&tree.join("infra/lint/lib"));
+        boss_testing::copy_gate_sh(&tree);
+        boss_testing::write_exec(
+            &tree.join("infra/lint/workspace-declares-what-it-runs.sh"),
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        // Called BY PATH by the gate proper, so each is executable, and
+        // each declares itself out of the roster the way the real ones do.
+        for called in [
+            "an-image-sourced-tenant-passes-its-check.sh",
+            "no-snapshot-arrays.sh",
+            "svelte-check.sh",
+        ] {
+            boss_testing::write_exec(
+                &tree.join("infra/lint").join(called),
+                "#!/usr/bin/env bash\n# consist: skip — a stub the gate proper runs by path\nexit 0\n",
+            );
+        }
+        for (name, body) in lints {
+            boss_testing::write_exec(&tree.join("infra/lint").join(name), body);
+        }
+        for web in ["apps/web", "apps/simulator", "libs/web-kit"] {
+            boss_testing::create_dir(&tree.join(web));
+        }
+        let bin = dir.join("bin");
+        boss_testing::create_dir(&bin);
+        for tool in ["cargo", "bun"] {
+            boss_testing::write_exec(&bin.join(tool), "#!/usr/bin/env bash\nexit 0\n");
+        }
+        boss_testing::write_exec(
+            &dir.join("df"),
+            "#!/usr/bin/env bash\n\
+             echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             echo '/dev/fake 1 1 943718400 1% /'\n",
+        );
+        boss_testing::create_dir(&dir.join("shared"));
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "."][..],
+            &[
+                "-c",
+                "user.email=gate-roster@test",
+                "-c",
+                "user.name=gate-roster",
+                "commit",
+                "-q",
+                "-m",
+                "the gate under test",
+            ][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&tree)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        RosterTree { dir, tree }
+    }
+
+    fn receipt_path(&self) -> std::path::PathBuf {
+        self.dir.join("receipt.json")
+    }
+
+    /// The gate with `args`, stdout and stderr into ONE file, the way the
+    /// gate runner captures `gate.log` — so a `::group::` block and the
+    /// lint's stderr can be read in the order a reader of that log sees.
+    fn run(&self, args: &[&str]) -> (Option<i32>, String) {
+        let log = self.dir.join("gate.log");
+        let file = std::fs::File::create(&log).expect("create gate.log");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let status = std::process::Command::new("bash")
+            .arg(self.tree.join("infra/gate.sh"))
+            .args(args)
+            .current_dir(&self.tree)
+            .env("PATH", format!("{}:{path}", self.dir.join("bin").display()))
+            .env("BOSS_GATE_DF_CMD", self.dir.join("df"))
+            .env("BOSS_GATE_MIN_FREE_GB", "12")
+            .env("BOSS_GATE_RECEIPT", self.receipt_path())
+            .env("BOSS_GATE_TRUNK", "HEAD")
+            .env("GIT_CEILING_DIRECTORIES", "")
+            .env("ROSTER_TEST_DIR", self.dir.join("shared"))
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().expect("clone gate.log"))
+            .stderr(file)
+            .status()
+            .expect("run gate.sh");
+        let text = std::fs::read_to_string(&log).expect("read gate.log");
+        (status.code(), text)
+    }
+}
+
+impl Drop for RosterTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The lines inside `::group::gate: <name>` … `::endgroup::`.
+fn group_block(log: &str, name: &str) -> Vec<String> {
+    let open = format!("::group::gate: {name}");
+    log.lines()
+        .skip_while(|l| *l != open)
+        .skip(1)
+        .take_while(|l| *l != "::endgroup::")
+        .map(str::to_string)
+        .collect()
+}
+
+/// A FAILING LINT IS STILL NAMED AND STILL FAILS THE RUN, run concurrently.
+///
+/// The gate proper, so there is a receipt to read. Three lints beside the
+/// pinned first: a slow one that passes, the one that fails — printing a
+/// line on each stream — and a quick one after it. The failing lint must
+/// be named in the `GATE FAIL` line, in the closing count, and as `fail`
+/// in the receipt; its words must be inside its OWN group block and no
+/// one else's; the checks must be reported in roster order, not in the
+/// order they finished; and the slow lint must carry its own two seconds,
+/// not the instant it took to replay its record.
+#[test]
+fn a_failing_lint_is_still_named_and_still_fails_the_run() {
+    let tree = RosterTree::new(
+        "a-failing-lint",
+        &[
+            (
+                "a-slow-pass.sh",
+                "#!/usr/bin/env bash\nsleep 2\necho 'a-slow-pass: scanned 1 thing'\nexit 0\n",
+            ),
+            (
+                "b-fails.sh",
+                "#!/usr/bin/env bash\n\
+                 echo 'b-fails: read 3 files'\n\
+                 echo 'b-fails: VIOLATION at x.rs:1 — the words a reader needs' >&2\n\
+                 exit 1\n",
+            ),
+            ("c-quick-pass.sh", "#!/usr/bin/env bash\nexit 0\n"),
+        ],
+    );
+    let (code, log) = tree.run(&[]);
+    assert_eq!(
+        code,
+        Some(1),
+        "a lint that found a violation fails the run:\n{log}"
+    );
+    assert!(
+        log.contains("GATE FAIL: b-fails (exit 1"),
+        "the failing lint is named where it fails:\n{log}"
+    );
+    assert!(
+        log.contains("gate: 1 check(s) failed: b-fails"),
+        "the closing line names exactly the failing lint:\n{log}"
+    );
+
+    let block = group_block(&log, "b-fails");
+    assert!(
+        block.iter().any(|l| l == "b-fails: read 3 files")
+            && block
+                .iter()
+                .any(|l| l == "b-fails: VIOLATION at x.rs:1 — the words a reader needs"),
+        "the lint's stdout AND stderr sit inside its own ::group:: block — the block the \
+         gate runner lifts into the failure detail. The block reads:\n{block:#?}\n{log}"
+    );
+    assert!(
+        !block.iter().any(|l| l.contains("a-slow-pass")),
+        "another lint's words leaked into b-fails's block:\n{block:#?}"
+    );
+    assert!(
+        group_block(&log, "a-slow-pass")
+            .iter()
+            .any(|l| l == "a-slow-pass: scanned 1 thing"),
+        "a passing lint's words stay in its own block:\n{log}"
+    );
+
+    let raw = std::fs::read_to_string(tree.receipt_path())
+        .unwrap_or_else(|e| panic!("the gate proper writes a receipt ({e}):\n{log}"));
+    let receipt: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("the receipt is JSON ({e}): {raw}"));
+    assert_eq!(receipt["verdict"], "failed", "{raw}");
+    let checks = receipt["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the receipt carries a checks array: {raw}"));
+    let at = |name: &str| {
+        checks
+            .iter()
+            .position(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is missing from the receipt's checks: {raw}"))
+    };
+    let order = [
+        "workspace-declares-what-it-runs",
+        "a-slow-pass",
+        "b-fails",
+        "c-quick-pass",
+    ]
+    .map(at);
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "the checks are reported in ROSTER order, whatever order they finished in: {raw}"
+    );
+    assert_eq!(checks[at("b-fails")]["result"], "fail", "{raw}");
+    let slow = checks[at("a-slow-pass")]["seconds"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a-slow-pass carries its seconds: {raw}"));
+    assert!(
+        slow >= 2,
+        "a-slow-pass slept two seconds and the receipt says {slow} — the duration must be \
+         the lint's own, not the time it took to replay its record: {raw}"
+    );
+}
+
+/// THE ROSTER RUNS ITS LINTS AT ONCE — AND A SERIAL-LANE LINT ALONE.
+///
+/// Two lints that each wait (up to five seconds) to see the other one
+/// running: run one at a time, the first gives up and fails. Two more
+/// that declare `# preflight: serial` and each hold one shared thing
+/// (a directory only one can create): run at once, the second finds it
+/// held and fails. `--quick` is clean only when the pool is concurrent
+/// AND the serial lane is serial.
+#[test]
+fn the_roster_runs_its_lints_at_once_and_its_serial_lane_one_at_a_time() {
+    let rendezvous = |me: &str, other: &str| {
+        format!(
+            "#!/usr/bin/env bash\n\
+             : \"${{ROSTER_TEST_DIR:?}}\"\n\
+             touch \"$ROSTER_TEST_DIR/{me}\"\n\
+             for _ in $(seq 1 50); do [ -e \"$ROSTER_TEST_DIR/{other}\" ] && exit 0; sleep 0.1; done\n\
+             echo '{me}: {other} never ran while I did — the roster ran its lints one at a time' >&2\n\
+             exit 1\n"
+        )
+    };
+    let holder = |me: &str| {
+        format!(
+            "#!/usr/bin/env bash\n\
+             # preflight: serial — a test lint that holds one thing another reader shares\n\
+             : \"${{ROSTER_TEST_DIR:?}}\"\n\
+             if ! mkdir \"$ROSTER_TEST_DIR/held\" 2>/dev/null; then\n\
+             \x20   echo '{me}: another serial-lane lint held the shared thing beside me' >&2\n\
+             \x20   exit 1\n\
+             fi\n\
+             sleep 0.5\n\
+             rmdir \"$ROSTER_TEST_DIR/held\"\n"
+        )
+    };
+    let (a, b) = (
+        rendezvous("pair-a", "pair-b"),
+        rendezvous("pair-b", "pair-a"),
+    );
+    let (x, y) = (holder("lane-x"), holder("lane-y"));
+    let tree = RosterTree::new(
+        "at-once",
+        &[
+            ("lane-x.sh", &x),
+            ("lane-y.sh", &y),
+            ("pair-a.sh", &a),
+            ("pair-b.sh", &b),
+        ],
+    );
+    let (code, log) = tree.run(&["--quick"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "the pool must run its lints concurrently and the serial lane one at a time:\n{log}"
+    );
+    assert!(
+        log.contains("pre-flight: clean"),
+        "--quick closes clean when every lint passed:\n{log}"
+    );
+}
+
+/// `--serial-lane` LISTS WHAT THE LINTS DECLARE, AND REFUSES A MUTE ONE.
+///
+/// Same rule as the consist skip, for the same reason: a lint says in its
+/// own header that it must not run beside another reader of what it
+/// reads, and says why — a bare declaration nobody explained is one
+/// nobody can later judge, so it is refused by name, in the listing and
+/// in the roster the pre-flight runs from.
+#[test]
+fn a_serial_lane_declaration_names_its_reason_or_is_refused() {
+    let tree = skeleton(
+        "boss-gate-serial-lane",
+        &[
+            (
+                "declared.sh",
+                "#!/usr/bin/env bash\n\
+                 # A lint that reads the live record.\n\
+                 # preflight: serial — reads the live jobs API, one reader at a time\n\
+                 exit 0\n",
+            ),
+            (
+                "plain.sh",
+                "#!/usr/bin/env bash\n# An ordinary static check.\nexit 0\n",
+            ),
+        ],
+    );
+    let out = skeleton_gate(&tree, "--serial-lane")
+        .output()
+        .expect("run the skeleton's gate.sh --serial-lane");
+    assert!(
+        out.status.success(),
+        "--serial-lane refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "infra/lint/declared.sh\treads the live jobs API, one reader at a time\n",
+        "exactly the lint whose header declares the serial lane, with its reason"
+    );
+    let _ = std::fs::remove_dir_all(tree.parent().expect("skeleton has a parent"));
+
+    let mute = skeleton(
+        "boss-gate-serial-lane-mute",
+        &[(
+            "mute.sh",
+            "#!/usr/bin/env bash\n# preflight: serial\nexit 0\n",
+        )],
+    );
+    for mode in ["--serial-lane", "--roster"] {
+        let out = skeleton_gate(&mute, mode)
+            .output()
+            .unwrap_or_else(|e| panic!("run the skeleton's gate.sh {mode}: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{mode} accepted a serial-lane declaration with no reason: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains("infra/lint/mute.sh") && stderr.contains("preflight: serial"),
+            "{mode}'s refusal names the lint and the line it wants: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(mute.parent().expect("skeleton has a parent"));
+}
+
+/// A LINT THAT READS THE LIVE RECORD RUNS IN THE SERIAL LANE.
+///
+/// `infra/lint/lib/sor-read.sh` is how a lint reads a registry off the
+/// system of record, so a roster lint that sources it is one whose answer
+/// depends on something outside the tree. Those run one at a time — a
+/// pre-flight is one reader of the record, as it was before the roster
+/// went concurrent, so a dozen builders' pre-flights during a roll do not
+/// become three dozen simultaneous readers of it. Read off the lints and
+/// asked of the script, so the lane cannot quietly lose one.
+#[test]
+fn a_lint_that_reads_the_live_record_runs_in_the_serial_lane() {
+    let roster = gate_cmd(&["--roster"])
+        .output()
+        .expect("run gate.sh --roster");
+    assert!(
+        roster.status.success(),
+        "--roster refused: {}",
+        String::from_utf8_lossy(&roster.stderr)
+    );
+    let lane = gate_cmd(&["--serial-lane"])
+        .output()
+        .expect("run gate.sh --serial-lane");
+    assert!(
+        lane.status.success(),
+        "--serial-lane refused: {}",
+        String::from_utf8_lossy(&lane.stderr)
+    );
+    let lane = String::from_utf8_lossy(&lane.stdout).to_string();
+    let in_lane: Vec<&str> = lane
+        .lines()
+        .filter_map(|l| l.split_once('\t').map(|(p, _)| p))
+        .collect();
+    let sources =
+        regex::Regex::new(r"^\s*(?:\.|source)\s+\S*lib/sor-read\.sh").expect("sources regex");
+    let mut readers = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&roster.stdout).lines() {
+        let Some((_, path)) = line.split_once(' ') else {
+            continue;
+        };
+        if !read(path).lines().any(|l| sources.is_match(l)) {
+            continue;
+        }
+        readers += 1;
+        if !in_lane.contains(&path) {
+            missing.push(path.to_string());
+        }
+    }
+    assert!(
+        readers >= 1,
+        "no roster lint sources infra/lint/lib/sor-read.sh — the shape this test reads has \
+         changed, and a pin that matches nothing passes while proving nothing"
+    );
+    assert!(
+        missing.is_empty(),
+        "these roster lints read the live record through lib/sor-read.sh but do not declare \
+         `# preflight: serial — <why>` in their headers, so they would run beside each other: \
+         {missing:?}\n--serial-lane printed:\n{lane}"
     );
 }

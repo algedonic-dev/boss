@@ -31,6 +31,7 @@
   } from '../catalog/schemas';
   import { fetchValidated, z } from '../data/parseResponse';
   import { href } from '../router';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   // Schema for /api/catalog/documents response — matches
   // `EntityDocument` in boss-catalog/src/types.rs. Inline because
@@ -338,7 +339,7 @@
           <p>
             Vendor: <EntityLink kind="vendor" id={reorderVendorOverride || (suggestedVendor as string)} />
             {#if suggestedVendor && !reorderVendorOverride}
-              <span style="color:#78716c; margin-left:8px">(from most recent PO)</span>
+              <span style="color:var(--static); margin-left:8px">(from most recent PO)</span>
             {/if}
           </p>
         {/if}
@@ -348,19 +349,19 @@
             placeholder={suggestedVendor ? `Override vendor (default: ${suggestedVendor})` : 'Vendor id'}
             bind:value={reorderVendorOverride}
             disabled={reorderSubmitting}
-            style="padding:6px 10px; border:1px solid #d6d3d1; border-radius:4px; font-family:inherit; min-width:240px"
+            style="padding:6px 10px; border:1px solid var(--hairline); border-radius:4px; font-family:inherit; min-width:240px"
           />
           <button
             type="button"
             onclick={startReorder}
             disabled={reorderSubmitting || (!suggestedVendor && !reorderVendorOverride)}
-            style="padding:8px 16px; background:#1c1917; color:white; border:none; border-radius:4px; font-family:inherit; cursor:pointer; font-weight:600"
+            style="padding:8px 16px; background:var(--band); color:var(--on-band); border:none; border-radius:4px; font-family:inherit; cursor:pointer; font-weight:600"
           >
             {reorderSubmitting ? 'Opening Job…' : 'Start reorder Job'}
           </button>
         </div>
         {#if reorderError}
-          <p style="color:#dc2626; margin-top:8px">{reorderError}</p>
+          <p style="color:var(--err); margin-top:8px">{reorderError}</p>
         {/if}
         {#if reorderJobId}
           <p style="margin-top:8px">
@@ -379,7 +380,7 @@
                 <Link to={href(`/ux/catalog/${m.sku}`)}>
                   {m.name}
                 </Link>
-                <span style="color:#78716c; margin-left:8px">
+                <span style="color:var(--static); margin-left:8px">
                   ({m.category.replace(/-/g, ' ')})
                 </span>
               </li>
@@ -392,7 +393,7 @@
         wide
       >
         {#if documents.length === 0}
-          <p style="color:#78716c; margin:0;">
+          <p style="color:var(--static); margin:0;">
             No documents on file. Tenants can attach COA scans,
             MSDS sheets, vendor datasheets, etc. by INSERTing into the
             <code>documents</code> table with
@@ -402,14 +403,14 @@
           <ul class="checklist">
             {#each documents as d (d.id)}
               <li>
-                {#if d.url}
-                  <a href={d.url} target="_blank" rel="noopener noreferrer">
+                {#if safeLinkHref(d.url)}
+                  <a href={safeLinkHref(d.url)} target="_blank" rel="noopener noreferrer">
                     {d.title}
                   </a>
                 {:else}
                   {d.title}
                 {/if}
-                <span style="color:#78716c; margin-left:8px">
+                <span style="color:var(--static); margin-left:8px">
                   ({d.doc_type}{d.version ? ` · v${d.version}` : ''})
                 </span>
               </li>

@@ -11,6 +11,10 @@ use boss_dispatcher::rules::authoring::{
 use boss_dispatcher::rules::registry::{RawDoStep, RawRule};
 use boss_testing::TestDb;
 
+/// The signed caller these library-level tests write as; the HTTP door
+/// supplies the real one (dispatcher_rule_writes_authorize_the_caller.rs).
+const AUTHOR: &str = "emp-test";
+
 fn rule(name: &str, on_event: &str, when: Option<&str>) -> RawRule {
     RawRule {
         name: name.to_string(),
@@ -51,7 +55,7 @@ async fn create_publish_retire_lifecycle() {
     let db = TestDb::new().await;
 
     // create draft v1
-    let d1 = create_draft(&db.pool, &rule("r1", "step.done.x", None), None)
+    let d1 = create_draft(&db.pool, &rule("r1", "step.done.x", None), None, AUTHOR)
         .await
         .unwrap();
     assert_eq!(d1.version, 1);
@@ -62,15 +66,15 @@ async fn create_publish_retire_lifecycle() {
     );
 
     // publish → v1 active
-    let a1 = publish(&db.pool, "r1").await.unwrap();
+    let a1 = publish(&db.pool, "r1", AUTHOR).await.unwrap();
     assert_eq!((a1.version, a1.status.as_str()), (1, "active"));
     assert_eq!(get_active(&db.pool, "r1").await.unwrap().version, 1);
 
     // create draft v2 + publish → v2 active, v1 retired, still exactly one active
-    create_draft(&db.pool, &rule("r1", "step.done.y", None), None)
+    create_draft(&db.pool, &rule("r1", "step.done.y", None), None, AUTHOR)
         .await
         .unwrap();
-    let a2 = publish(&db.pool, "r1").await.unwrap();
+    let a2 = publish(&db.pool, "r1", AUTHOR).await.unwrap();
     assert_eq!((a2.version, a2.status.as_str()), (2, "active"));
     assert_eq!(status_of(&db, "r1", 1).await.as_deref(), Some("retired"));
     assert_eq!(get_active(&db.pool, "r1").await.unwrap().version, 2);
@@ -86,7 +90,7 @@ async fn create_publish_retire_lifecycle() {
     assert_eq!(versions, vec![1, 2]);
 
     // retire → no active
-    retire(&db.pool, "r1").await.unwrap();
+    retire(&db.pool, "r1", AUTHOR).await.unwrap();
     assert_eq!(status_of(&db, "r1", 2).await.as_deref(), Some("retired"));
     assert!(get_active(&db.pool, "r1").await.is_err());
     assert_eq!(active_count(&db, "r1").await, 0);
@@ -104,7 +108,7 @@ async fn validate_rejects_unloadable_rule_and_create_draft_persists_nothing() {
     // create_draft rejects an invalid rule and writes no row
     let db = TestDb::new().await;
     assert!(
-        create_draft(&db.pool, &rule("bad", "step..x", None), None)
+        create_draft(&db.pool, &rule("bad", "step..x", None), None, AUTHOR)
             .await
             .is_err()
     );
@@ -118,7 +122,7 @@ async fn validate_rejects_unloadable_rule_and_create_draft_persists_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_without_draft_errors() {
     let db = TestDb::new().await;
-    assert!(publish(&db.pool, "nonexistent").await.is_err());
+    assert!(publish(&db.pool, "nonexistent", AUTHOR).await.is_err());
 }
 
 /// A DRAFT LANDS AT THE VERSION ITS BODY DECLARES when that is above
@@ -137,19 +141,19 @@ async fn a_draft_lands_at_the_declared_version_when_it_is_ahead_of_the_registry(
     let db = TestDb::new().await;
     let mut v1 = rule("declared", "step.done.x", None);
     v1.version = 1;
-    create_draft(&db.pool, &v1, Some("tenant:acme"))
+    create_draft(&db.pool, &v1, Some("tenant:acme"), AUTHOR)
         .await
         .unwrap();
-    publish(&db.pool, "declared").await.unwrap();
+    publish(&db.pool, "declared", AUTHOR).await.unwrap();
 
     let mut v3 = rule("declared", "step.done.y", None);
     v3.version = 3;
-    let d = create_draft(&db.pool, &v3, Some("tenant:acme"))
+    let d = create_draft(&db.pool, &v3, Some("tenant:acme"), AUTHOR)
         .await
         .unwrap();
     assert_eq!(d.version, 3, "the declared version, not MAX + 1");
     assert_eq!(d.source.as_deref(), Some("tenant:acme"));
-    let a = publish(&db.pool, "declared").await.unwrap();
+    let a = publish(&db.pool, "declared", AUTHOR).await.unwrap();
     assert_eq!((a.version, a.status.as_str()), (3, "active"));
     assert_eq!(
         status_of(&db, "declared", 1).await.as_deref(),
@@ -160,7 +164,7 @@ async fn a_draft_lands_at_the_declared_version_when_it_is_ahead_of_the_registry(
     // which is BELOW the registry — the draft takes MAX + 1 as before.
     let unversioned = rule("declared", "step.done.z", None);
     assert_eq!(unversioned.version, 1, "the default the editor sends");
-    let d = create_draft(&db.pool, &unversioned, Some("tenant:acme"))
+    let d = create_draft(&db.pool, &unversioned, Some("tenant:acme"), AUTHOR)
         .await
         .unwrap();
     assert_eq!(d.version, 4, "MAX + 1 when the body declares nothing newer");
@@ -177,14 +181,14 @@ async fn a_name_another_source_owns_is_refused_at_the_draft() {
     let db = TestDb::new().await;
     // The product's row: published with no source, as the authored
     // directory's seed and the SPA's editor both do.
-    create_draft(&db.pool, &rule("owned", "step.done.x", None), None)
+    create_draft(&db.pool, &rule("owned", "step.done.x", None), None, AUTHOR)
         .await
         .unwrap();
-    publish(&db.pool, "owned").await.unwrap();
+    publish(&db.pool, "owned", AUTHOR).await.unwrap();
 
     let mut hijack = rule("owned", "step.done.y", None);
     hijack.version = 2;
-    let err = create_draft(&db.pool, &hijack, Some("tenant:acme"))
+    let err = create_draft(&db.pool, &hijack, Some("tenant:acme"), AUTHOR)
         .await
         .expect_err("a tenant cannot draft over a product-owned name");
     let msg = err.to_string();
@@ -204,10 +208,11 @@ async fn a_name_another_source_owns_is_refused_at_the_draft() {
         &db.pool,
         &rule("theirs", "step.done.x", None),
         Some("tenant:acme"),
+        AUTHOR,
     )
     .await
     .unwrap();
-    let err = create_draft(&db.pool, &rule("theirs", "step.done.y", None), None)
+    let err = create_draft(&db.pool, &rule("theirs", "step.done.y", None), None, AUTHOR)
         .await
         .expect_err("the product cannot draft over a tenant-owned name");
     assert!(err.to_string().contains("tenant:acme"), "{err}");
@@ -225,22 +230,28 @@ async fn a_name_another_source_owns_is_refused_at_the_draft() {
 async fn a_name_whose_rows_are_all_retired_is_free_for_another_source() {
     let db = TestDb::new().await;
     // Product v1 active, then retired: nobody's.
-    create_draft(&db.pool, &rule("was-ours", "step.done.x", None), None)
-        .await
-        .unwrap();
-    publish(&db.pool, "was-ours").await.unwrap();
-    retire(&db.pool, "was-ours").await.unwrap();
+    create_draft(
+        &db.pool,
+        &rule("was-ours", "step.done.x", None),
+        None,
+        AUTHOR,
+    )
+    .await
+    .unwrap();
+    publish(&db.pool, "was-ours", AUTHOR).await.unwrap();
+    retire(&db.pool, "was-ours", AUTHOR).await.unwrap();
 
     let d = create_draft(
         &db.pool,
         &rule("was-ours", "step.done.y", None),
         Some("tenant:acme"),
+        AUTHOR,
     )
     .await
     .expect("a retired name is free");
     assert_eq!(d.version, 2, "above the retired history");
     assert_eq!(d.source.as_deref(), Some("tenant:acme"));
-    let a = publish(&db.pool, "was-ours").await.unwrap();
+    let a = publish(&db.pool, "was-ours", AUTHOR).await.unwrap();
     assert_eq!((a.version, a.status.as_str()), (2, "active"));
     assert_eq!(a.source.as_deref(), Some("tenant:acme"));
     assert_eq!(
@@ -252,20 +263,31 @@ async fn a_name_whose_rows_are_all_retired_is_free_for_another_source() {
 
     // Now the tenant holds the live row: the product is refused, with
     // the same sentence as before.
-    let err = create_draft(&db.pool, &rule("was-ours", "step.done.z", None), None)
-        .await
-        .expect_err("a live row of another source still refuses");
+    let err = create_draft(
+        &db.pool,
+        &rule("was-ours", "step.done.z", None),
+        None,
+        AUTHOR,
+    )
+    .await
+    .expect_err("a live row of another source still refuses");
     assert!(err.to_string().contains("owned by tenant:acme"), "{err}");
 
     // A DRAFT of another source is a live claim too — an armed draft is
     // what the next publish promotes.
-    create_draft(&db.pool, &rule("drafted", "step.done.x", None), None)
-        .await
-        .unwrap();
+    create_draft(
+        &db.pool,
+        &rule("drafted", "step.done.x", None),
+        None,
+        AUTHOR,
+    )
+    .await
+    .unwrap();
     let err = create_draft(
         &db.pool,
         &rule("drafted", "step.done.y", None),
         Some("tenant:acme"),
+        AUTHOR,
     )
     .await
     .expect_err("a product draft is a live claim on the name");

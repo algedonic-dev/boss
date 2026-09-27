@@ -117,6 +117,23 @@ async fn main() -> Result<()> {
         )))
     });
 
+    // Row-level authorization, wired the way boss-ledger-api wires it:
+    // sim traffic authorized at the boundary, real traffic enforced
+    // per role. Until 2026-09-23 this binary passed `policy: None`, so
+    // the employee Update gate never ran in production and the change
+    // log answered every caller (backlog 8cdad84c). The write callers
+    // it now meets — the tenant publish, both engines' prepare, the
+    // dispatcher — all sign as platform-admin, which the core default
+    // rules grant Update on `employee`.
+    // The bypass is installed on a sim instance only, and admits only a
+    // sim caller there (backlog 85e7f10f).
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+            ),
+        ));
+
     // Mount workflow and search routers first (more-specific routes),
     // then merge the people CRUD router (has catch-all /{id}).
     let mut app = boss_people::workflows::workflow_router(
@@ -124,16 +141,19 @@ async fn main() -> Result<()> {
         std::sync::Arc::new(boss_people::PgPeople::new(pool.clone())),
         publisher.clone(),
         clock.clone(),
+        Some(policy.clone()),
     )
     .merge(boss_people::requisitions::requisitions_router(
         pool.clone(),
         publisher.clone(),
         clock.clone(),
+        Some(policy.clone()),
     ))
     .merge(boss_people::employee_changes::employee_changes_router(
         pool.clone(),
         publisher.clone(),
         clock.clone(),
+        Some(policy.clone()),
     ))
     .merge(boss_people::scope::scope_router(pool.clone()))
     .merge(boss_people::webauthn::webauthn_router(
@@ -157,14 +177,22 @@ async fn main() -> Result<()> {
     let calendar: Option<std::sync::Arc<dyn boss_calendar_client::CalendarClient>> =
         cfg.calendar_api_url.as_deref().map(|url| {
             info!(calendar_api_url = %url, "calendar client wired up — PTO endpoint live");
-            std::sync::Arc::new(boss_calendar_client::ReqwestCalendarClient::new(url))
-                as std::sync::Arc<dyn boss_calendar_client::CalendarClient>
+            // Signed as this service (backlog 11721a25): the calendar
+            // asks policy of every write; PTO names its caller as the
+            // reservation's author.
+            std::sync::Arc::new(
+                boss_calendar_client::ReqwestCalendarClient::new(url)
+                    .signed_as("automation:people"),
+            ) as std::sync::Arc<dyn boss_calendar_client::CalendarClient>
         });
     if calendar.is_none() {
         tracing::info!("calendar_api_url unset — POST /api/people/pto will return 503");
     }
     app = app.merge(boss_people::pto::pto_router(
-        boss_people::pto::PtoApiState { calendar },
+        boss_people::pto::PtoApiState {
+            calendar,
+            policy: Some(policy.clone()),
+        },
     ));
 
     // Optional SubjectKind registry — opt-in validator for
@@ -182,7 +210,7 @@ async fn main() -> Result<()> {
     let state = PeopleApiState {
         people,
         publisher,
-        policy: None,
+        policy: Some(policy),
         subject_kinds,
         clock,
     };
@@ -204,6 +232,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "people HTTP API listening");
 
+    let app = boss_core::machine_gate::mount(app, "people", &["/api/people/health"]);
     axum::serve(listener, app).await?;
     Ok(())
 }

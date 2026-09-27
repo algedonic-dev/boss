@@ -60,7 +60,7 @@ fn user_header(role: &str) -> String {
 }
 
 /// The boarding rule, declaring a 30-minute heartbeat — what the
-/// gates -> track border's machine is judged silent against.
+/// dock -> track border's machine is judged silent against.
 fn depth_rule() -> CadenceRuleRow {
     CadenceRuleRow {
         name: "train-board-on-dock-depth".into(),
@@ -73,6 +73,7 @@ fn depth_rule() -> CadenceRuleRow {
         cadence: None,
         anchor_date: None,
         business_calendar: None,
+        regate_hold_minutes: None,
     }
 }
 
@@ -112,11 +113,12 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<dyn CadenceRepository>) {
     let cadence: Arc<dyn CadenceRepository> = Arc::new(InMemoryCadence::new(vec![depth_rule()]));
     let delivery: Arc<dyn DeliveryPolicyRepository> = Arc::new(InMemoryDeliveryPolicy::new(vec![]));
     // The dispatcher's firing record (b14afc48): auto-park-on-gate-green
-    // fired an hour before NOW, which is what the shop-floor -> dock
+    // fired an hour before NOW, which is what the gates -> dock
     // border must answer with instead of the old "nothing records it".
     // (That hop was marshalling -> dock until backlog 94c6ffd0 put the
-    // shop floor between the two — the same crossing, the same machine,
-    // one territory further along.)
+    // shop floor between the two, and shop-floor -> dock until design
+    // 62de32ae put the gates before the dock — the same crossing, the
+    // same machine, each time drawn where a car actually makes it.)
     let dispatcher_firings: Arc<dyn DispatcherFiringsRepository> =
         Arc::new(InMemoryDispatcherFirings::new(vec![(
             "auto-park-on-gate-green".to_string(),
@@ -167,6 +169,7 @@ fn job(kind: &str, id: &str, title: &str, status: JobStatus, metadata: Value) ->
         status,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()),
@@ -269,8 +272,21 @@ async fn every_border_carries_its_flow_its_queue_and_its_machine() {
     let declared: Vec<(&str, &str)> = BORDERS.iter().map(|s| (s.from, s.to)).collect();
     assert_eq!(pairs, declared, "the declared set, in layout order");
     for b in v["borders"].as_array().unwrap() {
+        // Motion's facts (design 31bade8f decision 8, car M1) ride every
+        // border — as an explicit null where they cannot be told, never
+        // absent, so a reader can tell "cannot tell" from an older server.
         for key in [
-            "crossing", "rate", "waiting", "holds", "machine", "state", "why",
+            "crossing",
+            "rate",
+            "waiting",
+            "holds",
+            "holds_by_class",
+            "flowing",
+            "held_since",
+            "flowing_why",
+            "machine",
+            "state",
+            "why",
         ] {
             assert!(
                 b.get(key).is_some(),
@@ -295,11 +311,16 @@ async fn every_border_carries_its_flow_its_queue_and_its_machine() {
     assert_eq!(v["window_hours"], 24);
     assert_eq!(v["now"], NOW);
 
-    // The dock has a car on it that has not boarded: the gates -> track
+    // The dock has a car on it that has not boarded: the dock -> track
     // border is holding traffic, with the record's own reason on it.
-    let boarding = border(&v, "gates", "track");
+    let boarding = border(&v, "dock", "track");
     assert_eq!(boarding["waiting"], 1, "{boarding}");
-    assert_eq!(boarding["state"], "busy");
+    assert_eq!(
+        boarding["holds_by_class"],
+        json!({ "machine": 1, "person": 0, "unknown": 0, "stuck": 0 }),
+        "a parked car is in line for a train: {boarding}"
+    );
+    assert_eq!(boarding["state"], "clear");
     let hold = &boarding["holds"][0];
     assert_eq!(hold["what"], "fix/a");
     assert!(
@@ -313,6 +334,10 @@ async fn every_border_carries_its_flow_its_queue_and_its_machine() {
     assert_eq!(arrivals["rate"]["current"], 1.0);
     assert_eq!(arrivals["rate"]["samples"], 1);
     assert_eq!(arrivals["last_crossed"], "2026-09-19T09:00:00+00:00");
+    // One crossing in 24h is a mean gap of a day, and three hours of
+    // quiet is well inside four of them: flowing, and held since nothing.
+    assert_eq!(arrivals["flowing"], true, "{arrivals}");
+    assert_eq!(arrivals["held_since"], Value::Null);
 }
 
 #[tokio::test]
@@ -323,12 +348,12 @@ async fn the_machine_is_read_from_its_own_firing_record_and_silence_is_trouble()
     // Never fired: the border says so, and says nothing about silence —
     // "cannot tell" must not render as "fine".
     let (_, v) = get(&app, "operator", "/api/yard/borders").await;
-    let boarding = border(&v, "gates", "track");
+    let boarding = border(&v, "dock", "track");
     assert_eq!(boarding["machine"]["name"], "train-board-on-dock-depth");
     assert_eq!(boarding["machine"]["kind"], "cadence");
     assert_eq!(boarding["machine"]["last_fired"], Value::Null);
     assert_eq!(boarding["machine"]["silent"], Value::Null);
-    assert_eq!(boarding["state"], "busy");
+    assert_eq!(boarding["state"], "clear");
 
     // Fired three hours ago against a declared 30-minute heartbeat,
     // with a car waiting: the border is troubled, and the why names it.
@@ -344,7 +369,7 @@ async fn the_machine_is_read_from_its_own_firing_record_and_silence_is_trouble()
         .await
         .unwrap();
     let (_, v) = get(&app, "operator", "/api/yard/borders").await;
-    let boarding = border(&v, "gates", "track");
+    let boarding = border(&v, "dock", "track");
     assert_eq!(
         boarding["machine"]["last_fired"],
         "2026-09-19T09:00:00+00:00"
@@ -366,7 +391,7 @@ async fn the_machine_is_read_from_its_own_firing_record_and_silence_is_trouble()
     // ran. Its silence stays unjudged: an event rule declares no
     // heartbeat, and a `silent: false` here would be a machine drawn
     // healthy on no evidence.
-    let parked = border(&v, "shop-floor", "dock");
+    let parked = border(&v, "gates", "dock");
     assert_eq!(parked["machine"]["kind"], "dispatcher-rule");
     assert_eq!(
         parked["machine"]["last_fired"], "2026-09-19T11:00:00+00:00",
@@ -398,7 +423,73 @@ async fn a_window_that_cannot_be_read_is_refused_and_a_denied_caller_gets_a_well
     let (status, v) = get(&app, "nobody", "/api/yard/borders").await;
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["borders"].as_array().unwrap().len(), BORDERS.len());
-    let boarding = border(&v, "gates", "track");
+    let boarding = border(&v, "dock", "track");
     assert_eq!(boarding["waiting"], 0);
     assert_eq!(boarding["state"], "clear");
+}
+
+/// THE MACHINE HALVES ARE SCOPED WITH THE REST (backlog e5f7b51e). The
+/// region half answers a caller who reads no packets an empty map; the
+/// cadence and dispatcher firing halves asked nothing and answered every
+/// machine's last-fired instant — to a request with no identity at all.
+/// Now that caller is told the record is withheld from it, never that
+/// the machine is quiet, and never that the read failed.
+#[tokio::test]
+async fn a_caller_who_reads_no_packets_reads_no_machine_firings() {
+    let (app, jobs, cadence) = app();
+    seed(&jobs).await;
+    cadence
+        .claim_firing(&NewFiring {
+            firing_id: "f1".into(),
+            rule_name: "train-board-on-dock-depth".into(),
+            verb: "board".into(),
+            basis: "queue-depth".into(),
+            fired_at: t("2026-09-19T09:00:00Z"),
+            detail: json!({}),
+        })
+        .await
+        .unwrap();
+
+    // Control: the operator reads both halves.
+    let (_, v) = get(&app, "operator", "/api/yard/borders").await;
+    assert_eq!(
+        border(&v, "dock", "track")["machine"]["last_fired"],
+        "2026-09-19T09:00:00+00:00"
+    );
+    assert_eq!(
+        border(&v, "gates", "dock")["machine"]["last_fired"],
+        "2026-09-19T11:00:00+00:00"
+    );
+
+    let unsigned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/yard/borders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::OK);
+    let body = unsigned.into_body().collect().await.unwrap().to_bytes();
+    let anonymous: Value = serde_json::from_slice(&body).unwrap();
+    let (_, nobody) = get(&app, "nobody", "/api/yard/borders").await;
+    for (who, v) in [("nobody", nobody), ("no identity at all", anonymous)] {
+        for (from, to) in [("dock", "track"), ("gates", "dock")] {
+            let machine = &border(&v, from, to)["machine"];
+            assert_eq!(machine["last_fired"], Value::Null, "{who}: {machine}");
+            // WITHHELD, not unread (backlog 493cebf3): the record was
+            // there and was not read FOR THIS CALLER, and a failure
+            // reason in its place sends a reader to diagnose a fault
+            // that does not exist.
+            let why = machine["why"].as_str().unwrap_or_default();
+            assert!(
+                why.contains("withheld") && why.contains("reads no packets"),
+                "{who}: {machine}"
+            );
+            assert!(!why.contains("could not be read"), "{who}: {machine}");
+        }
+    }
 }

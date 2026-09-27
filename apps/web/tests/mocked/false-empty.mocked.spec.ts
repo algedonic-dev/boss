@@ -12,7 +12,8 @@
 //   so the header announced "Nothing is waiting on you" during an
 //   outage. Failure now renders with the error and a Retry.
 
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route } from './_test';
+import { servePeopleRows } from './_smokeMocks';
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -61,6 +62,7 @@ async function triageMocks(page: Page) {
   await page.route(/\/api\/tenant\/manifest$/, (r) =>
     json(r, { display_name: 'Algedonic Ales', modules: {}, labels: {} }));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
 }
@@ -71,13 +73,17 @@ test('a failed workflows read fails the board — routed cards do not print unde
     json(r, { data: [ROUTED_JOB], total: 1 }));
   await page.route(/\/api\/workflows$/, (r) => json(r, 'registry down', 500));
 
-  await page.goto('/it/design/feedback');
-  await expect(page.locator('.tb-err')).toBeVisible();
-  await expect(page.locator('.tb-err')).toContainText('workflows');
+  // The feedback board is the Receiving station's panel since car N3 of
+  // design e765b3fc retired /it/design/feedback; the backlog board beside
+  // it fails the same read, so the feedback board's line is the one read.
+  await page.goto('/it?at=receiving');
+  const board = page.locator('[data-station-board="feedback"]');
+  await expect(board.locator('.tb-err')).toBeVisible();
+  await expect(board.locator('.tb-err')).toContainText('workflows');
   // The false-empty this replaces: the routed card misfiled as
   // untriaged under a column claiming nobody has routed it.
-  await expect(page.getByText('Nobody has routed these yet.')).toHaveCount(0);
-  await expect(page.locator('.tb-card')).toHaveCount(0);
+  await expect(board.getByText('Nobody has routed these yet.')).toHaveCount(0);
+  await expect(board.locator('.tb-card')).toHaveCount(0);
 });
 
 test('a truly empty queue still reads as empty, not as a failure', async ({ page }) => {
@@ -85,9 +91,10 @@ test('a truly empty queue still reads as empty, not as a failure', async ({ page
   await page.route(/\/api\/jobs\?kind=user-feedback/, (r) => json(r, { data: [], total: 0 }));
   await page.route(/\/api\/workflows$/, (r) => json(r, [KIND]));
 
-  await page.goto('/it/design/feedback');
-  await expect(page.locator('.tb-msg')).toBeVisible();
-  await expect(page.locator('.tb-err')).toHaveCount(0);
+  await page.goto('/it?at=receiving');
+  const board = page.locator('[data-station-board="feedback"]');
+  await expect(board.locator('.tb-msg')).toBeVisible();
+  await expect(board.locator('.tb-err')).toHaveCount(0);
 });
 
 // ---- inbox ------------------------------------------------------------
@@ -104,6 +111,7 @@ async function inboxMocks(page: Page) {
   });
   await page.route('**/api/**', (r) => json(r, []));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
 }
@@ -179,6 +187,7 @@ async function hrMocks(page: Page, steps: (r: Route) => Promise<void>) {
   await page.route(/\/api\/tenant\/manifest$/, (r) =>
     json(r, { display_name: 'Algedonic Ales', modules: {}, labels: {} }));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
   await page.route(/\/api\/workflows$/, (r) => json(r, [HR_WORKFLOW]));
@@ -219,6 +228,39 @@ test('a Job that genuinely has no steps still reads as empty, not as a failure',
   await expect(page.locator('.load-failed')).toHaveCount(0);
 });
 
+// Page audit b959394e, c69e7455: the workflows tab has two more reads
+// than the step read above — R2, the registry (/api/workflows) that
+// names the HR kinds, and R3, the open Jobs of each kind — and this file
+// mocked both as success only, so their failure lines were pinned by
+// nothing. Each read's failure line gets a test that fails it.
+
+test('a failed workflow-registry read says so — never "No HR workflows are published"', async ({ page }) => {
+  await hrMocks(page, (r) => json(r, [HR_STEP]));
+  await page.route(/\/api\/workflows$/, (r) => json(r, 'registry down', 500));
+  await page.goto('/ux/hr');
+  await page.getByRole('tab', { name: 'Workflows' }).click();
+
+  const failed = page.locator('.load-failed').filter({ hasText: "Couldn't load HR workflows" });
+  await expect(failed).toBeVisible();
+  await expect(failed).toContainText('HTTP 500');
+  await expect(page.getByText('No HR workflows are published')).toHaveCount(0);
+  await expect(page.getByText('No active workflows.')).toHaveCount(0);
+});
+
+test('a failed open-Jobs read says so — never "No active workflows."', async ({ page }) => {
+  await hrMocks(page, (r) => json(r, [HR_STEP]));
+  await page.route(/\/api\/jobs\?kind=onboarding/, (r) => json(r, 'jobs down', 500));
+  await page.goto('/ux/hr');
+  await page.getByRole('tab', { name: 'Workflows' }).click();
+
+  const failed = page.locator('.load-failed').filter({ hasText: "Couldn't load active workflows" });
+  await expect(failed).toBeVisible();
+  await expect(failed).toContainText('onboarding jobs');
+  await expect(page.getByText('No active workflows.')).toHaveCount(0);
+  // The registry read worked, so the kinds it named can still be started.
+  await expect(page.getByRole('button', { name: 'Start Onboarding' })).toBeVisible();
+});
+
 test('a healthy read renders the task', async ({ page }) => {
   await hrMocks(page, (r) => json(r, [HR_STEP]));
   await openHrWorkflows(page);
@@ -229,4 +271,44 @@ test('a healthy read renders the task', async ({ page }) => {
   // car the page looked for `payload.jobs` and flat `subject_kind`, so
   // this row could not exist and the tasks table was unreachable.
   await expect(page.getByText('0/1 tasks (0%)')).toBeVisible();
+});
+
+// ---- people roster ----------------------------------------------------
+//
+// Backlog 25ad5042 (page audit 0c0265a3, gap 4). /ux/people has one read,
+// /api/people, and this file mocked it as success only, while the outage
+// crawl kept it up as a shell read. So no spec failed the read, and the
+// page's "Couldn't load the roster" line could have regressed to "No
+// employees match those filters." with every suite green. The same pair
+// as above: broken and genuinely empty must not look alike.
+
+async function peopleMocks(page: Page, people: (r: Route) => Promise<void>) {
+  await page.addInitScript(() => {
+    setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
+  });
+  await page.route('**/api/**', (r) => json(r, []));
+  await page.route(/\/api\/tenant\/manifest$/, (r) =>
+    json(r, { display_name: 'Algedonic Ales', modules: {}, labels: {} }));
+  await page.route(/\/api\/session$/, (r) =>
+    json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
+  await servePeopleRows(page, [EMP]);
+  await page.route(/\/api\/people$/, people);
+}
+
+test('a failed roster read says so — never "No employees match those filters."', async ({ page }) => {
+  await peopleMocks(page, (r) => json(r, 'people store down', 500));
+
+  await page.goto('/ux/people');
+  await expect(page.locator('.load-failed')).toBeVisible();
+  await expect(page.locator('.load-failed')).toContainText("Couldn't load the roster");
+  await expect(page.locator('.load-failed')).toContainText('HTTP 500');
+  await expect(page.getByText('No employees match those filters.')).toHaveCount(0);
+});
+
+test('a genuinely empty roster still reads as empty, not as a failure', async ({ page }) => {
+  await peopleMocks(page, (r) => json(r, []));
+
+  await page.goto('/ux/people');
+  await expect(page.getByText('No employees match those filters.')).toBeVisible();
+  await expect(page.locator('.load-failed')).toHaveCount(0);
 });

@@ -109,6 +109,16 @@ async fn serve(pool: PgPool) -> String {
         registry: Arc::new(boss_jobs::agents::PgAgents::new(pool.clone())),
         classes: None,
     });
+    // The tenant publish stamp door (backlog 42da8bd2): the real router
+    // over the same pool, so the row `boss tenant published` reads is
+    // the one the jobs API's door wrote.
+    let stamps_router = boss_jobs::tenant_publishes::http::router(
+        boss_jobs::tenant_publishes::http::TenantPublishesApiState {
+            repo: Arc::new(boss_jobs::tenant_publishes::PgTenantPublishes::new(
+                pool.clone(),
+            )),
+        },
+    );
     // What boss-policy-api does before it binds: reconcile the code
     // defaults (platform-admin / audit-readonly / smoke-tester / guest)
     // into policy_rules. On a fresh database this is where every
@@ -169,6 +179,7 @@ async fn serve(pool: PgPool) -> String {
     let app = people_router
         .merge(locations_router)
         .merge(agents_router)
+        .merge(stamps_router)
         .merge(policy_router)
         .merge(outside_this_proof)
         .layer(axum::middleware::from_fn(
@@ -729,16 +740,24 @@ async fn baseline_then_tenant_reads_the_declared_roster_and_leaves_one_founder_r
 /// The shipped binary with the services container's environment:
 /// `BOSS_POSTGRES_URL` naming the database the doors serve from.
 fn boss_with_database(db: &TestDb, args: &[&str], take: Option<&str>) -> (i32, String) {
+    boss_unnamed(Some(db), args, take)
+}
+
+/// The same, unnamed, with or without the database URL — `None` is the
+/// operator's seat, which publishes through a door and holds no
+/// database (backlog 42da8bd2).
+fn boss_unnamed(db: Option<&TestDb>, args: &[&str], take: Option<&str>) -> (i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_boss"));
+    match db {
+        Some(db) => cmd.env("BOSS_POSTGRES_URL", db.url()),
+        None => cmd.env_remove("BOSS_POSTGRES_URL"),
+    };
     // Unnamed, as the launcher runs: the stamp then records the id
     // the writes were signed with, not whoever runs this test.
-    cmd.args(args)
-        .env("BOSS_POSTGRES_URL", db.url())
-        .env_remove("BOSS_ACTOR")
-        .env(
-            "BOSS_ACTOR_FILE",
-            scratch_dir("tenant-stamp-unnamed").join("no-actor-file"),
-        );
+    cmd.args(args).env_remove("BOSS_ACTOR").env(
+        "BOSS_ACTOR_FILE",
+        scratch_dir("tenant-stamp-unnamed").join("no-actor-file"),
+    );
     if let Some(t) = take {
         cmd.args(["--take", t]);
     }
@@ -798,28 +817,26 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
     let (code, _) = boss_with_database(&db, &["tenant", "published"], None);
     assert_eq!(code, 1, "a dry run leaves no stamp");
 
-    // Without the URL the publish lands and SAYS it left no stamp.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("not stamped: BOSS_POSTGRES_URL is unset"),
-        "the publish names the missing URL rather than staying silent:\n{out}"
-    );
-    let (code, _) = boss_with_database(&db, &["tenant", "published"], None);
-    assert_eq!(code, 1, "a publish with no database URL leaves no stamp");
-
-    // With it, the publish records one row; `published` prints the
-    // date first (the launcher's contract) and exits 0.
-    let (code, out) = boss_with_database(
-        &db,
+    // Without the URL — the operator's seat, which publishes through a
+    // door and holds no database — the publish STILL stamps, through
+    // the jobs API's own door (backlog 42da8bd2). It used to print
+    // "not stamped: BOSS_POSTGRES_URL is unset" and leave neither the
+    // row nor the tenant.published fact: the 2026-09-25 publish to
+    // prod is on no record.
+    let (code, out) = boss_unnamed(
+        None,
         &["tenant", "publish", &dir_s, "--gateway", &base],
         None,
     );
     assert_eq!(code, 0, "{out}");
     assert!(
-        out.contains("stamped: tenant algedonic publish recorded in tenant_publishes at "),
-        "{out}"
+        out.contains("stamped: tenant algedonic publish recorded in tenant_publishes at ")
+            && !out.contains("not stamped"),
+        "a publish with no database URL stamps through the door:\n{out}"
     );
+
+    // `published` prints the date first (the launcher's contract) and
+    // exits 0 — the row the door wrote is the one the guard reads.
     let (code, out) = boss_with_database(&db, &["tenant", "published"], None);
     assert_eq!(code, 0, "{out}");
     let line = out.lines().nth(1).unwrap_or_default();
@@ -871,13 +888,15 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
         "the first publish stays the stamp:\n{out}"
     );
 
-    // Each row projects a FACT the verb staged on the outbox with it
-    // (backlog dbdc4d31): one tenant.published per publish, payload =
-    // the row's columns, signed as the actor the row names — so the
-    // log, not the table, is the record of this database's publishes.
+    // Each row projects a FACT the door staged on the outbox with it
+    // (backlog dbdc4d31, 42da8bd2): one tenant.published per publish,
+    // payload = the row's columns, signed as the actor the row names —
+    // so the log, not the table, is the record of this database's
+    // publishes. Ordered by what each took, which differs, rather than
+    // by a whole-second timestamp two quick publishes could share.
     let events: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT source, payload FROM event_outbox WHERE kind = 'tenant.published' \
-         ORDER BY payload->>'published_at'",
+         ORDER BY jsonb_array_length(payload->'took')",
     )
     .fetch_all(&db.pool)
     .await

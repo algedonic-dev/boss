@@ -31,12 +31,15 @@
 # root-owned /tmp/all behind.
 #
 # THE RULE. A path rooted at a shared temp directory must carry a token
-# that makes it this run's own. Two shapes are refused:
+# that makes it this run's own. Three shapes are refused:
 #
-#   1. `std::env::temp_dir().join(...)` whose name is a fixed literal, or
-#      a `format!` that interpolates nothing unique. This is the shape the
-#      packet's title names.
+#   1. any `temp_dir()` call whose statement does not carry BOTH the uid
+#      and the pid (or a Uuid, or the scratch helpers) — a fixed literal
+#      name, a tokenless `format!`, a computed name, or the bare root
+#      bound to a variable (c0172bbc).
 #   2. a string literal opening `"/tmp/<name>` or `"/var/tmp/<name>`.
+#   3. `Path::new`/`PathBuf::from` of the bare root, or a read of
+#      `TMPDIR` (c0172bbc).
 #
 # ACCEPTED, and each is the shape of the fix:
 #
@@ -45,12 +48,46 @@
 #     collision, the uid turns "a leftover I cannot remove" into "a
 #     leftover I can always remove". Read its module note; it is the
 #     reasoning this lint enforces.
-#   * a name interpolating `std::process::id()`, `Uuid::new_v4()`, or
-#     `scratch_path`. The pid alone is accepted because it removes the
-#     concurrent half, which is the half that has bitten; `scratch` is
-#     the complete fix and is what the message recommends.
-#   * `temp_dir().join(<expression>)` — a computed name is not a literal
-#     and this lint does not judge it.
+#   * a name interpolating the uid AND `std::process::id()`, or a
+#     `Uuid::new_v4()`, or built by `scratch_path`. The uid is spelled
+#     however the site reads it — `current_uid()`, `{uid}`, `euid()` —
+#     and the scanner accepts any identifier that is `uid` or ends in
+#     `_uid`/`euid`, because which call yields it is not in the text.
+#
+# EVERY OTHER ROUTE TO THE ROOT (backlog c0172bbc, 2026-09-26). Until
+# then `temp_dir().join(<expression>)` was stated here as ACCEPTED — "a
+# computed name is not a literal" — and a `Path::new("/tmp")` or a
+# `$TMPDIR` read was not looked at at all. The hole was live: `boss
+# upgrade` bound `env::temp_dir()` to a variable and had `gh` download a
+# fixed artifact name into it with `--clobber`, so another uid's
+# leftover failed the download. What an expression evaluates to is not
+# in the text, so the rule stopped judging the NAME and judges the
+# ROUTE: every `temp_dir()` call is refused unless its own statement
+# carries the uid and the pid, a Uuid, or the scratch helpers — which
+# in practice means reaching the root through `boss_testing::scratch`
+# (tests) or boss-cli's `own_temp_path` (the verbs), the collapse the
+# packet named. `Path::new`/`PathBuf::from` of the bare root and
+# `var`/`var_os("TMPDIR")` are refused the same way. Measured on
+# origin/main 0c6c6bb7 before widening: two hits, `boss upgrade` (the
+# true positive, fixed in the same car) and `own_temp`'s own test
+# comparing a path's parent to the root (declared at the site); zero
+# `Path::new` roots and zero TMPDIR reads.
+#
+# WHY THE PID ALONE IS NO LONGER ENOUGH (backlog 307df975, 2026-09-23).
+# Until then a pid-bearing name passed, "because it removes the
+# concurrent half, which is the half that has bitten". But this lint's
+# own refusal names the OTHER half as the hazard — root and uid 65534 on
+# one 1777 directory — and a pid says nothing about a leftover from a
+# process that has EXITED: pids recycle, so two uids draw the same name
+# sooner or later, and the second one's `remove_dir_all` is an EPERM.
+# `boss gate --rebase`'s replay worktree was
+# `boss-gate-rebase-<pid>-<attempt>-<head>` in the verb itself, not a
+# test, and passed; so did a score more. The rule the lint recommends —
+# `scratch`, uid AND pid — is now the rule it enforces: the pid covers
+# concurrency, the uid covers ownership
+# (crates/core/boss-testing/src/scratch.rs, "Why both the pid and the
+# uid"). A uid without a pid is refused too, since that is the
+# concurrent collision between two parallel worktrees running as root.
 #   * prose. A comment may name a fixed path; several must, to tell the
 #     story.
 #
@@ -103,14 +140,20 @@
 # exactly the hole an allowlist has.
 #
 # WHAT THIS CANNOT SEE, stated rather than left to be discovered:
-#   * a bare `"/tmp"` with no name after it — `temp_dir()`'s own value,
-#     and the base of a legitimate `join`. `unwrap_or("/tmp")` in
-#     boss-cli's upgrade path is the real instance.
+#   * a bare `"/tmp"` with no name after it, handed to anything but
+#     `Path::new`/`PathBuf::from` — an `unwrap_or`, an argument, an
+#     expectation string. Which of those becomes a path is not in the
+#     text.
+#   * a temp root that arrives from outside this process's code — a
+#     path an argument or a config file names.
 #   * a path assembled from pieces across lines so that no single line
 #     holds `"/tmp/<name>`.
 #   * whether a literal is ever actually handed to the filesystem. It
 #     refuses the SHAPE, because instance eleven's literal was handed to
 #     `str::replace` and reached the filesystem two frames later.
+#   * whether the `uid` a name mentions is the uid. A format string
+#     spelling the word `uid` as fixed text reads as carrying it; the
+#     token is judged by name, not by value.
 #
 # EXIT STATUS (house style, infra/lint/lib/git-answer.sh):
 #   0  the tree was read and no Rust file builds a fixed temp path
@@ -300,20 +343,52 @@ findings_in() { # file
                     continue
                 }
 
-                # Shape 1 — the packet`s named shape: a temp_dir() path
-                # whose name is a fixed literal or a format! that
-                # interpolates nothing unique. Only a literal or a
-                # format! is judged; a computed name is not a literal.
-                if (line ~ /temp_dir\(\)[ \t]*\.join\([ \t]*"/ ||
-                    line ~ /temp_dir\(\)[ \t]*\.join\([ \t]*format!\(/) {
+                # Shape 3 — the bare root as a path, or the variable that
+                # names it (c0172bbc). A bare "/tmp" handed to anything
+                # else (an unwrap_or, an expectation) is not a path built
+                # here and is left alone.
+                if (line ~ /(Path::new|PathBuf::from)\([ \t]*"\/(var\/)?tmp\/?"/ ||
+                    (" " line) ~ /[^A-Za-z0-9_]var(_os)?\([ \t]*"TMPDIR"/) {
+                    if (!declared(i)) {
+                        path = "<the shared root>"
+                        if (match(line, /"[^"]*"/) > 0) path = substr(line, RSTART, RLENGTH)
+                        printf "%d\t%s\tthe shared temp root reached without a helper that owns it\n", i, path
+                    }
+                    continue
+                }
+
+                # Shape 1 — EVERY temp_dir() call (c0172bbc). Until then
+                # only a join of a literal or a format! was judged, and a
+                # computed name passed; `boss upgrade` bound temp_dir()
+                # to a variable and downloaded a fixed name into it. The
+                # text cannot say what an expression evaluates to, so a
+                # statement reaching temp_dir() must itself carry the uid
+                # AND the pid (307df975), a Uuid, or the scratch helpers.
+                # Padded so `stale_temp_dir()` is not the call.
+                if ((" " line) ~ /[^A-Za-z0-9_]temp_dir\(\)/) {
                     stmt = statement(i)
-                    if (stmt !~ /process::id/ && stmt !~ /Uuid::new_v4/ &&
-                        stmt !~ /scratch_dir/ && stmt !~ /scratch_path/ &&
-                        stmt !~ /current_uid/) {
+                    # Padded rather than anchored: a `(^|x)` alternation
+                    # is one more construct to trust mawk with.
+                    padded = " " stmt " "
+                    has_pid = (stmt ~ /process::id/)
+                    has_uid = (padded ~ /[^A-Za-z]e?uid[^A-Za-z]/)
+                    if (stmt !~ /Uuid::new_v4/ && stmt !~ /scratch_dir/ &&
+                        stmt !~ /scratch_path/ && !(has_pid && has_uid)) {
                         if (!declared(i)) {
                             path = quoted_after(stmt, ".join(")
                             if (path == "") path = "<the joined name>"
-                            printf "%d\t%s\ta temp_dir() name with no per-process token\n", i, path
+                            if (stmt !~ /temp_dir\(\)[ \t]*\.join\(/) {
+                                path = "temp_dir()"
+                                why = "a temp_dir() root taken with no per-process token in its statement"
+                            } else if (stmt !~ /temp_dir\(\)[ \t]*\.join\([ \t]*("|format!\()/)
+                                why = "a temp_dir() name computed from an expression the lint cannot see into"
+                            else if (has_pid)
+                                why = "a temp_dir() name with the pid but not the uid"
+                            else if (has_uid)
+                                why = "a temp_dir() name with the uid but not the pid"
+                            else
+                                why = "a temp_dir() name with no per-process token"
+                            printf "%d\t%s\t%s\n", i, path, why
                         }
                     }
                 }
@@ -340,16 +415,18 @@ self_test() {
     # shellcheck disable=SC2064
     trap "rm -rf '$t'" RETURN
 
-    # Each accepted shape, including a prose mention and a computed name.
+    # Each accepted shape, including a prose mention, a bare root that
+    # is not made a path, and a name that merely ends in the word.
     {
         printf '//! A comment may name %s/all and must not trip the scanner.\n' "$r"
         printf 'fn a() -> PathBuf { scratch::scratch_dir("boss-a") }\n'
-        printf 'fn b() -> PathBuf { std::env::temp_dir().join(format!("b-{}", std::process::id())) }\n'
+        printf 'fn b() -> PathBuf { std::env::temp_dir().join(format!("b-{}-{}", current_uid(), std::process::id())) }\n'
         printf 'fn c() -> PathBuf { std::env::temp_dir().join(format!("c-{}", Uuid::new_v4())) }\n'
-        printf 'fn d(n: &Path) -> PathBuf { std::env::temp_dir().join(n) }\n'
-        printf 'fn e() -> PathBuf {\n'
+        printf 'fn d(s: Option<&str>) -> &str { s.unwrap_or("%s") }\n' "$r"
+        printf 'fn over_a_stale_temp_dir() { std::env::set_var("TMPDIR", "x") }\n'
+        printf 'fn e(uid: u32) -> PathBuf {\n'
         printf '    std::env::temp_dir().join(format!(\n'
-        printf '        "e-{tag}-{}",\n'
+        printf '        "e-{tag}-{uid}-{}",\n'
         printf '        std::process::id()\n'
         printf '    ))\n'
         printf '}\n'
@@ -378,6 +455,19 @@ self_test() {
     printf 'let p = PathBuf::from("%s/boss-fixture");\n'              "$r"     >"$t/bad3.rs"
     printf 'let q = String::from("/var/tmp/boss-fixture");\n'                  >"$t/bad4.rs"
     printf 'script.replace("%s/k", &format!("{}/k", dir.display()));\n' "$r"   >"$t/bad5.rs"
+    # A pid is not an owner (307df975): the replay worktree boss gate
+    # --rebase shipped, and its mirror image, a uid with no pid.
+    {
+        printf 'let tmp = std::env::temp_dir().join(format!(\n'
+        printf '    "boss-gate-rebase-{}-{}-{}",\n'
+        printf '    std::process::id(),\n'
+        printf '    attempt,\n'
+        printf '    &head[..8]\n'
+        printf '));\n'
+    } >"$t/bad9.rs"
+    printf 'let d = std::env::temp_dir().join(format!("boss-mine-{uid}"));\n'     >"$t/bad10.rs"
+    # A word that merely contains the letters is not the uid.
+    printf 'let d = std::env::temp_dir().join(format!("fluid-{guid}-{}", std::process::id()));\n' >"$t/bad11.rs"
     {
         printf '// shared-tmp-ok\n'
         printf 'let p = PathBuf::from("%s/bare-marker");\n' "$r"
@@ -402,7 +492,14 @@ self_test() {
         printf '\n'
         printf 'fn two() -> String { String::from("%s/two") }\n' "$r"
     } >"$t/bad8.rs"
-    for f in bad1 bad2 bad3 bad4 bad5 bad6 bad7 bad8; do
+    # Every other route to the root (c0172bbc): a computed name, the
+    # root bound to a variable (`boss upgrade`, the live instance), the
+    # bare root made a path, and a TMPDIR read.
+    printf 'fn d(n: &Path) -> PathBuf { std::env::temp_dir().join(n) }\n'      >"$t/bad12.rs"
+    printf 'let tmp_dir = env::temp_dir();\n'                                  >"$t/bad13.rs"
+    printf 'let p = Path::new("%s").join("x");\n'                     "$r"     >"$t/bad14.rs"
+    printf 'let p = std::env::var_os("TMPDIR");\n'                             >"$t/bad15.rs"
+    for f in bad1 bad2 bad3 bad4 bad5 bad6 bad7 bad8 bad9 bad10 bad11 bad12 bad13 bad14 bad15; do
         [ -n "$(findings_in "$t/$f.rs")" ] || {
             echo "$NAME: self-test FAILED — the scanner passed:" >&2
             sed 's/^/    /' "$t/$f.rs" >&2
@@ -419,7 +516,7 @@ self_test() {
         esac
     done
 
-    echo "$NAME: self-test ok — six accepted shapes (scratch, a pid, a Uuid, a computed name, a declared intent, a declaration inside an argument list) and a prose mention pass; eight refused shapes (a literal join, a tokenless format!, /tmp and /var/tmp literals, a rebase argument, a reasonless marker, and a declaration leaking to a sibling in both brace and one-line form) are each named"
+    echo "$NAME: self-test ok — seven accepted shapes (scratch, a uid and a pid, a Uuid, a bare root that is not made a path, a name ending in the word, a declared intent, a declaration inside an argument list) and a prose mention pass; fifteen refused shapes (a literal join, a tokenless format!, a pid without the uid, a uid without the pid, a uid-like word that is not one, /tmp and /var/tmp literals, a rebase argument, a reasonless marker, a declaration leaking to a sibling in both brace and one-line form, a computed name, a bound root, a Path::new root, a TMPDIR read) are each named"
 }
 
 if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
@@ -449,9 +546,12 @@ EOF
 if [ "$findings" -gt 0 ]; then
     cat >&2 <<'MSG'
 
-FAIL — the finding(s) above build a fixture at a FIXED path under a
-world-writable sticky directory. /tmp and /var/tmp are mode 1777, so that
-is one path shared by every uid and every process on the box. This repo
+FAIL — the finding(s) above build a path under a world-writable sticky
+directory that this run does not own outright: a FIXED name, or a
+computed one missing the uid or the pid. /tmp and /var/tmp are mode
+1777, so a fixed name is one path shared by every uid and every process
+on the box, and a pid-only one is shared with every leftover a recycled
+pid left there under another uid. This repo
 has hit the resulting collision fourteen times; the gate runs as uid
 65534 and a pod session runs as root, and builders run in parallel
 worktrees, so it is contended in both directions and concurrently.
@@ -465,8 +565,14 @@ THE FIX, in order of preference:
          let dir = scratch::scratch_dir("boss-thing-test");
          scratch::write_file(&dir.join("fixture"), body);
 
-  2. In a crate that cannot depend on boss-testing, interpolate
-     `std::process::id()` (and ideally the uid) into the name yourself.
+  2. In a crate that cannot depend on boss-testing, reach the root
+     through its own helper (boss-cli: `crate::own_temp::own_temp_path`),
+     or interpolate the uid AND `std::process::id()` into the name
+     yourself, in the statement that calls temp_dir(). The pid alone is
+     refused: it separates live processes, but pids recycle, so a
+     leftover from an exited run under ANOTHER uid can hold the name
+     and this run cannot remove it. The uid makes every leftover one
+     you own (crates/core/boss-testing/src/scratch.rs).
 
   3. If the literal is LEGITIMATE — it names another machine's path (a
      container script's, quoted in order to be rebased), an expectation

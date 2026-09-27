@@ -181,10 +181,32 @@
     document.head.appendChild(el);
   }
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    })[c]);
+  // The surface is built as nodes, never as an HTML string (backlog
+  // 4a359b51, 2026-09-27): the branch, the item, the gate's receipt and
+  // the two halves are metadata any actor may write, and a string of
+  // markup is one missed escape from running it. A string child is a
+  // Text node by append's definition.
+  function h(tag, attrs, ...children) {
+    const el = document.createElement(tag);
+    if (attrs) {
+      for (const k in attrs) {
+        const v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'className') el.className = v;
+        else if (k.startsWith('on') && typeof v === 'function') {
+          el.addEventListener(k.slice(2).toLowerCase(), v);
+        } else if (k === 'checked' || k === 'disabled' || k === 'value') {
+          el[k] = v;
+        } else {
+          el.setAttribute(k, String(v));
+        }
+      }
+    }
+    for (const child of children.flat()) {
+      if (child == null || child === false) continue;
+      el.append(child instanceof Node ? child : String(child));
+    }
+    return el;
   }
 
   function mount(container, { step, jobId, onUpdate }) {
@@ -214,14 +236,15 @@
       const backlogId = jm.backlog_item;
       const backlogText = jm.backlog_text;
       const bits = [];
-      if (branch) bits.push(`branch <b>${esc(branch)}</b>`);
+      if (branch) bits.push(h('span', null, 'branch ', h('b', null, branch)));
       if (backlogId) {
-        bits.push(`answers <a href="/ux/jobs/${esc(backlogId)}">${esc(backlogId)}</a>`);
+        // The fixed path prefix keeps a scheme out of the href.
+        bits.push(h('span', null, 'answers ', h('a', { href: `/ux/jobs/${backlogId}` }, backlogId)));
       } else if (backlogText) {
-        bits.push(`answers ${esc(backlogText)}`);
+        bits.push(h('span', null, `answers ${backlogText}`));
       }
-      if (!bits.length) return '';
-      return `<div class="ssd-context">${bits.map((b) => `<span>${b}</span>`).join('')}</div>`;
+      if (!bits.length) return null;
+      return h('div', { className: 'ssd-context' }, bits);
     }
 
     /// The gate's receipt, when the gate has already run on this
@@ -229,87 +252,115 @@
     /// a step still in flight describes a run that may not be the one
     /// that ends up mattering.
     function gateBlock() {
-      if (!gate || !gate.metadata) return '';
+      if (!gate || !gate.metadata) return null;
       const gm = gate.metadata;
       const receipt = gm.receipt;
       const verified = gm.verified;
-      if (!receipt && !verified) return '';
-      return `
-        <details class="ssd-gate">
-          <summary>The gate has already run on this branch — what it recorded</summary>
-          ${verified ? `<p>${esc(verified)}</p>` : ''}
-          ${receipt ? `<pre>${esc(receipt)}</pre>` : ''}
-        </details>`;
+      if (!receipt && !verified) return null;
+      return h(
+        'details',
+        { className: 'ssd-gate' },
+        h('summary', null, 'The gate has already run on this branch — what it recorded'),
+        verified ? h('p', null, verified) : null,
+        receipt ? h('pre', null, receipt) : null,
+      );
     }
 
     function render() {
       if (terminal) {
-        root.innerHTML = `
-          ${contextLine()}
-          <div class="ssd-done">
-            <h4>This car does</h4>
-            <p>${esc(summary || '— nothing recorded —')}</p>
-            <h4>It deliberately does not</h4>
-            <p>${esc(excludes || '— nothing recorded —')}</p>
-          </div>`;
+        root.replaceChildren(
+          ...[
+            contextLine(),
+            h(
+              'div',
+              { className: 'ssd-done' },
+              h('h4', null, 'This car does'),
+              h('p', null, summary || '— nothing recorded —'),
+              h('h4', null, 'It deliberately does not'),
+              h('p', null, excludes || '— nothing recorded —'),
+            ),
+          ].filter(Boolean),
+        );
         return;
       }
 
       const ready = summary.trim() !== '' && excludes.trim() !== '';
-      root.innerHTML = `
-        <div class="ssd-head">
-          <h3>What is this change, and what is it not?</h3>
-        </div>
-        ${contextLine()}
-        ${gateBlock()}
-
-        <div class="ssd-field">
-          <label for="ssd-summary">What this car DOES</label>
-          <p class="ssd-why">
-            One sentence naming the change. This is the boundary you will
-            defend at review, written before the work rather than
-            reconstructed after it.
-          </p>
-          <textarea id="ssd-summary" rows="3"
-            placeholder="Fix the marketing-asset tag chips so the text is readable.">${esc(summary)}</textarea>
-        </div>
-
-        <div class="ssd-field">
-          <label for="ssd-excludes">What it deliberately does NOT do — and why</label>
-          <p class="ssd-why">
-            Name the next thing you could plausibly have swept in, and the
-            reason you are not. Naming what you are not doing is the act
-            that keeps a change small; this is the field the step exists
-            for, and the one place the protocol asks you to be honest
-            about scope while it is still cheap.
-          </p>
-          <textarea id="ssd-excludes" rows="4"
-            placeholder="Not sweeping the other pages' light-theme hex — a sibling car owns that file and two diffs there would collide.">${esc(excludes)}</textarea>
-          <p class="ssd-eg">
-            "Nothing" is almost never true. If it is, say what you
-            considered and why it turned out to be in scope after all.
-          </p>
-        </div>
-
-        <div class="ssd-actions">
-          <button type="button" ${ready && !saving ? '' : 'disabled'}>
-            ${saving ? 'Declaring…' : 'Declare the boundary'}
-          </button>
-          ${
-            ready
-              ? ''
-              : '<span class="ssd-hint">Both halves are required to complete this step.</span>'
-          }
-          ${saveError ? `<span class="ssd-err">${esc(saveError)}</span>` : ''}
-        </div>
-      `;
-
       // Bind without re-rendering on every keystroke: a full re-render
       // would move the caret to the end of the box mid-sentence.
-      const sEl = root.querySelector('#ssd-summary');
-      const eEl = root.querySelector('#ssd-excludes');
-      const btn = root.querySelector('.ssd-actions button');
-      const hint = root.querySelector('.ssd-hint');
+      // Each box holds its half as a Text node child — its default
+      // value, as the markup's content was.
+      const sEl = h(
+        'textarea',
+        {
+          id: 'ssd-summary',
+          rows: 3,
+          placeholder: 'Fix the marketing-asset tag chips so the text is readable.',
+          onInput: sync,
+        },
+        summary,
+      );
+      const eEl = h(
+        'textarea',
+        {
+          id: 'ssd-excludes',
+          rows: 4,
+          placeholder:
+            "Not sweeping the other pages' light-theme hex — a sibling car owns that file and two diffs there would collide.",
+          onInput: sync,
+        },
+        excludes,
+      );
+      const btn = h(
+        'button',
+        { type: 'button', disabled: !ready || saving, onClick: save },
+        saving ? 'Declaring…' : 'Declare the boundary',
+      );
+      const hint = ready
+        ? null
+        : h('span', { className: 'ssd-hint' }, 'Both halves are required to complete this step.');
+
+      root.replaceChildren(
+        ...[
+          h('div', { className: 'ssd-head' }, h('h3', null, 'What is this change, and what is it not?')),
+          contextLine(),
+          gateBlock(),
+          h(
+            'div',
+            { className: 'ssd-field' },
+            h('label', { for: 'ssd-summary' }, 'What this car DOES'),
+            h(
+              'p',
+              { className: 'ssd-why' },
+              'One sentence naming the change. This is the boundary you will defend at review, written before the work rather than reconstructed after it.',
+            ),
+            sEl,
+          ),
+          h(
+            'div',
+            { className: 'ssd-field' },
+            h('label', { for: 'ssd-excludes' }, 'What it deliberately does NOT do — and why'),
+            h(
+              'p',
+              { className: 'ssd-why' },
+              'Name the next thing you could plausibly have swept in, and the reason you are not. Naming what you are not doing is the act that keeps a change small; this is the field the step exists for, and the one place the protocol asks you to be honest about scope while it is still cheap.',
+            ),
+            eEl,
+            h(
+              'p',
+              { className: 'ssd-eg' },
+              '"Nothing" is almost never true. If it is, say what you considered and why it turned out to be in scope after all.',
+            ),
+          ),
+          h(
+            'div',
+            { className: 'ssd-actions' },
+            btn,
+            hint,
+            saveError ? h('span', { className: 'ssd-err' }, saveError) : null,
+          ),
+        ].filter(Boolean),
+      );
+
       function sync() {
         summary = sEl.value;
         excludes = eEl.value;
@@ -317,9 +368,6 @@
         btn.disabled = !ok || saving;
         if (hint) hint.style.display = ok ? 'none' : '';
       }
-      sEl.addEventListener('input', sync);
-      eEl.addEventListener('input', sync);
-      btn.addEventListener('click', save);
     }
 
     async function save() {

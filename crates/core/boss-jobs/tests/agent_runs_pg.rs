@@ -22,8 +22,8 @@
 use boss_core::actor::ActorId;
 use boss_core::agent::BudgetDecision;
 use boss_jobs::agent_runs::{
-    AgentRunError, AgentRunLog, NewAgentRun, PgAgentRuns, PricingBasis, RunFilter, RunOutcome,
-    TokenUsage, rebuild_agent_runs,
+    AgentRunLog, NewAgentRun, PgAgentRuns, PricingBasis, RunFilter, RunOutcome, TokenUsage,
+    rebuild_agent_runs,
 };
 use boss_testing::TestDb;
 use chrono::{TimeZone, Utc};
@@ -620,8 +620,11 @@ async fn the_caps_are_read_off_the_agents_row_and_the_decision_is_stored() {
     );
 }
 
+/// Backlog e6b2066f: over the cap is a READING on the row, and the run
+/// is recorded like any other — nothing is refused, so no
+/// `agents.run.denied` reaches the outbox.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refusal_is_on_the_outbox_and_not_in_the_table() {
+async fn an_over_cap_run_is_a_row_whose_budget_reads_deny() {
     let db = TestDb::new().await;
     cap_the_agent(&db, Some(20_000), None).await;
     let log = PgAgentRuns::new(db.pool.clone());
@@ -632,12 +635,12 @@ async fn a_refusal_is_on_the_outbox_and_not_in_the_table() {
     }
 
     // 21,000 spent in the hour before 01:30, cap 20,000.
-    let err = log
+    let out = log
         .record_run(&priced_run("run-4", 1, 30), &filer())
         .await
-        .expect_err("over the cap");
-    let AgentRunError::Denied { reason } = &err else {
-        panic!("{err:?}");
+        .expect("over the cap is still recorded");
+    let Some(BudgetDecision::Deny { reason }) = &out.run.budget else {
+        panic!("{:?}", out.run.budget);
     };
     assert!(reason.contains("21000 of 20000"), "{reason}");
 
@@ -645,24 +648,23 @@ async fn a_refusal_is_on_the_outbox_and_not_in_the_table() {
         .fetch_one(&db.pool)
         .await
         .expect("counts");
-    assert_eq!(rows, 3, "the refused run is not a row");
-
-    let denied: serde_json::Value =
-        sqlx::query_scalar("SELECT payload FROM event_outbox WHERE kind = 'agents.run.denied'")
+    assert_eq!(rows, 4, "the over-cap run is a row");
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT budget FROM agent_runs WHERE run_id = 'run-4'")
             .fetch_one(&db.pool)
             .await
-            .expect("the refusal committed to the outbox");
-    assert_eq!(denied["run_id"], "run-4");
-    assert_eq!(denied["actor_id"], "agent-claude");
-    assert_eq!(denied["spent_usd_micros"], 21_000);
-    assert_eq!(denied["hourly_budget_usd_micros"], 20_000);
-    assert_eq!(denied["window_from"], "2026-09-15T00:30:00Z");
-    assert_eq!(denied["usd_micros"], 7_000, "the refused run's own cost");
-    assert_eq!(denied["reason"], reason.as_str());
+            .expect("the row is there");
+    assert_eq!(stored["kind"], "deny");
+    let denied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE kind = 'agents.run.denied'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("counts");
+    assert_eq!(denied, 0, "nothing was refused");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_run_started_while_another_was_in_flight_is_refused_by_the_concurrency_cap() {
+async fn a_run_started_while_another_was_in_flight_reads_over_the_concurrency_cap() {
     let db = TestDb::new().await;
     cap_the_agent(&db, None, Some(1)).await;
     let log = PgAgentRuns::new(db.pool.clone());
@@ -673,11 +675,15 @@ async fn a_run_started_while_another_was_in_flight_is_refused_by_the_concurrency
         ..priced_run("run-long", 1, 0)
     };
     log.record_run(&long, &filer()).await.expect("first in");
-    let err = log
+    let mid = log
         .record_run(&priced_run("run-mid", 1, 5), &filer())
         .await
-        .expect_err("one of one in flight at 01:05");
-    assert!(err.to_string().contains("in flight"), "{err}");
+        .expect("recorded, one of one in flight at 01:05");
+    assert!(
+        matches!(&mid.run.budget, Some(BudgetDecision::Deny { reason }) if reason.contains("in flight")),
+        "{:?}",
+        mid.run.budget
+    );
     log.record_run(&priced_run("run-after", 1, 11), &filer())
         .await
         .expect("nothing in flight at 01:11");
@@ -789,45 +795,63 @@ async fn a_rebuild_of_a_pre_budget_event_holds_no_decision() {
 }
 
 /// The SEEDED card is the registry, so this is the pin on the migration
-/// itself (20260920223003): `opus-5[1m]` — the model every recorded run
-/// on this pod has run on — declares an 87.5% input share, and the run
-/// shape every coding agent here actually reports is priced by it.
+/// itself (20260924001627, backlog e6b2066f): every row declares a
+/// cache-read and a cache-write rate, `opus-5[1m]` no longer declares a
+/// blend, and a metered run — the four counts a transcript holds — is
+/// priced at all four rates and replayed by the rebuild with its cache
+/// columns.
 ///
-/// 200,000 tokens at the blend the two seeded rates weigh to
-/// ($7.50/MTok) is $1.50. Before this the same run was one of the 83
-/// unpriced rows out of 85 (backlog 6681a803).
+/// 40 x $5 + 30,000 x $6.25 + 1,470,000 x $0.50 + 9,000 x $25 per MTok
+/// is $1.1477. The same run's harness total (its final context,
+/// ~150,000) priced at the retired $7.50 blend read $1.13 while its
+/// processed total was 1,509,040.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_seeded_card_declares_a_blend_and_prices_a_total_with_it() {
+async fn the_seeded_card_prices_a_metered_run_and_declares_no_blend() {
     let db = TestDb::new().await;
     let log = PgAgentRuns::new(db.pool.clone());
 
-    let share: Option<i64> =
-        sqlx::query_scalar("SELECT blended_input_share_ppm FROM agent_rate_card WHERE model = $1")
-            .bind("opus-5[1m]")
-            .fetch_one(&db.pool)
-            .await
-            .expect("the seeded row is there");
-    assert_eq!(
-        share,
-        Some(875_000),
-        "the declared ratio, seeded not guessed"
-    );
+    let (share, read, write): (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT blended_input_share_ppm, cache_read_usd_micros_per_mtok, \
+         cache_write_usd_micros_per_mtok FROM agent_rate_card WHERE model = $1",
+    )
+    .bind("opus-5[1m]")
+    .fetch_one(&db.pool)
+    .await
+    .expect("the seeded row is there");
+    assert_eq!(share, None, "the blend is retired: a total is not a spend");
+    assert_eq!((read, write), (Some(500_000), Some(6_250_000)));
+    let unrated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_rate_card \
+         WHERE cache_read_usd_micros_per_mtok IS NULL OR cache_write_usd_micros_per_mtok IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("counts");
+    assert_eq!(unrated, 0, "every seeded model can price a metered run");
 
-    let mut run = a_run("run-blended", TokenUsage::TotalOnly { total: 200_000 });
+    let mut total = a_run("run-total", TokenUsage::TotalOnly { total: 200_000 });
+    total.actor_id = ActorId::agent("claude", "opus-5[1m]");
+    let out = log.record_run(&total, &filer()).await.expect("records");
+    assert_eq!(out.run.usd_micros, None, "unpriced, not blended");
+
+    let mut run = a_run(
+        "run-metered",
+        TokenUsage::Metered {
+            input: 40,
+            cache_write: 30_000,
+            cache_read: 1_470_000,
+            output: 9_000,
+        },
+    );
     run.actor_id = ActorId::agent("claude", "opus-5[1m]");
     let out = log.record_run(&run, &filer()).await.expect("records");
-    assert_eq!(out.run.usd_micros, Some(1_500_000));
-    assert_eq!(out.run.priced_by.as_deref(), Some("opus-5[1m]"));
-    assert_eq!(
-        out.run.pricing_basis(),
-        Some(PricingBasis::Blended),
-        "the record must say the figure rests on the declared ratio"
-    );
+    assert_eq!(out.run.usd_micros, Some(1_147_700));
+    assert_eq!(out.run.pricing_basis(), Some(PricingBasis::Metered));
+    assert_eq!(out.run.run.tokens, run.tokens, "read back as recorded");
 
-    // And the rebuild replays that figure rather than re-pricing, so
-    // the basis it derives is the one the run was recorded with. The
-    // outbox is what a live write fills; the rebuild reads audit_log,
-    // so move the event across as the relay would.
+    // The rebuild replays the figure and the four counts. The outbox is
+    // what a live write fills; the rebuild reads audit_log, so move the
+    // events across as the relay would.
     sqlx::query(
         "INSERT INTO audit_log (event_id, kind, source, timestamp, payload) \
          SELECT event_id, kind, source, timestamp, payload FROM event_outbox \
@@ -835,14 +859,242 @@ async fn the_seeded_card_declares_a_blend_and_prices_a_total_with_it() {
     )
     .execute(&db.pool)
     .await
-    .expect("relay the event");
+    .expect("relay the events");
     rebuild_agent_runs(&db.pool).await.expect("rebuilds");
     let held = log
         .list_runs(&RunFilter::default())
         .await
         .expect("lists")
-        .pop()
-        .expect("one run");
-    assert_eq!(held.usd_micros, Some(1_500_000));
-    assert_eq!(held.pricing_basis(), Some(PricingBasis::Blended));
+        .into_iter()
+        .find(|r| r.run.run_id == "run-metered")
+        .expect("the metered run");
+    assert_eq!(held.usd_micros, Some(1_147_700));
+    assert_eq!(held.run.tokens, run.tokens);
+    assert_eq!(held.pricing_basis(), Some(PricingBasis::Metered));
+}
+
+/// The model the dispatched runs ACTUALLY ran on (backlog 6bb85880,
+/// measured 2026-09-24: every turn of the newest subagent transcripts
+/// says `claude-opus-5-5`) is priced at ITS published rates — $4 in,
+/// $5 5-minute cache write, $0.20 cache read (0.05x, not the 0.1x the
+/// other rows carry), $20 out per MTok, read from Anthropic's pricing
+/// page 2026-09-25 — under both spellings a transcript can yield, and
+/// never at Opus 5's. The same 1,509,040-token run priced above at
+/// $1.1477 on `opus-5[1m]` is:
+///
+///   40 x $4 + 30,000 x $5 + 1,470,000 x $0.20 + 9,000 x $20 per MTok
+///   = $0.00016 + $0.15 + $0.294 + $0.18 = $0.62416
+#[tokio::test(flavor = "multi_thread")]
+async fn opus_5_5_is_priced_at_its_own_published_rates() {
+    let db = TestDb::new().await;
+    let log = PgAgentRuns::new(db.pool.clone());
+    for (i, model) in ["opus-5-5", "opus-5-5[1m]"].into_iter().enumerate() {
+        let mut run = a_run(
+            &format!("run-opus-5-5-{i}"),
+            TokenUsage::Metered {
+                input: 40,
+                cache_write: 30_000,
+                cache_read: 1_470_000,
+                output: 9_000,
+            },
+        );
+        run.actor_id = ActorId::agent("claude", model);
+        let out = log.record_run(&run, &filer()).await.expect("records");
+        assert_eq!(out.run.usd_micros, Some(624_160), "{model}");
+        assert_eq!(out.run.priced_by.as_deref(), Some(model), "its own row");
+    }
+}
+
+/// THE WHOLE CARD IS THE PUBLISHED PAGE, row by row (backlog 8e1a2a6f).
+/// 20260924001627 derived every cache-read rate as 0.1x input, and the
+/// page prices Fable 5.1's at 0.025x: the card read $1.00 where the page
+/// reads $0.25, on the component that is ~97% of a run's tokens. Every
+/// figure below was read off
+/// https://platform.claude.com/docs/en/about-claude/pricing on
+/// 2026-09-25 (input, output, cache hits and refreshes, 5m cache writes,
+/// in micro-USD per MTok) — not derived by a multiplier — and every row's
+/// note names that read date.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rate_card_is_the_published_page_as_read_2026_09_25() {
+    let db = TestDb::new().await;
+    let card: Vec<(String, i64, i64, Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, \
+         cache_read_usd_micros_per_mtok, cache_write_usd_micros_per_mtok, note \
+         FROM agent_rate_card ORDER BY model",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("reads the card");
+    let mut read: Vec<(&str, i64, i64, Option<i64>, Option<i64>)> = vec![
+        (
+            "fable-5",
+            10_000_000,
+            50_000_000,
+            Some(1_000_000),
+            Some(12_500_000),
+        ),
+        (
+            "fable-5-1",
+            10_000_000,
+            50_000_000,
+            Some(250_000),
+            Some(12_500_000),
+        ),
+        (
+            "haiku-4-5",
+            1_000_000,
+            5_000_000,
+            Some(100_000),
+            Some(1_250_000),
+        ),
+        (
+            "opus-4-8",
+            5_000_000,
+            25_000_000,
+            Some(500_000),
+            Some(6_250_000),
+        ),
+        (
+            "opus-5",
+            5_000_000,
+            25_000_000,
+            Some(500_000),
+            Some(6_250_000),
+        ),
+        (
+            "opus-5-5",
+            4_000_000,
+            20_000_000,
+            Some(200_000),
+            Some(5_000_000),
+        ),
+        (
+            "opus-5-5[1m]",
+            4_000_000,
+            20_000_000,
+            Some(200_000),
+            Some(5_000_000),
+        ),
+        (
+            "opus-5[1m]",
+            5_000_000,
+            25_000_000,
+            Some(500_000),
+            Some(6_250_000),
+        ),
+        (
+            "sonnet-4-6",
+            3_000_000,
+            15_000_000,
+            Some(300_000),
+            Some(3_750_000),
+        ),
+        (
+            "sonnet-5",
+            2_000_000,
+            10_000_000,
+            Some(200_000),
+            Some(2_500_000),
+        ),
+    ];
+    let mut got: Vec<(&str, i64, i64, Option<i64>, Option<i64>)> = card
+        .iter()
+        .map(|(m, i, o, r, w, _)| (m.as_str(), *i, *o, *r, *w))
+        .collect();
+    // Sorted here, not by ORDER BY: the database's collation places
+    // `opus-5[1m]` before `opus-5-5`, and a byte order does not.
+    got.sort();
+    read.sort();
+    assert_eq!(got, read, "the card, row by row, against the page");
+    for (model, .., note) in &card {
+        assert!(
+            note.contains("read 2026-09-25"),
+            "{model}'s note names no read date: {note}"
+        );
+    }
+
+    // The same 1,509,040-token run as above, on Fable 5.1:
+    //   40 x $10 + 30,000 x $12.50 + 1,470,000 x $0.25 + 9,000 x $50
+    //   = $0.0004 + $0.375 + $0.3675 + $0.45 = $1.1929
+    // (at the old $1.00 cache read it priced $2.2954).
+    let log = PgAgentRuns::new(db.pool.clone());
+    let mut run = a_run(
+        "run-fable-5-1",
+        TokenUsage::Metered {
+            input: 40,
+            cache_write: 30_000,
+            cache_read: 1_470_000,
+            output: 9_000,
+        },
+    );
+    run.actor_id = ActorId::agent("claude", "fable-5-1");
+    let out = log.record_run(&run, &filer()).await.expect("records");
+    assert_eq!(out.run.usd_micros, Some(1_192_900));
+}
+
+/// THE WORK PROFILE IS TELEMETRY BESIDE THE RECORD (backlog 2f23f4c6):
+/// it is held in its own table, a re-report replaces it, the window
+/// read returns it, and a rebuild of `agent_runs` — which DELETEs every
+/// row and replays the log — leaves it where it was. A column on the
+/// projection would have been wiped by that rebuild; this is the claim
+/// that it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_work_profile_survives_a_rebuild_and_a_re_report_replaces_it() {
+    use boss_jobs::agent_runs::{ClassTotal, WorkProfile};
+    let db = TestDb::new().await;
+    let log = PgAgentRuns::new(db.pool.clone());
+    log.record_run(
+        &a_run("run-profiled", TokenUsage::TotalOnly { total: 10 }),
+        &filer(),
+    )
+    .await
+    .expect("records");
+
+    let first = WorkProfile {
+        tool_calls: 4,
+        calls_before_first_edit: Some(3),
+        ..WorkProfile::default()
+    };
+    let at = Utc.with_ymd_and_hms(2026, 9, 26, 5, 0, 0).unwrap();
+    log.record_profile("run-profiled", &first, at)
+        .await
+        .expect("a profile records");
+    let mut longer = first.clone();
+    longer.tool_calls = 9;
+    longer.by_class.build_test = ClassTotal {
+        calls: 2,
+        wall_ms: 90_000,
+        result_bytes: 1_200,
+    };
+    let later = at + chrono::Duration::minutes(5);
+    log.record_profile("run-profiled", &longer, later)
+        .await
+        .expect("a re-report replaces the reading");
+
+    rebuild_agent_runs(&db.pool).await.expect("rebuilds");
+
+    let window = |from, to| log.list_profiles(from, to);
+    let held = window(
+        at - chrono::Duration::days(7),
+        later + chrono::Duration::seconds(1),
+    )
+    .await
+    .expect("reads");
+    assert_eq!(held.len(), 1, "one row per run, replaced not appended");
+    assert_eq!(held[0].profile, longer);
+    assert_eq!(held[0].recorded_at, later);
+    assert!(
+        window(
+            later + chrono::Duration::seconds(1),
+            later + chrono::Duration::days(1)
+        )
+        .await
+        .expect("reads")
+        .is_empty(),
+        "the window's edge is honoured"
+    );
+    assert!(
+        window(later, at).await.is_err(),
+        "an inverted window is refused, not answered empty"
+    );
 }

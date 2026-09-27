@@ -22,6 +22,8 @@
 // `window.__boss_markdown`, installed once by the SPA at boot — one
 // definition, no per-bundle copy to drift (§9a).
 
+import { safeLinkHref } from './links';
+
 function escapeHtml(s: string): string {
   return s
     .replaceAll('&', '&amp;')
@@ -30,10 +32,16 @@ function escapeHtml(s: string): string {
     .replaceAll('"', '&quot;');
 }
 
+/// safeLinkHref's rule (http(s), or one `/` that is not `//` or `/\` —
+/// both of which are another site to a browser, d9af15ba), plus the
+/// `./` and `../` a document uses to point at its neighbours.
 function safeHref(raw: string): string | null {
   const href = raw.trim();
-  if (/^https?:\/\//i.test(href)) return href;
-  if (href.startsWith('/') || href.startsWith('./') || href.startsWith('../')) return href;
+  const link = safeLinkHref(href);
+  if (link !== null) return link;
+  if ((href.startsWith('./') || href.startsWith('../')) && !/[\u0000-\u001f\u007f\\]/.test(href)) {
+    return href;
+  }
   return null;
 }
 

@@ -1,6 +1,9 @@
 // The nav catalog — the single registry of every routable nav entry:
-// its label, path, permKey, tenant-module gate, and which top-level
-// **app** it belongs to.
+// its label, path, permKey, tenant-module gate, and its **owner** —
+// Home, or the department whose tab it renders under and whose packets
+// it lists. Each department's sidebar and landing are derived from it
+// (car 2 of design 8c3e9599); the departments themselves are the
+// registry's.
 //
 // This lived inside AppShell.svelte's `<script>` block. It moved out
 // for two reasons, both about drift:
@@ -11,9 +14,9 @@
 //     (driving which tab highlights) — two sets, keyed off two
 //     different vocabularies, that had to agree for every routed
 //     surface or a page would render under the wrong tab. The comment
-//     on each said as much. `app` below is now the only place that
-//     answers "which app does this surface belong to", and both
-//     consumers derive from it.
+//     on each said as much. `owner` below (it was `app` until car 2 of
+//     design 8c3e9599) is now the only place that answers "which app
+//     does this surface belong to", and both consumers derive from it.
 //
 //  2. `sidebar-router-consistency.test.ts` hand-mirrored every sidebar
 //     path, because (its header explains) parsing a TypeScript const
@@ -21,9 +24,11 @@
 //     plain module the test imports the real thing, so the mirror —
 //     and the drift it was there to catch — is gone.
 //
-// Adding a surface: add one entry here with its `app`, and add a
-// matching branch to router.ts. The consistency test enforces the
-// second half.
+// Adding a surface: add one entry here with its `owner` (and
+// `unlisted` if it is a tab or a door rather than a sidebar row), and
+// add a matching branch to router.ts. The consistency test enforces the
+// second half. Adding a DEPARTMENT touches neither: it is a registry
+// row, and its tab, landing, sidebar and jobs view follow from it.
 
 import type { RouteName } from '@boss/web-kit/session/permissions';
 import type { AppId, AppTab, Department } from '@boss/web-kit/nav';
@@ -46,30 +51,36 @@ export type NavItem = Readonly<{
   /// `equipment` and `shipping`), the entry is hidden. Items
   /// without a module field are always-on (e.g. /jobs).
   module?: string;
-  /// Which app owns this surface. Required on every catalog entry —
-  /// an unassigned surface is how a page ends up rendering under the
-  /// wrong tab. Plain sub-page links (Audit Log, Atlas) declared
-  /// inline in a nav group carry no `app`; they inherit the group
-  /// they sit in.
-  app?: AppId;
-  /// The department whose packets this surface lists, by Class code.
+  /// Who owns this surface: `home`, or a department's registry code.
+  /// Required on every catalog entry — an unowned surface is how a page
+  /// ends up rendering under the wrong tab. Plain rows declared inline
+  /// in a sidebar group (My Day, a department's Jobs) carry none; they
+  /// belong to the group they sit in.
   ///
-  /// This is here for the reason `app` is (backlog 423a531d,
-  /// 2026-09-22): what a surface FILTERS on is part of what the
-  /// surface is, and it had no home. Two routes carried a workflow
-  /// kind as a literal prop instead — `initialKind="field-service"`
-  /// and `initialKind="sale"`, both tenant kinds this instance does
-  /// not publish — so both pages rendered a title and a permanent
-  /// "No jobs match" with nothing to catch it.
-  ///
-  /// A DEPARTMENT, not a kind, because a department's work is several
-  /// protocols: Sales runs `receive-a-sponsorship` AND
-  /// `receive-an-inquiry`, so no single kind= could express it even
-  /// once the literal was corrected. The server resolves a department
+  /// ONE FIELD, since car 2 of design 8c3e9599 (backlog 64656a46). It
+  /// replaced two: `app`, the tab the surface renders under, and
+  /// `department`, the department whose packets it lists — which is
+  /// part of what a surface IS (backlog 423a531d: two queues carried a
+  /// workflow kind no instance published, and rendered a permanent "No
+  /// jobs match"). A department rather than a kind, because a
+  /// department's work is several protocols, and the server resolves it
   /// to the kinds whose workflow row declares it
-  /// (`/api/jobs?department=<code>`), which keeps the mapping in
-  /// registry data where it belongs.
-  department?: string;
+  /// (`/api/jobs?department=<code>`). The two fields disagreed exactly
+  /// once — the Service queue sat under Service and listed Support — and
+  /// one field cannot disagree with itself (CLAUDE.md §9a). Practice
+  /// owners, which mount one surface under several departments, arrive
+  /// with car 9.
+  owner?: AppId;
+  /// The department's landing: what /<code> renders (design 8c3e9599
+  /// §5). Absent everywhere, the landing is the department's first
+  /// sidebar entry in catalog order, else its jobs view. At most one per
+  /// owner — the catalog's test holds that.
+  landing?: true;
+  /// Reachable, never a sidebar row: a tab on a row's page (ItTabs), or
+  /// a door reached from one. The sidebar is every OTHER entry its
+  /// department owns, in catalog order — the job AppShell's
+  /// APP_SURFACES and IT_GROUPS did as two hand lists until car 2.
+  unlisted?: true;
 }>;
 
 export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
@@ -90,61 +101,57 @@ export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }
 // gate parity from the surface they sit beside (hr → 'people',
 // watchlist → 'accounts') rather than widening the vocabulary; the
 // manual is permKey-less like the docs it renders.
+// 'system-crew', 'system-receiving' and 'system-marshalling' were ids
+// here until car N1 of design e765b3fc (2026-09-25): each was a sidebar
+// row onto a station of the map, and the map's one row replaced them.
 export type UngatedSurfaceId =
   | 'system-incidents'
-  // 'system-crew' (the Crew Board): permKey-less like the Operate row
-  // above, and for the same reason — it is a read-only observation
-  // surface over the delivery pipeline, readable by any operator, and
-  // adding a permKey would mean widening the RouteName vocabulary in
-  // libs/web-kit and every tenant's declared `surfaces` lists.
-  | 'system-crew'
-  // 'system-receiving' / 'system-marshalling' (the Receiving Yard and
-  // Marshalling Yard rows): permKey-less for the Crew Board's reason —
-  // a yard is the department's own floor, readable by any operator
-  // (feedback 92921c2f, design 55417146, 2026-09-18).
-  | 'system-receiving'
-  | 'system-marshalling'
   // 'system-codebase' (the Codebase row): the department's own numbers,
-  // readable by any operator — same shape as the Crew Board, and for
-  // the same reason (feedback 9827c699, 2026-09-14).
+  // readable by any operator — permKey-less like the Operate row above,
+  // because a permKey would widen the RouteName vocabulary in
+  // libs/web-kit and every tenant's declared `surfaces` lists
+  // (feedback 9827c699, 2026-09-14).
   | 'system-codebase'
   // 'system-registry-drift' (the Drift tab on Registry): a view of the
   // workflow registry against its authored bundle, so it borrows the
   // `workflows` gate of the family it sits in rather than widening the
   // RouteName vocabulary (4ae9969e, 2026-09-15).
   | 'system-registry-drift'
+  // 'system-agents' (the Agents tab on Registry): the agents registry
+  // as a directory (backlog 62988516). It borrows the `workflows` gate
+  // of the family it sits in, as Drift does, rather than widening the
+  // RouteName vocabulary.
+  | 'system-agents'
   | 'system-fleet'
-  | 'system-backlog'
   | 'hr'
   | 'watchlist'
   | 'manual';
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavItem>> = {
-  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'home' },
-  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'sales', department: 'sales' },
-  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'service', department: 'support' },
-  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'qa' },
-  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', app: 'finance' },
-  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'warehouse' },
-  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'distribution' },
-  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'support' },
-  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'executive' },
-  schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', app: 'home' },
-  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'maintenance' },
-  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   app: 'warehouse' },
-  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   app: 'production' },
-  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  app: 'sales' },
-  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   app: 'finance' },
-  people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    app: 'people' },
-  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'maintenance' },
-  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    app: 'sales' },
-  inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'home' },
-  views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     app: 'home' },
-  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'marketing' },
-  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'production' },
-  hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    app: 'people' },
-  watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  app: 'sales' },
-  manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       app: 'home' },
+  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      owner: 'home' },
+  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     owner: 'sales' },
+  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', owner: 'service' },
+  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      owner: 'qa' },
+  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', owner: 'finance' },
+  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', owner: 'warehouse' },
+  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', owner: 'distribution' },
+  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', owner: 'support' },
+  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    owner: 'executive' },
+  schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', owner: 'home' },
+  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', owner: 'maintenance' },
+  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   owner: 'warehouse' },
+  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   owner: 'production' },
+  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  owner: 'sales' },
+  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   owner: 'finance' },
+  people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    owner: 'people' },
+  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', owner: 'maintenance' },
+  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    owner: 'sales' },
+  inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     owner: 'home' },
+  views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     owner: 'home' },
+  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', owner: 'marketing' },
+  hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    owner: 'people', unlisted: true },
+  watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
+  manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       owner: 'home' },
 
   // The IT department — SIX surfaces (the 2026-08-31 consolidation,
   // packet 1f6d55e0; was 17 pages, four of them dual-routed). The
@@ -152,68 +159,66 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // exists (tab pages, unlisted doors) so appForSection() can answer
   // for them; map/flow/model died outright and fleet became Operate's
   // Bottlenecks tab.
-  // First IT surface in catalog order = the IT app's landing
-  // (departure-board.md Q1): the yard, now AT /it itself. Catalog
-  // order decides the LANDING (`departmentHref`), not the IT sidebar's
-  // order — that is AppShell's IT_GROUPS list — which is how design
-  // 55417146 (2026-09-18) keeps the Train Yard the /it landing while
-  // the sidebar leads with the two yards upstream of it.
-  'system-yard':              { id: 'system-yard',              label: 'Train Yard',          path: '/it',              permKey: 'system-yard',             app: 'it' },
-  // The Receiving Yard and the Marshalling Yard — SIDEBAR ROWS since
-  // David's feedback 92921c2f (2026-09-18): "graduate Receiving Yard
-  // and Marshalling Yard to the left navbar ... the three yards plus
-  // the Crew Board as the top 4". Second doors onto the Operate tabs
-  // that already answer these paths — the routes did not move, and
-  // the tabs stay. PermKey-less like the Crew Board: a yard is the
-  // department's own floor, readable by any operator.
-  'system-receiving':        { id: 'system-receiving',        label: 'Receiving Yard',      path: '/it/yard/receiving', app: 'it' },
-  'system-marshalling':      { id: 'system-marshalling',      label: 'Marshalling Yard',    path: '/it/yard/marshalling', app: 'it' },
+  // The IT app's landing (departure-board.md Q1), AT /it itself, and
+  // flagged `landing` since car 2 of design 8c3e9599 rather than resting
+  // on coming first in catalog order. Since car N1 of design
+  // e765b3fc (David, 2026-09-25) it is the DEPARTMENT MAP: the map on
+  // top, the selection's detail below it, and the one sidebar row where
+  // Receiving Yard, Marshalling Yard, Train Yard and Crew Board stood —
+  // each of those is a station on the map, selected there.
+  'system-yard':              { id: 'system-yard',              label: 'Department Map',      path: '/it',              permKey: 'system-yard',             owner: 'it', landing: true },
   // The Operate row is permKey-less like the incidents surface it
   // leads with — readable by any operator; the tabs behind it keep
   // their own gates.
-  'system-incidents':        { id: 'system-incidents',        label: 'Operate',             path: '/it/operate',      app: 'it' },
-  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/it/operate/audit', permKey: 'system-monitoring',      app: 'it' },
-  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',         path: '/it/operate/bottlenecks', permKey: 'system-monitoring', app: 'it' },
-  workflows:                 { id: 'workflows',               label: 'Registry',            path: '/it/registry',     permKey: 'workflows',               app: 'it' },
-  policy:                    { id: 'policy',                  label: 'Policy',              path: '/it/registry/policy', permKey: 'policy',               app: 'it' },
-  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/registry/step-plugins', permKey: 'system-step-plugins', app: 'it' },
-  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/registry/dispatcher', permKey: 'system-dispatcher', app: 'it' },
-  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/registry/subjects', permKey: 'system-subjects',    app: 'it' },
-  'system-registry-drift':   { id: 'system-registry-drift',   label: 'Protocol drift',      path: '/it/registry/drift', permKey: 'workflows',             app: 'it' },
-  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', app: 'it' },
-  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/registry/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
-  'system-design':           { id: 'system-design',           label: 'Design',              path: '/it/design',       permKey: 'system-design',           app: 'it' },
-  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/it/design/experiments', permKey: 'system-experiments', app: 'it' },
-  'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/it/design/feedback', permKey: 'system-feedback',      app: 'it' },
-  'system-backlog':          { id: 'system-backlog',          label: 'IT backlog',          path: '/it/design/backlog', permKey: 'system-feedback',      app: 'it' },
-  // The hardware registry — declared beside observed beside the
-  // difference, plus the dev-workspace door (59ef456a).
-  // The Crew Board — the middle third of the operator surface. A SIDEBAR
-  // ROW, not a tab: David's decision on backlog 04c5bbc0 (2026-09-11)
-  // reversed the proposal to fold it into an existing IT family.
-  'system-crew':             { id: 'system-crew',             label: 'Crew Board',          path: '/it/crew',         app: 'it' },
+  'system-incidents':        { id: 'system-incidents',        label: 'Operate',             path: '/it/operate',      owner: 'it' },
+  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/it/operate/audit', permKey: 'system-monitoring',      owner: 'it', unlisted: true },
+  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',         path: '/it/operate/bottlenecks', permKey: 'system-monitoring', owner: 'it', unlisted: true },
+  workflows:                 { id: 'workflows',               label: 'Registry',            path: '/it/registry',     permKey: 'workflows',               owner: 'it' },
+  policy:                    { id: 'policy',                  label: 'Policy',              path: '/it/registry/policy', permKey: 'policy',               owner: 'it', unlisted: true },
+  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/registry/step-plugins', permKey: 'system-step-plugins', owner: 'it', unlisted: true },
+  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/registry/dispatcher', permKey: 'system-dispatcher', owner: 'it', unlisted: true },
+  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/registry/subjects', permKey: 'system-subjects',    owner: 'it', unlisted: true },
+  'system-registry-drift':   { id: 'system-registry-drift',   label: 'Protocol drift',      path: '/it/registry/drift', permKey: 'workflows',             owner: 'it', unlisted: true },
+  // Agents live here and never on the People roster (David, 2026-09-26,
+  // answering 6a123f1f; backlog 62988516).
+  'system-agents':           { id: 'system-agents',           label: 'Agents',              path: '/it/registry/agents', permKey: 'workflows',            owner: 'it', unlisted: true },
+  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true },
+  // The editor's path is a PATTERN, spelled the way surface-opens records
+  // every open of it (routePattern). It shared the list's path until
+  // backlog 3071e235 (2026-09-24), so the page march — one audit per
+  // catalog path — never reached the page carrying all four rule writes.
+  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/registry/rules/:ruleName', permKey: 'system-dispatcher-rule',  owner: 'it', unlisted: true },
+  'system-design':           { id: 'system-design',           label: 'Design',              path: '/it/design',       permKey: 'system-design',           owner: 'it' },
+  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/it/design/experiments', permKey: 'system-experiments', owner: 'it', unlisted: true },
+  // 'system-feedback' (Feedback triage, /it/design/feedback) and
+  // 'system-backlog' (IT backlog, /it/design/backlog) were Design tabs
+  // until car N3 of design e765b3fc (2026-09-25): the feedback board is
+  // the receiving station's panel on the Department Map, and the backlog
+  // board the receiving and marshalling stations' — a packet of either
+  // kind is inbound until triaged, then stands at a station.
   // The Codebase — a SIDEBAR ROW, not the Design tab it was: David's
   // feedback 9827c699 (2026-09-14) asked for "a page to the IT department
   // showing the Code base stats" while the trend sat one tab in. permKey-
-  // less like the Crew Board: the department's own numbers, readable by
-  // any operator.
-  'system-codebase':         { id: 'system-codebase',         label: 'Codebase',            path: '/it/codebase',     app: 'it' },
-  'system-estate':           { id: 'system-estate',           label: 'Estate',              path: '/it/estate',       permKey: 'system-estate',           app: 'it' },
-  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               app: 'it' },
+  // less: the department's own numbers, readable by any operator.
+  'system-codebase':         { id: 'system-codebase',         label: 'Codebase',            path: '/it/codebase',     owner: 'it' },
+  // The hardware registry — declared beside observed beside the
+  // difference, plus the dev-workspace door (59ef456a).
+  'system-estate':          { id: 'system-estate',           label: 'Estate',              path: '/it/estate',       permKey: 'system-estate',           owner: 'it' },
+  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               owner: 'it' },
   // Unlisted door: reachable, never a sidebar row.
-  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              app: 'it' },
+  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              owner: 'it', unlisted: true },
 };
 
 /// The apps this host offers: Home, Simulator when the tenant has one,
-/// and one per department the tenant's Class registry declares.
+/// and one per department the tenant's registry declares.
 ///
 /// DERIVED, not listed, and since ce68f137 derived from the REGISTRY:
-/// the departments are the `(employee, *, department)` rows the SPA
-/// loads at boot, in their sort order, so a tenant adds a tab by
-/// adding a Class row (CLAUDE.md §9). The previous version filtered a
-/// hardcoded list down to the departments owning a catalog surface,
-/// which read one tenant's org chart and left Algedonic's
-/// `operations` with no tab at all.
+/// the departments are the rows `GET /api/departments` answers at boot
+/// (libs/web-kit session/departments.svelte.ts), in their sort order,
+/// so a tenant adds a tab by adding a row (CLAUDE.md §9). The previous
+/// version filtered a hardcoded list down to the departments owning a
+/// catalog surface, which read one tenant's org chart and left
+/// Algedonic's `operations` with no tab at all.
 ///
 /// A department with no surface of its own still gets its tab — that
 /// is the org chart, and the tenant declared it — and lands on its
@@ -226,31 +231,69 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
 /// instead of reading as covered.
 const OWNED = new Set<string>(
   Object.values(ROUTE_CATALOG)
-    .map((e) => e.app)
+    .map((e) => e.owner)
     .filter((a): a is AppId => a !== undefined && a !== 'home' && a !== 'simulator'),
 );
 
-/// The department jobs view's path — one surface for every declared
-/// department, keyed by its Class code. The router's `department`
-/// route is the other half of this spelling.
+/// A department's address: `/<code>`, its registry code and nothing
+/// else (design 8c3e9599 §5, car 2). Only the unit's own code — never
+/// its parents' — so a re-org changes no URL. The router's
+/// single-segment branch is the other half of this spelling, and what
+/// it renders there is `departmentLanding`.
+export function departmentPath(code: string): string {
+  return `/${encodeURIComponent(code)}`;
+}
+
+/// The department jobs view's path — in / working / out, the one
+/// surface every department carries, keyed by its registry code. It was
+/// /ux/departments/<code> until car 2 of design 8c3e9599 (backlog
+/// 64656a46), which retired that spelling with no alias (David,
+/// 2026-09-25). The router's `department` route is the other half.
 export function departmentJobsPath(code: string): string {
-  return `/ux/departments/${encodeURIComponent(code)}`;
+  return `${departmentPath(code)}/jobs`;
 }
 
-/// Where a department's tab lands: its first surface in catalog order
-/// — the same order the sidebar lists them in, so the tab opens on the
-/// row the sidebar shows first — or its jobs view when it owns none.
-/// IT is the one department whose sidebar order is its own list
-/// (AppShell's IT_GROUPS): it leads with the two yards upstream of the
-/// Train Yard and still lands on the Train Yard, because the catalog
-/// keeps 'system-yard' first (design 55417146, 2026-09-18).
-function departmentHref(code: string): string {
-  return Object.values(ROUTE_CATALOG).find((e) => e.app === code)?.path ?? departmentJobsPath(code);
+/// Every catalog entry a department owns, in catalog order.
+function ownedBy(code: string): ReadonlyArray<NavItem> {
+  return Object.values(ROUTE_CATALOG).filter((e) => e.owner === code);
 }
 
-/// One tab per declared department, in registry order.
+/// What `/<code>` renders (design 8c3e9599 §5): the entry the
+/// department flags `landing`, else its first sidebar entry in catalog
+/// order — so the tab opens on the row the sidebar shows first — else
+/// nothing, and the caller renders the jobs view. IT is the flagged
+/// one: its landing is the Department Map, which until car 2 rested on
+/// the map happening to come first in the catalog, beside a sidebar
+/// order that was AppShell's own IT_GROUPS list.
+export function departmentLanding(code: string): NavItem | undefined {
+  const owned = ownedBy(code);
+  return owned.find((e) => e.landing === true) ?? owned.find((e) => e.unlisted !== true);
+}
+
+/// A department's sidebar, before policy and module filter it (design
+/// 8c3e9599 §9): its own surfaces in catalog order, then Jobs. Child
+/// units go between the two when the registry first nests one — the
+/// departments row has no parent yet, and the approved roster nests
+/// nothing.
+///
+/// The Jobs row is permKey-less like the Audit Log link: the listing
+/// behind it is policy-scoped by the server, and a permKey would widen
+/// the RouteName vocabulary for a row every department has. For a
+/// department that owns no surface it is the whole group, which is the
+/// point: the tab used to open All jobs under Home with an empty
+/// sidebar here (cc76f755). Here rather than in AppShell so the test
+/// that pins every sidebar reads the rows the shell renders.
+export function departmentRows(code: string): ReadonlyArray<NavItem> {
+  return [
+    ...ownedBy(code).filter((e) => e.unlisted !== true),
+    { id: 'department-jobs', label: 'Jobs', path: departmentJobsPath(code) },
+  ];
+}
+
+/// One tab per declared department, in registry order, each linking to
+/// the department's own address.
 export function departmentApps(departments: ReadonlyArray<Department>): ReadonlyArray<AppTab> {
-  return departments.map((d) => ({ id: d.code, label: d.label, href: departmentHref(d.code) }));
+  return departments.map((d) => ({ id: d.code, label: d.label, href: departmentPath(d.code) }));
 }
 
 /// The full tab list, left to right. Simulator is a tab only for a
@@ -272,16 +315,29 @@ export function departmentsWithoutSurfaces(
 }
 
 /// Which app a surface belongs to, looked up by the `activeSection`
-/// id `App.svelte` derives from the current route. Unknown ids (the
-/// `me` fallback, plain sub-pages) fall back to `user` — the same
-/// answer the previous `MODEL_KINDS.has(route.kind)` check gave for
-/// anything it didn't list.
+/// id `App.svelte` derives from the current route: the entry's owner.
+/// Unknown ids (the `me` fallback, plain sub-pages) fall back to Home.
 export function appForSection(section: string): AppId {
   const entry = (ROUTE_CATALOG as Record<string, NavItem | undefined>)[section];
   // `me` (App.svelte's terminal fallback) and any plain sub-page id
   // resolve to Home — personal surfaces, which is where the fallback
   // belongs now that there is an app for them.
-  return entry?.app ?? 'home';
+  return entry?.owner ?? 'home';
+}
+
+/// Whether a sidebar row renders in the app being shown: judged by the
+/// row's OWN owner, and a row with none (an inline link like My Day or
+/// a department's Jobs row) belongs to the group it sits in.
+///
+/// It judged by the owner of the catalog entry the row's PERMKEY names
+/// until backlog 72a88031 (2026-09-24). That is the same answer for
+/// every row but one: Production's Products gates on `parts`, whose
+/// entry is Warehouse's, so Production dropped Products for every
+/// role. The permKey decides policy (canSeeRoute); the owner decides
+/// placement. Here, not in AppShell, so the test that pins every
+/// sidebar list imports the rule instead of restating it.
+export function inPerspective(item: NavItem, app: AppId): boolean {
+  return item.owner === undefined || item.owner === app;
 }
 
 /// Subject kinds each app is "about".

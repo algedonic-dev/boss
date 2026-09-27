@@ -47,6 +47,19 @@ wt_target_dir() {
     printf '%s/target-%s\n' "$1" "$(basename "$2")"
 }
 
+# wt_target_lock <target-root> <repo-root>
+#
+# The lock a build holds on that dir (backlog 94cd0c23, 2026-09-27):
+# wt-cargo takes it SHARED for cargo's whole run, and a green's free
+# (boss-cli scratch_target.rs, `lock_path`, pinned equal) takes it
+# EXCLUSIVE without waiting and keeps the target when it will not come.
+# BESIDE the dir, not inside it, because the free deletes the dir while
+# it holds the lock; a plain file, so the reclaim's `*/` walk never
+# counts it as a target.
+wt_target_lock() {
+    printf '%s.lock\n' "$(wt_target_dir "$1" "$2")"
+}
+
 # wt_isolate_target_dir [repo-root]
 #
 # Points CARGO_TARGET_DIR at this worktree's own dir when the ambient

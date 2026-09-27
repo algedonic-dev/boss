@@ -5,6 +5,8 @@ use super::*;
 
 use axum::extract::{Path, Query};
 
+use crate::registry::WorkflowStatus;
+
 #[allow(
     clippy::result_large_err,
     reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
@@ -77,12 +79,50 @@ pub(super) async fn policy_check<R: JobsRepository, B: EventBus>(
     match state.policy.check(user, action, Resource::workflow()).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("policy check failed: {e}"),
-        )
-            .into_response()),
+        Err(e) => Err(e.into_response()),
     }
+}
+
+/// Whether `user` may read a DRAFT on the `workflow` resource — a
+/// workflow version or a station version never published. `Ok(false)`
+/// is a reader; `Err` is policy not answering (fail closed).
+///
+/// WHY (backlog 1a4a4d03, decided at its triage as the narrower
+/// default). Workflow Read is the basic guest's shipped grant, justified
+/// as "the operating model, already public in the repo" — true of the
+/// protocols an install RUNS, not of the ones it is still writing. A
+/// draft is an author's workspace: its metadata, entitlements and agent
+/// blocks, a station predicate naming an assignee before anyone decided
+/// to route that way. So a draft is read by whoever may author one —
+/// Create, Update or Publish on `workflow` — while every version that
+/// was published, active or retired, stays readable to Read: it is the
+/// record of what ran, packets are pinned to retired versions, and a
+/// step surface reads the version its packet runs under.
+pub(super) async fn may_read_drafts<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> Result<bool, Response> {
+    for action in [Action::Create, Action::Update, Action::Publish] {
+        match state.policy.check(user, action, Resource::workflow()).await {
+            Ok(Decision::Allow { .. }) => return Ok(true),
+            Ok(Decision::Deny { .. }) => {}
+            Err(e) => return Err(e.into_response()),
+        }
+    }
+    Ok(false)
+}
+
+/// The refusal for a draft read by a caller who may not author one.
+pub(super) fn draft_refusal(what: &str, user: &boss_policy_client::User) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "{what} is an unpublished draft, read only by who may author one (Create, Update or \
+             Publish on workflow); {} (role {}) holds none of those",
+            user.id, user.role
+        ),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -139,6 +179,13 @@ pub(super) async fn get_kind_version<R: JobsRepository + 'static, B: EventBus + 
         return r;
     }
     match reg.get_version(&kind, version).await {
+        Ok(spec) if spec.status == WorkflowStatus::Draft => {
+            match may_read_drafts(&state, &user).await {
+                Ok(true) => Json(spec).into_response(),
+                Ok(false) => draft_refusal(&format!("workflow {kind} v{version}"), &user),
+                Err(r) => r,
+            }
+        }
         Ok(spec) => Json(spec).into_response(),
         Err(e) => kind_err_response(e),
     }
@@ -156,8 +203,20 @@ pub(super) async fn list_kind_versions<R: JobsRepository + 'static, B: EventBus 
     if let Err(r) = policy_check(&state, &user, Action::Read).await {
         return r;
     }
+    let drafts = match may_read_drafts(&state, &user).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     match reg.list_versions(&kind).await {
-        Ok(versions) => Json(versions).into_response(),
+        // A reader is served every version that was published and no
+        // draft ([`may_read_drafts`]).
+        Ok(versions) => Json(
+            versions
+                .into_iter()
+                .filter(|v| drafts || v.status != WorkflowStatus::Draft)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(e) => kind_err_response(e),
     }
 }
@@ -277,6 +336,16 @@ pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'sta
 /// this is that route. Draft-only: 409 for active/retired (history),
 /// 404 for a version that never existed (a typo must not read as
 /// success). Same policy gate as every registry write.
+///
+/// A draft a packet is pinned to is NOT pre-history — an experiment
+/// admits packets to its draft candidate, and `boss job convert --to
+/// vN` can move one onto a draft — so the route refuses 409, naming
+/// how many packets and one of them (backlog ce8b7d66). The registry
+/// never reuses the discarded number either way, so this refusal
+/// protects the packet's text, not only its number. The check reads
+/// before the delete rather than in its transaction: a packet admitted
+/// to the draft between the two is the draft-pinning question the
+/// experiments design owns (d8771dec).
 pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -288,6 +357,30 @@ pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBu
     };
     if let Err(r) = policy_check(&state, &user, Action::Update).await {
         return r;
+    }
+    match state.jobs.jobs_pinned_to_workflow(&kind, version).await {
+        Ok(pinned) if pinned.count > 0 => {
+            let named = pinned
+                .first
+                .map(|id| format!(" (e.g. {id})"))
+                .unwrap_or_default();
+            let noun = if pinned.count == 1 {
+                "packet is"
+            } else {
+                "packets are"
+            };
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "{kind} v{version} cannot be discarded: {} {noun} pinned to it{named}, \
+                     and a pinned packet runs the text it was admitted under",
+                    pinned.count
+                ),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
     let (actor, now) = write_stamp(&state, &user).await;
     match reg.discard_draft(&kind, version, &actor, now).await {

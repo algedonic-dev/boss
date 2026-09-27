@@ -1,4 +1,4 @@
-// Every section id SECTION_FOR_ROUTE produces must resolve in
+// Every section id `sectionForRoute` produces must resolve in
 // ROUTE_CATALOG — that key is what highlights the sidebar row and what
 // `appForSection` uses to pick the app tab. A value that misses the
 // catalog silently renders the page under Home chrome: right content,
@@ -13,22 +13,47 @@
 // and it is showing me still in home" (CLAUDE.md §9a).
 
 import { describe, expect, test } from 'bun:test';
+import * as sectionsModule from './sections';
 import {
   DYNAMIC_APP_SECTIONS,
   HOME_CHROME_SECTIONS,
-  REGION_SECTIONS,
-  SECTION_FOR_ROUTE,
+  ROUTE_KINDS,
+  SECTIONS_PRODUCED,
   appForRoute,
   moduleForRoute,
   sectionForRoute,
+  withRoster,
 } from './sections';
 import { ROUTE_CATALOG, appForSection } from './nav-catalog';
 import type { Route } from '../router';
 
 const catalogKeys = new Set(Object.keys(ROUTE_CATALOG));
-// Every section a route can light: the kind's own, plus the two a
-// yard floor's REGION answers for (car 4 of design d2154293).
-const sections = new Set([...Object.values(SECTION_FOR_ROUTE), ...Object.values(REGION_SECTIONS)]);
+// Every section a route can light. sections.ts derives it, so this file
+// does not know how many answers there are.
+const sections = SECTIONS_PRODUCED;
+
+describe('one reader answers which row a route lights', () => {
+  test('the kind-keyed map is not a public answer', () => {
+    // Backlog c6f91515 (2026-09-20): once a row depends on a route
+    // PARAMETER, a kind-keyed map answers plausibly and wrongly — both
+    // retired yards would light the Train Yard's row, and nothing
+    // errors. So the map is private to sections.ts, and
+    // `sectionForRoute` is the one place to look. Re-exporting it (or
+    // the region map beside it) hands the next author the wrong half.
+    const exported = Object.keys(sectionsModule);
+    expect(exported).not.toContain('SECTION_FOR_ROUTE');
+    expect(exported).not.toContain('SECTION_FOR_KIND');
+    expect(exported).not.toContain('REGION_SECTIONS');
+  });
+
+  test('every section produced is one some route lights', () => {
+    // SECTIONS_PRODUCED is derived, not listed: each entry must be
+    // reachable through the reader, or it is a ghost the pins below
+    // would count as covered.
+    const lit = new Set(ROUTE_KINDS.map((kind) => sectionForRoute({ kind } as Route)));
+    expect([...sections].filter((s) => !lit.has(s)).sort()).toEqual([]);
+  });
+});
 
 describe('sections resolve in the nav catalog', () => {
   test('every section id is a catalog key or a documented exception', () => {
@@ -63,28 +88,74 @@ describe('sections resolve in the nav catalog', () => {
     expect(appForRoute({ kind: 'department', code: 'operations' })).toBe('operations');
     // Every other route still answers through the catalog.
     expect(appForRoute({ kind: 'systemYard' })).toBe('it');
-    expect(appForRoute({ kind: 'systemYardFloor', region: 'dock' })).toBe('it');
+    expect(appForRoute({ kind: 'systemYard', at: 'dock' })).toBe('it');
     expect(appForRoute({ kind: 'accounts' })).toBe('sales');
     expect(appForRoute({ kind: 'jobs' })).toBe('home');
     expect(appForRoute({ kind: 'me' })).toBe('home');
   });
 
-  test('a yard with its own sidebar row highlights that row, not Operate', () => {
-    // Feedback 92921c2f / design 55417146 (2026-09-18): the Receiving
-    // Yard and the Marshalling Yard are sidebar rows now. The row that
-    // highlights is `activeSection === item.id`, so their route kinds
-    // must resolve to their own catalog keys — left on
-    // 'system-incidents' they would light the Operate row while the
-    // operator stands in a yard that has a row of its own.
-    // Car 4 of design d2154293 retired the two PAGES: each yard is a
-    // region of the world now, so the route is a yard floor and the
-    // REGION decides the row — `sectionForRoute`, not the kind alone.
-    // Read off the kind, both would light the Train Yard's row.
-    expect(sectionForRoute({ kind: 'systemYardFloor', region: 'receiving' })).toBe('system-receiving');
-    expect(sectionForRoute({ kind: 'systemYardFloor', region: 'marshalling' })).toBe('system-marshalling');
-    expect(sectionForRoute({ kind: 'systemYardFloor', region: 'dock' })).toBe('system-yard');
-    expect(appForRoute({ kind: 'systemYardFloor', region: 'receiving' })).toBe('it');
-    expect(appForRoute({ kind: 'systemYardFloor', region: 'marshalling' })).toBe('it');
+  test('an unmatched path renders in the department it was under (design ee3a3a2f Q4)', () => {
+    // The /it catch-all returned the yard, so the IT chrome came free;
+    // the not-found that replaced it must keep the reader in IT.
+    expect(appForRoute({ kind: 'notFound', path: '/it/no-such' })).toBe('it');
+    expect(appForRoute({ kind: 'notFound', path: '/dashboard/it/no-such' })).toBe('it');
+    expect(appForRoute({ kind: 'notFound', path: '/ux/no-such' })).toBe('home');
+    expect(appForRoute({ kind: 'notFound', path: '/items' })).toBe('home');
+  });
+
+  test('a department this instance does not have is not found, in the Home chrome', () => {
+    // Backlog 64656a46 (car 2 of design 8c3e9599), asked for by e543c6fe:
+    // a path whose owner is not a live row on this instance is the
+    // not-found page with one door Home — never a module-off notice, and
+    // never its own department's chrome, for a department the company
+    // does not have.
+    const roster = [{ code: 'it', label: 'IT' }, { code: 'support', label: 'Support' }];
+    const gone = withRoster({ kind: 'service' }, '/ux/service', roster);
+    expect(gone).toEqual({ kind: 'notFound', path: '/ux/service', department: 'service' });
+    expect(sectionForRoute(gone)).toBe('me');
+    expect(appForRoute(gone)).toBe('home');
+    expect(moduleForRoute(gone)).toBeNull();
+    // Even IT's own pages answer to the registry: a roster without `it`
+    // has no IT department, and its chrome is not the way back.
+    const noIt = withRoster({ kind: 'systemYard' }, '/it', [{ code: 'support', label: 'Support' }]);
+    expect(noIt).toEqual({ kind: 'notFound', path: '/it', department: 'it' });
+    expect(appForRoute(noIt)).toBe('home');
+    // A department the roster has, and Home's pages, pass untouched.
+    expect(withRoster({ kind: 'support' }, '/ux/support', roster)).toEqual({ kind: 'support' });
+    expect(withRoster({ kind: 'jobs' }, '/ux/jobs', roster)).toEqual({ kind: 'jobs' });
+    expect(withRoster({ kind: 'department', code: 'it' }, '/it/jobs', roster)).toEqual({
+      kind: 'department',
+      code: 'it',
+    });
+  });
+
+  test('a registry that has not answered decides nothing', () => {
+    // Loading, or a read that failed: `null`, never an empty roster —
+    // an unanswered read taken for "no departments" would turn every
+    // department page into not-found (a wrong target answers instead of
+    // erroring). The page renders as it always did.
+    expect(withRoster({ kind: 'service' }, '/ux/service', null)).toEqual({ kind: 'service' });
+    expect(withRoster({ kind: 'department', code: 'x' }, '/x', null)).toEqual({ kind: 'department', code: 'x' });
+    // And an already-unmatched path stays what it was.
+    expect(withRoster({ kind: 'notFound', path: '/it/nope' }, '/it/nope', [])).toEqual({
+      kind: 'notFound',
+      path: '/it/nope',
+    });
+  });
+
+  test('every station on the map lights the one Department Map row, not Operate', () => {
+    // Design e765b3fc, car N1 (2026-09-25): the Receiving Yard, the
+    // Marshalling Yard and the Crew Board lost their sidebar rows to the
+    // one "Department Map" row, so every selection on the map lights
+    // that row. Car N3 retired the floor pages and the crew board, so a
+    // selection is the only way in, and a retired path — not found —
+    // still renders in the IT chrome under the same row.
+    for (const at of ['gates', 'receiving', 'marshalling', 'dock', 'shop-floor']) {
+      expect(sectionForRoute({ kind: 'systemYard', at }), at).toBe('system-yard');
+      expect(appForRoute({ kind: 'systemYard', at }), at).toBe('it');
+    }
+    expect(sectionForRoute({ kind: 'notFound', path: '/it/yard/dock' })).toBe('system-yard');
+    expect(sectionForRoute({ kind: 'notFound', path: '/it/crew' })).toBe('system-yard');
   });
 
   test('no exception names a section no longer produced', () => {
@@ -119,12 +190,40 @@ describe('the module gate a route answers to', () => {
     expect(moduleForRoute({ kind: 'service' })).toEqual({ id: 'support', label: 'Service queue' });
   });
 
+  test('My schedule answers to its own row, not the Release calendar', () => {
+    // Backlog eff0c5e5 (page audit 0e4fef17, gap 1; David approved
+    // 2026-09-24): /ux/calendar/me IS the `schedule` row's path, but
+    // its kind lit the `calendar` row — so it highlighted Release
+    // calendar under Production and was gated on the calendar module,
+    // which the live instance has off, and every visit answered
+    // ModuleDisabled for a page whose own row is always-on in Home.
+    expect(ROUTE_CATALOG.schedule.path).toBe('/ux/calendar/me');
+    expect(sectionForRoute({ kind: 'myCalendar' })).toBe('schedule');
+    expect(appForRoute({ kind: 'myCalendar' })).toBe('home');
+    expect(moduleForRoute({ kind: 'myCalendar' })).toBeNull();
+  });
+
+  test('the service schedule answers to the Service queue, not My schedule', () => {
+    // Backlog 3b50fe11 (decided 2026-09-24): /ux/service/schedule is the
+    // service department's week grid of every tech, not a personal
+    // schedule, yet its kind lit the `schedule` row — so once eff0c5e5
+    // pointed myCalendar there too, two different pages highlighted
+    // Home > My schedule, and the tech grid was ungated. It lights the
+    // service department's own row and takes that row's module gate.
+    expect(sectionForRoute({ kind: 'schedule' })).toBe('service');
+    expect(appForRoute({ kind: 'schedule' })).toBe(ROUTE_CATALOG.service.owner!);
+    expect(moduleForRoute({ kind: 'schedule' })).toEqual({ id: 'support', label: 'Service queue' });
+    // One page per My schedule row: only /ux/calendar/me lights it.
+    const lightingMySchedule = ROUTE_KINDS.filter((kind) => sectionForRoute({ kind } as Route) === 'schedule');
+    expect(lightingMySchedule).toEqual(['myCalendar']);
+  });
+
   test('a route requires exactly the module that hides its own nav row', () => {
     // The drift this refuses: the module that HIDES a sidebar row and
     // the module that gates the ROUTE behind it are one fact.
-    for (const kind of Object.keys(SECTION_FOR_ROUTE) as ReadonlyArray<Route['kind']>) {
+    for (const kind of ROUTE_KINDS) {
       const entry = (ROUTE_CATALOG as Record<string, { module?: string } | undefined>)[
-        SECTION_FOR_ROUTE[kind]
+        sectionForRoute({ kind } as Route)
       ];
       expect(moduleForRoute({ kind } as Route)?.id ?? null, kind).toEqual(entry?.module ?? null);
     }

@@ -141,6 +141,17 @@ describe('parsePublishRequests', () => {
     expect(got[3]).toMatchObject({ mode: 'check', exit_code: '4' });
   });
 
+  test('keys merged onto an execute still open are not an answer', () => {
+    // The runner lands its keys through the merge door before the status
+    // (backlog 2aa2b19e); a status the server refused or never got leaves
+    // them on an open step, and that is no answer (review of car 24eb9471).
+    const raw = request({ id: 'm', status: 'open', exit_code: '0' });
+    const steps = raw.steps as Array<Record<string, unknown>>;
+    const open = { ...raw, steps: steps.map((s) => (s.spec_slug === 'execute' ? { ...s, status: 'ready', completed_at: undefined } : s)) };
+    const [got] = parsePublishRequests([open]);
+    expect(got).toMatchObject({ disposition: null, exit_code: null, output: '', runner_host: null });
+  });
+
   test('the query is metadata containment on the verb, not a page of every verb', () => {
     expect(PUBLISH_REQUESTS_QUERY).toBe('/api/jobs?kind=ops-request&metadata=%7B%22verb%22%3A%22publish-workflow%22%7D');
   });

@@ -137,13 +137,125 @@ pub fn projection(spec: &AgentSpec) -> [(&'static str, serde_json::Value); 4] {
     ]
 }
 
-/// The migration that seeds `agent_rate_card`. Read at compile time so
-/// the lint can name the priced models without a database; the pin
-/// tests below hold it equal to the whole schema directory and to the
-/// live table.
-const RATE_CARD_SEED: &str = include_str!(
-    "../../../../infra/postgres/schema/20260910030644-an-agent-run-leaves-a-record.sql"
-);
+/// The block a materialised step CARRIES — [`projection`] read back.
+/// All four keys or none: they are written together, so half a
+/// projection is no projection (the rule `boss dispatch` chose on
+/// dacee8cc, and now the one place it lives).
+pub fn projected(metadata: &serde_json::Value) -> Option<AgentSpec> {
+    let text = |k: &str| metadata.get(k)?.as_str().map(str::to_string);
+    Some(AgentSpec {
+        profile: text(PROFILE_KEY)?,
+        model: text(MODEL_KEY)?,
+        budget_usd: metadata.get(BUDGET_KEY)?.as_f64()?,
+        effort: serde_json::from_value(metadata.get(EFFORT_KEY)?.clone()).ok()?,
+    })
+}
+
+/// **THE resolution of a step's agent block** (backlog 51aef4dd): the
+/// projection the step carries, else the block its kind's ACTIVE
+/// Workflow row declares for the step's `spec_slug`, laid over the
+/// step's metadata IN MEMORY. Nothing is written to the packet. Every
+/// reader that decides whether an agent may be routed to a step — a
+/// station's membership, the claim door's station and budget gates —
+/// asks through this, so the queue an agent reads and the door it
+/// claims through cannot disagree about the same step.
+///
+/// WHY THE ACTIVE ROW AND NOT THE PINNED ONE — a decision, recorded
+/// here so it can be overturned. The materialisation that projects a
+/// block reads the SAME spec that sets `workflow_version`, so a step
+/// with no `agent_` key is a step whose pinned version declared none:
+/// the pinned row cannot answer for exactly the steps that need an
+/// answer. Measured 2026-09-22 over every live ready/active step: 57
+/// resolvable, all 57 only from the active row, zero from the pinned
+/// one. So an in-flight packet's AGENT ROUTING follows the current
+/// operating model while its contract of work — steps, evidence,
+/// terminals — stays pinned. The agent block is execution resourcing
+/// (which model, what effort, what spend), not the contract, and the
+/// three layers say protocols dictate the CURRENT model. Provenance is
+/// untouched because nothing is written: back-filling v3's block onto
+/// a v1 packet would make the record state a declaration that version
+/// never made, and this does not.
+///
+/// ONLY THE AGENT BLOCK. The audience keys (`authority_role`,
+/// `station`) are the contract of WHO does the work and stay as
+/// admitted; `station_reach` still counts a packet absent for want of
+/// one of those.
+///
+/// ONLY WHEN THE CONTRACT AGREES (backlog 09b354e7). The block is
+/// resourcing for a contract, and the active row's block was written
+/// for the active row's step. When the pinned step declares different
+/// `fields` ([`same_contract`]) the block is not its block: measured
+/// 2026-09-25, two backlog-item v2 packets whose `measure` declared no
+/// fields were queued and dispatched to analysts briefed for v11's
+/// `disposition` + `evidence`, and both refused, two runs spent. Such a
+/// step resolves to nothing here — no queue holds it, no claim routes an
+/// agent to it — and `boss dispatch` refuses it naming the convert that
+/// moves the packet onto the active version.
+pub fn resolved(
+    step: &boss_core::job::Step,
+    active: Option<&crate::registry::WorkflowSpec>,
+) -> boss_core::job::Step {
+    if projected(&step.metadata).is_some() {
+        return step.clone();
+    }
+    let declared = step.spec_slug.as_deref().and_then(|slug| {
+        let row_step = active?.steps.iter().find(|s| s.title == slug)?;
+        if !same_contract(&step.fields, &row_step.fields) {
+            return None;
+        }
+        row_step.agent.as_ref()
+    });
+    let Some(declared) = declared else {
+        return step.clone();
+    };
+    let mut metadata = match &step.metadata {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in projection(declared) {
+        metadata.insert(key.to_string(), value);
+    }
+    boss_core::job::Step {
+        metadata: serde_json::Value::Object(metadata),
+        ..step.clone()
+    }
+}
+
+/// Whether a pinned step and the active row's step declare the same
+/// completion contract, so the active block may stand in for the one
+/// the pinned version never declared. The step's own `fields` ARE its
+/// pinned version's: materialisation copies them off the spec that sets
+/// `workflow_version` (`registry::materialize_steps_at`), and `boss job convert`
+/// rewrites them with the version (`repin`) — so no second read of the
+/// pinned row is needed to know them. Order-free: the same fields
+/// authored in another order are the same contract.
+pub fn same_contract(
+    pinned: &[boss_core::job::StepField],
+    active: &[boss_core::job::StepField],
+) -> bool {
+    pinned.len() == active.len() && pinned.iter().all(|f| active.contains(f))
+}
+
+/// [`resolved`] over a packet's steps.
+pub fn resolved_steps(
+    steps: &[boss_core::job::Step],
+    active: Option<&crate::registry::WorkflowSpec>,
+) -> Vec<boss_core::job::Step> {
+    steps.iter().map(|s| resolved(s, active)).collect()
+}
+
+/// The migrations that insert `agent_rate_card` rows: the seed, then
+/// Opus 5.5 (backlog 6bb85880). Read at compile time so the lint can
+/// name the priced models without a database; the pin tests below hold
+/// them equal to the whole schema directory and to the live table.
+const RATE_CARD_SEED: &[&str] = &[
+    include_str!(
+        "../../../../infra/postgres/schema/20260910030644-an-agent-run-leaves-a-record.sql"
+    ),
+    include_str!(
+        "../../../../infra/postgres/schema/20260925023146-opus-5-5-is-priced-at-its-own-rates.sql"
+    ),
+];
 
 /// Every model an `INSERT INTO agent_rate_card … VALUES` block in `sql`
 /// names, in file order. Line-based: a VALUES row is written one per
@@ -178,7 +290,12 @@ pub fn models_in(sql: &str) -> Vec<String> {
 /// The models the rate card prices — the set a step's `agent.model`
 /// must belong to.
 pub fn known_models() -> &'static [String] {
-    static MODELS: LazyLock<Vec<String>> = LazyLock::new(|| models_in(RATE_CARD_SEED));
+    static MODELS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        RATE_CARD_SEED
+            .iter()
+            .flat_map(|sql| models_in(sql))
+            .collect()
+    });
     &MODELS
 }
 
@@ -218,6 +335,143 @@ mod tests {
             budget_usd: 5.0,
             effort: Effort::High,
         }
+    }
+
+    /// A step as a packet admitted under `metadata` carries it, at slug
+    /// `build`.
+    fn step_carrying(metadata: serde_json::Value) -> boss_core::job::Step {
+        let mut step =
+            boss_core::job::Step::new(boss_core::job::JobId::new(), "task", "Build the change", 0);
+        step.spec_slug = Some("build".into());
+        step.metadata = metadata;
+        step
+    }
+
+    /// The ACTIVE row: `build` declares `block`, `triage` declares none.
+    fn active_row(block: Option<AgentSpec>) -> crate::registry::WorkflowSpec {
+        let step = |title: &str, agent| crate::registry::StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: "true".into(),
+            authority_role: Some("platform-admin".into()),
+            agent,
+            ..Default::default()
+        };
+        crate::registry::WorkflowSpec::platform_seed(
+            "backlog-item",
+            "Backlog item",
+            "it",
+            vec!["custom".into()],
+            vec![step("build", block), step("triage", None)],
+        )
+    }
+
+    #[test]
+    fn projected_reads_back_what_projection_wrote_and_half_is_none() {
+        let whole: serde_json::Map<String, serde_json::Value> = projection(&builder())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let whole = serde_json::Value::Object(whole);
+        assert_eq!(projected(&whole), Some(builder()));
+        let mut half = whole.clone();
+        half.as_object_mut().unwrap().remove(BUDGET_KEY);
+        assert_eq!(projected(&half), None, "half a projection is none");
+        assert_eq!(projected(&serde_json::json!({})), None);
+    }
+
+    /// THE 51aef4dd CASE: a step pinned to a version with no block, whose
+    /// ACTIVE row declares one, resolves to that block — and the input
+    /// step is untouched, because the resolution writes nothing.
+    #[test]
+    fn a_step_pinned_before_its_block_resolves_from_the_active_row() {
+        let step = step_carrying(serde_json::json!({ "authority_role": "platform-admin" }));
+        let row = active_row(Some(builder()));
+        let out = resolved(&step, Some(&row));
+        assert_eq!(projected(&out.metadata), Some(builder()));
+        assert_eq!(
+            out.metadata["authority_role"], "platform-admin",
+            "the step's own keys survive the overlay"
+        );
+        assert!(step.metadata.get(MODEL_KEY).is_none(), "nothing written");
+    }
+
+    /// THE 09b354e7 CASE: a step pinned to a version whose row declares
+    /// DIFFERENT fields than the active one is not the step the active
+    /// block was written for, so it resolves to nothing. Measured
+    /// 2026-09-25: backlog-item v2's `measure` carried `fields: []` and
+    /// v11's declared `disposition` + `evidence`; the queue handed two
+    /// v2 packets to analysts briefed for v11, and both refused.
+    #[test]
+    fn a_pinned_step_whose_fields_differ_from_the_active_row_does_not_resolve() {
+        let field = |name: &str| -> boss_core::job::StepField {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "field_type": "text", "required": true
+            }))
+            .unwrap()
+        };
+        let step = step_carrying(serde_json::json!({ "authority_role": "platform-admin" }));
+        let mut row = active_row(Some(builder()));
+        row.steps
+            .iter_mut()
+            .find(|s| s.title == "build")
+            .unwrap()
+            .fields = vec![field("evidence")];
+        assert_eq!(
+            resolved(&step, Some(&row)),
+            step,
+            "fields [] against [evidence] is a different contract"
+        );
+
+        // The same fields, in another order, are the same contract: the
+        // block added later still resolves (51aef4dd).
+        let mut agreeing = step.clone();
+        agreeing.fields = vec![field("disposition"), field("evidence")];
+        row.steps
+            .iter_mut()
+            .find(|s| s.title == "build")
+            .unwrap()
+            .fields = vec![field("evidence"), field("disposition")];
+        assert_eq!(
+            projected(&resolved(&agreeing, Some(&row)).metadata),
+            Some(builder())
+        );
+    }
+
+    /// The step's own projection wins over the active row: a packet
+    /// admitted WITH a block keeps what it was admitted with.
+    #[test]
+    fn a_carried_projection_is_never_replaced() {
+        let mut cheaper = builder();
+        cheaper.budget_usd = 1.0;
+        let carried: serde_json::Map<String, serde_json::Value> = projection(&cheaper)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let step = step_carrying(serde_json::Value::Object(carried));
+        let out = resolved(&step, Some(&active_row(Some(builder()))));
+        assert_eq!(projected(&out.metadata), Some(cheaper));
+    }
+
+    /// No active row, a row whose step declares no block, or a slug the
+    /// row does not hold: the step is answered as it stands.
+    #[test]
+    fn nothing_to_resolve_from_leaves_the_step_as_it_is() {
+        let step = step_carrying(serde_json::json!({}));
+        assert_eq!(resolved(&step, None), step);
+        assert_eq!(resolved(&step, Some(&active_row(None))), step);
+        let mut triage = step.clone();
+        triage.spec_slug = Some("triage".into());
+        assert_eq!(
+            resolved(&triage, Some(&active_row(Some(builder())))),
+            triage
+        );
+        let mut unknown = step.clone();
+        unknown.spec_slug = Some("gone".into());
+        assert_eq!(
+            resolved(&unknown, Some(&active_row(Some(builder())))),
+            unknown
+        );
     }
 
     #[test]
@@ -281,6 +535,11 @@ mod tests {
             "the dev pod's session model is priced: {models:?}"
         );
         assert!(models.len() >= 8, "{models:?}");
+        // The model the runs actually ran on (backlog 6bb85880), under
+        // both spellings a transcript yields — so a block may name it.
+        for m in ["opus-5-5", "opus-5-5[1m]"] {
+            assert!(models.iter().any(|k| k == m), "{m} is priced: {models:?}");
+        }
     }
 
     /// The one definition is the schema directory, whole: a later

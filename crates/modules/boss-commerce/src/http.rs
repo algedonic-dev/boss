@@ -13,10 +13,10 @@ use boss_classes_client::ClassesClient;
 use boss_core::primitives::ClassRef;
 use boss_core::publisher::DomainPublisher;
 use boss_people_client::PeopleClient;
-use boss_policy::{Action, Decision, Resource};
+use boss_policy::{Action, Decision, Resource, Scope};
 use boss_policy_client::{CurrentUser, PolicyClient};
 
-use crate::port::{CommerceError, CommerceRepository};
+use crate::port::{CommerceError, CommerceRepository, InvoiceCreate};
 
 fn error_response(err: CommerceError) -> Response {
     match err {
@@ -62,11 +62,14 @@ pub struct CommerceApiState<R: CommerceRepository> {
     /// Wrapped in `Arc<dyn>` so the production binary plugs in
     /// `ReqwestPeopleClient` and tests can substitute a fake.
     pub people_client: Arc<dyn PeopleClient>,
-    /// Row-level authorization. Null in tests that don't exercise
-    /// the policy path — those handlers skip the gate and treat the
-    /// request as allowed (preserves existing test surface until the
-    /// broader rollout swaps every test's harness over).
-    pub policy: Option<Arc<dyn PolicyClient>>,
+    /// Row-level authorization for every write here. Required: until
+    /// backlog 2b49ab60 (2026-09-27) this was an `Option` and `None`
+    /// let every write through — fail-open by configuration, guarded
+    /// only by a comment and a source pin on the binary. Now no
+    /// surface can be built without a client, the ledger's shape
+    /// (7048afa8); a test that wants the gate out of its way says so
+    /// by wiring `PermissivePolicyClient`.
+    pub policy: Arc<dyn PolicyClient>,
     /// Authoritative clock. See `boss-clock-client`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
     /// Class registry for `InvoiceStatus` validation. When configured,
@@ -84,6 +87,7 @@ pub fn router<R: CommerceRepository + 'static>(state: CommerceApiState<R>) -> Ro
         .route("/api/commerce/health", get(health))
         .route("/api/commerce/revenue", get(list_revenue::<R>))
         .route("/api/commerce/summary", get(commerce_summary::<R>))
+        .route("/api/commerce/open-ar", get(open_ar_by_account::<R>))
         .route("/api/commerce/invoices", get(list_invoices::<R>))
         .route("/api/commerce/invoices/{id}", get(get_invoice::<R>))
         .route("/api/commerce/invoices/create", post(create_invoice::<R>))
@@ -140,6 +144,28 @@ async fn commerce_summary<R: CommerceRepository + 'static>(
     let today = state.clock.now().await.now.date_naive();
     match state.commerce.invoice_summary(today).await {
         Ok(summary) => Json(summary).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Open AR per account, in the paged envelope every list read speaks
+/// so the SPA reads it with `fetchPaged` — but never truncated: it is
+/// one row per owing account, summed over every invoice, so `total`
+/// is always `data.len()` (backlog 5257bfa9).
+async fn open_ar_by_account<R: CommerceRepository + 'static>(
+    State(state): State<Arc<CommerceApiState<R>>>,
+) -> Response {
+    match state.commerce.open_ar_by_account().await {
+        Ok(data) => {
+            let n = data.len() as i64;
+            Json(PaginatedResponse {
+                data,
+                total: n,
+                limit: n,
+                offset: 0,
+            })
+            .into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -249,15 +275,75 @@ async fn check_revenue_category(
     }
 }
 
+/// Ask policy for `action` on `Resource::invoice()`, answering the
+/// response that refuses. Every write handler here asks it, so the
+/// batch door and the status moves ask exactly what create asks —
+/// until backlog 6c0f6547 (2026-09-26) create was the only one that
+/// asked at all, and the batch door is the live invoice-issue path.
+async fn require<R: CommerceRepository>(
+    state: &CommerceApiState<R>,
+    user: &boss_policy_client::User,
+    action: Action,
+) -> Result<(), Response> {
+    require_on(state.policy.as_ref(), user, action, Resource::invoice()).await
+}
+
+/// One policy question for a commerce write, and the response that
+/// refuses it. A Deny is 403; a policy service that cannot answer
+/// refuses with the client error's own response (503 + Retry-After),
+/// never a pass.
+///
+/// An Allow counts only at scope `all` (backlog f922edea, 2026-09-27).
+/// These writes carry no row predicate — nothing here reads a grant's
+/// territory, team or department against the invoice or agreement
+/// being written — so an `Allow { scope: Territory }` used to pass as
+/// if it were `all`, and a rep granted their own accounts could write
+/// anyone's. Until a row predicate exists, a narrower grant is
+/// refused, naming the scope it held. Measured before refusing: no
+/// live policy rule grants a write on invoice, agreement or asset at
+/// any scope but `all`.
+pub(crate) async fn require_on(
+    policy: &dyn PolicyClient,
+    user: &boss_policy_client::User,
+    action: Action,
+    resource: Resource,
+) -> Result<(), Response> {
+    match policy.check(user, action, resource.clone()).await {
+        Ok(Decision::Allow { scope: Scope::All }) => Ok(()),
+        Ok(Decision::Allow { scope }) => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} on {resource} is granted to role {} only at scope {}; this write has no \
+                 row predicate, so only scope all admits it",
+                action.as_str(),
+                user.role,
+                scope.to_db_string(),
+            ),
+        )
+            .into_response()),
+        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
+        Err(e) => Err(e.into_response()),
+    }
+}
+
 async fn create_invoice<R: CommerceRepository + 'static>(
     State(state): State<Arc<CommerceApiState<R>>>,
     CurrentUser(user): CurrentUser,
     Json(invoice): Json<crate::types::Invoice>,
 ) -> Response {
+    // Policy first: creating an invoice requires an active Create rule
+    // on Resource::invoice() for the caller's role. It used to run
+    // AFTER the registry gate below, so a refused caller still drove
+    // one class-registry call per line and could tell a registered
+    // status or category (403) from an unregistered one (400) — the
+    // assets batch door had the same order (backlog f922edea). A
+    // refused caller now learns nothing and costs the registry nothing.
+    if let Err(resp) = require(&state, &user, Action::Create).await {
+        return resp;
+    }
     // Class-registry gate: the invoice status must be a registered
     // Class under (subject_kind='invoice'). Permissive when no registry
-    // is wired (test path). Runs before policy so a malformed status is
-    // a clean 400 regardless of the caller's role.
+    // is wired (test path).
     if let Err(resp) = check_status(state.classes_client.as_ref(), invoice.status.as_str()).await {
         return resp;
     }
@@ -273,28 +359,6 @@ async fn create_invoice<R: CommerceRepository + 'static>(
             return resp;
         }
     }
-    // Policy: creating an invoice requires an active Create rule on
-    // Resource::invoice() for the caller's role. If the state doesn't
-    // carry a policy client (test path), skip — the existing tests
-    // cover the invariants without role gating.
-    if let Some(ref policy) = state.policy {
-        match policy
-            .check(&user, Action::Create, Resource::invoice())
-            .await
-        {
-            Ok(Decision::Allow { .. }) => {}
-            Ok(Decision::Deny { reason }) => {
-                return (StatusCode::FORBIDDEN, reason).into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("policy check failed: {e}"),
-                )
-                    .into_response();
-            }
-        }
-    }
     let invoice_id = invoice.id.clone();
     // Outbox phase 2: the adapter records commerce.invoice.created
     // (the ENRICHED invoice — cost_basis populated in-tx) inside the
@@ -305,9 +369,16 @@ async fn create_invoice<R: CommerceRepository + 'static>(
         .create_invoice_at(&invoice, stamp.timestamp, &stamp)
         .await
     {
-        Ok(_enriched) => (
+        Ok(InvoiceCreate::Created(_)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"ok": true, "id": invoice_id})),
+        )
+            .into_response(),
+        // A repeat of a create that landed (backlog 9d2af748): nothing
+        // was written, so 200 and not 201, and the body says so.
+        Ok(InvoiceCreate::AlreadyCreated(_)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "id": invoice_id, "already_created": true})),
         )
             .into_response(),
         Err(e) => error_response(e),
@@ -339,7 +410,14 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(invoices): Json<Vec<crate::types::Invoice>>,
 ) -> Response {
+    // One question for the whole batch, before any row: the same
+    // Create on invoice that /create asks. A refusal is the batch's,
+    // not a per-row skip — the caller asked for all of it.
+    if let Err(resp) = require(&state, &user, Action::Create).await {
+        return resp;
+    }
     let mut inserted = 0u64;
+    let mut already_created: Vec<String> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let stamp = event_stamp(&state, &user).await;
     for inv in &invoices {
@@ -398,8 +476,8 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
         // (sort by SKU) prevents the common case; this rides out any
         // residual so the batch recovers in-request instead of skipping →
         // NAK → dead-letter (which then 404s the downstream collection).
-        // create_invoice_at is idempotent (ON CONFLICT + already-issued
-        // guard), so re-invoking is safe.
+        // create_invoice_at is idempotent by id (backlog 9d2af748), so
+        // re-invoking is safe.
         let mut attempt = 0u32;
         let result = loop {
             match state.commerce.create_invoice_at(inv, now, &stamp).await {
@@ -411,8 +489,17 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
             }
         };
         match result {
-            Ok(_enriched) => {
+            Ok(InvoiceCreate::Created(_)) => {
                 inserted += 1;
+            }
+            // Not `inserted`: nothing was written, and a count that
+            // claims a write is the record this item exists to stop
+            // (backlog 9d2af748). Named instead, so a caller whose
+            // delivery was a redelivery — the dispatcher's
+            // `commerce.invoice.issue` — reads that its invoice exists
+            // as sent, and converges rather than NAKing forever.
+            Ok(InvoiceCreate::AlreadyCreated(_)) => {
+                already_created.push(inv.id.clone());
             }
             Err(e) => {
                 // On a rejected row, log per-row + return the
@@ -433,6 +520,7 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
         StatusCode::OK,
         Json(serde_json::json!({
             "inserted": inserted,
+            "already_created": already_created,
             "skipped": skipped.iter()
                 .map(|(id, err)| serde_json::json!({"id": id, "error": err}))
                 .collect::<Vec<_>>(),
@@ -466,6 +554,9 @@ async fn mark_invoice_paid<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
     body: Option<axum::Json<MarkPaidBody>>,
 ) -> Response {
+    if let Err(resp) = require(&state, &user, Action::Update).await {
+        return resp;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let paid_on = body
         .and_then(|axum::Json(b)| b.paid_on)
@@ -488,6 +579,9 @@ async fn mark_invoice_past_due<R: CommerceRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
+    if let Err(resp) = require(&state, &user, Action::Update).await {
+        return resp;
+    }
     // Outbox phase 2: recorded in the adapter's transaction.
     let stamp = event_stamp(&state, &user).await;
     match state.commerce.mark_invoice_past_due(&id, &stamp).await {
@@ -501,6 +595,12 @@ async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
+    // A write-off is a status move like paid and past-due, so it asks
+    // Update rather than Close; every live caller holding one holds
+    // the other (triage of 6c0f6547).
+    if let Err(resp) = require(&state, &user, Action::Update).await {
+        return resp;
+    }
     // Outbox phase 2: the adapter records the event in the flip's own
     // transaction, structurally gated on the flip winning — the
     // emit-once-on-`newly` dance this handler used to do is gone.
@@ -532,6 +632,11 @@ async fn write_off_invoice_from_past_due<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<FromPastDueBody>,
 ) -> Response {
+    // Policy before the trigger is read: a refused caller learns
+    // nothing about which shapes resolve to an invoice.
+    if let Err(resp) = require(&state, &user, Action::Update).await {
+        return resp;
+    }
     let invoice_id = if let Some(step_id) = body
         .trigger
         .get("trigger")
@@ -618,7 +723,7 @@ mod tests {
             line_items: vec![InvoiceLineItem {
                 id: format!("{id}-l1"),
                 invoice_id: id.to_string(),
-                revenue_category: RevenueCategory::from("new-sales"),
+                revenue_category: RevenueCategory::from("wholesale"),
                 amount_cents: 1_200_000,
                 currency: "USD".to_string(),
                 description: "Test device sale".to_string(),
@@ -673,7 +778,7 @@ mod tests {
             commerce,
             publisher: None,
             people_client: Arc::new(AlwaysExistsPeople),
-            policy: Some(policy),
+            policy,
             clock: Arc::new(boss_clock_client::WallClockClient),
             classes_client: None,
         })
@@ -686,7 +791,7 @@ mod tests {
             commerce,
             publisher: None,
             people_client: Arc::new(AlwaysExistsPeople),
-            policy: Some(policy),
+            policy,
             clock: Arc::new(boss_clock_client::WallClockClient),
             classes_client: Some(classes),
         })
@@ -761,6 +866,424 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Policy on every write (backlog 6c0f6547) ───────────────────
+    //
+    // Until 2026-09-26 create_invoice was the one handler here that
+    // asked policy. The batch door — the live invoice-issue path the
+    // dispatcher's commerce.invoice.issue handler drives — and the
+    // four status moves asked nothing, so a wired client closed one
+    // write of six. Each test below sends a write through a client
+    // that denies everything and reads the store back: a refusal that
+    // still wrote is not a refusal.
+
+    /// A policy client that cannot be asked: every check is an outage.
+    struct UnreachablePolicy;
+
+    #[async_trait::async_trait]
+    impl PolicyClient for UnreachablePolicy {
+        async fn check(
+            &self,
+            _user: &boss_policy_client::User,
+            _action: Action,
+            _resource: Resource,
+        ) -> Result<Decision, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "test: policy pod rolling".into(),
+            ))
+        }
+        async fn scope_predicate(
+            &self,
+            _user: &boss_policy_client::User,
+            _resource: Resource,
+        ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "test: policy pod rolling".into(),
+            ))
+        }
+    }
+
+    /// The two seeded invoices behind `policy`; the store comes back
+    /// too, so a test can read what a refused write left behind.
+    fn app_with_policy(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryCommerce>) {
+        let commerce = Arc::new(InMemoryCommerce::new(vec![
+            test_invoice("inv-001"),
+            test_invoice("inv-002"),
+        ]));
+        let app = router(CommerceApiState {
+            commerce: commerce.clone(),
+            publisher: None,
+            people_client: Arc::new(AlwaysExistsPeople),
+            policy,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+            classes_client: None,
+        });
+        (app, commerce)
+    }
+
+    fn deny_app() -> (Router, Arc<InMemoryCommerce>) {
+        app_with_policy(Arc::new(boss_policy_client::FakePolicyClient::deny_all()))
+    }
+
+    async fn send_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn status_of(commerce: &InMemoryCommerce, id: &str) -> String {
+        commerce
+            .invoice_by_id(id)
+            .await
+            .unwrap()
+            .expect("seeded invoice")
+            .status
+            .as_str()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_denied_caller_cannot_issue_invoices_through_the_batch_door() {
+        let (app, commerce) = deny_app();
+        let resp = send_json(
+            &app,
+            "POST",
+            "/api/commerce/invoices/batch",
+            serde_json::to_value(vec![test_invoice("inv-batch-1")]).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            commerce
+                .invoice_by_id("inv-batch-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused batch must not issue the invoice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_caller_cannot_mark_an_invoice_paid() {
+        let (app, commerce) = deny_app();
+        let resp = send_json(
+            &app,
+            "PUT",
+            "/api/commerce/invoices/inv-001/paid",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&commerce, "inv-001").await,
+            InvoiceStatus::OUTSTANDING
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_caller_cannot_mark_an_invoice_past_due() {
+        let (app, commerce) = deny_app();
+        let resp = send_json(
+            &app,
+            "PUT",
+            "/api/commerce/invoices/inv-001/past-due",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&commerce, "inv-001").await,
+            InvoiceStatus::OUTSTANDING
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_caller_cannot_write_an_invoice_off() {
+        let (app, commerce) = deny_app();
+        let resp = send_json(
+            &app,
+            "PUT",
+            "/api/commerce/invoices/inv-001/write-off",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&commerce, "inv-001").await,
+            InvoiceStatus::OUTSTANDING
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_caller_cannot_write_off_from_a_past_due_trigger() {
+        let (app, commerce) = deny_app();
+        let resp = send_json(
+            &app,
+            "POST",
+            "/api/commerce/invoices/write-off/from-past-due",
+            serde_json::json!({"trigger": {"id": "inv-001"}}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&commerce, "inv-001").await,
+            InvoiceStatus::OUTSTANDING
+        );
+    }
+
+    /// A policy service that cannot answer is not a gate that passed,
+    /// and not a Deny either: the batch door answers the client
+    /// error's own 503, and issues nothing.
+    #[tokio::test]
+    async fn a_policy_outage_refuses_the_batch_door_with_503() {
+        let (app, commerce) = app_with_policy(Arc::new(UnreachablePolicy));
+        let resp = send_json(
+            &app,
+            "POST",
+            "/api/commerce/invoices/batch",
+            serde_json::to_value(vec![test_invoice("inv-batch-2")]).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            commerce
+                .invoice_by_id("inv-batch-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ── Grant-shaped policy tests (backlog f922edea) ───────────────
+    //
+    // A deny-all client refuses whatever a handler asks, so every
+    // test above stays green if a handler asks the WRONG question: the
+    // review of 6c0f6547 mutated paid to ask Create, commerce to ask
+    // asset, and every lib test still passed. These grant exactly one
+    // (action, resource, scope) to one role and read which doors open,
+    // so each door is pinned to the question it asks.
+
+    const CLERK: &str = "billing-clerk";
+
+    /// A client granting `CLERK` exactly the listed (action, resource,
+    /// scope) triples and nothing else.
+    fn grant(rules: &[(Action, Resource, Scope)]) -> Arc<dyn PolicyClient> {
+        let builder = rules
+            .iter()
+            .fold(boss_policy_client::FakePolicyClient::builder(), |b, r| {
+                b.allow(CLERK, r.0, r.1.clone(), r.2.clone())
+            });
+        Arc::new(builder.build())
+    }
+
+    async fn send_as_clerk(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        let user = serde_json::json!({"id": "emp-clerk", "role": CLERK}).to_string();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", user)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The status of every write door for a clerk holding `rules`,
+    /// each against a fresh store, in the order: create, batch, paid,
+    /// past-due, write-off, write-off-from-past-due.
+    async fn doors_under(rules: &[(Action, Resource, Scope)]) -> Vec<StatusCode> {
+        let mut out = Vec::new();
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/commerce/invoices/create",
+                serde_json::to_value(test_invoice("inv-new")).unwrap(),
+            ),
+            (
+                "POST",
+                "/api/commerce/invoices/batch",
+                serde_json::to_value(vec![test_invoice("inv-new-b")]).unwrap(),
+            ),
+            (
+                "PUT",
+                "/api/commerce/invoices/inv-001/paid",
+                serde_json::json!({}),
+            ),
+            (
+                "PUT",
+                "/api/commerce/invoices/inv-001/past-due",
+                serde_json::json!({}),
+            ),
+            (
+                "PUT",
+                "/api/commerce/invoices/inv-001/write-off",
+                serde_json::json!({}),
+            ),
+            (
+                "POST",
+                "/api/commerce/invoices/write-off/from-past-due",
+                serde_json::json!({"trigger": {"id": "inv-001"}}),
+            ),
+        ] {
+            let (app, _) = app_with_policy(grant(rules));
+            out.push(send_as_clerk(&app, method, uri, body).await.status());
+        }
+        out
+    }
+
+    const OPEN_CREATE: [StatusCode; 2] = [StatusCode::CREATED, StatusCode::OK];
+    const OPEN_MOVES: [StatusCode; 4] = [
+        StatusCode::NO_CONTENT,
+        StatusCode::NO_CONTENT,
+        StatusCode::NO_CONTENT,
+        StatusCode::OK,
+    ];
+    const SHUT_CREATE: [StatusCode; 2] = [StatusCode::FORBIDDEN; 2];
+    const SHUT_MOVES: [StatusCode; 4] = [StatusCode::FORBIDDEN; 4];
+
+    #[tokio::test]
+    async fn update_on_invoice_opens_the_status_moves_and_not_the_issue_doors() {
+        let doors = doors_under(&[(Action::Update, Resource::invoice(), Scope::All)]).await;
+        assert_eq!(doors[..2], SHUT_CREATE, "create and batch ask Create");
+        assert_eq!(doors[2..], OPEN_MOVES, "the four status moves ask Update");
+    }
+
+    #[tokio::test]
+    async fn create_on_invoice_opens_the_issue_doors_and_not_the_status_moves() {
+        let doors = doors_under(&[(Action::Create, Resource::invoice(), Scope::All)]).await;
+        assert_eq!(doors[..2], OPEN_CREATE, "create and batch ask Create");
+        assert_eq!(doors[2..], SHUT_MOVES, "the four status moves ask Update");
+    }
+
+    #[tokio::test]
+    async fn a_grant_on_another_resource_opens_no_invoice_door() {
+        let doors = doors_under(&[
+            (Action::Create, Resource::asset(), Scope::All),
+            (Action::Update, Resource::asset(), Scope::All),
+            (Action::Create, Resource::agreement(), Scope::All),
+            (Action::Update, Resource::agreement(), Scope::All),
+        ])
+        .await;
+        assert_eq!(doors[..2], SHUT_CREATE);
+        assert_eq!(doors[2..], SHUT_MOVES);
+    }
+
+    /// The invoice writes carry no row predicate, so a grant narrower
+    /// than `all` used to pass as if it were `all` — `Allow { .. }`
+    /// dropped the scope on the floor. It is refused now, and the
+    /// refusal names the scope held.
+    #[tokio::test]
+    async fn a_grant_below_scope_all_opens_no_invoice_door() {
+        let doors = doors_under(&[
+            (Action::Create, Resource::invoice(), Scope::Territory),
+            (Action::Update, Resource::invoice(), Scope::Team),
+        ])
+        .await;
+        assert_eq!(doors[..2], SHUT_CREATE);
+        assert_eq!(doors[2..], SHUT_MOVES);
+
+        let (app, commerce) = app_with_policy(grant(&[(
+            Action::Create,
+            Resource::invoice(),
+            Scope::Territory,
+        )]));
+        let resp = send_as_clerk(
+            &app,
+            "POST",
+            "/api/commerce/invoices/create",
+            serde_json::to_value(test_invoice("inv-territory")).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("scope territory"),
+            "the refusal names the scope it held: {body}"
+        );
+        assert!(
+            commerce
+                .invoice_by_id("inv-territory")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A class registry that answers yes and counts every question.
+    struct CountingClasses(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ClassesClient for CountingClasses {
+        async fn class_exists(
+            &self,
+            _class_ref: &ClassRef,
+        ) -> Result<bool, boss_classes_client::ClassesClientError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn list_for_subject_kind(
+            &self,
+            _subject_kind: &str,
+        ) -> Result<Vec<boss_core::primitives::Class>, boss_classes_client::ClassesClientError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    /// Policy is asked before the class registry: a refused caller
+    /// drives no registry call and so cannot tell a registered status
+    /// or category (403) from an unregistered one (400).
+    #[tokio::test]
+    async fn a_refused_create_asks_the_class_registry_nothing() {
+        let classes = Arc::new(CountingClasses(Default::default()));
+        let app = router(CommerceApiState {
+            commerce: Arc::new(InMemoryCommerce::new(vec![])),
+            publisher: None,
+            people_client: Arc::new(AlwaysExistsPeople),
+            policy: Arc::new(boss_policy_client::FakePolicyClient::deny_all()),
+            clock: Arc::new(boss_clock_client::WallClockClient),
+            classes_client: Some(classes.clone() as Arc<dyn ClassesClient>),
+        });
+        let resp = send_as_clerk(
+            &app,
+            "POST",
+            "/api/commerce/invoices/create",
+            serde_json::to_value(test_invoice("inv-probe")).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            classes.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused create must not reach the class registry"
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ async fn build_app(pool: PgPool) -> Router {
         pool,
         None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
+        None,
     )
 }
 

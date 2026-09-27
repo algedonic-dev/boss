@@ -26,6 +26,10 @@
 //!   clean row from one host erased the other's evidence, so a host
 //!   finding could NEVER survive N consecutive rows. `estate.compare`
 //!   stamps `host` on self-scoped comparisons for exactly this filter.
+//!   And the filter runs in the READ, not only on the page (111996f5):
+//!   forge compares every fifteen minutes and boss-gcp once a day, so a
+//!   page of the host scope held no boss-gcp row at all, and three
+//!   below-floor days filed nothing. Both halves read `host=`.
 //! - the SILENCE SWEEP: an expected series that stops arriving IS a
 //!   finding. A host observation older than [`STALE_MULTIPLIER`]x its
 //!   own measured cadence means the observer died or the host did —
@@ -38,9 +42,15 @@
 //! - HARD findings only — `not_ready` (a declared node that is sick),
 //!   `declared_not_observed` (a declared node that is GONE),
 //!   `disk_tight` (a host below the floor a gate needs),
-//!   `units_unhealthy` (a watched unit the observer derived sick), and
+//!   `units_unhealthy` (a watched unit the observer derived sick),
 //!   `dead_letters_unrecorded` (a dispatcher dead-letter with no
-//!   durable record anywhere else, 8834804a).
+//!   durable record anywhere else, 8834804a), and `door_dark` (a door
+//!   half dark past its declared band, e6406701 — band-judged, so it
+//!   raises on sight rather than after PERSIST_N; see
+//!   [`banded_findings`]), and `ops_credentials_absent` (a declared
+//!   cluster-operator without the root material only David can place,
+//!   714bc71f — recorded, never fatal, on the converge, so this is the
+//!   reader that interrupts someone).
 //!   `observed_not_declared` is a paperwork gap and `drift` is config
 //!   — real, but not 03:00-urgent, and an alarm that cries over
 //!   paperwork trains operators to ignore it.
@@ -88,8 +98,8 @@ use serde_json::{Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{api_client, get_json, owner_for_filing, post_json};
-use super::estate_compare::{HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE};
+use super::common::{api_client, get_json, owner_for_filing, post_json, rows_or_refuse};
+use super::estate_compare::{DOOR_SCOPE, HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE};
 
 /// Consecutive same-series comparisons a hard finding must survive to
 /// raise. Three: at the tightened 15-minute observer cadence that is
@@ -116,15 +126,30 @@ const STALE_MIN_OBSERVATIONS: usize = 3;
 /// (seconds apart) cannot make a series look "quiet" minutes later.
 const STALE_MIN_CADENCE_S: i64 = 60;
 
+/// How far back the silence sweep looks for the hosts a self-scoped
+/// series has come from. A host goes stale within three of its own
+/// cadences — three days for the daily host series — so a week finds
+/// every host that could go stale, and a host quiet longer than that has
+/// already raised (the packet stays open until someone answers it) or
+/// was retired. Unbounded, a retired host would re-raise every week for
+/// good.
+const SILENCE_MEMORY_DAYS: i64 = 7;
+
 /// The observation series the silence sweep watches: every source the
 /// estate loop expects to keep arriving. `true` = self-scoped (one
 /// series per host, identity in `nodes[0].id`); `false` = one series
 /// for the whole scope. The scope names are `estate_compare`'s own
 /// consts — one definition, not a copy.
-const WATCHED_SERIES: [(&str, bool); 3] = [
+///
+/// The door series (backlog e6406701) is one series for the scope, like
+/// the cluster's: an observer that stops probing the door is
+/// `unobserved:door`, or the door watch would die as quietly as the
+/// door did.
+const WATCHED_SERIES: [(&str, bool); 4] = [
     (KNOWN_SCOPE, false),
     (HOST_SCOPE, true),
     (UNITS_SCOPE, true),
+    (DOOR_SCOPE, false),
 ];
 
 pub struct EstateAlarm {
@@ -157,6 +182,123 @@ impl EstateAlarm {
     fn base(&self) -> &str {
         self.jobs_base.trim_end_matches('/')
     }
+
+    /// Every host's OWN observation series in one self-scoped scope, and
+    /// the reads that failed (backlog 111996f5). A read of the whole
+    /// scope is spent by its fastest host: measured 2026-09-25,
+    /// `scope=host&limit=50` held 50 forge rows and none of boss-gcp's
+    /// daily ones, so boss-gcp's observer could die unheard. So the
+    /// hosts come first — the newest comparison of each, inside
+    /// [`SILENCE_MEMORY_DAYS`], because a comparison carries the `host`
+    /// stamp an observation lacks (4579f9b5) — and then each host's
+    /// series is read on its own.
+    async fn per_host_observations(
+        &self,
+        scope: &str,
+        now: DateTime<Utc>,
+        rule: &str,
+    ) -> (Vec<Value>, Vec<String>) {
+        let mut errors = Vec::new();
+        let since = (now - chrono::Duration::days(SILENCE_MEMORY_DAYS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let read = format!("the hosts read (scope {scope})");
+        let hosts = get_json(
+            &self.client,
+            &format!(
+                "{}/api/estate/comparisons?scope={scope}&latest_per=host&since={since}&limit=50",
+                self.base()
+            ),
+            rule,
+        )
+        .await
+        .and_then(|body| {
+            rows_or_refuse::<Value>(&body, &read)
+                .map(|rows| (rows, body))
+                .map_err(HandlerError::Downstream)
+        });
+        let hosts = match hosts {
+            Ok((rows, body)) => {
+                // A limit is not a filter: a host past the page is a
+                // host nobody judged, and that is said, not swallowed.
+                let total = body.get("total").and_then(Value::as_u64);
+                if total.is_none_or(|t| (rows.len() as u64) < t) {
+                    errors.push(format!(
+                        "{read} answered {} of {total:?} hosts; the rest were not judged",
+                        rows.len()
+                    ));
+                }
+                series_hosts(&rows)
+            }
+            Err(e) => {
+                errors.push(format!("{read} failed; its hosts were not judged: {e}"));
+                return (Vec::new(), errors);
+            }
+        };
+        let mut out = Vec::new();
+        for host in hosts {
+            if !query_safe(&host) {
+                errors.push(format!(
+                    "host {host:?} (scope {scope}) cannot ride a query unescaped; its series was not read"
+                ));
+                continue;
+            }
+            let read = format!("the observations read (scope {scope}, host {host})");
+            let obs = get_json(
+                &self.client,
+                &format!(
+                    "{}/api/estate/observations?scope={scope}&host={host}&limit=50",
+                    self.base()
+                ),
+                rule,
+            )
+            .await
+            .and_then(|body| {
+                rows_or_refuse::<Value>(&body, &read).map_err(HandlerError::Downstream)
+            });
+            match obs {
+                // Only this host's rows: a jobs API that predates
+                // `host=` answers the whole scope to every host's read,
+                // and a neighbour's series counted once per host measures
+                // a zero-second cadence and reads as silence.
+                Ok(rows) => out.extend(
+                    rows.into_iter()
+                        .filter(|r| observed_host(r) == Some(host.as_str())),
+                ),
+                Err(e) => errors.push(format!("{read} failed; other hosts still checked: {e}")),
+            }
+        }
+        (out, errors)
+    }
+}
+
+/// Can `s` ride a query string as it is? Host ids are declared
+/// kebab-case and observed ones are hostnames; anything else is refused
+/// by name rather than escaped by hand (the crate has no encoder).
+/// `estate.recover` reads the series the same way, so it shares this.
+pub(super) fn query_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// The host a self-scoped observation row is about: its first node's
+/// id, the identity `stale_series` keys it by.
+fn observed_host(row: &Value) -> Option<&str> {
+    row.get("payload")
+        .unwrap_or(row)
+        .pointer("/nodes/0/id")
+        .and_then(Value::as_str)
+}
+
+/// The distinct hosts a `latest_per=host` comparisons page names, in
+/// the page's order. A row with no `host` stamp names none.
+fn series_hosts(rows: &[Value]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    rows.iter()
+        .filter_map(|r| r.get("payload").unwrap_or(r).get("host")?.as_str())
+        .filter(|h| seen.insert(h.to_string()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The entries of one findings array, tolerant of the field being
@@ -191,6 +333,16 @@ fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
         // reader that owes nothing to the jobs API — the path CLAUDE.md
         // §Diagnosis asks of an arm. Keyed on the dispatcher's id.
         ("dead_letters_unrecorded", "dead_letters_unrecorded"),
+        // A door half dark past its declared band (backlog e6406701):
+        // keyed `<door>/<half>`, so WHICH half is down is the finding.
+        // Band-judged — see [`banded_findings`] — so it raises on sight.
+        ("door_dark", "door_dark"),
+        // A declared cluster-operator without its root material
+        // (backlog 714bc71f). The converge records it as not-ready and
+        // stays green, because no converge can place what only David
+        // can; this is the reader that makes the absence interrupt
+        // someone, keyed by host, the entry naming the act.
+        ("ops_credentials_absent", "ops_credentials_absent"),
     ] {
         for v in entries(comparison, field) {
             let id = v
@@ -215,6 +367,36 @@ fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
         }
     }
     out
+}
+
+/// The hard findings whose persistence the INSTRUMENT already
+/// integrated over time: a door half is `door_dark` only once it has
+/// been dark for its declared band (`infra/estate/doors.toml`, judged in
+/// `estate_compare::compare_door`). They raise on the first comparison
+/// that carries them — the silence sweep's reasoning ("the staleness
+/// window IS the persistence"): counting [`PERSIST_N`] more comparisons
+/// on top would make the declared band a lie by ten minutes.
+fn banded_findings(comparison: &Value) -> Vec<(String, Value)> {
+    hard_findings(comparison)
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("door_dark:"))
+        .collect()
+}
+
+/// The keys that say a condition has NOT recovered: every hard key,
+/// plus a door half dark again inside its band (`door_dimming`), keyed
+/// as the `door_dark` it would become. A door that answered once and
+/// went dark again is not answering, and closing its alarm on three
+/// dimming readings would re-raise it a quarter-hour later — the flap
+/// the band exists to absorb. `estate.recover` judges by this set.
+pub(super) fn unrecovered_keys(comparison: &Value) -> BTreeSet<String> {
+    let mut keys = hard_finding_keys(comparison);
+    keys.extend(
+        entries(comparison, "door_dimming")
+            .filter_map(|v| v.get("id").and_then(Value::as_str))
+            .map(|id| format!("door_dark:{id}")),
+    );
+    keys
 }
 
 /// Just the keys of [`hard_findings`] — the set the persistence
@@ -342,8 +524,9 @@ fn stale_series(rows: &[Value], per_host: bool, scope: &str, now: DateTime<Utc>)
 const SETTLED_DAYS: i64 = 7;
 
 /// The dedup read's page size. One bounded read (`closed_within`, so
-/// open packets plus only the last [`SETTLED_DAYS`] of closed ones)
-/// stays well under this in steady state; a `total` past it trips the
+/// open packets plus only the last [`SETTLED_DAYS`] of closed ones, and
+/// only those carrying `estate_finding`, dde64482) stays well under
+/// this in steady state; a `total` past it trips the
 /// truncation HOLD in [`dedup_page_complete`] rather than raising blind.
 /// This is the jobs API's own `MAX_LIMIT`, the largest page it serves.
 pub(super) const DEDUP_PAGE: usize = 1000;
@@ -469,6 +652,57 @@ fn alarm_body(
     })
 }
 
+/// The urgent packet one door half dark past its band becomes (backlog
+/// e6406701). The title names the half, what it points at and the band
+/// — WHICH door is down is the first question, and a person reading the
+/// queue should not have to open the packet to learn it. No persistence
+/// count: the band is the persistence. No `host`: the door series' rows
+/// carry none, and `estate.recover` matches the packet to them by
+/// `(scope, host)` (3908d555).
+fn door_body(key: &str, entry: &Value, evidence: &str, owner: &str) -> Value {
+    let text = |k: &str| entry.get(k).and_then(Value::as_str).unwrap_or("?");
+    let half = text("half");
+    let target = text("target");
+    let band = entry
+        .get("band_s")
+        .and_then(Value::as_i64)
+        .map(|s| format!("{}-minute", s / 60))
+        .unwrap_or_else(|| "undeclared".to_string());
+    let metadata = json!({
+        "area": "estate",
+        "estate_finding": key,
+        "scope": DOOR_SCOPE,
+        "detail": format!(
+            "Raised by estate.alarm from the door series (backlog e6406701; \
+             incident 55d001b0, where both of the dev pod's ssh doors were dark \
+             ~36h and a person found it). The {half} half of door `{door}` \
+             ({target}) has been dark since {since}, past its {band} band \
+             declared in infra/estate/doors.toml. Why the probe failed: \
+             {reason}. The prober is infra/estate/observe-door.sh on the forge, \
+             outside the pod, so this alarm does not depend on the pod it is \
+             about. It closes itself once the half answers again \
+             (estate.recover). Latest reading: {latest}. Evidence: {evidence}. \
+             The series rides /api/estate/comparisons?scope=door.",
+            door = text("door"),
+            since = text("dark_since"),
+            reason = text("reason"),
+            latest = excerpt(entry),
+        ),
+    });
+    json!({
+        "kind": "backlog-item",
+        "title": format!(
+            "ESTATE ALARM: {key} — the {half} half ({target}) is dark past its {band} band"
+        ),
+        "subject": {"subject_kind": "custom", "id": "bosspipeline"},
+        "owner_id": owner,
+        "priority": "urgent",
+        "status": "open",
+        "tags": [],
+        "metadata": super::common::with_lane(metadata, InputChannel::Telemetry),
+    })
+}
+
 /// The dedup key of one stale series: `unobserved:<series>` — one
 /// condition per quiet host, even when both of its series go dark;
 /// `unobserved:kubernetes-nodes` for the cluster observer.
@@ -576,27 +810,59 @@ impl Handler for EstateAlarm {
         // --- The persistence half: does the TRIGGERING comparison's
         // finding survive the last PERSIST_N of its own series? Only
         // worth a fetch when it found something hard at all.
-        let hard = hard_findings(comparison);
+        //
+        // A band-judged finding (a door half dark past its declared band,
+        // backlog e6406701) needs no series read: the band already
+        // integrated it over time. It goes straight to the dedup below.
+        let banded = banded_findings(comparison);
+        for (key, entry) in &banded {
+            to_raise
+                .entry(key.clone())
+                .or_insert_with(|| door_body(key, entry, &evidence, &owner));
+        }
+        let hard: Vec<(String, Value)> = hard_findings(comparison)
+            .into_iter()
+            .filter(|(k, _)| !banded.iter().any(|(b, _)| b == k))
+            .collect();
         if !hard.is_empty() {
             // The recorded series IS the state (the handler keeps
             // none). Scope travels down in the query — a page across
             // all scopes is spent by whichever series ticks fastest.
-            match get_json(
-                &self.client,
-                &format!(
-                    "{}/api/estate/comparisons?scope={scope}&limit=20",
-                    self.base()
-                ),
-                &ctx.rule_name,
-            )
-            .await
-            {
-                Ok(recent) => {
-                    let rows: Vec<Value> = recent
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
+            //
+            // A series with no `data` array is NO ANSWER, and it fails
+            // soft exactly as a failed fetch does. Read as an empty series
+            // nothing persisted and the pass ACKed clean — the alarm
+            // silently not alarming (backlog 37fc5837).
+            //
+            // And the HOST travels down too (backlog 111996f5): a page of
+            // the host scope is spent by forge's fifteen-minute rows, so
+            // boss-gcp's daily series never held three rows to intersect
+            // and three below-floor days in a row filed nothing. An
+            // unsafe host id is refused by name, never read unfiltered.
+            let series = match host {
+                Some(h) if query_safe(h) => Ok(format!("scope={scope}&host={h}")),
+                Some(h) => Err(HandlerError::Downstream(format!(
+                    "host {h:?} cannot ride a query unescaped"
+                ))),
+                None => Ok(format!("scope={scope}")),
+            };
+            let recent = match series {
+                Ok(series) => {
+                    get_json(
+                        &self.client,
+                        &format!("{}/api/estate/comparisons?{series}&limit=20", self.base()),
+                        &ctx.rule_name,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+            .and_then(|recent| {
+                rows_or_refuse::<Value>(&recent, &format!("the comparisons read (scope {scope})"))
+                    .map_err(HandlerError::Downstream)
+            });
+            match recent {
+                Ok(rows) => {
                     // Rows are event envelopes; the comparison rides in
                     // `payload` (recorded verbatim by the dumb door). Fall
                     // back to the row itself so a flattened future shape
@@ -628,7 +894,23 @@ impl Handler for EstateAlarm {
         // is exactly when a dead observer is lying loudest.
         let now = boss_clock_client::now_from(&self.clock).await;
         for (watched_scope, per_host) in WATCHED_SERIES {
-            let obs = match get_json(
+            // A self-scoped series is read host by host (111996f5); a
+            // whole-scope page is spent by its fastest host.
+            if per_host {
+                let (rows, failed) = self
+                    .per_host_observations(watched_scope, now, &ctx.rule_name)
+                    .await;
+                errors.extend(failed);
+                for stale in stale_series(&rows, per_host, watched_scope, now) {
+                    let body = staleness_body(&stale, &evidence, &owner);
+                    to_raise.entry(unobserved_key(&stale)).or_insert(body);
+                }
+                continue;
+            }
+            // The same refusal, failing soft the same way: an error-shaped
+            // series read as empty is a dead observer nobody hears about
+            // (backlog 37fc5837).
+            let obs = get_json(
                 &self.client,
                 &format!(
                     "{}/api/estate/observations?scope={watched_scope}&limit=50",
@@ -637,8 +919,15 @@ impl Handler for EstateAlarm {
                 &ctx.rule_name,
             )
             .await
-            {
-                Ok(o) => o,
+            .and_then(|obs| {
+                rows_or_refuse::<Value>(
+                    &obs,
+                    &format!("the observations read (scope {watched_scope})"),
+                )
+                .map_err(HandlerError::Downstream)
+            });
+            let rows = match obs {
+                Ok(rows) => rows,
                 Err(e) => {
                     errors.push(format!(
                         "observation fetch for scope {watched_scope} failed; other scopes still checked: {e}"
@@ -646,11 +935,6 @@ impl Handler for EstateAlarm {
                     continue;
                 }
             };
-            let rows: Vec<Value> = obs
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
             for stale in stale_series(&rows, per_host, watched_scope, now) {
                 let body = staleness_body(&stale, &evidence, &owner);
                 to_raise.entry(unobserved_key(&stale)).or_insert(body);
@@ -674,23 +958,36 @@ impl Handler for EstateAlarm {
         // flood). Bounding the read to the recency window keeps it a
         // page or two; a genuine overflow past DEDUP_PAGE trips the
         // truncation HOLD below rather than re-raising blind.
+        //
+        // `metadata_has=estate_finding` narrows it to the only packets
+        // either question reads (backlog dde64482). Without it every
+        // backlog-item of the week counted toward the page: on 2026-09-26
+        // that was 1049 rows, 14 of them estate packets, so the HOLD
+        // engaged on every pass and no alarm could be filed at all. The
+        // HOLD stays as the fail-safe; it now needs a thousand estate
+        // packets in a week to engage.
         if !to_raise.is_empty() {
             let listing = get_json(
                 &self.client,
                 &format!(
-                    "{}/api/jobs?kind=backlog-item&closed_within={SETTLED_DAYS}&limit={DEDUP_PAGE}",
+                    "{}/api/jobs?kind=backlog-item&closed_within={SETTLED_DAYS}&metadata_has=estate_finding&full=true&limit={DEDUP_PAGE}",
                     self.base()
                 ),
                 &ctx.rule_name,
             )
-            .await;
+            .await
+            // No `data` array is no answer, and HOLDS like a failed read.
+            // It was held before only by accident of the truncation
+            // check (a count with no rows looks short); an error body
+            // carrying `total: 0` would have passed that and raised
+            // blind (d4698bc2).
+            .and_then(|body| {
+                rows_or_refuse::<Value>(&body, "the dedup read (GET /api/jobs)")
+                    .map(|rows| (rows, body))
+                    .map_err(HandlerError::Downstream)
+            });
             match listing {
-                Ok(body) => {
-                    let rows: Vec<Value> = body
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
+                Ok((rows, body)) => {
                     // The list's own `total` is authoritative over the
                     // page length; a missing `total` is treated as
                     // truncated (fail-safe), never as zero.
@@ -843,6 +1140,29 @@ mod tests {
         c["findings"]["dead_letters_unrecorded"] = json!([]);
         c["findings"]["dispatcher_unread"] = json!("curl: (7) Failed to connect");
         assert!(hard_finding_keys(&c).is_empty(), "unread is informational");
+    }
+
+    #[test]
+    fn absent_root_material_on_a_cluster_operator_is_hard_and_unmeasured_is_not() {
+        // Backlog 714bc71f: the forge's missing admin kubeconfig redded
+        // every converge for twelve hours with no alarm, then became a
+        // recorded not-ready — which is silent unless it reaches this
+        // reader. Keyed by host, so each host's missing set is ONE
+        // packet, and its excerpt carries the act that clears it.
+        let mut c = host_comparison("forge", false);
+        c["findings"]["ops_credentials_absent"] = json!([{
+            "id": "forge", "state": "not ready: talosconfig:absent kubeconfig:absent",
+            "act": "place /etc/boss-ops/kubeconfig and /etc/boss-ops/talosconfig root:root 600 on forge" }]);
+        c["findings"]["ops_credentials_unmeasured"] = json!([{"id": "boss-gcp"}]);
+        assert_eq!(
+            hard_finding_keys(&c).into_iter().collect::<Vec<_>>(),
+            vec!["ops_credentials_absent:forge".to_string()],
+        );
+        let (_, entry) = hard_findings(&c)
+            .into_iter()
+            .next()
+            .expect("the hard finding");
+        assert!(excerpt(&entry).contains("root:root 600"), "{entry}");
     }
 
     #[test]
@@ -1033,6 +1353,80 @@ mod tests {
                 .unwrap()
                 .contains("\"sub_state\":\"dead\"")
         );
+    }
+
+    // ----- the door scope (backlog e6406701) -----
+
+    fn door_entry(half: &str, target: &str) -> Value {
+        json!({"id": format!("dev-ssh/{half}"), "door": "dev-ssh", "half": half,
+               "target": target, "reason": "connection refused",
+               "dark_since": "2026-09-24T11:40:00Z", "dark_for_s": 1200, "band_s": 900})
+    }
+
+    fn door_comparison(dark: &[Value], dimming: &[Value]) -> Value {
+        json!({
+            "scope": "door",
+            "findings": { "door_dark": dark, "door_dimming": dimming },
+        })
+    }
+
+    #[test]
+    fn a_door_dark_past_its_band_is_hard_and_a_dimming_one_is_not() {
+        let c = door_comparison(
+            &[door_entry("lan", "10.20.0.35:22")],
+            &[door_entry("public", "dev.algedonic.dev")],
+        );
+        // One key per HALF: which half is down is the finding.
+        assert_eq!(
+            hard_finding_keys(&c),
+            BTreeSet::from(["door_dark:dev-ssh/lan".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_door_finding_is_judged_by_its_band_not_by_counting_comparisons() {
+        // The band already integrated the darkness over time, the way
+        // STALE_MULTIPLIER does for silence: waiting PERSIST_N more
+        // comparisons would make the declared band a lie by ten minutes.
+        let c = door_comparison(&[door_entry("lan", "10.20.0.35:22")], &[]);
+        let banded: Vec<String> = banded_findings(&c).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(banded, vec!["door_dark:dev-ssh/lan".to_string()]);
+        // Every other hard finding still waits for its persistence.
+        assert!(banded_findings(&comparison("kubernetes-nodes", &["cp-2"], &[])).is_empty());
+    }
+
+    #[test]
+    fn the_door_alarm_names_the_half_its_target_and_its_band() {
+        let entry = door_entry("lan", "10.20.0.35:22");
+        let b = door_body("door_dark:dev-ssh/lan", &entry, "evt", "emp-owner");
+        let title = b["title"].as_str().unwrap();
+        assert!(title.contains("door_dark:dev-ssh/lan"), "{title}");
+        assert!(title.contains("lan half"), "{title}");
+        assert!(title.contains("10.20.0.35:22"), "{title}");
+        assert!(title.contains("15-minute band"), "{title}");
+        assert!(
+            !title.contains("consecutive"),
+            "the band is the persistence: {title}"
+        );
+        assert_eq!(b["priority"], "urgent");
+        assert_eq!(b["owner_id"], "emp-owner");
+        assert_eq!(b["metadata"]["estate_finding"], "door_dark:dev-ssh/lan");
+        assert_eq!(b["metadata"]["scope"], "door");
+        // No host: the door series' rows carry none, and the packet's
+        // (scope, host) is what estate.recover closes it by (3908d555).
+        assert!(b["metadata"].get("host").is_none(), "{b}");
+        let detail = b["metadata"]["detail"].as_str().unwrap();
+        assert!(detail.contains("connection refused"), "{detail}");
+        assert!(detail.contains("2026-09-24T11:40:00Z"), "{detail}");
+        assert!(detail.contains("infra/estate/doors.toml"), "{detail}");
+    }
+
+    #[test]
+    fn the_door_series_is_watched_for_silence_as_one_series() {
+        // An observer that stops posting is its own alarm
+        // (`unobserved:door`), or the door watch dies quietly the way
+        // the door did.
+        assert!(WATCHED_SERIES.contains(&(DOOR_SCOPE, false)));
     }
 
     // ----- the silence sweep (a7a19a1a) -----
@@ -1295,6 +1689,412 @@ mod tests {
         assert!(
             settled.contains("unit_unhealthy:boss-gcp/other.service"),
             "a human's stale still holds for the week"
+        );
+    }
+}
+
+/// EACH HOST'S OWN SERIES (backlog 111996f5). boss-gcp read 12-13G free
+/// against its 17G floor on three consecutive daily comparisons
+/// (2026-09-23..25) and no ESTATE ALARM was filed: both halves read the
+/// whole host SCOPE — `limit=20` comparisons, `limit=50` observations —
+/// and forge, which reports every fifteen minutes, spent both pages.
+/// These drive the handler end to end over that interleaved series:
+/// forge every fifteen minutes, boss-gcp once a day at 10:25. The stub
+/// answers the whole-scope read the way the live API did (forge's rows
+/// only) and a `host=` read with that host's own rows.
+#[cfg(test)]
+mod per_host_series_tests {
+    use super::*;
+    use crate::handlers::listing_stub::{empty_listing, serve};
+
+    fn firing(comparison: Value) -> InvocationContext {
+        InvocationContext {
+            rule_name: "estate-alarm".into(),
+            triggering_event_id: "evt-cmp-1".into(),
+            triggering_topic: "estate.comparison.recorded".into(),
+            event_payload: comparison,
+        }
+    }
+
+    fn handler(base: String) -> Arc<EstateAlarm> {
+        // The clock is unreachable on purpose: `now` falls back to the
+        // wall clock, which is what the fixtures below are dated from.
+        EstateAlarm::new(
+            base,
+            "http://127.0.0.1:1",
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        )
+    }
+
+    /// A host comparison envelope as the comparisons reader returns it.
+    fn cmp_row(host: &str, at: DateTime<Utc>, disk_tight: bool) -> Value {
+        let tight: Vec<Value> = if disk_tight {
+            vec![json!({"id": host, "free_gb": 12, "disk_gb": 47, "floor_gb": 17})]
+        } else {
+            vec![]
+        };
+        json!({
+            "event_id": format!("{host}-{}", at.timestamp()), "timestamp": at.to_rfc3339(),
+            "kind": "jobs.estate.compared",
+            "payload": {"scope": "host", "host": host, "observed_at": at.to_rfc3339(),
+                        "findings": {"disk_tight": tight, "not_ready": []}},
+        })
+    }
+
+    /// A host observation envelope: no `host` stamp, the host is the
+    /// first node (4579f9b5).
+    fn obs_row(host: &str, at: DateTime<Utc>) -> Value {
+        json!({
+            "event_id": format!("{host}-{}", at.timestamp()), "timestamp": at.to_rfc3339(),
+            "kind": "jobs.estate.observed",
+            "payload": {"scope": "host", "observed_at": at.to_rfc3339(), "observer": "t",
+                        "nodes": [{"id": host}]},
+        })
+    }
+
+    /// Three days of the interleaved series, newest first: forge every
+    /// fifteen minutes up to `forge_newest`, boss-gcp at 10:25 on each
+    /// of the three days ending `gcp_newest`. `row` builds each envelope.
+    fn interleaved(
+        forge_newest: DateTime<Utc>,
+        gcp_newest: DateTime<Utc>,
+        row: impl Fn(&str, DateTime<Utc>) -> Value,
+    ) -> Vec<(DateTime<Utc>, Value)> {
+        let mut rows: Vec<(DateTime<Utc>, Value)> = (0..(3 * 96))
+            .map(|i| forge_newest - chrono::Duration::minutes(15 * i))
+            .map(|at| (at, row("forge", at)))
+            .chain(
+                (0..3)
+                    .map(|d| gcp_newest - chrono::Duration::days(d))
+                    .map(|at| (at, row("boss-gcp", at))),
+            )
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+        rows
+    }
+
+    /// The reader's answer for a page of `limit` rows of `rows`.
+    fn page(rows: &[(DateTime<Utc>, Value)], limit: usize) -> Value {
+        let data: Vec<Value> = rows.iter().take(limit).map(|(_, r)| r.clone()).collect();
+        json!({"data": data, "total": rows.len()})
+    }
+
+    fn only(rows: &[(DateTime<Utc>, Value)], host: &str) -> Vec<(DateTime<Utc>, Value)> {
+        rows.iter()
+            .filter(|(_, r)| r["payload"]["host"] == host || r["payload"]["nodes"][0]["id"] == host)
+            .cloned()
+            .collect()
+    }
+
+    fn raised(stub: &crate::handlers::listing_stub::Stub) -> Vec<String> {
+        stub.sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .map(|(_, b)| {
+                b["metadata"]["estate_finding"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_daily_host_below_its_floor_three_days_running_raises() {
+        let now = Utc::now();
+        let series = interleaved(
+            now - chrono::Duration::minutes(2),
+            now - chrono::Duration::hours(16),
+            |host, at| cmp_row(host, at, host == "boss-gcp"),
+        );
+        // Precondition: the whole-scope page holds none of boss-gcp's.
+        assert!(
+            !page(&series, 20).to_string().contains("boss-gcp"),
+            "precondition: forge spends a 20-row page"
+        );
+        let gcp = page(&only(&series, "boss-gcp"), 20);
+        let stub = serve(vec![
+            ("/api/estate/comparisons?scope=host&host=boss-gcp", gcp),
+            (
+                "/api/estate/comparisons?scope=host&latest_per=host",
+                empty_listing(),
+            ),
+            ("/api/estate/comparisons?scope=host", page(&series, 20)),
+            ("/api/estate/comparisons", empty_listing()),
+            ("/api/estate/observations", empty_listing()),
+            ("/api/jobs", empty_listing()),
+        ])
+        .await;
+        // The firing: boss-gcp's newest comparison, below its floor.
+        let trigger = series
+            .iter()
+            .find(|(_, r)| r["payload"]["host"] == "boss-gcp")
+            .map(|(_, r)| r["payload"].clone())
+            .unwrap();
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(trigger))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(raised(&stub), vec!["disk_tight:boss-gcp".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_daily_host_whose_observer_died_is_noticed_behind_a_busy_neighbour() {
+        let now = Utc::now();
+        // boss-gcp's last reading was four days ago on a daily cadence:
+        // 4d > 3 x 1d. forge is fresh, two minutes ago.
+        let forge_newest = now - chrono::Duration::minutes(2);
+        let gcp_newest = now - chrono::Duration::days(4);
+        let obs = interleaved(forge_newest, gcp_newest, obs_row);
+        assert!(
+            !page(&obs, 50).to_string().contains("boss-gcp"),
+            "precondition: forge spends a 50-row page"
+        );
+        let hosts = json!({"data": [
+            cmp_row("forge", forge_newest, false),
+            cmp_row("boss-gcp", gcp_newest, false),
+        ], "total": 2});
+        let stub = serve(vec![
+            ("/api/estate/comparisons?scope=host&latest_per=host", hosts),
+            ("/api/estate/comparisons", empty_listing()),
+            (
+                "/api/estate/observations?scope=host&host=boss-gcp",
+                page(&only(&obs, "boss-gcp"), 50),
+            ),
+            (
+                "/api/estate/observations?scope=host&host=forge",
+                page(&only(&obs, "forge"), 50),
+            ),
+            ("/api/estate/observations?scope=host", page(&obs, 50)),
+            ("/api/estate/observations", empty_listing()),
+            ("/api/jobs", empty_listing()),
+        ])
+        .await;
+        let trigger = cmp_row("forge", forge_newest, false)["payload"].clone();
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(trigger))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(raised(&stub), vec!["unobserved:boss-gcp".to_string()]);
+    }
+
+    /// A jobs API that does not know `host=` yet (the dispatcher and the
+    /// API roll separately) answers the whole scope to every host's
+    /// read. Unfiltered, forge's rows would arrive once per host, and a
+    /// doubled series measures a zero-second cadence: forge, five minutes
+    /// quiet, would read as unobserved. Each host's read keeps only that
+    /// host's rows.
+    #[tokio::test]
+    async fn a_reader_that_ignores_host_cannot_double_a_neighbours_series() {
+        let now = Utc::now();
+        let forge_newest = now - chrono::Duration::minutes(5);
+        let obs = interleaved(forge_newest, now - chrono::Duration::hours(16), obs_row);
+        let hosts = json!({"data": [
+            cmp_row("forge", forge_newest, false),
+            cmp_row("boss-gcp", now - chrono::Duration::hours(16), false),
+        ], "total": 2});
+        let stub = serve(vec![
+            ("/api/estate/comparisons?scope=host&latest_per=host", hosts),
+            ("/api/estate/comparisons", empty_listing()),
+            ("/api/estate/observations?scope=host", page(&obs, 50)),
+            ("/api/estate/observations", empty_listing()),
+            ("/api/jobs", empty_listing()),
+        ])
+        .await;
+        let trigger = cmp_row("forge", forge_newest, false)["payload"].clone();
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(trigger))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(raised(&stub).is_empty(), "{:?}", raised(&stub));
+    }
+}
+
+/// AN ALARM READ WITH NO `data` ARRAY IS NO ANSWER (backlog 37fc5837).
+/// Both halves read a series and, handed an error-shaped body, used to
+/// read it as an empty series: the persistence half then found nothing
+/// persistent and the silence half nothing stale, and the pass ACKed
+/// clean — the alarm system silently not alarming. Each now lands in
+/// the pass's error accumulator, so the firing NAKs and names the read.
+#[cfg(test)]
+mod no_data_array_tests {
+    use super::*;
+    use crate::handlers::listing_stub::{
+        assert_refused_by_name, empty_listing, no_data_array, serve,
+    };
+
+    /// The dedup read as the stub matches it: only a request that carries
+    /// the `estate_finding` filter is answered (dde64482), so a read that
+    /// drops it 404s and the pass holds, failing the test that relied on it.
+    const DEDUP_ROUTE: &str = "/api/jobs?kind=backlog-item&metadata_has=estate_finding";
+
+    fn firing(comparison: Value) -> InvocationContext {
+        InvocationContext {
+            rule_name: "estate-alarm".into(),
+            triggering_event_id: "evt-cmp-1".into(),
+            triggering_topic: "estate.comparison.recorded".into(),
+            event_payload: comparison,
+        }
+    }
+
+    fn handler(base: String) -> Arc<EstateAlarm> {
+        // The clock is unreachable on purpose: the silence half's `now`
+        // falls back, and nothing here depends on its value.
+        EstateAlarm::new(
+            base,
+            "http://127.0.0.1:1",
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_comparisons_read_with_no_data_array_refuses_by_name() {
+        let stub = serve(vec![
+            ("/api/estate/comparisons", no_data_array()),
+            ("/api/estate/observations", empty_listing()),
+            (DEDUP_ROUTE, empty_listing()),
+        ])
+        .await;
+        // A hard finding, so the persistence half fetches its series.
+        let hard = json!({
+            "scope": "kubernetes-nodes",
+            "findings": { "not_ready": ["cp-2"] },
+        });
+        let res = handler(stub.base.clone()).invoke(&[], &firing(hard)).await;
+        assert_refused_by_name(res, "the comparisons read");
+    }
+
+    #[tokio::test]
+    async fn an_observations_read_with_no_data_array_refuses_by_name() {
+        let stub = serve(vec![
+            ("/api/estate/observations", no_data_array()),
+            (DEDUP_ROUTE, empty_listing()),
+        ])
+        .await;
+        // No findings: only the silence half runs, on every firing.
+        let quiet = json!({ "scope": "kubernetes-nodes", "findings": {} });
+        let res = handler(stub.base.clone()).invoke(&[], &firing(quiet)).await;
+        assert_refused_by_name(res, "the observations read");
+    }
+
+    fn door_dark_comparison() -> Value {
+        json!({
+            "scope": "door",
+            "findings": {
+                "door_dark": [{"id": "dev-ssh/lan", "door": "dev-ssh", "half": "lan",
+                               "target": "10.20.0.35:22", "reason": "connection refused",
+                               "dark_since": "2026-09-24T11:40:00Z",
+                               "dark_for_s": 1200, "band_s": 900}],
+                "door_dimming": [],
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_door_dark_past_its_band_files_one_packet_without_reading_the_series() {
+        // No route for the comparison SERIES: a read of it would 404 and
+        // the pass would fail. The band is the persistence, so none is
+        // made. (The silence sweep's hosts read is answered, 111996f5.)
+        let stub = serve(vec![
+            ("/api/estate/comparisons?latest_per=host", empty_listing()),
+            ("/api/estate/observations", empty_listing()),
+            (DEDUP_ROUTE, empty_listing()),
+        ])
+        .await;
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(door_dark_comparison()))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        let posts: Vec<(String, Value)> = stub
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(
+            posts[0].1["metadata"]["estate_finding"],
+            "door_dark:dev-ssh/lan"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_door_already_raised_is_not_raised_again() {
+        let open = json!({
+            "data": [{"id": "a1", "status": "open",
+                      "metadata": {"estate_finding": "door_dark:dev-ssh/lan", "scope": "door"}}],
+            "total": 1,
+        });
+        let stub = serve(vec![
+            ("/api/estate/comparisons?latest_per=host", empty_listing()),
+            ("/api/estate/observations", empty_listing()),
+            (DEDUP_ROUTE, open),
+        ])
+        .await;
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(door_dark_comparison()))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(stub.writes().is_empty(), "{:?}", stub.writes());
+    }
+
+    /// THE DEDUP READS ONLY ESTATE PACKETS (backlog dde64482). Unfiltered,
+    /// the read counted every backlog-item open or closed this week; on
+    /// 2026-09-26 that was 1049 against a 1000-row page, so the truncation
+    /// HOLD engaged on every pass and no ESTATE ALARM of any kind could be
+    /// filed — forge sat below its disk floor for 35 comparisons unalarmed.
+    /// The stub answers as the jobs API does: the `metadata_has` read
+    /// returns only the packets carrying the key, the unfiltered one a
+    /// truncated page of unrelated items. The dedup must still see the
+    /// estate packet it holds, and raise the finding no packet carries.
+    #[tokio::test]
+    async fn a_backlog_past_one_page_does_not_hold_a_new_estate_finding() {
+        let unrelated: Vec<Value> = (0..DEDUP_PAGE)
+            .map(|i| {
+                json!({"id": format!("b{i}"), "status": "closed",
+                            "closed_on": "2026-09-25", "metadata": {"description": "unrelated"}})
+            })
+            .collect();
+        let wide = json!({ "data": unrelated, "total": DEDUP_PAGE + 49 });
+        let narrow = json!({
+            "data": [{"id": "a1", "status": "open",
+                      "metadata": {"estate_finding": "door_dark:dev-ssh/lan", "scope": "door"}}],
+            "total": 1,
+        });
+        // The silence sweep's hosts read (111996f5) is answered as in the
+        // door tests above; this test is about the dedup page, not it.
+        let stub = serve(vec![
+            ("/api/estate/comparisons?latest_per=host", empty_listing()),
+            ("/api/estate/observations", empty_listing()),
+            (DEDUP_ROUTE, narrow),
+            ("/api/jobs", wide),
+        ])
+        .await;
+        let mut comparison = door_dark_comparison();
+        comparison["findings"]["door_dark"]
+            .as_array_mut()
+            .unwrap()
+            .push(
+                json!({"id": "forge-ssh/lan", "door": "forge-ssh", "half": "lan",
+                         "target": "192.0.2.15:22", "reason": "connection refused",
+                         "dark_since": "2026-09-24T11:40:00Z",
+                         "dark_for_s": 1200, "band_s": 900}),
+            );
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing(comparison))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a new finding must raise, not be held: {res:?}"
+        );
+        let posts: Vec<(String, Value)> = stub
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(
+            posts[0].1["metadata"]["estate_finding"], "door_dark:forge-ssh/lan",
+            "the already-raised door is deduped; only the new one files"
         );
     }
 }

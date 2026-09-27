@@ -36,6 +36,16 @@ use uuid::Uuid;
 /// installing + wiring a `serial_test` dep.
 static DB_LOCK: Mutex<()> = Mutex::new(());
 
+/// The code rules over the brewery example tenant's revenue-category
+/// Classes (examples/brewery/seeds/classes.json) — the DB tests below
+/// declare the same Classes with `declare_revenue_categories_of`.
+fn brewery_rules() -> BossRuleSet {
+    BossRuleSet::new(boss_ledger::RevenueAccounts::from_classes(
+        [("distribution", "4140"), ("wholesale", "4100")]
+            .map(|(c, a)| (c.to_string(), Some(a.to_string()))),
+    ))
+}
+
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
 }
@@ -71,7 +81,7 @@ async fn seed_schedule(
               revenue_account, deferred_account, total_cents, start_date, \
               end_date, frequency, recognized_to_date_cents, \
               next_recognition_date, status) \
-         VALUES ($1, 'service_agreement', $2, $3, 'contracts', \
+         VALUES ($1, 'service_agreement', $2, $3, 'distribution', \
                  '4140', '2200', $4, $5, $6, 'monthly', 0, $7, 'active')",
     )
     .bind(id)
@@ -126,6 +136,7 @@ async fn journal_total_for_account(db: &TestDb, account_code: &str) -> (i64, i64
 async fn schedule_closes_after_final_period_recognition() {
     let _guard = DB_LOCK.lock().unwrap();
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_account(&db, "account-e2e-1").await;
 
     let schedule_id = "rs-E2E-1";
@@ -186,6 +197,7 @@ async fn schedule_closes_after_final_period_recognition() {
 async fn period_crossing_contract_recognizes_across_year_boundary() {
     let _guard = DB_LOCK.lock().unwrap();
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_account(&db, "account-e2e-crossing").await;
 
     // Contract runs 2026-12-01 → 2027-11-30 — twelve months spanning
@@ -239,6 +251,7 @@ async fn period_crossing_contract_recognizes_across_year_boundary() {
 async fn locked_period_skip_advances_cursor_without_posting() {
     let _guard = DB_LOCK.lock().unwrap();
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_account(&db, "account-e2e-lock").await;
 
     // Contract starts Feb 1, 2026. We'll lock the Feb period so the
@@ -361,13 +374,13 @@ async fn v1_and_v2_yield_same_annual_revenue_total_over_12_months() {
     let v1_payload = json!({
         "invoice_id": "inv-parity",
         "line_items": [
-            { "category": "contracts", "amount_cents": 1_200_000 },
+            { "category": "distribution", "amount_cents": 1_200_000 },
         ],
     });
     let v2_invoice_payload = json!({
         "invoice_id": "inv-parity",
         "line_items": [
-            { "category": "contracts", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
+            { "category": "distribution", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
         ],
     });
 
@@ -384,8 +397,8 @@ async fn v1_and_v2_yield_same_annual_revenue_total_over_12_months() {
         happened_on: d(2026, 2, 1),
         payload: &v2_invoice_payload,
     };
-    let v1_draft = evaluate(&BossRuleSet, &v1_fact).unwrap();
-    let v2_draft = evaluate(&BossRuleSet, &v2_fact).unwrap();
+    let v1_draft = evaluate(&brewery_rules(), &v1_fact).unwrap();
+    let v2_draft = evaluate(&brewery_rules(), &v2_fact).unwrap();
 
     // v1: 4140 gets a direct credit. v2: 2200 gets the credit on invoice.
     let v1_rev_credit: i64 = v1_draft
@@ -423,7 +436,7 @@ async fn v1_and_v2_yield_same_annual_revenue_total_over_12_months() {
             "period_start": post_date,
             "period_end": post_date,
             "amount_cents": amount,
-            "category": "contracts",
+            "category": "distribution",
             "account_id": "account-e2e-parity",
         });
         let recognition_fact = FactRef {
@@ -432,7 +445,7 @@ async fn v1_and_v2_yield_same_annual_revenue_total_over_12_months() {
             happened_on: post_date,
             payload: &payload,
         };
-        let r = evaluate(&BossRuleSet, &recognition_fact).unwrap();
+        let r = evaluate(&brewery_rules(), &recognition_fact).unwrap();
         v2_recognized_revenue += r
             .lines
             .iter()

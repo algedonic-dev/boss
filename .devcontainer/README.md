@@ -37,7 +37,7 @@ finds Postgres via `BOSS_TEST_POSTGRES_ADMIN_URL`.
 ```bash
 # Rust — the same gates CI runs
 cargo build --workspace
-cargo clippy --workspace --all-features --tests -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --all-features
 cargo fmt -- --check
 

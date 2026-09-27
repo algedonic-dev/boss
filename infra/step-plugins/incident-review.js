@@ -1,5 +1,8 @@
-// incident-review.js — custom Step UX for the incident-post-mortem
-// Workflow's "Human review of the findings" step.
+// incident-review.js — custom Step UX for the `incident` Workflow's
+// "Human review of the findings" step. Written for incident-post-mortem,
+// whose review never mounted it; that protocol was folded into
+// `incident` on 2026-09-24 (backlog 59d15039), whose review step is the
+// first to declare kind=incident-review.
 //
 // WHY THIS EXISTS. Two feedback packets said the review step renders
 // the findings unusably; one asked for "a custom step UX that
@@ -30,10 +33,10 @@
 // WHY A NEW KIND AND NOT A PLUGIN ON `task`. Plugins register by step
 // kind and the SPA mounts by kind; registering for `task` would hijack
 // every task step in the system (same rationale recorded on
-// 146-correction-verdict-plugin.sql). The Workflow's review step moves
-// to kind=incident-review in the next workflow version; the Rust
-// StepRegistry does not need to learn the kind (validate_metadata is
-// permissive for kinds it does not know).
+// 146-correction-verdict-plugin.sql). The Workflow's review step
+// declares kind=incident-review; the Rust StepRegistry does not need to
+// learn the kind (validate_metadata is permissive for kinds it does not
+// know).
 //
 // Plugin contract: window.__boss_register_step_plugin(kind, mount).
 // Host calls mount(container, props) with { step, jobId, onUpdate }.
@@ -128,10 +131,32 @@
     document.head.appendChild(el);
   }
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    })[c]);
+  // The document is built as nodes, never as an HTML string (backlog
+  // 4a359b51, 2026-09-27): every finding, title and holder is metadata
+  // any actor may write, and a string of markup is one missed escape
+  // from running it. A string child is a Text node by append's
+  // definition.
+  function h(tag, attrs, ...children) {
+    const el = document.createElement(tag);
+    if (attrs) {
+      for (const k in attrs) {
+        const v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'className') el.className = v;
+        else if (k.startsWith('on') && typeof v === 'function') {
+          el.addEventListener(k.slice(2).toLowerCase(), v);
+        } else if (k === 'disabled') {
+          el[k] = v;
+        } else {
+          el.setAttribute(k, String(v));
+        }
+      }
+    }
+    for (const child of children.flat()) {
+      if (child == null || child === false) continue;
+      el.append(child instanceof Node ? child : String(child));
+    }
+    return el;
   }
 
   function humanize(key) {
@@ -204,12 +229,12 @@
     'agent_requested_at', 'agent_requested_by',
   ]);
 
-  function sectionHtml(s) {
-    return (
-      '<section class="sir-section">' +
-      '<h5 class="sir-label">' + esc(s.label) + '</h5>' +
-      '<p class="sir-body">' + esc(s.body) + '</p>' +
-      '</section>'
+  function sectionNode(s) {
+    return h(
+      'section',
+      { className: 'sir-section' },
+      h('h5', { className: 'sir-label' }, s.label),
+      h('p', { className: 'sir-body' }, s.body),
     );
   }
 
@@ -230,14 +255,19 @@
 
     const terminal = step.status === 'completed' || step.status === 'skipped';
 
-    function findingsHtml() {
+    function findings() {
       if (loadError) {
         // The findings are the point — say so rather than rendering a
         // confident-looking empty review (false-empty sweep).
-        return '<p class="sir-err">Could not load the post-mortem findings — ' +
-          esc(loadError) + '. Reload before reviewing.</p>';
+        return [
+          h(
+            'p',
+            { className: 'sir-err' },
+            `Could not load the post-mortem findings — ${loadError}. Reload before reviewing.`,
+          ),
+        ];
       }
-      if (!job) return '<p class="sir-empty">Loading the findings…</p>';
+      if (!job) return [h('p', { className: 'sir-empty' }, 'Loading the findings…')];
 
       const meta = job.metadata || {};
       const when = prose(meta.incident_at) || prose(meta.incident_date);
@@ -256,58 +286,61 @@
         }))
         .filter((x) => x.found.length > 0);
 
-      return (
-        '<div class="sir-head">' +
-        '<h3>' + esc(job.title || 'Post-mortem findings') + '</h3>' +
-        (when ? '<span class="sir-when">' + esc(when) + '</span>' : '') +
-        '</div>' +
-        (sections.length
-          ? sections.map(sectionHtml).join('')
-          : '<p class="sir-empty">The packet carries no findings in its metadata yet.</p>') +
-        (siblings.length
-          ? '<h4 class="sir-steps-title">What each step found</h4>' +
-            siblings
-              .map(
-                (x) =>
-                  '<article class="sir-step' +
-                  (x.step.status === 'skipped' ? ' sir-skipped' : '') +
-                  '">' +
-                  '<h4>' + esc(x.step.title) +
-                  (x.step.assignee_id
-                    ? ' <span class="sir-by">· ' + esc(x.step.assignee_id) + '</span>'
-                    : '') +
-                  '</h4>' +
-                  x.found.map(sectionHtml).join('') +
-                  '</article>',
-              )
-              .join('')
-          : '')
-      );
+      return [
+        h(
+          'div',
+          { className: 'sir-head' },
+          h('h3', null, job.title || 'Post-mortem findings'),
+          when ? h('span', { className: 'sir-when' }, when) : null,
+        ),
+        sections.length
+          ? sections.map(sectionNode)
+          : h('p', { className: 'sir-empty' }, 'The packet carries no findings in its metadata yet.'),
+        siblings.length ? h('h4', { className: 'sir-steps-title' }, 'What each step found') : null,
+        siblings.map((x) =>
+          h(
+            'article',
+            { className: `sir-step${x.step.status === 'skipped' ? ' sir-skipped' : ''}` },
+            h(
+              'h4',
+              null,
+              x.step.title,
+              x.step.assignee_id
+                ? [' ', h('span', { className: 'sir-by' }, `· ${x.step.assignee_id}`)]
+                : null,
+            ),
+            x.found.map(sectionNode),
+          ),
+        ),
+      ].flat();
     }
 
-    function actionsHtml() {
+    function actions() {
       if (terminal) {
-        return '<div class="sir-done">Review recorded — this step is ' +
-          esc(step.status) + '. The document above is the durable record.</div>';
+        return h(
+          'div',
+          { className: 'sir-done' },
+          `Review recorded — this step is ${step.status}. The document above is the durable record.`,
+        );
       }
       // A findings load failure must not offer completion: reviewing a
       // post-mortem nobody has seen is not a review (same gate
       // review-design.js carries).
-      if (loadError || !job) return '';
-      return (
-        '<div class="sir-actions">' +
-        '<button type="button" data-action="complete"' + (saving ? ' disabled' : '') + '>' +
-        (saving ? 'Recording…' : 'Findings reviewed — complete review') +
-        '</button>' +
-        (saveError ? '<span class="sir-err">' + esc(saveError) + '</span>' : '') +
-        '</div>'
+      if (loadError || !job) return null;
+      return h(
+        'div',
+        { className: 'sir-actions' },
+        h(
+          'button',
+          { type: 'button', 'data-action': 'complete', disabled: saving, onClick: complete },
+          saving ? 'Recording…' : 'Findings reviewed — complete review',
+        ),
+        saveError ? h('span', { className: 'sir-err' }, saveError) : null,
       );
     }
 
     function render() {
-      root.innerHTML = findingsHtml() + actionsHtml();
-      const btn = root.querySelector('[data-action=complete]');
-      if (btn) btn.addEventListener('click', complete);
+      root.replaceChildren(...[...findings(), actions()].filter(Boolean));
     }
 
     async function complete() {

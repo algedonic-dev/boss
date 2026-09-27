@@ -12,8 +12,23 @@
 //! - `subject_exists` is the uniform existence probe the jobs gate
 //!   uses for every kind.
 
-use boss_subject_kinds::subjects::{record_subject_in_tx, subject_exists, upsert_subject};
+use boss_subject_kinds::subjects::{record_subject_in_tx, subject_exists};
 use boss_testing::TestDb;
+
+/// One write-through in a transaction of its own — the shape every
+/// domain caller of `record_subject_in_tx` has. (The pool-level
+/// `upsert_subject` these tests used had no caller outside them and
+/// was deleted with backlog 92473357: a write that stages no fact.)
+async fn write_through(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    id: &str,
+    label: Option<&str>,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    record_subject_in_tx(&mut tx, kind, id, label).await?;
+    tx.commit().await.map_err(|e| e.to_string())
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn record_in_tx_commit_lands_rollback_does_not() {
@@ -64,11 +79,11 @@ async fn unregistered_kind_is_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn upsert_is_idempotent_and_label_never_regresses() {
     let db = TestDb::new().await;
-    upsert_subject(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One"))
+    write_through(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One"))
         .await
         .unwrap();
     // Re-upsert with no label: keeps the old one.
-    upsert_subject(&db.pool, "vendor", "vnd-r1-001", None)
+    write_through(&db.pool, "vendor", "vnd-r1-001", None)
         .await
         .unwrap();
     let label: Option<String> =
@@ -78,7 +93,7 @@ async fn upsert_is_idempotent_and_label_never_regresses() {
             .unwrap();
     assert_eq!(label.as_deref(), Some("Vendor One"));
     // A newer non-null label wins.
-    upsert_subject(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One Renamed"))
+    write_through(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One Renamed"))
         .await
         .unwrap();
     let label: Option<String> =
@@ -92,7 +107,7 @@ async fn upsert_is_idempotent_and_label_never_regresses() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exists_is_false_for_unknown_and_kind_scoped() {
     let db = TestDb::new().await;
-    upsert_subject(&db.pool, "account", "shared-id", None)
+    write_through(&db.pool, "account", "shared-id", None)
         .await
         .unwrap();
     assert!(
@@ -395,6 +410,134 @@ async fn the_mint_door_keeps_a_held_label_by_default_and_overwrites_only_under_t
     assert_eq!(label().await.as_deref(), Some("Acme, LLC"));
 }
 
+/// A subject minted or relabelled through the mint door survives a
+/// rebuild from the log (backlog 92473357, mechanism A of design
+/// 3036296f). Until 2026-09-27 `publish_subject` wrote `subjects` on
+/// the pool and staged nothing, while `rebuild_subjects` TRUNCATEs the
+/// table and replays it from `audit_log` — so every identity the door
+/// minted (a company at tenant publish, a sim birth, an operator's
+/// mint) was gone after the first rebuild, and a relabel under take
+/// reverted.
+///
+/// The replay: drive the door the way its callers do, drain the outbox
+/// through the real relay, snapshot the rows the door wrote, rebuild
+/// from the log, and read the same rows back. A kept declaration moves
+/// nothing, so it records nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subject_the_mint_door_wrote_is_rebuilt_from_the_log() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use boss_core::port::EventBus;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    const OPERATOR: &str = r#"{"id":"emp-op-1","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
+    let db = TestDb::new().await;
+    let app = boss_subject_kinds::subjects::subjects_router(db.pool.clone());
+    let post = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-boss-user", OPERATOR)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    for (uri, body, want) in [
+        // Minted with a label, through the kind-scoped door the tenant
+        // publish uses.
+        (
+            "/api/subjects/company",
+            serde_json::json!({"id": "acme-rb", "label": "Acme, LLC"}),
+            StatusCode::CREATED,
+        ),
+        // Minted with no label, through the body-kind door.
+        (
+            "/api/subjects",
+            serde_json::json!({"kind": "workflow", "id": "wf-rb"}),
+            StatusCode::CREATED,
+        ),
+        // Relabelled under take.
+        (
+            "/api/subjects/company?mode=take",
+            serde_json::json!({"id": "acme-rb", "label": "Acme Holdings"}),
+            StatusCode::OK,
+        ),
+        // Kept: the held label stays, and nothing moved.
+        (
+            "/api/subjects/company",
+            serde_json::json!({"id": "acme-rb", "label": "Acme, LLC"}),
+            StatusCode::OK,
+        ),
+    ] {
+        let resp = app.clone().oneshot(post(uri, body)).await.unwrap();
+        assert_eq!(resp.status(), want, "{uri}");
+    }
+
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
+
+    let snapshot = || async {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT kind, id, label FROM subjects \
+             WHERE (kind, id) IN (('company', 'acme-rb'), ('workflow', 'wf-rb')) \
+             ORDER BY kind, id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+    };
+    let live = snapshot().await;
+    assert_eq!(
+        live,
+        vec![
+            (
+                "company".into(),
+                "acme-rb".into(),
+                Some("Acme Holdings".into())
+            ),
+            ("workflow".into(), "wf-rb".into(), None),
+        ],
+        "the door wrote what it answered"
+    );
+
+    boss_subject_kinds::subjects::rebuild_subjects(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot().await,
+        live,
+        "a rebuild from the log must reproduce every row the mint door wrote"
+    );
+
+    // One fact per state change, signed by the caller: two mints and
+    // one relabel — the kept declaration left none. The kinds are
+    // spelled out, not read from the consts: they are the wire names
+    // the event_kinds migration declares.
+    let facts: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT kind, payload FROM audit_log \
+         WHERE kind LIKE 'subjects.subject.%' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let kinds: Vec<&str> = facts.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "subjects.subject.minted",
+            "subjects.subject.minted",
+            "subjects.subject.relabelled",
+        ]
+    );
+    assert_eq!(facts[2].1["from"], "Acme, LLC");
+    assert_eq!(facts[2].1["label"], "Acme Holdings");
+    for (_, payload) in &facts {
+        assert_eq!(payload["_actor"], "emp-op-1", "{payload}");
+    }
+}
+
 /// The list read `boss tenant export` writes `tenant.toml`'s
 /// display_name from (design e187198f car 3, backlog e618f3ac).
 /// Measured 2026-09-18: the company Subject lives in `subjects` (kind
@@ -409,13 +552,13 @@ async fn a_kind_lists_every_identity_row_sorted_with_its_label() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     let db = TestDb::new().await;
-    upsert_subject(&db.pool, "company", "zeta", Some("Zeta, LLC"))
+    write_through(&db.pool, "company", "zeta", Some("Zeta, LLC"))
         .await
         .unwrap();
-    upsert_subject(&db.pool, "company", "acme", None)
+    write_through(&db.pool, "company", "acme", None)
         .await
         .unwrap();
-    upsert_subject(&db.pool, "vendor", "vnd-1", Some("not a company"))
+    write_through(&db.pool, "vendor", "vnd-1", Some("not a company"))
         .await
         .unwrap();
 

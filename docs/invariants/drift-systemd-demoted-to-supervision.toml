@@ -1,7 +1,7 @@
 [[invariant]]
 id = "drift-systemd-demoted-to-supervision"
 claim = "systemd is demoted to supervision — cadence moves out of timers."
-source = "implied by the cadence work; docs/design/protocol-cadence.md"
+source = "implied by the cadence work; the protocol-cadence decision in docs/architecture-decisions.md"
 enforcement = "unenforced"
 mechanism = ""
 last_verified = ""

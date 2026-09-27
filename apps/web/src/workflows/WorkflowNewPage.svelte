@@ -15,23 +15,47 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
   import { href, navigate } from '../router';
+  import {
+    failedRead,
+    loadingRead,
+    readStateOfResponse,
+    type ReadState,
+  } from '../data/readState';
 
   let ownerId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
   );
 
+  // The two suggestion reads and their outcomes (backlog aaeb02d6). Each
+  // used to end in `if (!r.ok) return` and a bare catch, so a failure
+  // kept the defaults and the form looked like a registry with no
+  // categories and nothing beyond the built-in subject kinds. The form
+  // still works without either — both only fill suggestions — so each
+  // failure is a named line, not a blocked page.
+  const WORKFLOWS_URL = '/api/workflows';
+  const SUBJECT_KINDS_URL = '/api/subject-kinds';
+
+  /// Fetch one suggestion read and parse it, or say why not.
+  async function suggestionRead<T>(url: string): Promise<{ read: ReadState; body: T | null }> {
+    try {
+      const r = await fetch(url);
+      const read = readStateOfResponse(url, r);
+      return read.kind === 'ok' ? { read, body: (await r.json()) as T } : { read, body: null };
+    } catch (e) {
+      return { read: failedRead(`${url}: ${e instanceof Error ? e.message : String(e)}`), body: null };
+    }
+  }
+
   let categoryOptions = $state<string[]>([]);
+  let workflowsRead = $state<ReadState>(loadingRead);
   $effect(() => {
     let cancelled = false;
     void (async () => {
-      try {
-        const r = await fetch('/api/workflows');
-        if (!r.ok) return;
-        const kinds = (await r.json()) as Array<{ category?: string }>;
-        if (cancelled) return;
-        categoryOptions = [...new Set(kinds.map((k) => k.category).filter((c): c is string => !!c))].sort();
-      } catch {
-        // empty datalist → free text only
+      const { read, body } = await suggestionRead<Array<{ category?: string }>>(WORKFLOWS_URL);
+      if (cancelled) return;
+      workflowsRead = read;
+      if (body) {
+        categoryOptions = [...new Set(body.map((k) => k.category).filter((c): c is string => !!c))].sort();
       }
     })();
     return () => { cancelled = true; };
@@ -40,20 +64,18 @@
   let subjectKindOptions = $state<string[]>([
     'asset', 'account', 'employee', 'vendor', 'campaign', 'purchase_order', 'custom',
   ]);
+  let subjectKindsRead = $state<ReadState>(loadingRead);
   $effect(() => {
     let cancelled = false;
     void (async () => {
-      try {
-        const r = await fetch('/api/subject-kinds');
-        if (!r.ok) return;
-        const rows = (await r.json()) as Array<{ kind: string }>;
-        if (cancelled) return;
+      const { read, body } = await suggestionRead<Array<{ kind: string }>>(SUBJECT_KINDS_URL);
+      if (cancelled) return;
+      subjectKindsRead = read;
+      if (body) {
         subjectKindOptions = [...new Set([
-          ...rows.map((x) => x.kind),
+          ...body.map((x) => x.kind),
           'asset', 'account', 'employee', 'vendor', 'campaign', 'purchase_order', 'custom',
         ])].sort();
-      } catch {
-        // keep defaults
       }
     })();
     return () => { cancelled = true; };
@@ -148,29 +170,40 @@
     subtitle="Name it, then build the trigger→outcome graph in the authoring workspace. Nothing publishes until you drive the design Job to its publish step."
   />
 
+  {#if workflowsRead.kind === 'failed'}
+    <p class="load-failed" role="alert">
+      Couldn't load the existing job kinds — {workflowsRead.error}. Category has no suggestions; type one.
+    </p>
+  {/if}
+  {#if subjectKindsRead.kind === 'failed'}
+    <p class="load-failed" role="alert">
+      Couldn't load subject kinds — {subjectKindsRead.error}. Only the built-in subject kinds are listed below.
+    </p>
+  {/if}
+
   <Section title="Identity">
     <div style="display:grid; gap:12px; max-width:800px">
       <div>
-        <div style="font-size:12px; color:#666; margin-bottom:2px">
+        <div style="font-size:12px; color:var(--static); margin-bottom:2px">
           Kind slug
-          <span style="color:#888"> — lowercase, hyphen-separated; becomes the kind's permanent identity</span>
+          <span style="color:var(--static)"> — lowercase, hyphen-separated; becomes the kind's permanent identity</span>
         </div>
         <input bind:value={kindSlug} placeholder="seasonal-release" class="mono" style="padding:6px; font-size:13px; width:100%" />
       </div>
       <div>
-        <div style="font-size:12px; color:#666; margin-bottom:2px">Label</div>
+        <div style="font-size:12px; color:var(--static); margin-bottom:2px">Label</div>
         <input bind:value={label} placeholder="Seasonal Release" style="padding:6px; font-size:13px; width:100%" />
       </div>
       <div>
-        <div style="font-size:12px; color:#666; margin-bottom:2px">Category</div>
+        <div style="font-size:12px; color:var(--static); margin-bottom:2px">Category</div>
         <input list="category-options" bind:value={category} placeholder="production / sales / procurement / …" style="padding:6px; font-size:13px" />
         <datalist id="category-options">
           {#each categoryOptions as c (c)}<option value={c}></option>{/each}
         </datalist>
       </div>
       <div>
-        <div style="font-size:12px; color:#666; margin-bottom:2px">
-          Subject kinds <span style="color:#888"> — what each Job of this kind is about</span>
+        <div style="font-size:12px; color:var(--static); margin-bottom:2px">
+          Subject kinds <span style="color:var(--static)"> — what each Job of this kind is about</span>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap">
           {#each subjectKindOptions as s (s)}
@@ -182,16 +215,16 @@
         </div>
       </div>
       <div>
-        <div style="font-size:12px; color:#666; margin-bottom:2px">Description <span style="color:#888"> — optional</span></div>
+        <div style="font-size:12px; color:var(--static); margin-bottom:2px">Description <span style="color:var(--static)"> — optional</span></div>
         <textarea bind:value={description} rows="3" placeholder="What this kind of Job accomplishes" style="padding:6px; font-size:13px; width:100%"></textarea>
       </div>
     </div>
   </Section>
 
   <div style="padding:0 24px 24px; display:flex; gap:12px; align-items:center">
-    <button type="button" class="wb-btn wb-btn-primary" onclick={start} disabled={starting}>
+    <button type="button" class="btn btn-primary" onclick={start} disabled={starting}>
       {starting ? 'Creating…' : 'Create & author →'}
     </button>
-    {#if error}<span style="color:#dc2626; font-size:13px">{error}</span>{/if}
+    {#if error}<span style="color:var(--err); font-size:13px">{error}</span>{/if}
   </div>
 </div>

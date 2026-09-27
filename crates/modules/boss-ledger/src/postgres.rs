@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::error::LedgerError;
 use crate::posting_rules::{DataRuleSet, load_newest_rule_in_tx};
-use crate::rules::{evaluate, is_gl_inert};
+use crate::rules::{credits_revenue_by_category, evaluate, is_gl_inert};
 use crate::tax_registry::{check_tax_accounts_in_tx, names_a_tax_liability};
 use crate::types::{FactRef, JournalEntryDraft};
 
@@ -41,7 +41,9 @@ use crate::types::{FactRef, JournalEntryDraft};
 pub const RULE_SET_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
 
 /// The one construction site of the active RuleSet: one primary-key
-/// read for the fact's kind, then the pure evaluation.
+/// read for the fact's kind, the revenue-category Classes for a fact
+/// whose rule credits revenue by category (backlog aa860c6d — the
+/// account is the Class's `gl_account`), then the pure evaluation.
 async fn evaluate_active(
     tx: &mut Transaction<'_, Postgres>,
     fact: &FactRef<'_>,
@@ -52,6 +54,11 @@ async fn evaluate_active(
             .into_iter()
             .collect(),
     );
+    let rules = if credits_revenue_by_category(fact.kind) {
+        rules.with_revenue_accounts(crate::revenue_accounts::load(&mut **tx).await?)
+    } else {
+        rules
+    };
     let draft = evaluate(&rules, fact)?;
     Ok((draft, RULE_SET_ID))
 }

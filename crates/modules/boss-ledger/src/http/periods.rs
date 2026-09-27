@@ -22,6 +22,9 @@ pub(super) async fn list_periods_handler(State(state): State<Arc<LedgerApiState>
 
 #[derive(Deserialize)]
 pub(super) struct LockBody {
+    /// Read only to refuse a claim: the locker is the signed caller
+    /// (`super::author`, backlog 975c228f — the finance page sent the
+    /// literal `operator`, which the Periods table showed as "Locked by").
     #[serde(default)]
     locked_by: Option<String>,
 }
@@ -35,9 +38,11 @@ pub(super) async fn lock_handler(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    let locked_by = body
-        .and_then(|b| b.0.locked_by)
-        .unwrap_or_else(|| "ledger".to_string());
+    let said = body.and_then(|b| b.0.locked_by);
+    let locked_by = match super::author::author(&user, "locked_by", said.as_deref()) {
+        Ok(a) => a,
+        Err(refused) => return refused.into_response(),
+    };
     // Outbox phase 2: the who-locked-what audit event records inside
     // lock_period's own transaction.
     let stamp = super::event_stamp(&state, &user).await;
@@ -191,6 +196,8 @@ pub(super) async fn create_period_handler(
 /// existing checksum without re-posting.
 #[derive(Deserialize)]
 pub(super) struct CloseBody {
+    /// Read only to refuse a claim: the closer, written to the year's
+    /// `locked_by`, is the signed caller (backlog 975c228f).
     #[serde(default)]
     closed_by: Option<String>,
     /// Retained-earnings account the net income rolls into. Defaults
@@ -237,7 +244,10 @@ pub(super) async fn close_period_handler(
         retained_earnings_account: None,
         wip_account: None,
     });
-    let closed_by = body.closed_by.unwrap_or_else(|| "ledger".to_string());
+    let closed_by = match super::author::author(&user, "closed_by", body.closed_by.as_deref()) {
+        Ok(a) => a,
+        Err(refused) => return refused.into_response(),
+    };
     let retained_earnings = body
         .retained_earnings_account
         .unwrap_or_else(|| "3000".to_string());
@@ -424,7 +434,7 @@ pub(super) async fn close_period_handler(
         happened_on: ends_on,
         payload: &payload,
     };
-    let draft = match crate::rules::evaluate(&crate::BossRuleSet, &fact_ref) {
+    let draft = match crate::rules::evaluate(&crate::BossRuleSet::default(), &fact_ref) {
         Ok(d) => d,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };

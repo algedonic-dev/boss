@@ -10,9 +10,19 @@
   // order-composer here — that's what the SPA's Sales surface is
   // for. Intake is the "yes, this is what we're brewing" gate.
 
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { untrack } from 'svelte';
+  import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { putStep, releaseStep, startStep } from './stepWrite';
+  import {
+    HOLDER_LOCKED_NOTE,
+    askReleaseReason,
+    claimedFor,
+    gestureFields,
+    holderLocked,
+    startable,
+  } from './holder';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
 
   type LineItem = {
@@ -66,6 +76,15 @@
     void step.id;
     writeError = null;
   });
+  /// The picker follows the step it shows, and an active step's holder
+  /// is not offered for change — GenericSurface says why (backlogs
+  /// 848477c3, 650ebd0c, 0f42efa0).
+  let holderKey = $derived(`${step.id}\u0000${step.assignee_id ?? ''}`);
+  $effect(() => {
+    void holderKey;
+    assigneeId = untrack(() => step.assignee_id ?? '');
+  });
+  let locked = $derived(holderLocked(step));
   let terminal = $derived(_isTerminal(step.status));
 
   let employees = $state<Employee[]>([]);
@@ -88,23 +107,51 @@
     lineItems.reduce((sum, li) => sum + (li.amount_cents ?? 0), 0),
   );
 
-  async function persist(status?: string): Promise<void> {
+  /// `status` only when the gesture moves the step, and the holder only
+  /// when the picker changed it — neither from the snapshot this body
+  /// is otherwise built on (backlog 6ef4a36b; GenericSurface says why).
+  /// A Start saves and then claims (design 611fbffd, clause b).
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
       const body = {
-        ...step,
+        ...drawn,
         job_id: jobId,
         notes: notes || undefined,
-        status: status ?? step.status,
-        assignee_id: assigneeId || null,
+        ...gestureFields(step, assigneeId, status),
         metadata: {
           ...step.metadata,
           delivery_window: deliveryWindow,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      let res = await putStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(assigneeId));
+      }
       if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
+      onUpdate();
+    } finally {
+      saving = false;
+    }
+  }
+
+  /// The release the note beside the picker names (backlog 6ef4a36b),
+  /// with its reason asked first and a partial release left on screen
+  /// (the review of car 675f1858, #2).
+  async function release(): Promise<void> {
+    const why = askReleaseReason();
+    if (why === null) return;
+    saving = true;
+    writeError = null;
+    try {
+      const by = session.value.kind === 'ready' ? session.value.user.id : null;
+      const res = await releaseStep(jobId, step, why, by);
+      if (res.kind !== 'ok') {
         writeError = res.error;
         return;
       }
@@ -173,13 +220,16 @@
     <select
       id={`assignee-${step.id}`}
       bind:value={assigneeId}
-      disabled={terminal || saving}
+      disabled={terminal || saving || locked}
     >
       <option value="">— unassigned —</option>
       {#each employees as e (e.id)}
         <option value={e.id}>{e.name} · {e.role}</option>
       {/each}
     </select>
+    {#if locked}
+      <span class="step-meta-row small step-holder-locked">{HOLDER_LOCKED_NOTE}</span>
+    {/if}
   </div>
 
   <div class="step-field">
@@ -198,18 +248,28 @@
   {/if}
 
   <div class="step-actions">
-    {#if !terminal && isPending(step.status)}
+    {#if startable(step)}
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist('active')}
+        class="btn btn-primary"
+        onclick={() => persist(undefined, true)}
         disabled={saving}
       >
         Start
       </button>
     {/if}
+    {#if locked}
+      <button
+        class="btn"
+        onclick={release}
+        disabled={saving}
+        title="Hand this step back — it returns to ready, and the next holder claims it"
+      >
+        Release
+      </button>
+    {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving}
       >
@@ -228,32 +288,32 @@
   }
   .step-line-items td {
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-line-items .qty {
     width: 60px;
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
   .step-line-items .desc {
-    color: var(--text, #111827);
+    color: var(--text);
   }
   .step-line-items .amount {
     width: 100px;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
   .step-line-items tr.total {
     font-weight: 600;
   }
   .step-line-items tr.total td {
-    border-top: 1px solid var(--border, #d1d5db);
+    border-top: 1px solid var(--border);
     border-bottom: none;
-    color: var(--text, #111827);
+    color: var(--text);
   }
   .step-line-items tr.total .amount {
-    color: var(--text, #111827);
+    color: var(--text);
   }
 </style>

@@ -39,8 +39,10 @@ export type Subject = {
   id: string;
 };
 
-export type JobStatus =
-  | 'draft' | 'open' | 'blocked' | 'pending-sign-off' | 'closed' | 'cancelled';
+/** Mirrors `boss_core::job::JobStatus`. `blocked` and `pending-sign-off`
+ *  were retired (backlog 3c3dc8f3): no Job ever held either, and the
+ *  API now refuses both. */
+export type JobStatus = 'draft' | 'open' | 'closed' | 'cancelled';
 
 /**
  * Five-state predicate-driven lifecycle (mirrors `boss_core::job::StepStatus`).
@@ -116,7 +118,15 @@ export type Step = {
     shape_hash: string;
   }[];
   completed_on: string | null;
+  /// ABSENT on a step read off `GET /api/jobs?…` with `full=false` —
+  /// and, once the list's default flips to slim, whenever the read does
+  /// not ask `full=true` (backlog 9b473d4a). The one-packet GET always
+  /// carries both. A board reading this off a listed row asks `full`.
   metadata: Record<string, unknown>;
+  /// The job's corrections that target this step, attached by the job
+  /// GET (design 4105b020); absent when there are none. Read only
+  /// through `steps/corrections.ts`, which the one marker draws from.
+  corrections?: unknown;
   notes?: string | null;
   /// Pointer to a child Job when this Step's work decomposes
   /// further. Structural column on the `steps` table; traversal
@@ -140,6 +150,38 @@ export type Job = {
   steps?: Step[];
 };
 
+/// The body of a Job read from `url`, or a throw naming what it lacks.
+///
+/// Only what JobDetailPage dereferences is checked: an object carrying
+/// an `id`, a `subject` object (subjectPath reads `s.id` off it), and
+/// `steps` that are a list when present. Every other field renders as
+/// it comes. Backlog c2e18fdd (2026-09-26): the page cast any 2xx body
+/// to Job, the mocked api floor's `[]` among them, and the Subject
+/// section threw "Cannot read properties of undefined (reading 'id')"
+/// under a passing spec. The real jobs API always sends `subject`, so
+/// production meets this only on a wrong-shaped 200 — and that is a
+/// failed read, said on the failure line, as the employee page's is
+/// (548a1e8d), never a render throw.
+export function parseJob(url: string, raw: unknown): Job {
+  if (
+    typeof raw !== 'object' ||
+    raw === null ||
+    Array.isArray(raw) ||
+    typeof (raw as { id?: unknown }).id !== 'string'
+  ) {
+    throw new Error(`${url}: the answer is not a Job`);
+  }
+  const row = raw as Record<string, unknown>;
+  const subject = row['subject'];
+  if (typeof subject !== 'object' || subject === null || Array.isArray(subject)) {
+    throw new Error(`${url}: the Job carries no subject`);
+  }
+  if (row['steps'] !== undefined && !Array.isArray(row['steps'])) {
+    throw new Error(`${url}: the Job's steps are not a list`);
+  }
+  return raw as Job;
+}
+
 /// Pick the human-readable identifier for a Subject — the value
 /// most useful in a table row or a hero header.
 export function subjectLabel(s: Subject): string {
@@ -149,33 +191,37 @@ export function subjectLabel(s: Subject): string {
 /// Pick the canonical SPA path for a Subject — where clicking the
 /// subject in a list should navigate to.
 ///
-/// Same dispatch shape as `subjectLabel`; unknown kinds return `'#'`
-/// so existing click handlers don't throw.
+/// The cases are the kinds this SPA has a page for. Every other kind
+/// lands on its own packets, and needs no case to: a kind is registry
+/// data (boss-subject-kinds), a tenant adds one without touching this
+/// file, and every Subject a Job points at has at least that Job.
+/// `subject_id` is the filter the /jobs route already parses, and it
+/// asks the honest question — this subject's work, whatever protocol
+/// it runs under.
+///
+/// A campaign got there first, from `kind=marketing-motion`, a tenant
+/// workflow hardcoded into shared frontend (backlog 423a531d,
+/// 2026-09-22). `custom` and every unnamed kind answered `'#'` until
+/// backlog 4af37dd8 (2026-09-24): `href('#')` is `/#`, which parses as
+/// `/`, so the click landed on Home — for every open packet on the
+/// instance, all of which are `custom`.
 export function subjectPath(s: Subject): string {
+  // The canonical /ux/… spelling, as entityHref writes it. These were
+  // the router's unprefixed legacy paths, which resolve only because
+  // the router strips /ux "defensively" (backlog d0b93b80).
+  const id = encodeURIComponent(s.id ?? '');
   switch (s.subject_kind) {
     case 'asset':
-      return `/assets/${encodeURIComponent(s.id)}`;
+      return `/ux/assets/${id}`;
     case 'account':
-      return `/accounts/${s.id ?? ''}`;
+      return `/ux/accounts/${id}`;
     case 'purchase_order':
-      return `/purchase-orders/${s.id ?? ''}`;
-    // A campaign has no page of its own, so it lands on its own
-    // packets. It used to land on `kind=marketing-motion`, a
-    // tenant workflow hardcoded into shared frontend
-    // (backlog 423a531d, 2026-09-22): an instance running another
-    // tenant does not publish that kind, so the click reached an
-    // empty list. `subject_id` is the filter the /jobs route already
-    // parses, and it asks the honest question — this campaign's work,
-    // whatever protocol it runs under.
-    case 'campaign':
-      return `/jobs?subject_id=${encodeURIComponent(s.id ?? '')}`;
+      return `/ux/purchase-orders/${id}`;
     case 'employee':
-      return `/people/${s.id ?? ''}`;
+      return `/ux/people/${id}`;
     case 'vendor':
-      return `/vendors/${s.id ?? ''}`;
-    case 'custom':
-      return '#';
+      return `/ux/vendors/${id}`;
     default:
-      return '#';
+      return `/ux/jobs?subject_id=${id}`;
   }
 }

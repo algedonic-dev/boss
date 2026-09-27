@@ -718,15 +718,18 @@ fn shipped_verbs(root: &Path) -> PathBuf {
 
 /// One open ops-request for boss-gcp carrying the verb and args, run
 /// through `ops-runner.sh` against a stubbed system of record. The
-/// stub `curl` answers the jobs read with the packet, records the PUT,
+/// stub `curl` answers the jobs read with the packet, keeps what it recorded on the step,
 /// and answers the estate-nodes read the script makes.
 fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json::Value>) {
     write_exec(
         &c.bin.join("curl"),
-        "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
-         for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
-         cat \"$STUB_JOBS\"\n",
+        &[
+            "#!/bin/sh\n",
+            boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
+            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
+             cat \"$STUB_JOBS\"\n",
+        ]
+        .concat(),
     );
     write_file(
         &c.root.join("jobs.json"),
@@ -734,8 +737,8 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
             r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"boss-gcp","verb":"uninstall-not-in-role","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}]}}"#
         ),
     );
-    let put = c.root.join("put.json");
-    let _ = std::fs::remove_file(&put);
+    let step_md = c.root.join("step-metadata.json");
+    let _ = std::fs::remove_file(&step_md);
     let mut cmd = Command::new("sh");
     cmd.arg(repo_root().join("infra/ops/ops-runner.sh"));
     c.env(&mut cmd);
@@ -743,17 +746,14 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", c.root.join("jobs.json"))
-        .env("STUB_PUT", &put);
+        .env("STUB_STEP_METADATA", &step_md);
     let out = cmd.output().expect("ops-runner.sh runs");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let meta = std::fs::read_to_string(&put)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("PUT payload is JSON"))
-        .map(|v| v["metadata"].clone());
+    let meta = boss_testing::ops_runner_stub::step_metadata_written(&step_md);
     (text, meta)
 }
 

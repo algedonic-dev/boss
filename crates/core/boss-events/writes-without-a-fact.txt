@@ -1,0 +1,168 @@
+# writes-without-a-fact.txt — the ONE allowlist of
+# crates/core/boss-testing/tests/every_write_stages_a_fact.rs
+# (backlog 8c271e8f, design 3036296f mechanism A, David approved
+# 2026-09-27).
+#
+# The rule: every Postgres write in non-test code stages its fact on the
+# outbox in the same transaction (boss_events::outbox::record_event_in_tx)
+# — the log is the system of record. A write that does not is named here,
+# with its reason, or the pin fails naming it.
+#
+# FORMAT, one entry per line:
+#
+#   <status> <scope> <target> -- <reason>
+#
+#   status  not-a-fact  the write is not a state change of the company:
+#                       a projection rebuilt from the log, a cache, a
+#                       session, telemetry (David 2026-09-16: "the
+#                       audit_log just needs to capture all work that is
+#                       done; sensors record data that don't flow into
+#                       the audit_log"), outbox bookkeeping.
+#           gap         the write IS a state change and stages nothing.
+#                       Measured when the pin landed and recorded so the
+#                       tree stays green while each is retired by its own
+#                       car — a DEBT, never a decision that the write
+#                       needs no fact. Retiring one means staging the
+#                       fact and deleting the line; the pin then refuses
+#                       the line as stale until it goes.
+#   scope   fn <file>::<Type::fn | fn>   one function and every write in it
+#           file <file>                  every function in one file (a
+#                                        rebuilder module)
+#           table <name>                 every write to one table
+#
+# An entry that excuses a function also covers the transaction helpers
+# it drives (a rebuilder's `upsert_row(&mut conn, ..)`), which is why a
+# helper shared by a live path and a rebuilder needs no entry of its own
+# once the rebuilder has one. Every entry must still excuse something:
+# a stale allowance is a hole shaped like a write that no longer exists.
+#
+# Adding a line here is a decision a reviewer should see. A new write
+# that is a fact does not go here: it stages its event.
+
+# ---------------------------------------------------------------------
+# not-a-fact: projection rebuilders. Each replays audit_log (or a
+# projection of it) into its tables; the facts they write FROM are the
+# record, and a fact staged here would duplicate the history it reads.
+# ---------------------------------------------------------------------
+not-a-fact file crates/core/boss-calendar/src/rebuild.rs -- projection rebuilder: replays calendar events from audit_log into calendar_reservations
+not-a-fact file crates/core/boss-content/src/files/rebuild.rs -- projection rebuilder: replays content.file.* events from audit_log into file_refs
+not-a-fact file crates/core/boss-content/src/rebuild.rs -- projection rebuilder: replays content.bulletin.* events from audit_log into bulletins and dismissals
+not-a-fact file crates/core/boss-jobs/src/agent_runs/rebuild.rs -- projection rebuilder: replays agents.run.recorded from audit_log into agent_runs
+not-a-fact file crates/core/boss-jobs/src/rebuild.rs -- projection rebuilder: replays jobs.* events from audit_log into jobs and steps
+not-a-fact file crates/core/boss-jobs/src/scheduling/rebuild.rs -- projection rebuilder: replays scheduling events from audit_log into the scheduling tables
+not-a-fact file crates/core/boss-search/src/rebuild.rs -- projection rebuilder: search_index is rebuilt from the identity projections, themselves rebuilt from audit_log
+not-a-fact file crates/core/boss-subject-kinds/src/bin/boss_subjects_rebuild.rs -- projection rebuilder: boss-subjects-rebuild reproduces the subjects identity rows from audit_log
+not-a-fact fn crates/core/boss-subject-kinds/src/subjects.rs::rebuild_subjects -- projection rebuilder: TRUNCATE-and-replay of subjects from audit_log
+not-a-fact file crates/core/boss-views/src/rebuild_event_facts.rs -- projection rebuilder: event_facts is a windowed projection of audit_log
+not-a-fact file crates/modules/boss-accounts/src/rebuild.rs -- projection rebuilder: replays accounts.* events from audit_log
+not-a-fact file crates/modules/boss-campaigns/src/rebuild.rs -- projection rebuilder: replays campaign events from audit_log
+not-a-fact file crates/modules/boss-catalog/src/rebuild.rs -- projection rebuilder: replays catalog events from audit_log
+not-a-fact file crates/modules/boss-commerce/src/rebuild.rs -- projection rebuilder: replays commerce events from audit_log
+not-a-fact file crates/modules/boss-customers/src/rebuild.rs -- projection rebuilder: replays customer events from audit_log
+not-a-fact file crates/modules/boss-inventory/src/rebuild.rs -- projection rebuilder: replays inventory and procurement events from audit_log
+not-a-fact file crates/modules/boss-ledger/src/rebuild.rs -- projection rebuilder: the GL is re-projected from financial_facts through the active posting rules
+not-a-fact file crates/modules/boss-ledger/src/rebuild_bank_settlements.rs -- projection rebuilder: replays bank settlement events from audit_log
+not-a-fact file crates/modules/boss-ledger/src/rebuild_facts.rs -- projection rebuilder: replays ledger.* events from audit_log into financial_facts
+not-a-fact file crates/modules/boss-ledger/src/rebuild_payroll.rs -- projection rebuilder: replays payroll events from audit_log
+not-a-fact file crates/modules/boss-ledger/src/rebuild_tax_filings.rs -- projection rebuilder: replays tax filing events from audit_log
+not-a-fact file crates/modules/boss-messages/src/rebuild.rs -- projection rebuilder: replays message events from the messages trail
+not-a-fact file crates/modules/boss-people/src/rebuild.rs -- projection rebuilder: replays people events from audit_log
+not-a-fact file crates/modules/boss-products/src/rebuild.rs -- projection rebuilder: replays product events from audit_log
+not-a-fact file crates/modules/boss-shipping/src/rebuild.rs -- projection rebuilder: replays shipping events from audit_log
+not-a-fact file crates/modules/boss-ledger/src/live_facts.rs -- projection consumer: runs the rebuild's own project_event over events already delivered from the log, so the facts it writes are projections of facts already recorded
+not-a-fact fn crates/modules/boss-ledger/src/supersede.rs::replay_supersede_events_in_tx -- projection rebuilder: replays ledger.fact.superseded events from audit_log onto financial_facts
+not-a-fact file crates/modules/boss-ledger/src/replay_check.rs -- verifier: re-projects the GL inside a transaction it always rolls back, so nothing it writes survives
+not-a-fact fn crates/modules/boss-assets/src/postgres.rs::PgAssets::rebuild_projection -- projection rebuilder: re-projects the assets tables from asset_events (whose own gap is recorded below)
+
+# ---------------------------------------------------------------------
+# not-a-fact: the log itself and its bookkeeping.
+# ---------------------------------------------------------------------
+not-a-fact fn crates/core/boss-events/src/audit_pg.rs::PgAuditWriter::write -- this IS the log: the legacy direct audit_log writer behind DomainPublisher; the row is the fact, not a write that owes one
+not-a-fact fn crates/core/boss-events/src/audit_pg.rs::PgAuditWriter::write_batch -- this IS the log: the batch form of the legacy direct audit_log writer
+not-a-fact fn crates/core/boss-events/src/outbox.rs::drain_outbox_once -- outbox bookkeeping: the relay copies an already-staged event into audit_log and stamps its delivered_at
+not-a-fact fn crates/core/boss-events/src/messages_events_pg.rs::PgMessagesEventWriter::write -- this IS a log: the messages trail, kept apart from audit_log so its PII can be purged on a retention horizon
+not-a-fact fn crates/core/boss-events/src/messages_events_pg.rs::PgMessagesEventWriter::write_batch -- this IS a log: the batch form of the messages trail writer
+not-a-fact file crates/modules/boss-messages/src/bin/boss_messages_events_purge.rs -- retention: the daily sweep that expires the messages trail past its tenant-declared horizon
+
+# ---------------------------------------------------------------------
+# not-a-fact: telemetry and bookkeeping — measurements of the work, not
+# the work (David 2026-09-16), cursors, exactly-once claim ledgers.
+# ---------------------------------------------------------------------
+not-a-fact fn crates/core/boss-jobs/src/agent_runs/postgres.rs::PgAgentRuns::record_profile -- telemetry: a run's work profile is a measurement of the work, deliberately no event (agent_runs/profile.rs)
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::PgJobs::record_step_write_refusal_at -- telemetry: a refused write changed nothing, and David chose the sibling table over the log on 2026-08-29
+not-a-fact fn crates/core/boss-jobs/src/surface_opens/postgres.rs::PgSurfaceOpens::record -- telemetry: which surface an operator opened is a measurement, recorded outside the log by design
+not-a-fact fn crates/core/boss-jobs/src/surface_opens/postgres.rs::PgSurfaceOpens::sweep -- telemetry retention: the surface-opens sweep expires old measurements
+not-a-fact fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::record -- telemetry: a sensor reading is data about the world, not work (sensors/mod.rs; the PACKET it opens is the fact)
+not-a-fact fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::stamp -- telemetry bookkeeping: links a reading to the packet it opened, whose own creation is the fact
+not-a-fact fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::sweep -- telemetry retention: readings are swept on RETENTION_DAYS
+not-a-fact fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::mark_polled -- bookkeeping: the poller's cursor and last-polled stamp on the sensor row
+not-a-fact fn crates/core/boss-jobs/src/moves.rs::PgMoves::record -- derived: every yard move cites the audit event that caused it, and is recomputed from placements plus the log
+not-a-fact fn crates/core/boss-jobs/src/cadence/postgres.rs::PgCadence::claim_firing -- bookkeeping: the exactly-once claim of a cadence window; the verb it fires writes its own record
+not-a-fact fn crates/core/boss-jobs/src/cadence/postgres.rs::PgCadence::record_outcome -- bookkeeping: merges a fired verb's exit code into its firing row
+not-a-fact fn crates/core/boss-dispatcher/src/rules/firings.rs::PgFirings::record -- bookkeeping: the dispatcher's firing ledger; the writes a rule makes go through the jobs API and stage their own facts
+not-a-fact fn crates/core/boss-dispatcher/src/rules/firings.rs::PgFirings::maybe_prune -- bookkeeping retention: prunes the dispatcher's firing ledger
+not-a-fact fn crates/core/boss-dispatcher/src/rules/log_tail.rs::LogTail::ensure_cursor -- bookkeeping: the dispatcher's read cursor into audit_log
+not-a-fact fn crates/core/boss-dispatcher/src/rules/log_tail.rs::LogTail::advance -- bookkeeping: advances the dispatcher's read cursor into audit_log
+not-a-fact fn crates/core/boss-dispatcher/src/rules/schedule_runner.rs::ScheduleRunner::save_cursor -- bookkeeping: the scheduled-rule runner's clock cursor
+not-a-fact fn crates/core/boss-ml/src/postgres.rs::PgMlRepo::create_prediction -- telemetry: a model's inference output is a reading, not work; the work it prompts is recorded where it is done
+not-a-fact fn crates/core/boss-ml/src/postgres.rs::PgMlRepo::upsert_model -- boot reference data: the model catalogue is re-derived from the binary at every service start (bootstrap.rs)
+
+# ---------------------------------------------------------------------
+# not-a-fact: sessions and ceremonies.
+# ---------------------------------------------------------------------
+not-a-fact fn crates/modules/boss-people/src/webauthn.rs::mint_challenge -- session: a single-use WebAuthn challenge, minted for one ceremony and expired
+not-a-fact fn crates/modules/boss-people/src/webauthn.rs::consume_challenge -- session: spends a single-use WebAuthn challenge
+not-a-fact fn crates/modules/boss-people/src/webauthn.rs::record_credential_use -- session bookkeeping: a passkey's signature counter and last-used stamp after an assertion
+
+# ---------------------------------------------------------------------
+# not-a-fact: the simulator's own control state. Records are stamped in
+# wall-clock time and sim time is payload data only (a7a4cae5), and an
+# epoch restart rewinds the sim's synthetic history to the seed
+# baseline by design.
+# ---------------------------------------------------------------------
+not-a-fact fn crates/core/boss-clock/src/postgres.rs::write_params -- simulator control: the sim clock's warp, anchor and pause parameters
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::PgJobs::set_sim_clock_paused -- simulator control: pauses the sim clock
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::PgJobs::restart_sim_clock_epoch -- simulator control: flags an epoch restart in progress
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::run_restart_epoch_background -- simulator control: the epoch restart's sim_clock reset
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::trim_epoch_audit_log -- simulator control: an epoch restart trims the sim's synthetic history back to the seed baseline, preserving platform meta-work
+not-a-fact fn crates/core/boss-jobs/src/postgres.rs::clear_epoch_payroll_state -- simulator control: an epoch restart clears the sim's payroll state before the rebuilders replay
+
+# ---------------------------------------------------------------------
+# not-a-fact: not a write, or not a production write.
+# ---------------------------------------------------------------------
+not-a-fact fn crates/core/boss-jobs/src/agent_spec.rs::models_in -- not a write: it reads migration SQL text for an INSERT INTO agent_rate_card block and executes nothing
+not-a-fact fn crates/core/boss-testing/src/test_db.rs::TestDb::declare_revenue_categories_of -- test support: declares a tenant's Classes into a per-test database, the way a tenant publish would
+
+# ---------------------------------------------------------------------
+# GAPS — measured 2026-09-27 when this pin landed. Each writes company
+# state and stages no fact; each is a debt to retire in its own car,
+# after which its line goes (the pin refuses it once it excuses nothing).
+# ---------------------------------------------------------------------
+# Registries written with no fact, where workflows, stations and step
+# plugins stage a *.published event for the same kind of write:
+gap fn crates/core/boss-calendar/src/postgres.rs::PgCalendar::publish_business_calendars -- business calendars (and their closed days) are published with no event
+gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::create_draft -- a dispatcher rule draft is authored with no event
+gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::publish -- a dispatcher rule is published, retiring the prior version, with no event
+gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::retire -- a dispatcher rule is retired with no event
+gap fn crates/core/boss-dispatcher/src/rules/seed.rs::seed_authored_rules -- the boot seed retires and replaces dispatcher rules with no event
+gap fn crates/core/boss-dispatcher/src/rules/seed.rs::insert_active -- the boot seed inserts an active dispatcher rule with no event
+gap fn crates/core/boss-jobs/src/delivery/postgres.rs::PgDeliveryPolicy::publish_declared -- a delivery policy is published, retiring the prior version, with no event
+gap fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::publish -- a sensor registry row is published with no event
+# The privilege model: policy_rule_audit is a sibling table, not the log.
+gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_rule_judged -- a policy rule is created or changed with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_rule -- a policy rule is deactivated with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_user_override_judged -- a user policy override is created or changed with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_user_override_judged -- a user policy override is deactivated with no event (only a policy_rule_audit row)
+# Domain writes with no fact:
+gap fn crates/core/boss-content/src/postgres.rs::PgContent::create_section -- a manual section is created with no event (SECTION_CREATED is reserved in events.rs and never emitted)
+gap fn crates/core/boss-content/src/postgres.rs::PgContent::update_section -- a manual section is edited with no event (SECTION_UPDATED is reserved and never emitted)
+gap fn crates/core/boss-jobs/src/scheduling/postgres.rs::PgScheduling::materialize_shift_patterns -- availability materialized from shift patterns stages no event, so a rebuild from the log cannot reproduce it
+gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::create -- an operator's saved View is created with no event
+gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::replace -- an operator's saved View is replaced with no event
+gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::delete -- an operator's saved View is deleted with no event
+gap fn crates/modules/boss-assets/src/postgres.rs::PgAssets::append -- asset history is appended to its own asset_events table, never staged on the outbox, so audit_log does not hold it
+gap fn crates/modules/boss-assets/src/postgres.rs::PgAssets::batch_append -- the batch form of the asset_events append, likewise never reaching audit_log
+gap fn crates/modules/boss-catalog/src/marketing_assets/postgres.rs::PgMarketingAssets::create -- a marketing asset (and each edit, which re-creates it) mints a subject and a row with no event
+gap fn crates/modules/boss-catalog/src/marketing_assets/postgres.rs::PgMarketingAssets::retire -- a marketing asset is retired with no event
+gap fn crates/modules/boss-people/src/webauthn.rs::register_credential -- a break-glass passkey is registered with no event
+gap fn crates/modules/boss-people/src/webauthn.rs::remove_credential -- a break-glass passkey is removed with no event

@@ -280,9 +280,14 @@ async fn a_tenant_lands_at_its_files_version_on_a_fresh_database() {
             .is_empty(),
         "no history under the name before the tenant publishes"
     );
-    let draft = create_draft(&db.pool, rule, Some("tenant:brewery"))
-        .await
-        .expect("the name is free on a fresh database");
+    let draft = create_draft(
+        &db.pool,
+        rule,
+        Some("tenant:brewery"),
+        "automation:tenant-seed",
+    )
+    .await
+    .expect("the name is free on a fresh database");
     assert_eq!(
         draft.version, rule.version as i32,
         "the tenant's row takes the version its file declares — not one above a retired \

@@ -200,14 +200,16 @@ impl JobsApi {
 #[async_trait::async_trait]
 impl ClosedSponsorships for JobsApi {
     /// The listing the jobs API answers: `{data: [job + steps],
-    /// total, limit, offset}` (boss-jobs http/jobs.rs `list_jobs`).
+    /// total, limit, offset}` (boss-jobs http/jobs.rs `list_jobs`), asked
+    /// `full=true` because `project` reads the decide step's
+    /// `public_thanks` off each row (backlog 9b473d4a).
     /// Signed as the gateway's own actor — the identity passkey.rs
     /// uses for its server-side reads — plus the machine token when
     /// the process has one, so the read is admitted once the door
     /// requires it on reads too.
     async fn page(&self, offset: usize, limit: usize) -> Result<Page, String> {
         let url = format!(
-            "{}/api/jobs?kind={KIND}&status=closed&limit={limit}&offset={offset}",
+            "{}/api/jobs?kind={KIND}&status=closed&full=true&limit={limit}&offset={offset}",
             self.base
         );
         let mut rb = self.http.get(&url).header(
@@ -219,7 +221,7 @@ impl ClosedSponsorships for JobsApi {
             })
             .to_string(),
         );
-        if let Some(token) = boss_core::machine_token::from_env() {
+        if let Some(token) = boss_core::machine_token::current() {
             rb = rb.header(boss_core::machine_token::HEADER, token);
         }
         let resp = rb
@@ -451,6 +453,7 @@ mod tests {
             session_key: vec![0u8; 32],
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
+            machine_token: Default::default(),
         });
         let root = boss_testing::scratch_dir("gateway-sponsors");
         boss_testing::create_dir(&root);
@@ -724,6 +727,7 @@ mod tests {
             session_key: vec![0u8; 32],
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
+            machine_token: Default::default(),
         });
         let root = boss_testing::scratch_dir("gateway-sponsors-unwired");
         boss_testing::create_dir(&root);

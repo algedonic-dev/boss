@@ -103,6 +103,13 @@ shape; consumers parse what they need from `serde_json::Value`.
 - `is_system_role: true` — flags `platform-admin` and similar
   platform-shipped roles so tenant admin UIs can hide them from
   per-tenant role-editing surfaces.
+- `counts_in_headcount: false` — on an `(employee, role)` Class, says
+  whoever wears the role is an account, not a person, so the /ux/people
+  headcount leaves them out (`headcount` in
+  `apps/web/src/people/roster-counts.ts`); absent means counted.
+  `audit-readonly` carries it (backlog 6a123f1f). It is not
+  `is_system_role`, which `platform-admin` also carries and a founder
+  wears.
 
 Other conventions used purely for display (`color`, `icon`,
 `department`, etc.) carry no platform semantics — consuming surfaces

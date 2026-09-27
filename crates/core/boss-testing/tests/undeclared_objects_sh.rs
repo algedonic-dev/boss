@@ -220,10 +220,14 @@ get)
         exit 1
     fi
     if [ -z "$name" ]; then
-        # A label selector keeps the rows whose third column is the value.
+        # A label selector keeps the rows it matches. The third column is
+        # either the bare part-of value (the tree's own mark) or, when it
+        # holds an `=`, the object's full `key=value,...` label set.
         if [ -n "$sel" ]; then
-            want="${sel#*=}"
-            live "$kind" "$ns" | awk -F'\t' -v w="$want" '$3 == w'
+            live "$kind" "$ns" | awk -F'\t' -v s="$sel" '
+                BEGIN { k = s; sub(/=.*/, "", k); w = s; sub(/^[^=]*=/, "", w) }
+                index($3, "=") == 0 { if (k == "app.kubernetes.io/part-of" && $3 == w) print; next }
+                { n = split($3, a, ","); for (i = 1; i <= n; i++) if (a[i] == s) { print; next } }'
         else
             live "$kind" "$ns"
         fi
@@ -418,7 +422,7 @@ fn a_repo_sourced_instances_delivered_tenant_is_exempt_by_derivation_and_never_s
     // reads clean.
     std::fs::write(
         c.tree.join("infra/cluster/instances.toml"),
-        "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \"david/algedonic-llc\"\ntenant_ref = \"main\"\nsim = false\nhostname = \"h.example\"\nguest = false\n\n[playground]\nnamespace = \"boss-playground\"\ntenant_dir = \"examples/brewery\"\nsim = true\nhostname = \"p.example\"\nguest = true\n",
+        "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \"david/algedonic-llc\"\ntenant_ref = \"main\"\nsim = false\nhostname = \"h.example\"\nguest = false\n\n[playground]\nnamespace = \"boss-playground\"\ntenant_dir = \"examples/brewery\"\nsim = true\nhostname = \"p.example\"\nguest = \"audit\"\n",
     )
     .unwrap();
     let (rc, derived, all) = c.run(&["--exemptions-derived"]);
@@ -670,6 +674,108 @@ fn a_labelled_object_of_a_kind_the_tree_never_declares_stays_out_of_scope() {
     assert_eq!(rc, 3, "refused: a kind the tree declares nowhere: {all}");
 }
 
+/// The gate Job's manifest, in the shape `infra/gate-runner/gate-runner.yaml`
+/// has: no name, a `generateName`, `boss-dev`, one literal label and two
+/// placeholders `boss gate` fills at launch.
+fn gate_template() -> String {
+    r#"{"kind":"Job","metadata":{"generateName":"gate-$GATE_NAME_HINT-","namespace":"boss-dev","labels":{"app":"gate-runner","boss.dev/packet":"$GATE_RUN_JOB_ID","boss.dev/branch":"$GATE_NAME_HINT"}}}"#.to_string()
+}
+
+/// Backlog 4438217e. `Job/boss-dev/seed-dir-probe-2` was made by hand on
+/// 2026-09-12 — no owner, no ttlSecondsAfterFinished — and nothing could
+/// ever name it: the tree's only Job in `boss-dev` is the gate runner's
+/// generateName TEMPLATE, which declared no specific object and so put
+/// no (Job, boss-dev) pair in scope. `--check` refused it with "the tree
+/// declares no Job in boss-dev", and `delete-orphan-object`, which
+/// derives its authority from this, could not retire it.
+///
+/// A template declares its KIND in its namespace, and the objects it
+/// stamps out are the live ones carrying its literal labels. So the
+/// hand-made Job is a finding and the gate Jobs — 285 of them live on
+/// 2026-09-26, all `app=gate-runner` — are not; a CronJob's Job stays
+/// out by its ownerReference, as before.
+#[test]
+fn a_generate_name_template_declares_its_kind_and_the_objects_that_carry_its_labels() {
+    let c = Case::new("gate-template", &[]);
+    // The control FIRST, on the same fixture: without the template, the
+    // pair is out of scope and the hand-made Job is refused exactly as
+    // the live sweep refused it.
+    c.add_live("Job", "boss-dev", "seed-dir-probe-2", "");
+    let (rc, stdout, all) = c.run(&["--check", "Job/boss-dev/seed-dir-probe-2"]);
+    assert_eq!(rc, 3, "without a template there is no Job pair: {all}");
+    assert!(
+        all.contains("declares no Job in `boss-dev`"),
+        "the refusal the packet measured: {all}"
+    );
+    assert_eq!(stdout, "");
+
+    std::fs::write(
+        c.tree.join("infra/gate-runner/gate-runner.yaml"),
+        format!("{}\n", gate_template()),
+    )
+    .unwrap();
+    for n in ["gate-fix-a-x1k2p", "gate-fix-b-7qz9m", "gate-train-c-0aa1b"] {
+        c.add_live_labelled(
+            "Job",
+            "boss-dev",
+            n,
+            &format!("app=gate-runner,boss.dev/packet=p-{n},boss.dev/branch={n}"),
+        );
+    }
+    c.add_live("Job", "boss-dev", "boss-playground-crawl-29311", "CronJob");
+
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(
+        stdout.trim(),
+        "Job\tboss-dev\tseed-dir-probe-2",
+        "the hand-made Job is the one finding; the gate Jobs and the CronJob's are not:\n{all}"
+    );
+
+    let (rc, stdout, all) = c.run(&["--check", "Job/boss-dev/seed-dir-probe-2"]);
+    assert_eq!(rc, 0, "the verb's bound now names it: {all}");
+    assert_eq!(stdout.trim(), "undeclared\tJob\tboss-dev\tseed-dir-probe-2");
+
+    let (rc, _, all) = c.run(&["--check", "Job/boss-dev/gate-fix-a-x1k2p"]);
+    assert_eq!(rc, 3, "a gate Job is declared by its template: {all}");
+    names_all(
+        &all,
+        &["infra/gate-runner/gate-runner.yaml", "app=gate-runner"],
+        "the template refusal names the file and the selector",
+    );
+
+    let (rc, _, all) = c.run(&["--check", "Job/boss-dev/boss-playground-crawl-29311"]);
+    assert_eq!(rc, 3, "a CronJob's Job is its controller's: {all}");
+    assert!(all.contains("ownerReferences[0].kind=CronJob"), "{all}");
+
+    // A template declares its kind in ITS namespace only: `boss` holds
+    // no Job pair, so a Job there is still refused, and the template
+    // brings no label pair into scope either.
+    c.add_live("Job", "boss", "someone-in-prod", "");
+    let (rc, _, all) = c.run(&["--check", "Job/boss/someone-in-prod"]);
+    assert_eq!(rc, 3, "{all}");
+    assert!(all.contains("declares no Job in `boss`"), "{all}");
+}
+
+/// A template whose labels are ALL placeholders can match nothing it
+/// stamped, so claiming its kind would make every live object of it a
+/// finding. It declares nothing, as a nameless document did before.
+#[test]
+fn a_template_with_no_literal_label_declares_nothing() {
+    let c = Case::new("gate-template-unlabelled", &[]);
+    std::fs::write(
+        c.tree.join("infra/gate-runner/gate-runner.yaml"),
+        r#"{"kind":"Job","metadata":{"generateName":"gate-","namespace":"boss-dev","labels":{"boss.dev/packet":"$GATE_RUN_JOB_ID"}}}"#,
+    )
+    .unwrap();
+    c.add_live("Job", "boss-dev", "gate-abcde", "");
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(stdout, "", "{all}");
+    let (rc, _, all) = c.run(&["--check", "Job/boss-dev/gate-abcde"]);
+    assert_eq!(rc, 3, "{all}");
+}
+
 #[test]
 fn check_still_says_not_live_for_an_object_that_is_absent() {
     let c = Case::new("absent", &[]);
@@ -771,7 +877,10 @@ impl LintCase {
         for rel in [LINT_REL, DERIVE_REL] {
             let dst = c.tree.join(rel);
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
-            std::fs::copy(repo_root().join(rel), &dst).unwrap();
+            // The lint execs the derivation by path (`"$DERIVE" --list`),
+            // so it is copied by the child writer, mode kept: a
+            // `std::fs::copy` holds it open in this process (eed361e0).
+            boss_testing::copy_exec(&repo_root().join(rel), &dst);
         }
 
         // A SEAM for the one case the real derivation cannot be driven
@@ -793,7 +902,9 @@ impl LintCase {
              echo \"undeclared-objects: cannot parse ${{STUB_LIST_REFUSES}} — refusing to sweep against a declaration set that is missing it\" >&2\n    \
              exit 4\nfi\n"
         );
-        std::fs::write(&derive, body.replacen(shebang, &guard, 1)).unwrap();
+        // write_file, not std::fs::write: the path is already executable,
+        // so it is rewritten in place by the child writer (eed361e0).
+        boss_testing::write_file(&derive, &body.replacen(shebang, &guard, 1));
 
         let run_git = |args: &[&str]| {
             let out = Command::new("git")

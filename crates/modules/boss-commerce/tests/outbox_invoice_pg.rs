@@ -34,7 +34,7 @@ fn fixture(id: &str, account: &str) -> Invoice {
         line_items: vec![InvoiceLineItem {
             id: format!("{id}-l1"),
             invoice_id: id.into(),
-            revenue_category: RevenueCategory::from("new-sales"),
+            revenue_category: RevenueCategory::from("wholesale"),
             amount_cents: 5_000,
             currency: "USD".into(),
             description: "keg".into(),
@@ -80,6 +80,7 @@ async fn guarded_pool(db: &TestDb) -> sqlx::PgPool {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_records_the_event_in_tx_and_ghost_account_aborts_everything() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let pool = guarded_pool(&db).await;
     let repo = PgCommerce::new(pool.clone());
 
@@ -89,9 +90,14 @@ async fn create_records_the_event_in_tx_and_ghost_account_aborts_everything() {
         .await
         .unwrap();
 
-    repo.create_invoice_at(&fixture("INV-OK", "acc-real"), Utc::now(), &stamp())
+    let created = repo
+        .create_invoice_at(&fixture("INV-OK", "acc-real"), Utc::now(), &stamp())
         .await
         .expect("resolvable account must create");
+    assert!(matches!(
+        created,
+        boss_commerce::port::InvoiceCreate::Created(_)
+    ));
 
     let (outbox, actor): (i64, Option<String>) = (
         sqlx::query_scalar(

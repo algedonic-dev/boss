@@ -1,9 +1,20 @@
 //! HTTP surface: health + readiness probes, the read-only cascade-viz
 //! `rules` feed, and the rule-authoring write endpoints (create-draft /
 //! validate / publish / retire) that back the SPA authoring UI. The
-//! authoring writes go through `crate::rules::authoring`; the running
-//! RulesRunner picks up a published change on its next restart (live
-//! hot-reload is a planned follow-up).
+//! authoring writes go through `crate::rules::authoring`; the binary's
+//! supervision loop polls a fingerprint of `dispatcher_rules` every 30s
+//! and rebuilds the runners when it moves (backlog 1e576baf), so a
+//! published change is live without a restart. A product draft no
+//! authored file names is refused at the door — the boot seed would
+//! retire it (backlog 7d9df2fe).
+//!
+//! The three WRITES — draft, publish, retire — authorize their caller
+//! here, at the service, and not only at the gateway (backlog 847af5c7):
+//! no identity is 401, a caller without Create / Publish / Retire on
+//! `dispatcher-rule` is 403 (platform-admin's alone by default), and an
+//! unreachable policy service is 503. Each stamps the signed caller on
+//! the row (`created_by`, `published_by`, `retired_by`). `_validate`
+//! writes nothing and stays open.
 //!
 //! `/api/dispatcher/health` answers 200 while the PROCESS is up — necessary
 //! but NOT sufficient: the consumer loops run detached and can die while the
@@ -11,6 +22,25 @@
 //! under a no-restart launcher). `/api/dispatcher/readyz` reports the actual
 //! consumer liveness (see [`crate::liveness`]) so operators — and the brewery
 //! sim's pre-Go readiness gate — can tell "up" from "actually working."
+//!
+//! `/api/dispatcher/schedule` (design ea906603) answers, per scheduled
+//! rule, when it last fired and when the runner next fires it — the
+//! top board's "scheduled rules due next". It asks policy: a caller whose
+//! scope reads no packets is told the schedule is withheld, the rule the
+//! machine-firings car applied to the yard's reads (backlog e5f7b51e).
+//!
+//! The rule reads — `rules` and the two version reads — take the same
+//! rule since backlog 493cebf3: until then they asked nothing, so any
+//! gateway session, a basic guest that reads no packets among them, read
+//! every rule's name, trigger, guard and handler. Two reads stay open, by
+//! decision rather than oversight: `health`, which says the process is
+//! up, and `readyz`, which carries liveness NUMBERS and flags — no rule's
+//! name, no packet. Its readers (the estate observer's dead-letter read,
+//! the OSS quickstart's launch wait, a tenant sim's pre-Go gate) read
+//! it with no identity, and an alarm that must ask policy before it can
+//! speak is an arm that needs the patient (CLAUDE.md §Diagnosis).
+//! `readyz_answers_anyone_and_names_no_rule` holds it to numbers, so a
+//! name added to it later fails a test instead of reaching a stranger.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,11 +51,20 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use boss_calendar_client::CalendarClient;
+use boss_clock_client::ClockClient;
+use boss_core::calendar::BusinessCalendar;
+use boss_jobs::dispatcher_firings::{DispatcherFiringsRepository, RETENTION_DAYS, RuleLastFiring};
+use boss_policy_client::{Action, CurrentUser, Decision, PolicyClient, Predicate, Resource, User};
+use chrono::{DateTime, Utc};
 
 use crate::cascade;
 use crate::liveness::DispatcherLiveness;
 use crate::rules::authoring::{self, AuthoringError};
-use crate::rules::registry::{ENFORCED_STATUS, RawRule, authored_why, load_active_rules};
+use crate::rules::registry::{
+    ENFORCED_STATUS, RawRule, authored_why, load_active_rules, parse_raw_path,
+};
+use crate::rules::schedule_runner::next_due;
 
 /// HTTP state: the consumer-liveness handle + the Postgres pool, so the
 /// read-only `/api/dispatcher/rules` surface can serve the rule registry
@@ -40,6 +79,24 @@ pub struct HttpState {
     /// `None` is served as `why: null` with the reason stated, never as
     /// "no rule records a why".
     pub authored_rules_dir: Option<PathBuf>,
+    /// What the assembler declared about the handlers it registered —
+    /// served verbatim as `handler_emits` + `system_edges`. Core spells
+    /// no handler of its own (backlog ec40e269; see [`cascade`]).
+    pub cascade: Arc<cascade::Cascade>,
+    /// Who may read the schedule: a caller whose scope reads no packets
+    /// may not (backlog e5f7b51e's rule, see the module doc). And who may
+    /// write a rule: Create / Publish / Retire on `dispatcher-rule`
+    /// (backlog 847af5c7).
+    pub policy: Arc<dyn PolicyClient>,
+    /// The clock the schedule runner fires by — the schedule's "now".
+    pub clock: Arc<dyn ClockClient>,
+    /// Where the business calendars a schedule names are read, the way
+    /// the runner reads them at start.
+    pub calendar: Arc<dyn CalendarClient>,
+    /// The firing record's reader (`boss_jobs::dispatcher_firings`, the
+    /// one copy of that read). `None` answers every last firing null
+    /// with the reason, never "never fired".
+    pub firings: Option<Arc<dyn DispatcherFiringsRepository>>,
 }
 
 pub fn router(state: HttpState) -> Router {
@@ -59,6 +116,7 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/dispatcher/rules/{name}/publish", post(publish_rule))
         .route("/api/dispatcher/rules/{name}/retire", post(retire_rule))
+        .route("/api/dispatcher/schedule", get(schedule))
         .with_state(state)
 }
 
@@ -189,21 +247,37 @@ fn authored_whys(dir: Option<&std::path::Path>) -> (BTreeMap<String, String>, se
 /// `schedule`), `when`, `do`/args, `delay`, plus the `why` its authored
 /// file records and whether it is `authored` at all (see
 /// [`rule_views`]) — alongside `authored_registry` (where the whys came
-/// from) and the static cascade metadata: per-handler emitted events +
-/// the jobs-api/external "system edges" that close the feedback loops.
+/// from) and the cascade metadata the assembler declared
+/// ([`HttpState::cascade`]): per-handler emitted events + the
+/// jobs-api/external "system edges" that close the feedback loops.
 ///
 /// Queries the table per request — a low-traffic admin view, and reading
 /// live reflects any rule edits without a restart.
-async fn rules(State(state): State<HttpState>) -> Json<serde_json::Value> {
+///
+/// Asked of policy FIRST (backlog 493cebf3): a caller whose scope reads
+/// no packets gets the feed's failure shape with the reason it was
+/// withheld, and never reaches the table. Its readers all sign — the SPA
+/// through its session, the departments readiness read as its viewer,
+/// `boss tenant export` as the seed identity, a recorded probe as its
+/// `audit-readonly` reader — so the caller this turns away is the one a
+/// rule's name was never owed to.
+async fn rules(
+    State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
+) -> Json<serde_json::Value> {
+    let failed = |error: String| {
+        Json(serde_json::json!({
+            "error": error,
+            "rules": [], "authored_registry": null,
+            "handler_emits": {}, "system_edges": [],
+        }))
+    };
+    if let Err(why) = reads_packets(state.policy.as_ref(), &user, "the rule registry").await {
+        return failed(why);
+    }
     let raw = match load_active_rules(&state.pool).await {
         Ok(raw) => raw,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("load dispatcher_rules: {e}"),
-                "rules": [], "authored_registry": null,
-                "handler_emits": {}, "system_edges": [],
-            }));
-        }
+        Err(e) => return failed(format!("load dispatcher_rules: {e}")),
     };
     let (why, authored_registry) = authored_whys(state.authored_rules_dir.as_deref());
     // Not best-effort: a failed read here would leave every row reading
@@ -211,13 +285,7 @@ async fn rules(State(state): State<HttpState>) -> Json<serde_json::Value> {
     // §Doors), so it fails the way a failed rule load does.
     let sources = match authoring::enforced_sources(&state.pool).await {
         Ok(sources) => sources,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("load dispatcher_rules sources: {e}"),
-                "rules": [], "authored_registry": null,
-                "handler_emits": {}, "system_edges": [],
-            }));
-        }
+        Err(e) => return failed(format!("load dispatcher_rules sources: {e}")),
     };
     let mut out = serde_json::Map::new();
     out.insert(
@@ -225,15 +293,229 @@ async fn rules(State(state): State<HttpState>) -> Json<serde_json::Value> {
         serde_json::Value::Array(rule_views(&raw.rules, ENFORCED_STATUS, &why, &sources)),
     );
     out.insert("authored_registry".into(), authored_registry);
+    insert_cascade(&mut out, &state.cascade);
+    Json(serde_json::Value::Object(out))
+}
+
+/// The assembler's declared cascade, as the feed's two fields.
+fn insert_cascade(out: &mut serde_json::Map<String, serde_json::Value>, c: &cascade::Cascade) {
     out.insert(
         "handler_emits".into(),
-        serde_json::to_value(cascade::handler_emits()).unwrap_or_default(),
+        serde_json::to_value(&c.handler_emits).unwrap_or_default(),
     );
     out.insert(
         "system_edges".into(),
-        serde_json::to_value(cascade::system_edges()).unwrap_or_default(),
+        serde_json::to_value(&c.system_edges).unwrap_or_default(),
     );
-    Json(serde_json::Value::Object(out))
+}
+
+// ---------------------------------------------------------------------------
+// The schedule (design ea906603) — last firing and next due, per rule.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/dispatcher/schedule` — every scheduled rule the dispatcher
+/// enforces: `name`, `version`, `cadence`, `anchor_date`,
+/// `business_calendar`, `when`, its newest firing off the record
+/// (`last_fired`), and when the runner next fires it (`next_due`, from
+/// [`next_due`]), soonest first — beside `now` and `simulated`, the
+/// clock both are read against.
+///
+/// WHY (design ea906603). The IT department's top board shows what
+/// happens next, and scheduled rules are half of that: the daily
+/// publish, the sweeps, the polls. `/api/dispatcher/rules` carries each
+/// schedule's cadence and anchor with no time of day, and the firing
+/// record says only what already ran, so "when is this next" was a
+/// derivation every reader would have to redo from the runner's source.
+///
+/// NOTHING IS OMITTED FOR WANT OF A READ. A last firing or a next due
+/// that cannot be given is `null` beside a `*_why` saying which: no row
+/// in the record's window, a record that could not be read, a calendar
+/// that could not be read. The whole schedule is `null` beside
+/// `schedule_error` when the caller may not read it or the rule table
+/// will not load — never an empty list, which reads as "nothing is
+/// scheduled".
+async fn schedule(
+    State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
+) -> Json<serde_json::Value> {
+    let clock = state.clock.now().await;
+    let answer = |schedule: serde_json::Value, error: Option<String>| {
+        Json(serde_json::json!({
+            "now": clock.now,
+            "simulated": clock.simulated,
+            // The firing record's window: "no firing recorded" means none
+            // in this many days, never "never".
+            "retention_days": RETENTION_DAYS,
+            "schedule": schedule,
+            "schedule_error": error,
+        }))
+    };
+    // Asked FIRST, so a caller the scope refuses never reaches the table.
+    if let Err(why) = reads_packets(state.policy.as_ref(), &user, "the schedule").await {
+        return answer(serde_json::Value::Null, Some(why));
+    }
+    let raw = match load_active_rules(&state.pool).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            return answer(
+                serde_json::Value::Null,
+                Some(format!("load dispatcher_rules: {e}")),
+            );
+        }
+    };
+    let firings = match &state.firings {
+        None => Err("the dispatcher firing record is not wired to this dispatcher".to_string()),
+        Some(repo) => repo
+            .last_firings()
+            .await
+            .map_err(|e| format!("reading dispatcher_firings: {e}")),
+    };
+    let calendars = read_calendars(state.calendar.as_ref(), &raw.rules).await;
+    answer(
+        serde_json::Value::Array(schedule_views(&raw.rules, &firings, &calendars, clock.now)),
+        None,
+    )
+}
+
+/// THE SCOPE RULE (backlog e5f7b51e, applied to the yard's machine
+/// reads): a caller whose policy scope reads no packets — which is what
+/// a request with no identity is — reads nothing about the machinery
+/// that moves them. Any scope that reads packets at all, however narrow,
+/// reads the schedule: it is about the machine, not about any one
+/// packet. A policy service that cannot answer refuses (D9, fail
+/// closed), and its detail is logged rather than handed to the caller,
+/// because it names the policy service's internal address (fe9d212c).
+///
+/// `what` names the read in the reason — "the schedule", "the rules" —
+/// so a caller is told which record was withheld from it, and that it
+/// was WITHHELD: a refusal by scope is not a read that failed.
+async fn reads_packets(policy: &dyn PolicyClient, user: &User, what: &str) -> Result<(), String> {
+    match policy.scope_predicate(user, Resource::job()).await {
+        Ok(Predicate::None) => Err(format!(
+            "this caller's policy scope reads no packets, so {what} of the machinery that \
+             moves them is withheld from it"
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, read = what, "dispatcher read: policy check failed; withheld");
+            Err(format!(
+                "policy check failed, so {what} is withheld until policy can answer"
+            ))
+        }
+    }
+}
+
+/// Read each business calendar a scheduled rule names, once. An error
+/// is kept as the error — the rule it moves answers "unknown", not the
+/// nominal day passed off as the real one.
+async fn read_calendars(
+    client: &dyn CalendarClient,
+    rules: &[RawRule],
+) -> BTreeMap<String, Result<Option<BusinessCalendar>, String>> {
+    let codes: std::collections::BTreeSet<&str> = rules
+        .iter()
+        .filter_map(|r| r.schedule.as_ref()?.business_calendar.as_deref())
+        .collect();
+    let mut out = BTreeMap::new();
+    for code in codes {
+        let read = client
+            .get_business_calendar(code)
+            .await
+            .map_err(|e| e.to_string());
+        out.insert(code.to_string(), read);
+    }
+    out
+}
+
+/// The schedule rows — pure: rules, the firing record's read, the
+/// calendars' reads and the clock instant in, rows out, soonest
+/// `next_due` first (a row with none last), then by name. Event rules
+/// have no schedule and no row.
+fn schedule_views(
+    rules: &[RawRule],
+    firings: &Result<Vec<RuleLastFiring>, String>,
+    calendars: &BTreeMap<String, Result<Option<BusinessCalendar>, String>>,
+    now: DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    let mut rows: Vec<(Option<DateTime<Utc>>, &str, serde_json::Value)> = rules
+        .iter()
+        .filter_map(|r| {
+            let s = r.schedule.as_ref()?;
+            let (last_fired, last_fired_why) = match firings {
+                Err(e) => (
+                    serde_json::Value::Null,
+                    Some(format!("the firing record could not be read: {e}")),
+                ),
+                Ok(all) => match all.iter().find(|f| f.rule == r.name) {
+                    Some(f) => (
+                        serde_json::json!({ "at": f.fired_at, "fired_on": f.fired_on }),
+                        None,
+                    ),
+                    None => (
+                        serde_json::Value::Null,
+                        Some(format!(
+                            "no firing recorded in the last {RETENTION_DAYS} days, which \
+                             is as far back as the firing record keeps"
+                        )),
+                    ),
+                },
+            };
+            // `Ok(None)` for a calendar that does not EXIST is the
+            // runner's own fail-open (`ScheduleRunner::load_calendars`):
+            // it fires on the nominal day, so the answer is that day,
+            // and the row says what it assumed.
+            let (cal, assumed) = match s.business_calendar.as_deref() {
+                None => (Ok(None), None),
+                Some(code) => match calendars.get(code) {
+                    Some(Ok(Some(c))) => (Ok(Some(c)), None),
+                    Some(Ok(None)) => (
+                        Ok(None),
+                        Some(format!(
+                            "business calendar `{code}` does not exist, so the runner \
+                             fires on the nominal day and this is that day"
+                        )),
+                    ),
+                    Some(Err(e)) => (
+                        Err(format!(
+                            "business calendar `{code}` could not be read ({e}), so the \
+                             day it moves this firing to is unknown"
+                        )),
+                        None,
+                    ),
+                    None => (
+                        Err(format!("business calendar `{code}` was not read")),
+                        None,
+                    ),
+                },
+            };
+            let (next, next_due_why) = match cal.and_then(|cal| next_due(s, cal, now)) {
+                Ok(at) => (Some(at), assumed),
+                Err(why) => (None, Some(why)),
+            };
+            let view = serde_json::json!({
+                "name": r.name,
+                "version": r.version,
+                "cadence": s.cadence.token(),
+                "anchor_date": s.anchor_date,
+                "business_calendar": s.business_calendar,
+                // A guard can decline a due firing; a reader is told it
+                // is there rather than handed a certainty.
+                "when": r.when,
+                "last_fired": last_fired,
+                "last_fired_why": last_fired_why,
+                "next_due": next,
+                "next_due_why": next_due_why,
+            });
+            Some((next, r.name.as_str(), view))
+        })
+        .collect();
+    rows.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.1.cmp(b.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(b.1),
+    });
+    rows.into_iter().map(|(_, _, v)| v).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -282,20 +564,100 @@ fn split_draft_body(body: serde_json::Value) -> Result<(RawRule, Option<String>)
     Ok((rule, source))
 }
 
+/// Refuse a PRODUCT draft (`source` absent) under a name no file in the
+/// authored registry declares; `None` lets it through.
+///
+/// WHY (backlog 7d9df2fe, design ff1c3615 — David chose option b,
+/// 2026-09-23). `rules::seed` runs at every dispatcher boot and retires
+/// each active product-sourced rule no file names. So a product rule
+/// created here, once published, fired until the next restart and was
+/// then retired, the only trace a name in a boot log's `retired` list.
+/// The SPA's "+ New rule" was the one caller that made them — `boss
+/// tenant publish` always sends `tenant:<id>` — and it now points at
+/// the two durable paths instead; this refusal makes the class
+/// impossible rather than merely unoffered. A NEW VERSION of a rule a
+/// file does name is still accepted: the seed never walks a live
+/// version back (it reports it `behind`), so that edit survives.
+///
+/// The authored names are read with `parse_raw_path`, the seed's own
+/// reader, so the door and the seed cannot disagree about what the
+/// tree authors. A registry that is unset or will not read refuses
+/// every product draft (503, naming the knob or the directory): the
+/// door cannot vouch for a rule it cannot compare, and answering
+/// "allowed" there is the confident wrong answer.
+fn unauthored_product_draft(
+    name: &str,
+    source: Option<&str>,
+    authored_dir: Option<&std::path::Path>,
+) -> Option<(StatusCode, String)> {
+    if source.is_some() {
+        return None;
+    }
+    let Some(dir) = authored_dir else {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BOSS_DISPATCHER_RULES is unset, so this dispatcher cannot read which product \
+             rules the tree authors, and a product draft it cannot compare is refused"
+                .to_string(),
+        ));
+    };
+    let authored = match parse_raw_path(dir) {
+        Ok(authored) => authored,
+        Err(e) => {
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the authored rule registry at {} will not read ({e}), so a product \
+                     draft cannot be compared against it and is refused",
+                    dir.display()
+                ),
+            ));
+        }
+    };
+    if authored.rules.iter().any(|r| r.name == name) {
+        return None;
+    }
+    Some((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "no file in the authored registry names `{name}`, so the dispatcher's boot seed \
+             would retire this product rule at its next restart. A rule that lasts is \
+             authored one of two ways: a file infra/dispatcher/rules/{name}.toml carried by a \
+             car, or a [[rule]] in a tenant's seeds/rules.toml published by `boss tenant \
+             publish` (source tenant:<id>)"
+        ),
+    ))
+}
+
 /// `POST /api/dispatcher/rules` — append a new draft version of a rule.
 /// Body is the rule spec (name, on_event, when?, do[], delay?, version?)
 /// plus an optional `source` ([`split_draft_body`]). The draft is validated
 /// (must load via `Rule::from_raw`) before it persists; `201` on success
-/// returns the stored draft. A name another source owns is refused 400.
+/// returns the stored draft. A name another source owns is refused 400,
+/// and so is a product draft no authored file names
+/// ([`unauthored_product_draft`]). The caller is authorized FIRST
+/// ([`authorize_rule_write`], Create) and stored as `created_by`.
 async fn create_rule_draft(
     State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    let author = match authorize_rule_write(state.policy.as_ref(), &user, Action::Create).await {
+        Ok(author) => author,
+        Err(refusal) => return refusal,
+    };
     let (rule, source) = match split_draft_body(body) {
         Ok(split) => split,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e).into_response(),
     };
-    match authoring::create_draft(&state.pool, &rule, source.as_deref()).await {
+    if let Some(refusal) = unauthored_product_draft(
+        &rule.name,
+        source.as_deref(),
+        state.authored_rules_dir.as_deref(),
+    ) {
+        return refusal.into_response();
+    }
+    match authoring::create_draft(&state.pool, &rule, source.as_deref(), &author).await {
         Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
         Err(e) => authoring_err(e),
     }
@@ -311,9 +673,27 @@ async fn validate_rule(Json(raw): Json<RawRule>) -> Json<serde_json::Value> {
     }
 }
 
+/// The rule reads' gate, as a refusal: 403 with the reason it was
+/// withheld (backlog 493cebf3). A version read names the rule and
+/// carries its whole definition, drafts included, so it takes the feed's
+/// scope rule.
+async fn rule_read_refusal(state: &HttpState, user: &User) -> Option<Response> {
+    reads_packets(state.policy.as_ref(), user, "the rule registry")
+        .await
+        .err()
+        .map(|why| (StatusCode::FORBIDDEN, why).into_response())
+}
+
 /// `GET /api/dispatcher/rules/{name}/versions` — all versions, oldest first
 /// (draft + active + retired).
-async fn list_rule_versions(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
+async fn list_rule_versions(
+    State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refused) = rule_read_refusal(&state, &user).await {
+        return refused;
+    }
     match authoring::list_versions(&state.pool, &name).await {
         Ok(vs) => Json(vs).into_response(),
         Err(e) => authoring_err(e),
@@ -323,8 +703,12 @@ async fn list_rule_versions(State(state): State<HttpState>, Path(name): Path<Str
 /// `GET /api/dispatcher/rules/{name}/versions/{version}` — one version.
 async fn get_rule_version(
     State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
     Path((name, version)): Path<(String, i32)>,
 ) -> Response {
+    if let Some(refused) = rule_read_refusal(&state, &user).await {
+        return refused;
+    }
     match authoring::get_version(&state.pool, &name, version).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => authoring_err(e),
@@ -332,19 +716,82 @@ async fn get_rule_version(
 }
 
 /// `POST /api/dispatcher/rules/{name}/publish` — activate the latest draft,
-/// retiring the prior active version.
-async fn publish_rule(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
-    match authoring::publish(&state.pool, &name).await {
+/// retiring the prior active version. Publish authority on
+/// `dispatcher-rule`; the caller is stamped as `published_by`.
+async fn publish_rule(
+    State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    let publisher = match authorize_rule_write(state.policy.as_ref(), &user, Action::Publish).await
+    {
+        Ok(publisher) => publisher,
+        Err(refusal) => return refusal,
+    };
+    match authoring::publish(&state.pool, &name, &publisher).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => authoring_err(e),
     }
 }
 
 /// `POST /api/dispatcher/rules/{name}/retire` — retire the active version.
-async fn retire_rule(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
-    match authoring::retire(&state.pool, &name).await {
+/// Retire authority on `dispatcher-rule`; the caller is stamped as
+/// `retired_by`.
+async fn retire_rule(
+    State(state): State<HttpState>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    let retirer = match authorize_rule_write(state.policy.as_ref(), &user, Action::Retire).await {
+        Ok(retirer) => retirer,
+        Err(refusal) => return refusal,
+    };
+    match authoring::retire(&state.pool, &name, &retirer).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => authoring_err(e),
+    }
+}
+
+/// THE RULE-WRITE AUTHORITY (backlog 847af5c7, 2026-09-27). A dispatcher
+/// rule drives side effects — it spawns packets, files ops-requests,
+/// converges hosts — so drafting, publishing or retiring one is a
+/// trust-boundary act, and until this check none of the three doors
+/// asked who was acting: the gateway refused only a read-only session,
+/// and the ClusterIP machine door (`boss-dispatcher-internal`) reaches
+/// this port from any pod with no gateway in front of it at all.
+///
+/// Three answers, asked BEFORE the body is read or the table touched:
+/// - no identity (no `x-boss-user`, or one claiming only the no-header
+///   sentinel's role) → 401, because there is no one to ask policy about;
+/// - policy says no → 403 with policy's reason (`dispatcher-rule` is
+///   platform-admin's alone in the core defaults);
+/// - policy cannot answer → 503 + `Retry-After` (fail closed, D9), its
+///   detail logged and never handed out (fe9d212c).
+///
+/// On an allow it returns the caller's id — the one the request was
+/// SIGNED as — which the write stores as its author. The body never
+/// names one: `split_draft_body` refuses any key the registry does not
+/// read, `created_by` included.
+async fn authorize_rule_write(
+    policy: &dyn PolicyClient,
+    user: &User,
+    action: Action,
+) -> Result<String, Response> {
+    if user.is_anonymous() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "a dispatcher rule write is signed by its caller, and this request names no caller \
+             (no x-boss-user identity)",
+        )
+            .into_response());
+    }
+    match policy
+        .check(user, action, Resource::dispatcher_rule())
+        .await
+    {
+        Ok(Decision::Allow { .. }) => Ok(user.id.clone()),
+        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
+        Err(e) => Err(e.into_response()),
     }
 }
 
@@ -472,6 +919,68 @@ mod tests {
         assert!(e.contains("onevent"), "{e}");
     }
 
+    /// A PRODUCT DRAFT NO FILE NAMES IS REFUSED AT THE DOOR (backlog
+    /// 7d9df2fe, design ff1c3615 option b). The boot seed retires every
+    /// active product-sourced rule no file in the authored registry
+    /// names, so such a draft, once published, lived until the next
+    /// dispatcher restart and its retirement showed only in a boot log.
+    /// The SPA's "+ New rule" was the only caller that made one; the
+    /// refusal makes the class impossible instead of merely unoffered.
+    #[test]
+    fn a_product_draft_no_authored_file_names_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sweep.toml"),
+            "[[rule]]\nname = \"sweep\"\nwhy = \"\"\"\na timer\n\"\"\"\n\
+             on_event = \"x.y\"\n[[rule.do]]\nhandler = \"noop\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            unauthored_product_draft("sweep", None, Some(dir.path())).is_none(),
+            "a new version of a rule a file authors is the live-edit path the seed keeps"
+        );
+
+        let (code, why) = unauthored_product_draft("scratch", None, Some(dir.path()))
+            .expect("a product rule no file names is the seed's to retire");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        for named in [
+            "scratch",
+            "infra/dispatcher/rules/scratch.toml",
+            "seeds/rules.toml",
+        ] {
+            assert!(why.contains(named), "the refusal must name {named}: {why}");
+        }
+
+        assert!(
+            unauthored_product_draft("scratch", Some("tenant:acme"), Some(dir.path())).is_none(),
+            "a tenant's rule is the tenant's protocol data; the seed never retires it"
+        );
+    }
+
+    /// When the door cannot read what the tree authors it cannot tell a
+    /// durable product draft from a doomed one, so it refuses rather
+    /// than answer (CLAUDE.md §Doors: a wrong target answers instead of
+    /// erroring) — and says which knob or which directory.
+    #[test]
+    fn a_product_draft_is_refused_when_the_authored_registry_will_not_read() {
+        let (code, why) = unauthored_product_draft("sweep", None, None)
+            .expect("an unset registry cannot vouch for any product rule");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(why.contains("BOSS_DISPATCHER_RULES"), "{why}");
+
+        let missing = std::path::Path::new("/nonexistent/dispatcher/rules");
+        let (code, why) = unauthored_product_draft("sweep", None, Some(missing))
+            .expect("an unreadable registry cannot vouch for any product rule");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(why.contains("/nonexistent/dispatcher/rules"), "{why}");
+
+        assert!(
+            unauthored_product_draft("sweep", Some("tenant:acme"), None).is_none(),
+            "a tenant draft does not depend on the product's directory"
+        );
+    }
+
     /// A rule the system enforces that NO authored file records reads as
     /// `authored: false, why: null` — the §9a drift, visible in the
     /// response itself rather than only to whoever runs the check.
@@ -529,5 +1038,182 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(block["rules"], 1);
         assert!(block["error"].is_null(), "{block}");
+    }
+
+    // ----- the schedule view (design ea906603) -----------------------
+
+    fn scheduled(name: &str, cadence: &str, anchor: &str, calendar: Option<&str>) -> RawRule {
+        RawRule {
+            name: name.into(),
+            on_event: None,
+            schedule: Some(crate::rules::registry::RawSchedule {
+                cadence: boss_core::calendar::Cadence::parse(cadence).unwrap(),
+                anchor_date: anchor.parse().unwrap(),
+                business_calendar: calendar.map(str::to_string),
+            }),
+            when: None,
+            do_steps: vec![RawDoStep {
+                handler: "jobs.spawn".into(),
+                args: Default::default(),
+            }],
+            delay: None,
+            version: 2,
+            why: None,
+        }
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn last(rule: &str, fired_at: &str) -> RuleLastFiring {
+        RuleLastFiring {
+            rule: rule.into(),
+            fired_on: "clock.day".into(),
+            fired_at: at(fired_at),
+        }
+    }
+
+    /// One row per SCHEDULED rule — an event rule has no schedule to
+    /// read — carrying its cadence and anchor, its last firing off the
+    /// record, and its next due time off the runner's own math, soonest
+    /// first.
+    #[test]
+    fn the_schedule_answers_each_scheduled_rule_last_and_next() {
+        let mut guarded = scheduled("publish-daily", "daily", "2026-08-14", None);
+        guarded.when = Some("NOT open_publish_exists(\"github-mirror\")".into());
+        let rules = [
+            rule("converge-on-merge"),
+            guarded,
+            scheduled("sensors-poll", "every-5-minutes", "2026-09-17", None),
+        ];
+        let views = schedule_views(
+            &rules,
+            &Ok(vec![last("sensors-poll", "2026-09-27T14:30:00Z")]),
+            &BTreeMap::new(),
+            at("2026-09-27T14:32:10Z"),
+        );
+        assert_eq!(views.len(), 2, "the event rule has no schedule: {views:?}");
+
+        let poll = &views[0];
+        assert_eq!(poll["name"], "sensors-poll", "soonest first: {views:?}");
+        assert_eq!(poll["cadence"], "every-5-minutes");
+        assert_eq!(poll["anchor_date"], "2026-09-17");
+        assert_eq!(poll["last_fired"]["at"], "2026-09-27T14:30:00Z");
+        assert_eq!(poll["last_fired"]["fired_on"], "clock.day");
+        assert!(poll["last_fired_why"].is_null(), "{poll}");
+        assert_eq!(poll["next_due"], "2026-09-27T14:35:00Z");
+        assert!(poll["next_due_why"].is_null(), "{poll}");
+
+        let daily = &views[1];
+        assert_eq!(daily["name"], "publish-daily");
+        assert_eq!(daily["version"], 2);
+        assert_eq!(daily["next_due"], "2026-09-28T00:00:00Z");
+        assert_eq!(
+            daily["when"], "NOT open_publish_exists(\"github-mirror\")",
+            "a guard can still decline a due firing, so it rides beside it"
+        );
+        // Never omitted: no row in the record is a reason, not a gap.
+        assert!(daily["last_fired"].is_null(), "{daily}");
+        assert!(
+            daily["last_fired_why"].as_str().is_some_and(
+                |w| w.contains("no firing recorded") && w.contains(&RETENTION_DAYS.to_string())
+            ),
+            "{daily}"
+        );
+    }
+
+    /// UNREAD IS NOT NEVER. A firing record that could not be read makes
+    /// every last firing null WITH the error, so a stalled cadence is
+    /// not painted "never fired" on no evidence.
+    #[test]
+    fn an_unread_firing_record_is_said_on_every_row() {
+        let views = schedule_views(
+            &[scheduled("publish-daily", "daily", "2026-08-14", None)],
+            &Err("reading dispatcher_firings: connection refused".into()),
+            &BTreeMap::new(),
+            at("2026-09-27T14:32:10Z"),
+        );
+        assert!(views[0]["last_fired"].is_null());
+        assert!(
+            views[0]["last_fired_why"]
+                .as_str()
+                .is_some_and(|w| w.contains("connection refused")),
+            "{}",
+            views[0]
+        );
+        assert_eq!(views[0]["next_due"], "2026-09-28T00:00:00Z");
+    }
+
+    /// A business calendar that cannot be read is a next due that cannot
+    /// be computed — null with the calendar named, never the nominal day
+    /// passed off as the real one. A calendar that does not EXIST is the
+    /// runner's documented fail-open: it fires on the nominal day, and so
+    /// does the answer.
+    #[test]
+    fn a_calendar_that_cannot_be_read_is_a_next_due_that_says_so() {
+        let calendars = BTreeMap::from([
+            (
+                "us-banking".to_string(),
+                Err::<Option<BusinessCalendar>, String>("calendar-api: 503".into()),
+            ),
+            ("us-tax".to_string(), Ok(None)),
+        ]);
+        let views = schedule_views(
+            &[
+                scheduled("bank-sweep", "daily", "2026-01-01", Some("us-banking")),
+                scheduled("tax-file", "daily", "2026-01-01", Some("us-tax")),
+            ],
+            &Ok(vec![]),
+            &calendars,
+            at("2026-09-27T14:32:10Z"),
+        );
+        let sweep = views.iter().find(|v| v["name"] == "bank-sweep").unwrap();
+        assert!(sweep["next_due"].is_null(), "{sweep}");
+        assert!(
+            sweep["next_due_why"]
+                .as_str()
+                .is_some_and(|w| w.contains("us-banking") && w.contains("503")),
+            "{sweep}"
+        );
+        assert_eq!(sweep["business_calendar"], "us-banking");
+        let tax = views.iter().find(|v| v["name"] == "tax-file").unwrap();
+        assert_eq!(tax["next_due"], "2026-09-28T00:00:00Z", "{tax}");
+        assert_eq!(
+            views.last().unwrap()["name"],
+            "bank-sweep",
+            "a row with no next due sorts last"
+        );
+    }
+
+    /// The cascade the read surface serves is the one its ASSEMBLER
+    /// declared, not a roster core spells (backlog ec40e269): core names
+    /// no handler, so a handler only a tenant's assembly registers is
+    /// served exactly as that assembly declared it.
+    #[test]
+    fn the_cascade_served_is_the_one_the_assembler_declared() {
+        let declared = cascade::Cascade {
+            handler_emits: BTreeMap::from([("tenant.only.thing", vec!["tenant.only.done"])]),
+            system_edges: vec![cascade::SystemEdge {
+                from: "tenant.only.done",
+                to: "step.ready.*",
+                kind: "jobs-api",
+                label: "a label",
+            }],
+        };
+        let mut out = serde_json::Map::new();
+        insert_cascade(&mut out, &declared);
+        assert_eq!(
+            out["handler_emits"],
+            serde_json::json!({"tenant.only.thing": ["tenant.only.done"]})
+        );
+        assert_eq!(out["system_edges"][0]["from"], "tenant.only.done");
+
+        let mut out = serde_json::Map::new();
+        insert_cascade(&mut out, &cascade::Cascade::default());
+        assert_eq!(out["handler_emits"], serde_json::json!({}));
+        assert_eq!(out["system_edges"], serde_json::json!([]));
     }
 }

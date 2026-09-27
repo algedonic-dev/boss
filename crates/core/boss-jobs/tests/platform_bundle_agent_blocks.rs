@@ -68,6 +68,12 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
     let want: BTreeSet<String> = [
         "backlog-item/build builder $5.00 high",
         "backlog-item/draft-design analyst $2.00 medium",
+        // The front of the item (backlog cf6be734, 2026-09-25): 95
+        // items waited at `triage` while `boss dispatch` refused it by
+        // name, and `measure` the same. A route and a re-measurement
+        // are reads and a verdict, no car — the analyst setting.
+        "backlog-item/triage analyst $2.00 medium",
+        "backlog-item/measure analyst $2.00 medium",
         "user-feedback/build builder $5.00 high",
         "user-feedback/draft-design analyst $2.00 medium",
         "protocol-retro/collect analyst $2.00 medium",
@@ -82,6 +88,13 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // per code-scanning rule off the reading on the packet — the
         // analyst setting, the same as the retros' work steps.
         "publish-to-github/judge-checks analyst $2.00 medium",
+        // v8's work steps (backlog d4bfe548, David 2026-09-24): the
+        // daily packet sat at `measure` from 00:00Z until the operator
+        // worked it after 03:50Z, because no step before the sign-off
+        // declared an agent. The same analyst setting as judge-checks;
+        // `approve` stays David's and declares none.
+        "publish-to-github/measure analyst $2.00 medium",
+        "publish-to-github/review analyst $2.00 medium",
         // The page march (backlog 4a1b307c, 2026-09-19). Three efforts
         // across four steps of ONE kind, each argued in the TOML beside
         // the step: `measure` subtracts a department's needs from a
@@ -93,6 +106,24 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         "page-audit/file analyst $1.00 low",
         "page-audit/test builder $5.00 high",
         "page-audit/revise builder $3.00 medium",
+        // The fold (2026-09-23): a car writing the settled paragraphs
+        // into docs/architecture-decisions.md, so the builder setting.
+        // Without it `boss dispatch` refused every answered design by
+        // name and 34 waited at `fold` with no way to hand them out.
+        "design-doc/fold builder $5.00 high",
+        // The documentation flatten (backlog ede02a78, 2026-09-27): the
+        // ad hoc run c98e5183 waited at `survey` because `boss dispatch`
+        // refused it by name — doc-flatten declared no block on any
+        // step. `survey` and `verify` read the corpus and record a
+        // finding, no car: the analyst setting. `fold` writes settled
+        // decisions into docs/architecture-decisions.md, the same car
+        // as design-doc's fold, so the same setting; `curate` retires
+        // what the fold superseded — deletions and one-line pointers,
+        // a smaller car at medium. `review` stays a person's sign-off.
+        "doc-flatten/survey analyst $2.00 medium",
+        "doc-flatten/fold builder $5.00 high",
+        "doc-flatten/curate builder $3.00 medium",
+        "doc-flatten/verify analyst $2.00 medium",
     ]
     .into_iter()
     .map(str::to_string)

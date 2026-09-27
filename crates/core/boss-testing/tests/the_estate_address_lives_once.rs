@@ -42,6 +42,10 @@
 //!     converges that render it — and carries no inline pin;
 //!   * the lint `infra/lint/the-estate-address-lives-once.sh` is red on
 //!     a planted literal, red on a stale allowance, green on the tree.
+//!
+//! tree-wide pin — it scans a tree no changed-file map can attribute
+//! to this crate, so every scoped gate runs it whatever its scope
+//! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
 use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
 use std::path::{Path, PathBuf};
@@ -147,6 +151,20 @@ fn the_env_file_renders_every_key_from_the_source() {
     assert_eq!(
         value_of_str(&r.out, "JOBS_API"),
         value_of_str(&r.out, "BOSS_JOBS_URL")
+    );
+    // The instance's ML API: the record's host on the port boss-ports
+    // names for `ml` — derived, never declared, so it cannot point at a
+    // different instance from the record (backlog 9599babc: the nightly
+    // batch fed a retired stack's database for a week at 127.0.0.1:7070).
+    let host = sor
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| panic!("sor_url {sor} carries no port"));
+    assert_eq!(
+        value_of_str(&r.out, "BOSS_ML_API_URL"),
+        format!("{host}:{}", boss_ports::prod("ml")),
+        "{}",
+        r.out
     );
     // A comment saying where it came from and not to edit it: the next
     // converge rewrites the file.

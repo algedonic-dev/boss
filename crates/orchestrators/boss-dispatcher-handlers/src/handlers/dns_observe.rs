@@ -37,6 +37,15 @@
 //! READS THE ACCOUNT AGAIN so the packet records what is there, never
 //! what was sent. DRIFT is reported and alarmed, never corrected.
 //!
+//! An application declaring `short_lived_ca = true` also gets its
+//! short-lived-certificate CA: generated when the account holds none
+//! for it, and its PUBLIC key recorded on the packet as `ssh_ca` either
+//! way — the value the ssh server's `TrustedUserCAKeys` must hold. The
+//! dashboard offers only the account-wide Access-for-Infrastructure CA
+//! since 2026-09, which signs nothing `cloudflared access ssh` asks
+//! for; without the per-application CA the client is refused "bad ca
+//! application" before it reaches the server (incident 55d001b0).
+//!
 //! THE INTERLOCK. A zone record declaring `interlock = "access"` is
 //! applied — created when ABSENT (replacing whatever other type the
 //! name held), corrected when DRIFT — only once the application
@@ -82,8 +91,8 @@ use serde_json::{Value as Json, json};
 use tokio::io::AsyncWriteExt;
 
 use super::common::{
-    StepEvent, api_client, dispatcher_actor_header, dispatcher_reader_header, get_json,
-    owner_for_filing, post_json, sim_origin_value, write_json,
+    StepEvent, api_client, complete_step, dispatcher_reader_header, get_json, owner_for_filing,
+    post_json, row_or_refuse, rows_or_refuse, sim_origin_value, write_json,
 };
 use super::credential_issuer::{
     AccessApp, AccessAppSpec, AccessApps, AccessPolicy, AccessPolicySpec, SecretStore,
@@ -109,7 +118,8 @@ pub const INTERLOCK_TUNNEL: &str = "tunnel";
 /// The chore whose packet carries the converge's `tunnel_ingress` and
 /// `cloudflared` facts (infra/forge/cluster-deploy-runner.service).
 pub const CONVERGE_KIND: &str = "maintenance-cluster-converge";
-/// How many open backlog-items the dedup read is allowed to hold; a
+/// How many open estate packets (backlog-items carrying
+/// `estate_finding`, c5ac71de) the dedup read is allowed to hold; a
 /// page shorter than the list's `total` is a truncated dedup and the
 /// raise is HELD rather than made blind (estate.alarm's rule).
 const DEDUP_PAGE: usize = 200;
@@ -215,6 +225,11 @@ pub struct DeclaredApp {
     pub app_type: String,
     pub session_duration: String,
     pub why: String,
+    /// Generate this application's short-lived-certificate CA when the
+    /// account holds none, and record its public key (see the module
+    /// doc). Only an ssh door needs one.
+    #[serde(default)]
+    pub short_lived_ca: bool,
     #[serde(default)]
     pub policy: Vec<DeclaredPolicy>,
 }
@@ -520,14 +535,14 @@ pub struct TunnelFacts {
 
 impl TunnelFacts {
     /// Off the newest `maintenance-cluster-converge` packet's `run` step
-    /// (the listing is newest-first). A listing without one reads as
-    /// no facts — the gate then holds, never releases.
-    pub fn from_listing(listing: &Json) -> Self {
-        listing
-            .get("data")
-            .and_then(Json::as_array)
-            .into_iter()
-            .flatten()
+    /// (the listing is newest-first). A listing with no such packet
+    /// reads as no facts — the gate then holds, never releases. A
+    /// listing with no `data` array is no answer and refuses; the caller
+    /// states its own fallback (d4698bc2).
+    pub fn from_listing(listing: &Json) -> Result<Self, String> {
+        let rows: Vec<Json> = rows_or_refuse(listing, "the converge read (GET /api/jobs)")?;
+        Ok(rows
+            .iter()
             .flat_map(|j| {
                 j.get("steps")
                     .and_then(Json::as_array)
@@ -547,7 +562,7 @@ impl TunnelFacts {
                     connector: text("cloudflared"),
                 }
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 }
 
@@ -825,6 +840,9 @@ pub struct Reading {
     pub zone: Comparison,
     pub access: Vec<Json>,
     pub applied: Vec<String>,
+    /// `{domain, public_key}` for every declared short-lived CA the
+    /// account holds after this firing.
+    pub ssh_ca: Vec<Json>,
 }
 
 impl Reading {
@@ -924,22 +942,27 @@ impl Reading {
     }
 }
 
-/// The one body the observe completion sends: the fields
-/// dns-zone-observation.toml requires at done, over the step's existing
-/// metadata (PATCH-on-PUT replaces `metadata` wholesale). `access` and
-/// `applied` ride beside them the way `counts` always has.
-pub fn observe_put_body(existing: &serde_json::Map<String, Json>, r: &Reading) -> Json {
-    let mut metadata = existing.clone();
+/// The fields the observe completion writes: what
+/// dns-zone-observation.toml requires at done, with `access` and
+/// `applied` beside them the way `counts` always has. ONLY these: they
+/// ride the step merge door, which keeps the step's existing metadata,
+/// and the status flips alone after them (backlog e39a9d2a) — this was
+/// one PUT of the step's metadata as read plus these keys, which the
+/// step PUT refuses once anything wrote the step in between, and
+/// refuses outright under the decided end state.
+pub fn observe_fields(r: &Reading) -> serde_json::Map<String, Json> {
+    let mut metadata = serde_json::Map::new();
     metadata.insert("verdicts".into(), Json::Array(r.zone.verdicts.clone()));
     metadata.insert("access".into(), Json::Array(r.access.clone()));
     metadata.insert("applied".into(), json!(r.applied));
+    metadata.insert("ssh_ca".into(), Json::Array(r.ssh_ca.clone()));
     metadata.insert("summary".into(), json!(r.summary()));
     metadata.insert(
         "result".into(),
         json!(if r.hard() == 0 { "match" } else { "findings" }),
     );
     metadata.insert("counts".into(), r.counts());
-    json!({ "status": "completed", "metadata": metadata })
+    metadata
 }
 
 /// The urgent packet a drifted zone becomes. Keyed like every estate
@@ -1001,11 +1024,9 @@ pub fn alarm_refresh(observation_id: &str, r: &Reading) -> Json {
 /// The open packet already carrying `key`, if any, and whether the page
 /// that answered can be trusted to be complete.
 pub fn already_open(listing: &Json, key: &str) -> Result<Option<String>, String> {
-    let rows: Vec<&Json> = listing
-        .get("data")
-        .and_then(Json::as_array)
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
+    // No `data` array refuses for what it is; it was held before only
+    // by accident of the truncation check below (d4698bc2).
+    let rows: Vec<Json> = rows_or_refuse(listing, "the dedup read (GET /api/jobs)")?;
     let total = listing
         .get("total")
         .and_then(Json::as_u64)
@@ -1172,7 +1193,8 @@ impl DnsObserve {
             )));
         };
         let row = self.get(&format!("/api/credentials/{cred}")).await?;
-        let row = row.get("data").cloned().unwrap_or(row);
+        let row = row_or_refuse(row, &format!("GET /api/credentials/{cred}"))
+            .map_err(HandlerError::Downstream)?;
         let location = row
             .get("storage_location")
             .and_then(Json::as_str)
@@ -1343,6 +1365,58 @@ impl DnsObserve {
         (applied, created, refused)
     }
 
+    /// Every declared `short_lived_ca` application the account holds:
+    /// its CA read, generated when absent, and its public key returned
+    /// for the packet. An application the account does not hold is
+    /// skipped — its ABSENT or REFUSED verdict already says so. A read
+    /// or create the account refuses is a REFUSED finding, the same
+    /// rule `apply_access` follows.
+    async fn apply_short_lived_cas(
+        &self,
+        account_id: &str,
+        declared: &[DeclaredApp],
+        live: &[AccessApp],
+    ) -> (Vec<String>, Vec<Json>, Vec<Json>) {
+        let mut applied = Vec::new();
+        let mut cas = Vec::new();
+        let mut refused = Vec::new();
+        for d in declared.iter().filter(|d| d.short_lived_ca) {
+            let Some(app) = live.iter().find(|a| a.domain == d.domain) else {
+                continue;
+            };
+            let key = match self.access.short_lived_ca(account_id, &app.id).await {
+                Ok(Some(key)) => key,
+                Ok(None) => match self.access.create_short_lived_ca(account_id, &app.id).await {
+                    Ok(key) => {
+                        applied.push(format!(
+                            "Access short-lived certificate CA created on {}",
+                            d.domain
+                        ));
+                        key
+                    }
+                    Err(e) => {
+                        refused.push(refused_verdict(
+                            &d.domain,
+                            &format!("create short-lived certificate CA on {}", d.domain),
+                            &e,
+                        ));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    refused.push(refused_verdict(
+                        &d.domain,
+                        &format!("read short-lived certificate CA on {}", d.domain),
+                        &e,
+                    ));
+                    continue;
+                }
+            };
+            cas.push(json!({"domain": d.domain, "public_key": key}));
+        }
+        (applied, cas, refused)
+    }
+
     /// Execute one released zone write.
     ///
     /// The error is the account's own answer, verbatim: the caller
@@ -1383,10 +1457,15 @@ impl DnsObserve {
         r: &Reading,
     ) -> Result<&'static str, HandlerError> {
         let key = alarm_key(zone);
+        // Only the packets carrying `estate_finding`, the one key the
+        // dedup compares (backlog c5ac71de). Unfiltered, every open
+        // backlog-item counted toward the 200-row page; open items passed
+        // 200 in September 2026 (370 on 2026-09-26), so the first drift
+        // after that would have been held as a truncated read.
         let listing = get_json(
             &self.client,
             &format!(
-                "{}/api/jobs?kind=backlog-item&status=open&limit={DEDUP_PAGE}",
+                "{}/api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit={DEDUP_PAGE}",
                 self.base()
             ),
             rule,
@@ -1443,7 +1522,10 @@ impl Handler for DnsObserve {
         let rule = ctx.rule_name.as_str();
 
         let job = self.get(&format!("/api/jobs/{}", ev.job_id)).await?;
-        let job = job.get("data").cloned().unwrap_or(job);
+        // A body that is not a job would fail the kind check below and
+        // skip this ready step without a word (backlog f2eac973).
+        let job = row_or_refuse(job, &format!("GET /api/jobs/{}", ev.job_id))
+            .map_err(HandlerError::Downstream)?;
         if job.get("kind").and_then(Json::as_str) != Some(OBSERVATION_KIND) {
             return Ok(());
         }
@@ -1463,12 +1545,6 @@ impl Handler for DnsObserve {
             // does nothing (the step API would 409 a write anyway).
             return Ok(());
         }
-        let existing = step
-            .get("metadata")
-            .and_then(Json::as_object)
-            .cloned()
-            .unwrap_or_default();
-
         // What the declarations reference, then each one resolved from
         // the system of record — before anything is read from
         // Cloudflare, so a declaration this observer cannot judge costs
@@ -1512,20 +1588,32 @@ impl Handler for DnsObserve {
                 .map_err(HandlerError::Downstream)?;
             access_verdicts = compare_access(&access_decl.application, &live_apps);
         }
+        let (ca_applied, ssh_ca, ca_refused) = self
+            .apply_short_lived_cas(&info.account_id, &access_decl.application, &live_apps)
+            .await;
+        applied.extend(ca_applied);
         // What the account refused rides beside what it holds: a
         // finding on the step, in the alarm, counted as hard.
         access_verdicts.extend(refused);
+        access_verdicts.extend(ca_refused);
         // The tunnel interlock's facts: the newest converge packet's
         // ingress line and connector reading (fd75c641). Read once per
         // firing; a listing that cannot be read holds every tunnel-
         // interlocked record rather than releasing it blind.
-        let converge = self
+        // The fallback is DELIBERATE and stated here, where it is chosen:
+        // a failed read and an answer with no `data` array both yield no
+        // facts, and no facts HOLDS every tunnel-interlocked record.
+        let tunnel_facts = self
             .get(&format!(
-                "/api/jobs?kind={CONVERGE_KIND}&status=closed&limit=1"
+                "/api/jobs?kind={CONVERGE_KIND}&status=closed&limit=1&full=true"
             ))
             .await
-            .unwrap_or_else(|_| json!({"data": []}));
-        let tunnel_facts = TunnelFacts::from_listing(&converge);
+            .map_err(|e| e.to_string())
+            .and_then(|listing| TunnelFacts::from_listing(&listing))
+            .unwrap_or_else(|why| {
+                tracing::warn!(%why, "dns.observe: no converge facts; every tunnel-interlocked record holds");
+                TunnelFacts::default()
+            });
         let gate_for = |v: &Json| -> Interlock {
             let hostname = v.get("name").and_then(Json::as_str).unwrap_or_default();
             match v.get("interlock").and_then(Json::as_str) {
@@ -1575,6 +1663,7 @@ impl Handler for DnsObserve {
             zone: comparison,
             access: access_verdicts,
             applied,
+            ssh_ca,
         };
 
         // The alarm FIRST (see the module doc for why), then the step.
@@ -1585,29 +1674,15 @@ impl Handler for DnsObserve {
             "none"
         };
 
-        let url = format!(
-            "{}/api/jobs/{}/steps/{}",
+        complete_step(
+            &self.client,
             self.base(),
             ev.job_id,
-            ev.step_id
-        );
-        let resp = self
-            .client
-            .put(&url)
-            .header("content-type", "application/json")
-            .header("x-boss-user", dispatcher_actor_header(rule))
-            .header("x-sim-origin", sim_origin_value())
-            .json(&observe_put_body(&existing, &reading))
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("PUT {url}: {e}")))?;
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "PUT {url} returned {st}: {body}"
-            )));
-        }
+            ev.step_id,
+            observe_fields(&reading),
+            rule,
+        )
+        .await?;
         tracing::info!(
             zone,
             packet = ev.job_id,
@@ -1672,41 +1747,41 @@ mod tests {
             zone: c,
             access: vec![],
             applied: vec![],
+            ssh_ca: vec![],
         }
     }
 
     #[test]
     fn the_observe_body_completes_with_the_verdicts_and_forks_on_hard() {
-        let mut existing = serde_json::Map::new();
-        existing.insert("spec_slug".into(), json!("observe"));
         let clean = reading(comparison(
             0,
             json!([{"record": "boss.algedonic.dev CNAME", "verdict": "MATCH"}]),
         ));
-        let b = observe_put_body(&existing, &clean);
-        assert_eq!(b["status"], "completed");
-        assert_eq!(b["metadata"]["result"], "match");
+        let b = observe_fields(&clean);
+        assert_eq!(b["result"], "match");
+        let mut keys: Vec<&str> = b.keys().map(String::as_str).collect();
+        keys.sort_unstable();
         assert_eq!(
-            b["metadata"]["spec_slug"], "observe",
-            "existing keys ride along"
+            keys,
+            [
+                "access", "applied", "counts", "result", "ssh_ca", "summary", "verdicts"
+            ],
+            "its own fields only — the merge door keeps the step's (e39a9d2a)"
         );
-        assert_eq!(b["metadata"]["verdicts"][0]["verdict"], "MATCH");
+        assert_eq!(b["verdicts"][0]["verdict"], "MATCH");
         assert!(
-            b["metadata"]["summary"]
+            b["summary"]
                 .as_str()
                 .unwrap()
                 .starts_with(&clean.zone.summary)
         );
-        assert_eq!(b["metadata"]["counts"]["zone"]["MATCH"], 1);
+        assert_eq!(b["counts"]["zone"]["MATCH"], 1);
 
         let drifted = reading(comparison(
             1,
             json!([{"record": "boss.algedonic.dev CNAME", "verdict": "DRIFT"}]),
         ));
-        assert_eq!(
-            observe_put_body(&existing, &drifted)["metadata"]["result"],
-            "findings"
-        );
+        assert_eq!(observe_fields(&drifted)["result"], "findings");
 
         // HELD is paperwork: the zone disagrees with the declaration
         // by design until the interlock releases, and that is not a
@@ -1716,23 +1791,14 @@ mod tests {
             json!([{"record": "boss.algedonic.dev CNAME", "verdict": "HELD", "held": "flip held — Access app absent"}]),
         ));
         assert_eq!(held.hard(), 0);
-        assert_eq!(
-            observe_put_body(&existing, &held)["metadata"]["result"],
-            "match"
-        );
-        assert_eq!(
-            observe_put_body(&existing, &held)["metadata"]["counts"]["zone"]["HELD"],
-            1
-        );
+        assert_eq!(observe_fields(&held)["result"], "match");
+        assert_eq!(observe_fields(&held)["counts"]["zone"]["HELD"], 1);
 
         // An Access finding is a finding.
         let mut access_drift = reading(comparison(0, json!([])));
         access_drift.access = vec![json!({"application": "x", "verdict": "DRIFT"})];
         assert_eq!(access_drift.hard(), 1);
-        assert_eq!(
-            observe_put_body(&existing, &access_drift)["metadata"]["result"],
-            "findings"
-        );
+        assert_eq!(observe_fields(&access_drift)["result"], "findings");
     }
 
     #[test]
@@ -1822,6 +1888,7 @@ mod tests {
             app_type: "self_hosted".into(),
             session_duration: "24h".into(),
             why: "test".into(),
+            short_lived_ca: false,
             policy: vec![DeclaredPolicy {
                 name: policy.into(),
                 decision: "allow".into(),
@@ -1863,6 +1930,49 @@ mod tests {
             include: email_rules(emails),
             precedence: 1,
         }
+    }
+
+    /// An SSH application is the SAME vocabulary as a self_hosted one
+    /// (design 5fc71f03; backlog e4cedb46 asked whether the handler
+    /// knows only HTTP applications). `type` is a value carried
+    /// verbatim from the declaration to the comparison and to the
+    /// create body — never matched against a list of known kinds — so
+    /// the dev door needed no handler change, and this test is what
+    /// keeps that true when someone reaches for an enum.
+    #[test]
+    fn an_ssh_application_is_declared_compared_and_created_as_one() {
+        let text = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/cluster/dns/access.toml"),
+        )
+        .expect("access.toml ships beside the zone file");
+        let dec = parse_access_declaration(&text, "algedonic.dev").expect("parses for the zone");
+        let dev = dec
+            .application
+            .iter()
+            .find(|a| a.domain == "dev.algedonic.dev")
+            .expect("the dev workspace door is declared");
+        assert_eq!(dev.app_type, "ssh");
+        assert!(
+            dev.short_lived_ca,
+            "the ssh door declares its CA, or cloudflared is refused 'bad ca application'"
+        );
+
+        // ABSENT is what the first observation after this lands reads,
+        // and what makes the handler create it — with the declared
+        // type, not a default.
+        let absent = compare_access(std::slice::from_ref(dev), &[]);
+        assert_eq!(absent[0]["verdict"], json!("ABSENT"));
+        assert_eq!(absent[0]["declared"]["type"], json!("ssh"));
+
+        // And once the account holds it, the comparison MATCHes: an
+        // ssh application does not read as permanent DRIFT against a
+        // vocabulary that only knew self_hosted.
+        let live = AccessApp {
+            app_type: "ssh".into(),
+            ..live_app("dev.algedonic.dev", vec![allow("operators", &[DAVID])])
+        };
+        let matched = compare_access(std::slice::from_ref(dev), &[live]);
+        assert_eq!(matched[0]["verdict"], json!("MATCH"), "{matched:?}");
     }
 
     #[test]
@@ -2402,7 +2512,7 @@ measured = "2026-09-20: read from the IdP"
                 }}
             ]
         }]});
-        let facts = TunnelFacts::from_listing(&listing);
+        let facts = TunnelFacts::from_listing(&listing).expect("a listing");
         assert_eq!(tunnel_gate("id.algedonic.dev", &facts), TunnelGate::Routed);
         assert_eq!(
             tunnel_gate("boss.algedonic.dev", &facts),
@@ -2427,8 +2537,12 @@ measured = "2026-09-20: read from the IdP"
         );
         assert_eq!(
             TunnelFacts::from_listing(&json!({"data": []})),
-            TunnelFacts::default(),
+            Ok(TunnelFacts::default()),
             "no converge packet: no facts, and every tunnel gate holds"
+        );
+        assert!(
+            TunnelFacts::from_listing(&json!({"total": 1})).is_err(),
+            "no `data` array is no answer — the caller states the hold (d4698bc2)"
         );
         assert_eq!(
             tunnel_gate("id.algedonic.dev", &TunnelFacts::default()),
@@ -2599,32 +2713,54 @@ measured = "2026-09-20: read from the IdP"
         reads: Mutex<usize>,
         writes: Mutex<Vec<String>>,
         refuse_policies: Option<String>,
+        /// Short-lived-certificate CA public keys, by application id.
+        /// An account built `with` its applications holds a CA for each
+        /// (the dev door's, as the account reads once the observer has
+        /// run); `without_cas` holds none.
+        cas: Mutex<HashMap<String, String>>,
+        refuse_cas: Option<String>,
     }
 
     impl FakeAccess {
-        fn with(apps: Vec<AccessApp>) -> Arc<Self> {
+        fn ca_key(app_id: &str) -> String {
+            format!("ecdsa-sha2-nistp256 CA-OF-{app_id}")
+        }
+        fn build(
+            apps: Result<Vec<AccessApp>, String>,
+            refuse_policies: Option<String>,
+            cas: HashMap<String, String>,
+            refuse_cas: Option<String>,
+        ) -> Arc<Self> {
             Arc::new(Self {
-                apps: Mutex::new(Ok(apps)),
+                apps: Mutex::new(apps),
                 reads: Mutex::new(0),
                 writes: Mutex::new(vec![]),
-                refuse_policies: None,
+                refuse_policies,
+                cas: Mutex::new(cas),
+                refuse_cas,
             })
+        }
+        fn all_cas(apps: &[AccessApp]) -> HashMap<String, String> {
+            apps.iter()
+                .map(|a| (a.id.clone(), Self::ca_key(&a.id)))
+                .collect()
+        }
+        fn with(apps: Vec<AccessApp>) -> Arc<Self> {
+            let cas = Self::all_cas(&apps);
+            Self::build(Ok(apps), None, cas, None)
+        }
+        fn without_cas(apps: Vec<AccessApp>) -> Arc<Self> {
+            Self::build(Ok(apps), None, HashMap::new(), None)
+        }
+        fn refusing_cas(apps: Vec<AccessApp>, why: &str) -> Arc<Self> {
+            Self::build(Ok(apps), None, HashMap::new(), Some(why.to_string()))
         }
         fn refusing_policies(apps: Vec<AccessApp>, why: &str) -> Arc<Self> {
-            Arc::new(Self {
-                apps: Mutex::new(Ok(apps)),
-                reads: Mutex::new(0),
-                writes: Mutex::new(vec![]),
-                refuse_policies: Some(why.to_string()),
-            })
+            let cas = Self::all_cas(&apps);
+            Self::build(Ok(apps), Some(why.to_string()), cas, None)
         }
         fn dark(msg: &str) -> Arc<Self> {
-            Arc::new(Self {
-                apps: Mutex::new(Err(msg.to_string())),
-                reads: Mutex::new(0),
-                writes: Mutex::new(vec![]),
-                refuse_policies: None,
-            })
+            Self::build(Err(msg.to_string()), None, HashMap::new(), None)
         }
         fn writes(&self) -> Vec<String> {
             self.writes.lock().unwrap().clone()
@@ -2698,6 +2834,34 @@ measured = "2026-09-20: read from the IdP"
             }
             Ok(())
         }
+        async fn short_lived_ca(
+            &self,
+            account_id: &str,
+            app_id: &str,
+        ) -> Result<Option<String>, String> {
+            assert_eq!(account_id, "acct-1");
+            Ok(self.cas.lock().unwrap().get(app_id).cloned())
+        }
+        async fn create_short_lived_ca(
+            &self,
+            account_id: &str,
+            app_id: &str,
+        ) -> Result<String, String> {
+            assert_eq!(account_id, "acct-1");
+            self.writes
+                .lock()
+                .unwrap()
+                .push(format!("create ca on {app_id}"));
+            if let Some(why) = &self.refuse_cas {
+                return Err(why.clone());
+            }
+            let key = Self::ca_key(app_id);
+            self.cas
+                .lock()
+                .unwrap()
+                .insert(app_id.to_string(), key.clone());
+            Ok(key)
+        }
     }
 
     #[derive(Default)]
@@ -2769,8 +2933,10 @@ measured = "2026-09-20: read from the IdP"
     /// deleted that morning, 530 from then on (fd75c641).
     const OLD_TUNNEL_CNAME: &str = "8bb06ec8-a6d1-4796-8f51-df363798b48c.cfargotunnel.com";
     /// The converge packet's ingress line once tunnel-origins.toml routes
-    /// the IdP (the sibling car), as the runner records it.
-    const CONVERGE_ROUTES_IDP: &str = "boss.algedonic.dev → boss; playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin)";
+    /// the IdP (the sibling car) and the dev door (5fc71f03), as the
+    /// runner records it: both are declared origins, so both appear
+    /// here, and the tunnel interlock on either record reads it.
+    const CONVERGE_ROUTES_IDP: &str = "boss.algedonic.dev → boss; playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin); dev.algedonic.dev → ssh://boss-dev-ssh.boss-dev.svc.cluster.local:22 (origin)";
 
     fn converge_listing(ingress: &str) -> Json {
         json!({"data": [{
@@ -2799,6 +2965,13 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // The dev workspace's ssh door (5fc71f03), present here
+            // although it did not exist on 2026-09-16: each test below
+            // isolates ONE record's flip, and an absent interlocked
+            // record the test is not about would add a create to every
+            // write list. Its own creation is the subject of
+            // `the_dev_door_record_is_created_once_the_converge_routes_it`.
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ]
     }
 
@@ -2815,6 +2988,13 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // The dev workspace's ssh door (5fc71f03). It is absent
+            // from `as_measured` deliberately: it did not exist on
+            // 2026-09-16, so every fixture of the zone BEFORE the flip
+            // is now one record short of the declaration, and each
+            // test below that observes such a zone sees the observer
+            // create this one behind its tunnel interlock.
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ]
     }
 
@@ -2854,6 +3034,15 @@ measured = "2026-09-20: read from the IdP"
                     precedence: 1,
                 }],
             ),
+            // The dev workspace's ssh door (5fc71f03): the only
+            // application of another `type`, which is why it is here
+            // rather than only in its own test — every MATCH fixture
+            // must carry it, or the type a live read returns is one
+            // nothing compares.
+            AccessApp {
+                app_type: "ssh".into(),
+                ..live_app("dev.algedonic.dev", vec![allow("operators", &[DAVID])])
+            },
         ]
     }
 
@@ -2894,10 +3083,16 @@ measured = "2026-09-20: read from the IdP"
         converge_ingress: &'static str,
     ) -> (String, Captured) {
         use axum::extract::{Path, Query};
+        use axum::response::IntoResponse;
         use axum::{Json as AxJson, Router, routing::get, routing::post, routing::put};
 
         let captured: Captured = Default::default();
-        let (c1, c2, c3) = (captured.clone(), captured.clone(), captured.clone());
+        let (c1, c2, c3, c4) = (
+            captured.clone(),
+            captured.clone(),
+            captured.clone(),
+            captured.clone(),
+        );
         let alarms = Arc::new(open_alarms);
         let app = Router::new()
             .route(
@@ -2913,7 +3108,13 @@ measured = "2026-09-20: read from the IdP"
                         }
                         assert_eq!(q.get("kind").map(String::as_str), Some("backlog-item"));
                         assert_eq!(q.get("status").map(String::as_str), Some("open"));
-                        AxJson(json!({ "data": *alarms, "total": alarms.len() }))
+                        // Answered as the jobs API answers it, behind more
+                        // unrelated open items than one page (c5ac71de).
+                        AxJson(crate::handlers::listing_stub::backlog_listing(
+                            &alarms,
+                            q.get("metadata_has").map(String::as_str),
+                            q.get("limit").and_then(|l| l.parse().ok()),
+                        ))
                     }
                 })
                 .post(move |AxJson(body): AxJson<Json>| {
@@ -2957,12 +3158,37 @@ measured = "2026-09-20: read from the IdP"
                 put(move |Path((id, sid)): Path<(String, String)>, AxJson(body): AxJson<Json>| {
                     let c = c3.clone();
                     async move {
+                        // The decided end state (e39a9d2a).
+                        if let Some(refused) =
+                            super::super::listing_stub::end_state_step_put(&id, &sid, &body)
+                        {
+                            c.lock()
+                                .unwrap()
+                                .push((format!("PUT /api/jobs/{id}/steps/{sid} (409)"), body));
+                            return refused;
+                        }
                         c.lock()
                             .unwrap()
                             .push((format!("PUT /api/jobs/{id}/steps/{sid}"), body));
-                        AxJson(json!({ "ok": true }))
+                        AxJson(json!({ "ok": true })).into_response()
                     }
                 }),
+            )
+            // The step merge door, recorded in order with the PUT.
+            .route(
+                "/api/jobs/{id}/steps/{sid}/metadata",
+                axum::routing::patch(
+                    move |Path((id, sid)): Path<(String, String)>, AxJson(body): AxJson<Json>| {
+                        let c = c4.clone();
+                        async move {
+                            c.lock().unwrap().push((
+                                format!("PATCH /api/jobs/{id}/steps/{sid}/metadata"),
+                                body,
+                            ));
+                            AxJson(json!({ "ok": true }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/api/credentials/{id}",
@@ -3037,21 +3263,139 @@ measured = "2026-09-20: read from the IdP"
         c.lock().unwrap().clone()
     }
 
+    /// The observe step's completion as the stub saw it: the fields
+    /// through the step merge door, then a PUT carrying the status and
+    /// nothing else (e39a9d2a). Answers the merged fields.
     fn step_put(w: &[(String, Json)]) -> Json {
-        w.iter()
-            .find(|(p, _)| p == "PUT /api/jobs/obs-1/steps/step-observe")
-            .map(|(_, b)| b.clone())
-            .unwrap_or_else(|| panic!("no step completion among {w:?}"))
+        let merged = w
+            .iter()
+            .position(|(p, _)| p == MERGE_OBSERVE)
+            .unwrap_or_else(|| panic!("no merge onto the observe step among {w:?}"));
+        assert_eq!(
+            w.get(merged + 1),
+            Some(&(PUT_OBSERVE.to_string(), json!({"status": "completed"}))),
+            "the merge is followed by the flip, and the flip carries the status alone: {w:?}"
+        );
+        w[merged].1.clone()
     }
 
+    /// The two writes that complete the observe step, in order.
+    const MERGE_OBSERVE: &str = "PATCH /api/jobs/obs-1/steps/step-observe/metadata";
+    const PUT_OBSERVE: &str = "PUT /api/jobs/obs-1/steps/step-observe";
+
     fn boss_verdict(body: &Json) -> Json {
-        body["metadata"]["verdicts"]
+        body["verdicts"]
             .as_array()
             .unwrap()
             .iter()
             .find(|v| v["name"] == "boss.algedonic.dev")
             .cloned()
             .unwrap_or_else(|| panic!("no boss. verdict: {body}"))
+    }
+
+    // ----- the dev door's short-lived-certificate CA (incident 55d001b0) -----
+
+    /// 2026-09-23: the account held the dev door's application and no
+    /// CA for it — the dashboard offers only the account-wide
+    /// Access-for-Infrastructure CA — so `cloudflared access ssh` was
+    /// refused "bad ca application". The observer generates it and
+    /// records the public key the pod's sshd must trust.
+    #[tokio::test]
+    async fn the_dev_door_ca_is_generated_and_its_public_key_recorded() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let access = FakeAccess::without_cas(account_as_declared());
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        assert_eq!(
+            access.writes(),
+            vec!["create ca on app-dev.algedonic.dev".to_string()],
+            "only the application that declares a CA gets one"
+        );
+        let w = writes(&captured);
+        assert_eq!(w.len(), 2, "the merge and the flip, no alarm: {w:?}");
+        let body = step_put(&w);
+        assert_eq!(body["result"], "match");
+        assert_eq!(
+            body["applied"],
+            json!(["Access short-lived certificate CA created on dev.algedonic.dev"])
+        );
+        assert_eq!(
+            body["ssh_ca"],
+            json!([{
+                "domain": "dev.algedonic.dev",
+                "public_key": "ecdsa-sha2-nistp256 CA-OF-app-dev.algedonic.dev",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_ca_is_recorded_and_not_generated_again() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        assert!(access.writes().is_empty(), "{:?}", access.writes());
+        let body = step_put(&writes(&captured));
+        assert_eq!(
+            body["ssh_ca"],
+            json!([{
+                "domain": "dev.algedonic.dev",
+                "public_key": "ecdsa-sha2-nistp256 CA-OF-app-dev.algedonic.dev",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_ca_is_a_finding_that_names_the_account_answer() {
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(as_declared());
+        let why = "POST /accounts/acct-1/access/apps/app-dev.algedonic.dev/ca returned 403";
+        let access = FakeAccess::refusing_cas(account_as_declared(), why);
+        let h = handler(
+            jobs,
+            zone.clone(),
+            access.clone(),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+
+        let w = writes(&captured);
+        assert!(
+            w.iter().any(|(p, _)| p == "POST /api/jobs"),
+            "a refused CA raises the alarm: {w:?}"
+        );
+        let body = step_put(&w);
+        assert_eq!(body["result"], "findings");
+        assert_eq!(body["ssh_ca"], json!([]));
+        let refused: Vec<&Json> = body["access"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["verdict"] == "REFUSED")
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            refused[0]["write"],
+            "create short-lived certificate CA on dev.algedonic.dev"
+        );
+        assert_eq!(refused[0]["error"], why);
     }
 
     // ----- steady state -----
@@ -3078,18 +3422,17 @@ measured = "2026-09-20: read from the IdP"
         let w = writes(&captured);
         assert_eq!(
             w.len(),
-            1,
-            "one write: the step completion; no alarm: {w:?}"
+            2,
+            "the step completion — merge, then flip; no alarm: {w:?}"
         );
         let body = step_put(&w);
-        assert_eq!(body["status"], "completed");
-        assert_eq!(body["metadata"]["result"], "match");
-        assert_eq!(
-            body["metadata"]["kept"], "yes",
-            "existing step metadata rides along"
+        assert_eq!(body["result"], "match");
+        assert!(
+            body.get("kept").is_none(),
+            "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
         );
-        let verdicts = body["metadata"]["verdicts"].as_array().unwrap();
-        assert_eq!(verdicts.len(), 4, "boss., id., playground. and www.");
+        let verdicts = body["verdicts"].as_array().unwrap();
+        assert_eq!(verdicts.len(), 5, "boss., id., playground., www. and dev.");
         assert!(
             verdicts.iter().all(|v| v["verdict"] == "MATCH"),
             "{verdicts:?}"
@@ -3108,22 +3451,22 @@ measured = "2026-09-20: read from the IdP"
             !body.to_string().contains("Zml4dHVyZS"),
             "tunnel secret leaked: {body}"
         );
-        let access_v = body["metadata"]["access"].as_array().unwrap();
+        let access_v = body["access"].as_array().unwrap();
         assert_eq!(
             access_v.len(),
-            4,
-            "boss., www., the playground and its callback bypass"
+            5,
+            "boss., www., dev., the playground and its callback bypass"
         );
         assert!(
             access_v.iter().all(|v| v["verdict"] == "MATCH"),
             "{access_v:?}"
         );
-        assert_eq!(body["metadata"]["applied"], json!([]));
-        let summary = body["metadata"]["summary"].as_str().unwrap();
+        assert_eq!(body["applied"], json!([]));
+        let summary = body["summary"].as_str().unwrap();
         assert!(
             summary.contains(
-                "4 match, 0 drift, 0 absent, 0 undeclared — every declared record matches"
-            ) && summary.contains("· access: 4 match, 0 drift, 0 absent, 0 undeclared"),
+                "5 match, 0 drift, 0 absent, 0 undeclared — every declared record matches"
+            ) && summary.contains("· access: 5 match, 0 drift, 0 absent, 0 undeclared"),
             "{summary}"
         );
     }
@@ -3175,29 +3518,29 @@ measured = "2026-09-20: read from the IdP"
             ]
         );
         assert_eq!(*zone.reads.lock().unwrap(), 2, "read back after the apply");
-        assert_eq!(zone.live().len(), 4, "no A left beside the CNAME");
+        assert_eq!(zone.live().len(), 5, "no A left beside the CNAME");
 
         let w = writes(&captured);
         assert_eq!(
             w.len(),
-            1,
+            2,
             "no alarm: the reading after the writes matches: {w:?}"
         );
         let body = step_put(&w);
-        assert_eq!(body["metadata"]["result"], "match");
+        assert_eq!(body["result"], "match");
         let boss = boss_verdict(&body);
         assert_eq!(boss["verdict"], "MATCH", "{boss}");
         assert_eq!(boss["access"], "created");
         assert_eq!(boss["type"], "CNAME");
         assert_eq!(
-            body["metadata"]["applied"],
+            body["applied"],
             json!([
                 "Access application boss.algedonic.dev created",
                 "Access policy operators (allow) created on boss.algedonic.dev",
                 "boss.algedonic.dev CNAME created (replacing 1 record(s) at that name)",
             ])
         );
-        let summary = body["metadata"]["summary"].as_str().unwrap();
+        let summary = body["summary"].as_str().unwrap();
         assert!(
             summary.contains("applied: Access application boss.algedonic.dev created"),
             "{summary}"
@@ -3253,10 +3596,10 @@ measured = "2026-09-20: read from the IdP"
             "the record is created once the application reads present; nothing else is touched"
         );
         let w = writes(&captured);
-        assert_eq!(w.len(), 1, "no alarm: {w:?}");
+        assert_eq!(w.len(), 2, "the merge and the flip, no alarm: {w:?}");
         let body = step_put(&w);
-        assert_eq!(body["metadata"]["result"], "match");
-        let www = body["metadata"]["verdicts"]
+        assert_eq!(body["result"], "match");
+        let www = body["verdicts"]
             .as_array()
             .unwrap()
             .iter()
@@ -3266,7 +3609,7 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(www["verdict"], "MATCH", "{www}");
         assert_eq!(www["access"], "created");
         assert_eq!(
-            body["metadata"]["applied"],
+            body["applied"],
             json!([
                 "Access application www.algedonic.dev created",
                 "Access policy operators (allow) created on www.algedonic.dev",
@@ -3312,11 +3655,11 @@ measured = "2026-09-20: read from the IdP"
         let w = writes(&captured);
         assert_eq!(
             w.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "the alarm, then the step: {w:?}"
         );
         let body = step_put(&w);
-        assert_eq!(body["metadata"]["result"], "findings");
+        assert_eq!(body["result"], "findings");
         let boss = boss_verdict(&body);
         assert_eq!(boss["verdict"], "ABSENT", "the zone as it is now: {boss}");
         assert_eq!(
@@ -3324,11 +3667,11 @@ measured = "2026-09-20: read from the IdP"
             "the account's answer, verbatim"
         );
         assert_eq!(
-            body["metadata"]["applied"],
+            body["applied"],
             json!([]),
             "nothing was written that the account took"
         );
-        let summary = body["metadata"]["summary"].as_str().unwrap();
+        let summary = body["summary"].as_str().unwrap();
         assert!(
             summary.contains("refused by the zone: boss.algedonic.dev: POST /zones/zone-1/dns_records returned 400"),
             "{summary}"
@@ -3359,6 +3702,57 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(kept[0]["refused"], "x", "and the refusal is still recorded");
     }
 
+    /// The dev workspace's ssh door (design 5fc71f03; backlog
+    /// e4cedb46). Its record rides the SAME interlock the IdP's does —
+    /// applied only once the converge reports the tunnel routing it —
+    /// because a CNAME to a tunnel with no rule for the name is the
+    /// 530 of 2026-09-16, and an ssh door that answers 530 looks
+    /// exactly like an ssh door that is down.
+    #[tokio::test]
+    async fn the_dev_door_record_is_created_once_the_converge_routes_it() {
+        let without_dev: Vec<Json> = as_declared()
+            .into_iter()
+            .filter(|r| r["name"] != "dev.algedonic.dev")
+            .collect();
+        let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
+        let zone = FakeZone::with(without_dev.clone());
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(jobs, zone.clone(), access, secrets(), declarations());
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+        assert_eq!(
+            zone.writes(),
+            vec![format!(
+                "create dev.algedonic.dev CNAME {} proxied=true ttl=1",
+                tunnel_cname()
+            )],
+            "the door's record created behind the tunnel interlock, nothing else touched"
+        );
+        let body = step_put(&writes(&captured));
+        let dev = body["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "dev.algedonic.dev")
+            .cloned()
+            .unwrap_or_else(|| panic!("no dev. verdict: {body}"));
+        assert_eq!(dev["tunnel"], "routed");
+
+        // With a converge that does not name it, nothing is written:
+        // the record waits for the route rather than answering 530.
+        let (jobs, _captured) = stub_jobs_api_with_converge(
+            "ready",
+            vec![],
+            LOCATION,
+            "boss.algedonic.dev → boss; id.algedonic.dev → https://10.20.0.31:443 (origin)",
+        )
+        .await;
+        let zone = FakeZone::with(without_dev);
+        let access = FakeAccess::with(account_as_declared());
+        let h = handler(jobs, zone.clone(), access, secrets(), declarations());
+        h.invoke(&zone_args(), &ctx()).await.unwrap();
+        assert!(zone.writes().is_empty(), "held: {:?}", zone.writes());
+    }
+
     /// The 2026-09-16 outage (fd75c641): the IdP's record pointed at
     /// the deleted tunnel. With the converge routing id. (the sibling
     /// car landed) the observer corrects the CNAME in place behind the
@@ -3377,6 +3771,9 @@ measured = "2026-09-20: read from the IdP"
                 1,
             ),
             record("www.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
+            // Already applied, so the id. correction is the only write
+            // this test has to account for (see `as_measured`).
+            record("dev.algedonic.dev", "CNAME", &tunnel_cname(), true, 1),
         ];
         let (jobs, captured) = stub_jobs_api("ready", vec![], LOCATION).await;
         let zone = FakeZone::with(stale.clone());
@@ -3392,8 +3789,8 @@ measured = "2026-09-20: read from the IdP"
             "the stale CNAME corrected in place, nothing else touched"
         );
         let body = step_put(&writes(&captured));
-        assert_eq!(body["metadata"]["result"], "match", "{body}");
-        let idp = body["metadata"]["verdicts"]
+        assert_eq!(body["result"], "match", "{body}");
+        let idp = body["verdicts"]
             .as_array()
             .unwrap()
             .iter()
@@ -3403,10 +3800,7 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(idp["verdict"], "MATCH");
         assert_eq!(idp["tunnel"], "routed");
         assert!(idp.get("access").is_none(), "{idp}");
-        assert_eq!(
-            body["metadata"]["applied"],
-            json!(["id.algedonic.dev CNAME corrected"])
-        );
+        assert_eq!(body["applied"], json!(["id.algedonic.dev CNAME corrected"]));
 
         // Before the sibling car converges: the converge's ingress line
         // does not name id. — HELD, alarm raised, nothing written.
@@ -3428,19 +3822,19 @@ measured = "2026-09-20: read from the IdP"
         let w = writes(&captured);
         assert_eq!(
             w.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["PUT /api/jobs/obs-1/steps/step-observe"],
+            vec![MERGE_OBSERVE, PUT_OBSERVE],
             "{w:?}"
         );
         let body = step_put(&w);
         assert!(
-            body["metadata"]["summary"]
+            body["summary"]
                 .as_str()
                 .unwrap()
                 .contains("id.algedonic.dev: flip held — the converge does not route"),
             "{}",
-            body["metadata"]["summary"]
+            body["summary"]
         );
-        let idp = body["metadata"]["verdicts"]
+        let idp = body["verdicts"]
             .as_array()
             .unwrap()
             .iter()
@@ -3493,6 +3887,12 @@ measured = "2026-09-20: read from the IdP"
         struct RefusingAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for RefusingAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 self.0.access_apps(a).await
             }
@@ -3530,16 +3930,15 @@ measured = "2026-09-20: read from the IdP"
         let w = writes(&captured);
         assert_eq!(
             w.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "the alarm, then the step: {w:?}"
         );
         let body = step_put(&w);
-        assert_eq!(body["status"], "completed");
-        assert_eq!(body["metadata"]["result"], "findings");
+        assert_eq!(body["result"], "findings");
         let boss = boss_verdict(&body);
         assert_eq!(boss["verdict"], "HELD", "{boss}");
         assert_eq!(boss["access"], "absent");
-        let access_v = body["metadata"]["access"].as_array().unwrap();
+        let access_v = body["access"].as_array().unwrap();
         let refused: Vec<&Json> = access_v
             .iter()
             .filter(|v| v["verdict"] == "REFUSED")
@@ -3555,8 +3954,8 @@ measured = "2026-09-20: read from the IdP"
             "the account's own answer, verbatim: {}",
             refused[0]
         );
-        assert_eq!(body["metadata"]["counts"]["access"]["REFUSED"], 1);
-        let summary = body["metadata"]["summary"].as_str().unwrap();
+        assert_eq!(body["counts"]["access"]["REFUSED"], 1);
+        let summary = body["summary"].as_str().unwrap();
         assert!(
             summary.contains("1 absent, 0 undeclared, 1 refused"),
             "{summary}"
@@ -3604,18 +4003,18 @@ measured = "2026-09-20: read from the IdP"
         let w = writes(&captured);
         assert_eq!(
             w.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "{w:?}"
         );
         let body = step_put(&w);
-        assert_eq!(body["metadata"]["result"], "findings");
+        assert_eq!(body["result"], "findings");
         let boss = boss_verdict(&body);
         assert_eq!(boss["verdict"], "HELD", "{boss}");
         assert_eq!(
             boss["access"], "no-allow-policy",
             "the app is there, its allow policy is not: {boss}"
         );
-        let refused: Vec<Json> = body["metadata"]["access"]
+        let refused: Vec<Json> = body["access"]
             .as_array()
             .unwrap()
             .iter()
@@ -3636,7 +4035,7 @@ measured = "2026-09-20: read from the IdP"
             refused[0]
         );
         assert_eq!(
-            body["metadata"]["applied"],
+            body["applied"],
             json!(["Access application boss.algedonic.dev created"]),
             "what WAS written is still recorded"
         );
@@ -3666,7 +4065,7 @@ measured = "2026-09-20: read from the IdP"
         );
         assert_eq!(zone.writes().len(), 2, "{:?}", zone.writes());
         let body = step_put(&writes(&captured));
-        assert_eq!(body["metadata"]["result"], "match", "{body}");
+        assert_eq!(body["result"], "match", "{body}");
         let boss = boss_verdict(&body);
         assert_eq!(boss["verdict"], "MATCH");
         assert_eq!(boss["access"], "present");
@@ -3684,6 +4083,12 @@ measured = "2026-09-20: read from the IdP"
         struct StubbornAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for StubbornAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 self.0.access_apps(a).await
             }
@@ -3730,7 +4135,7 @@ measured = "2026-09-20: read from the IdP"
         let order: Vec<&str> = w.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             order,
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "the Access DRIFT (a deny policy the declaration does not name) is a finding; the held flip is not"
         );
         let body = step_put(&w);
@@ -3738,7 +4143,7 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(boss["verdict"], "HELD", "{boss}");
         assert_eq!(boss["access"], "no-allow-policy");
         assert_eq!(boss["held"], "flip held — Access app has no allow policy");
-        let summary = body["metadata"]["summary"].as_str().unwrap();
+        let summary = body["summary"].as_str().unwrap();
         assert!(
             summary.contains("boss.algedonic.dev: flip held — Access app has no allow policy"),
             "{summary}"
@@ -3766,6 +4171,12 @@ measured = "2026-09-20: read from the IdP"
         struct LaggingAccess(Arc<FakeAccess>);
         #[async_trait]
         impl AccessApps for LaggingAccess {
+            async fn short_lived_ca(&self, a: &str, i: &str) -> Result<Option<String>, String> {
+                self.0.short_lived_ca(a, i).await
+            }
+            async fn create_short_lived_ca(&self, a: &str, i: &str) -> Result<String, String> {
+                self.0.create_short_lived_ca(a, i).await
+            }
             async fn access_apps(&self, a: &str) -> Result<Vec<AccessApp>, String> {
                 let apps = self.0.access_apps(a).await?;
                 Ok(apps
@@ -3812,7 +4223,7 @@ measured = "2026-09-20: read from the IdP"
         let order: Vec<&str> = w.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             order,
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "the application ABSENT on the re-read is a finding, alarmed"
         );
         let body = step_put(&w);
@@ -3820,9 +4231,9 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(boss["verdict"], "HELD", "{boss}");
         assert_eq!(boss["access"], "absent");
         assert_eq!(boss["held"], "flip held — Access app absent");
-        assert_eq!(body["metadata"]["result"], "findings");
+        assert_eq!(body["result"], "findings");
         assert!(
-            body["metadata"]["summary"]
+            body["summary"]
                 .as_str()
                 .unwrap()
                 .contains("boss.algedonic.dev: flip held — Access app absent")
@@ -3850,13 +4261,13 @@ measured = "2026-09-20: read from the IdP"
         h.invoke(&zone_args(), &ctx()).await.unwrap();
 
         let w = writes(&captured);
-        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w.len(), 2, "the merge and the flip: {w:?}");
         let body = &w[0].1;
         assert_eq!(
-            body["metadata"]["result"], "match",
+            body["result"], "match",
             "UNDECLARED is reported, not a failure"
         );
-        let verdicts = body["metadata"]["verdicts"].as_array().unwrap();
+        let verdicts = body["verdicts"].as_array().unwrap();
         let id = verdicts
             .iter()
             .find(|v| v["record"] == "id.algedonic.dev A")
@@ -3898,7 +4309,7 @@ measured = "2026-09-20: read from the IdP"
         let order: Vec<&str> = w.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             order,
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"],
+            vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE],
             "the alarm is filed BEFORE the step completes"
         );
         let alarm = &w[0].1;
@@ -3916,8 +4327,7 @@ measured = "2026-09-20: read from the IdP"
             findings[0]["live"]["content"],
             "00000000-1111-4222-8333-444444444444.cfargotunnel.com"
         );
-        let step = &w[1].1;
-        assert_eq!(step["metadata"]["result"], "findings");
+        assert_eq!(step_put(&w)["result"], "findings");
     }
 
     #[tokio::test]
@@ -3942,12 +4352,16 @@ measured = "2026-09-20: read from the IdP"
             )]
         );
         let w = writes(&captured);
-        assert_eq!(w.len(), 1, "corrected, re-read, matched: no alarm: {w:?}");
+        assert_eq!(
+            w.len(),
+            2,
+            "corrected, re-read, matched: the merge and the flip, no alarm: {w:?}"
+        );
         let body = step_put(&w);
-        assert_eq!(body["metadata"]["result"], "match");
+        assert_eq!(body["result"], "match");
         assert_eq!(boss_verdict(&body)["verdict"], "MATCH");
         assert_eq!(
-            body["metadata"]["applied"],
+            body["applied"],
             json!(["boss.algedonic.dev CNAME corrected"])
         );
     }
@@ -3975,7 +4389,8 @@ measured = "2026-09-20: read from the IdP"
             order,
             vec![
                 "PATCH /api/jobs/alarm-1/metadata",
-                "PUT /api/jobs/obs-1/steps/step-observe"
+                MERGE_OBSERVE,
+                PUT_OBSERVE
             ]
         );
         let patch = &w[0].1;
@@ -3984,6 +4399,53 @@ measured = "2026-09-20: read from the IdP"
         assert_eq!(
             patch["findings"][0]["record"],
             "playground.algedonic.dev CNAME"
+        );
+    }
+
+    /// THE DEDUP READS ONLY ESTATE PACKETS (backlog c5ac71de). Unfiltered,
+    /// the read counted every open backlog-item against a 200-row page;
+    /// open items passed 200 in September 2026 (370 on 2026-09-26), so
+    /// the first drift after that would have been HELD as a truncated
+    /// dedup, never raised. The stub answers as the jobs API does, behind
+    /// more unrelated open items than the page holds, with the zone's
+    /// standing alarm last: a drift must find it and refresh it — neither
+    /// held nor twinned.
+    #[tokio::test]
+    async fn a_backlog_past_one_page_does_not_hold_a_dns_drift() {
+        use crate::handlers::listing_stub::UNRELATED_BACKLOG;
+        const {
+            assert!(
+                UNRELATED_BACKLOG > DEDUP_PAGE,
+                "the fixture outgrows a page"
+            )
+        };
+        let open = vec![
+            json!({"id": "alarm-other", "kind": "backlog-item", "status": "open",
+                   "metadata": {"estate_finding": "sensor_unreadable:stripe-sponsorships"}}),
+            json!({"id": "alarm-1", "kind": "backlog-item", "status": "open",
+                   "metadata": {"estate_finding": "dns_drift:algedonic.dev"}}),
+        ];
+        let (jobs, captured) = stub_jobs_api("ready", open, LOCATION).await;
+        let live = vec![as_declared()[0].clone()]; // playground. ABSENT
+        let h = handler(
+            jobs,
+            FakeZone::with(live),
+            FakeAccess::with(account_as_declared()),
+            secrets(),
+            declarations(),
+        );
+        h.invoke(&zone_args(), &ctx())
+            .await
+            .expect("a drift must reach its alarm, not be held");
+        let w = writes(&captured);
+        let order: Vec<&str> = w.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "PATCH /api/jobs/alarm-1/metadata",
+                MERGE_OBSERVE,
+                PUT_OBSERVE
+            ]
         );
     }
 
@@ -4006,16 +4468,13 @@ measured = "2026-09-20: read from the IdP"
         h.invoke(&zone_args(), &ctx()).await.unwrap();
         let w = writes(&captured);
         let order: Vec<&str> = w.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(
-            order,
-            vec!["POST /api/jobs", "PUT /api/jobs/obs-1/steps/step-observe"]
-        );
+        assert_eq!(order, vec!["POST /api/jobs", MERGE_OBSERVE, PUT_OBSERVE]);
         let findings = w[0].1["metadata"]["findings"].as_array().unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["application"], "playground.algedonic.dev");
         assert_eq!(findings[0]["declared"]["session_duration"], "24h");
         assert_eq!(findings[0]["live"]["session_duration"], "720h");
-        assert_eq!(step_put(&w)["metadata"]["result"], "findings");
+        assert_eq!(step_put(&w)["result"], "findings");
     }
 
     // ----- refusals -----

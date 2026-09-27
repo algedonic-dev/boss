@@ -4,7 +4,15 @@
 // must carry whatever the server said about why.
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import { WRITE_RETRY, describeWriteFailure, putStep, writeStep } from './stepWrite';
+import {
+  WRITE_RETRY,
+  describeWriteFailure,
+  putStep,
+  releaseStep,
+  saveStep,
+  startStep,
+  writeStep,
+} from './stepWrite';
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -76,6 +84,33 @@ describe('writeStep', () => {
     const res = await writeStep('/api/x', { method: 'PUT' }, noWait);
     expect(res.kind).toBe('failed');
     if (res.kind === 'failed') expect(res.error).toContain('Failed to fetch');
+  });
+
+  // Backlog 3ce3c15f: a surface must be able to tell a completion refused
+  // for PRESENCE from every other refusal, because that one it answers
+  // with a passkey tap — and the status alone does not say it (a 422 is
+  // also a malformed body).
+  test('a 422 refusal for presence is marked as one', async () => {
+    stubFetch(
+      async () =>
+        new Response(
+          JSON.stringify({ error: 'step requires stronger assurance', required: 'presence' }),
+          { status: 422 },
+        ),
+    );
+    const res = await writeStep('/api/x', { method: 'PUT' });
+    expect(res).toEqual({
+      kind: 'failed',
+      error: 'HTTP 422 — step requires stronger assurance',
+      presenceRequired: true,
+    });
+  });
+
+  test('any other 422 is not', async () => {
+    stubFetch(async () => new Response(JSON.stringify({ error: 'bad field' }), { status: 422 }));
+    const res = await writeStep('/api/x', { method: 'PUT' });
+    expect(res).toEqual({ kind: 'failed', error: 'HTTP 422 — bad field' });
+    expect('presenceRequired' in res).toBe(false);
   });
 });
 
@@ -164,6 +199,196 @@ describe('writeStep — deploy-roll retry (packet 04cc82ab)', () => {
   });
 });
 
+describe('saveStep — the two doors (backlog e39a9d2a)', () => {
+  type Seen = { url: string; method: string; body: unknown };
+  function recordAll(status = 200): Seen[] {
+    const seen: Seen[] = [];
+    stubFetch(async (url, init) => {
+      seen.push({
+        url,
+        method: String(init?.method),
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      return new Response('{}', { status });
+    });
+    return seen;
+  }
+
+  test('metadata rides the merge door FIRST, then a PUT carrying no metadata', async () => {
+    const seen = recordAll();
+    const res = await saveStep('job-1', 'step-9', {
+      status: 'completed',
+      notes: 'n',
+      metadata: { carrier: 'ups' },
+    });
+    expect(res.kind).toBe('ok');
+    expect(seen.map((s) => [s.method, s.url])).toEqual([
+      ['PATCH', '/api/jobs/job-1/steps/step-9/metadata'],
+      ['PUT', '/api/jobs/job-1/steps/step-9'],
+    ]);
+    expect(seen.map((s) => s.body)).toEqual([
+      { carrier: 'ups' },
+      { status: 'completed', notes: 'n' },
+    ]);
+  });
+
+  // THE DEFECT. A surface built its body as `{...step.metadata, key: x
+  // || undefined}`; JSON drops an undefined key, and the PUT replaced
+  // metadata wholesale, so an emptied field was cleared by OMISSION —
+  // the class the step PUT is about to refuse. Through the merge door
+  // an emptied field is an explicit null, which the door deletes.
+  test('a field emptied to undefined is sent as an explicit null, never omitted', async () => {
+    const seen = recordAll();
+    await saveStep('job-1', 'step-9', { metadata: { due_on: undefined, kept: 'x' } });
+    expect(seen.map((s) => s.body)).toEqual([{ due_on: null, kept: 'x' }]);
+  });
+
+  test('no metadata sends no merge; metadata alone sends no PUT', async () => {
+    let seen = recordAll();
+    await saveStep('job-1', 'step-9', { status: 'active' });
+    expect(seen.map((s) => s.method)).toEqual(['PUT']);
+    seen = recordAll();
+    await saveStep('job-1', 'step-9', { metadata: {}, status: 'active' });
+    expect(seen.map((s) => s.method)).toEqual(['PUT']);
+    seen = recordAll();
+    await saveStep('job-1', 'step-9', { metadata: { a: 1 } });
+    expect(seen.map((s) => s.method)).toEqual(['PATCH']);
+  });
+
+  test('a refused merge stops the chain — the status never flips on top of it', async () => {
+    const seen = recordAll(400);
+    const res = await saveStep('job-1', 'step-9', { status: 'completed', metadata: { a: 1 } });
+    expect(res.kind).toBe('failed');
+    expect(seen.map((s) => s.method)).toEqual(['PATCH']);
+  });
+
+  test('the merge is retried across a deploy roll, like the PUT it replaces', async () => {
+    let calls = 0;
+    stubFetch(async () => {
+      calls += 1;
+      return calls < 2 ? new Response('rolling', { status: 503 }) : new Response('{}');
+    });
+    const res = await saveStep('job-1', 'step-9', { metadata: { a: 1 } }, noWait);
+    expect(res.kind).toBe('ok');
+    expect(calls).toBe(2);
+  });
+});
+
+describe('releaseStep — the page hands a held step back (backlog 6ef4a36b)', () => {
+  type Seen = { method: string; url: string; body: unknown };
+  const WHY = 'handing over to the day shift';
+  /// The step as the server holds it after a clean release.
+  const releasedRow = {
+    id: 'step-9',
+    status: 'ready',
+    assignee_id: null,
+    metadata: { brief: 'kept', released: { why: WHY } },
+  };
+  /// Records every call; `answer` decides each response, and the
+  /// read-back (`GET …/steps`) answers `readBack` unless told otherwise.
+  function recordAll(
+    answer: (s: Seen) => Response | null = () => null,
+    readBack: unknown = [releasedRow],
+  ): Seen[] {
+    const seen: Seen[] = [];
+    stubFetch(async (url, init) => {
+      const s = {
+        method: String(init?.method ?? 'GET'),
+        url,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      };
+      seen.push(s);
+      const custom = answer(s);
+      if (custom) return custom;
+      if (s.method === 'GET') return new Response(JSON.stringify(readBack), { status: 200 });
+      return new Response(null, { status: 204 });
+    });
+    return seen;
+  }
+  const writes = (seen: Seen[]) => seen.filter((s) => s.method !== 'GET');
+
+  test('always clears the run edge and records the stamp, then releases, then reads back', async () => {
+    // The page was drawn BEFORE the dispatcher wrote `agent_run`, so its
+    // snapshot has none — the release clears it anyway (review of car
+    // 675f1858, #1), and records why in the same merge (#2).
+    const seen = recordAll();
+    const res = await releaseStep(
+      'job-1',
+      { id: 'step-9', metadata: { brief: 'kept' } },
+      WHY,
+      'emp-001',
+      noWait,
+    );
+    expect(res.kind).toBe('ok');
+    expect(seen).toEqual([
+      {
+        method: 'PATCH',
+        url: '/api/jobs/job-1/steps/step-9/metadata',
+        body: {
+          agent_run: null,
+          released: { why: WHY, by: 'emp-001', at: expect.any(String), from_run: null },
+        },
+      },
+      {
+        method: 'PUT',
+        url: '/api/jobs/job-1/steps/step-9',
+        body: { status: 'ready', assignee_id: null },
+      },
+      { method: 'GET', url: '/api/jobs/job-1/steps', body: undefined },
+    ]);
+  });
+
+  test('a blank reason writes nothing', async () => {
+    const seen = recordAll();
+    const res = await releaseStep('job-1', { id: 'step-9', metadata: {} }, '   ', 'emp-001', noWait);
+    expect(res.kind).toBe('failed');
+    expect(seen).toEqual([]);
+  });
+
+  test('a refused merge stops before the status write', async () => {
+    const seen = recordAll((s) =>
+      s.method === 'PATCH' ? new Response('{"error":"nope"}', { status: 403 }) : null,
+    );
+    const res = await releaseStep('job-1', { id: 'step-9', metadata: {} }, WHY, 'emp-001', noWait);
+    expect(res).toEqual({ kind: 'failed', error: 'HTTP 403 — nope' });
+    expect(writes(seen).map((s) => s.method)).toEqual(['PATCH']);
+  });
+
+  test('a status write refused AFTER the merge is a partial release, read back and said so', async () => {
+    // The merge landed — the reason is recorded, the run edge cleared —
+    // and the step is still held. That is neither success nor a clean
+    // failure, and the page must not render it as either.
+    const seen = recordAll(
+      (s) =>
+        s.method === 'PUT'
+          ? new Response('{"error":"not the holder"}', { status: 409 })
+          : null,
+      [{ ...releasedRow, status: 'active', assignee_id: 'agent-claude' }],
+    );
+    const res = await releaseStep('job-1', { id: 'step-9', metadata: {} }, WHY, 'emp-001', noWait);
+    expect(res.kind).toBe('partial');
+    if (res.kind !== 'partial') return;
+    expect(res.error).toMatch(/^PARTIAL RELEASE/);
+    expect(res.error).toContain('HTTP 409 — not the holder');
+    expect(res.error).toContain('reads back active');
+    expect(seen.map((s) => s.method)).toEqual(['PATCH', 'PUT', 'GET']);
+  });
+
+  test('a 2xx the read-back does not bear out is partial too', async () => {
+    recordAll(() => null, [{ ...releasedRow, assignee_id: 'agent-claude' }]);
+    const res = await releaseStep('job-1', { id: 'step-9', metadata: {} }, WHY, 'emp-001', noWait);
+    expect(res.kind).toBe('partial');
+    if (res.kind !== 'partial') return;
+    expect(res.error).toContain('still assigned to agent-claude');
+  });
+
+  test('a read-back that cannot be read is partial, not ok', async () => {
+    recordAll((s) => (s.method === 'GET' ? new Response('down', { status: 500 }) : null));
+    const res = await releaseStep('job-1', { id: 'step-9', metadata: {} }, WHY, 'emp-001', noWait);
+    expect(res.kind).toBe('partial');
+  });
+});
+
 describe('putStep', () => {
   test('PUTs the JSON body to the step endpoint', async () => {
     let seenUrl = '';
@@ -178,5 +403,83 @@ describe('putStep', () => {
     expect(seenUrl).toBe('/api/jobs/job-1/steps/step-9');
     expect(seenInit?.method).toBe('PUT');
     expect(JSON.parse(String(seenInit?.body))).toEqual({ status: 'completed' });
+    // No ticket was handed in, so none is sent.
+    expect((seenInit?.headers as Record<string, string>)['x-presence-ticket']).toBeUndefined();
+  });
+
+  // Backlog b568044a: a presence-gated completion is judged on its own
+  // request, so the caller that ran the ceremony hands its ticket over
+  // and the PUT carries it in the header the gateway verifies.
+  test('carries a presence ticket it is handed, in x-presence-ticket', async () => {
+    let seenInit: RequestInit | undefined;
+    stubFetch(async (_url, init) => {
+      seenInit = init;
+      return new Response('{}', { status: 200 });
+    });
+    await putStep('job-1', 'step-9', { status: 'completed' }, 'ticket-1');
+    expect((seenInit?.headers as Record<string, string>)['x-presence-ticket']).toBe('ticket-1');
+    expect(JSON.parse(String(seenInit?.body))).toEqual({ status: 'completed' });
+  });
+});
+
+// Design 611fbffd, clause (b) of backlog 6ef4a36b item (2): a step
+// becomes Active only through a claim. Every surface's Start was its own
+// `PUT {status: 'active'}`, which the record cannot tell from "someone
+// assigned X and started the clock"; the claim door records who took it.
+describe('startStep — a Start is a claim, never a status PUT', () => {
+  type Seen = { method: string; url: string; body: unknown };
+  function recordAll(status = 200): Seen[] {
+    const seen: Seen[] = [];
+    stubFetch(async (url, init) => {
+      seen.push({ method: String(init?.method ?? 'GET'), url, body: init?.body });
+      return status === 200
+        ? new Response('{}', { status })
+        : new Response(JSON.stringify({ error: 'step already claimed or not claimable' }), {
+            status,
+          });
+    });
+    return seen;
+  }
+
+  test('POSTs the claim door with no body, for the caller', async () => {
+    const seen = recordAll();
+    const res = await startStep('job-1', 'step-9');
+    expect(res.kind).toBe('ok');
+    expect(seen).toEqual([
+      { method: 'POST', url: '/api/jobs/job-1/steps/step-9/claim', body: undefined },
+    ]);
+  });
+
+  test('names the holder it starts FOR, and a blank names nobody', async () => {
+    let seen = recordAll();
+    await startStep('job-1', 'step-9', 'emp-brewer 1');
+    expect(seen.map((s) => s.url)).toEqual([
+      '/api/jobs/job-1/steps/step-9/claim?claimed_for=emp-brewer%201',
+    ]);
+    seen = recordAll();
+    await startStep('job-1', 'step-9', '  ');
+    expect(seen.map((s) => s.url)).toEqual(['/api/jobs/job-1/steps/step-9/claim']);
+  });
+
+  test("the door's refusal is the surface's error, in the server's words", async () => {
+    recordAll(409);
+    const res = await startStep('job-1', 'step-9');
+    expect(res).toEqual({
+      kind: 'failed',
+      error: 'HTTP 409 — step already claimed or not claimable',
+    });
+  });
+
+  // The claim is idempotent for its holder, so a claim resent through a
+  // deploy roll answers the step it already took — unlike a create POST.
+  test('is retried across a deploy roll, because a claim is idempotent for its holder', async () => {
+    let calls = 0;
+    stubFetch(async () => {
+      calls += 1;
+      return calls < 2 ? new Response('rolling', { status: 503 }) : new Response('{}');
+    });
+    const res = await startStep('job-1', 'step-9', undefined, noWait);
+    expect(res.kind).toBe('ok');
+    expect(calls).toBe(2);
   });
 });

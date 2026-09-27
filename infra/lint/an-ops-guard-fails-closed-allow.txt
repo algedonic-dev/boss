@@ -1,0 +1,41 @@
+# an-ops-guard-fails-closed-allow.txt — the allowances for
+# infra/lint/an-ops-guard-fails-closed.sh.
+#
+# Format: one entry per line, `<rule> <path> <count> <reason>`.
+#   rule    swallowed-read | failed-read-as-number | no-pipefail
+#   count   EXACTLY the file's findings under that rule — fixing a site
+#           without lowering the count leaves a hole shaped like it
+#   reason  REQUIRED: why THIS failure cannot open the guard, checkable
+#           by the next reviewer. An allowance nobody can read is a skip.
+# `#` starts a full-line comment.
+#
+# Seeded 2026-09-27 (backlog fdbb447e, design 3036296f mechanism B) from
+# the lint's first run over origin/main d8393e48: 45 sites in 19 entries,
+# every one read in its function before it was written down; 43 on
+# origin/main 9acc8b05 after train #752 retired two in ops-runner.sh. An entry
+# marked FOLLOW-UP is a site whose failure CAN reach a verdict and is
+# allowed only so this car stays a lint; each is named in the car's
+# report for its own item. Lower the count in the change that fixes one.
+
+# --- failed-read-as-number ---------------------------------------------
+failed-read-as-number infra/forge/checkout-lock.sh 1 mtime=0 when stat fails makes the lock look ancient, but the removal still waits on git_holds_checkout finding no live git in the repo, the check that decides
+failed-read-as-number infra/forge/cluster-watchdog.sh 1 an absent state file on the first dark tick IS zero; an unreadable one restarts the dark count, which delays a rollback and never causes one. FOLLOW-UP: tell absent from unreadable
+failed-read-as-number infra/forge/journal-read.sh 1 grep -c exits 1 with 0 on no match, the answer; its producer is printf of a variable, which cannot fail. The curl feeding it is the swallowed-read entry below
+
+# --- swallowed-read -----------------------------------------------------
+swallowed-read infra/forge/checkout-lock.sh 2 an unreadable /proc/<pid>/cwd or cmdline is told apart on the next lines by asking whether /proc/<pid> still exists, and a live git it cannot inspect keeps the lock
+swallowed-read infra/forge/ci-image-report.sh 1 a read-only report: empty metadata prints the tag as (metadata unreadable), never an age or a size
+swallowed-read infra/forge/cluster-deploy-lib.sh 1 FOLLOW-UP: a failed manifest key read leaves required empty, so boss-secrets is minted from the standard three-key recipe without the key check; the instance gate after it still reads presence
+swallowed-read infra/forge/cluster-deploy-runner.sh 1 check_summary is display text for the run summary; the verdict is check_rc, read on the next line
+swallowed-read infra/forge/credential-deposit.sh 4 args and when lines: an empty one refuses on the literal-fields check below them; the remote URL: empty is FAILED on the next line; the helper read: empty re-writes the wanted helper, which converges and never widens
+swallowed-read infra/forge/forge-backup.sh 2 repos: an empty or non-numeric count is set to 0 and refused on the next line; leak: an unreadable listing already refused on the repos count, one line earlier, from the same file
+swallowed-read infra/forge/forge-log.sh 1 created_s only decides whether a NOTE about a replaced container is printed; empty prints no note and changes no count
+swallowed-read infra/forge/journal-read.sh 2 FOLLOW-UP: a failed entries curl reads as 0 rows and prints a real nothing-to-report; the tail curl only narrows the freshness bar, and an empty one leaves the machine cutoff as the reading
+swallowed-read infra/forge/landed-train-shas.lib.sh 3 three counts for one stderr narrative line; the collectable set is the comm output itself, printed after, never these numbers
+swallowed-read infra/forge/merge-tenant-main.sh 2 owner_home: an empty home becomes / for runuser, which authenticates nothing; merge-tree: exit 1 is its conflict answer. FOLLOW-UP: exit 128 there reads as clean in the report
+swallowed-read infra/forge/prune-ci-images.lib.sh 1 grep -c over printf of a variable: printf cannot fail, and exit 1 with 0 is the no-landed-shas answer
+swallowed-read infra/forge/prune-registry-versions.sh 13 each counts a file this script creates with : > before it is filled, so grep -c exits 1 only for zero lines; LANDED_COUNT empty refuses on the next line. FOLLOW-UP: the awk pipelines also swallow an awk failure as 0
+swallowed-read infra/forge/publish-github-pr.sh 4 push URL: empty falls to sor_require, which refuses by name; the three counts are over files written by redirection just above, under set -e, and feed a report
+swallowed-read infra/forge/read-publish-checks.sh 1 an empty opened_s takes the explicit empty arm of the case on the next line: age unknown, past 0
+swallowed-read infra/gcp/retire-cloudflared.sh 1 an empty obs_epoch is refused on the next line: nothing was stopped
+swallowed-read infra/ops/ops-runner.sh 1 the oldest-wait reading: an empty t takes the explicit empty arm of the case on the next line and the wait prints as unknown (the two put_code sites left with complete_step in train #752, e174f9c5)

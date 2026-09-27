@@ -1,0 +1,657 @@
+// The Marshalling Yard — every control its board renders, pinned (page
+// audit 7c228914, step `test`).
+//
+// It was a page at /it/operate/marshalling, then the floor page
+// /it/yard/marshalling; since car N3 of design e765b3fc (2026-09-25)
+// both paths are not found and the board is the MARSHALLING STATION'S
+// PANEL on the Department Map, `/it?at=marshalling` — with the backlog
+// board beside it (panel.ts `STATION_BOARDS`). So this spec mounts that
+// selection and pins the board in it. The region's own map, its
+// breadcrumb, its "← the world" button and its Escape key retired with
+// the floor page: the map is on top, and the panel's close deselects.
+// it-station-contents.mocked.spec.ts pins the overlap line and the waits
+// count in the same panel; this spec pins every control, each read's
+// own failure line, the empty leg, and the words the board says.
+//
+// The inventory, measured on origin/main 507d2308 on 2026-09-25 and
+// re-read for car N3:
+//   links     3 kinds — one per row of the waits table, up to 12 (→ the
+//                        job detail surface); one per failed or unjudged
+//                        machine in the HUD frame (→ that machine's
+//                        region, selected on the map: /it?at=<region>);
+//                        the panel's close (→ /it)
+//   buttons   3         — the window 24 h / 3 d / 7 d
+//   keys      0
+//   forms     0, inputs 0
+//   reads     5         — /api/yard/regions, /api/yard/borders (10 s);
+//                        /api/stations/load, /api/stations/flow,
+//                        /api/jobs/queue-age (60 s, and on every window click)
+//   writes    0
+//
+// THIS STEP PINS WHAT THE PAGE DOES TODAY; it does not fix the gaps.
+// Where today's behaviour IS a filed gap, the test says so in its name
+// ("CURRENT, gap N (item)") and asserts the current paint, so the car
+// that fixes the gap has to flip that assertion — the fix is visible in
+// this file rather than passing beside a spec that never noticed. The
+// gaps measured on 2026-09-23 and where each stands on 507d2308:
+//   1  ba1fcc6d  open    — the constraint is named from the countable queues only
+//   2  6c06ef65  FIXED   — server (regions.rs marshalling_stations reads resolved steps)
+//   3  140a2222  FIXED   — the overlap line; pinned here on the alias too
+//   4  f49f21b7  open    — loading-dock stands on the marshalling floor
+//   5  c4c77ddd  FIXED on main, item still open — the region's own rails
+//                         in and out (design 62de32ae decision 7)
+//   6  4142d821  FIXED   — the HUD frame's stuck and waiting, side by side
+//   7  f9b75688  open    — WORKING (claimed vs ready) is not shown
+//   8  18683a0a  FIXED   — the waits count line
+//   9  fdc0ea0b  open    — no station opens its queue
+//   10 67825067  FIXED   — a malformed 200 from any board read is its
+//                         failure line (c3e4edcc's sweep had closed
+//                         without reaching this page)
+//   11 8dcd28ce  FIXED   — server (stations.rs readable_predicate: a
+//                         denied scope is a 403, train #600); the refusal
+//                         is the load's failure line here
+//   12 371aa184  open    — the failure lines are pinned HERE (that half is
+//                         this car's); the envelope's window_hours and
+//                         unsequenced window reads are still current
+
+import { expect, test, type Page, type Route } from './_test';
+import { mountPage } from './_helpers';
+import { FAILURE_MARKER } from './_routes';
+import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
+import { parseRoute } from '../../src/router';
+import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { TERRITORIES } from '../../src/it/yard/world';
+import { regionHref } from '../../src/it/yard/regions';
+
+// The marshalling station's selection on the Department Map — where the
+// board lives since car N3 retired the page and the floor.
+const PATH = regionHref('marshalling');
+const AT_PATH = /\/it\?at=marshalling$/;
+const TITLE = { titleMatch: /Department Map/ };
+
+const json = (r: Route, body: unknown, status = 200): Promise<void> =>
+  r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+
+/// The board's three reads, as marshalling.ts spells them.
+const LOAD_READ = /\/api\/stations\/load$/;
+const FLOW_READ = /\/api\/stations\/flow\?window_hours=\d+$/;
+const WAITS_READ = /\/api\/jobs\/queue-age$/;
+
+// ---------------------------------------------------------------------
+// Fixtures — the live shape of 2026-09-23, cut down.
+// ---------------------------------------------------------------------
+
+const trend = { metric: 'served', unit: 'per day', current: 54, previous: 19, samples: 5, previous_samples: 5 };
+
+/// Every territory, so the world draws when a control leaves for it;
+/// marshalling carries the live head.
+const REGIONS = {
+  window_hours: 24,
+  now: '2026-09-25T05:00:00Z',
+  regions: TERRITORIES.map(({ name }) =>
+    name === 'marshalling'
+      ? { name, count: 303, unit: 'packets at stations', state: 'attention', why: '303 packets standing at 3 stations', trend }
+      : { name, count: 0, state: 'clear', why: 'nothing here', trend: { ...trend, current: null, previous: null, samples: 0, previous_samples: 0 } },
+  ),
+  // The HUD's queue-management row: stuck and waiting side by side
+  // (design cf820810 Q1, gap 6).
+  thirds: [
+    {
+      third: 'queue-management',
+      regions: ['receiving', 'marshalling'],
+      balance: { unit: 'packets', in_means: 'triaged', out_means: 'taken off a station', in: 215, out: 68, net: 147, in_count: 215, out_count: 68, why: null },
+      stuck: { stuck: 2, waiting: 4, unknown: [], oldest_hours: 72, regions: ['marshalling'] },
+    },
+  ],
+  // One failed machine, so the HUD lists it as a link.
+  machines: {
+    running: 0, idle: 0, failed: 1, unknown: 0, total: 1,
+    failed_or_unknown: [
+      { region: 'marshalling', id: 'station:q.platform-admin.sign-off', name: 'sign-off station', state: 'failed', why: 'over its bound' },
+    ],
+  },
+};
+
+const rail = (from: string, to: string, over: Record<string, unknown>) => ({
+  from, to, crossing: 'a packet crossed', state: 'clear', why: 'nothing waiting',
+  rate: { metric: 'crossings', unit: 'per day', current: 5, previous: 4, samples: 5, previous_samples: 4 },
+  last_crossed: null, waiting: 0, holds: [],
+  machine: { name: 'nothing', kind: 'actors', last_fired: null, silent_for_minutes: null,
+    expected_every_minutes: null, silent: null, why: '' },
+  ...over,
+});
+
+/// Marshalling's two rails and one that is not its own.
+const BORDERS = {
+  window_hours: 24,
+  now: '2026-09-25T05:00:00Z',
+  borders: [
+    rail('receiving', 'marshalling', { waiting: 12 }),
+    rail('marshalling', 'shop-floor', {
+      rate: { metric: 'crossings', unit: 'per day', current: 215, previous: 68, samples: 5, previous_samples: 5 },
+      waiting: 303, state: 'attention', why: '303 waiting against 68 a day',
+      machine: { name: 'dispatch-agent-runs', kind: 'dispatcher-rule', last_fired: '2026-09-25T04:53:00Z',
+        silent_for_minutes: 7, expected_every_minutes: null, silent: false, why: '' },
+    }),
+    rail('gates', 'dock', {}),
+  ],
+};
+
+/// Five stations: the two blind queues that hold nearly everything, a
+/// counted one, the dock's station (gap 4) and a clear one. Depths sum
+/// to 517 over 304 distinct packets — every agent-station packet also
+/// stands in the task queue.
+const LOAD = {
+  data: [
+    { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, wip_limit: 24, over_limit: true, oldest_age_days: 6, capability_roles: ['platform-admin'], also_elsewhere: 213 },
+    { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, wip_limit: null, over_limit: false, oldest_age_days: 5, capability_roles: ['platform-admin'], also_elsewhere: 213 },
+    { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, wip_limit: null, over_limit: false, oldest_age_days: 2, capability_roles: ['platform-admin'], also_elsewhere: 0 },
+    { station: 'loading-dock', kind: 'batch', depth: 1, wip_limit: 24, over_limit: false, oldest_age_days: null, capability_roles: null, also_elsewhere: 0 },
+    { station: 'q.platform-admin.checklist', kind: 'constraint', depth: 0, wip_limit: null, over_limit: false, oldest_age_days: null, capability_roles: ['platform-admin'], also_elsewhere: 0 },
+  ],
+  total: 5,
+  distinct_packets: 304,
+};
+
+const TASK_BLIND = 'a job-level metadata_absent clause the flow cube cannot evaluate';
+const AGENT_BLIND = 'the step predicate matches on agent_model';
+const DOCK_BLIND = 'a Job-metadata clause the log cannot attribute';
+
+/// The flow read for `hours`, echoing it; sign-off served `served`.
+const flow = (hours: number, served: number, asOf: string) => ({
+  window_hours: hours,
+  as_of: asOf,
+  data: [
+    { station: 'q.platform-admin.task', basis: 'unavailable', arrived: null, served: null, net: null, unavailable_reason: TASK_BLIND },
+    { station: 'a.platform-admin.opus-5-1m', basis: 'unavailable', arrived: null, served: null, net: null, unavailable_reason: AGENT_BLIND },
+    { station: 'q.platform-admin.sign-off', basis: 'step-events', arrived: 6, served, net: 6 - served },
+    { station: 'loading-dock', basis: 'unavailable', arrived: null, served: null, net: null, unavailable_reason: DOCK_BLIND },
+    { station: 'q.platform-admin.checklist', basis: 'step-events', arrived: 0, served: 2, net: -2 },
+  ],
+});
+
+const AS_OF_24 = '2026-09-25T05:00:00Z';
+
+const WAIT_ACTIVE = '11111111-aaaa-4aaa-8aaa-000000000001';
+const WAIT_READY = '11111111-aaaa-4aaa-8aaa-000000000002';
+const WAIT_FLOOR = '11111111-aaaa-4aaa-8aaa-000000000003';
+
+/// Three real obligations — one CLAIMED (status active, gap 7), one on
+/// nobody, one whose stamp is a fallback — and one simulated.
+const WAITS = {
+  data: [
+    { job_id: WAIT_ACTIVE, job_kind: 'backlog-item', job_title: 'Teach the dock to breathe', step_title: 'Build the change', status: 'active', assignee_id: 'agent-claude', partition: 'real', simulated: false, exact: true, waiting_days: 5.5 },
+    { job_id: WAIT_READY, job_kind: 'page-audit', job_title: 'Page audit: /it/estate', step_title: 'Sign off the page', status: 'ready', assignee_id: null, partition: 'real', simulated: false, exact: true, waiting_days: 0.25 },
+    { job_id: WAIT_FLOOR, job_kind: 'design-doc', job_title: 'Recent performance', step_title: 'Review the design', status: 'ready', assignee_id: 'emp-david', partition: 'real', simulated: false, exact: false, waiting_days: 2 },
+    { job_id: 'sim-1', job_kind: 'brew', job_title: 'a simulated batch', step_title: 'Mash', status: 'ready', assignee_id: null, partition: 'simulated', simulated: true, exact: true, waiting_days: 400 },
+  ],
+  total: 4,
+  now: '2026-09-25T05:00:00Z',
+};
+
+type Counts = { load: number; waits: number; flow: Record<number, number> };
+
+/// The page's world, well-formed. Each read can be overridden; the
+/// counts say how many times the page asked.
+async function install(
+  page: Page,
+  over: Partial<Record<'regions' | 'borders' | 'load' | 'flow' | 'waits', (r: Route) => Promise<void>>> = {},
+): Promise<Counts> {
+  await installSmokeMocks(page);
+  const counts: Counts = { load: 0, waits: 0, flow: {} };
+  await page.route(YARD_REGIONS, over.regions ?? ((r) => json(r, REGIONS)));
+  await page.route(YARD_BORDERS, over.borders ?? ((r) => json(r, BORDERS)));
+  await page.route(LOAD_READ, (r) => {
+    counts.load += 1;
+    return over.load ? over.load(r) : json(r, LOAD);
+  });
+  await page.route(FLOW_READ, (r) => {
+    const hours = Number(new URL(r.request().url()).searchParams.get('window_hours'));
+    counts.flow[hours] = (counts.flow[hours] ?? 0) + 1;
+    return over.flow ? over.flow(r) : json(r, flow(hours, hours === 24 ? 5 : 30, `${AS_OF_24} (${hours}h)`));
+  });
+  await page.route(WAITS_READ, (r) => {
+    counts.waits += 1;
+    return over.waits ? over.waits(r) : json(r, WAITS);
+  });
+  return counts;
+}
+
+const board = (page: Page) => page.locator('.my-root');
+const panel = (page: Page) => page.locator('section[data-map-panel][data-selection="marshalling"]');
+const sidingRows = (page: Page) => board(page).locator('table.my-table').first().locator('tbody tr');
+const waitsTable = (page: Page) => board(page).locator('table.my-table').nth(1);
+const failures = (page: Page) => page.locator(FAILURE_MARKER);
+
+// ---------------------------------------------------------------------
+// The route, the chrome and the words
+// ---------------------------------------------------------------------
+
+test.describe('the marshalling station — the selection, and the words it says', () => {
+  test('the selection opens the Marshalling station under the map, with its board in the panel', async ({ page }) => {
+    expect(parseRoute('/it', '?at=marshalling')).toEqual({ kind: 'systemYard', at: 'marshalling' });
+    // The two paths the board answered at are not found (car N3).
+    expect(parseRoute('/it/operate/marshalling').kind).toBe('notFound');
+    expect(parseRoute('/it/yard/marshalling').kind).toBe('notFound');
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    await expect(page).toHaveURL(AT_PATH);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
+    // The board's own page header is dropped: the station's panel heads it.
+    await expect(page.getByRole('heading', { name: 'Marshalling Yard' })).toHaveCount(0);
+
+    // The station's head, off the regions read.
+    const p = panel(page);
+    await expect(p.locator('.panel-title')).toHaveText('Marshalling');
+    await expect(p.locator('[data-figure]')).toHaveText('303 packets at stations');
+    await expect(p).toHaveAttribute('data-state', 'attention');
+    await expect(p.locator('[data-field="verdict"]')).toContainText('303 packets standing at 3 stations');
+    await expect(p.locator('[data-contents="marshalling"] .my-root')).toBeVisible();
+    // The map's own line under it.
+    await expect(page.locator('.yard-flow')).toContainText('window 24h against the 24h before · read ');
+  });
+
+  test("the station's rails, in then out, are its panel's rate — gap 5 (c4c77ddd) is FIXED on main", async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const rate = panel(page).locator('[data-field="rate"] li');
+    await expect(rate.first()).toContainText('in from receiving');
+    await expect(rate.last()).toContainText('out to shop floor');
+  });
+
+  // Gap 6 (4142d821) was fixed by the thirds rows' stuck-and-waiting
+  // cell; those rows were REMOVED by the top board (design ea906603, Q5,
+  // David 2026-09-27: "I haven't been looking at those numbers"), so
+  // what stands above the region now is the board's four rows.
+  test('the HUD frame stands above the region with the top board’s four rows — the thirds rows are removed (ea906603 Q5)', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const hud = page.locator('section[data-hud][aria-label="The whole system"]');
+    await expect(hud.locator('.hud-title')).toHaveText('The whole system');
+    await expect(hud.locator('.hud-label')).toHaveText(['Outranks regular order', 'Needs you', 'Next up', 'Machines']);
+    await expect(hud.locator('[data-third]')).toHaveCount(0);
+  });
+
+  test('the board reads its sections, headers, rows and footnote verbatim', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const b = board(page);
+
+    await expect(b.locator('.my-controls-label')).toHaveText('window');
+    await expect(b.locator('.my-controls button')).toHaveText(['24 h', '3 d', '7 d']);
+    await expect(b.locator('.my-asof')).toHaveText(`read ${AS_OF_24} (24h)`);
+    await expect(b.locator('.my-section')).toHaveText([
+      '00 — THE CONSTRAINT',
+      '01 — SIDINGS HOLDING WORK',
+      '02 — LONGEST-WAITING OBLIGATIONS',
+      '03 — RATE NOT COUNTABLE',
+      '04 — CLEAR',
+    ]);
+
+    await expect(b.locator('table.my-table').first().locator('thead th')).toHaveText([
+      'Station', 'Depth', 'Oldest', 'Arrived', 'Served', 'Net', 'Clears in', 'Why it is not moving',
+    ]);
+    // Pressure order: the deepest blind queues first, the dock's last.
+    const rows = sidingRows(page);
+    await expect(rows).toHaveCount(4);
+    await expect(rows.nth(0).locator('td')).toHaveText([
+      'q.platform-admin.task', '297 / 24', '6 d', '—', '—', '—', '—',
+      `297 waiting; rate not counted — ${TASK_BLIND}.`,
+    ]);
+    await expect(rows.nth(1).locator('td')).toHaveText([
+      'a.platform-admin.opus-5-1m', '213', '5 d', '—', '—', '—', '—',
+      `213 waiting; rate not counted — ${AGENT_BLIND}.`,
+    ]);
+    await expect(rows.nth(2).locator('td')).toHaveText([
+      'q.platform-admin.sign-off', '6', '2 d', '6', '5', '+1', '29 h',
+      '6 arrived, 5 served: growing by 1 a 24h window — 29h to clear at that rate.',
+    ]);
+    await expect(rows.nth(2)).toHaveClass(/constraint/);
+
+    await expect(b.locator('.my-overlap')).toHaveText(
+      'The depths sum to 517 but hold 304 distinct packets: a packet stands at every station whose predicate it matches, so 213 of those standings count a packet already counted at another station. Also standing elsewhere: q.platform-admin.task 213 of 297, a.platform-admin.opus-5-1m 213 of 213.',
+    );
+
+    await expect(waitsTable(page).locator('thead th')).toHaveText(['Waiting', 'Obligation', 'Packet', 'On whom']);
+    const waits = waitsTable(page).locator('tbody tr');
+    await expect(waits).toHaveCount(3);
+    await expect(waits.nth(0).locator('td')).toHaveText(['5 d', 'Build the change', 'Teach the dock to breathe backlog-item', 'agent-claude']);
+    await expect(waits.nth(1).locator('td')).toHaveText(['at least 2 d', 'Review the design', 'Recent performance design-doc', 'emp-david']);
+    await expect(waits.nth(2).locator('td')).toHaveText(['6 h', 'Sign off the page', 'Page audit: /it/estate page-audit', 'nobody']);
+    await expect(waits.nth(2).locator('td').nth(3)).toHaveClass(/nobody/);
+    await expect(b.locator('.my-waits-count')).toHaveText(
+      '3 of 3 outstanding obligations, longest first · 1 on simulated or shadow packets not ranked',
+    );
+
+    await expect(b.locator('.my-blind li')).toHaveText([
+      `q.platform-admin.task — ${TASK_BLIND}`,
+      `a.platform-admin.opus-5-1m — ${AGENT_BLIND}`,
+      `loading-dock — ${DOCK_BLIND}`,
+    ]);
+    await expect(b.locator('.my-clear')).toHaveText('q.platform-admin.checklist');
+    await expect(b.locator('.my-footnote')).toHaveText(
+      'Depth and the oldest packet\'s age come from /api/stations/load; arrivals and departures from /api/stations/flow, counted over the window from the log\'s own step.ready / step.done transitions on their WALL-CLOCK write instant — never event time, which is sim-authoritative here. "Oldest" is the oldest member packet\'s age since it opened, which over-reports time in this queue; the per-obligation wait below it is the step-level figure. Nothing on this page is estimated: a queue whose rate could not be counted says so.',
+    );
+    await expect(failures(page)).toHaveCount(0);
+  });
+
+  test('CURRENT, gap 1 (ba1fcc6d): the constraint is named from the countable queues only — 6 standing — while 510 stand where no rate is counted', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const box = board(page).locator('.my-constraint');
+    await expect(box).toHaveClass(/named/);
+    await expect(box.locator('.my-constraint-name')).toHaveText('q.platform-admin.sign-off');
+    await expect(box.locator('.my-constraint-why')).toHaveText(
+      '6 waiting against 5 served in the last 24h: 29h to clear at the rate it is actually being worked, longer than any other counted queue.',
+    );
+    // Nothing in the box names the blind queues holding the work.
+    await expect(box).not.toContainText('q.platform-admin.task');
+  });
+
+  test('CURRENT, gap 4 (f49f21b7): the dock\'s own station stands on the marshalling board', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    await expect(sidingRows(page).nth(3).locator('td').first()).toHaveText('loading-dock');
+  });
+
+  test('CURRENT, gap 7 (f9b75688): a claimed obligation reads exactly like a ready one — no WORKING split', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    // The first row's step is ACTIVE (claimed by agent-claude) and the
+    // third's READY; the table has no column and no word for either.
+    await expect(waitsTable(page).locator('thead th')).toHaveCount(4);
+    await expect(board(page)).not.toContainText(/\bactive\b|\bclaimed\b|\bworking\b/i);
+  });
+
+  test('CURRENT, gap 9 (fdc0ea0b): no station opens its queue — the only links on the board are the packets', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const links = board(page).locator('a');
+    await expect(links).toHaveCount(3);
+    const hrefs = await links.evaluateAll((as) => as.map((a) => a.getAttribute('href')));
+    expect(hrefs).toEqual([`/jobs/${WAIT_ACTIVE}`, `/jobs/${WAIT_FLOOR}`, `/jobs/${WAIT_READY}`]);
+    await expect(board(page).locator('.my-constraint a, .my-blind a, .my-clear a')).toHaveCount(0);
+  });
+});
+
+// ---------------------------------------------------------------------
+// The controls — each does what its label says, and back returns
+// ---------------------------------------------------------------------
+
+test.describe('the marshalling station — every control', () => {
+  test('a packet link lands on the catalogued job detail surface, and back returns to the selection', async ({ page }) => {
+    await install(page);
+    // The packet the link opens, so the detail page has something to
+    // mount rather than throwing on the catch-all's `[]`.
+    await page.route(new RegExp(`/api/jobs/${WAIT_ACTIVE}$`), (r) =>
+      json(r, {
+        id: WAIT_ACTIVE, kind: 'backlog-item', workflow_version: 1,
+        subject: { subject_kind: 'custom', id: 'bosspipeline' },
+        title: 'Teach the dock to breathe', owner_id: 'emp-david', status: 'open', priority: 'standard',
+        opened_on: '2026-09-20', due_on: null, closed_on: null, metadata: {}, steps: [],
+      }));
+    await mountPage(page, PATH, TITLE);
+    const link = waitsTable(page).getByRole('link', { name: 'Teach the dock to breathe' });
+    // The link spells the bare /jobs/{id}; the router resolves it to the
+    // same surface as the catalog's /ux/jobs/{id}.
+    await expect(link).toHaveAttribute('href', `/jobs/${WAIT_ACTIVE}`);
+    expect(parseRoute(`/jobs/${WAIT_ACTIVE}`)).toEqual({ kind: 'jobDetail', jobId: WAIT_ACTIVE });
+    expect(parseRoute(`${ROUTE_CATALOG.jobs.path}/${WAIT_ACTIVE}`)).toEqual({ kind: 'jobDetail', jobId: WAIT_ACTIVE });
+
+    await link.click();
+    await expect(page).toHaveURL(new RegExp(`/jobs/${WAIT_ACTIVE}$`));
+    await expect(panel(page)).toHaveCount(0);
+    await expect(page.locator('h1').first()).toContainText('Teach the dock to breathe');
+    await page.goBack();
+    await expect(page).toHaveURL(AT_PATH);
+    await expect(waitsTable(page).getByRole('link', { name: 'Teach the dock to breathe' })).toBeVisible();
+  });
+
+  test("the HUD's machine link selects the machine's region on the Department Map", async ({ page }) => {
+    // A selection since car N1 of design e765b3fc — here, the station
+    // already selected, so the panel stays where it is.
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+    const link = page.locator('section[data-hud] .hud-listed a');
+    await expect(link).toHaveCount(1);
+    await expect(link).toHaveText('failed · marshalling · sign-off station');
+    await expect(link).toHaveAttribute('href', regionHref('marshalling'));
+    await expect(link).toHaveAttribute('title', 'over its bound');
+    await link.click();
+    await expect(page).toHaveURL(/\/it\?at=marshalling$/);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
+    await expect(page.locator('section[data-map-panel]')).toHaveAttribute('data-selection', 'marshalling');
+    await page.goBack();
+    await expect(page).toHaveURL(AT_PATH);
+  });
+
+  test('each window button re-reads the board over its window, says it is pressed, and judges in its hours', async ({ page }) => {
+    const counts = await install(page);
+    await mountPage(page, PATH, TITLE);
+    const buttons = board(page).locator('.my-controls button');
+    const pressed = board(page).locator('.my-controls button[aria-pressed="true"]');
+    await expect(buttons.nth(0)).toHaveAttribute('aria-pressed', 'true');
+    await expect(buttons.nth(1)).toHaveAttribute('aria-pressed', 'false');
+    await expect(buttons.nth(2)).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(() => counts.flow[24]).toBe(1);
+
+    for (const [i, hours, label] of [[1, 72, '3 d'], [2, 168, '7 d'], [0, 24, '24 h']] as const) {
+      const before = { load: counts.load, waits: counts.waits, flow: counts.flow[hours] ?? 0 };
+      await buttons.nth(i).click();
+      await expect(buttons.nth(i)).toHaveText(label);
+      await expect(buttons.nth(i)).toHaveAttribute('aria-pressed', 'true');
+      await expect(pressed).toHaveText([label]);
+      // The flow read over the window — and, CURRENT (measure's note),
+      // the load and the waits again although neither takes a window.
+      await expect.poll(() => counts.flow[hours] ?? 0).toBe(before.flow + 1);
+      await expect.poll(() => counts.load).toBe(before.load + 1);
+      await expect.poll(() => counts.waits).toBe(before.waits + 1);
+      const served = hours === 24 ? 5 : 30;
+      await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (${hours}h)`);
+      await expect(board(page).locator('.my-constraint-why')).toContainText(
+        `6 waiting against ${served} served in the last ${hours}h`,
+      );
+    }
+  });
+
+  test('CURRENT, gap 12 (371aa184): the envelope\'s own window_hours is parsed and ignored — a clamped answer is judged in the pressed hours', async ({ page }) => {
+    await install(page, {
+      flow: (r) => {
+        const hours = Number(new URL(r.request().url()).searchParams.get('window_hours'));
+        // The server clamps 168 to 72 and says so on its envelope.
+        return json(r, flow(hours === 168 ? 72 : hours, 30, 'clamped'));
+      },
+    });
+    await mountPage(page, PATH, TITLE);
+    await board(page).locator('.my-controls button', { hasText: '7 d' }).click();
+    await expect(board(page).locator('.my-asof')).toHaveText('read clamped');
+    await expect(board(page).locator('.my-constraint-why')).toHaveText(
+      '6 waiting against 30 served in the last 168h: 34h to clear at the rate it is actually being worked, longer than any other counted queue.',
+    );
+  });
+
+  test('CURRENT, gap 12 (371aa184): window reads are not sequenced — a slow 24 h answer lands under a pressed 7 d', async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await install(page, {
+      flow: async (r) => {
+        const hours = Number(new URL(r.request().url()).searchParams.get('window_hours'));
+        if (hours === 24) await held;
+        return json(r, flow(hours, hours === 24 ? 5 : 30, `${AS_OF_24} (${hours}h)`));
+      },
+    });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-quiet')).toHaveText('Reading the network…');
+    await board(page).locator('.my-controls button', { hasText: '7 d' }).click();
+    await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (168h)`);
+    release();
+    // The 24 h answer, which the 7 d click superseded, lands last and wins.
+    await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (24h)`);
+    await expect(board(page).locator('.my-controls button', { hasText: '7 d' })).toHaveAttribute('aria-pressed', 'true');
+    await expect(board(page).locator('.my-constraint-why')).toHaveText(
+      '6 waiting against 5 served in the last 168h: 202h to clear at the rate it is actually being worked, longer than any other counted queue.',
+    );
+  });
+
+  test('the page writes nothing: every control used, no non-GET call leaves it', async ({ page }) => {
+    const writes: string[] = [];
+    page.on('request', (req) => {
+      if (req.method() !== 'GET' && req.url().includes('/api/') && !req.url().includes('/api/surface-opens')) {
+        writes.push(`${req.method()} ${req.url()}`);
+      }
+    });
+    const counts = await install(page);
+    await mountPage(page, PATH, TITLE);
+    for (const label of ['3 d', '7 d', '24 h']) {
+      await board(page).locator('.my-controls button', { hasText: label }).click();
+    }
+    await expect.poll(() => counts.load).toBe(4);
+    await panel(page).locator('a[data-close]').click();
+    await expect(page).toHaveURL(/\/it$/);
+    expect(writes).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Empty, failed and malformed — never the same paint
+// ---------------------------------------------------------------------
+
+/// The well-formed empty network: stations answered, nothing stands.
+const EMPTY = {
+  load: (r: Route) => json(r, { data: [], total: 0, distinct_packets: 0 }),
+  flow: (r: Route) => json(r, { window_hours: 24, as_of: AS_OF_24, data: [] }),
+  waits: (r: Route) => json(r, { data: [], total: 0, now: AS_OF_24 }),
+};
+
+async function expectClearPaint(page: Page): Promise<void> {
+  const b = board(page);
+  await expect(b.locator('.my-constraint-name')).toHaveText('No queue can be named');
+  await expect(b.locator('.my-constraint')).not.toHaveClass(/named/);
+  await expect(b.locator('.my-constraint-why')).toHaveText('Nothing is waiting at any watched station.');
+  await expect(b.locator('.my-quiet')).toHaveText(['Every watched station is clear.', 'Nothing is outstanding.']);
+  await expect(b.locator('table.my-table')).toHaveCount(0);
+  await expect(failures(page)).toHaveCount(0);
+}
+
+test.describe('the marshalling station — the empty leg and every failure line', () => {
+  test('an EMPTY network paints as clear, with no failure marker', async ({ page }) => {
+    await install(page, EMPTY);
+    await mountPage(page, PATH, TITLE);
+    await expectClearPaint(page);
+  });
+
+  // Gap 11, FIXED on the server by train #600 (de8e1c3b, 2026-09-24):
+  // stations.rs `readable_predicate` refuses a caller whose job scope
+  // translates to None with a 403 naming them, where stations_load used
+  // to answer the empty envelope an idle network sends. This spec was
+  // written a day later and pinned that retired empty 200 as CURRENT,
+  // so it asserted a clear yard for an answer the server no longer
+  // gives. The mock is now the server's own refusal (its body is the
+  // server's words for an intern), and the paint is the failure line.
+  test('gap 11 (8dcd28ce): a denied scope is refused 403, and the refusal is the failure line, never a clear yard', async ({ page }) => {
+    await install(page, {
+      ...EMPTY,
+      load: (r) => json(r, 'emp-x (role intern) may read no packets, so no station can be evaluated for them', 403),
+    });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      'The station load did not answer: /api/stations/load: HTTP 403. An unreachable read is not an empty yard, so this page shows nothing rather than a clear one.',
+    );
+    await expect(board(page)).not.toContainText('Every watched station is clear.');
+    await expect(board(page).locator('.my-quiet')).toHaveCount(0);
+    await expect(board(page).locator('.my-section')).toHaveCount(0);
+  });
+
+  // Gap 10, FIXED by 67825067: each board read's parse goes through the
+  // shared envelope reader (src/data/shape.ts), so a 200 that is not
+  // the envelope is a failed read — the same failure line as a 500, with
+  // the read named and what came back said.
+  const NOT_THE_SHAPE = (path: string) =>
+    `${path}: HTTP 200, but the body is an object with no data list, not a {data: [...]} envelope`;
+
+  test('gap 10 (67825067): a malformed 200 from all three board reads is a failure line, never a clear yard', async ({ page }) => {
+    await install(page, {
+      load: (r) => json(r, { error: 'not the shape' }),
+      flow: (r) => json(r, { error: 'not the shape' }),
+      waits: (r) => json(r, { error: 'not the shape' }),
+    });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      `The station load did not answer: ${NOT_THE_SHAPE('/api/stations/load')}. An unreachable read is not an empty yard, so this page shows nothing rather than a clear one.`,
+    );
+    await expect(board(page)).not.toContainText('Every watched station is clear.');
+    await expect(board(page).locator('.my-quiet')).toHaveCount(0);
+    await expect(board(page).locator('.my-section')).toHaveCount(0);
+  });
+
+  test('gap 10 (67825067): a malformed 200 from the station flow alone is its failure line, and no constraint is named', async ({ page }) => {
+    await install(page, { flow: (r) => json(r, []) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      'The station flow did not answer: /api/stations/flow: HTTP 200, but the body is a list, not a {data: [...]} envelope. Depth without a rate cannot say whether anything is forming, so the constraint is not named.',
+    );
+    await expect(board(page).locator('.my-constraint')).toHaveCount(0);
+    await expect(board(page).locator('.my-quiet')).toHaveCount(0);
+  });
+
+  test('gap 10 (67825067): a malformed 200 from the queue-age lens alone is its failure line, never "Nothing is outstanding."', async ({ page }) => {
+    await install(page, { waits: (r) => json(r, { error: 'not the shape' }) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      `The queue-age lens did not answer: ${NOT_THE_SHAPE('/api/jobs/queue-age')}.`,
+    );
+    await expect(board(page)).not.toContainText('Nothing is outstanding.');
+    await expect(sidingRows(page)).toHaveCount(4);
+  });
+
+  test('a failed regions read is said, and the HUD says when; the station still opens and its board reads its own', async ({ page }) => {
+    await install(page, { regions: (r) => json(r, 'down', 500) });
+    await mountPage(page, PATH, TITLE);
+    await expect(page.locator('.yard-empty.load-failed').first()).toHaveText('The regions cannot be read — /api/yard/regions: HTTP 500');
+    await expect(page.locator('section[data-hud] .hud-age')).toHaveText(/^read failed \d\d:\d\dZ · no good read yet$/);
+    // The station's panel opens on its name, its readings said unread
+    // (car N3) — the floor page it replaced drew its board regardless.
+    await expect(panel(page)).toHaveAttribute('data-state', 'unknown');
+    await expect(panel(page)).toContainText('Its readings come with the regions read, which failed');
+    await expect(board(page).locator('.my-constraint-name')).toHaveText('q.platform-admin.sign-off');
+  });
+
+  test('a failed borders read is said, and the panel says its rails are unread', async ({ page }) => {
+    await install(page, { borders: (r) => json(r, 'down', 500) });
+    await mountPage(page, PATH, TITLE);
+    await expect(page.locator('.yard-empty.load-failed')).toHaveText('The borders cannot be read — /api/yard/borders: HTTP 500');
+    await expect(board(page).locator('.my-constraint-name')).toHaveText('q.platform-admin.sign-off');
+  });
+
+  test('a failed station load is said on the board, never as a clear yard', async ({ page }) => {
+    await install(page, { load: (r) => json(r, 'down', 500) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      'The station load did not answer: /api/stations/load: HTTP 500. An unreachable read is not an empty yard, so this page shows nothing rather than a clear one.',
+    );
+    // Neither empty state, and no section at all under a failed load.
+    await expect(board(page).locator('.my-quiet')).toHaveCount(0);
+    await expect(board(page).locator('.my-section')).toHaveCount(0);
+  });
+
+  test('a failed station flow is said on the board, and no constraint is named', async ({ page }) => {
+    await install(page, { flow: (r) => json(r, 'down', 500) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      'The station flow did not answer: /api/stations/flow?window_hours=24: HTTP 500. Depth without a rate cannot say whether anything is forming, so the constraint is not named.',
+    );
+    await expect(board(page).locator('.my-constraint')).toHaveCount(0);
+    await expect(board(page).locator('.my-quiet')).toHaveCount(0);
+  });
+
+  test('a failed queue-age read is said under the sidings, never as "Nothing is outstanding."', async ({ page }) => {
+    await install(page, { waits: (r) => json(r, 'down', 500) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-fail.load-failed')).toHaveText(
+      'The queue-age lens did not answer: /api/jobs/queue-age: HTTP 500.',
+    );
+    await expect(board(page)).not.toContainText('Nothing is outstanding.');
+    await expect(sidingRows(page)).toHaveCount(4);
+  });
+});

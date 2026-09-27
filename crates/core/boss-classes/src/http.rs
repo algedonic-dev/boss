@@ -18,7 +18,7 @@ use boss_policy_client::{AccessTier, CurrentUser};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::port::ClassRepository;
+use crate::port::{ClassRepository, class_differs};
 
 #[derive(Clone)]
 pub struct ClassesApiState {
@@ -65,6 +65,12 @@ async fn health() -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct ListQuery {
     subject_kind: String,
+    /// Narrows the list to one axis of the kind. One subject_kind can
+    /// hold several taxonomies told apart only by `member_attribute` —
+    /// the employee drawer held role, department, status and
+    /// employment_type side by side on 2026-09-23 (backlog ab1e6ff8) —
+    /// so a reader after one column's values asks for that axis.
+    member_attribute: Option<String>,
 }
 
 async fn list_classes(
@@ -72,7 +78,15 @@ async fn list_classes(
     Query(q): Query<ListQuery>,
 ) -> Response {
     match state.classes.list_for_subject_kind(&q.subject_kind).await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(
+            rows.into_iter()
+                .filter(|c| {
+                    q.member_attribute.is_none()
+                        || c.member_attribute.as_deref() == q.member_attribute.as_deref()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -107,7 +121,7 @@ async fn update_class(
     Path((subject_kind, code)): Path<(String, String)>,
     Json(body): Json<ClassInput>,
 ) -> Response {
-    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let sim = boss_policy_client::sim_bypass_allowed(&user);
     let tier_ok = matches!(user.access_tier, AccessTier::Operator);
     if !(sim || tier_ok) {
         return (StatusCode::FORBIDDEN, "operator tier required").into_response();
@@ -119,7 +133,9 @@ async fn update_class(
     class.subject_kind = subject_kind;
     class.code = code;
 
-    match state.classes.update(&class).await {
+    // The edit's `class.updated` names the caller (backlog 10dabe13):
+    // `boss tenant publish --take classes` edits through this door.
+    match state.classes.update(&class, &write_stamp(&user)).await {
         Ok(true) => Json(class).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such class").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -136,13 +152,13 @@ async fn retire_class(
     CurrentUser(user): CurrentUser,
     Path((subject_kind, code)): Path<(String, String)>,
 ) -> Response {
-    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let sim = boss_policy_client::sim_bypass_allowed(&user);
     let tier_ok = matches!(user.access_tier, AccessTier::Operator);
     if !(sim || tier_ok) {
         return (StatusCode::FORBIDDEN, "operator tier required").into_response();
     }
     let class_ref = ClassRef::new(subject_kind, code);
-    match state.classes.retire(&class_ref).await {
+    match state.classes.retire(&class_ref, &write_stamp(&user)).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such class").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -204,30 +220,19 @@ impl From<ClassInput> for Class {
     }
 }
 
-/// The declared fields a held Class disagrees with the declaration on,
-/// by the input's field names (the chart door's `differs_from`, for
-/// the registry's editable body — the key itself cannot differ, it is
-/// what matched). `retired_at` is the table's own and not compared: a
-/// retired code the file still declares is kept retired, which is the
-/// retire door's decision, not the seed's.
-pub fn class_differs(held: &Class, declared: &Class) -> Vec<String> {
-    let mut out = Vec::new();
-    if held.display_name != declared.display_name {
-        out.push("display_name".to_string());
-    }
-    if held.parent_code != declared.parent_code {
-        out.push("parent_code".to_string());
-    }
-    if held.member_attribute != declared.member_attribute {
-        out.push("member_attribute".to_string());
-    }
-    if held.metadata != declared.metadata {
-        out.push("metadata".to_string());
-    }
-    if held.sort_order != declared.sort_order {
-        out.push("sort_order".to_string());
-    }
-    out
+/// The stamp every write door signs its fact with: the actor the
+/// request signed with (`x-boss-user`, the id `boss tenant publish`
+/// sends); a sim-chain caller with no identity is this service's own
+/// automation, never anonymous. Publisher-less (the credentials door's
+/// shape): the adapter stages the event on the outbox inside the
+/// write's transaction and the relay moves it on, so this service
+/// needs no bus of its own. One function for the batch, the edit and
+/// the retire doors, so the three facts cannot be signed three ways.
+fn write_stamp(user: &boss_policy_client::User) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("classes".into()));
+    boss_core::publisher::EventStamp::new("classes", actor)
 }
 
 /// Batch-upsert Class rows — the single write surface, used to seed
@@ -235,17 +240,18 @@ pub fn class_differs(held: &Class, declared: &Class) -> Vec<String> {
 /// inserts `ON CONFLICT (subject_kind, code) DO NOTHING`, so the call
 /// is idempotent.
 ///
-/// Gated to operator-tier callers, with the `x-sim-origin` bypass that
-/// every seed path honors (the trusted simulator/seeder masquerades as
-/// operators; its requests carry `x-sim-origin: true`, which the
-/// request-context middleware scopes into `is_in_sim_chain`). Reads
-/// stay open; only this write is privileged.
+/// Gated to operator-tier callers — every seed path signs operator
+/// tier — or a sim caller on a sim instance
+/// (`boss_policy_client::sim_bypass_allowed`). The header alone opened
+/// this door to any caller that reached :7800 directly until
+/// 2026-09-25 (backlog 85e7f10f). Reads stay open; only this write is
+/// privileged.
 async fn batch_upsert(
     State(state): State<ClassesApiState>,
     CurrentUser(user): CurrentUser,
     Json(rows): Json<Vec<ClassInput>>,
 ) -> Response {
-    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let sim = boss_policy_client::sim_bypass_allowed(&user);
     let tier_ok = matches!(user.access_tier, AccessTier::Operator);
     if !(sim || tier_ok) {
         return (StatusCode::FORBIDDEN, "operator tier required").into_response();
@@ -277,17 +283,12 @@ async fn batch_upsert(
         }
     }
     // The fact each inserted row leaves is stamped with the actor the
-    // request signed with (`x-boss-user`, the id `boss tenant publish`
-    // sends); a sim-chain caller with no identity is this service's
-    // own automation, never anonymous. The stamp is publisher-less
-    // (the credentials door's shape): the adapter stages the event on
-    // the outbox inside the insert's transaction and the relay moves
-    // it on, so this service needs no bus of its own.
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("classes".into()));
-    let stamp = boss_core::publisher::EventStamp::new("classes", actor);
-    match state.classes.batch_upsert(&classes, &stamp).await {
+    // request signed with ([`write_stamp`]).
+    match state
+        .classes
+        .batch_upsert(&classes, &write_stamp(&user))
+        .await
+    {
         Ok(inserted) => Json(serde_json::json!({
             "received": classes.len(),
             "inserted": inserted,
@@ -347,6 +348,66 @@ mod tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v.is_array());
         assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    /// One subject_kind can hold several taxonomies, told apart only by
+    /// `member_attribute` — the live employee drawer held 22 codes on
+    /// four axes on 2026-09-23 (backlog ab1e6ff8). `member_attribute`
+    /// narrows the list to one axis; an axis nothing carries answers an
+    /// empty list, not the whole drawer; and without it the list is
+    /// unchanged.
+    #[tokio::test]
+    async fn list_narrows_to_one_member_attribute() {
+        let on = |code: &str, attribute: &str| Class {
+            member_attribute: Some(attribute.into()),
+            ..employee(code, 10)
+        };
+        let rows = vec![
+            on("platform-admin", "role"),
+            on("owner", "role"),
+            on("it", "department"),
+            on("active", "status"),
+        ];
+        let codes = |uri: &'static str| {
+            let app = build_app(rows.clone());
+            async move {
+                let req = Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                let mut codes: Vec<String> = v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["code"].as_str().unwrap().to_string())
+                    .collect();
+                codes.sort();
+                codes
+            }
+        };
+        assert_eq!(
+            codes("/api/classes?subject_kind=employee&member_attribute=role").await,
+            vec!["owner", "platform-admin"]
+        );
+        assert_eq!(
+            codes("/api/classes?subject_kind=employee&member_attribute=department").await,
+            vec!["it"]
+        );
+        assert!(
+            codes("/api/classes?subject_kind=employee&member_attribute=account_team_role")
+                .await
+                .is_empty(),
+            "an axis nothing carries is empty, not the whole drawer"
+        );
+        assert_eq!(
+            codes("/api/classes?subject_kind=employee").await.len(),
+            4,
+            "no filter, no change"
+        );
     }
 
     #[tokio::test]
@@ -534,6 +595,110 @@ mod tests {
         assert_eq!(stored.display_name, "Renamed");
     }
 
+    /// The fact an edit leaves (backlog 10dabe13, 2026-09-27): until
+    /// then only `class.declared` reached the log, so the three rows
+    /// `boss tenant publish --take classes` edited through this door on
+    /// 2026-09-26 left no fact at all. One `class.updated` per PUT that
+    /// CHANGED the row — the key, the changed fields' before and after,
+    /// and `updated_by`, the actor the request signed with — and none
+    /// for a PUT that restates what the row already holds.
+    #[tokio::test]
+    async fn put_records_one_updated_event_naming_what_changed_and_none_for_a_restatement() {
+        let repo = seeded();
+        let body = json!({
+            "subject_kind": "employee",
+            "code": "platform-admin",
+            "display_name": "Platform administrator",
+            "member_attribute": "role",
+            "sort_order": 3,
+            "metadata": {"is_system_role": true}
+        });
+        for _ in 0..2 {
+            let resp = router(ClassesApiState {
+                classes: repo.clone(),
+            })
+            .oneshot(put_request(
+                Some(&operator_header()),
+                "employee",
+                "platform-admin",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let events = repo.recorded_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "one fact for the edit, none for the identical repeat: {events:?}"
+        );
+        let e = &events[0];
+        assert_eq!(e.kind, crate::port::CLASS_UPDATED);
+        assert_eq!(e.source, "classes");
+        assert_eq!(e.payload["subject_kind"], json!("employee"));
+        assert_eq!(e.payload["code"], json!("platform-admin"));
+        assert_eq!(e.payload["changed"], json!(["display_name", "metadata"]));
+        assert_eq!(
+            e.payload["before"],
+            json!({
+                "display_name": "Platform admin",
+                "metadata": {"is_executive": true, "is_system_role": true}
+            })
+        );
+        assert_eq!(
+            e.payload["after"],
+            json!({
+                "display_name": "Platform administrator",
+                "metadata": {"is_system_role": true}
+            })
+        );
+        assert_eq!(e.payload["updated_by"], json!("automation:test-seed"));
+        assert_eq!(
+            e.payload["_actor"], e.payload["updated_by"],
+            "updated_by and the stamp's actor are one value"
+        );
+    }
+
+    /// The fact a retirement leaves (backlog 10dabe13): one
+    /// `class.retired` when the stamp is set — carrying the stamp and
+    /// `retired_by` — and none on the idempotent repeat (the stamp did
+    /// not move, so no state changed) or for a code that names nothing.
+    #[tokio::test]
+    async fn retire_records_one_retired_event_and_none_for_a_repeat_or_a_missing_code() {
+        let repo = seeded();
+        let h = operator_header();
+        for code in ["platform-admin", "platform-admin", "no-such"] {
+            router(ClassesApiState {
+                classes: repo.clone(),
+            })
+            .oneshot(retire_request(Some(&h), code))
+            .await
+            .unwrap();
+        }
+
+        let events = repo.recorded_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e.kind, crate::port::CLASS_RETIRED);
+        assert_eq!(e.source, "classes");
+        assert_eq!(e.payload["subject_kind"], json!("employee"));
+        assert_eq!(e.payload["code"], json!("platform-admin"));
+        let held = repo
+            .get(&ClassRef::new("employee", "platform-admin"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            e.payload["retired_at"],
+            serde_json::to_value(held.retired_at.expect("stamped")).unwrap(),
+            "the fact carries the stamp the row holds"
+        );
+        assert_eq!(e.payload["retired_by"], json!("automation:test-seed"));
+        assert_eq!(e.payload["_actor"], e.payload["retired_by"]);
+    }
+
     #[tokio::test]
     async fn put_on_a_missing_class_is_not_found() {
         let app = router(ClassesApiState {
@@ -702,12 +867,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_upsert_bypassed_by_sim_origin() {
-        // Sim traffic carries `x-sim-origin: true`, which the request-
-        // context middleware scopes into `is_in_sim_chain`. The router
-        // under test omits that middleware, so we set the task-local
-        // directly to exercise the bypass branch with a non-operator
-        // (anonymous) caller.
+    async fn a_sim_chain_alone_is_not_operator_tier() {
+        // Backlog 85e7f10f (2026-09-25): `sim || tier_ok` let ANY caller
+        // that reached :7800 directly write the registry by sending
+        // `x-sim-origin: true`. The chain flag is set here directly (the
+        // router under test omits the middleware) and the caller is
+        // anonymous — no sim identity, no operator tier — so the door
+        // refuses and nothing lands, whatever the deployment's sim switch
+        // says (the sim-on leg, through the real middleware, is
+        // tests/a_sim_header_alone_writes_no_class.rs).
         let repo = Arc::new(InMemoryClasses::new(vec![]));
         let app = router(ClassesApiState {
             classes: repo.clone(),
@@ -719,10 +887,10 @@ mod tests {
             boss_core::sim_origin::with_sim_chain(true, app.oneshot(batch_request(None, body)))
                 .await
                 .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             repo.list_for_subject_kind("employee").await.unwrap().len(),
-            1
+            0
         );
     }
     fn retire_request(user_header: Option<&str>, code: &str) -> Request<axum::body::Body> {

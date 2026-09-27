@@ -1,0 +1,12 @@
+{
+  "about": "MUTATING — the named rollback of move-forgejo-data: puts Forgejo back on the pre-move copy on the root filesystem (infra/forge/move-forgejo-data.sh --rollback; backlog 016aeea3). Its own approval verb, never a hand procedure: it declares requires_approval with plan-a-forgejo-data-rollback as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list (David) signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and changes nothing unless the bytes hash alike. It takes no path. It holds the converge (unless a hold stands), stops Forgejo (-t 60) if it runs, unmounts /opt/forgejo/data if it is the move's bind (three tries, each refusal naming the holders with fuser -vm), removes EXACTLY the fstab line the move wrote through a temporary file checked with findmnt --verify --tab-file — tolerating only the boss-data drive's own errors, and only while lsblk no longer lists the drive, because a rollback is needed most when the drive is gone — clears the immutable flag and removes the empty mountpoint, renames /opt/forgejo/data.pre-move-<8 hex> back, starts Forgejo (a real start), proves healthz, a readable main, the container's /data being the restored copy by device and inode, and the manifest of the stamp the MOVE recorded in the target's marker (never the current stamp, whose image may exist only in the moved copy; with the drive gone, or no marker, that leg is reported rather than proved, and the plan says so), and releases its own hold; a failed proof stops Forgejo again, and restart-forgejo starts it under its own approved plan. Each step runs only when the observed state needs it, so it repairs a move that stopped part-way as well as a finished one. It never deletes the moved copy: anything Forgejo wrote since the move stays there and is not copied back, and the plan says so. Any failure stops, prints what stands, keeps the hold, exit 1.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-forgejo-data-rollback",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/move-forgejo-data.sh", "--rollback", "{1}"],
+  "params": [
+    { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
+  ],
+  "timeout": 900
+}

@@ -18,13 +18,17 @@
 // is the one list this file keeps, and it is short because the
 // pipeline's kinds are the ones the Train Yard already shows.
 //
-// A CHANNEL IS A FACT WHERE ONE WAS RECORDED. `metadata.channel` naming
-// a channel is read as recorded; everything else is DERIVED from the
-// kind and the reporter, and says so (`basis`), the way the yard's
-// production panel says whether a number came from the record or from
-// a window. A backlog item naming no source is `unrecorded` — never
-// guessed into a lane, because the whole reason this page exists is to
-// make "where does our work come from" a fact instead of a feeling.
+// A LANE IS WHAT THE SERVER READ, AND ONLY WHAT THE FILER RECORDED.
+// Each row carries `lane: {lane, basis}` because this page asks the list
+// for it (`lane=true`): the server reads the lane the filer recorded, in
+// the one vocabulary (`boss_jobs::channels::lane_of`), and a packet whose
+// filer named none is `unclassified` — never guessed into a lane, because
+// the whole reason this page exists is to make "where does our work come
+// from" a fact instead of a feeling. Until backlog 1eea4554 this file
+// kept a six-lane vocabulary and three kind lists of its own and read a
+// key no filer writes, so 0 of 1,626 arrivals read as recorded while 492
+// of them had recorded one; `regions/receiving.rs` pins that no rule
+// grows back here.
 //
 // NO NUMBER THIS SURFACE MAKES UP. A page that truncated (`total` past
 // the rows read) is reported as such by the page; a failed read is a
@@ -84,73 +88,221 @@ export function inboundKinds(workflows: ReadonlyArray<WorkflowRow>): ReadonlyArr
 }
 
 // ---------------------------------------------------------------------
-// Channel
+// Lane — the server's reading, drawn as it came
 // ---------------------------------------------------------------------
 
-export type Channel = 'feedback' | 'monitoring' | 'session' | 'design' | 'protocol' | 'unrecorded';
+export type LaneBasis = 'recorded' | 'unclassified';
 
-export const CHANNELS: ReadonlyArray<Channel> = [
-  'feedback',
-  'monitoring',
-  'session',
-  'design',
-  'protocol',
-  'unrecorded',
+export type LaneReading = Readonly<{ lane: string; basis: LaneBasis }>;
+
+/** What the server answers for a packet whose filer recorded no lane. */
+export const UNCLASSIFIED: LaneReading = { lane: 'unclassified', basis: 'unclassified' };
+
+/** The `lane` the server put on a listed row. The read asks for it, and a
+ *  server that cannot answer `lane=true` refuses the whole read (400),
+ *  so a row without one is not something this page's read returns; it
+ *  is drawn unclassified rather than dropped, because a lost packet
+ *  would shrink every count on the page. */
+export function laneOf(row: unknown): LaneReading {
+  const l = ((row ?? {}) as { lane?: unknown }).lane as Record<string, unknown> | undefined;
+  const lane = str(l?.lane);
+  return lane !== null && l?.basis === 'recorded' ? { lane, basis: 'recorded' } : UNCLASSIFIED;
+}
+
+/** The lanes to draw: every recorded lane the rows carry, in the
+ *  server's spelling and alphabetical, then `unclassified` — always,
+ *  because it is the reading this page exists to make, and an empty
+ *  track there is an answer. */
+export function lanesOf(rows: ReadonlyArray<InboundRow>): ReadonlyArray<string> {
+  const recorded = [
+    ...new Set(rows.filter((r) => r.laneBasis === 'recorded').map((r) => r.lane)),
+  ].sort();
+  return [...recorded, UNCLASSIFIED.lane];
+}
+
+/** A hue per lane, by the lane's place in [`lanesOf`], so one reading
+ *  paints a lane alike in the chart, the tracks and the manifest. Ten,
+ *  for the ten lanes a filer may name; `unclassified` is the faint one,
+ *  because it is the absence of an answer. */
+const LANE_COLORS: ReadonlyArray<string> = [
+  'var(--signal)',
+  'var(--err)',
+  'var(--warn)',
+  'var(--ok)',
+  'var(--busy)',
+  'var(--map-line-publish)',
+  'var(--map-line-tenant)',
+  'var(--fog)',
+  'var(--map-line-delivery)',
+  'var(--map-line-siding)',
 ];
 
-export const CHANNEL_LABEL: Readonly<Record<Channel, string>> = {
-  feedback: 'Feedback · a person wrote it',
-  monitoring: 'Monitoring · alarms and the observer',
-  session: 'Sessions · what a builder found',
-  design: 'Design queue',
-  protocol: 'Protocol steps',
-  unrecorded: 'Channel unrecorded',
-};
-
-const isChannel = (v: unknown): v is Channel =>
-  typeof v === 'string' && (CHANNELS as ReadonlyArray<string>).includes(v);
-
-const DESIGN_KINDS: ReadonlySet<string> = new Set([
-  'design-doc',
-  'design-doc-review',
-  'workflow-design',
-  'protocol-retro',
-  'protocol-experiment',
-]);
-const PROTOCOL_KINDS: ReadonlySet<string> = new Set([
-  'rotate-a-credential',
-  'publish-to-github',
-  'approval',
-  'join-a-node',
-]);
-const MONITORING_KINDS: ReadonlySet<string> = new Set(['incident', 'incident-post-mortem']);
-
-export type ChannelReading = Readonly<{ channel: Channel; basis: 'recorded' | 'derived' }>;
-
-/** The recorded channel if the packet carries one; otherwise the rule. */
-export function channelOf(job: unknown): ChannelReading {
-  const j = (job ?? {}) as Record<string, unknown>;
-  const md = (j.metadata ?? {}) as Record<string, unknown>;
-  if (isChannel(md.channel)) return { channel: md.channel, basis: 'recorded' };
-  const kind = str(j.kind) ?? '';
-  const derived = (channel: Channel): ChannelReading => ({ channel, basis: 'derived' });
-  if (kind === 'user-feedback') return derived('feedback');
-  if (MONITORING_KINDS.has(kind)) return derived('monitoring');
-  if (DESIGN_KINDS.has(kind)) return derived('design');
-  if (PROTOCOL_KINDS.has(kind)) return derived('protocol');
-  // Backlog items name their source in several keys or not at all —
-  // the reading the prototype surfaced. Read them in order, then
-  // classify the actor: a machine reporter is monitoring, anything
-  // else that wrote a source is a session.
-  const source =
-    str(md.reporter) ?? str(md.filed_by) ?? str(md.source) ?? str(md.submitted_by) ?? null;
-  if (source === null) return derived('unrecorded');
-  const s = source.toLowerCase();
-  if (s.startsWith('automation:') || s.startsWith('cadence') || s === 'conductor') {
-    return derived('monitoring');
-  }
-  return derived('session');
+export function laneColor(lane: string, lanes: ReadonlyArray<string>): string {
+  const i = lanes.indexOf(lane);
+  return lane === UNCLASSIFIED.lane || i < 0
+    ? 'var(--text-faint)'
+    : (LANE_COLORS[i % LANE_COLORS.length] ?? 'var(--text-faint)');
 }
+
+// ---------------------------------------------------------------------
+// Origin — where an item came from, as the server read it
+// ---------------------------------------------------------------------
+
+// THE SOURCE AND AREA ARE THE SERVER'S (design 3036296f mechanism D,
+// backlog 9b473d4a), the way the lane is: this page asks the list for
+// `origin=true` and each row carries `origin: {source: {basis, kind,
+// key, id, branch}, area}`, read by `boss_jobs::origin::origin_of` — the
+// rule the receiving REGION tallies too. This file groups by the `key`
+// it was handed and reads no metadata key of its own; the pin
+// `the_receiving_yard_groups_by_the_origin_the_server_read`
+// (regions/receiving.rs) holds that, and the words below, to the server.
+
+/** Why a source reads as it does: `recorded` groups by source; every
+ *  other basis is the one "no recorded source" group, named. */
+export type SourceBasis = 'recorded' | 'ad-hoc' | 'prose' | 'unreadable' | 'missing';
+
+export type SourceRead = Readonly<{
+  /** The server's word — a basis this page does not know is kept as
+   *  sent and drawn unrecorded, never promoted to a source. */
+  basis: SourceBasis | string;
+  kind: string | null;
+  key: string | null;
+  id: string | null;
+  branch: string | null;
+}>;
+
+const NO_SOURCE: SourceRead = { basis: 'missing', kind: null, key: null, id: null, branch: null };
+
+/** The source and area the server put on a listed row. A row without
+ *  them is not something this page's read returns (a server that cannot
+ *  answer `origin=true` refuses the read, 400); it is drawn with no
+ *  recorded source rather than dropped. */
+export function originOf(row: unknown): Readonly<{ source: SourceRead; area: string | null }> {
+  const o = ((row ?? {}) as { origin?: unknown }).origin as Record<string, unknown> | undefined;
+  const s = (o?.source ?? {}) as Record<string, unknown>;
+  const basis = str(s.basis) ?? NO_SOURCE.basis;
+  const key = str(s.key);
+  const source: SourceRead =
+    basis === 'recorded' && key !== null
+      ? { basis, kind: str(s.kind), key, id: str(s.id), branch: str(s.branch) }
+      : { ...NO_SOURCE, basis: basis === 'recorded' ? 'unreadable' : basis };
+  return { source, area: str(o?.area) };
+}
+
+/** The one kind filed with a source (`boss job file --source`); the
+ *  other inbound kinds are not, so they are not tallied by it. */
+export const SOURCED_KIND = 'backlog-item';
+
+/** How n sources of a kind read in a sentence — "71 items from 14 car
+ *  reviews". `boss_jobs::origin::kind_noun`, pinned equal to it. */
+const KIND_NOUNS: ReadonlyArray<readonly [string, string, string]> = [
+  ['car', 'car', 'cars'],
+  ['gate-run', 'gate run', 'gate runs'],
+  ['agent-run', 'agent run', 'agent runs'],
+  ['packet', 'packet', 'packets'],
+  ['review', 'car review', 'car reviews'],
+];
+
+export function kindNoun(kind: string, n: number): string {
+  const [, one, many] =
+    KIND_NOUNS.find(([k]) => k === kind) ?? KIND_NOUNS.find(([k]) => k === 'packet')!;
+  return n === 1 ? one : many;
+}
+
+export type KindTally = Readonly<{ kind: string; items: number; sources: number; urgent: number }>;
+
+const items = (n: number): string => `${n} item${n === 1 ? '' : 's'}`;
+
+/** "71 items from 14 car reviews, 9 urgent" — design 3036296f's own
+ *  example, with urgent (the priority every item records) where it said
+ *  blocking, since no item records a blocking flag. */
+export function kindSentence(t: KindTally): string {
+  const head = `${items(t.items)} from ${t.sources} ${kindNoun(t.kind, t.sources)}`;
+  return t.urgent > 0 ? `${head}, ${t.urgent} urgent` : head;
+}
+
+export type SourceGroup = Readonly<{
+  key: string;
+  kind: string;
+  /** What the group is named by: the branch, else the id's first 8. */
+  label: string;
+  /** The packet to link to, when the reading carries one. */
+  id: string | null;
+  rows: ReadonlyArray<WaitingRow>;
+  urgent: number;
+}>;
+
+export type AreaGroup = Readonly<{ area: string; rows: ReadonlyArray<WaitingRow>; urgent: number }>;
+
+export type Provenance = Readonly<{
+  /** The standing backlog items read. */
+  items: number;
+  kinds: ReadonlyArray<KindTally>;
+  groups: ReadonlyArray<SourceGroup>;
+  unrecorded: Readonly<{ rows: ReadonlyArray<WaitingRow>; byBasis: Readonly<Record<string, number>> }>;
+  areas: ReadonlyArray<AreaGroup>;
+  noArea: ReadonlyArray<WaitingRow>;
+}>;
+
+const urgentIn = (rows: ReadonlyArray<WaitingRow>): number =>
+  rows.filter((r) => r.priority === 'urgent').length;
+
+const largestFirst = <T extends { rows: ReadonlyArray<unknown> }>(key: (t: T) => string) =>
+  (a: T, b: T): number => b.rows.length - a.rows.length || key(a).localeCompare(key(b));
+
+/** THE UNTRIAGED PILE, NOT FLAT: the standing backlog items grouped by
+ *  the source key the server read and by area, with the unrecorded as
+ *  one group counted by basis. Pure; the page draws what it returns. */
+export function provenance(standing: ReadonlyArray<WaitingRow>): Provenance {
+  const mine = standing.filter((r) => r.kind === SOURCED_KIND);
+  const recorded = mine.filter((r) => r.source.basis === 'recorded' && r.source.key !== null);
+  const groups = [...new Set(recorded.map((r) => r.source.key!))]
+    .map((key): SourceGroup => {
+      const rows = recorded.filter((r) => r.source.key === key);
+      const first = rows[0]!.source;
+      return {
+        key,
+        kind: first.kind ?? '',
+        label: first.branch ?? (first.id !== null ? first.id.slice(0, 8) : key),
+        id: rows.map((r) => r.source.id).find((id) => id !== null) ?? null,
+        rows,
+        urgent: urgentIn(rows),
+      };
+    })
+    .sort(largestFirst((g) => g.key));
+  const kinds = [...new Set(groups.map((g) => g.kind))]
+    .map((kind): KindTally => {
+      const of = groups.filter((g) => g.kind === kind);
+      const rows = of.flatMap((g) => g.rows);
+      return { kind, items: rows.length, sources: of.length, urgent: urgentIn(rows) };
+    })
+    .sort((a, b) => b.items - a.items || a.kind.localeCompare(b.kind));
+  const unrecordedRows = mine.filter((r) => !recorded.includes(r));
+  const byBasis = unrecordedRows.reduce<Record<string, number>>(
+    (acc, r) => ({ ...acc, [r.source.basis]: (acc[r.source.basis] ?? 0) + 1 }),
+    {},
+  );
+  const areas = [...new Set(mine.flatMap((r) => (r.area === null ? [] : [r.area])))]
+    .map((area): AreaGroup => {
+      const rows = mine.filter((r) => r.area === area);
+      return { area, rows, urgent: urgentIn(rows) };
+    })
+    .sort(largestFirst((a) => a.area));
+  return {
+    items: mine.length,
+    kinds,
+    groups,
+    unrecorded: { rows: unrecordedRows, byBasis },
+    areas,
+    noArea: mine.filter((r) => r.area === null),
+  };
+}
+
+/** The kind a person files through the feedback door. The feedback
+ *  reading counts it by KIND, not by lane: measured 2026-09-26, 17 of the
+ *  19 user-feedback packets in the window recorded no lane, and reading a
+ *  lane off the kind is the rule this file stopped keeping. */
+export const FEEDBACK_KIND = 'user-feedback';
 
 // ---------------------------------------------------------------------
 // Rows — one parse at the fetch site
@@ -169,10 +321,33 @@ export type InboundRow = Readonly<{
   openedOn: string;
   closedOn: string | null;
   priority: string;
-  channel: Channel;
-  channelBasis: 'recorded' | 'derived';
+  /** The lane the server read ([`laneOf`]). */
+  lane: string;
+  laneBasis: LaneBasis;
+  /** Where it came from and its area, as the server read them ([`originOf`]). */
+  source: SourceRead;
+  area: string | null;
   ready: ReadonlyArray<ReadyStep>;
+  /** An actor has picked it up: a step other than its trigger has
+   *  completed ([`takenIn`]). From then on it is marshalling's, not
+   *  standing here (design 62de32ae decision 4). */
+  takenIn: boolean;
 }>;
+
+/** THE INTAKE RULE — `regions.rs::taken_in`, the server's partition
+ *  between receiving and marshalling, read the same way here so the
+ *  receiving floor stands what the region's header counts. The intake
+ *  step is the first step after the trigger, read off the step kinds:
+ *  a `triage`, a `decide`, whatever a protocol put first. The trigger
+ *  completes at admission, so it takes nothing in; a skipped step is
+ *  not a completed one. Measured 2026-09-24: 216 of 232 open
+ *  backlog-items were triaged and waiting on `build`, and this board
+ *  stood every one of them. */
+export const TRIGGER_STEP_KIND = 'trigger';
+
+export function takenIn(steps: ReadonlyArray<Readonly<Record<string, unknown>>>): boolean {
+  return steps.some((s) => s.status === 'completed' && s.kind !== TRIGGER_STEP_KIND);
+}
 
 export type JobsPage = Readonly<{ rows: ReadonlyArray<InboundRow>; total: number }>;
 
@@ -187,7 +362,8 @@ export function parseJobsPage(raw: unknown): JobsPage {
     const openedOn = str(r.opened_on);
     if (!id || !kind || !openedOn) return [];
     const steps = Array.isArray(r.steps) ? (r.steps as ReadonlyArray<Record<string, unknown>>) : [];
-    const ch = channelOf(r);
+    const ln = laneOf(r);
+    const origin = originOf(r);
     return [
       {
         id,
@@ -197,8 +373,10 @@ export function parseJobsPage(raw: unknown): JobsPage {
         openedOn,
         closedOn: str(r.closed_on),
         priority: str(r.priority) ?? 'standard',
-        channel: ch.channel,
-        channelBasis: ch.basis,
+        lane: ln.lane,
+        laneBasis: ln.basis,
+        source: origin.source,
+        area: origin.area,
         ready: steps
           .filter((s) => s.status === 'ready')
           .map((s) => ({
@@ -206,6 +384,7 @@ export function parseJobsPage(raw: unknown): JobsPage {
             who: str(s.assignee_id),
             failed: failedVerb(s.metadata),
           })),
+        takenIn: takenIn(steps),
       },
     ];
   });
@@ -270,7 +449,7 @@ export function daysEndingOn(today: string, n: number): ReadonlyArray<string> {
 export type DayFlow = Readonly<{
   day: string;
   arrived: number;
-  byChannel: Readonly<Partial<Record<Channel, number>>>;
+  byLane: Readonly<Record<string, number>>;
   /** Closed that day — including packets that arrived before the window. */
   left: number;
 }>;
@@ -281,14 +460,14 @@ export function arrivalsByDay(
 ): ReadonlyArray<DayFlow> {
   return days.map((day) => {
     const arrived = rows.filter((r) => r.openedOn === day);
-    const byChannel = arrived.reduce<Partial<Record<Channel, number>>>(
-      (acc, r) => ({ ...acc, [r.channel]: (acc[r.channel] ?? 0) + 1 }),
+    const byLane = arrived.reduce<Record<string, number>>(
+      (acc, r) => ({ ...acc, [r.lane]: (acc[r.lane] ?? 0) + 1 }),
       {},
     );
     return {
       day,
       arrived: arrived.length,
-      byChannel,
+      byLane,
       left: rows.filter((r) => r.closedOn === day).length,
     };
   });
@@ -297,10 +476,13 @@ export function arrivalsByDay(
 export type WaitingRow = InboundRow &
   Readonly<{ age: number; band: AgeBand; holder: Holder }>;
 
-/** Every open packet, oldest first. */
+/** A packet standing in receiving: open, and not yet taken in. */
+export const standsHere = (r: InboundRow): boolean => r.status === 'open' && !r.takenIn;
+
+/** Every packet standing in receiving, oldest first. */
 export function waiting(rows: ReadonlyArray<InboundRow>, today: string): ReadonlyArray<WaitingRow> {
   return rows
-    .filter((r) => r.status === 'open')
+    .filter(standsHere)
     .map((r) => {
       const age = ageDays(r.openedOn, today);
       return { ...r, age, band: ageBand(age), holder: holderOf(r) };
@@ -324,7 +506,7 @@ export function readings(
   days: ReadonlyArray<string>,
 ): Readings {
   const standing = waiting(rows, today);
-  const feedback = standing.filter((r) => r.channel === 'feedback');
+  const feedback = standing.filter((r) => r.kind === FEEDBACK_KIND);
   const holders = standing.map((r) => r.holder.label);
   const top = [...new Set(holders)]
     .map((label) => ({ label, n: holders.filter((h) => h === label).length }))
@@ -338,7 +520,7 @@ export function readings(
     },
     onOneActor: { count: top?.n ?? 0, of: standing.length, actor: top?.label ?? '—' },
     unrecorded: {
-      count: arrived.filter((r) => r.channel === 'unrecorded').length,
+      count: arrived.filter((r) => r.laneBasis === 'unclassified').length,
       of: arrived.length,
     },
   };
@@ -356,14 +538,46 @@ export function loadWorkflows(): Promise<
 }
 
 /** One kind's packets: everything open, plus what closed inside the
- *  window. Real work only — the demo tenant's packets are not inbound. */
+ *  window. Real work only — the demo tenant's packets are not inbound.
+ *  `lane=true` asks the server to put its lane reading on each row, and
+ *  `origin=true` its source-and-area reading. */
 export function loadKind(
   kind: string,
   windowDays: number,
   limit: number,
+  offset = 0,
 ): Promise<Exclude<Remote<JobsPage>, { kind: 'loading' }>> {
   return fetchRemote(
-    `/api/jobs?kind=${encodeURIComponent(kind)}&simulated=false&closed_within=${windowDays}&limit=${limit}`,
+    `/api/jobs?kind=${encodeURIComponent(kind)}&simulated=false&closed_within=${windowDays}&lane=true&origin=true&full=true&limit=${limit}&offset=${offset}`,
     parseJobsPage,
   );
+}
+
+/** EVERY packet of one kind in the window, page after page until the
+ *  server's `total` — a limit is not a filter (design 62de32ae
+ *  decision 4). This board read one page of 500 and, measured
+ *  2026-09-24, backlog-item had 822 in the window: every count below
+ *  it was a floor, said in a notice nobody reads as a number. A row a
+ *  shifting page repeats is kept once. Any page failing fails the
+ *  whole read — half a kind is not a kind. */
+export async function loadEveryPage(
+  kind: string,
+  windowDays: number,
+  pageSize: number,
+  load: typeof loadKind = loadKind,
+): Promise<Exclude<Remote<JobsPage>, { kind: 'loading' }>> {
+  const read = async (
+    offset: number,
+    got: ReadonlyArray<InboundRow>,
+  ): Promise<Exclude<Remote<JobsPage>, { kind: 'loading' }>> => {
+    const page = await load(kind, windowDays, pageSize, offset);
+    if (page.kind === 'failed') return page;
+    const seen = new Set(got.map((r) => r.id));
+    const rows = [...got, ...page.data.rows.filter((r) => !seen.has(r.id))];
+    const next = offset + page.data.rows.length;
+    return page.data.rows.length === 0 || next >= page.data.total
+      ? { kind: 'ready', data: { rows, total: page.data.total } }
+      : read(next, rows);
+  };
+  return read(0, []);
 }

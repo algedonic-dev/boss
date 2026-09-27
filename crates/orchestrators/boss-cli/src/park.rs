@@ -140,6 +140,14 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
         );
     }
 
+    // A green whose run declared no estate made none of its live
+    // comparisons; the one predicate the auto-park handler asks too
+    // (backlog 3e63662c). This is `boss park`'s and `boss rerail
+    // --finish`'s door onto a car, so both refuse here.
+    if let Some(why) = boss_jobs::car::declared_no_estate(raw) {
+        bail!("the gate for `{branch}` cannot be parked: {why}");
+    }
+
     let parsed: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     let head = parsed
         .get("head")
@@ -270,14 +278,31 @@ pub(crate) async fn route_linked_item(
     let Some(write) = triage_on_park(&item, car_id, branch) else {
         return;
     };
-    match crate::gate::api(
+    // The route through the step merge door, THEN a status-only PUT — a
+    // PUT carrying metadata replaces the step's stored keys wholesale, so
+    // the old read-then-PUT dropped anything written between the two
+    // (backlog e39a9d2a). Merge first: the step's required-at-done fields
+    // are validated on the flip.
+    let routed = match crate::gate::api(
         http,
-        reqwest::Method::PUT,
-        &format!("/api/jobs/{item_id}/steps/{}", write.step_id),
-        Some(write.body),
+        reqwest::Method::PATCH,
+        &write.merge_path(item_id),
+        Some(write.metadata.clone()),
     )
     .await
     {
+        Ok(_) => {
+            crate::gate::api(
+                http,
+                reqwest::Method::PUT,
+                &write.status_path(item_id),
+                Some(write.status_body),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    match routed {
         Ok(_) => println!("{}", routed_line(verb, &item)),
         Err(e) => println!(
             "boss {verb}: could not route {} to `build` ({e}) — \
@@ -327,15 +352,15 @@ pub(crate) async fn run(
 
     // The receipt first: refuse before anything is created, so a red
     // gate costs a line of output rather than a half-filled packet.
-    let open = crate::gate::rows(
+    let open = crate::train::rows(
         crate::gate::api(
             &http,
             reqwest::Method::GET,
-            "/api/jobs?kind=gate-run&limit=100",
+            "/api/jobs?kind=gate-run&limit=100&full=true",
             None,
         )
         .await?,
-    );
+    )?;
     let head_now = crate::gate::resolve_sha(branch);
     let receipt = receipt_for(&open, branch, &head_now)?;
     println!(
@@ -369,7 +394,7 @@ pub(crate) async fn run(
             // whichever query happened to run first.
             let mut all = Vec::new();
             for kind in ["backlog-item", "user-feedback"] {
-                all.extend(crate::gate::rows(
+                all.extend(crate::train::rows(
                     crate::gate::api(
                         &http,
                         reqwest::Method::GET,
@@ -377,7 +402,7 @@ pub(crate) async fn run(
                         None,
                     )
                     .await?,
-                ));
+                )?);
             }
             let full = resolve_job_id(&all, &given)?;
             if full != given {
@@ -549,15 +574,24 @@ pub(crate) async fn run(
     // The writes are decided in core, shared with the auto-park handler,
     // and SKIP whatever the open already completed — the step API refuses
     // a metadata write to a completed step, so re-sending `scope` would
-    // 409 on every car a builder opened.
+    // 409 on every car a builder opened. Each is the evidence through the
+    // step merge door, THEN a status-only PUT — a PUT carrying metadata
+    // replaces the step's stored keys wholesale (backlog e39a9d2a).
     for w in finish_writes(&job, summary, excludes, test, verified, &receipt, now)
         .map_err(anyhow::Error::msg)?
     {
         crate::gate::api(
             &http,
+            reqwest::Method::PATCH,
+            &w.merge_path(&car),
+            Some(w.metadata.clone()),
+        )
+        .await?;
+        crate::gate::api(
+            &http,
             reqwest::Method::PUT,
-            &format!("/api/jobs/{car}/steps/{}", w.step_id),
-            Some(w.body),
+            &w.status_path(&car),
+            Some(w.status_body),
         )
         .await?;
     }
@@ -650,6 +684,22 @@ mod tests {
         assert_eq!(r.raw, WIDE, "the whole receipt rides the car, unrebuilt");
         assert_eq!(r.head, "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8");
         assert_eq!(r.mode, "auto");
+    }
+
+    /// `boss park` and `boss rerail --finish` both take their receipt
+    /// through `receipt_for`, so it asks the same question the auto-park
+    /// handler does (`boss_jobs::car::declared_no_estate`, backlog
+    /// 3e63662c): a green whose receipt declares no estate made none of
+    /// its live comparisons and is refused, naming the declaration.
+    #[test]
+    fn a_green_whose_receipt_declares_no_estate_is_refused() {
+        const DECLARED: &str = r#"{"verdict":"green","head":"e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8","mode":"full","estate":{"declared":"none","live_not_run":["a-car-stays-under-the-edit-level"]}}"#;
+        let ps = vec![packet("feat/x", Some("green"), Some(DECLARED))];
+        let e = receipt_for(&ps, "feat/x", HEAD).unwrap_err().to_string();
+        assert!(
+            e.contains("estate") && e.contains("a-car-stays-under-the-edit-level"),
+            "refused, naming the declaration and what it skipped: {e}"
+        );
     }
 
     #[test]

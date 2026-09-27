@@ -57,6 +57,19 @@
 # `/api/cadence/rules`, and a migration may not carry a registry row);
 # once it is, the loop's `open:` verb has no user and can go.
 #
+# ONLY DEPARTMENTS THAT DECLARE A PROTOCOL (backlog a4fda30b, decided
+# 2026-09-25; da600d10). The W39 firing opened thirteen retros, ten of
+# them over zero protocols — an analyst run a week to report zero — and
+# seven stayed open after their departments retired. The handler now
+# opens a department's retro only when its readiness read answers
+# `protocols.has = true`, and records every department it skipped, with
+# the reason, as `departments_skipped` on the protocol-retro it opens in
+# the same firing: the platform's review of its own protocols is where
+# this rule's choices are read. `open_without_protocol` is the one
+# exemption: IT, whose platform workflows carry no department until
+# a8458043 lands, and whose retro reads the agent work profile
+# (2f23f4c6). Delete the arg when a8458043 lands and IT reads true.
+#
 # The silence sweep derives this rule's platform cadence from these
 # args (`cadence_roster::clock_cadences` reads `retro.open` the way it
 # reads `jobs.spawn`); the per-department half is tenant data and is
@@ -68,7 +81,8 @@ A TIMER, the standing exemption: no packet causes "a week passed", so no
 Workflow definition can declare it — a retro's whole point is to run
 when the week's work is done, whether or not anything fired. It adds no
 routing: one firing opens one department-retro per department the
-departments registry holds (and the platform's protocol-retro), and what
+departments registry holds that declares a protocol (and the platform's
+protocol-retro, carrying the departments it skipped), and what
 happens next is those protocols' own rows. The department list is READ
 from the registry at fire time rather than declared here, which is why
 this is one rule and not one per department.
@@ -76,4 +90,4 @@ this is one rule and not one per department.
 schedule = { cadence = "weekly", anchor_date = "2026-09-21" }
 [[rule.do]]
 handler = "retro.open"
-args = { department_kind = "\"department-retro\"", platform_kind = "\"protocol-retro\"", platform_subject = "\"infra/protocol-retro\"" }
+args = { department_kind = "\"department-retro\"", platform_kind = "\"protocol-retro\"", platform_subject = "\"infra/protocol-retro\"", open_without_protocol = "\"it\"" }

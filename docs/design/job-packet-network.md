@@ -15,7 +15,7 @@ each payload will be encoded with all the protocols and versions it
 is supporting at that moment" (`75a66b01`). "Our architecture and
 system diagram snap to networking primitives better now that we
 understand where this is going" (`955ba4e5`).
-**Related**: [requirements-based-addressing.md](./requirements-based-addressing.md) —
+**Related**: [requirements-based-addressing, folded into the decision record](../architecture-decisions.md) —
 the addressing half of this model: queues as predicates, pools as
 their actor face ·
 [stations.md](./stations.md) — the network's nodes, and the

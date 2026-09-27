@@ -41,6 +41,75 @@ async fn post_invoice_emits_commerce_invoice_created_event() {
     );
 }
 
+/// Backlog 9d2af748: a second POST under one id — a retried click, a
+/// redelivered issue — writes nothing, records no second
+/// `commerce.invoice.created` (the event that drives the finished-goods
+/// consume), and answers 200 saying so rather than 201.
+#[tokio::test]
+async fn post_invoice_twice_answers_the_invoice_once_and_records_one_event() {
+    let app = CommerceTestApp::new();
+    let inv = invoice_fixture("inv-twice-1");
+
+    TestRequest::post("/api/commerce/invoices/create")
+        .json(&inv)
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::CREATED);
+    let again = TestRequest::post("/api/commerce/invoices/create")
+        .json(&inv)
+        .send(&app.router)
+        .await;
+    again.assert_status(StatusCode::OK);
+    let body: serde_json::Value = again.assert_json();
+    assert_eq!(body["already_created"], true, "{body}");
+    assert_eq!(app.recorded_of_kind("commerce.invoice.created").len(), 1);
+
+    // A different invoice under the same id is refused, naming why.
+    let mut other = inv.clone();
+    other.amount_cents = 1;
+    other.line_items[0].amount_cents = 1;
+    let refused = TestRequest::post("/api/commerce/invoices/create")
+        .json(&other)
+        .send(&app.router)
+        .await;
+    refused.assert_status(StatusCode::CONFLICT);
+    assert_eq!(app.recorded_of_kind("commerce.invoice.created").len(), 1);
+}
+
+/// The batch the dispatcher's `commerce.invoice.issue` posts: a
+/// redelivered issue writes nothing, so `inserted` reads 0, and
+/// `already_created` names the invoice that was answered rather than
+/// written — the handler converges on it instead of NAKing.
+#[tokio::test]
+async fn a_redelivered_batch_names_the_invoice_it_did_not_write() {
+    let app = CommerceTestApp::new();
+    let inv = invoice_fixture("inv-batch-twice-1");
+
+    let first = TestRequest::post("/api/commerce/invoices/batch")
+        .json(&vec![inv.clone()])
+        .send(&app.router)
+        .await;
+    first.assert_status(StatusCode::OK);
+    let first: serde_json::Value = first.assert_json();
+    assert_eq!(first["inserted"], 1, "{first}");
+    assert_eq!(first["already_created"], serde_json::json!([]), "{first}");
+
+    let again = TestRequest::post("/api/commerce/invoices/batch")
+        .json(&vec![inv])
+        .send(&app.router)
+        .await;
+    again.assert_status(StatusCode::OK);
+    let again: serde_json::Value = again.assert_json();
+    assert_eq!(again["inserted"], 0, "nothing was written: {again}");
+    assert_eq!(
+        again["already_created"],
+        serde_json::json!(["inv-batch-twice-1"]),
+        "{again}"
+    );
+    assert_eq!(again["skipped"], serde_json::json!([]), "{again}");
+    assert_eq!(app.recorded_of_kind("commerce.invoice.created").len(), 1);
+}
+
 #[tokio::test]
 async fn post_invoice_with_invalid_json_returns_4xx() {
     let app = CommerceTestApp::new();
@@ -78,7 +147,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
             InvoiceLineItem {
                 id: "inv-multi-1-L1".to_string(),
                 invoice_id: "inv-multi-1".to_string(),
-                revenue_category: RevenueCategory::from("new-sales"),
+                revenue_category: RevenueCategory::from("wholesale"),
                 amount_cents: 4_500_000,
                 currency: "USD".to_string(),
                 description: "New device sale".to_string(),
@@ -91,7 +160,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
             InvoiceLineItem {
                 id: "inv-multi-1-L2".to_string(),
                 invoice_id: "inv-multi-1".to_string(),
-                revenue_category: RevenueCategory::from("contracts"),
+                revenue_category: RevenueCategory::from("distribution"),
                 amount_cents: 1_200_000,
                 currency: "USD".to_string(),
                 description: "1-year service agreement".to_string(),
@@ -104,7 +173,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
             InvoiceLineItem {
                 id: "inv-multi-1-L3".to_string(),
                 invoice_id: "inv-multi-1".to_string(),
-                revenue_category: RevenueCategory::from("service"),
+                revenue_category: RevenueCategory::from("taproom"),
                 amount_cents: 300_000,
                 currency: "USD".to_string(),
                 description: "Installation + training".to_string(),
@@ -145,7 +214,7 @@ async fn post_invoice_with_mismatched_sum_rejected() {
         line_items: vec![InvoiceLineItem {
             id: "inv-bad-sum-L1".to_string(),
             invoice_id: "inv-bad-sum".to_string(),
-            revenue_category: RevenueCategory::from("new-sales"),
+            revenue_category: RevenueCategory::from("wholesale"),
             amount_cents: 500_000, // line item only has 5k
             currency: "USD".to_string(),
             description: "mismatch".to_string(),
@@ -345,4 +414,29 @@ async fn put_write_off_second_call_converges_without_duplicate_event() {
         1,
         "repeat PUT is a converged no-op"
     );
+}
+
+/// A written-off invoice cannot be marked past-due: the receivable is
+/// already gone, and the flip would count it owed again. The API says
+/// so by name — 409 naming both statuses — and records nothing
+/// (backlog 203ef806; the whole table is `invoice_transitions.rs`).
+#[tokio::test]
+async fn put_past_due_on_a_written_off_invoice_is_refused_by_name() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-wo-pd")]);
+    TestRequest::put("/api/commerce/invoices/inv-step-wo-pd/write-off")
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let resp = TestRequest::put("/api/commerce/invoices/inv-step-wo-pd/past-due")
+        .send(&app.router)
+        .await;
+
+    resp.assert_status(StatusCode::CONFLICT);
+    let body = String::from_utf8_lossy(&resp.body_bytes);
+    assert!(
+        body.contains("'written-off' -> 'past-due'"),
+        "the refusal names the transition: {body}"
+    );
+    assert!(app.recorded_of_kind("commerce.invoice.past_due").is_empty());
 }

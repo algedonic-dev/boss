@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# preflight: serial — reads the edit level off the live jobs API through lib/sor-read.sh; one reader of the record per pre-flight
 #
 # a-car-stays-under-the-edit-level — the gate half of the hosting door
 # (a479faf7; design 01c3cc3f "Tiers are one registry, read three
@@ -56,6 +57,12 @@
 # a verdict on a guess: the gate turns 3 into a refusal receipt, not a
 # red, and `--quick` warns.
 #
+# NO ESTATE. `BOSS_ESTATE=none` (the public mirror's workflow, and only
+# it) says there is no instance, so no level to read: the paths are
+# still read and counted, the lint says none was judged, with
+# lib/no-estate.sh's marker, and exits 0; the gate names it on the
+# receipt. Unset, an unreadable level stays exit 3 (backlog 3e63662c).
+#
 #   target: <url> (override with BOSS_JOBS_URL)   is printed on a skip
 #   so the gate's warning names the instance it could not read.
 
@@ -66,6 +73,10 @@ cd "$LINT_DIR/../.." || exit 1
 . "$LINT_DIR/lib/git-answer.sh" || exit 3
 . "$LINT_DIR/lib/trunk-ref.sh" || exit 3
 . "$LINT_DIR/lib/tiers.sh" || exit 3
+# The read waits out a rollout before it refuses (backlog 834ddb7c).
+. "$LINT_DIR/lib/sor-read.sh" || exit 3
+# BOSS_ESTATE=none skips the level read, and only it (backlog 3e63662c).
+. "$LINT_DIR/lib/no-estate.sh" || exit 3
 
 LINT=a-car-stays-under-the-edit-level
 BASE="${BOSS_JOBS_URL:-http://boss-jobs-internal.boss.svc.cluster.local:7900}"
@@ -80,6 +91,41 @@ skip() {
 }
 
 # ---------------------------------------------------------------------------
+# The paths this car lands: commits over the trunk, plus staged and dirty.
+# A function because two paths read it: the verdict below, and a run that
+# declares no estate, whose tree half is exactly this read.
+# ---------------------------------------------------------------------------
+car_paths() {
+    local trunk status mb committed dirty untracked
+    git_can_answer "$LINT" || return "$LINT_CANNOT_ANSWER"
+    trunk=$(resolve_trunk_ref "$LINT")
+    status=$?
+    if [ "$status" -eq "$LINT_CANNOT_ANSWER" ]; then return "$status"; fi
+    if [ "$status" -ne 0 ]; then
+        skip "no trunk ref to diff against (tried $(trunk_candidates)) — set BOSS_TRUNK_REF"
+    fi
+    mb=$(resolve_merge_base "$LINT" "$trunk") || return $?
+    committed=$(git_answer "$LINT" 0 diff --name-only "$mb" HEAD) || return $?
+    dirty=$(git_answer "$LINT" 0 diff --name-only HEAD) || return $?
+    untracked=$(git_answer "$LINT" 0 ls-files --others --exclude-standard) || return $?
+    printf '%s\n%s\n%s\n' "$committed" "$dirty" "$untracked" | awk 'NF && !seen[$0]++'
+}
+
+# ---------------------------------------------------------------------------
+# A run with no estate at all (the public mirror) has no instance, so no
+# level: it says so rather than being refused on every run for a route
+# it will never have (backlog 3e63662c; lib/no-estate.sh). The paths are
+# still read — a checkout git cannot answer for is still CANNOT ANSWER —
+# and counted, so the line says how much went unjudged.
+# ---------------------------------------------------------------------------
+if lint_no_estate "$LINT" "the instance's edit level ($URL)"; then
+    paths=$(car_paths) || exit $?
+    unjudged=$(printf '%s\n' "$paths" | awk 'NF' | wc -l | tr -d ' ')
+    echo "$LINT: $unjudged path(s) this car touches were NOT judged against any edit level — BOSS_ESTATE=none, so no instance declared one"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # The level, off the instance.
 # ---------------------------------------------------------------------------
 command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
@@ -87,7 +133,7 @@ command -v jq >/dev/null 2>&1 || skip "jq is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(curl -sS -m 10 -o "$body" -w '%{http_code}' "$URL" 2>/dev/null)
+code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body")
 case "$code" in
     200) ;;
     404)
@@ -109,20 +155,9 @@ if [ -z "$level" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The paths this car lands: commits over the trunk, plus staged and dirty.
+# The paths this car lands.
 # ---------------------------------------------------------------------------
-git_can_answer "$LINT" || exit "$LINT_CANNOT_ANSWER"
-trunk=$(resolve_trunk_ref "$LINT")
-status=$?
-if [ "$status" -eq "$LINT_CANNOT_ANSWER" ]; then exit "$status"; fi
-if [ "$status" -ne 0 ]; then
-    skip "no trunk ref to diff against (tried $(trunk_candidates)) — set BOSS_TRUNK_REF"
-fi
-mb=$(resolve_merge_base "$LINT" "$trunk") || exit $?
-committed=$(git_answer "$LINT" 0 diff --name-only "$mb" HEAD) || exit $?
-dirty=$(git_answer "$LINT" 0 diff --name-only HEAD) || exit $?
-untracked=$(git_answer "$LINT" 0 ls-files --others --exclude-standard) || exit $?
-paths=$(printf '%s\n%s\n%s\n' "$committed" "$dirty" "$untracked" | awk 'NF && !seen[$0]++')
+paths=$(car_paths) || exit $?
 
 # ---------------------------------------------------------------------------
 # The verdict, from the one predicate.

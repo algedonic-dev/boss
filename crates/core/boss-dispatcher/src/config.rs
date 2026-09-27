@@ -64,6 +64,10 @@ pub struct DispatcherConfig {
     /// Calendar service base URL. The schedule runner fetches the
     /// business calendars its schedule rules reference at startup.
     pub calendar_api_url: String,
+    /// Policy service base URL — the scope gate on
+    /// `GET /api/dispatcher/schedule` (design ea906603), the one read
+    /// here that asks who is reading.
+    pub policy_api_url: String,
     pub http_bind: String,
     /// Postgres URL — the dispatcher loads its rule registry (the
     /// append-only versioned `dispatcher_rules` table) from here at
@@ -168,6 +172,8 @@ impl Default for DispatcherConfig {
                 .unwrap_or_else(|_| boss_ports::url("clock")),
             calendar_api_url: std::env::var("BOSS_CALENDAR_URL")
                 .unwrap_or_else(|_| boss_ports::url("calendar")),
+            policy_api_url: std::env::var("BOSS_POLICY_URL")
+                .unwrap_or_else(|_| boss_ports::url("policy")),
             // Loopback: the gateway is the sole trust boundary and is
             // co-located in every deployment (SECURITY.md §Deployment
             // trust model). BOSS_DISPATCHER_BIND widens deliberately.

@@ -46,14 +46,27 @@ publish-github-pr: FAILED — pushing publish/2026-09-18 to the forge (http://10
 const FAILED_LINE: &str = "publish-github-pr: FAILED — pushing publish/2026-09-18 to the forge (http://10.20.0.15:3000/david/boss.git) as david: fatal: detected dubious ownership in repository at '/var/lib/boss-publish/boss.git' To add an exception for this directory, call:  \tgit config --global --add safe.directory /var/lib/boss-publish/boss.git . Without it on the forge, the push mirror prunes the PR's head at the next train";
 
 const PR_URL: &str = "https://github.com/algedonic-dev/boss/pull/241";
+/// The snapshot the PR's head holds — what read-publish-checks reads
+/// the checks of, and refuses the packet without (backlog 1f0aa60d).
+const SNAPSHOT: &str = "28554177812cc9645ab0eff2158574c25286f34a";
 
 /// The verb's happy path, as infra/forge/publish-github-pr.sh prints it.
 fn opened_output() -> String {
     format!(
-        "publish-github-pr: packet 254177e2 — open-pr ready; publishing forge main as publish/2026-09-18\n\
-         publish-github-pr: pushed publish/2026-09-18 to the forge as david — the mirror carries it\n\
-         publish-github-pr: pushed dauld:publish/2026-09-18\n\
-         publish-github-pr: opened {PR_URL}\n\
+        "publish-github-pr: packet 254177e2 — open-pr ready; publishing forge main as publish/2026-09-18-<snapshot>\n\
+         publish-github-pr: snapshot {SNAPSHOT} (tree t of forge f, parent mirror m) — branch publish/2026-09-18-28554177812c\n\
+         publish-github-pr: pushed publish/2026-09-18-28554177812c to the forge as david — the off-site push carries it too\n\
+         publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
+         publish-github-pr: opened {PR_URL} at {SNAPSHOT}\n\
+         publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
+    )
+}
+
+/// The re-run's line: the PR found open for the run's own branch.
+fn reused_output() -> String {
+    format!(
+        "publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
+         publish-github-pr: PR already open for dauld:publish/2026-09-18-28554177812c — reusing {PR_URL} at {SNAPSHOT}\n\
          publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
     )
 }
@@ -227,12 +240,32 @@ async fn mock_jobs(
                       Json(body): Json<serde_json::Value>| {
                     let writes = writes.clone();
                     async move {
+                        // The step PUT as the decided end state of
+                        // design 93d2bddb has it (e39a9d2a): a body
+                        // carrying metadata is refused 409 and routed
+                        // to the merge door below. Recorded as
+                        // "PUT (409)", so a test sees the attempt.
+                        if body.get("metadata").is_some() {
+                            writes.lock().unwrap().push((
+                                "PUT (409)".into(),
+                                format!("/api/jobs/{id}/steps/{step_id}"),
+                                body,
+                            ));
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                Json(json!({
+                                    "error": "a step PUT carries no metadata",
+                                    "merge_door":
+                                        format!("/api/jobs/{id}/steps/{step_id}/metadata"),
+                                })),
+                            );
+                        }
                         writes.lock().unwrap().push((
                             "PUT".into(),
                             format!("/api/jobs/{id}/steps/{step_id}"),
                             body,
                         ));
-                        Json(json!({ "ok": true }))
+                        (axum::http::StatusCode::OK, Json(json!({ "ok": true })))
                     }
                 },
             )
@@ -377,16 +410,56 @@ async fn an_opened_pr_completes_the_open_pr_step_with_its_url() {
     let puts: Vec<_> = w.iter().filter(|(m, _, _)| m == "PUT").collect();
     assert_eq!(puts.len(), 1, "exactly the open-pr step completed: {w:?}");
     assert_eq!(puts[0].1, format!("/api/jobs/{PUBLISH}/steps/{OPEN_PR}"));
-    let body = &puts[0].2;
-    assert_eq!(body["status"], "completed");
     assert_eq!(
-        body["metadata"]["pr_url"], PR_URL,
+        puts[0].2,
+        json!({ "status": "completed" }),
+        "the flip carries the status alone (e39a9d2a)"
+    );
+    // The fields ride the step merge door, before the flip.
+    let body = step_patch(&w);
+    let merge_path = format!("/api/jobs/{PUBLISH}/steps/{OPEN_PR}/metadata");
+    let merge_at = w
+        .iter()
+        .position(|(m, p, _)| m == "PATCH" && *p == merge_path)
+        .unwrap();
+    let flip_at = w.iter().position(|(m, _, _)| m == "PUT").unwrap();
+    assert!(merge_at < flip_at, "merge first, then flip: {w:?}");
+    assert_eq!(body["pr_url"], PR_URL, "copied from the verb's line");
+    // The head the PR stands on, from the same line: without it the
+    // next machine step (read-publish-checks) refuses the packet, which
+    // is how 8d7a3507 stalled after a hand completion (backlog 1f0aa60d).
+    assert_eq!(
+        body["snapshot_commit"], SNAPSHOT,
         "copied from the verb's line"
     );
-    assert_eq!(body["metadata"]["published_by"]["car"], REQUEST);
+    assert_eq!(body["published_by"]["car"], REQUEST);
     assert!(
         !w.iter().any(|(m, _, _)| m == "POST"),
         "nothing to alert: {w:?}"
+    );
+}
+
+/// The reuse line completes the step the same way — url AND snapshot.
+#[tokio::test]
+async fn a_reused_pr_completes_the_open_pr_step_with_its_url_and_snapshot() {
+    let (base, writes) = mock_jobs(
+        vec![request("0", &reused_output()), publish("ready", json!({}))],
+        vec![],
+    )
+    .await;
+    handler(base)
+        .invoke(&rule_args(), &ctx())
+        .await
+        .expect("runs");
+
+    let w = writes.lock().unwrap().clone();
+    let body = step_patch(&w);
+    assert_eq!(body["pr_url"], PR_URL, "{w:?}");
+    assert_eq!(body["snapshot_commit"], SNAPSHOT, "{w:?}");
+    assert_eq!(
+        w.iter().filter(|(m, _, _)| m == "PUT").count(),
+        1,
+        "the step completed: {w:?}"
     );
 }
 

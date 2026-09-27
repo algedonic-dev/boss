@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import { putStep } from './stepWrite';
+  import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { saveStep, startStep } from './stepWrite';
+  import { claimedFor, startable } from './holder';
   // Shipment step surface — wholesale-keg-order's last tier and
   // the equipment-preventive-maintenance depot-return path. Captures carrier +
   // tracking + ETA so the wholesale-courier counterparty's scan
@@ -72,17 +73,20 @@
 
 
 
-  async function persist(status?: string): Promise<void> {
+  /// `status` only when the gesture moves the step — never the page's
+  /// snapshot (backlog 6ef4a36b) — and a Start saves, then claims for the
+  /// stored nominee (design 611fbffd, clause b).
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // The keys this surface owns, through the merge door; an emptied
+      // date is sent as null and deleted, where it used to be cleared by
+      // omission from a wholesale PUT (backlog e39a9d2a).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
-        status: status ?? step.status,
+        ...(status ? { status } : {}),
         metadata: {
-          ...step.metadata,
           carrier,
           tracking_number: trackingNumber,
           shipped_date: shippedDate || undefined,
@@ -90,7 +94,10 @@
           delivered_date: deliveredDate || undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(step.assignee_id));
+      }
       if (res.kind === 'failed') {
         writeError = res.error;
         return;
@@ -206,10 +213,10 @@
   {/if}
 
   <div class="step-actions">
-    {#if !terminal && isPending(step.status)}
+    {#if startable(step)}
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist('active')}
+        class="btn btn-primary"
+        onclick={() => persist(undefined, true)}
         disabled={saving}
       >
         Start
@@ -217,7 +224,7 @@
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving}
       >
@@ -245,10 +252,10 @@
   }
   .step-tracking li {
     padding: 3px 0;
-    border-bottom: 1px solid var(--border-soft, #f3f4f6);
+    border-bottom: 1px solid var(--hairline);
   }
   .step-tracking .tracking-time {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
     margin-right: 8px;
     font-variant-numeric: tabular-nums;
   }
@@ -256,10 +263,10 @@
     font-weight: 500;
   }
   .step-tracking .tracking-note {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
     margin-left: 4px;
   }
   .muted {
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
   }
 </style>

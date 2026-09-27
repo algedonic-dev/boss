@@ -5,15 +5,18 @@
 //!   1. Require a valid `boss_session` cookie; return 401 on miss.
 //!      Login + cookie minting runs through local-auth (the v1 OSS
 //!      auth path).
+//!   1a. Refuse any method but GET/HEAD/OPTIONS from a read-only
+//!      session (a guest's `visitor` or `audit-readonly`) with a named 403, before
+//!      any upstream is contacted — [`read_only_write_refusal`].
 //!   2. Forward the request to the owning service's HTTP port,
 //!      stripping hop-by-hop headers both ways, streaming the body.
 //!   3. Surface upstream errors as 502 with a short reason string.
 //!
 //! Each route gets a `ProxyConfig` (name, env-var-overridable default
-//! upstream URL) and an optional `UpstreamFallback` that turns a
-//! connection failure into a graceful 200 — used today for the
-//! policy service's `my-scope` endpoint so the frontend doesn't log
-//! errors every page load when the policy upstream is down.
+//! upstream URL). There is no per-route fallback: the only one answered
+//! the policy service's `my-scope` with an empty scope when the upstream
+//! was down, for a fetch the web no longer makes, and went with that
+//! endpoint (backlog 5a914364 S2).
 
 use std::sync::{Arc, OnceLock};
 
@@ -22,10 +25,14 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::AppState;
 use boss_gateway::session::{self, Session, find_cookie};
+
+/// The named refusal a read-only session's write gets at the edge —
+/// see [`read_only_write_refusal`].
+pub(crate) const READ_ONLY_REFUSAL: &str = "a read-only session cannot write";
 
 /// Static configuration for a single reverse-proxy mount point.
 pub struct ProxyConfig {
@@ -35,38 +42,20 @@ pub struct ProxyConfig {
     /// OnceLock storing the resolved upstream URL (env var or
     /// `boss_ports::url(name)`).
     pub upstream: OnceLock<String>,
-    /// Optional fallback for specific (path, method) pairs when the
-    /// upstream is unreachable. Returns `Some(response)` to short-
-    /// circuit; `None` to proceed with the usual 502.
-    pub fallback: Option<fn(path: &str, method: &Method) -> Option<Response>>,
 }
 
 impl ProxyConfig {
-    /// Build a vanilla config that always proxies — no graceful fallback.
-    /// The default upstream URL is pulled from `boss_ports::url(name)`
-    /// at first-use; the `BOSS_<NAME>_UPSTREAM` env var still wins when
-    /// set.
+    /// Build a config that always proxies. The default upstream URL is
+    /// pulled from `boss_ports::url(name)` at first-use; the
+    /// `BOSS_<NAME>_UPSTREAM` env var still wins when set.
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
             upstream: OnceLock::new(),
-            fallback: None,
         }
     }
 
-    /// Build a config whose upstream failures can degrade gracefully.
-    pub const fn with_fallback(
-        name: &'static str,
-        fallback: fn(path: &str, method: &Method) -> Option<Response>,
-    ) -> Self {
-        Self {
-            name,
-            upstream: OnceLock::new(),
-            fallback: Some(fallback),
-        }
-    }
-
-    fn upstream_url(&self) -> &str {
+    pub(crate) fn upstream_url(&self) -> &str {
         self.upstream.get_or_init(|| {
             let env_key = format!("BOSS_{}_UPSTREAM", self.name.to_uppercase());
             if let Ok(v) = std::env::var(&env_key) {
@@ -102,11 +91,81 @@ pub async fn handle(
     req: Request,
     config: &'static ProxyConfig,
 ) -> Response {
-    if !has_valid_session(req.headers(), &state.session_key) {
-        return unauthorized();
+    if let Some(refusal) = writer_gate(req.headers(), req.method(), req.uri().path(), &state) {
+        return refusal;
     }
-
     forward_to_upstream(state, req, config).await
+}
+
+/// The edge's two questions, in order: is there a session (401 if
+/// not), and may it send this method (the named 403 if not). `Some` is
+/// the refusal to answer with; `None` lets the request through. Shared
+/// by every session-gated proxy and by the gateway's own writes that
+/// are not auth ceremonies (`/api/gateway/perf/reset`).
+pub(crate) fn writer_gate(
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    state: &AppState,
+) -> Option<Response> {
+    match valid_session(headers, &state.session_key) {
+        None => Some(unauthorized()),
+        Some(session) => read_only_write_refusal(&session, method, path),
+    }
+}
+
+/// A read-only session may read and must never write, and the gateway
+/// says so HERE, before any upstream sees the request (backlog
+/// 07e797b4, 2026-09-25). The blast-radius sweep of car e2209174 found
+/// about 110 upstream write routes — dispatcher rule publish/retire,
+/// `POST /api/jobs`, the scheduling calendar token, ~27 ledger writes,
+/// messages with no ownership check — that authorize no caller, so any
+/// valid session reached them, including the anonymous one
+/// `POST /api/auth/guest` mints on a guest-enabled instance. Each
+/// service's own authorization follows as its own item; this is the
+/// floor under all of them, and it holds for a route added tomorrow.
+///
+/// "Write" is every method but GET, HEAD and OPTIONS — the methods the
+/// SPA and every service here use for reads. A read spelled as a POST
+/// would be refused too, and deliberately: none is reached from a
+/// read-only session's browsing (the policy `my-scope` POST that was
+/// the one exception is deleted, backlog 5a914364), and an
+/// allowlist of "POSTs that are really reads" is a list of holes.
+///
+/// Read-only is `boss_core::roles::is_read_only_floor` of the session's
+/// effective role — `audit-readonly` and design 2830b6b7's `visitor`,
+/// the two roles a guest can carry — and a roleless session acts as a
+/// `visitor`, as the role-header layer tells every service. A role that
+/// joins that ONE list is refused here with no edit.
+pub(crate) fn read_only_write_refusal(
+    session: &Session,
+    method: &Method,
+    path: &str,
+) -> Option<Response> {
+    let role = session.effective_role();
+    let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    if safe || !boss_core::roles::is_read_only_floor(role) {
+        return None;
+    }
+    warn!(
+        user = %session.username,
+        role,
+        method = %method,
+        path,
+        "refused a write from a read-only session at the edge"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": READ_ONLY_REFUSAL,
+                "role": role,
+                "method": method.as_str(),
+                "path": path,
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// App-shaped proxy variant — for sub-apps the browser NAVIGATES to
@@ -121,7 +180,7 @@ pub async fn handle_app(
     req: Request,
     config: &'static ProxyConfig,
 ) -> Response {
-    if !has_valid_session(req.headers(), &state.session_key) {
+    let Some(session) = valid_session(req.headers(), &state.session_key) else {
         if is_document_navigation(req.method(), req.headers()) {
             let next: String = req
                 .uri()
@@ -141,6 +200,12 @@ pub async fn handle_app(
             return (StatusCode::SEE_OTHER, headers).into_response();
         }
         return unauthorized();
+    };
+    // The simulator's control writes were refused to the read-only
+    // floor by the service's own operator gate; the edge now refuses them first,
+    // the same as every other upstream's (backlog 07e797b4).
+    if let Some(refusal) = read_only_write_refusal(&session, req.method(), req.uri().path()) {
+        return refusal;
     }
     forward_to_upstream(state, req, config).await
 }
@@ -177,7 +242,6 @@ async fn forward_to_upstream(
 ) -> Response {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_owned);
-    let method = req.method().clone();
     let upstream = config.upstream_url();
     let upstream_url = match query.as_deref() {
         Some(q) => format!("{upstream}{path}?{q}"),
@@ -187,12 +251,6 @@ async fn forward_to_upstream(
     match forward(req, &upstream_url, &state.proxy_client).await {
         Ok(resp) => resp,
         Err(()) => {
-            if let Some(fallback) = config.fallback
-                && let Some(resp) = fallback(&path, &method)
-            {
-                debug!(service = config.name, "upstream down — returning fallback");
-                return resp;
-            }
             warn!(service = config.name, url = %upstream_url, "upstream request failed");
             (
                 StatusCode::BAD_GATEWAY,
@@ -226,14 +284,10 @@ fn is_blocked_request_header(name_lower: &str) -> bool {
     HOP_BY_HOP.contains(&name_lower) || name_lower == boss_core::sim_origin::SIM_ORIGIN_HEADER
 }
 
-fn has_valid_session(headers: &HeaderMap, key: &[u8]) -> bool {
-    let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let Some(raw) = find_cookie(cookie_header, session::COOKIE_NAME) else {
-        return false;
-    };
-    Session::decode(raw, key).is_ok()
+fn valid_session(headers: &HeaderMap, key: &[u8]) -> Option<Session> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    let raw = find_cookie(cookie_header, session::COOKIE_NAME)?;
+    Session::decode(raw, key).ok()
 }
 
 fn unauthorized() -> Response {
@@ -341,10 +395,6 @@ pub static CLASSES: ProxyConfig = ProxyConfig::new("classes");
 pub static LOCATIONS: ProxyConfig = ProxyConfig::new("locations");
 pub static SUBJECT_KINDS: ProxyConfig = ProxyConfig::new("subject_kinds");
 pub static CALENDAR: ProxyConfig = ProxyConfig::new("calendar");
-/// Cross-VM Cybernetics dashboard aggregator. Hosts /api/snapshot
-/// (which the SPA's Operations page reads) + the per-VM
-/// cybernetics rollup. Port 7880, declared in boss_ports.
-pub static OBSERVABILITY: ProxyConfig = ProxyConfig::new("observability");
 pub static PRODUCTS: ProxyConfig = ProxyConfig::new("products");
 pub static CAMPAIGNS: ProxyConfig = ProxyConfig::new("campaigns");
 pub static CUSTOMERS: ProxyConfig = ProxyConfig::new("customers");
@@ -353,23 +403,7 @@ pub static CUSTOMERS: ProxyConfig = ProxyConfig::new("customers");
 /// boss_ports.
 pub static SIMULATOR: ProxyConfig = ProxyConfig::new("simulator");
 
-/// Policy's `my-scope` POST is called on every page load. When the
-/// upstream is down we'd otherwise log a 502 into every browser
-/// console — return an empty-scope payload instead so the frontend's
-/// MyScopeContext silently falls into its defaults-table path.
-pub static POLICY: ProxyConfig = ProxyConfig::with_fallback("policy", |path, method| {
-    if path == "/api/policy/my-scope" && method == Method::POST {
-        return Some(
-            axum::Json(serde_json::json!({
-                "allow_read": [],
-                "scope_filters": {},
-                "version": 0,
-            }))
-            .into_response(),
-        );
-    }
-    None
-});
+pub static POLICY: ProxyConfig = ProxyConfig::new("policy");
 
 #[cfg(test)]
 mod tests {

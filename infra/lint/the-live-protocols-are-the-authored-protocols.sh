@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# preflight: serial — reads the live protocol registry off the jobs API through lib/sor-read.sh, waiting out a roll; one reader of the record per pre-flight
 #
 # the-live-protocols-are-the-authored-protocols — every protocol the
 # running registry admits Jobs under is one this tree writes down.
@@ -90,6 +91,13 @@
 # EMPTY one — a registry admitting zero kinds is dead air, not a clean
 # bill.
 #
+# UNLESS THE RUN DECLARES NO ESTATE. `BOSS_ESTATE=none` (the public
+# mirror's workflow, and only it) says there is no registry to read: the
+# static half runs and its findings still fail, the live comparison is
+# not attempted, the lint says so with lib/no-estate.sh's marker and
+# exits 0, and the gate names it on the receipt. Unset, the refusal above
+# stands; `--require-live` never consults it (backlog 3e63662c).
+#
 # THE SECOND CHECKED PROPERTY — a live row still SAYS what its file says
 # ----------------------------------------------------------------------
 # The property above is about existence: whatever the registry admits,
@@ -168,7 +176,8 @@
 #                   They run on every invocation regardless; the flag
 #                   only makes them speak.
 #
-#   Exit codes:  0 clean (or drift, reported, bare invocation)
+#   Exit codes:  0 clean (or drift, reported, bare invocation; or the
+#                  static half clean under BOSS_ESTATE=none)
 #                1 a failure of the tree — an unauthored live kind, a
 #                  Rust literal, a stale exemption, an unreadable
 #                  bundle file, or a comparison refused as vacuous
@@ -189,6 +198,12 @@ cd "$(dirname "$0")/../.." || exit 1
 . infra/lint/lib/scanned.sh || exit 3
 # shellcheck source=infra/lint/lib/git-answer.sh
 . infra/lint/lib/git-answer.sh || exit 3
+# The live read waits out a rollout before it refuses (backlog 834ddb7c).
+# shellcheck source=infra/lint/lib/sor-read.sh
+. infra/lint/lib/sor-read.sh || exit 3
+# BOSS_ESTATE=none skips the live half, and only it (backlog 3e63662c).
+# shellcheck source=infra/lint/lib/no-estate.sh
+. infra/lint/lib/no-estate.sh || exit 3
 
 BUNDLE="infra/platform/workflows"
 TENANT_GLOB="examples/*/seeds/workflows.toml"
@@ -900,9 +915,14 @@ PY
     #    caller with somewhere to put the answer, and it must exit 75
     #    (EX_TEMPFAIL) rather than 0 when the registry cannot be read.
     #    A link-local port nothing listens on: refused in ~6ms, and no
-    #    DNS lookup, so the resolver flake cannot make this hang.
+    #    DNS lookup, so the resolver flake cannot make this hang. A
+    #    refused connect is waited out as a rollout since backlog
+    #    834ddb7c (lib/sor-read.sh), so this child — which runs on every
+    #    invocation, the gate's included — asks for no wait at all:
+    #    without the zero it would sit a full window on a port that is
+    #    refused by design.
     if [ -z "${BOSS_LINT_SELFTEST_CHILD:-}" ]; then
-        out=$(BOSS_LINT_SELFTEST_CHILD=1 BOSS_JOBS_URL="http://[::1]:9" bash "$0" --require-live 2>&1); rc=$?
+        out=$(BOSS_LINT_SELFTEST_CHILD=1 BOSS_SOR_WAIT_SECONDS=0 BOSS_JOBS_URL="http://[::1]:9" bash "$0" --require-live 2>&1); rc=$?
         [ "$rc" -eq 75 ] || { echo "self-test FAILED: --require-live against an unreachable registry exited $rc, expected 75: $out" >&2; rm -rf "$t"; return 1; }
         grep -qF "SKIPPED the live comparison" <<< "$out" \
             || { echo "self-test FAILED: the skip is not loud: $out" >&2; rm -rf "$t"; return 1; }
@@ -1118,12 +1138,27 @@ skip() {
     exit "$LINT_CANNOT_ANSWER"
 }
 
+# A run with no estate at all (the public mirror) says so rather than
+# being refused on every run for a route it will never have (backlog
+# 3e63662c; lib/no-estate.sh). Only the bare invocation consults it:
+# `--require-live` asks for the comparison, and for that caller "could
+# not compare" stays 75. The tree half above has already run and
+# recorded its findings, and a finding is still this lint's red.
+if [ "$REQUIRE_LIVE" -eq 0 ] \
+    && lint_no_estate "$NAME" "the live workflow registry ($URL)"; then
+    [ -z "$REPORT_JSON" ] || echo "  no report was written to $REPORT_JSON — a report of no comparison would read as no drift." >&2
+    [ "$problems" -eq 0 ] || exit 1
+    lint_scanned "$NAME" "$(printf '%s\n' "$authored" | LC_ALL=C sed '/^$/d' | wc -l | tr -d ' ')" \
+        "authored kind(s) — the tree half only; the live comparison was NOT made"
+    exit 0
+fi
+
 command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
 command -v python3 >/dev/null 2>&1 || skip "python3 is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(curl -sS -m 10 -o "$body" -w '%{http_code}' "$URL" 2>/dev/null)
+code=$(lint_sor_read "$NAME" "the jobs API" "$URL" "$body")
 # 000 is curl's "never got an answer" — no route, refused, timed out.
 [ "$code" = "200" ] || skip "$URL answered HTTP $code"
 
@@ -1236,7 +1271,7 @@ if [ -n "$unauthored" ]; then
     echo "    replaces one problem with a worse one. ship-a-change.toml is the" >&2
     echo "    worked example and was generated for exactly that reason." >&2
     echo "" >&2
-    echo "  A TENANT protocol (one only the brewery or the used-device-shop" >&2
+    echo "  A TENANT protocol (one only an example tenant such as the brewery" >&2
     echo "  runs) goes in that tenant's examples/<tenant>/seeds/workflows.toml" >&2
     echo "  instead, not in the platform bundle." >&2
     echo "" >&2

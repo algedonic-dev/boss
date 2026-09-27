@@ -44,7 +44,8 @@
 # ======================================================================
 
 # Brewery demo tenant (Algedonic Ales). THE SOURCE FOR THIS RULE'S
-# INTENT is docs/design/brewery-fidelity.md §The live experiment, which
+# INTENT is brewery-fidelity §The live experiment (packet 4a39c1df; the
+# doc retired on 2026-09-27 and this quotation is what remains), which
 # names this exact reaction: "**`tasting-panel` v1** (active 2026-08-21):
 # brew close spawns a sensory panel — pour-flight (qa-tech) →
 # panel-verdict (qa-supervisor, `release|hold`) → terminals
@@ -161,7 +162,8 @@ handler = "jobs.spawn"
 args = { kind = "\"tasting-panel\"", subject_kind = "\"company\"", subject = "\"brewery\"", title = "\"Tasting panel\"", "metadata.batch_job_id" = "id" }
 
 # Brewery demo tenant (Algedonic Ales). THE SOURCE FOR THIS RULE'S
-# INTENT is docs/design/brewery-fidelity.md §The live experiment, which
+# INTENT is brewery-fidelity §The live experiment (packet 4a39c1df; the
+# doc retired on 2026-09-27 and this quotation is what remains), which
 # names this exact reaction as one of two protocols published live on
 # 2026-08-21: "**`keg-return` v1** (active 2026-08-21): a delivered
 # wholesale order spawns the fleet-return leg — log-fleet-out (kegs,

@@ -1,6 +1,6 @@
 [Unit]
 Description=BOSS train conductor — cadence loop (rules fire the verbs; systemd keeps the process alive)
-Documentation=file:/opt/boss/docs/design/protocol-cadence.md
+Documentation=file:/opt/boss/docs/architecture-decisions.md
 # No postgresql.service here: the loop holds no database connection
 # of its own — everything rides the jobs API (see BOSS_JOBS_URL below).
 After=network-online.target boss-clock-api.service boss-jobs-api.service

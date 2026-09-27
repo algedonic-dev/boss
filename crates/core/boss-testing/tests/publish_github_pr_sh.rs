@@ -42,7 +42,7 @@
 //! Nothing here touches the network, the forge, or a token: the token
 //! fixture holds a fixed non-secret string and is never printed.
 
-use boss_testing::repo_root;
+use boss_testing::{feed_stdin, repo_root};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -716,7 +716,6 @@ fn git_version() -> String {
 /// One git command in `dir` with `input` on stdin — `hash-object` and
 /// `mktree` are the two fixtures below need, and both read stdin.
 fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
-    use std::io::Write;
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -730,12 +729,8 @@ fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .spawn()
         .expect("git runs");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin is piped")
-        .write_all(input.as_bytes())
-        .expect("git reads stdin");
+    // git's exit status, asserted below, is the verdict (backlog fec29a02).
+    feed_stdin(&mut child, input.as_bytes());
     let out = child.wait_with_output().expect("git finishes");
     assert!(
         out.status.success(),
@@ -801,15 +796,14 @@ impl Run {
         std::fs::create_dir_all(&gh_api).unwrap();
 
         // One open publish-to-github packet whose open-pr step is ready —
-        // the shape the verb selects with jq.
+        // the shape the verb selects with jq — APPROVED the way registry v6
+        // demands: a presence stamp over an approve step naming forge
+        // main's head as the measured, scanned tree (backlog 02b65d81).
         let jobs = root.join("jobs.json");
+        let source = git_in(&forge, &["rev-parse", "refs/heads/main"]);
         boss_testing::write_file(
             &jobs,
-            r#"{"data":[{"id":"00000000-0000-0000-0000-0000000000aa",
-                         "title":"publish to github","status":"open",
-                         "steps":[{"id":"00000000-0000-0000-0000-0000000000bb",
-                                   "spec_slug":"open-pr","status":"ready",
-                                   "metadata":{"ops_verb":"publish-github-pr"}}]}]}"#,
+            &serde_json::json!({ "data": [Packet::signed(&source).json()] }).to_string(),
         );
 
         let stubs = root.join("stubs");
@@ -842,7 +836,26 @@ if [ "$1" = "repo" ] && [ "$2" = "fork" ]; then
     exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+    if [ -f '{api}/_pr_create_refuses' ]; then cat '{api}/_pr_create_refuses' >&2; exit 1; fi
     echo 'https://github.invalid/{mirror_slug}/pull/1'
+    exit 0
+fi
+# `pr list --head <owner>:<branch>` answers NOTHING, as real gh does:
+# its manual says of --head "(\"<owner>:<branch>\" syntax not
+# supported)", so the spelling the verb used until backlog 1f0aa60d
+# never matched a PR (PR #245, 2026-09-27). Without `--head` it is the
+# open-PR listing, which gh answers `[]` when empty.
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+    case " $* " in *" --head "*) exit 0 ;; esac
+    if [ -f '{api}/_open_prs.json' ]; then cat '{api}/_open_prs.json'; else echo '[]'; fi
+    exit 0
+fi
+# `pr close <n>` brings GitHub's answer for pulls/<n> into being — a
+# closed PR, unless `on_close` planted a different answer.
+if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
+    f='{api}/'"$(echo "{mirror_slug}/pulls/$3" | tr / _)".json
+    if [ -f '{api}/_on_close.json' ]; then cp '{api}/_on_close.json' "$f"
+    else printf '{{"number":%s,"state":"closed","merged":false,"closed_at":"2026-01-02T00:00:00Z"}}\n' "$3" > "$f"; fi
     exit 0
 fi
 exit 0
@@ -929,6 +942,16 @@ cat '{jobs}'
         for (k, v) in base_env(&self.root) {
             cmd.env(k, v);
         }
+        // A CLEAN secrets scan by default: the run path scans the approved
+        // commit itself (02b65d81 review, H1) and the fixture's one-file
+        // trees carry no lint. Its own file, so a case's `planted_scan`
+        // (scan.sh), passed as an extra, is never overwritten by it.
+        let clean_scan = self.root.join("default-clean-scan.sh");
+        boss_testing::write_exec(
+            &clean_scan,
+            "#!/bin/sh\necho 'no-secrets: scanned (fixture default)'\nexit 0\n",
+        );
+        cmd.env("BOSS_SECRETS_SCAN", clean_scan.display().to_string());
         cmd.env("BOSS_JOBS_URL", "http://jobs.invalid")
             .env("BOSS_FORGE_REPO_PATH", self.forge.display().to_string())
             .env("BOSS_MIRROR_SLUG", MIRROR_SLUG)
@@ -958,19 +981,15 @@ cat '{jobs}'
     /// This is the assertion that matters: a refusal that still pushed is
     /// not a refusal.
     fn pushed(&self) -> bool {
-        Command::new("git")
-            .arg("-C")
-            .arg(&self.fork)
-            .args([
-                "rev-parse",
-                "--verify",
-                "-q",
-                &format!("refs/heads/publish/{PUBLISH_DATE}"),
-            ])
-            .output()
-            .expect("git runs")
-            .status
-            .success()
+        self.fork_branch().is_some()
+    }
+
+    /// The run's own branch on the fork and the commit it holds. Every
+    /// publish names its branch `publish/<date>-<snapshot>` (backlog
+    /// 1f0aa60d), so the fixture finds it by its dated prefix rather
+    /// than spelling a name it cannot know before the run.
+    fn fork_branch(&self) -> Option<(String, String)> {
+        published_branch(&self.fork)
     }
 
     /// Did the snapshot ALSO reach the forge under the same branch name?
@@ -979,20 +998,7 @@ cat '{jobs}'
     /// that lives only on GitHub dies at the next train (ce5339d6, PR
     /// #238 closed 2 min after opening). On the forge it is carried.
     fn forge_has_branch(&self) -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.forge)
-            .args([
-                "rev-parse",
-                "--verify",
-                "-q",
-                &format!("refs/heads/publish/{PUBLISH_DATE}"),
-            ])
-            .output()
-            .expect("git runs");
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        published_branch(&self.forge).map(|(_, sha)| sha)
     }
 
     fn gh_log(&self) -> String {
@@ -1002,6 +1008,31 @@ cat '{jobs}'
     fn curl_log(&self) -> String {
         std::fs::read_to_string(self.root.join("curl.log")).unwrap_or_default()
     }
+}
+
+/// The one `publish/<PUBLISH_DATE>-<snapshot>` branch in `repo`, with
+/// the commit it holds — `None` when there is none. More than one is a
+/// finding in itself: a run publishes exactly one branch.
+fn published_branch(repo: &Path) -> Option<(String, String)> {
+    let listed = git_in(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            &format!("refs/heads/publish/{PUBLISH_DATE}-*"),
+        ],
+    );
+    let rows: Vec<(String, String)> = listed
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(n, s)| (n.to_string(), s.to_string()))
+        .collect();
+    assert!(
+        rows.len() <= 1,
+        "one run publishes one branch, found {rows:?} in {}",
+        repo.display()
+    );
+    rows.into_iter().next()
 }
 
 /// A fork of the mirror — `fork=true`, `parent`/`source` the mirror. The
@@ -1043,6 +1074,16 @@ fn a_real_fork_of_the_mirror_is_published_to() {
         "the verb forked a fork that already existed: {}",
         run.gh_log()
     );
+    // With no older publish PR open, the supersession sweep asks and
+    // closes nothing. The sweep's listing is the one WITHOUT `--head`
+    // (that one is the reuse question).
+    let gh = run.gh_log();
+    assert!(
+        gh.lines()
+            .any(|l| l.starts_with("pr list") && !l.contains("--head")),
+        "the verb never listed the mirror's open PRs: {gh}"
+    );
+    assert!(!gh.contains("pr close"), "nothing here is older: {gh}");
 }
 
 /// THE BRANCH LIVES ON THE FORGE TOO (ce5339d6). PR #238 opened at
@@ -1073,14 +1114,10 @@ fn the_snapshot_is_pushed_to_the_forge_so_the_mirror_carries_it() {
     assert!(ok, "{out}");
     let on_forge = run
         .forge_has_branch()
-        .expect("publish/<date> must exist on the forge after a run");
-    let on_fork = git_in(
-        &run.fork,
-        &["rev-parse", &format!("refs/heads/publish/{PUBLISH_DATE}")],
-    );
+        .expect("publish/<date>-<snapshot> must exist on the forge after a run");
+    let (_, on_fork) = run.fork_branch().expect("and on the fork");
     assert_eq!(
-        on_forge,
-        on_fork.trim(),
+        on_forge, on_fork,
         "the forge and the fork must hold the SAME snapshot commit"
     );
     assert!(
@@ -1159,9 +1196,15 @@ fn the_forge_push_as_another_user_carries_its_own_safe_directory() {
     );
 }
 
-/// The credential for the forge push is the converge's own: the
-/// checkout's `forgejo` remote URL carries it as userinfo, the way
-/// cluster-deploy-lib.sh derives every tenant URL from it. Measured
+/// The forge push goes where the converge fetches from: the checkout's
+/// `forgejo` remote, as it stands. Since design 1c90d183 (backlog
+/// c4cbc6b5) forge-converge's deposit strips that remote's userinfo once
+/// the owner's credential helper authenticates, so on a converted host
+/// the URL carries nothing and the owner's helper answers (the helper
+/// path is measured against a real 401-ing forge in
+/// credential_deposit_sh.rs). THIS case is a host the deposit has not
+/// converted, where the remote still carries the token: it is pushed to
+/// as it stands and never reaches a message. Measured
 /// 2026-09-19 04:55Z on ops-request 3d9d5f58, the second approved
 /// publish: with the URL built from sor.env the push as david died on
 /// `could not read Username for 'http://10.20.0.15:3000'` — no helper,
@@ -1419,6 +1462,7 @@ done
 for a in "$@"; do
     if [ "$a" = "PATCH" ]; then
         cp "$payload" '{patch}'
+        {{ tr -d '\n' < "$payload"; echo; }} >> '{patches}'
         # 204 No Content: the real door returns NO body. Anything the
         # verb wants to know about its write, it must go and read.
         if [ '{merged}' = true ]; then
@@ -1427,12 +1471,21 @@ for a in "$@"; do
         fi
         exit 0
     fi
-    if [ "$a" = "PUT" ]; then exit 0; fi
+    if [ "$a" = "PUT" ]; then
+        {{ tr -d '\n' < "$payload"; echo; }} >> '{puts}'
+        exit 0
+    fi
 done
 # `/api/jobs/<id>` is one packet; `/api/jobs?...` is a listing. The
 # read-back asks the first question and must not be handed the second.
+# `.../pulls/<n>` is GitHub's pulls API: the fixture's answer, or the
+# 404 curl -f turns into exit 22.
 for a in "$@"; do
     case "$a" in
+        */pulls/*)
+            if [ -f '{pulls}/'"${{a##*/}}"'.json' ]; then cat '{pulls}/'"${{a##*/}}"'.json'; exit 0; fi
+            echo 'curl: (22) The requested URL returned error: 404' >&2
+            exit 22 ;;
         *api/jobs/*\?*) ;;
         *api/jobs/*)
             if [ -f '{after}' ]; then cat '{after}'; else jq '.data[0]' '{jobs}'; fi
@@ -1443,6 +1496,9 @@ cat '{jobs}'
 "#,
                 log = self.root.join("curl.log").display(),
                 patch = self.root.join("patch.json").display(),
+                patches = self.root.join("patches.jsonl").display(),
+                puts = self.root.join("puts.jsonl").display(),
+                pulls = self.gh_api.display(),
                 jobs = self.root.join("jobs.json").display(),
                 after = self.root.join("jobs-after.json").display(),
                 merged = merged,
@@ -1465,6 +1521,21 @@ cat '{jobs}'
     fn measure(&self, extra: &[(&str, String)]) -> (bool, String) {
         self.echoing_curl();
         self.go_argv("--measure", extra)
+    }
+
+    /// What GitHub's pulls API answers for pull request `n`.
+    fn github_pull(&self, n: u32, body: &str) {
+        boss_testing::write_file(&self.gh_api.join(format!("{n}.json")), body);
+    }
+
+    /// Every PATCH body the run sent, in order.
+    fn patches(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.root.join("patches.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("a PATCH body is JSON"))
+            .collect()
     }
 
     /// The PATCH body the run sent, as JSON.
@@ -1513,6 +1584,90 @@ fn a_measure_run_records_todays_drift_on_the_open_packet() {
         run.curl_log().contains("PATCH"),
         "the measurement never reached the packet: {}",
         run.curl_log()
+    );
+}
+
+/// THE PULL REQUESTS' STATE, OBSERVED (backlog a5d4322c). The publish
+/// region called #239 open for 86 hours on 2026-09-22 while GitHub said
+/// it had merged three days earlier: nothing in the pipeline ever asked
+/// GitHub. `--measure` runs every day, so it asks — GitHub's public
+/// pulls API, no credential — for every publish PR not already read
+/// closed, and writes the answer onto the PR's own packet as
+/// `pr_state`. Every packet here is CLOSED, as a publish packet is long
+/// before its PR merges, so this also pins that the question is asked
+/// on a day with no open packet to re-measure.
+#[test]
+fn a_measure_run_records_what_github_says_about_each_publish_pull_request() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the measure path needs a real jq");
+        return;
+    }
+    let run = Run::new("measure-pr-state");
+    let pr = |n: u32| format!("https://github.com/{MIRROR_SLUG}/pull/{n}");
+    boss_testing::write_file(
+        &run.root.join("jobs.json"),
+        &format!(
+            r#"{{"total":4,"data":[
+  {{"id":"00000000-0000-0000-0000-0000000000c1","status":"closed","metadata":{{}},
+    "steps":[{{"spec_slug":"open-pr","status":"completed","metadata":{{"pr_url":"{p239}"}}}}]}},
+  {{"id":"00000000-0000-0000-0000-0000000000c2","status":"closed","metadata":{{}},
+    "steps":[{{"spec_slug":"open-pr","status":"completed","metadata":{{"pr_url":"{p240}"}}}}]}},
+  {{"id":"00000000-0000-0000-0000-0000000000c3","status":"closed",
+    "metadata":{{"pr_state":{{"pr_url":"{p238}","state":"closed","merged":true}}}},
+    "steps":[{{"spec_slug":"open-pr","status":"completed","metadata":{{"pr_url":"{p238}"}}}}]}},
+  {{"id":"00000000-0000-0000-0000-0000000000c4","status":"closed","metadata":{{}},
+    "steps":[{{"spec_slug":"open-pr","status":"skipped","metadata":{{}}}}]}}]}}"#,
+            p238 = pr(238),
+            p239 = pr(239),
+            p240 = pr(240),
+        ),
+    );
+    // #239 as GitHub answered it from the pod on 2026-09-22.
+    run.github_pull(
+        239,
+        r#"{"number":239,"state":"closed","merged":true,
+            "merged_at":"2026-09-19T14:16:04Z","closed_at":"2026-09-19T14:16:04Z"}"#,
+    );
+    // #240: no fixture, so GitHub answers 404.
+    let scan = run.planted_scan(0);
+    let (ok, out) = run.measure(&[("BOSS_SECRETS_SCAN", scan)]);
+    assert!(
+        ok,
+        "a PR GitHub would not answer for is not a failed measurement: {out}"
+    );
+
+    let states: Vec<serde_json::Value> = run
+        .patches()
+        .into_iter()
+        .filter(|p| p.get("pr_state").is_some())
+        .collect();
+    assert_eq!(states.len(), 1, "only #239 was answered: {states:?}\n{out}");
+    let st = &states[0]["pr_state"];
+    assert_eq!(st["pr_url"], pr(239).as_str(), "{st}");
+    assert_eq!(st["state"], "closed", "{st}");
+    assert_eq!(st["merged"], true, "{st}");
+    assert_eq!(st["merged_at"], "2026-09-19T14:16:04Z", "{st}");
+    assert!(
+        st["read_at"].as_str().is_some_and(|s| s.len() >= 20),
+        "no read_at: {st}"
+    );
+    let log = run.curl_log();
+    assert!(
+        log.contains("api/jobs/00000000-0000-0000-0000-0000000000c1/metadata"),
+        "the answer must land on #239's own packet: {log}"
+    );
+    assert!(
+        log.contains(&format!("repos/{MIRROR_SLUG}/pulls/239")),
+        "GitHub was never asked about #239: {log}"
+    );
+    assert!(
+        !log.contains("pulls/238"),
+        "a PR already read closed was asked again: {log}"
+    );
+    // The unanswered one is SAID, not skipped in silence.
+    assert!(
+        out.contains(&pr(240)) && out.contains("never read"),
+        "an unanswered PR must be named: {out}"
     );
 }
 
@@ -1657,5 +1812,976 @@ fn the_same_run_passes_once_the_packet_carries_it() {
             .any(|l| l.contains("/api/jobs/") && !l.contains("PATCH")),
         "no read of the packet follows the PATCH — the verb is still trusting the \
          write call's own answer, which is 204 with no body: {log}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// ONE MIRROR PULL REQUEST AT A TIME (backlog d4bfe548, David 2026-09-24).
+//
+// Measured 04:05Z that day: #242 (publish 2026-09-23, packet d2967a9c,
+// closed `pr-opened`) was still OPEN on GitHub, and #243 (packet
+// e0558b28) carried everything in #242 plus newer commits; #239-#242
+// had all been open at once. The mirror's head had not moved since
+// before #239, so each dated snapshot contains every one before it, and
+// nothing marked the older ones superseded. So when a run opens (or
+// reuses) today's PR, it closes each OLDER open `publish/<date>` PR
+// from the same fork with a comment naming the new one, reads GitHub
+// back to prove the close took, and records it on the older packet.
+// ---------------------------------------------------------------------
+
+impl Run {
+    /// What `gh pr list --json …` answers for the mirror's open PRs.
+    fn open_prs(&self, body: &str) {
+        boss_testing::write_file(&self.gh_api.join("_open_prs.json"), body);
+    }
+
+    /// What GitHub answers for a PR after `gh pr close` — by default a
+    /// closed PR; plant anything else to stand in for a close that did
+    /// not take.
+    fn on_close(&self, body: &str) {
+        boss_testing::write_file(&self.gh_api.join("_on_close.json"), body);
+    }
+
+    /// The PR numbers the run asked gh to close, in order.
+    fn closed_prs(&self) -> Vec<String> {
+        self.gh_log()
+            .lines()
+            .filter_map(|l| l.strip_prefix("pr close "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every step PUT body the run sent, in order.
+    fn puts(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.root.join("puts.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("a PUT body is JSON"))
+            .collect()
+    }
+
+    fn a_real_fork(&self) {
+        self.gh_repo(
+            FORK_SLUG,
+            &format!(
+                r#"{{"full_name":"{FORK_SLUG}","fork":true,
+                     "parent":{{"full_name":"{MIRROR_SLUG}"}},
+                     "source":{{"full_name":"{MIRROR_SLUG}"}},
+                     "default_branch":"main","private":false}}"#
+            ),
+        );
+    }
+}
+
+const OLDER_PACKET: &str = "00000000-0000-0000-0000-0000000000c5";
+
+/// The open packet the run publishes for, plus a CLOSED older packet
+/// whose open-pr recorded pull/5 — the shape d2967a9c had on 2026-09-24.
+fn jobs_with_an_older_publish(run: &Run) {
+    let older: serde_json::Value = serde_json::from_str(&format!(
+        r#"{{"id":"{OLDER_PACKET}","title":"publish to github","status":"closed","metadata":{{}},
+    "steps":[{{"id":"00000000-0000-0000-0000-0000000000c6","spec_slug":"open-pr","status":"completed",
+               "metadata":{{"pr_url":"https://github.com/{MIRROR_SLUG}/pull/5"}}}}]}}"#
+    ))
+    .unwrap();
+    boss_testing::write_file(
+        &run.root.join("jobs.json"),
+        &serde_json::json!({ "data": [Packet::signed(&run.forge_main()).json(), older] })
+            .to_string(),
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE APPROVAL THE VERB ACTS ON (backlog 02b65d81, with 6ab3a61c and
+// 0677a618; David 2026-09-27: "Approved the publish, but did not get a
+// passkey check").
+//
+// Measured on publish 8d7a3507: approve completed with `sign_offs []`,
+// and this verb — which read nothing but open-pr's readiness — pushed a
+// 660-commit snapshot of whatever forge main was AT THAT MOMENT to a
+// public repository. Two faults, both the verb's to close now that the
+// row demands a passkey: it trusted readiness as an approval (a flag is
+// not a signature), and it published forge main's head rather than the
+// tree the measurement scanned, the review read and the passkey signed.
+//
+// So the run reads the approval off the system of record's own record —
+// the approve step's stamps, bound to its current shape, over the two
+// shas the measurement named — and publishes EXACTLY that tree.
+// ---------------------------------------------------------------------
+
+const OPEN_PACKET: &str = "00000000-0000-0000-0000-0000000000aa";
+/// The title the row gives approve (`title_template`), which is part of
+/// what the passkey signs.
+const APPROVE_TITLE: &str = "Approve publishing to the public mirror";
+
+/// How the fixture's approve step was stamped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stamp {
+    /// A passkey over the step's current shape — the only approval.
+    Presence,
+    /// A session-assured stamp: a click, no passkey.
+    Session,
+    /// No stamp at all: the 8d7a3507 shape.
+    Absent,
+    /// A passkey over a DIFFERENT shape than the step now holds.
+    OtherShape,
+    /// A passkey over this shape, voided by the server since.
+    Voided,
+}
+
+/// The open publish packet as the verb reads it: measure, approve and
+/// open-pr, each field independently settable so a case changes one.
+#[derive(Clone, Debug)]
+struct Packet {
+    /// The tree the approve step names (and the passkey signs).
+    source: String,
+    /// The tree the approve step says the scan read.
+    scanned: String,
+    /// What the MEASURE step recorded for both.
+    measured_source: String,
+    measured_scanned: String,
+    secrets: &'static str,
+    decision: &'static str,
+    stamp: Stamp,
+    approve_status: &'static str,
+    /// Whether approve carries `source_sha` / `scanned_sha` at all.
+    names_a_tree: bool,
+    /// Who the stamp names (`authority_id`).
+    stamped_by: &'static str,
+    /// An extra LIVE presence stamp on the same shape, by someone else,
+    /// before the counted one.
+    bystander: Option<&'static str>,
+    /// The approve step exactly as publish 8d7a3507 carried it (registry
+    /// v5): no `assurance_required`, `sign_offs_required: []`,
+    /// `sign_offs: []`, metadata `{decision: approved}` and the tree.
+    legacy_v5: bool,
+}
+
+impl Packet {
+    /// Everything agreeing on `sha`, signed with a passkey.
+    fn signed(sha: &str) -> Packet {
+        Packet {
+            source: sha.to_string(),
+            scanned: sha.to_string(),
+            measured_source: sha.to_string(),
+            measured_scanned: sha.to_string(),
+            secrets: "clean",
+            decision: "approved",
+            stamp: Stamp::Presence,
+            approve_status: "completed",
+            names_a_tree: true,
+            stamped_by: "emp-david",
+            bystander: None,
+            legacy_v5: false,
+        }
+    }
+
+    fn approve_metadata(&self) -> serde_json::Value {
+        if self.legacy_v5 {
+            return serde_json::json!({
+                "decision": "approved", "source_sha": self.source, "scanned_sha": self.scanned,
+            });
+        }
+        let mut md = serde_json::json!({
+            "authority_role": "platform-admin",
+            "human_only": true,
+            "decision": self.decision,
+        });
+        if self.names_a_tree {
+            md["source_sha"] = serde_json::json!(self.source);
+            md["scanned_sha"] = serde_json::json!(self.scanned);
+        }
+        md
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let md = self.approve_metadata();
+        let shape = boss_core::job::step_shape_hash(APPROVE_TITLE, &md);
+        let by = self.stamped_by;
+        let stamp = |assurance: &str, shape: &str| {
+            serde_json::json!({
+                "authority_id": by, "role": "platform-admin",
+                "stamped_at": "2026-01-02T00:00:00.000000Z", "shape_hash": shape,
+                "assurance": assurance, "presence_nonce": "fixture-nonce",
+            })
+        };
+        let sign_offs = match self.stamp {
+            Stamp::Presence => vec![stamp("presence", &shape)],
+            Stamp::Session => vec![stamp("session", &shape)],
+            Stamp::Absent => vec![],
+            Stamp::OtherShape => vec![stamp("presence", &"0".repeat(64))],
+            Stamp::Voided => {
+                let mut s = stamp("presence", &shape);
+                s["voided_at"] = serde_json::json!("2026-01-02T00:01:00Z");
+                vec![s]
+            }
+        };
+        let sign_offs = match self.bystander {
+            Some(who) => {
+                let mut other = stamp("presence", &shape);
+                other["authority_id"] = serde_json::json!(who);
+                std::iter::once(other).chain(sign_offs).collect()
+            }
+            None => sign_offs,
+        };
+        let approve = if self.legacy_v5 {
+            serde_json::json!({
+                "id": "00000000-0000-0000-0000-0000000000b2", "spec_slug": "approve",
+                "title": APPROVE_TITLE, "status": "completed",
+                "sign_offs_required": [], "sign_offs": [], "metadata": md})
+        } else {
+            serde_json::json!({
+                "id": "00000000-0000-0000-0000-0000000000b2", "spec_slug": "approve",
+                "title": APPROVE_TITLE, "status": self.approve_status,
+                "assurance_required": "presence",
+                "sign_offs_required": ["platform-admin"],
+                "sign_offs": sign_offs, "metadata": md})
+        };
+        serde_json::json!({
+            "id": OPEN_PACKET, "title": "publish to github", "status": "open", "metadata": {},
+            "steps": [
+                {"id": "00000000-0000-0000-0000-0000000000b1", "spec_slug": "measure",
+                 "title": "Measure drift and scan for secrets", "status": "completed",
+                 "metadata": {"source_sha": self.measured_source,
+                              "scanned_sha": self.measured_scanned,
+                              "secrets_scan": self.secrets, "has_drift": "true"}},
+                approve,
+                {"id": "00000000-0000-0000-0000-0000000000bb", "spec_slug": "open-pr",
+                 "status": "ready", "metadata": {"ops_verb": "publish-github-pr"}},
+            ],
+        })
+    }
+}
+
+impl Run {
+    /// The forge fixture's `main`, as git says.
+    fn forge_main(&self) -> String {
+        git_in(&self.forge, &["rev-parse", "refs/heads/main"])
+    }
+
+    /// Serve `packet` as the one open publish packet.
+    fn packet(&self, packet: &Packet) {
+        boss_testing::write_file(
+            &self.root.join("jobs.json"),
+            &serde_json::json!({ "data": [packet.json()] }).to_string(),
+        );
+    }
+
+    /// Move forge main on by one commit whose tree differs — a train
+    /// landing between the measurement and the publish.
+    fn forge_moves_on(&self) -> String {
+        let blob = git_stdin(
+            &self.forge,
+            &["hash-object", "-t", "blob", "-w", "--stdin"],
+            "forge main, one train later\n",
+        );
+        let tree = git_stdin(
+            &self.forge,
+            &["mktree"],
+            &format!("100644 blob {blob}\tfile\n"),
+        );
+        let parent = self.forge_main();
+        let commit = git_in(
+            &self.forge,
+            &["commit-tree", &tree, "-p", &parent, "-m", "a later train"],
+        );
+        git_in(&self.forge, &["update-ref", "refs/heads/main", &commit]);
+        commit
+    }
+
+    /// The tree of the snapshot the run pushed to the fork, if any —
+    /// found through `fork_branch`, because the branch is named by the
+    /// snapshot it holds (publish/<date>-<snapshot>, backlog 1f0aa60d).
+    fn pushed_tree(&self) -> Option<String> {
+        self.fork_branch()
+            .map(|(_, sha)| git_in(&self.fork, &["rev-parse", &format!("{sha}^{{tree}}")]))
+    }
+
+    /// A refusal must stop BEFORE anything leaves: nothing on the fork,
+    /// nothing on the forge, no PR, no completion.
+    fn assert_nothing_published(&self, out: &str) {
+        assert!(!self.pushed(), "a refused approval still pushed: {out}");
+        assert!(
+            self.forge_has_branch().is_none(),
+            "a refused approval still pushed the snapshot to the forge: {out}"
+        );
+        assert!(
+            !self.gh_log().contains("pr create"),
+            "a refused approval still opened a PR: {}",
+            self.gh_log()
+        );
+        assert!(
+            !self.curl_log().contains("PUT"),
+            "a refused approval still completed open-pr: {}",
+            self.curl_log()
+        );
+    }
+}
+
+/// One refusal case: `change` reshapes the signed packet, and the run
+/// must refuse naming `names`, having published nothing.
+fn refused_when(case: &str, change: impl FnOnce(&mut Packet, &Run), names: &str) {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new(case);
+    run.a_real_fork();
+    let mut packet = Packet::signed(&run.forge_main());
+    change(&mut packet, &run);
+    run.packet(&packet);
+    let (ok, out) = run.go();
+    assert!(!ok, "{case}: the verb published over {packet:?}: {out}");
+    assert!(
+        out.contains("REFUSED") && out.contains(names),
+        "{case}: the refusal must say `{names}`: {out}"
+    );
+    run.assert_nothing_published(&out);
+}
+
+/// THE BUG: an approval with no stamp at all — 8d7a3507's `sign_offs []`.
+#[test]
+fn an_approval_with_no_stamp_publishes_nothing() {
+    refused_when(
+        "approval-unstamped",
+        |p, _| p.stamp = Stamp::Absent,
+        "no platform-admin sign-off",
+    );
+}
+
+/// A click is not a passkey: a session-assured stamp is refused.
+#[test]
+fn an_approval_stamped_without_a_passkey_publishes_nothing() {
+    refused_when(
+        "approval-session",
+        |p, _| p.stamp = Stamp::Session,
+        "not presence",
+    );
+}
+
+/// A passkey over some OTHER shape signed something else.
+#[test]
+fn a_passkey_over_another_shape_publishes_nothing() {
+    refused_when(
+        "approval-other-shape",
+        |p, _| p.stamp = Stamp::OtherShape,
+        "not what was signed",
+    );
+}
+
+/// A stamp the server voided is dead, even on the shape it signed.
+#[test]
+fn a_voided_passkey_publishes_nothing() {
+    refused_when("approval-voided", |p, _| p.stamp = Stamp::Voided, "voided");
+}
+
+/// A rejection runs the same ceremony; only `approved` approves.
+#[test]
+fn a_signed_rejection_publishes_nothing() {
+    refused_when(
+        "approval-rejected",
+        |p, _| p.decision = "rejected",
+        "not \"approved\"",
+    );
+}
+
+/// Readiness is not an approval: an approve step still open refuses.
+#[test]
+fn an_approve_step_not_completed_publishes_nothing() {
+    refused_when(
+        "approval-open",
+        |p, _| p.approve_status = "ready",
+        "not completed",
+    );
+}
+
+/// The passkey must have signed a NAMED tree.
+#[test]
+fn an_approval_that_names_no_tree_publishes_nothing() {
+    refused_when(
+        "approval-no-tree",
+        |p, _| p.names_a_tree = false,
+        "names no tree",
+    );
+}
+
+/// THE SCAN MUST COVER THE PUBLISHED SHA (0677a618): a scanned tree that
+/// is not the source tree vouches for nothing being published.
+#[test]
+fn a_scan_that_does_not_cover_the_published_sha_publishes_nothing() {
+    refused_when(
+        "scan-elsewhere",
+        |p, _| {
+            p.scanned = "1".repeat(40);
+            p.measured_scanned = "1".repeat(40);
+        },
+        "scan does not cover",
+    );
+}
+
+/// The approval must be of what was MEASURED: an approve step naming a
+/// different tree from the measure step's is two different decisions.
+#[test]
+fn an_approval_of_a_tree_the_measurement_did_not_name_publishes_nothing() {
+    refused_when(
+        "approval-unmeasured-tree",
+        |p, _| {
+            p.measured_source = "2".repeat(40);
+            p.measured_scanned = "2".repeat(40);
+        },
+        "measure step recorded",
+    );
+}
+
+/// A tree whose secrets scan FAILED never leaves by machine, signed or
+/// not: a public push cannot be taken back.
+#[test]
+fn a_tree_whose_secrets_scan_failed_publishes_nothing() {
+    refused_when("scan-failed", |p, _| p.secrets = "FAILED", "secrets scan");
+}
+
+/// THE SOURCE MOVED: the signed sha is not on forge main's history (a
+/// rewritten main, or a sha from somewhere else) — refused, by name.
+#[test]
+fn a_signed_tree_that_is_not_on_forge_main_publishes_nothing() {
+    refused_when(
+        "source-not-on-forge",
+        |p, _| {
+            let elsewhere = "3".repeat(40);
+            p.source = elsewhere.clone();
+            p.scanned = elsewhere.clone();
+            p.measured_source = elsewhere.clone();
+            p.measured_scanned = elsewhere;
+        },
+        "not on forge main",
+    );
+}
+
+/// WHO MAY APPROVE IS A NAMED LIST, NEVER A ROLE (adversarial review of
+/// 02b65d81, M1). A passkey stamp from ANOTHER platform-admin satisfies
+/// the row's `sign_offs_required` — a role — but the claim the publish
+/// rests on is David's passkey: the verb's own `approvers` list decides.
+#[test]
+fn a_passkey_stamp_by_someone_not_named_publishes_nothing() {
+    refused_when(
+        "approval-wrong-actor",
+        |p, _| p.stamped_by = "emp-another-admin",
+        "not among the approvers",
+    );
+}
+
+/// And a live stamp by someone unnamed is a finding even beside a named
+/// approver's own: every live stamp on a public publish's approval is a
+/// named approver's.
+#[test]
+fn a_live_stamp_by_someone_not_named_beside_davids_publishes_nothing() {
+    refused_when(
+        "approval-bystander",
+        |p, _| p.bystander = Some("emp-another-admin"),
+        "not among the approvers",
+    );
+}
+
+/// THE MEASURED SHAPE, pinned as refused (review M2): publish 8d7a3507's
+/// approve step exactly as the record held it — no
+/// `assurance_required`, `sign_offs_required: []`, `sign_offs: []`,
+/// `decision: approved` — even carrying a named tree the measurement
+/// agrees with. That is the approval that published 660 commits.
+#[test]
+fn the_8d7a3507_approval_publishes_nothing() {
+    refused_when(
+        "approval-8d7a3507",
+        |p, _| p.legacy_v5 = true,
+        "not presence",
+    );
+}
+
+/// THE SCAN IS RUN HERE, NOT BELIEVED (review H1). The measure step says
+/// `clean` — an agent's transcription nothing signs — over a tree whose
+/// secrets scan FAILS when the publish runs it over the approved commit.
+/// Refused, naming the scan's own report, nothing pushed.
+#[test]
+fn a_clean_measure_step_over_a_tree_the_scan_fails_publishes_nothing() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("scan-disagrees-with-measure");
+    run.a_real_fork();
+    run.packet(&Packet::signed(&run.forge_main()));
+    let failing = run.planted_scan(1);
+    let (ok, out) = run.go_with(&[("BOSS_SECRETS_SCAN", failing)]);
+    assert!(!ok, "a publish whose own scan failed went ahead: {out}");
+    assert!(
+        out.contains("REFUSED") && out.contains("FAILED when run here"),
+        "the refusal must say the scan run here failed: {out}"
+    );
+    assert!(
+        out.contains("no-secrets: scanned"),
+        "the refusal must carry the scan's own report: {out}"
+    );
+    run.assert_nothing_published(&out);
+}
+
+/// A scan that cannot run is not a pass: no evidence refuses too.
+#[test]
+fn a_publish_whose_scan_cannot_run_publishes_nothing() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("scan-unrunnable");
+    run.a_real_fork();
+    run.packet(&Packet::signed(&run.forge_main()));
+    let absent = run.root.join("absent.sh").display().to_string();
+    let (ok, out) = run.go_with(&[("BOSS_SECRETS_SCAN", absent)]);
+    assert!(!ok, "a publish with no scan behind it went ahead: {out}");
+    assert!(
+        out.contains("REFUSED") && out.contains("could not run"),
+        "the refusal must say the scan could not run: {out}"
+    );
+    run.assert_nothing_published(&out);
+}
+
+/// THE POSITIVE HALF, and the one that makes "bound to what was
+/// measured" a property of the push rather than of a check: forge main
+/// moves on after the measurement (a train lands between measure and the
+/// passkey), and the snapshot carries the MEASURED tree — the one the
+/// scan read, the review read and the passkey signed — not the newer
+/// head nobody looked at.
+#[test]
+fn the_snapshot_carries_the_signed_tree_even_after_forge_main_moves() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("signed-tree-published");
+    run.a_real_fork();
+    run.echoing_curl();
+    let measured = run.forge_main();
+    run.packet(&Packet::signed(&measured));
+    let later = run.forge_moves_on();
+    let (ok, out) = run.go();
+    assert!(
+        ok,
+        "a passkey-signed approval of a tree on forge main must publish: {out}"
+    );
+
+    let signed_tree = git_in(&run.forge, &["rev-parse", &format!("{measured}^{{tree}}")]);
+    let later_tree = git_in(&run.forge, &["rev-parse", &format!("{later}^{{tree}}")]);
+    assert_ne!(
+        signed_tree, later_tree,
+        "fixture: the two trees must differ"
+    );
+    assert_eq!(
+        run.pushed_tree().as_deref(),
+        Some(signed_tree.as_str()),
+        "the snapshot must carry the SIGNED tree ({measured}), not forge main's newer head \
+         ({later}): {out}"
+    );
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    assert_eq!(
+        done["metadata"]["source_sha"], measured,
+        "open-pr records the tree it published: {done}"
+    );
+    assert!(
+        out.contains(&measured),
+        "the run names the signed tree it published: {out}"
+    );
+}
+
+fn pr_row(n: u32, url: &str, head: &str, owner: &str) -> String {
+    format!(
+        r#"{{"number":{n},"url":"{url}","headRefName":"{head}","headRepositoryOwner":{{"login":"{owner}"}}}}"#
+    )
+}
+
+#[test]
+fn a_new_publish_pr_closes_each_older_publish_pr_as_superseded() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("supersede-older");
+    run.a_real_fork();
+    run.echoing_curl();
+    jobs_with_an_older_publish(&run);
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    let url = |n: u32| format!("https://github.com/{MIRROR_SLUG}/pull/{n}");
+    let new_pr = format!("https://github.invalid/{MIRROR_SLUG}/pull/1");
+    run.open_prs(&format!(
+        "[{}]",
+        [
+            // Older publishes from our fork: both superseded.
+            pr_row(5, &url(5), "publish/2026-01-01", owner),
+            pr_row(4, &url(4), "publish/2025-12-31", owner),
+            // Somebody else's branch that happens to be named publish/:
+            // not ours to close.
+            pr_row(6, &url(6), "publish/2025-12-30", "someone-else"),
+            // Ours, but not a publish.
+            pr_row(9, &url(9), "fix-a-typo", owner),
+            // Today's own PR, and a NEWER one: never closed by today's.
+            pr_row(1, &new_pr, &format!("publish/{PUBLISH_DATE}"), owner),
+            pr_row(10, &url(10), "publish/2026-01-03", owner),
+        ]
+        .join(",")
+    ));
+
+    let (ok, out) = run.go();
+    assert!(ok, "{out}");
+
+    let mut closed = run.closed_prs();
+    closed.sort();
+    assert_eq!(
+        closed,
+        vec!["4".to_string(), "5".to_string()],
+        "exactly the OLDER publish PRs from our fork are closed: {}",
+        run.gh_log()
+    );
+    // The comment names the PR that supersedes it, and the new PR exists
+    // BEFORE anything older is closed.
+    let gh = run.gh_log();
+    let created = gh.find("pr create").expect("today's PR was opened");
+    for line in gh.lines().filter(|l| l.starts_with("pr close ")) {
+        assert!(
+            line.contains(&new_pr),
+            "the close comment must name the superseding PR: {line}"
+        );
+        assert!(
+            gh.find(line).is_some_and(|at| at > created),
+            "an older PR was closed before today's was opened: {gh}"
+        );
+    }
+
+    // Recorded on the older packet: the supersession, and GitHub's own
+    // answer about the PR's state, read back after the close.
+    let log = run.curl_log();
+    assert!(
+        log.contains(&format!("api/jobs/{OLDER_PACKET}/metadata")),
+        "nothing was written onto the older packet: {log}"
+    );
+    let patches = run.patches();
+    let sup = patches
+        .iter()
+        .find_map(|p| p.get("pr_superseded"))
+        .unwrap_or_else(|| panic!("no pr_superseded annotation: {patches:?}"));
+    assert_eq!(sup["pr_url"], url(5).as_str(), "{sup}");
+    assert_eq!(sup["by_pr_url"], new_pr.as_str(), "{sup}");
+    let st = patches
+        .iter()
+        .find_map(|p| p.get("pr_state"))
+        .unwrap_or_else(|| panic!("no pr_state read back: {patches:?}"));
+    assert_eq!(st["pr_url"], url(5).as_str(), "{st}");
+    assert_eq!(st["state"], "closed", "{st}");
+    // #4 was recorded by no packet: said, not skipped in silence.
+    assert!(
+        out.contains(&url(4)) && out.contains("no publish packet recorded"),
+        "a closed PR no packet recorded must be named: {out}"
+    );
+
+    // Today's packet carries what it superseded.
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    let superseded = done["metadata"]["superseded_prs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no superseded_prs on open-pr: {done}"));
+    let mut urls: Vec<&str> = superseded.iter().filter_map(|v| v.as_str()).collect();
+    urls.sort_unstable();
+    assert_eq!(urls, vec![url(4).as_str(), url(5).as_str()], "{done}");
+}
+
+/// A close is a claim until GitHub is read back saying so: a PR that
+/// still reads open after `gh pr close` fails the run, and open-pr is
+/// NOT completed, so a re-run (which reuses today's PR) tries again.
+#[test]
+fn a_close_github_does_not_confirm_fails_the_run_before_open_pr_completes() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("supersede-unconfirmed");
+    run.a_real_fork();
+    run.echoing_curl();
+    jobs_with_an_older_publish(&run);
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    let old = format!("https://github.com/{MIRROR_SLUG}/pull/5");
+    run.open_prs(&format!(
+        "[{}]",
+        pr_row(5, &old, "publish/2026-01-01", owner)
+    ));
+    run.on_close(r#"{"number":5,"state":"open","merged":false}"#);
+
+    let (ok, out) = run.go();
+    assert!(!ok, "a close GitHub still reads open must fail: {out}");
+    assert!(
+        out.contains(&old) && out.contains("still reads open"),
+        "the failure must name the PR and what GitHub said: {out}"
+    );
+    assert!(
+        run.puts().is_empty(),
+        "open-pr was completed over an unconfirmed close: {:?}",
+        run.puts()
+    );
+}
+
+// ---------------------------------------------------------------------
+// A SECOND PUBLISH ON THE SAME DAY (backlog 1f0aa60d, measured
+// 2026-09-27). Publish 8d7a3507 superseded 1fcbefde, whose PR #245 stood
+// on dauld:publish/2026-09-27. Both ran that day, the branch was named
+// by the date alone, and both pushes were `--force`: ops-request
+// 9084d6cd moved #245's head from 1fcbefde's snapshot d459c67a to its
+// own 28554177, then `gh pr create` refused ("a pull request for branch
+// … already exists") and the verb exited 1. The reuse lookup that should
+// have found #245 asked `gh pr list --head dauld:publish/2026-09-27`,
+// a spelling gh's manual says it does not support, so it never matched
+// anything. 1fcbefde's record still said #245 was d459c67a; the PR said
+// otherwise; and read-publish-checks then refused 8d7a3507 because
+// open-pr, completed by hand, carried no snapshot_commit.
+//
+// So: every publish gets its own branch, `publish/<date>-<snapshot>`,
+// pushed without force; the older PR is closed by the supersession
+// sweep like any other; and an open PR is found by reading the listing
+// gh does answer — owner and branch compared, not asked of --head.
+// ---------------------------------------------------------------------
+
+/// Plants `publish/<PUBLISH_DATE>` — the date-only name every publish
+/// used until 1f0aa60d — at `repo`'s main, and returns that commit.
+fn a_date_only_branch(repo: &Path) -> String {
+    let main = git_in(repo, &["rev-parse", "refs/heads/main"]);
+    git_in(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/heads/publish/{PUBLISH_DATE}"),
+            &main,
+        ],
+    );
+    main
+}
+
+/// THE INCIDENT. An older publish's PR is open on the date-only branch
+/// of the SAME day. The run must open its own branch and PR, leave the
+/// open PR's branch exactly where it was on the fork AND the forge, close
+/// the older PR as superseded, and complete open-pr with the url, the
+/// snapshot and the head it actually published.
+#[test]
+fn a_second_publish_on_the_same_day_opens_its_own_branch_and_moves_no_open_pr() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("second-publish-same-day");
+    run.a_real_fork();
+    run.echoing_curl();
+    jobs_with_an_older_publish(&run);
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    let older = format!("https://github.com/{MIRROR_SLUG}/pull/5");
+    let fork_before = a_date_only_branch(&run.fork);
+    let forge_before = a_date_only_branch(&run.forge);
+    run.open_prs(&format!(
+        "[{}]",
+        pr_row(5, &older, &format!("publish/{PUBLISH_DATE}"), owner)
+    ));
+
+    let (ok, out) = run.go();
+    assert!(ok, "{out}");
+
+    // The open PR's branch did not move — on either side.
+    let date_only = format!("refs/heads/publish/{PUBLISH_DATE}");
+    assert_eq!(
+        git_in(&run.fork, &["rev-parse", &date_only]),
+        fork_before,
+        "the open PR's branch on the fork was moved: {out}"
+    );
+    assert_eq!(
+        git_in(&run.forge, &["rev-parse", &date_only]),
+        forge_before,
+        "the open PR's branch on the forge was moved: {out}"
+    );
+
+    // Its own branch, named by the date and the snapshot it holds.
+    let (name, sha) = run
+        .fork_branch()
+        .unwrap_or_else(|| panic!("no publish/<date>-<snapshot> branch on the fork: {out}"));
+    let suffix = name
+        .strip_prefix(&format!("publish/{PUBLISH_DATE}-"))
+        .unwrap_or_else(|| panic!("{name} is not publish/<date>-<snapshot>"));
+    assert!(
+        !suffix.is_empty() && sha.starts_with(suffix),
+        "the branch {name} must name the snapshot it holds ({sha})"
+    );
+    let gh = run.gh_log();
+    assert!(
+        gh.lines()
+            .any(|l| l.starts_with("pr create") && l.contains(&format!("--head {owner}:{name}"))),
+        "the PR must be opened on the run's own branch: {gh}"
+    );
+
+    // The older PR is superseded through the sweep, not overwritten.
+    assert_eq!(run.closed_prs(), vec!["5".to_string()], "{gh}");
+
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    let md = &done["metadata"];
+    assert_eq!(
+        md["pr_url"],
+        format!("https://github.invalid/{MIRROR_SLUG}/pull/1").as_str(),
+        "{done}"
+    );
+    assert_eq!(md["snapshot_commit"], sha.as_str(), "{done}");
+    assert_eq!(md["head"], format!("{owner}:{name}").as_str(), "{done}");
+}
+
+/// THE REUSE LOOKUP, and the re-run it exists for. The snapshot is a
+/// pure function of what it publishes, so a second run of the same
+/// packet builds the same commit, pushes nothing new, and must FIND the
+/// PR it opened the first time — in the listing, because `--head
+/// <owner>:<branch>` answers nothing (the stub answers it the way gh
+/// does). Found, it opens no second PR and completes open-pr with that
+/// PR's url and the snapshot it carries.
+#[test]
+fn a_re_run_finds_its_open_pr_in_the_listing_and_opens_no_second_one() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("re-run-reuses");
+    run.a_real_fork();
+    run.echoing_curl();
+    let owner = FORK_SLUG.split('/').next().unwrap();
+
+    let (ok, out) = run.go();
+    assert!(ok, "the first run: {out}");
+    let (name, sha) = run.fork_branch().expect("the first run published");
+
+    // GitHub now holds that run's PR; the log starts over.
+    let mine = format!("https://github.com/{MIRROR_SLUG}/pull/3");
+    run.open_prs(&format!("[{}]", pr_row(3, &mine, &name, owner)));
+    std::fs::remove_file(run.root.join("gh.log")).unwrap();
+    std::fs::remove_file(run.root.join("puts.jsonl")).unwrap();
+
+    let (ok, out) = run.go();
+    assert!(ok, "the re-run: {out}");
+    assert_eq!(
+        run.fork_branch(),
+        Some((name.clone(), sha.clone())),
+        "the re-run must build the SAME snapshot on the SAME branch: {out}"
+    );
+    let gh = run.gh_log();
+    assert!(
+        !gh.contains("pr create"),
+        "the open PR was not found, so a second was asked for: {gh}"
+    );
+    assert!(
+        out.contains(&format!("reusing {mine} at {sha}")),
+        "the run must say which PR it reused and what it carries: {out}"
+    );
+    assert!(
+        run.closed_prs().is_empty(),
+        "its own PR is never superseded: {gh}"
+    );
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    assert_eq!(done["metadata"]["pr_url"], mine.as_str(), "{done}");
+    assert_eq!(done["metadata"]["snapshot_commit"], sha.as_str(), "{done}");
+}
+
+/// A PR that cannot be opened is a FAILED run that names what it left
+/// behind — the branch and the snapshot it pushed, which no PR carries —
+/// and completes nothing, so the answer rule troubles open-pr and files
+/// the alert (f47861a5) rather than a step reading done.
+#[test]
+fn a_refused_pr_create_names_what_it_pushed_and_completes_nothing() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("pr-create-refused");
+    run.a_real_fork();
+    run.echoing_curl();
+    boss_testing::write_file(
+        &run.gh_api.join("_pr_create_refuses"),
+        "GraphQL: something GitHub refused (createPullRequest)\n",
+    );
+
+    let (ok, out) = run.go();
+    assert!(!ok, "a PR that was not opened must fail the run: {out}");
+    let (name, sha) = run.fork_branch().expect("the branch was pushed");
+    let failed = out
+        .lines()
+        .find(|l| l.contains("FAILED"))
+        .unwrap_or_else(|| panic!("no FAILED line: {out}"));
+    assert!(
+        failed.contains(&name)
+            && failed.contains(&sha)
+            && failed.contains("something GitHub refused"),
+        "the FAILED line must name the branch, the snapshot and gh's words: {failed}"
+    );
+    assert!(
+        run.puts().is_empty(),
+        "open-pr completed with no PR: {:?}",
+        run.puts()
+    );
+}
+
+/// THE RE-RUN AFTER A TRAIN (02b65d81 meets 1f0aa60d). The snapshot
+/// publishes the APPROVED commit, so nothing that moves when forge main
+/// moves may enter it — not forge main's commit time, not its sha in the
+/// message. Otherwise a re-run of the same approved packet after any
+/// train lands builds a NEW snapshot of the same tree, pushes a second
+/// `publish/<date>-<snapshot>` branch and opens a second PR for one
+/// approval. So: first run, a train lands, re-run — the same branch and
+/// the same commit, the PR reused, nothing created.
+#[test]
+fn a_re_run_after_forge_main_moves_rebuilds_the_same_snapshot() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("re-run-after-a-train");
+    run.a_real_fork();
+    run.echoing_curl();
+    let owner = FORK_SLUG.split('/').next().unwrap();
+
+    let (ok, out) = run.go();
+    assert!(ok, "the first run: {out}");
+    let (name, sha) = run.fork_branch().expect("the first run published");
+
+    // A train lands on forge main one second or more later; GitHub holds
+    // the first run's PR; the logs start over.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let later = run.forge_moves_on();
+    let mine = format!("https://github.com/{MIRROR_SLUG}/pull/3");
+    run.open_prs(&format!("[{}]", pr_row(3, &mine, &name, owner)));
+    std::fs::remove_file(run.root.join("gh.log")).unwrap();
+    std::fs::remove_file(run.root.join("puts.jsonl")).unwrap();
+
+    let (ok, out) = run.go();
+    assert!(ok, "the re-run after forge main moved to {later}: {out}");
+    assert_eq!(
+        run.fork_branch(),
+        Some((name.clone(), sha.clone())),
+        "the re-run must rebuild the SAME snapshot on the SAME branch although forge main \
+         moved to {later}: {out}"
+    );
+    assert!(
+        !run.gh_log().contains("pr create"),
+        "one approval, one PR: a second was opened after a train: {}",
+        run.gh_log()
     );
 }

@@ -8,7 +8,7 @@ my work."* Immediately after a laptop ran out of disk mid-build and
 wedged its own shell — the second time in two days that development
 happening on a personal machine cost a session.
 
-**Related**: [durable-session](./durable-session.md) (the pod this
+**Related**: [durable-session, folded into the decision record](../architecture-decisions.md) (the pod this
 generalises) · `bossnet-physical-topology` Q1 (the Subject kinds,
 accepted) · [presence](./presence.md) (who may claim one)
 

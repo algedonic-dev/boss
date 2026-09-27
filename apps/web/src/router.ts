@@ -5,8 +5,19 @@
 // Phase 2 expands to every route the React app knows about.
 // URLs stay identical so deep-links work across the flip.
 
+import { safeSitePath } from '@boss/web-kit/links';
+import { readFinanceView, type FinanceView } from './finance/financeQuery';
+import { departmentLanding } from './shell/nav-catalog';
+
 export type Route =
+  /// The landing page (the System Model live view), at /ux/system-model.
   | { kind: 'home' }
+  /// A path nothing in the app answers — rendered in place, naming the
+  /// path as it was asked for (design ee3a3a2f). `department` is set
+  /// only by the registry check (sections.ts `withRoster`): the path is
+  /// a page, and the department that owns it is not a row on this
+  /// instance. The router never sets it; it cannot see the registry.
+  | { kind: 'notFound'; path: string; department?: string }
   | { kind: 'login' }
   | { kind: 'authAdmin' }
   | { kind: 'me' }
@@ -18,14 +29,16 @@ export type Route =
       // #93: filter by Job.owner_id so "View this employee's
       // assigned jobs" links actually filter the list.
       jobOwnerId?: string;
-      // #93: filter by Job.subject_id (with optional
-      // subject_kind disambiguator). For "View this account's
-      // jobs", "View this vendor's POs", etc.
-      jobSubjectKind?: string;
+      // #93: filter by Job.subject_id. For "View this account's
+      // jobs", "View this vendor's POs", etc. There is no subject-kind
+      // half: the jobs API takes none, and the one that was parsed
+      // here was never sent (backlog 45ca0f89).
       jobSubjectId?: string;
       // Phase 3 of the create-Job UX work: deep-link from a
       // Subject detail page opens the form pre-filled.
       newJobOpen?: boolean;
+      // The new job's Kind — `kind` under `new=1` (backlog 3f5cce16).
+      newJobKind?: string;
       newJobSubjectKind?: string;
       newJobSubjectId?: string;
     }
@@ -37,9 +50,6 @@ export type Route =
   /// Personal Views — the Home-app surface for composing your own
   /// reads over the information layer.
   | { kind: 'views' }
-  /// IT feedback triage board.
-  | { kind: 'systemFeedback' }
-  | { kind: 'systemBacklog' }
   /// The codebase trend — the daily metrics packets, rendered.
   | { kind: 'systemCodebase' }
   /// Full-page step surface. A step whose UX is a plugin gets the
@@ -65,9 +75,14 @@ export type Route =
   | { kind: 'employee'; empId: string }
   | { kind: 'parts' }
   | { kind: 'part'; partSku: string }
-  | { kind: 'products' }
+  /// `q` is the list's search box, read back off the query so a
+  /// filtered view survives a reload and can be linked (1c2db4c2).
+  | { kind: 'products'; q: string }
   | { kind: 'product'; productSku: string }
-  | { kind: 'finance' }
+  /// The tab, and the entry or fact a link opened, read back off the
+  /// query so a posted entry is shown and a tab survives back and
+  /// reload (2ab44d55).
+  | { kind: 'finance'; view: FinanceView }
   | { kind: 'newInvoice' }
   | { kind: 'newJournalEntry' }
   | { kind: 'invoice'; invoiceId: string }
@@ -86,7 +101,6 @@ export type Route =
   | { kind: 'systemMonitoringPerf' }
   | { kind: 'systemMonitoringEvents' }
   | { kind: 'systemMonitoringAtlas' }
-  | { kind: 'systemMonitoringConductor' }
   | { kind: 'policy' }
   | { kind: 'workflows' }
   | { kind: 'workflowsAdmin' }
@@ -96,46 +110,46 @@ export type Route =
   | { kind: 'systemStepPlugins' }
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
-  | { kind: 'systemYard' }
-  /** One of the yard's floors — the Train Yard focused on a region's
-   *  panel (design 0524fc95, car 2). `region` is the map's name for it
-   *  (dock, gates, track, shed, arrivals, garage); the page maps it to
-   *  a selection and an unknown name falls back to the track. */
-  | { kind: 'systemYardFloor'; region: string }
-  /// Yard status — where each train sits and why, computed from the SoR
-  /// (the-cluster-is-the-system.md Phase 0). An Operate tab, beside the
-  /// live-pipeline dashboards it belongs with.
-  | { kind: 'systemYardStatus' }
+  /** The Department Map — the IT landing (design e765b3fc, car N1): the
+   *  map on top, and below it the detail of `at`, the station the query
+   *  selects (`/it?at=gates`). Absent, nothing is selected. */
+  | { kind: 'systemYard'; at?: string }
+  // 'systemYardFloor' (/it/yard/<region>), 'systemCrew' (/it/crew),
+  // 'systemYardStatus', 'systemMonitoringConductor', 'systemFeedback'
+  // and 'systemBacklog' retired 2026-09-25 with car N3 of design
+  // e765b3fc: each page's content is a selection's panel on the
+  // Department Map now (MapPage.svelte says which), and the paths are
+  // not found like any other.
   /// Fleet lives on as Operate's Bottlenecks tab (1f6d55e0 Q3: the
   /// per-kind dashboard is unique, not a duplicate rendering).
   | { kind: 'systemFleet' }
-  /// The Crew Board — who is building what, right now. The MIDDLE third
-  /// of the operator surface (backlog 04c5bbc0): the Train Yard shows
-  /// landed work, the Marshalling Yard shows work waiting, and the
-  /// interval in between had no surface at all.
-  | { kind: 'systemCrew' }
   /// The hardware registry, declared beside observed (59ef456a).
   | { kind: 'systemEstate' }
-  /// The IT incidents surface — active incident-post-mortem packets +
+  /// The IT incidents surface — active incident packets +
   /// the closed ones rendered as a durable archive.
   | { kind: 'incidents' }
   | { kind: 'systemSubjects' }
   /// The Drift tab on Registry — the newest maintenance-protocol-drift
   /// packet rendered (4ae9969e, car 2 of 8f4e9cc0).
   | { kind: 'systemRegistryDrift' }
+  /// The Agents tab on Registry — the agents registry as a directory
+  /// (backlog 62988516; David 2026-09-26: agents get a page in IT,
+  /// never the People roster).
+  | { kind: 'systemAgents' }
   | { kind: 'experiments' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
   | { kind: 'dispatcherRuleEdit'; ruleName: string }
   | { kind: 'inbox' }
-  | { kind: 'calendar' }
   | { kind: 'myCalendar' }
   | { kind: 'schedule' }
   | { kind: 'exec' }
   /// A department's own jobs — its in / working / out over the
-  /// packets whose workflow declares it (cc76f755). The code is Class
-  /// registry data, so the route carries it; the router knows no
-  /// department by name.
+  /// packets whose workflow declares it (cc76f755), at /<code>/jobs,
+  /// and at /<code> for a department whose catalog owns no landing. The
+  /// code is registry data, so the route carries it; the router knows
+  /// no department by name, and whether the code is a row on this
+  /// instance is the registry's answer, not the router's.
   | { kind: 'department'; code: string }
   | { kind: 'warehouse' }
   | { kind: 'catalog' }
@@ -151,8 +165,55 @@ export type Route =
   | { kind: 'shop' }
   | { kind: 'shopProduct'; sku: string };
 
-export function parseRoute(pathname: string): Route {
-  let raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
+/// The path as the router matches it: the /dashboard mount and a
+/// trailing slash dropped.
+/// Exported for the interaction crawl, which asks "does this link land
+/// on /?" of the router's own normalisation rather than a copy of it
+/// (backlog 7c69a45f).
+export function routable(pathname: string): string {
+  return pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
+}
+
+function underIt(raw: string): boolean {
+  return raw === '/it' || raw.startsWith('/it/');
+}
+
+/// One path segment, decoded — or as it was typed when its escape is
+/// malformed, so a mistyped URL renders a page instead of throwing out
+/// of the router.
+function segment(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/// The one door an unmatched path offers: back to the department it was
+/// under (design ee3a3a2f Q3). No search box and no "did you mean" — a
+/// suggestion is a guess, which is what the not-found page refuses.
+///
+/// `department` is set when the path IS a page, owned by a department
+/// this instance does not have (sections.ts `withRoster`, backlog
+/// 64656a46). Its own department is then the one place the door cannot
+/// lead, so it leads Home — "Service is not a department on this
+/// instance", with one way back (e543c6fe).
+export function notFoundBack(pathname: string, department?: string): { href: string; label: string } {
+  if (department !== undefined) return { href: '/', label: 'Back to Home' };
+  return underIt(routable(pathname))
+    ? { href: '/it', label: 'Back to the Department Map' }
+    : { href: '/ux', label: 'Back to My Day' };
+}
+
+/// `search` is the query string (`window.location.search` at the SPA's
+/// call site, leading `?` and all). It is an ARGUMENT, not a read of
+/// `window`: the router read that global until backlog cb211b39, so
+/// every caller outside a browser had to plant a window first, and one
+/// test file's planted window made another file pass only when bun
+/// happened to run it second. Omitted, it is no query — which is what a
+/// path with no query means.
+export function parseRoute(pathname: string, search = ''): Route {
+  const raw = routable(pathname);
   if (raw === '/login') return { kind: 'login' };
 
   // ===== The IT department — /it/* =====
@@ -165,147 +226,172 @@ export function parseRoute(pathname: string): Route {
   // "kept permanently" promise the old alias comment made (feedback
   // 0fc8b216 got the /it half; this finishes it). A /system path now
   // falls through to the catch-all like any other unknown route.
-  if (raw === '/it' || raw.startsWith('/it/')) {
+  if (underIt(raw)) {
     const p = raw.slice('/it'.length) || '/';
     // 1. The landing is the yard — delivery truth first. Since design
-    //    0524fc95 (car 2) the landing is the yard's MAP: eight region
-    //    cards, each a door to a floor. The floors are the yard page
-    //    itself, opened on a region's panel, at /it/yard[/<region>].
-    if (p === '/') return { kind: 'systemYard' };
-    if (p === '/yard') return { kind: 'systemYardFloor', region: 'track' };
-    const floorM = p.match(/^\/yard\/([a-z-]+)$/);
-    if (floorM) return { kind: 'systemYardFloor', region: floorM[1]! };
+    //    0524fc95 (car 2) the landing is the yard's MAP. Since design
+    //    e765b3fc (car N1) it is the DEPARTMENT MAP: the map stays on
+    //    top and a selection opens its detail below, named in the query
+    //    so a link says what it selects. A query, not a path: the map is
+    //    not torn down and rebuilt by a selection. Car N3 retired the
+    //    floor pages at /it/yard[/<region>] and every page whose content
+    //    moved into a selection's panel — /it/crew, yard status, the
+    //    conductor's feed, the feedback and backlog boards — and with
+    //    them the four aliases that still answered (/it/yard,
+    //    /it/operate/receiving, /it/operate/marshalling,
+    //    /it/design/codebase). No alias and no redirect (David,
+    //    2026-09-25: no shims before 1.0.0): each falls to not-found
+    //    below, whose one door is the Department Map.
+    if (p === '/') {
+      const r: Route = { kind: 'systemYard' };
+      const at = new URLSearchParams(search).get('at');
+      if (at) (r as { at?: string }).at = at;
+      return r;
+    }
     // 2. Operate — incidents lead; audit/perf/atlas/bottlenecks tabs.
     if (p === '/operate') return { kind: 'incidents' };
     if (p === '/operate/audit') return { kind: 'systemMonitoringEvents' };
     if (p === '/operate/perf') return { kind: 'systemMonitoringPerf' };
     if (p === '/operate/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/operate/bottlenecks') return { kind: 'systemFleet' };
-    // The Receiving Yard and the Marshalling Yard RETIRED as pages on
-    // car 4 of design d2154293: each is a region of the world, and its
-    // board mounts under the world zoomed into that region. The two
-    // old paths resolve to the same route rather than 404ing, because
-    // they are written down in packets, briefs and this session's own
-    // notes — one surface, two spellings, not two surfaces.
-    if (p === '/operate/marshalling') return { kind: 'systemYardFloor', region: 'marshalling' };
-    if (p === '/operate/receiving') return { kind: 'systemYardFloor', region: 'receiving' };
-    if (p === '/operate/yard-status') return { kind: 'systemYardStatus' };
-    if (p === '/operate/conductor') return { kind: 'systemMonitoringConductor' };
     // 3. Registry — one surface over the registry family.
     if (p === '/registry') return { kind: 'workflows' };
     if (p === '/registry/new') return { kind: 'workflowNew' };
     if (p === '/registry/authoring') return { kind: 'workflowsAdmin' };
-    const jkDesignM = p.match(/^\/registry\/authoring\/(.+)$/);
-    if (jkDesignM) return { kind: 'workflowDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
+    const jkDesignM = p.match(/^\/registry\/authoring\/([^/]+)$/);
+    if (jkDesignM) return { kind: 'workflowDesign', jobId: segment(jkDesignM[1]!) };
     if (p === '/registry/step-plugins') return { kind: 'systemStepPlugins' };
-    const spM = p.match(/^\/registry\/step-plugins\/(.+)$/);
-    if (spM) return { kind: 'systemStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
+    const spM = p.match(/^\/registry\/step-plugins\/([^/]+)$/);
+    if (spM) return { kind: 'systemStepPluginDetail', pluginSlug: segment(spM[1]!) };
     if (p === '/registry/rules') return { kind: 'dispatcherRulesList' };
-    const drM = p.match(/^\/registry\/rules\/(.+)$/);
-    if (drM) return { kind: 'dispatcherRuleEdit', ruleName: decodeURIComponent(drM[1]!) };
+    const drM = p.match(/^\/registry\/rules\/([^/]+)$/);
+    if (drM) return { kind: 'dispatcherRuleEdit', ruleName: segment(drM[1]!) };
     if (p === '/registry/dispatcher') return { kind: 'dispatcherRules' };
     if (p === '/registry/policy') return { kind: 'policy' };
     if (p === '/registry/subjects') return { kind: 'systemSubjects' };
     if (p === '/registry/drift') return { kind: 'systemRegistryDrift' };
-    // 4. Design — reviews lead; experiments and feedback tabs.
+    if (p === '/registry/agents') return { kind: 'systemAgents' };
+    // 4. Design — reviews lead; the experiments tab.
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/design/experiments') return { kind: 'experiments' };
-    if (p === '/design/feedback') return { kind: 'systemFeedback' };
-    if (p === '/design/backlog') return { kind: 'systemBacklog' };
-    // /it/codebase is the row (9827c699); the old Design-tab path still
-    // answers so a bookmark or a packet link keeps working.
-    if (p === '/codebase' || p === '/design/codebase') return { kind: 'systemCodebase' };
+    // /it/codebase is the row (9827c699).
+    if (p === '/codebase') return { kind: 'systemCodebase' };
     // 5. Estate. 6. KB. Plus the unlisted auth door.
-    // 5a. The Crew Board — a sidebar row of its own, not an Operate tab.
-    // David's decision on 04c5bbc0 (2026-09-11) overrode the proposal to
-    // make it a tab inside an existing family: "Port the Crew Board as a
-    // new sidebar page in IT."
-    if (p === '/crew') return { kind: 'systemCrew' };
     if (p === '/estate') return { kind: 'systemEstate' };
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/auth-admin') return { kind: 'authAdmin' };
+    // 7. The jobs view every department carries (design 8c3e9599 §4,
+    //    car 2). IT's block owns every /it path, so the /<code>/jobs
+    //    branch below never sees this one; the code is IT's own.
+    if (p === '/jobs') return { kind: 'department', code: 'it' };
     // Workflow detail LAST — its wildcard would eclipse the
     // specific /registry/* cases above.
-    const jkM = p.match(/^\/registry\/(.+)$/);
-    if (jkM) return { kind: 'workflowDetail', kindSlug: decodeURIComponent(jkM[1]!) };
-    // Unknown /it path: the department's own landing, not Home.
-    return { kind: 'systemYard' };
+    const jkM = p.match(/^\/registry\/([^/]+)$/);
+    if (jkM) return { kind: 'workflowDetail', kindSlug: segment(jkM[1]!) };
+    // Unknown /it path: it says so, inside the IT chrome. It returned the
+    // yard until design ee3a3a2f (Q4), so a mistyped IT link landed on the
+    // map and looked like a working one.
+    return { kind: 'notFound', path: pathname };
   }
 
   // ===== User Experiences perspective — /ux/* (canonical); bare / is the public alias for the UX home.
   // Unprefixed legacy paths still resolve here (defensive). =====
   const p = raw === '/' || raw === '/ux' ? '/' : raw.startsWith('/ux/') ? raw.slice('/ux'.length) : raw;
+  // A department's address (design 8c3e9599 §5, car 2): /<code> and
+  // /<code>/jobs, for any code — never under /ux, which is retiring and
+  // was never a department's (a /ux/<code> path is not found).
+  const unprefixed = !raw.startsWith('/ux/');
+  // /<code>/jobs FIRST: the one-segment family wildcards below
+  // (/finance/:invoiceId, /sales/:jobId, /service/:jobId,
+  // /people/:empId) would read "jobs" as an id and render a missing
+  // invoice, job or employee for a department that has all three.
+  const deptJobsM = unprefixed ? p.match(/^\/([^/]+)\/jobs$/) : null;
+  if (deptJobsM) return { kind: 'department', code: segment(deptJobsM[1]!) };
   // User Experiences lands on My Day by default — the actor's personal
-  // work view, not a marketing landing. (The landing page stays the
-  // catch-all fallback for unknown paths, at the bottom of this fn.)
+  // work view, not a marketing landing.
+  //
+  // EVERY SINGLE-ID WILDCARD BELOW TAKES ONE SEGMENT, `([^/]+)`. They
+  // were greedy `(.+)` until design ee3a3a2f (Q6), and a deeper path
+  // under a list became a convincing "missing X": /ux/accounts/
+  // agreements/<id> rendered the ACCOUNT page for accountId
+  // "agreements/<id>". An id holding a slash arrives percent-encoded
+  // (entityHref encodes every id) and is decoded by `segment`. The one
+  // exception is /manual, whose slug may hold a slash by design — the
+  // content API routes it as `{*slug}`.
   if (p === '/') return { kind: 'me' };
   if (p === '/me') return { kind: 'me' };
   if (p === '/inbox') return { kind: 'inbox' };
   if (p === '/views') return { kind: 'views' };
+  // The landing page's own door. The catch-all was its ONLY way in until
+  // design ee3a3a2f (Q5) — `/` and `/ux` are My Day — so turning the
+  // catch-all into a not-found would have orphaned a real page.
+  if (p === '/system-model') return { kind: 'home' };
   if (p === '/accounts') return { kind: 'accounts' };
-  const cm = p.match(/^\/accounts\/(.+)$/);
-  if (cm) return { kind: 'account', accountId: cm[1]! };
+  const cm = p.match(/^\/accounts\/([^/]+)$/);
+  if (cm) return { kind: 'account', accountId: segment(cm[1]!) };
 
   if (p === '/vendors') return { kind: 'vendors' };
-  const vm = p.match(/^\/vendors\/(.+)$/);
-  if (vm) return { kind: 'vendor', vendorLookup: decodeURIComponent(vm[1]!) };
+  const vm = p.match(/^\/vendors\/([^/]+)$/);
+  if (vm) return { kind: 'vendor', vendorLookup: segment(vm[1]!) };
 
   if (p === '/people') return { kind: 'people' };
-  const em = p.match(/^\/people\/(.+)$/);
-  if (em) return { kind: 'employee', empId: em[1]! };
+  const em = p.match(/^\/people\/([^/]+)$/);
+  if (em) return { kind: 'employee', empId: segment(em[1]!) };
 
   if (p === '/parts') return { kind: 'parts' };
-  const partM = p.match(/^\/parts\/(.+)$/);
-  if (partM) return { kind: 'part', partSku: decodeURIComponent(partM[1]!) };
+  const partM = p.match(/^\/parts\/([^/]+)$/);
+  if (partM) return { kind: 'part', partSku: segment(partM[1]!) };
 
-  if (p === '/products') return { kind: 'products' };
-  const prodM = p.match(/^\/products\/(.+)$/);
-  if (prodM) return { kind: 'product', productSku: decodeURIComponent(prodM[1]!) };
+  if (p === '/products') {
+    return { kind: 'products', q: new URLSearchParams(search).get('q') ?? '' };
+  }
+  const prodM = p.match(/^\/products\/([^/]+)$/);
+  if (prodM) return { kind: 'product', productSku: segment(prodM[1]!) };
 
-  if (p === '/finance') return { kind: 'finance' };
+  if (p === '/finance') return { kind: 'finance', view: readFinanceView(search) };
   if (p === '/finance/new') return { kind: 'newInvoice' };
   if (p === '/finance/journal-entries/new') return { kind: 'newJournalEntry' };
   // Wildcard MUST come after every specific `/finance/X` case above —
-  // it eagerly matches any tail and would otherwise eclipse them.
-  const invM = p.match(/^\/finance\/(.+)$/);
-  if (invM) return { kind: 'invoice', invoiceId: decodeURIComponent(invM[1]!) };
+  // it matches any one-segment tail and would otherwise eclipse /new.
+  const invM = p.match(/^\/finance\/([^/]+)$/);
+  if (invM) return { kind: 'invoice', invoiceId: segment(invM[1]!) };
 
   if (p === '/shipping') return { kind: 'shipping' };
-  const shipM = p.match(/^\/shipments\/(.+)$/);
-  if (shipM) return { kind: 'shipmentDetail', shipmentId: decodeURIComponent(shipM[1]!) };
+  const shipM = p.match(/^\/shipments\/([^/]+)$/);
+  if (shipM) return { kind: 'shipmentDetail', shipmentId: segment(shipM[1]!) };
 
   if (p === '/support') return { kind: 'support' };
 
   if (p === '/calendar/me') return { kind: 'myCalendar' };
-  if (p === '/calendar') return { kind: 'calendar' };
   if (p === '/service/schedule') return { kind: 'schedule' };
   if (p === '/exec') return { kind: 'exec' };
-  const deptM = p.match(/^\/departments\/([^/]+)$/);
-  if (deptM) return { kind: 'department', code: decodeURIComponent(deptM[1]!) };
+  // /ux/departments/<code> retired with car 2 of design 8c3e9599 — the
+  // jobs view is /<code>/jobs above, with no alias (David, 2026-09-25).
   if (p === '/warehouse') return { kind: 'warehouse' };
   if (p === '/catalog') return { kind: 'catalog' };
-  const catM = p.match(/^\/catalog\/(.+)$/);
-  if (catM) return { kind: 'device', sku: decodeURIComponent(catM[1]!) };
+  const catM = p.match(/^\/catalog\/([^/]+)$/);
+  if (catM) return { kind: 'device', sku: segment(catM[1]!) };
   if (p === '/assets') return { kind: 'assets' };
-  const assetM = p.match(/^\/assets\/(.+)$/);
-  if (assetM) return { kind: 'asset', assetId: decodeURIComponent(assetM[1]!) };
+  const assetM = p.match(/^\/assets\/([^/]+)$/);
+  if (assetM) return { kind: 'asset', assetId: segment(assetM[1]!) };
   if (p === '/marketing-assets') return { kind: 'marketingAssets' };
-  const mktM = p.match(/^\/marketing-assets\/(.+)$/);
-  if (mktM) return { kind: 'marketingAsset', assetId: decodeURIComponent(mktM[1]!) };
+  const mktM = p.match(/^\/marketing-assets\/([^/]+)$/);
+  if (mktM) return { kind: 'marketingAsset', assetId: segment(mktM[1]!) };
   if (p === '/manual') return { kind: 'manual' };
+  // `(.+)` on purpose: a manual slug may hold a slash (see above).
   const mManual = p.match(/^\/manual\/(.+)$/);
-  if (mManual) return { kind: 'manualSection', slug: decodeURIComponent(mManual[1]!) };
-  const poM = p.match(/^\/purchase-orders\/(.+)$/);
-  if (poM) return { kind: 'po', poId: decodeURIComponent(poM[1]!) };
-  const viM = p.match(/^\/vendor-invoices\/(.+)$/);
-  if (viM) return { kind: 'vendorInvoice', vendorInvoiceId: decodeURIComponent(viM[1]!) };
+  if (mManual) return { kind: 'manualSection', slug: segment(mManual[1]!) };
+  const poM = p.match(/^\/purchase-orders\/([^/]+)$/);
+  if (poM) return { kind: 'po', poId: segment(poM[1]!) };
+  const viM = p.match(/^\/vendor-invoices\/([^/]+)$/);
+  if (viM) return { kind: 'vendorInvoice', vendorInvoiceId: segment(viM[1]!) };
   if (p === '/watchlist') return { kind: 'watchlist' };
   if (p === '/shop') return { kind: 'shop' };
-  const shopM = p.match(/^\/shop\/(.+)$/);
-  if (shopM) return { kind: 'shopProduct', sku: decodeURIComponent(shopM[1]!) };
+  const shopM = p.match(/^\/shop\/([^/]+)$/);
+  if (shopM) return { kind: 'shopProduct', sku: segment(shopM[1]!) };
 
   if (p === '/search') {
-    const sp = new URLSearchParams(window.location.search);
+    const sp = new URLSearchParams(search);
     return { kind: 'search', q: sp.get('q') ?? '' };
   }
 
@@ -313,15 +399,15 @@ export function parseRoute(pathname: string): Route {
   if (p === '/qa') return { kind: 'qa' };
 
   if (p === '/service') return { kind: 'service' };
-  const tm = p.match(/^\/service\/(.+)$/);
-  if (tm) return { kind: 'jobDetail', jobId: tm[1]! };
+  const tm = p.match(/^\/service\/([^/]+)$/);
+  if (tm) return { kind: 'jobDetail', jobId: segment(tm[1]!) };
 
   if (p === '/sales') return { kind: 'sales' };
-  const sm = p.match(/^\/sales\/(.+)$/);
-  if (sm) return { kind: 'jobDetail', jobId: sm[1]! };
+  const sm = p.match(/^\/sales\/([^/]+)$/);
+  if (sm) return { kind: 'jobDetail', jobId: segment(sm[1]!) };
 
   if (p === '/jobs') {
-    const sp = new URLSearchParams(window.location.search);
+    const sp = new URLSearchParams(search);
     const jk = sp.get('kind');
     const jkp = sp.get('kind_prefix');
     const js = sp.get('status');
@@ -332,25 +418,40 @@ export function parseRoute(pathname: string): Route {
     // owner_id filters by Job.owner_id; subject_id filters by
     // Job.subject_id.
     const ownerId = sp.get('owner_id');
-    const filterSubjectKind = sp.get('filter_subject_kind');
     const filterSubjectId = sp.get('subject_id');
     const r: Route = { kind: 'jobs' };
-    if (jk) (r as { workflow?: string }).workflow = jk;
+    // Under `new=1` the kind is the new job's Kind, as the subject_id
+    // below is its subject: HrPage's link names its workflow there, and
+    // read as the list's filter it narrowed the list behind the form
+    // and left the form's own Kind unpicked (backlog 3f5cce16).
+    if (jk && newJob !== '1') (r as { workflow?: string }).workflow = jk;
     if (jkp) (r as { workflowPrefix?: string }).workflowPrefix = jkp;
-    if (js) (r as { jobStatus?: string }).jobStatus = js;
+    // `!== null`, not truthiness: an EMPTY status is a deep link asking
+    // for every status (EmployeePage's owned-jobs link sends
+    // `status=`), and only an ABSENT one takes the page's open default.
+    // The truthiness check dropped the empty value (backlog 03e198e5).
+    if (js !== null) (r as { jobStatus?: string }).jobStatus = js;
     if (ownerId) (r as { jobOwnerId?: string }).jobOwnerId = ownerId;
-    if (filterSubjectId) (r as { jobSubjectId?: string }).jobSubjectId = filterSubjectId;
-    if (filterSubjectKind) (r as { jobSubjectKind?: string }).jobSubjectKind = filterSubjectKind;
-    if (newJob === '1') (r as { newJobOpen?: boolean }).newJobOpen = true;
-    if (sk) (r as { newJobSubjectKind?: string }).newJobSubjectKind = sk;
-    if (sid) (r as { newJobSubjectId?: string }).newJobSubjectId = sid;
+    // Under `new=1` the subject_id is the new job's subject and not a
+    // filter: it narrowed the list behind the form too, and Cancel left
+    // it narrowed under a URL that no longer said so (backlog d0b93b80).
+    // filterQuery's write reads the parameter the same way.
+    if (filterSubjectId && newJob !== '1') (r as { jobSubjectId?: string }).jobSubjectId = filterSubjectId;
+    // The new-job half exists only under `new=1`; without it there is
+    // no form to seed, and the same parameters are the list's filters.
+    if (newJob === '1') {
+      (r as { newJobOpen?: boolean }).newJobOpen = true;
+      if (jk) (r as { newJobKind?: string }).newJobKind = jk;
+      if (sk) (r as { newJobSubjectKind?: string }).newJobSubjectKind = sk;
+      if (sid) (r as { newJobSubjectId?: string }).newJobSubjectId = sid;
+    }
     return r;
   }
-  // Before the greedy /jobs/(.+) below, which would otherwise swallow
-  // the whole `{id}/steps/{stepId}` tail as a job id.
+  // Before /jobs/([^/]+) below — which, while it was the greedy
+  // /jobs/(.+), swallowed the whole `{id}/steps/{stepId}` tail as a job id.
   const sfm = p.match(/^\/jobs\/([^/]+)\/steps\/([^/]+)$/);
   if (sfm) {
-    const sp = new URLSearchParams(window.location.search);
+    const sp = new URLSearchParams(search);
     const r: Route = { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
     // Where "back" goes, and what to call it. Only the lens that sent
     // the operator here knows — the step surface cannot infer it, and
@@ -360,17 +461,46 @@ export function parseRoute(pathname: string): Route {
     // button into an open redirect.
     const from = sp.get('from');
     const fromLabel = sp.get('from_label');
-    if (from?.startsWith('/') && !from.startsWith('//')) {
-      (r as { from?: string }).from = from;
+    // safeSitePath also refuses `/\host` and a control character, each
+    // of which a browser reads as `//host` (4f1f7698).
+    const back = safeSitePath(from);
+    if (back !== null) {
+      (r as { from?: string }).from = back;
       if (fromLabel) (r as { fromLabel?: string }).fromLabel = fromLabel;
     }
     return r;
   }
 
-  const jm = p.match(/^\/jobs\/(.+)$/);
-  if (jm) return { kind: 'jobDetail', jobId: jm[1]! };
+  const jm = p.match(/^\/jobs\/([^/]+)$/);
+  if (jm) return { kind: 'jobDetail', jobId: segment(jm[1]!) };
 
-  return { kind: 'home' };
+  // A department's landing — LAST of the matches, because every one-
+  // segment page above (/inbox, /finance, /hr, …) is a more specific
+  // answer for its segment. What /<code> renders is catalog data: the
+  // entry the department flags `landing`, else its first sidebar entry,
+  // else its jobs view (nav-catalog `departmentLanding`). The landing
+  // renders in place under the department's own address, the way an
+  // entry's own path does, so /executive IS the Exec page. A segment no
+  // department owns lands on the jobs view here, and is not found once
+  // the registry says it is no row (sections.ts `withRoster`): the
+  // router cannot see the registry, so it cannot tell a department
+  // nobody built a page for from a typo.
+  const landingM = unprefixed ? p.match(/^\/([^/]+)$/) : null;
+  if (landingM) {
+    const code = segment(landingM[1]!);
+    const entry = departmentLanding(code);
+    // An entry whose own path is this one would land on itself forever;
+    // such a path has no page of its own, so it is the jobs view.
+    return entry && routable(entry.path) !== raw ? parseRoute(entry.path) : { kind: 'department', code };
+  }
+
+  // Nothing answers this path, and the page says so, naming it as it was
+  // asked for (design ee3a3a2f). This returned the landing page until
+  // then, so a dead link rendered a real, working, plausible page and
+  // the reader concluded they had misremembered (backlog c4f2ae24).
+  // Rendered in place, never redirected: a redirect replaces the
+  // evidence in the address bar with a working page, which is the defect.
+  return { kind: 'notFound', path: pathname };
 }
 
 // `href` (honors the /dashboard mount) + `navigate` (pushState SPA nav)

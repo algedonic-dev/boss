@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::port::{CommerceError, CommerceRepository};
+use crate::port::{CommerceError, CommerceRepository, InvoiceCreate};
 use crate::types::*;
 
 pub struct PgCommerce {
@@ -141,6 +141,37 @@ impl CommerceRepository for PgCommerce {
         Ok((invoices, total))
     }
 
+    async fn open_ar_by_account(&self) -> Result<Vec<AccountOpenAr>, CommerceError> {
+        // Summed here, over every row, so the answer is exact at any
+        // volume (backlog 5257bfa9). The not-owed statuses are bound
+        // from the one Rust list rather than spelled in the SQL.
+        let not_owed: Vec<String> = InvoiceStatus::NOT_OWED
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT account_id, \
+                    COALESCE(SUM(amount_cents), 0)::bigint, \
+                    COUNT(*)::bigint \
+             FROM invoices \
+             WHERE status <> ALL($1) \
+             GROUP BY account_id \
+             ORDER BY account_id",
+        )
+        .bind(&not_owed)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CommerceError::Storage(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(account_id, open_ar_cents, open_count)| AccountOpenAr {
+                account_id,
+                open_ar_cents,
+                open_count,
+            })
+            .collect())
+    }
+
     async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError> {
         let row: Option<InvoiceRow> = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
             .bind(id)
@@ -168,7 +199,7 @@ impl CommerceRepository for PgCommerce {
         inv: &Invoice,
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
-    ) -> Result<Invoice, CommerceError> {
+    ) -> Result<InvoiceCreate, CommerceError> {
         // Invariant: line-item revenue + sales tax must equal the
         // header rollup. Enforce in the adapter so a buggy caller
         // can't persist a document whose total lies about its
@@ -226,22 +257,24 @@ impl CommerceRepository for PgCommerce {
             .await
             .map_err(CommerceError::Storage)?;
 
-        sqlx::query(
+        // ONCE PER ID (backlog 9d2af748). This was `ON CONFLICT (id) DO
+        // UPDATE`: a repeat create overwrote the header — a redelivered
+        // issue carrying `outstanding` turned a PAID invoice owed again
+        // — rewrote the lines, and recorded `commerce.invoice.created`
+        // a second time, which is the event that drives the
+        // finished-goods consume. Now the first create's row stands: a
+        // conflicting insert writes nothing, the transaction is rolled
+        // back (the identity row above included), and the stored
+        // invoice answers — or refuses a body that is not it. A
+        // concurrent first create waits on the unique index here and
+        // then sees the other's committed row, so two racing creates
+        // record one event between them.
+        let inserted = sqlx::query(
             "INSERT INTO invoices (id, account_id, issued_on, due_on, paid_on, status, \
                                    amount_cents, currency, tax_cents, tax_jurisdiction, \
                                    payment_method, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT (id) DO UPDATE SET \
-                account_id = EXCLUDED.account_id, \
-                issued_on = EXCLUDED.issued_on, \
-                due_on = EXCLUDED.due_on, \
-                status = EXCLUDED.status, \
-                paid_on = EXCLUDED.paid_on, \
-                amount_cents = EXCLUDED.amount_cents, \
-                currency = EXCLUDED.currency, \
-                tax_cents = EXCLUDED.tax_cents, \
-                tax_jurisdiction = EXCLUDED.tax_jurisdiction, \
-                payment_method = EXCLUDED.payment_method",
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(&inv.id)
         .bind(&inv.account_id)
@@ -257,17 +290,25 @@ impl CommerceRepository for PgCommerce {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| CommerceError::Storage(e.to_string()))?;
-
-        // On re-emission of an existing invoice, wipe its old line
-        // items before re-inserting so the document stays consistent.
-        // Cheaper than diffing and replay is the only path that
-        // re-emits today.
-        sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id = $1")
-            .bind(&inv.id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CommerceError::Storage(e.to_string()))?;
+        .map_err(|e| CommerceError::Storage(e.to_string()))?
+        .rows_affected();
+        if inserted == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| CommerceError::Storage(e.to_string()))?;
+            let stored = self
+                .invoice_by_id(&inv.id)
+                .await?
+                .ok_or_else(|| CommerceError::NotFound(format!("invoice {}", inv.id)))?;
+            let differing = inv.issuance_differences(&stored);
+            return if differing.is_empty() {
+                Ok(InvoiceCreate::AlreadyCreated(stored))
+            } else {
+                Err(CommerceError::another_invoice_under_this_id(
+                    &inv.id, &differing,
+                ))
+            };
+        }
 
         // The FG drawdown + COGS moved OUT of the invoice tx (Q2,
         // docs/architecture-decisions.md §Finance & ledger, 6b): the
@@ -381,7 +422,7 @@ impl CommerceRepository for PgCommerce {
         // event — the same shape the finance.invoice.issued fact persists,
         // so audit_log replay reconstructs the identical fact (incl. COGS
         // legs).
-        Ok(enriched_invoice)
+        Ok(InvoiceCreate::Created(enriched_invoice))
     }
 
     async fn mark_invoice_paid_at(
@@ -417,18 +458,12 @@ impl CommerceRepository for PgCommerce {
         // can still author the fact directly via
         // `record_fact_in_tx`; we just don't auto-emit one for
         // every PUT /paid.
-        let row: Option<(String, i64, String, chrono::NaiveDate)> = sqlx::query_as(
-            "UPDATE invoices SET status = 'paid', paid_on = $2 \
-             WHERE id = $1 RETURNING account_id, amount_cents, currency, paid_on",
-        )
-        .bind(id)
-        .bind(paid_on)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CommerceError::Storage(e.to_string()))?;
-
-        if row.is_none() {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        //
+        // Guarded by the transition rule: an already-paid invoice keeps
+        // its first paid_on and records nothing, and a written-off one
+        // is refused — it re-stamped both before (backlog 203ef806).
+        if !transition_in_tx(&mut tx, id, InvoiceStatus::PAID, Some(paid_on)).await? {
+            return Ok(());
         }
 
         // OUTBOX (phase 2): record commerce.invoice.paid with the full
@@ -466,13 +501,8 @@ impl CommerceRepository for PgCommerce {
             .begin()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        let result = sqlx::query("UPDATE invoices SET status = 'past-due' WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        if result.rows_affected() == 0 {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        if !transition_in_tx(&mut tx, id, InvoiceStatus::PAST_DUE, None).await? {
+            return Ok(());
         }
         let invoice = fetch_invoice_in_tx(&mut tx, id).await?;
         let event = stamp.event(
@@ -513,35 +543,14 @@ impl CommerceRepository for PgCommerce {
         // write-off drive arrives once per past-due copy the
         // counterparty received, and only the copy that wins the
         // UPDATE writes the fact — the row lock serializes the rest
-        // into the 0-rows branch below.
+        // into `transition_in_tx`'s already-written-off answer.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        let updated = sqlx::query(
-            "UPDATE invoices SET status = 'written-off' \
-             WHERE id = $1 AND status IN ('outstanding', 'past-due')",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        if updated.rows_affected() == 0 {
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM invoices WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| CommerceError::Storage(e.to_string()))?;
-            return match status.as_deref() {
-                None => Err(CommerceError::NotFound(format!("invoice {id}"))),
-                Some("written-off") => Ok(false),
-                Some(other) => Err(CommerceError::Conflict(format!(
-                    "invoice {id} is '{other}': only outstanding or past-due \
-                     invoices write off"
-                ))),
-            };
+        if !transition_in_tx(&mut tx, id, InvoiceStatus::WRITTEN_OFF, None).await? {
+            return Ok(false);
         }
         // Fetch the full written-off invoice in-tx so the live fact payload
         // is byte-identical to the commerce.invoice.written_off event the
@@ -680,17 +689,20 @@ impl CommerceRepository for PgCommerce {
         .await
         .map_err(|e| CommerceError::Storage(e.to_string()))?;
 
-        // Invert the ledger's category → account map so we can find,
-        // for each revenue account row, which category tags belong
-        // to it ("retail" + "merchandise" both → 4110).
-        let category_to_account = boss_ledger::revenue_accounts_map();
+        // Invert the ledger's category → account map — the account
+        // each revenue-category Class names (backlog aa860c6d) — so we
+        // can find, for each revenue account row, which category tags
+        // belong to it ("retail" + "merchandise" both → 4110).
+        let category_to_account = boss_ledger::revenue_accounts::load(&self.pool)
+            .await
+            .map_err(|e| CommerceError::Storage(e.to_string()))?;
         let mut account_to_categories: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
         for (category, account_code) in category_to_account.iter() {
             account_to_categories
                 .entry(account_code)
                 .or_default()
-                .push(category.as_str());
+                .push(category);
         }
 
         let tagged_cogs_by_category: std::collections::HashMap<String, i64> =
@@ -761,47 +773,32 @@ impl CommerceRepository for PgCommerce {
 
         let total_gross_margin_ttm_cents: i64 = total_revenue_ttm_cents - total_cogs_ttm_cents;
 
-        // AR aging: every unpaid invoice bucketed by how many days past its
-        // due date. `current` means "due in the future or due today".
-        let aging_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        // AR aging: every OWED invoice, summed here per days-past-due
+        // and bucketed by `ArAgingBucket::age`. It filtered
+        // `status <> 'paid'` and so aged written-off invoices as
+        // outstanding (backlog 926d64a3); the not-owed statuses are now
+        // bound from the one Rust list, as `open_ar_by_account` binds
+        // them. One row per distinct due date, so the sum stays exact
+        // at any volume.
+        let not_owed: Vec<String> = InvoiceStatus::NOT_OWED
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let aging_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
             "SELECT \
-                CASE \
-                    WHEN $1::date - due_on <= 0 THEN 'current' \
-                    WHEN $1::date - due_on <= 30 THEN '1-30' \
-                    WHEN $1::date - due_on <= 60 THEN '31-60' \
-                    WHEN $1::date - due_on <= 90 THEN '61-90' \
-                    ELSE '90+' \
-                END as label, \
-                COUNT(*)::bigint as count, \
-                COALESCE(SUM(amount_cents), 0)::bigint as total_cents \
+                ($1::date - due_on)::bigint AS days_past_due, \
+                COUNT(*)::bigint, \
+                COALESCE(SUM(amount_cents), 0)::bigint \
              FROM invoices \
-             WHERE status <> 'paid' \
+             WHERE status <> ALL($2) \
              GROUP BY 1",
         )
         .bind(today)
+        .bind(&not_owed)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CommerceError::Storage(e.to_string()))?;
-
-        // Emit the buckets in canonical order even when some are empty, so
-        // the frontend always sees the same 5-row shape.
-        let mut ar_map: std::collections::HashMap<String, (i64, i64)> =
-            std::collections::HashMap::new();
-        for (label, count, total_cents) in aging_rows {
-            ar_map.insert(label, (count, total_cents));
-        }
-        let canonical_order = ["current", "1-30", "31-60", "61-90", "90+"];
-        let ar_aging: Vec<ArAgingBucket> = canonical_order
-            .iter()
-            .map(|label| {
-                let (count, total_cents) = ar_map.get(*label).copied().unwrap_or((0, 0));
-                ArAgingBucket {
-                    label: label.to_string(),
-                    count,
-                    total_cents,
-                }
-            })
-            .collect();
+        let ar_aging = ArAgingBucket::age(aging_rows);
 
         let total_outstanding_cents: i64 = ar_aging.iter().map(|b| b.total_cents).sum();
 
@@ -855,6 +852,57 @@ impl CommerceRepository for PgCommerce {
             revenue_by_month,
             currency: "USD".to_string(),
         })
+    }
+}
+
+/// The status write all three status verbs run (backlog 203ef806):
+/// `InvoiceStatus::transition_to`, applied in the UPDATE's own WHERE so
+/// the check and the write are one statement under the row lock — the
+/// past-due flip had no guard at all and moved paid and written-off
+/// invoices back into the receivable. `true` when THIS call moved the
+/// invoice (the caller then records its event); `false` when it was
+/// already at `to` (a redelivered drive — no event); a terminal source
+/// is refused by name, never answered as a silent 0-row update. The
+/// not-owed statuses are bound from the one Rust list.
+async fn transition_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    to: &str,
+    paid_on: Option<chrono::NaiveDate>,
+) -> Result<bool, CommerceError> {
+    let not_owed: Vec<String> = InvoiceStatus::NOT_OWED
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let updated = sqlx::query(
+        "UPDATE invoices SET status = $2, paid_on = COALESCE($3, paid_on) \
+         WHERE id = $1 AND status <> $2 AND status <> ALL($4)",
+    )
+    .bind(id)
+    .bind(to)
+    .bind(paid_on)
+    .bind(&not_owed)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| CommerceError::Storage(e.to_string()))?;
+    if updated.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let from: Option<String> = sqlx::query_scalar("SELECT status FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| CommerceError::Storage(e.to_string()))?;
+    let Some(from) = from else {
+        return Err(CommerceError::NotFound(format!("invoice {id}")));
+    };
+    match InvoiceStatus::new(from.clone()).transition_to(to) {
+        InvoiceTransition::Already => Ok(false),
+        InvoiceTransition::Refused => Err(CommerceError::refused_transition(id, &from, to)),
+        // Only a write between the UPDATE and this read lands here.
+        InvoiceTransition::Flip => Err(CommerceError::Conflict(format!(
+            "invoice {id} moved to '{from}' while being written '{to}'; retry"
+        ))),
     }
 }
 

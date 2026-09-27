@@ -1,0 +1,62 @@
+# A documentation flatten opens every week on the clock (backlog
+# ede02a78; David, 2026-09-27: "let us have a weekly timer, but we can
+# also do an ad hoc trigger just to test it").
+#
+# `doc-flatten` (infra/platform/workflows/doc-flatten.toml) folds
+# settled decisions into docs/architecture-decisions.md and retires
+# what they supersede. It had 0 packets ever until the ad hoc run
+# c98e5183 was opened by hand on 2026-09-27, and its one opener before
+# this file, `open-doc-flatten-on-release-cut` (04c6e143), fires only
+# when a release is CUT. That rule stays: a release still owes its own
+# flatten. This one is the cadence that holds when no release is cut.
+#
+# WHEN. The schedule is day-granular: the runner fires day rules at the
+# sim-day boundary, 00:00Z. A Monday anchor therefore fires at Sunday
+# 17:00 PDT (16:00 PST) — a quiet hour, and the week's flatten is
+# waiting before Monday 09:00 America/Los_Angeles, which the schedule
+# has no finer grain to name. It shares that boundary with
+# `department-retros-weekly`.
+#
+# THE GUARD, AND WHY IT DOES NOT RETIRE THE CADENCE. A week with a
+# flatten still open opens no second one: the guard asks whether a
+# flatten ABOUT `docs-architecture-decisions` is open — the subject the
+# ad hoc run c98e5183 was filed under, so that run counts as this
+# week's. A bare `NOT open_job_exists` is the dedup that silently
+# retires a cadence (a-dedup-guard-silently-retires-a-cadence), and
+# this one is not silent BY SHAPE: a scheduled `jobs.spawn` with a
+# literal `(kind, subject)` and a guard on that same identity is what
+# `cadence_roster::clock_cadences` derives a watched cadence from, so
+# `cadence-silence-sweep-daily` measures it without a line of its own.
+# A flatten left open is reported there as SUPPRESSED, naming the
+# packet holding it, and becomes an alarm once the hold passes the
+# sweep's suppression window — three intervals, 21 days for a weekly
+# cadence (`SUPPRESSION_INTERVALS`). With no flatten open and none
+# arriving, the plain silence window is two intervals, 14 days.
+#
+# The release rule's flatten is about the RELEASE (`subject = id`), so
+# an open release flatten does not suppress this one, nor this one it:
+# the two openers answer different questions and are deduped
+# separately. Pinned by
+# crates/core/boss-dispatcher/tests/doc_flatten_weekly_rule.rs and, for
+# the silence roster, by the handlers crate's
+# the_silence_roster_covers_the_clock_rules.rs.
+[[rule]]
+name = "open-doc-flatten-weekly"
+why = """
+A TIMER, the standing exemption: no packet causes "a week passed", so
+no Workflow definition can declare it. `doc-flatten` keeps
+docs/architecture-decisions.md current and had 0 packets ever until an
+ad hoc run on 2026-09-27 (c98e5183), because its only opener fires on
+a cut release. David, 2026-09-27: "let us have a weekly timer". Opening
+a periodic chore is mechanical and belongs to the machine. It adds no
+routing: the flatten's own row owns survey -> fold -> curate -> verify
+-> review. One open flatten of the decision record suppresses the
+week's twin, and the silence sweep names that hold rather than letting
+it retire the cadence.
+"""
+version = 1
+when = 'NOT open_job_exists("doc-flatten", "docs-architecture-decisions")'
+schedule = { cadence = "weekly", anchor_date = "2026-09-28" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = '"doc-flatten"', subject_kind = '"custom"', subject = '"docs-architecture-decisions"', title = '"Documentation flatten — the weekly fold"', "metadata.trigger" = '"weekly"', "metadata.area" = '"docs"' }

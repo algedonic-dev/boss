@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# preflight: serial — reads the live rule registry off the dispatcher through lib/sor-read.sh, waiting out a roll; one reader of the record per pre-flight
 #
 # the-live-rules-are-the-authored-rules — the dispatcher-rule registry
 # the running system enforces is DERIVED from the authored directory, and
@@ -74,6 +75,13 @@
 # receipt (`refused`, not `failed`), which the conductor relaunches and
 # strikes no car for.
 #
+# UNLESS THE RUN DECLARES NO ESTATE. `BOSS_ESTATE=none` (the public
+# mirror's workflow, and only it) says there is no dispatcher to read:
+# the tree half runs, the live comparison is not attempted, the lint
+# says so with lib/no-estate.sh's marker and exits 0, and the gate
+# names it on the receipt. Unset, the refusal above stands (backlog
+# 3e63662c).
+#
 # Usage:  infra/lint/the-live-rules-are-the-authored-rules.sh
 #   BOSS_DISPATCHER_URL  read surface base (default: the in-cluster
 #                        machine door, boss-dispatcher-internal:7950,
@@ -86,6 +94,12 @@ cd "$(dirname "$0")/../.." || exit 1
 . infra/lint/lib/scanned.sh || exit 3
 # shellcheck source=infra/lint/lib/git-answer.sh
 . infra/lint/lib/git-answer.sh || exit 3
+# The live read waits out a rollout before it refuses (backlog 834ddb7c).
+# shellcheck source=infra/lint/lib/sor-read.sh
+. infra/lint/lib/sor-read.sh || exit 3
+# BOSS_ESTATE=none skips the live half, and only it (backlog 3e63662c).
+# shellcheck source=infra/lint/lib/no-estate.sh
+. infra/lint/lib/no-estate.sh || exit 3
 
 RULES_DIR="infra/dispatcher/rules"
 BASE="${BOSS_DISPATCHER_URL:-http://boss-dispatcher-internal.boss.svc.cluster.local:7950}"
@@ -121,12 +135,21 @@ skip() {
     exit "$LINT_CANNOT_ANSWER"
 }
 
+# A run with no estate at all (the public mirror) says so rather than
+# being refused on every run for a route it will never have (backlog
+# 3e63662c; lib/no-estate.sh). The tree half above has already run; the
+# count is of what it read, and the line says what it did not compare.
+if lint_no_estate the-live-rules-are-the-authored-rules "the dispatcher's live rule registry ($URL)"; then
+    lint_scanned the-live-rules-are-the-authored-rules "${#files[@]}" "authored rule file(s) — the tree half only; the live comparison was NOT made"
+    exit 0
+fi
+
 command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
 command -v python3 >/dev/null 2>&1 || skip "python3 is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(curl -sS -m 10 -o "$body" -w '%{http_code}' "$URL" 2>/dev/null)
+code=$(lint_sor_read the-live-rules-are-the-authored-rules "the dispatcher" "$URL" "$body")
 # 000 is curl's "never got an answer" — no route, refused, timed out.
 [ "$code" = "200" ] || skip "$URL answered HTTP $code"
 
@@ -145,6 +168,15 @@ try:
 except Exception as e:
     print(f"unparseable: {e}", file=sys.stderr)
     sys.exit(3)
+# A non-empty `error` is the dispatcher saying WHY it read nothing —
+# the feed's failure shape, `rules: []` beside the reason. Since the
+# guest-reads car (train #744) an unscoped caller is answered exactly
+# that, "…withheld…", and this lint counted the empty list as zero
+# enforced rules (backlog e76582c1). The reason is the finding.
+err = doc.get("error") if isinstance(doc, dict) else None
+if isinstance(err, str) and err.strip():
+    print(err.replace("\t", " ").replace("\n", " "))
+    sys.exit(6)
 rules = doc.get("rules") if isinstance(doc, dict) else None
 if not isinstance(rules, list):
     keys = sorted(doc) if isinstance(doc, dict) else type(doc).__name__
@@ -182,6 +214,17 @@ case "$?" in
     3) skip "the response did not parse as JSON — treated as no answer" ;;
     4) fail "$URL answered 200 with no \`rules\` array — a 200 from the wrong \
 surface, or an error body; either way nothing read the registry"
+       exit 1 ;;
+    # The dispatcher answered, and said why it gave no registry. That is
+    # a statement about this READ, not an empty registry: most often the
+    # caller's identity (lib/sor-read.sh signs every lint read as the
+    # platform's read role for exactly this reason), else policy being
+    # unable to answer. Named verbatim, never counted as zero.
+    6) fail "$URL answered 200 with an error and no registry: $read_out"
+       echo "" >&2
+       echo "  Nothing about the enforced rules was read, so nothing is claimed" >&2
+       echo "  about them. 'withheld' means the caller was not admitted to the" >&2
+       echo "  rules: check the x-boss-user lib/sor-read.sh sends (backlog e76582c1)." >&2
        exit 1 ;;
     5) fail "$URL reports ZERO enforced rules"
        echo "" >&2

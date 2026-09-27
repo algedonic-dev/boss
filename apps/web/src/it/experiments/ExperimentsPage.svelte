@@ -28,6 +28,8 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../../router';
   import type { Job, Step } from '../../jobs/types';
+  import { standingOf } from '../../jobs/position';
+  import { fetchEvery, wholeOrThrow } from '../../data/paginated';
 
   type LoadState =
     | { kind: 'loading' }
@@ -39,13 +41,14 @@
   async function fetchExperiments(): Promise<void> {
     load = { kind: 'loading' };
     try {
-      const res = await fetch('/api/jobs?kind=protocol-experiment&limit=200');
-      if (!res.ok) {
-        load = { kind: 'failed', message: `the jobs API answered ${res.status}` };
-        return;
-      }
-      const body = await res.json();
-      const jobs = (body?.data ?? body ?? []) as ReadonlyArray<Job>;
+      // EVERY experiment, running and concluded: the archive is the
+      // point of the page, and one page of 200 would have dropped the
+      // oldest conclusions in silence once the kind passed 200
+      // (backlog b68a9dde). A read that stops short fails, saying how
+      // many of how many it held.
+      const jobs = wholeOrThrow(
+        await fetchEvery<Job>('/api/jobs?kind=protocol-experiment&full=true'),
+      );
       load = { kind: 'ready', jobs };
     } catch (e) {
       load = { kind: 'failed', message: e instanceof Error ? e.message : String(e) };
@@ -77,11 +80,10 @@
     return typeof v === 'string' ? v : v == null ? '' : String(v);
   };
 
-  /// The step someone can act on now — what the experiment is waiting for.
-  const waitingOn = (j: Job): string => {
-    const s = stepsOf(j).find((x) => x.status === 'ready' || x.status === 'active');
-    return s?.spec_slug ?? '';
-  };
+  /// The step someone can act on now — what the experiment is waiting
+  /// for — with its status beside it, so a terminal like `promoted`
+  /// standing ready does not read as already promoted (3102fe7a).
+  const waitingOn = (j: Job): string => standingOf({ ...j, steps: [...stepsOf(j)] }) ?? '';
 
   const outcomeOf = (j: Job): string => {
     const o = (j.metadata as Record<string, unknown> | undefined)?.outcome;
@@ -183,12 +185,12 @@
   .exp-msg,
   .exp-empty,
   .exp-note {
-    color: var(--text-muted);
+    color: var(--static);
     font-size: 0.9rem;
   }
   .exp-failed {
-    border: 1px solid var(--danger, #b3261e);
-    border-radius: var(--radius, 6px);
+    border: 1px solid var(--err);
+    border-radius: var(--radius);
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
   }
@@ -200,12 +202,12 @@
     margin: 1.25rem 0 0.5rem;
   }
   .exp-count {
-    color: var(--text-muted);
+    color: var(--static);
     font-weight: 400;
   }
   .exp-card {
     border: 1px solid var(--border);
-    border-radius: var(--radius, 6px);
+    border-radius: var(--radius);
     padding: 0.75rem 1rem;
     margin-bottom: 0.75rem;
   }
@@ -221,7 +223,7 @@
   .exp-waiting,
   .exp-outcome {
     font-size: 0.8rem;
-    color: var(--text-muted);
+    color: var(--static);
     white-space: nowrap;
   }
   .exp-dl {
@@ -232,12 +234,12 @@
     font-size: 0.875rem;
   }
   .exp-dl dt {
-    color: var(--text-muted);
+    color: var(--static);
   }
   .exp-dl dd {
     margin: 0;
   }
   .exp-confounds {
-    color: var(--text-muted);
+    color: var(--static);
   }
 </style>

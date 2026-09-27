@@ -1,7 +1,7 @@
 [[invariant]]
 id = "protocol-data-agrees-between-record-and-runtime"
 claim = "The registry an operator can read is the registry the runtime obeys: protocol rows in the system of record and the rows the executing process evaluates are the same rows."
-source = "docs/design/protocol-cadence.md; packet c7775816; infra/postgres/schema/123-cadence-registry-reconcile.sql"
+source = "the protocol-cadence decision in docs/architecture-decisions.md; packet c7775816; infra/postgres/schema/123-cadence-registry-reconcile.sql"
 enforcement = "unenforced"
 mechanism = ""
 last_verified = ""

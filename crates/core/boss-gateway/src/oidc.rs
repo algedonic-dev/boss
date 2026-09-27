@@ -396,9 +396,25 @@ pub async fn callback(
         }
     };
 
+    // The same role rule local login applies (backlog e0996bca): a
+    // blank or unregistered row role is the visitor, never a writer —
+    // and a row naming break-glass is a visitor too, because only the
+    // hardware key mints that role (backlog 8f45e0b4).
+    let role = match crate::local_auth::session_role(
+        &state.audit,
+        crate::audit::AuthMethod::Oidc,
+        Some(&oidc.config.issuer),
+        &email,
+        &scope.role,
+    )
+    .await
+    {
+        Ok(role) => role,
+        Err(refusal) => return refusal,
+    };
     let mut sess = Session::new(&email, session::DEFAULT_TTL_SECONDS);
     sess.employee_id = Some(scope.id);
-    sess.role = Some(scope.role);
+    sess.role = Some(role.role.clone());
     sess.department = scope.department;
     sess.territory_account_ids = scope.territory_account_ids;
     sess.direct_report_ids = scope.direct_report_ids;
@@ -407,6 +423,7 @@ pub async fn callback(
         &email,
         sess.employee_id.as_deref(),
         crate::audit::AuthMethod::Oidc,
+        role.downgrade(),
     );
 
     let session_cookie = session::set_cookie(
@@ -473,9 +490,12 @@ mod tests {
 
     // ----------------------------------------------------------------
     // Flow tests against an ephemeral mock IdP + mock people-api.
-    // Serialized: bootstrap_email reads BOSS_PEOPLE_UPSTREAM from env.
+    // Serialized, and restored after: bootstrap_email and session_role
+    // read their upstreams from env (crate::login_doubles::UpstreamEnv).
     // ----------------------------------------------------------------
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::login_doubles::{
+        CLASSES_VAR, PEOPLE_VAR, UpstreamEnv, asked, mock_classes, mock_people_as,
+    };
 
     async fn mock_idp() -> String {
         use axum::routing::{get, post};
@@ -510,28 +530,186 @@ mod tests {
 
     /// people-api double: only the operator email has an employee row.
     async fn mock_people() -> String {
-        use axum::routing::get;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = axum::Router::new().route(
-            "/api/people/by-email/{email}/bootstrap",
-            get(
-                |axum::extract::Path(email): axum::extract::Path<String>| async move {
-                    if email == "op@example.com" {
-                        axum::Json(serde_json::json!({
-                            "id": "emp-op",
-                            "role": "platform-admin",
-                            "department": "platform",
-                        }))
-                        .into_response()
-                    } else {
-                        axum::http::StatusCode::NOT_FOUND.into_response()
-                    }
-                },
-            ),
+        mock_people_as("platform-admin").await
+    }
+
+    /// What one OIDC sign-in left behind: the response status, the
+    /// session it minted (if any), and the auth events it recorded.
+    struct SignIn {
+        status: StatusCode,
+        sess: Option<Session>,
+        events: Vec<boss_core::event::Event>,
+    }
+
+    /// Sign `op@example.com` in through the OIDC callback against a
+    /// people row carrying `row_role` and the registry at `classes`,
+    /// with the upstream addresses held by `env` until it drops.
+    async fn sign_in_with_row_role(
+        env: &mut UpstreamEnv,
+        row_role: &'static str,
+        classes: &str,
+    ) -> SignIn {
+        let idp = mock_idp().await;
+        let people = mock_people_as(row_role).await;
+        env.set(PEOPLE_VAR, &people);
+        env.set(CLASSES_VAR, classes);
+        let cap = Arc::new(crate::audit::testing::Captured::default());
+        let st = oidc_state_with_audit(&idp, crate::audit::AuthAudit::spawn(cap.clone()));
+        let cookie = encode_state_cookie(&st.session_key, "st-r", "ver-r");
+        let resp = callback(
+            State(st.clone()),
+            Query(CallbackQuery {
+                code: Some("code-r".into()),
+                state: Some("st-r".into()),
+                error: None,
+            }),
+            cookie_header(&cookie),
+        )
+        .await;
+        let status = resp.status();
+        let sess = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|c| c.starts_with(session::COOKIE_NAME))
+            .and_then(|c| c.split(';').next())
+            .and_then(|pair| pair.split_once('='))
+            .and_then(|(_, v)| Session::decode(v, &st.session_key).ok());
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        SignIn {
+            status,
+            sess,
+            events,
+        }
+    }
+
+    /// Backlog e0996bca (2026-09-25): an employee row whose role no live
+    /// `role` Class holds — a typo, a SQL-seeded row, a retired Class —
+    /// was minted as-is, and a role off the read-only floor wrote past
+    /// the edge. It signs in as the visitor now. The registry here holds
+    /// `quartermaster` on the DEPARTMENT axis only, which is not a role.
+    /// And the downgrade is on the record (backlog 8f45e0b4 item 3): the
+    /// succeeded event names the role the row held and the one minted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_role_no_role_class_holds_signs_in_as_a_visitor() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(Some(vec![
+            ("role", "engineering-agent"),
+            ("department", "quartermaster"),
+        ]))
+        .await;
+        let got = sign_in_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::FOUND, "the person still signs in");
+        let sess = got.sess.expect("a session is minted");
+        assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
+        assert_eq!(sess.employee_id.as_deref(), Some("emp-op"));
+        assert!(boss_core::roles::is_read_only_floor(sess.effective_role()));
+        assert!(asked(&counter) > 0);
+        assert_eq!(got.events.len(), 1, "{:?}", got.events);
+        assert_eq!(got.events[0].kind, "auth.login.succeeded");
+        assert_eq!(
+            got.events[0].payload["downgrade"],
+            serde_json::json!({ "from": "quartermaster", "to": "visitor" })
         );
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        base
+    }
+
+    /// THE CONTROL: the same row with its role registered on the role
+    /// axis signs in as itself, so the visitor above is the registry's
+    /// answer and not a lookup that never matches — and a login that
+    /// was not downgraded carries no `downgrade` field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_role_a_role_class_holds_signs_in_as_itself() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, _) = mock_classes(Some(vec![("role", "quartermaster")])).await;
+        let got = sign_in_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::FOUND);
+        assert_eq!(
+            got.sess.expect("minted").role.as_deref(),
+            Some("quartermaster")
+        );
+        assert_eq!(got.events[0].kind, "auth.login.succeeded");
+        assert!(got.events[0].payload.get("downgrade").is_none());
+    }
+
+    /// Backlog e0996bca item (2) / 315edfab item (2): an empty or
+    /// whitespace role is the visitor, settled without asking the
+    /// registry at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_row_role_signs_in_as_a_visitor_without_the_registry() {
+        let mut env = UpstreamEnv::lock().await;
+        for blank in ["", "   "] {
+            let (classes, counter) = mock_classes(None).await;
+            let got = sign_in_with_row_role(&mut env, blank, &classes).await;
+            assert_eq!(got.status, StatusCode::FOUND, "{blank:?}");
+            assert_eq!(
+                got.sess.expect("minted").role.as_deref(),
+                Some(boss_core::roles::VISITOR_ROLE),
+                "{blank:?}"
+            );
+            assert_eq!(asked(&counter), 0);
+        }
+    }
+
+    /// Backlog 8f45e0b4 (2026-09-27): a row naming break-glass signs in
+    /// through the IdP as the visitor, never as break-glass — the
+    /// emergency role is the hardware key's (break_glass.rs) and nothing
+    /// else's. The registry below would vouch for a `break-glass` role
+    /// Class if asked, and must not be asked. The downgrade is recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_break_glass_row_signs_in_through_the_idp_as_a_visitor() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(Some(vec![("role", "break-glass")])).await;
+        let got = sign_in_with_row_role(&mut env, "break-glass", &classes).await;
+        assert_eq!(got.status, StatusCode::FOUND);
+        let sess = got.sess.expect("minted");
+        assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
+        assert!(!boss_core::roles::can_administer_auth(
+            sess.effective_role()
+        ));
+        assert_eq!(asked(&counter), 0, "the registry is not asked");
+        assert_eq!(
+            got.events[0].payload["downgrade"],
+            serde_json::json!({ "from": "break-glass", "to": "visitor" })
+        );
+    }
+
+    /// The operator's login never waits on the registry: a platform role
+    /// is settled by core, so a registry that cannot answer is not asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_platform_role_signs_in_while_the_registry_cannot_answer() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(None).await;
+        let got = sign_in_with_row_role(&mut env, "platform-admin", &classes).await;
+        assert_eq!(got.status, StatusCode::FOUND);
+        assert_eq!(
+            got.sess.expect("minted").role.as_deref(),
+            Some(boss_core::roles::PLATFORM_ADMIN_ROLE)
+        );
+        assert_eq!(asked(&counter), 0);
+    }
+
+    /// A tenant role the registry cannot vouch for, because it cannot
+    /// answer, is refused loudly with no session — never minted as-is
+    /// (a writer), and never quietly minted as a visitor, which would
+    /// leave the person read-only for a day with nothing to say why.
+    /// Loud means on the record (backlog 8f45e0b4 item 3): the refusal
+    /// used to leave only a warn line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_role_is_refused_while_the_registry_cannot_answer() {
+        let mut env = UpstreamEnv::lock().await;
+        let (classes, counter) = mock_classes(None).await;
+        let got = sign_in_with_row_role(&mut env, "quartermaster", &classes).await;
+        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(got.sess.is_none(), "no session is minted");
+        assert!(asked(&counter) > 0);
+        assert_eq!(got.events.len(), 1, "{:?}", got.events);
+        let e = &got.events[0];
+        assert_eq!(e.kind, "auth.login.denied");
+        assert_eq!(e.payload["reason"], "role_unconfirmed");
+        assert_eq!(e.payload["method"], "oidc");
+        assert_eq!(e.payload["email_claimed"], "op@example.com");
+        assert!(e.payload.get("employee_id").is_none());
     }
 
     fn oidc_state(issuer: &str) -> Arc<LocalAuthState> {
@@ -546,7 +724,7 @@ mod tests {
             session_key: vec![9u8; 32],
             http: reqwest::Client::new(),
             audit,
-            guest_access: false,
+            guest_access: crate::local_auth::GuestAccess::Off,
             oidc: Some(OidcRuntime::new(OidcConfig {
                 issuer: issuer.to_string(),
                 client_id: "boss".into(),
@@ -569,10 +747,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn callback_mints_the_same_session_local_login_would() {
-        let _guard = ENV_LOCK.lock().await;
+        let mut env = UpstreamEnv::lock().await;
         let idp = mock_idp().await;
         let people = mock_people().await;
-        unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
+        env.set(PEOPLE_VAR, &people);
         let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
         let st = oidc_state_with_audit(&idp, crate::audit::AuthAudit::spawn(cap.clone()));
 
@@ -636,7 +814,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_email_with_no_employee_fails_closed() {
-        let _guard = ENV_LOCK.lock().await;
+        let mut env = UpstreamEnv::lock().await;
         // IdP that authenticates an email People has never heard of.
         use axum::routing::{get, post};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -668,7 +846,7 @@ mod tests {
             );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let people = mock_people().await;
-        unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
+        env.set(PEOPLE_VAR, &people);
         let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
         let st = oidc_state_with_audit(&base, crate::audit::AuthAudit::spawn(cap.clone()));
 
@@ -709,7 +887,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_state_mismatch_is_rejected_before_any_token_exchange() {
-        let _guard = ENV_LOCK.lock().await;
+        let _env = UpstreamEnv::lock().await;
         // The token endpoint records whether it was ever called:
         // rejection must happen BEFORE the exchange, or a forged
         // state still burns a single-use code.

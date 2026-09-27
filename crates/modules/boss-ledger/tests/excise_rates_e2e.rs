@@ -1,7 +1,8 @@
 //! End-to-end tests for graduated excise rates as registry data.
 //!
-//! The contract under test (docs/design/brewery-fidelity.md Q4,
-//! decided 2026-08-22): excise rates live in the
+//! The contract under test (brewery-fidelity Q4, packet 4a39c1df,
+//! decided 2026-08-22; the doc retired into docs/architecture-decisions.md
+//! §Simulator on 2026-09-27): excise rates live in the
 //! `excise_rate_schedules` registry, and `POST /api/ledger/tax-accruals`
 //! resolves the rate from it — splitting a batch across tiers by the
 //! jurisdiction's year-to-date taxed barrels — with a loud flat-rate
@@ -35,8 +36,8 @@ fn make_router(db: &TestDb) -> axum::Router {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     })
 }
 

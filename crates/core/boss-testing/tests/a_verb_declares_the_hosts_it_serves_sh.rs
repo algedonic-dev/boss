@@ -49,12 +49,13 @@ impl Tree {
         scratch::write_exec(&root.join(LINT), &body);
         copy_dir(&repo_root().join("infra/ops"), &root.join("infra/ops"));
         // The verbs' argv[0] scripts live in these three directories and
-        // the lint checks each is a file in the tree; `infra/lib` is what
+        // the lint checks each is a file in the tree. `infra/lib` — what
         // `infra/ops/verbs-allowlist.sh` sources its `jq_doc_file` guard
-        // from (d96e38ab), and the copied `infra/ops` above resolves it
-        // as a sibling. Symlinked rather than copied: this fixture varies
-        // the ESTATE and nothing else.
-        for dir in ["infra/cluster", "infra/forge", "infra/gcp", "infra/lib"] {
+        // from (d96e38ab) — is already here: `copy_lint_libs` carries it
+        // since backlog 834ddb7c, and the copied `infra/ops` above
+        // resolves it as a sibling. Symlinked rather than copied: this
+        // fixture varies the ESTATE and nothing else.
+        for dir in ["infra/cluster", "infra/forge", "infra/gcp"] {
             std::os::unix::fs::symlink(repo_root().join(dir), root.join(dir))
                 .unwrap_or_else(|e| panic!("link {dir}: {e}"));
         }
@@ -138,10 +139,9 @@ fn copy_dir(src: &Path, dst: &Path) {
         if from.is_dir() {
             copy_dir(&from, &to);
         } else {
-            std::fs::copy(&from, &to)
-                .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", from.display(), to.display()));
-            let mode = std::fs::metadata(&from).expect("metadata").permissions();
-            let _ = std::fs::set_permissions(&to, mode);
+            // infra/ops carries executables; copy_exec keeps their mode
+            // without this process holding them open (eed361e0).
+            boss_testing::copy_exec(&from, &to);
         }
     }
 }

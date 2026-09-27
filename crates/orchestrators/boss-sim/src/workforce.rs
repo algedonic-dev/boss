@@ -698,19 +698,23 @@ impl Workforce {
                     }
                     spent.insert((emp.clone(), day), so_far + commitment);
                 }
-                self.claim(job_id, step_id, &emp, &metadata, now)?;
+                let claimed = self.claim(job_id, step_id, &emp, &metadata, now)?;
                 delta.claimed += 1;
                 // An assigned zero-duration step completes the same pass —
                 // no point holding it. (Structural markers complete
                 // elsewhere: triggers are resolved at materialization, and
                 // outcome / milestone are completed by the dispatcher's
                 // marker handler — none are ever assigned to a worker.)
+                // It completes from the metadata the CLAIM wrote, not the
+                // row read before it, so the completion's diff never
+                // mistakes the claim's `started_at` for a key to write
+                // (backlog e39a9d2a).
                 if step_hours <= 0.0 {
                     self.complete(
                         job_id,
                         step_id,
                         kind,
-                        &metadata,
+                        &claimed,
                         &emp,
                         &sign_offs_required,
                         &authored_fields,
@@ -752,9 +756,16 @@ impl Workforce {
         Ok(delta)
     }
 
-    /// Ready → Active. Stamps `started_at` so the completion gate can
-    /// measure elapsed sim-time. Metadata is sent whole (PATCH-on-PUT
-    /// replaces it wholesale) so no existing keys are lost.
+    /// Ready → Active, through the claim door (design 611fbffd, clause b
+    /// of backlog 6ef4a36b): a step becomes Active only by a claim, and
+    /// this one is the simulated employee's own — signed as them, as the
+    /// sign-off is — so the record says "emp took this work", not
+    /// "automation:sim assigned emp and started the clock". Then stamps
+    /// `started_at` so the completion gate can measure elapsed sim-time,
+    /// through the step merge door (backlog e39a9d2a, design 93d2bddb
+    /// Stage 2); after the claim, so a refused claim writes nothing.
+    /// Answers the step's metadata as it now stands, so a same-pass
+    /// completion diffs against the stamp rather than the pre-claim read.
     fn claim(
         &self,
         job_id: &str,
@@ -762,23 +773,23 @@ impl Workforce {
         emp: &str,
         metadata: &Value,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<Value> {
+        self.post_claim(job_id, step_id, emp)?;
+        let stamp =
+            serde_json::Map::from_iter([("started_at".to_string(), json!(now.to_rfc3339()))]);
+        self.patch_step_metadata(job_id, step_id, &stamp, emp)?;
         let mut md = metadata.clone();
         if let Some(obj) = md.as_object_mut() {
-            obj.insert("started_at".to_string(), json!(now.to_rfc3339()));
+            obj.extend(stamp);
         }
-        let body = json!({
-            "status": "active",
-            "assignee_id": emp,
-            "metadata": md,
-        });
-        self.put_step(job_id, step_id, &body, emp)
+        Ok(md)
     }
 
     /// Active → Completed, attributed to `emp`. For a demand-gate step,
     /// reads real finished-goods stock to stamp the brew/oversupply
-    /// outcome the Workflow forks on. Co-signs in the same PUT when the
-    /// step needs sign-off (the sim-origin bypass authorizes it).
+    /// outcome the Workflow forks on. The fields it fills go through the
+    /// step merge door (only the keys it added or changed), then any
+    /// sign-off stamps, then a status-only PUT (backlog e39a9d2a).
     fn complete(
         &self,
         job_id: &str,
@@ -790,16 +801,12 @@ impl Workforce {
         authored_fields: &[(String, String)],
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let mut body = json!({
-            "status": "completed",
-            "completed_by": emp,
-        });
-        let obj = body.as_object_mut().expect("object");
         // Supply the step's required-at-done fields the executor would
-        // fill in. Start from the current metadata so PATCH-on-PUT keeps
-        // existing keys, then fill any required field the Workflow didn't
-        // already default.
-        let mut md = metadata.as_object().cloned().unwrap_or_default();
+        // fill in. Start from the current metadata so a field the
+        // Workflow already defaulted is never re-synthesized, then fill
+        // any required field still missing.
+        let incoming = metadata.as_object().cloned().unwrap_or_default();
+        let mut md = incoming.clone();
         self.fill_required_fields(kind, &mut md, step_id, now);
         // Inline authoring: the step's own required fields
         // are part of the completion contract too.
@@ -821,23 +828,20 @@ impl Workforce {
         // assigned, so the workforce never sees a gate — the gate decision
         // lives in boss-dispatcher's gate.resolve handler (the sim drives
         // only labor; see docs/architecture-decisions.md).
-        obj.insert("metadata".to_string(), Value::Object(md.clone()));
-        if sign_offs_required.is_empty() {
-            self.put_step(job_id, step_id, &body, emp)?;
-            self.note_completion(emp);
-            return Ok(());
+        // Only what this pass added or changed goes to the merge door;
+        // every key the step already holds unchanged stays where it is.
+        let filled: serde_json::Map<String, Value> = md
+            .into_iter()
+            .filter(|(k, v)| incoming.get(k) != Some(v))
+            .collect();
+        if !filled.is_empty() {
+            self.patch_step_metadata(job_id, step_id, &filled, emp)?;
         }
         // Sign-off contract: stamps attest the step's FINAL shape, so the
         // metadata the executor fills lands first, then the stamps,
         // then the status flip. Stamping happens as the role-matched
         // human — policy (the seeded step-signoff:<role> rules)
         // decides, no sim exemption.
-        self.put_step(
-            job_id,
-            step_id,
-            &json!({ "metadata": Value::Object(md) }),
-            emp,
-        )?;
         for role in sign_offs_required {
             self.post_sign_off(job_id, step_id, emp, role)?;
         }
@@ -995,6 +999,42 @@ impl Workforce {
         Ok(())
     }
 
+    /// `POST .../steps/{step}/claim` as the executing employee: the id is
+    /// theirs, so the claim door's compare-and-set admits the step the
+    /// dispatcher nominated them to, and the role is `system-sim` — the
+    /// shape `boss_policy_client::is_sim_identity` recognises,
+    /// so a sim instance's policy bypass admits it as it admits the
+    /// workforce's other calls.
+    fn post_claim(&self, job_id: &str, step_id: &str, emp: &str) -> Result<()> {
+        let path = format!("/api/jobs/{job_id}/steps/{step_id}/claim");
+        let url = service_url(&self.api_base, &path);
+        let user = json!({
+            "id": emp,
+            "role": "system-sim",
+            "access_tier": "user",
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+            "department": null,
+        })
+        .to_string();
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-boss-user", user)
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let ok = resp.status().is_success();
+        let role = self.role_of(emp);
+        self.record_employee_call("POST", &path, emp, role, ok);
+        if !ok {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            anyhow::bail!("POST {url} -> {status}: {text}");
+        }
+        debug!(%url, "workforce step claim ok");
+        Ok(())
+    }
+
     fn put_step(&self, job_id: &str, step_id: &str, body: &Value, emp: &str) -> Result<()> {
         let path = format!("/api/jobs/{job_id}/steps/{step_id}");
         let url = service_url(&self.api_base, &path);
@@ -1013,6 +1053,36 @@ impl Workforce {
             anyhow::bail!("PUT {url} -> {status}: {text}");
         }
         debug!(%url, "workforce step PUT ok");
+        Ok(())
+    }
+
+    /// The step merge door, `PATCH /api/jobs/{job}/steps/{step}/metadata`:
+    /// merges `patch`'s top-level keys into the step's stored metadata and
+    /// touches no other key (backlog e39a9d2a).
+    fn patch_step_metadata(
+        &self,
+        job_id: &str,
+        step_id: &str,
+        patch: &serde_json::Map<String, Value>,
+        emp: &str,
+    ) -> Result<()> {
+        let path = format!("/api/jobs/{job_id}/steps/{step_id}/metadata");
+        let url = service_url(&self.api_base, &path);
+        let resp = self
+            .client
+            .patch(&url)
+            .json(patch)
+            .send()
+            .with_context(|| format!("PATCH {url}"))?;
+        let ok = resp.status().is_success();
+        let role = self.role_of(emp);
+        self.record_employee_call("PATCH", &path, emp, role, ok);
+        if !ok {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            anyhow::bail!("PATCH {url} -> {status}: {text}");
+        }
+        debug!(%url, "workforce step metadata PATCH ok");
         Ok(())
     }
 
@@ -1674,5 +1744,220 @@ mod tests {
         let mut empty = serde_json::Map::new();
         wf.fill_required_fields("not-a-kind", &mut empty, "step-2", now);
         assert!(empty.is_empty());
+    }
+
+    /// Every request's `x-boss-user`, in the same arrival order as the
+    /// write log — who the sim signed each call as.
+    type Callers = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+    /// A stand-in jobs API on a loopback port: answers every request
+    /// `200 {}` and records `(method, path, body)` in arrival order —
+    /// the path with its query — and each call's signer beside it.
+    fn recording_api() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
+        Callers,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let callers: Callers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signed = callers.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let mut len = 0usize;
+                let mut user = Value::Null;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    if let Some((name, v)) = h.split_once(':')
+                        && name.eq_ignore_ascii_case("x-boss-user")
+                    {
+                        user = serde_json::from_str(v.trim()).unwrap_or(Value::Null);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                seen.lock().unwrap().push((method, path, body));
+                signed.lock().unwrap().push(user);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 2\r\nconnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        (base, log, callers)
+    }
+
+    /// A ZERO-DURATION STEP KEEPS ITS CLAIM STAMP (backlog e39a9d2a,
+    /// Stage 1). `work_step` claimed the step — a PUT whose metadata
+    /// added `started_at` — and then completed it in the same pass from
+    /// the metadata it had read BEFORE the claim. The step PUT replaces
+    /// metadata wholesale, so the completion cleared `started_at` by
+    /// omission, on every zero-duration step the sim ever worked.
+    #[test]
+    fn a_zero_duration_completion_carries_the_claims_started_at() {
+        let (base, log, _) = recording_api();
+        let wf = Workforce::new(
+            &base,
+            HashMap::from([("task".to_string(), 0.0)]),
+            HashMap::new(),
+        );
+        let row = json!({
+            "job_id": "job-1",
+            "step": { "id": "step-1", "kind": "task", "status": "ready",
+                      "assignee_id": "emp-aa-007", "metadata": { "brief": "b" } },
+        });
+        let delta = wf.work_step(&row, fixed_now()).unwrap();
+        assert_eq!((delta.claimed, delta.completed), (1, 1));
+
+        let writes = log.lock().unwrap().clone();
+        let puts: Vec<&Value> = writes
+            .iter()
+            .filter(|(m, p, _)| m == "PUT" && p == "/api/jobs/job-1/steps/step-1")
+            .map(|(_, _, b)| b)
+            .collect();
+        // The claim is the claim door's (design 611fbffd, clause b), so
+        // the one step PUT left is the completion.
+        assert_eq!(puts.len(), 1, "only the completion is a PUT: {writes:?}");
+        assert_eq!(puts[0]["status"], "completed");
+        // Stage 2 (design 93d2bddb): the stamp rides the merge door, so
+        // no later write can clear it by omission — the PUT carries no
+        // metadata at all.
+        assert!(
+            puts.iter().all(|b| b.get("metadata").is_none()),
+            "a step PUT carries no metadata: {writes:?}"
+        );
+        let patches = step_metadata_patches(&writes, "job-1", "step-1");
+        assert!(
+            patches[0]["started_at"].is_string(),
+            "the claim stamps started_at through the merge door: {writes:?}"
+        );
+        assert!(
+            patches.iter().all(|p| p.get("brief").is_none()),
+            "a key the step already holds unchanged is never re-sent: {writes:?}"
+        );
+    }
+
+    /// THE SIMULATED WORKER CLAIMS ITS STEP (design 611fbffd, clause b of
+    /// backlog 6ef4a36b). The workforce took a Ready step to Active with
+    /// `PUT {status: active, assignee_id: emp}` signed `automation:sim` —
+    /// the record said "someone assigned emp and started the clock", not
+    /// "emp took this work", and nothing but the claim door enforces
+    /// "release, then claim". It now claims through the door, signed as
+    /// the employee (the employee's id with role `system-sim`), so the
+    /// claim is emp's own — and only then stamps
+    /// `started_at`, so a refused claim writes nothing.
+    #[test]
+    fn the_simulated_worker_claims_its_step_through_the_claim_door() {
+        let (base, log, callers) = recording_api();
+        let wf = Workforce::new(
+            &base,
+            HashMap::from([("task".to_string(), 4.0)]),
+            HashMap::new(),
+        );
+        let row = json!({
+            "job_id": "job-3",
+            "step": { "id": "step-3", "kind": "task", "status": "ready",
+                      "assignee_id": "emp-aa-007", "metadata": {} },
+        });
+        let delta = wf.work_step(&row, fixed_now()).unwrap();
+        assert_eq!((delta.claimed, delta.completed), (1, 0));
+
+        let writes = log.lock().unwrap().clone();
+        let callers = callers.lock().unwrap().clone();
+        assert!(
+            writes.iter().all(|(m, _, _)| m != "PUT"),
+            "a claim is not a step PUT: {writes:?}"
+        );
+        let claim = writes
+            .iter()
+            .position(|(m, p, _)| m == "POST" && p == "/api/jobs/job-3/steps/step-3/claim")
+            .unwrap_or_else(|| panic!("the claim door was not called: {writes:?}"));
+        assert_eq!(
+            callers[claim]["id"], "emp-aa-007",
+            "the worker claims for itself: {callers:?}"
+        );
+        assert_eq!(callers[claim]["role"], "system-sim", "{callers:?}");
+        let stamp = writes
+            .iter()
+            .position(|(m, p, _)| m == "PATCH" && p.ends_with("/steps/step-3/metadata"))
+            .unwrap_or_else(|| panic!("started_at was not stamped: {writes:?}"));
+        assert!(
+            claim < stamp,
+            "the claim lands before the stamp: {writes:?}"
+        );
+        assert!(writes[stamp].2["started_at"].is_string(), "{writes:?}");
+    }
+
+    /// Every `PATCH .../steps/{step}/metadata` body, in arrival order.
+    fn step_metadata_patches(
+        writes: &[(String, String, Value)],
+        job: &str,
+        step: &str,
+    ) -> Vec<Value> {
+        let door = format!("/api/jobs/{job}/steps/{step}/metadata");
+        writes
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && *p == door)
+            .map(|(_, _, b)| b.clone())
+            .collect()
+    }
+
+    /// THE WORKFORCE WRITES STEP METADATA THROUGH THE MERGE DOOR (backlog
+    /// e39a9d2a, design 93d2bddb Stage 2). A sign-off completion used to
+    /// PUT the step's whole metadata back, then stamp, then PUT the
+    /// status: a read-merge-write the any-body refusal will refuse. It now
+    /// PATCHes only the keys it filled, BEFORE the stamps (they attest the
+    /// final shape), and flips the status with a PUT that carries none.
+    #[test]
+    fn a_sign_off_completion_merges_its_fields_then_stamps_then_flips() {
+        let (base, log, _) = recording_api();
+        let wf = Workforce::new(&base, HashMap::new(), HashMap::new());
+        let row = json!({
+            "job_id": "job-2",
+            "step": { "id": "step-2", "kind": "task", "status": "active",
+                      "assignee_id": "emp-aa-007",
+                      "sign_offs_required": ["qa"],
+                      "fields": [{ "name": "notes", "field_type": "string", "required": true }],
+                      "metadata": { "brief": "b", "started_at": "2025-01-01T00:00:00Z" } },
+        });
+        let delta = wf.work_step(&row, fixed_now()).unwrap();
+        assert_eq!(delta.completed, 1);
+
+        let writes = log.lock().unwrap().clone();
+        let order: Vec<&str> = writes
+            .iter()
+            .filter(|(_, p, _)| p.starts_with("/api/jobs/job-2/steps/step-2"))
+            .map(|(m, p, _)| match (m.as_str(), p.rsplit('/').next()) {
+                ("PATCH", Some("metadata")) => "merge",
+                ("POST", Some("sign-offs")) => "stamp",
+                ("PUT", _) => "put",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, ["merge", "stamp", "put"], "{writes:?}");
+        let patch = &step_metadata_patches(&writes, "job-2", "step-2")[0];
+        assert!(patch["notes"].is_string(), "the filled field: {patch}");
+        assert!(patch.get("brief").is_none() && patch.get("started_at").is_none());
+        let put = &writes.iter().find(|(m, _, _)| m == "PUT").unwrap().2;
+        assert_eq!(put["status"], "completed");
+        assert!(put.get("metadata").is_none(), "{put}");
     }
 }

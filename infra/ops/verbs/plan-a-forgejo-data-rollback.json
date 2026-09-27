@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY: renders what `roll-back-forgejo-data-move` WOULD do to put Forgejo back on the copy the move left on the root filesystem, and changes nothing (infra/forge/move-forgejo-data.sh --plan-rollback; backlog 016aeea3). It takes no param. It reads the state a move left, finished or not: exactly one /opt/forgejo/data.pre-move-<8 hex> directory on /, which is refused when absent or ambiguous; the fstab line for /opt/forgejo/data, which it will remove only when it is exactly the line move-forgejo-data writes; whether /opt/forgejo/data is mounted, and only as that bind; whether it is the empty mountpoint the move leaves; and whether Forgejo is running. The plan names each undo step with whether it applies, the literal fstab line, and that anything Forgejo wrote since the move stays in the moved copy and is NOT copied back. No clock in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/move-forgejo-data.sh", "--plan-rollback"],
+  "params": [],
+  "timeout": 300
+}

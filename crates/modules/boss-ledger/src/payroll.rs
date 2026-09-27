@@ -101,12 +101,38 @@ impl LineTotals {
     }
 }
 
-/// Insert a payroll run plus all its lines. Idempotent on `id` —
-/// a repeat insert with the same id returns the existing row (the
-/// UNIQUE PRIMARY KEY on `payroll_runs.id` does the work). Lines
-/// are inserted through `ON CONFLICT DO NOTHING` against the
-/// composite primary key so replays don't double-count.
-pub async fn create_run(pool: &PgPool, new: NewPayrollRun<'_>) -> Result<PayrollRun, LedgerError> {
+/// A payroll-run write plus whether it actually created the header.
+/// `inserted` is the idempotency guard doubling as the event gate, the
+/// `CreatedSettlement` shape: the caller records `finance.payroll.run`
+/// and `ledger.payroll.run` only when a run really landed, so a
+/// concurrent repeat cannot put a second run in the log.
+#[derive(Debug, Clone)]
+pub struct CreatedRun {
+    pub run: PayrollRun,
+    pub inserted: bool,
+}
+
+/// Insert a payroll run plus all its lines, inside the caller's
+/// transaction so the fact, the journal entry and the event commit with
+/// them or not at all. Idempotent on `id` — a repeat insert with the
+/// same id returns the existing row (the UNIQUE PRIMARY KEY on
+/// `payroll_runs.id` does the work) with `inserted = false`. Lines are
+/// inserted through `ON CONFLICT DO NOTHING` against the composite
+/// primary key so replays don't double-count.
+///
+/// Until 2026-09-27 this took the pool and committed its own
+/// transaction before the caller opened the one that records the fact
+/// (backlog 016a2763): a refused post (a locked period) or a crash left
+/// a run and its lines with no fact behind them, and every later POST
+/// of the same id short-circuited on the existing row, so the fact
+/// could never be recorded.
+///
+/// `xmax = 0` is Postgres's tell for "this RETURNING row came from the
+/// INSERT arm, not the DO UPDATE arm".
+pub async fn create_run_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new: NewPayrollRun<'_>,
+) -> Result<CreatedRun, LedgerError> {
     if new.employer_tax_cents < 0 {
         return Err(LedgerError::InvalidPayload {
             kind: "finance.payroll.run".to_string(),
@@ -121,11 +147,6 @@ pub async fn create_run(pool: &PgPool, new: NewPayrollRun<'_>) -> Result<Payroll
     }
     let totals = LineTotals::sum(new.lines)?;
 
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| LedgerError::Storage(e.to_string()))?;
-
     let header_row = sqlx::query(
         "INSERT INTO payroll_runs \
             (id, run_date, period_start, period_end, gross_cents, employer_tax_cents, \
@@ -134,7 +155,7 @@ pub async fn create_run(pool: &PgPool, new: NewPayrollRun<'_>) -> Result<Payroll
          ON CONFLICT (id) DO UPDATE SET updated_at = payroll_runs.updated_at \
          RETURNING id, run_date, period_start, period_end, gross_cents, \
                    employer_tax_cents, withheld_cents, net_cents, \
-                   employee_count, provider, status",
+                   employee_count, provider, status, (xmax = 0) AS inserted",
     )
     .bind(new.id)
     .bind(new.run_date)
@@ -146,9 +167,18 @@ pub async fn create_run(pool: &PgPool, new: NewPayrollRun<'_>) -> Result<Payroll
     .bind(totals.net_cents)
     .bind(totals.employee_count)
     .bind(new.provider)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    let inserted: bool = header_row.get("inserted");
+    if !inserted {
+        // The run already exists: its lines are the ones it landed
+        // with, and nothing of this call's is written.
+        return Ok(CreatedRun {
+            run: row_to_run(&header_row),
+            inserted,
+        });
+    }
 
     for line in new.lines {
         sqlx::query(
@@ -165,16 +195,15 @@ pub async fn create_run(pool: &PgPool, new: NewPayrollRun<'_>) -> Result<Payroll
         .bind(line.net_cents)
         .bind(&line.department)
         .bind(&line.role)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| LedgerError::Storage(e.to_string()))?;
-
-    Ok(row_to_run(&header_row))
+    Ok(CreatedRun {
+        run: row_to_run(&header_row),
+        inserted,
+    })
 }
 
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PayrollRun>, LedgerError> {

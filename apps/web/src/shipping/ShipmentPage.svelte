@@ -12,8 +12,15 @@
     type Shipment,
   } from './types';
   import { href } from '../router';
+  import { fetchPaged } from '../data/paginated';
+  import { ACCOUNTS_LIST_URL } from '../accounts/api';
+  import type { Account as AccountRow } from '../accounts/types';
 
-  type Account = { id: string; name: string };
+  // The shared row, not a local redeclaration: the accounts name column
+  // is nullable, and a local `name: string` told the checker otherwise
+  // (backlog 918af7bc; SupportPage made the same move in #567).
+  // EntityLink already falls back to the id for a null label.
+  type Account = Pick<AccountRow, 'id' | 'name'>;
 
   let { shipmentId } = $props<{ shipmentId: string }>();
 
@@ -33,17 +40,16 @@
     loading = true;
     (async () => {
       try {
-        const [sResp, pResp] = await Promise.all([
+        const [sResp, pPaged] = await Promise.all([
           fetch(`/api/shipping/shipments/${encodeURIComponent(targetId)}`),
-          fetch('/api/people/accounts'),
+          fetchPaged<Account>(ACCOUNTS_LIST_URL),
         ]);
         const sBody = sResp.ok ? ((await sResp.json()) as Shipment) : null;
-        const pBody = pResp.ok ? await pResp.json() : [];
         if (!cancelled) {
           shipment = sBody;
           loadFailed =
             sResp.ok || sResp.status === 404 ? null : `HTTP ${sResp.status}`;
-          accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
+          accounts = pPaged.kind === 'ready' ? [...pPaged.page.data] : [];
           loading = false;
         }
       } catch (e) {

@@ -7,7 +7,7 @@
 // and nothing on a step that was since completed, whose note is
 // history.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './_test';
 import { mountPage } from './_helpers';
 
 const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
@@ -30,7 +30,7 @@ const baseStep = {
   blocked_by: [],
   sign_offs_required: [],
   sign_offs: [],
-  completed_on: null,
+  completed_on: null as string | null,
   notes: null,
   fields: [],
   metadata: {

@@ -24,7 +24,9 @@
     }
     for (const child of children.flat()) {
       if (child == null || child === false) continue;
-      el.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+      // A string child is a Text node by append's definition (backlog
+      // 4a359b51 — the reason is at sign-off.js's h()).
+      el.append(child instanceof Node ? child : String(child));
     }
     return el;
   }
@@ -37,7 +39,7 @@
         }))
       : [];
     let saving = false;
-    const isDone = step.status === 'done';
+    const isDone = step.status === 'completed';
 
     function allChecked() {
       return items.length > 0 && items.every((i) => i.checked);
@@ -139,20 +141,14 @@
               await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...fresh, job_id: jobId, status: 'done' }),
+                body: JSON.stringify({ ...fresh, job_id: jobId, status: 'completed' }),
               });
             }
-          } else if (step.status === 'pending') {
-            // A save still flips a pending step active. Status cannot
-            // travel through the metadata PATCH, and the step PUT
-            // overlays — every field this body omits keeps its current
-            // value, the just-merged metadata included.
-            await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ job_id: jobId, status: 'active' }),
-            });
           }
+          // A save no longer flips a pending step active (design
+          // 611fbffd, clause b of backlog 6ef4a36b): a step becomes
+          // Active only through a claim, and a pending one is opened by
+          // its protocol's predicate, not by a save on a page.
         }
         onUpdate();
       } finally {
