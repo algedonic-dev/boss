@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::LedgerError;
+use crate::revenue_accounts::RevenueAccounts;
 use crate::rules::{BossRuleSet, RuleSet, cents_from_payload};
 use crate::types::{FactRef, JournalEntryDraft, JournalLineDraft};
 
@@ -393,11 +394,24 @@ fn render_memo(template: &str, payload: &Value) -> String {
 /// no connection and stays pure.
 pub struct DataRuleSet {
     rules: Vec<PostingRule>,
+    code: BossRuleSet,
 }
 
 impl DataRuleSet {
     pub fn new(rules: Vec<PostingRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            code: BossRuleSet::default(),
+        }
+    }
+
+    /// The code rules this set falls back to evaluate against the
+    /// instance's revenue-category Classes (backlog aa860c6d).
+    pub fn with_revenue_accounts(self, revenue_accounts: RevenueAccounts) -> Self {
+        Self {
+            code: BossRuleSet::new(revenue_accounts),
+            ..self
+        }
     }
 
     /// The newest registry rule for `kind`, if any.
@@ -413,13 +427,13 @@ impl RuleSet for DataRuleSet {
     /// The interpreter's version — the wrapped code rules' — so an
     /// entry's `rule_version_id` keeps naming the RuleSet that ran.
     fn version(&self) -> i32 {
-        BossRuleSet.version()
+        self.code.version()
     }
 
     fn evaluate(&self, fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
         match self.rule_for(fact.kind) {
             Some(rule) => evaluate_data_rule(rule, fact),
-            None => BossRuleSet.evaluate(fact),
+            None => self.code.evaluate(fact),
         }
     }
 }
@@ -820,7 +834,7 @@ lines = [
         let draft = evaluate(&rules, &fact("finance.invoice.paid", &payload)).unwrap();
         assert_eq!(draft.lines[0].account_code.as_ref(), "1000");
         assert_eq!(draft.lines[1].account_code.as_ref(), "1100");
-        assert_eq!(rules.version(), BossRuleSet.version());
+        assert_eq!(rules.version(), BossRuleSet::VERSION);
         assert!(matches!(
             evaluate(&rules, &fact("finance.nobody.knows", &payload)),
             Err(LedgerError::UnknownFactKind(_))

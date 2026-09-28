@@ -5,7 +5,7 @@
 instance (job 23fa024b) named CI as the long pole, and the
 2026-08-13 morning run measured the second one.
 **Related**: [deployment-as-network.md](./deployment-as-network.md) ·
-[protocol-experiments.md](./protocol-experiments.md) ·
+[protocol-experiments, folded into the decision record](../architecture-decisions.md) ·
 [internal-forge.md](./internal-forge.md)
 
 ---

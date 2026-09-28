@@ -19,58 +19,37 @@
 //! THE STAMP IS A ROW, NOT A BELIEF. One row per successful publish in
 //! `tenant_publishes` (infra/postgres/schema/20260918200200-…), append-
 //! only: the first row's date is what the launcher prints, a later row
-//! is the record of a republish and what it took. It is written by the
-//! verb through BOSS_POSTGRES_URL — the sim tenant's reset-baseline
-//! stamp is written the same way — because the stamp is a fact about THIS
-//! database, and the services container is where both the verb and
-//! the URL are. A publish run with no URL says so and leaves no row.
+//! is the record of a republish and what it took. The row projects a
+//! FACT in the log — one `tenant.published` event staged on the outbox
+//! in the same transaction (backlog dbdc4d31) — and the row stays as
+//! the launcher's fast read.
 //!
-//! THE ROW PROJECTS A FACT IN THE LOG (backlog dbdc4d31, 2026-09-19).
-//! Until this car the row was the only record: no audit_log event said
-//! "this database was published from `<boss_commit>` by `<actor>`, taking
-//! `<registries>`", and a publish that wrote N registry rows plus a
-//! stamp left nothing in the system of record for a rebuilder to see.
-//! Now every stamp stages ONE `tenant.published` event — payload = the
-//! stamp's columns, `_actor` = the actor it names — on the
-//! transactional outbox in the SAME transaction as the row, the door
-//! the ledger verbs use (`boss ledger lock` → record_ledger_event_in_tx
-//! → boss_events::outbox), and boss-event-relay lands it in audit_log
-//! post-commit. The row stays as the launcher's fast read.
+//! THE STAMP IS WRITTEN THROUGH THE JOBS API (backlog 42da8bd2). Until
+//! 2026-09-27 the verb wrote row and event straight into
+//! BOSS_POSTGRES_URL, so a publish from a seat with no database — the
+//! operator's `--door` route — printed "not stamped" and left NEITHER:
+//! measured that day, no `tenant.*` event had ever reached the live
+//! audit log, and the 2026-09-25 publish to prod that filed 42da8bd2 is
+//! on no record. Now the verb posts the stamp to `POST
+//! /api/tenant/publishes` on the same jobs service its other writes
+//! just went through (`boss_jobs::tenant_publishes`), on EVERY route:
+//! the transaction lives once, in the service, and the door credits the
+//! signed caller and answers with the stamp as recorded, which is what
+//! the verb prints. BOSS_POSTGRES_URL is now only the READ the
+//! launcher's guard makes (`boss tenant published`).
 //!
-//! A PORT WITH TWO ADAPTERS, the crate's shape: [`PublishStamps`] is
-//! what the verb needs, [`InMemoryStamps`] proves the verb's decisions
-//! without a database, [`PgStamps`] is the one the binary runs and is
-//! pinned against a real TestDb below.
+//! PORTS, the crate's shape: [`PublishStamps`] is the write the verb
+//! needs ([`HttpStamps`] in the binary), [`PublishedStamps`] the read
+//! the guard needs ([`PgStamps`]); `InMemoryStamps` proves the verb's
+//! decisions without either.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use boss_core::actor::ActorId;
-use boss_core::event::Event;
-use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 
-/// The one event kind a publish leaves: declared in event_kinds
-/// (20260919-a-tenant-publish-is-a-fact-in-the-log.sql), which the
-/// emitted-kinds-are-declared lint holds against this constant.
-pub const TENANT_PUBLISHED: &str = "tenant.published";
-
-/// One recorded publish — the row as `tenant_publishes` holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stamp {
-    pub tenant_id: String,
-    pub published_at: DateTime<Utc>,
-    /// The actor running the verb when one is named (BOSS_ACTOR, the
-    /// actor file); the launcher runs unnamed, and its writes were
-    /// signed `automation:tenant-seed`, so that is what it records.
-    pub published_by: String,
-    /// The publishing binary's build commit — never the tenant
-    /// directory's, which a ConfigMap delivers without a .git.
-    pub boss_commit: String,
-    /// What `--take` named on this run; empty for a plain publish.
-    pub took: Vec<String>,
-    /// How many doors the plan wrote through.
-    pub writes: i32,
-}
+pub use boss_jobs::tenant_publishes::{NewStamp, Stamp};
+#[cfg(test)]
+use boss_jobs::tenant_publishes::{TENANT_PUBLISHED, published_event};
 
 /// What the launcher reads: the first publish and how many there are.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,31 +61,6 @@ pub struct Published {
 
 fn rfc3339(t: &DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// PURE: the fact a stamp projects — `tenant.published` with the
-/// stamp's columns as its payload, signed as the actor the stamp
-/// names (one value, read from one place, so `published_by` and
-/// `_actor` cannot disagree). The event's own timestamp is minted
-/// wall-clock by the stamp builder, as every live record is;
-/// `published_at` rides in the payload as the column it is.
-pub fn published_event(stamp: &Stamp) -> Event {
-    // `ActorId: FromStr<Err = Infallible>`: every spelling parses.
-    let actor: ActorId = stamp
-        .published_by
-        .parse()
-        .unwrap_or_else(|never: std::convert::Infallible| match never {});
-    EventStamp::new("tenant", actor).event(
-        TENANT_PUBLISHED,
-        serde_json::json!({
-            "tenant_id": stamp.tenant_id,
-            "published_at": rfc3339(&stamp.published_at),
-            "published_by": stamp.published_by,
-            "boss_commit": stamp.boss_commit,
-            "took": stamp.took,
-            "writes": stamp.writes,
-        }),
-    )
 }
 
 impl Published {
@@ -127,28 +81,81 @@ impl Published {
     }
 }
 
-/// The port: what `boss tenant publish` and `boss tenant published`
-/// need from the database, and nothing else.
+/// The write `boss tenant publish` needs: record one publish, signed as
+/// `actor`, and hand back the stamp AS RECORDED — the door's receipt,
+/// not the verb's belief about it.
 #[async_trait]
 pub trait PublishStamps: Send + Sync {
-    /// The first publish recorded in this database, with the count,
-    /// or `None` for a database no publish has stamped.
-    async fn published(&self) -> Result<Option<Published>>;
-    /// Append one stamp AND the [`published_event`] it projects, as
-    /// one atomic write. Never updates, never deletes.
-    async fn record(&self, stamp: &Stamp) -> Result<()>;
+    async fn record(&self, stamp: &NewStamp, actor: &str) -> Result<Stamp>;
 }
 
-/// In memory, for the verb's tests: the same port, no database. Holds
-/// the rows and the events beside them, so a test reads what the
-/// adapter recorded on both sides.
+/// The read `boss tenant published` needs: the first publish recorded
+/// in this database, with the count, or `None` for a database no
+/// publish has stamped.
+#[async_trait]
+pub trait PublishedStamps: Send + Sync {
+    async fn published(&self) -> Result<Option<Published>>;
+}
+
+/// The jobs API's stamp door — the base is the SAME jobs base the
+/// publish's own writes went to (`Bases::jobs`: the machine door's jobs
+/// port, a gateway, or the in-pod localhost port), so the stamp lands
+/// in the instance that was published.
+pub struct HttpStamps {
+    base: String,
+    client: reqwest::Client,
+}
+
+impl HttpStamps {
+    pub fn new(base: &str) -> Result<Self> {
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+        })
+    }
+}
+
+#[async_trait]
+impl PublishStamps for HttpStamps {
+    async fn record(&self, stamp: &NewStamp, actor: &str) -> Result<Stamp> {
+        let url = format!("{}/api/tenant/publishes", self.base);
+        let resp = self
+            .client
+            .post(&url)
+            // Signed as the caller the verb runs as — the door credits
+            // this header's id as published_by, never a body field.
+            .header("x-boss-user", crate::identity::header(actor))
+            .json(stamp)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} (the tenant publish stamp)"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("POST {url} answered {status}: {text}");
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("POST {url} answered {status} with no stamp: {text}"))
+    }
+}
+
+/// In memory, for the verb's tests: both ports, no database. Holds the
+/// rows and the events beside them, so a test reads what was recorded
+/// on both sides.
 #[cfg(test)]
 #[derive(Default)]
-pub struct InMemoryStamps(std::sync::Mutex<Vec<(Stamp, Event)>>);
+pub struct InMemoryStamps(std::sync::Mutex<Vec<(Stamp, boss_core::event::Event)>>);
 
 #[cfg(test)]
 impl InMemoryStamps {
-    pub fn events(&self) -> Vec<Event> {
+    pub fn push(&self, stamp: Stamp) {
+        let event = published_event(&stamp);
+        self.0.lock().unwrap().push((stamp, event));
+    }
+
+    pub fn events(&self) -> Vec<boss_core::event::Event> {
         self.0
             .lock()
             .map(|rows| rows.iter().map(|(_, e)| e.clone()).collect())
@@ -159,17 +166,21 @@ impl InMemoryStamps {
 #[cfg(test)]
 #[async_trait]
 impl PublishStamps for InMemoryStamps {
+    async fn record(&self, stamp: &NewStamp, actor: &str) -> Result<Stamp> {
+        let st = stamp
+            .credited(actor, boss_clock_client::wall_now())
+            .map_err(anyhow::Error::msg)?;
+        self.push(st.clone());
+        Ok(st)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PublishedStamps for InMemoryStamps {
     async fn published(&self) -> Result<Option<Published>> {
         let rows = self.0.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(summarise(rows.iter().map(|(s, _)| s.clone())))
-    }
-
-    async fn record(&self, stamp: &Stamp) -> Result<()> {
-        self.0
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .push((stamp.clone(), published_event(stamp)));
-        Ok(())
     }
 }
 
@@ -188,7 +199,7 @@ fn summarise(rows: impl Iterator<Item = Stamp>) -> Option<Published> {
     })
 }
 
-/// The database. `BOSS_POSTGRES_URL` is the services container's
+/// The database, READ: `BOSS_POSTGRES_URL` is the services container's
 /// spelling (docker-compose.yml, the cluster manifests); the same one
 /// the sim tenant's baseline stamp and every service read.
 pub struct PgStamps(sqlx::PgPool);
@@ -210,7 +221,7 @@ impl PgStamps {
 }
 
 #[async_trait]
-impl PublishStamps for PgStamps {
+impl PublishedStamps for PgStamps {
     async fn published(&self) -> Result<Option<Published>> {
         let first: Option<(String, DateTime<Utc>, String, String, Vec<String>, i32)> =
             sqlx::query_as(
@@ -241,83 +252,37 @@ impl PublishStamps for PgStamps {
             last_at,
         }))
     }
-
-    async fn record(&self, stamp: &Stamp) -> Result<()> {
-        // The row and its fact commit or abort together: the event is
-        // staged on the outbox inside the row's transaction (backlog
-        // dbdc4d31), so a stamp never exists without the log entry a
-        // rebuilder would reproduce it from, nor the entry without
-        // the row.
-        let mut tx = self
-            .0
-            .begin()
-            .await
-            .context("opening the tenant publish stamp transaction")?;
-        sqlx::query(
-            "INSERT INTO tenant_publishes \
-             (tenant_id, published_at, published_by, boss_commit, took, writes) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(&stamp.tenant_id)
-        .bind(stamp.published_at)
-        .bind(&stamp.published_by)
-        .bind(&stamp.boss_commit)
-        .bind(&stamp.took)
-        .bind(stamp.writes)
-        .execute(&mut *tx)
-        .await
-        .context("recording the tenant publish stamp in tenant_publishes")?;
-        boss_events::outbox::record_event_in_tx(&mut tx, &published_event(stamp))
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("staging tenant.published on the event outbox")?;
-        tx.commit()
-            .await
-            .context("committing the tenant publish stamp and its event")?;
-        Ok(())
-    }
 }
 
-/// The one line `boss tenant publish` prints about its stamp. PURE
-/// over the port so the decisions are pinned without a database: no
-/// URL is a printed fact, not an error (an operator's workstation
-/// publishes through the gateway and holds no database), and a stamp
-/// that did not land after a publish that did IS an error — the
-/// launcher's contract is "published and stamped", and its retry
-/// republishes idempotently until both hold.
+/// The one line `boss tenant publish` prints about its stamp, rendered
+/// from the stamp the door RECORDED. A stamp that did not land after a
+/// publish that did IS an error — the launcher's contract is "published
+/// and stamped", and its retry republishes idempotently until both hold.
 pub async fn stamp_after_publish(
-    stamps: Option<&dyn PublishStamps>,
-    stamp: &Stamp,
+    stamps: &dyn PublishStamps,
+    stamp: &NewStamp,
+    actor: &str,
 ) -> Result<String> {
-    match stamps {
-        None => Ok(format!(
-            "not stamped: BOSS_POSTGRES_URL is unset here, so this publish leaves no row in \
-             tenant_publishes; the launcher's once-per-database guard reads that table (tenant {})",
-            stamp.tenant_id
-        )),
-        Some(s) => {
-            s.record(stamp).await?;
-            Ok(format!(
-                "stamped: tenant {} publish recorded in tenant_publishes at {} by {} (boss {}){}",
-                stamp.tenant_id,
-                rfc3339(&stamp.published_at),
-                stamp.published_by,
-                stamp.boss_commit,
-                if stamp.took.is_empty() {
-                    String::new()
-                } else {
-                    format!("; took {}", stamp.took.join(","))
-                }
-            ))
+    let recorded = stamps.record(stamp, actor).await?;
+    Ok(format!(
+        "stamped: tenant {} publish recorded in tenant_publishes at {} by {} (boss {}){}",
+        recorded.tenant_id,
+        rfc3339(&recorded.published_at),
+        recorded.published_by,
+        recorded.boss_commit,
+        if recorded.took.is_empty() {
+            String::new()
+        } else {
+            format!("; took {}", recorded.took.join(","))
         }
-    }
+    ))
 }
 
 /// `boss tenant published`'s verdict: the line and the exit code the
 /// launcher's guard reads — 0 stamped (the date is the first word), 1
 /// no stamp in this database. An unreadable database is the caller's
 /// error (exit 2 in the verb), never one of these.
-pub async fn published_verdict(stamps: &dyn PublishStamps) -> Result<(String, i32)> {
+pub async fn published_verdict(stamps: &dyn PublishedStamps) -> Result<(String, i32)> {
     Ok(match stamps.published().await? {
         Some(p) => (p.render(), 0),
         None => (
@@ -347,6 +312,15 @@ mod tests {
         }
     }
 
+    fn new_stamp(took: &[&str]) -> NewStamp {
+        NewStamp {
+            tenant_id: "acme".into(),
+            boss_commit: "478231fb".into(),
+            took: took.iter().map(|s| s.to_string()).collect(),
+            writes: 12,
+        }
+    }
+
     #[tokio::test]
     async fn an_unstamped_store_answers_none_and_exit_1() {
         let s = InMemoryStamps::default();
@@ -361,12 +335,8 @@ mod tests {
         let s = InMemoryStamps::default();
         // Recorded out of order: the FIRST by date is the stamp, not
         // the first written.
-        s.record(&stamp("acme", "2026-09-19T08:00:00", &["agents"]))
-            .await
-            .unwrap();
-        s.record(&stamp("acme", "2026-09-18T19:00:00", &[]))
-            .await
-            .unwrap();
+        s.push(stamp("acme", "2026-09-19T08:00:00", &["agents"]));
+        s.push(stamp("acme", "2026-09-18T19:00:00", &[]));
         let p = s.published().await.unwrap().unwrap();
         assert_eq!(p.first, stamp("acme", "2026-09-18T19:00:00", &[]));
         assert_eq!(p.count, 2);
@@ -380,9 +350,7 @@ mod tests {
     async fn renders_the_date_first() {
         // tenant-launch.sh reads `${stamp%% *}` as the date.
         let s = InMemoryStamps::default();
-        s.record(&stamp("acme", "2026-09-18T19:00:00", &[]))
-            .await
-            .unwrap();
+        s.push(stamp("acme", "2026-09-18T19:00:00", &[]));
         let (line, code) = published_verdict(&s).await.unwrap();
         assert_eq!(code, 0);
         assert_eq!(
@@ -390,9 +358,7 @@ mod tests {
             "2026-09-18T19:00:00Z tenant acme published by automation:tenant-seed (boss 478231fb); \
              1 publish, last 2026-09-18T19:00:00Z"
         );
-        s.record(&stamp("acme", "2026-09-19T08:00:00", &["agents"]))
-            .await
-            .unwrap();
+        s.push(stamp("acme", "2026-09-19T08:00:00", &["agents"]));
         let (line, _) = published_verdict(&s).await.unwrap();
         assert!(
             line.ends_with("2 publishes, last 2026-09-19T08:00:00Z"),
@@ -401,20 +367,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_url_is_a_printed_fact_and_a_store_records_the_stamp() {
-        let st = stamp("acme", "2026-09-18T19:00:00", &["employees", "agents"]);
-        let line = stamp_after_publish(None, &st).await.unwrap();
-        assert!(
-            line.starts_with("not stamped: BOSS_POSTGRES_URL is unset"),
-            "{line}"
-        );
-
+    async fn the_stamp_line_is_the_recorded_stamp_and_the_fact_rides_with_it() {
         let s = InMemoryStamps::default();
-        let line = stamp_after_publish(Some(&s), &st).await.unwrap();
-        assert_eq!(
-            line,
-            "stamped: tenant acme publish recorded in tenant_publishes at 2026-09-18T19:00:00Z \
-             by automation:tenant-seed (boss 478231fb); took employees,agents"
+        let line = stamp_after_publish(&s, &new_stamp(&["employees", "agents"]), "agent-claude")
+            .await
+            .unwrap();
+        assert!(
+            line.starts_with("stamped: tenant acme publish recorded in tenant_publishes at ")
+                && line.ends_with(" by agent-claude (boss 478231fb); took employees,agents"),
+            "{line}"
         );
         assert_eq!(s.published().await.unwrap().unwrap().count, 1);
         // The row is a projection; the FACT is the event recorded
@@ -423,48 +384,67 @@ mod tests {
         let events = s.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, TENANT_PUBLISHED);
-        assert_eq!(events[0].payload, published_event(&st).payload);
+        assert_eq!(events[0].payload["_actor"], "agent-claude");
     }
 
-    /// The event a publish leaves in the log — the stamp's columns as
-    /// the payload, signed by the actor the stamp names, so the
-    /// tenant_publishes row can be rebuilt from it (backlog dbdc4d31).
-    #[test]
-    fn the_published_event_carries_the_stamps_columns() {
-        let st = stamp("acme", "2026-09-18T19:00:00", &["employees", "agents"]);
-        let e = published_event(&st);
-        assert_eq!(e.kind, TENANT_PUBLISHED);
-        assert_eq!(e.kind, "tenant.published");
-        assert_eq!(e.source, "tenant");
-        assert_eq!(e.payload["tenant_id"], "acme");
-        assert_eq!(e.payload["published_at"], "2026-09-18T19:00:00Z");
-        assert_eq!(e.payload["published_by"], "automation:tenant-seed");
-        assert_eq!(e.payload["boss_commit"], "478231fb");
-        assert_eq!(
-            e.payload["took"],
-            serde_json::json!(["employees", "agents"])
-        );
-        assert_eq!(e.payload["writes"], 12);
-        // Provenance: `_actor` is the same value as published_by, read
-        // from one place, never two arguments that can disagree.
-        assert_eq!(e.payload["_actor"], "automation:tenant-seed");
-        assert_eq!(e.payload.as_object().unwrap().len(), 7);
-    }
-
-    /// The adapter the binary runs, against the real table: the SQL's
-    /// first-by-date, count and max agree with the in-memory answer.
+    /// The adapter the binary runs, against the REAL door (backlog
+    /// 42da8bd2): HttpStamps posts to `/api/tenant/publishes`, signed as
+    /// the actor, and prints what the door answered — a refusal is an
+    /// error naming the status, never a quiet "not stamped".
     #[tokio::test(flavor = "multi_thread")]
-    async fn pg_stamps_read_and_write_tenant_publishes() {
+    async fn http_stamps_record_through_the_jobs_door_signed_as_the_actor() {
+        let repo =
+            std::sync::Arc::new(boss_jobs::tenant_publishes::InMemoryTenantPublishes::default());
+        let app = boss_jobs::tenant_publishes::http::router(
+            boss_jobs::tenant_publishes::http::TenantPublishesApiState { repo: repo.clone() },
+        )
+        .layer(axum::middleware::from_fn(
+            boss_policy_client::request_context_middleware,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = HttpStamps::new(&base).unwrap();
+        let line = stamp_after_publish(&http, &new_stamp(&["departments"]), "agent-claude")
+            .await
+            .unwrap();
+        assert!(
+            line.contains(" by agent-claude (boss 478231fb); took departments"),
+            "{line}"
+        );
+        let rows = repo.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.published_by, "agent-claude");
+        assert_eq!(rows[0].1.payload["_actor"], "agent-claude");
+
+        // A door that refuses is an error that names the refusal.
+        let mut bad = new_stamp(&[]);
+        bad.tenant_id = String::new();
+        let err = stamp_after_publish(&http, &bad, "agent-claude")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"), "{err:#}");
+        assert_eq!(repo.rows().len(), 1);
+    }
+
+    /// The read the launcher's guard makes, against the real table the
+    /// jobs API's Pg adapter writes: the SQL's first-by-date, count and
+    /// max agree with the in-memory answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_stamps_read_what_the_door_adapter_wrote() {
+        use boss_jobs::tenant_publishes::{PgTenantPublishes, TenantPublishes};
         let db = boss_testing::TestDb::new().await;
         let pg = PgStamps::from_pool(db.pool.clone());
         assert_eq!(pg.published().await.unwrap(), None);
         let (_, code) = published_verdict(&pg).await.unwrap();
         assert_eq!(code, 1);
 
-        pg.record(&stamp("acme", "2026-09-19T08:00:00", &["agents"]))
+        let door = PgTenantPublishes::new(db.pool.clone());
+        door.record(&stamp("acme", "2026-09-19T08:00:00", &["agents"]))
             .await
             .unwrap();
-        pg.record(&stamp("acme", "2026-09-18T19:00:00", &[]))
+        door.record(&stamp("acme", "2026-09-18T19:00:00", &[]))
             .await
             .unwrap();
         let p = pg.published().await.unwrap().unwrap();
@@ -480,47 +460,5 @@ mod tests {
             line.starts_with("2026-09-18T19:00:00Z tenant acme"),
             "{line}"
         );
-
-        // The row is what was recorded — `took` as a text array, the
-        // write count — and nothing was updated in place.
-        let rows: Vec<(String, Vec<String>, i32)> = sqlx::query_as(
-            "SELECT tenant_id, took, writes FROM tenant_publishes ORDER BY published_at",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                ("acme".to_string(), vec![], 12),
-                ("acme".to_string(), vec!["agents".to_string()], 12),
-            ]
-        );
-
-        // Each row's fact is staged on the transactional outbox in
-        // the SAME transaction (backlog dbdc4d31): one tenant.published
-        // per stamp, payload = the columns, for the relay to land in
-        // audit_log.
-        let events: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
-            "SELECT source, kind, payload FROM event_outbox WHERE kind = $1 \
-             ORDER BY payload->>'published_at'",
-        )
-        .bind(TENANT_PUBLISHED)
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(events.len(), 2);
-        for (source, kind, payload) in &events {
-            assert_eq!(source, "tenant");
-            assert_eq!(kind, "tenant.published");
-            assert_eq!(payload["tenant_id"], "acme");
-            assert_eq!(payload["boss_commit"], "478231fb");
-            assert_eq!(payload["published_by"], "automation:tenant-seed");
-            assert_eq!(payload["_actor"], "automation:tenant-seed");
-            assert_eq!(payload["writes"], 12);
-        }
-        assert_eq!(events[0].2["published_at"], "2026-09-18T19:00:00Z");
-        assert_eq!(events[0].2["took"], serde_json::json!([]));
-        assert_eq!(events[1].2["took"], serde_json::json!(["agents"]));
     }
 }

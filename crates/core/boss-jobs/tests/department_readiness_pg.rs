@@ -87,6 +87,7 @@ fn packet(n: u8, kind: &str, status: JobStatus, metadata: Value) -> Job {
         status,
         priority: Priority::Standard,
         opened_on: day(2026, 9, 1 + u32::from(n)),
+        opened_at: None,
         due_on: None,
         closed_on: (status == JobStatus::Closed).then(|| day(2026, 9, 10 + u32::from(n))),
         metadata,
@@ -175,6 +176,7 @@ async fn fixture(wired: bool, rules: Option<Arc<dyn DispatcherRules>>) -> Fixtur
         jobs: jobs as Arc<dyn JobsRepository>,
         sensors: Some(Arc::new(sensors) as Arc<dyn Sensors>),
         rules,
+        classes: None,
     };
     Fixture {
         app: router(state),

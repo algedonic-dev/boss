@@ -194,6 +194,30 @@ SELECT name, version + 1, 'active', max_red_trains, 9
  LIMIT 1;
 ";
 
+/// A migration that retires a Class with a bare UPDATE — the shape
+/// 20260924172233 retired the refurb phases in on 2026-09-24, which put
+/// no `class.retired` fact in the log (backlog fa25700f).
+const NEW_CLASS_RETIRE: &str = "20261001000005-a-class-retired-the-old-way.sql";
+const NEW_CLASS_RETIRE_SQL: &str = "\
+-- 20261001000005 — a Class retired where no event is published.
+UPDATE classes c
+   SET retired_at = NOW(),
+       updated_at = NOW()
+ WHERE c.subject_kind = 'asset'
+   AND c.code = 'qa';
+";
+
+/// A migration that deletes a Workflow row with the keyword on its own
+/// line, then rewrites a SubjectKind through a schema-qualified name —
+/// two spellings a line-at-a-time `UPDATE classes` grep would miss.
+const NEW_REGISTRY_REWRITE: &str = "20261001000006-registry-rows-rewritten-the-old-way.sql";
+const NEW_REGISTRY_REWRITE_SQL: &str = "\
+-- 20261001000006 — registry rows changed where no event is published.
+DELETE
+  FROM workflows WHERE kind = 'old-kind';
+UPDATE ONLY public.subject_kinds SET metadata = '{}'::jsonb WHERE kind = 'x';
+";
+
 /// The scanner proves itself on every invocation and SAYS so.
 #[test]
 fn the_scanner_proves_itself_on_every_invocation() {
@@ -374,6 +398,152 @@ fn a_post_cutover_delivery_policy_insert_is_refused_naming_its_bundle() {
     assert!(
         !msg.contains(&format!("{SCHEMA}/{NEW_POLICY}:2")),
         "the retiring UPDATE is not a finding:\n{msg}"
+    );
+}
+
+/// BEHAVIOUR 4 (backlog fa25700f) — a migration that retires a Class
+/// with a bare UPDATE is refused by file, line and table, and the
+/// verdict names the evented doors and the facts they leave. A Class
+/// changed in SQL publishes nothing, so the audit log — the system of
+/// record — never learns the vocabulary moved.
+#[test]
+fn a_migration_that_updates_a_class_is_refused_naming_the_evented_door() {
+    let tree = Tree::new("class-update");
+    tree.migration(HISTORY, HISTORY_SQL)
+        .migration(NEW_SCHEMA, NEW_SCHEMA_SQL)
+        .migration(NEW_CLASS_RETIRE, NEW_CLASS_RETIRE_SQL);
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a migration that rewrites a Class must exit 1:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    for expect in [
+        &format!("{SCHEMA}/{NEW_CLASS_RETIRE}:2"),
+        "updates classes",
+        // the doors, and the facts they leave
+        "/api/classes/{subject_kind}/{code}/retire",
+        "class.retired",
+        "class.updated",
+    ] {
+        assert!(
+            msg.contains(expect),
+            "the verdict must name {expect:?}:\n{msg}"
+        );
+    }
+    assert!(
+        !msg.contains(&format!("{SCHEMA}/{NEW_SCHEMA}:")),
+        "an UPDATE of a bundle-declared table's new column is still a \
+         migration's business and must not be named:\n{msg}"
+    );
+}
+
+/// BEHAVIOUR 4, the other two tables and the other verb — a DELETE of a
+/// Workflow row whose keyword sits on its own line, and an UPDATE ONLY
+/// of a schema-qualified SubjectKind, are each refused at the line the
+/// statement starts on, each naming its own door.
+#[test]
+fn a_migration_that_deletes_a_workflow_or_updates_a_subject_kind_is_refused() {
+    let tree = Tree::new("registry-rewrite");
+    tree.migration(HISTORY, HISTORY_SQL)
+        .migration(NEW_REGISTRY_REWRITE, NEW_REGISTRY_REWRITE_SQL);
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a migration that rewrites registry rows must exit 1:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    for expect in [
+        &format!("{SCHEMA}/{NEW_REGISTRY_REWRITE}:2 deletes from workflows"),
+        &format!("{SCHEMA}/{NEW_REGISTRY_REWRITE}:4 updates subject_kinds"),
+        "infra/platform/workflows/",
+        "jobs.kind.retired",
+        "no write door",
+    ] {
+        assert!(
+            msg.contains(expect),
+            "the verdict must name {expect:?}:\n{msg}"
+        );
+    }
+}
+
+/// BEHAVIOUR 4, the ratchet's other half — a migration named in the
+/// lint's allowlist already ran on every instance and cannot be
+/// rewritten (migrations-append-only.sh), so it is admitted and the
+/// certificate says how many were; the same SQL under any other name is
+/// refused (the class-update test above).
+#[test]
+fn an_allowlisted_migration_is_history_and_is_admitted() {
+    let tree = Tree::new("allowlisted");
+    tree.migration(HISTORY, HISTORY_SQL).migration(
+        "20260924172233-the-refurb-asset-phases-retire.sql",
+        NEW_CLASS_RETIRE_SQL,
+    );
+    let out = tree.run();
+    assert!(
+        out.status.success(),
+        "an allowlisted migration must be admitted; got {:?}:\n{}",
+        out.status.code(),
+        text(&out)
+    );
+    let msg = text(&out);
+    assert!(
+        msg.contains("1 allowlisted"),
+        "the certificate must say an allowlisted write was admitted, not \
+         pretend the tree held none:\n{msg}"
+    );
+}
+
+/// The allowlist is a named set of real files, each with its reason —
+/// never a count, never a dead entry. An entry whose migration is gone
+/// would admit a NEW file that reused its name; an entry with no reason
+/// is a belief, not a record.
+#[test]
+fn every_allowlisted_migration_exists_and_says_why() {
+    let body = std::fs::read_to_string(lint()).expect("read the lint");
+    let entries: Vec<&str> = body
+        .lines()
+        .skip_while(|l| !l.starts_with("EVENTED_ALLOWLIST=("))
+        .skip(1)
+        .take_while(|l| l.trim() != ")")
+        .map(str::trim)
+        .filter(|l| l.starts_with('"'))
+        .collect();
+    assert!(
+        entries.len() >= 4,
+        "the allowlist must hold the four migrations measured on 2026-09-27 \
+         (01-registries.sql and the three Class UPDATEs): {entries:?}"
+    );
+    for entry in &entries {
+        let inner = entry.trim_matches('"');
+        let (file, reason) = inner
+            .split_once('|')
+            .unwrap_or_else(|| panic!("an entry is `file|reason`: {entry}"));
+        assert!(
+            repo_root().join(SCHEMA).join(file).is_file(),
+            "allowlisted migration {file} is not in {SCHEMA} — a dead entry \
+             admits whatever next takes its name"
+        );
+        assert!(
+            reason.split_whitespace().count() >= 5,
+            "allowlisted migration {file} must say why in a sentence: {reason:?}"
+        );
+    }
+    let tables = body
+        .lines()
+        .find_map(|l| l.strip_prefix("EVENTED_TABLES=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("the evented-registry list is declared once, on one line");
+    let tables: Vec<&str> = tables.split_whitespace().collect();
+    assert_eq!(
+        tables,
+        ["classes", "subject_kinds", "workflows"],
+        "the evented registries: dispatcher_rules is NOT here because \
+         no-migration-writes-a-dispatcher-rule.sh already owns it (§9a): {tables:?}"
     );
 }
 

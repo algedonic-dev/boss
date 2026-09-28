@@ -19,6 +19,7 @@
   } from './types';
   import { formatMoney } from '@boss/web-kit/ui/money';
   import type { Account } from '../accounts/types';
+  import { fetchAccountsPage } from '../accounts/api';
   import { href } from '../router';
 
   type Props = { invoiceId: string };
@@ -39,15 +40,12 @@
     fetchState = { kind: 'loading' };
     (async () => {
       try {
-        const [invResp, pResp] = await Promise.all([
+        const [invResp, pPaged] = await Promise.all([
           fetch(`/api/commerce/invoices/${encodeURIComponent(id)}`),
-          fetch('/api/people/accounts'),
+          fetchAccountsPage(),
         ]);
         if (cancelled) return;
-        if (pResp.ok) {
-          const body = await pResp.json();
-          accounts = Array.isArray(body) ? body : (body.data ?? []);
-        }
+        if (pPaged.kind === 'ready') accounts = [...pPaged.page.data];
         if (invResp.status === 404) {
           fetchState = { kind: 'notfound' };
           return;
@@ -105,7 +103,7 @@
     <header class="detail-hero">
       <h1 class="detail-title">Failed to load invoice</h1>
     </header>
-    <p class="empty">{fetchState.message}</p>
+    <p class="empty load-failed" role="alert">{fetchState.message}</p>
   {:else}
     {@const invoice = fetchState.invoice}
     {@const account = accounts.find((p) => p.id === invoice.account_id)}
@@ -154,7 +152,7 @@
               <dd>
                 {moneyFmt(taxCents)}
                 {#if invoice.tax_jurisdiction}
-                  <span class="mono" style="margin-left:8px; color:#78716c">
+                  <span class="mono" style="margin-left:8px; color:var(--static)">
                     {invoice.tax_jurisdiction}
                   </span>
                 {/if}
@@ -223,12 +221,12 @@
                   </tr>
                 {/each}
                 <tr>
-                  <td colspan="3" style="color:#78716c">Subtotal (revenue)</td>
+                  <td colspan="3" style="color:var(--static)">Subtotal (revenue)</td>
                   <td class="num">{moneyFmt(lineSumCents)}</td>
                 </tr>
                 {#if taxCents > 0}
                   <tr>
-                    <td colspan="3" style="color:#78716c">
+                    <td colspan="3" style="color:var(--static)">
                       Sales tax
                       {#if invoice.tax_jurisdiction}
                         <span class="mono" style="font-size:11px">{invoice.tax_jurisdiction}</span>

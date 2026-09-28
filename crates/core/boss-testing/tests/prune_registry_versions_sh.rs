@@ -338,7 +338,12 @@ impl Case {
         // minted token), `none`, or `other`. Answers come from $STUB_DIR
         // by URL shape; a DELETE is appended to $STUB_DELETES and answers
         // 204 unless `delete-code` (with `delete-body`) or
-        // `delete-fail-on` (a version) says otherwise. `-f` fails on a
+        // `delete-fail-on` (a version: 500) or `delete-gone-on` (a
+        // version: 404, deleted by someone else first) says otherwise. A
+        // version a DELETE removed (204, or the someone-else 404) leaves
+        // every later listing, so the re-list reads the effect; a
+        // `delete-code` answer removes nothing, and `delete-survives` (a
+        // version) answers 204 and stays listed. `-f` fails on a
         // 4xx with exit 22, the way curl does (landed_train_shas uses
         // -fsS).
         write_exec(
@@ -373,7 +378,15 @@ fi
 printf '%s %s auth=%s\n' "$method" "$url" "$auth" >> "$STUB_CURL_LOG"
 emit() { # <code> <body-file>
     local code="$1" body="$2"
-    if [ -n "$hdr" ]; then printf 'HTTP/1.1 %s\r\nX-Total-Count: %s\r\n\r\n' "$code" "$(cat "$STUB_DIR/total")" > "$hdr"; fi
+    if [ -n "$hdr" ]; then
+        # The forge's count is the registry NOW: what a DELETE removed
+        # is no longer counted. `total-text` sends a header that is not
+        # a number at all.
+        tot=$(cat "$STUB_DIR/total")
+        if [ -f "$STUB_DIR/total-text" ]; then tot=$(cat "$STUB_DIR/total-text")
+        else rmn=$(grep -c . "$STUB_DIR/removed" 2>/dev/null || true); tot=$((tot - ${rmn:-0})); fi
+        printf 'HTTP/1.1 %s\r\nX-Total-Count: %s\r\n\r\n' "$code" "$tot" > "$hdr"
+    fi
     if [ -n "$out" ]; then cat "$body" > "$out"; else cat "$body"; fi
     [ "$want_code" = 1 ] && printf '%s' "$code"
     if [ "$fail" = 1 ] && [ "$code" -ge 400 ]; then exit 22; fi
@@ -388,6 +401,26 @@ case "$url" in
         if [ -f "$STUB_DIR/list-code" ]; then emit "$(cat "$STUB_DIR/list-code")" "$STUB_DIR/list-body"; fi
         page=$(printf '%s' "$url" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
         f="$STUB_DIR/page-$page.json"; [ -f "$f" ] || f="$STUB_DIR/empty.json"
+        # After the first DELETE, the re-list can be made to lie:
+        # `relist-empty` answers [] for every page, `relist-short` [] from
+        # page 2 on, `relist-body` replaces page 1.
+        if [ -s "$STUB_DELETES" ]; then
+            [ -f "$STUB_DIR/relist-empty" ] && emit 200 "$STUB_DIR/empty.json"
+            if [ -f "$STUB_DIR/relist-short" ] && [ "$page" -ge 2 ]; then emit 200 "$STUB_DIR/empty.json"; fi
+            if [ -f "$STUB_DIR/relist-body" ] && [ "$page" = 1 ]; then emit 200 "$STUB_DIR/relist-body"; fi
+            # `relist-hide` (`name version`): a version nobody deleted
+            # vanishes from the re-list AND from its count, so the count
+            # agrees and only the positive control can see it.
+            if [ -f "$STUB_DIR/relist-hide" ] && ! grep -qxF "$(cat "$STUB_DIR/relist-hide")" "$STUB_DIR/removed" 2>/dev/null; then
+                cat "$STUB_DIR/relist-hide" >> "$STUB_DIR/removed"
+            fi
+        fi
+        # The registry as it stands NOW: a version a DELETE really
+        # removed is gone from every later listing (the re-list).
+        if [ -s "$STUB_DIR/removed" ]; then
+            jq -c --rawfile r "$STUB_DIR/removed" '($r | split("\n")) as $rm | map(select(((.name + " " + .version) as $k | $rm | index($k)) | not))' "$f" > "$STUB_DIR/page-now.json"
+            f="$STUB_DIR/page-now.json"
+        fi
         emit 200 "$f" ;;
     */v2/token*)
         [ "$auth" = basic-ok ] || emit 401 "$STUB_DIR/notfound.json"
@@ -404,8 +437,21 @@ case "$url" in
         [ "$auth" = basic-ok ] || emit 401 "$STUB_DIR/notfound.json"
         rest="${url#*/container/}"; name="${rest%%/*}"; ver="${rest#*/}"
         printf '%s %s\n' "$name" "$ver" >> "$STUB_DELETES"
+        # How many outcomes the list file already held when this DELETE
+        # was sent: one number per DELETE, so a test can see the file
+        # grow as the deletes happen rather than after the last one.
+        cat "$BOSS_PRUNE_LIST_DIR"/*.txt 2>/dev/null | grep -c '^deleted ' >> "$STUB_DIR/listed-before-delete"
         if [ -f "$STUB_DIR/delete-code" ]; then emit "$(cat "$STUB_DIR/delete-code")" "$STUB_DIR/delete-body"; fi
         if [ -f "$STUB_DIR/delete-fail-on" ] && [ "$ver" = "$(cat "$STUB_DIR/delete-fail-on")" ]; then emit 500 "$STUB_DIR/notfound.json"; fi
+        if [ -f "$STUB_DIR/delete-gone-on" ] && [ "$ver" = "$(cat "$STUB_DIR/delete-gone-on")" ]; then
+            printf '%s %s\n' "$name" "$ver" >> "$STUB_DIR/removed"
+            emit 404 "$STUB_DIR/notfound.json"
+        fi
+        # `delete-survives`: a 204 whose version stays listed — the
+        # answer without the effect.
+        if ! { [ -f "$STUB_DIR/delete-survives" ] && [ "$ver" = "$(cat "$STUB_DIR/delete-survives")" ]; }; then
+            printf '%s %s\n' "$name" "$ver" >> "$STUB_DIR/removed"
+        fi
         emit 204 /dev/null ;;
 esac
 echo "stub curl: unexpected url $url" >&2
@@ -566,7 +612,8 @@ fn refuses_a_missing_or_foreign_mode_or_keep_count() {
         (vec!["--yes"], "a foreign mode"),
         (vec!["--dry-run", "0"], "a zero keep count"),
         (vec!["--dry-run", "ten"], "a non-numeric keep count"),
-        (vec!["--dry-run", "10", "extra"], "a fourth word"),
+        (vec!["--dry-run", "10", "extra"], "a non-numeric ceiling"),
+        (vec!["--dry-run", "10", "8", "extra"], "a fourth word"),
     ] {
         let (rc, out) = c.run(&args);
         assert_eq!(rc, 2, "{why}: {out}");
@@ -931,6 +978,26 @@ fn the_real_run_deletes_exactly_the_planned_set_tags_first_and_records() {
         &["OK", "deleted 8", "df", "Forgejo"],
         "the closing line says what happened and what the bytes wait on",
     );
+    // Backlog 1bef55a6 (1): the verdict carries how much of the registry
+    // it could judge — the indexes read and the versions left
+    // unclassified — so a clean line says what it saw, not only what it
+    // did.
+    contains_all(
+        &out,
+        &[
+            "OK — deleted 8 of 8 planned version(s)",
+            "indexes read 13 of 13 tag(s), 100 percent; 2 unclassified kept",
+            "shown gone by a re-list",
+        ],
+        "the verdict names what it could judge",
+    );
+    assert_eq!(r["index"]["read_pct"], 100, "{r}");
+    assert_eq!(r["relist"]["done"], true, "{r}");
+    assert_eq!(r["relist"]["still_listed"], 0, "{r}");
+    assert_eq!(r["index"]["bearer"], true, "{r}");
+    assert_eq!(r["index"]["tags"], 13, "{r}");
+    assert_eq!(r["index"]["read"], 13, "{r}");
+    assert_eq!(r["gone"], 0, "{r}");
 }
 
 #[test]
@@ -982,6 +1049,560 @@ fn a_failed_delete_mid_way_stops_and_states_what_was_deleted() {
     let r = c.record(&out);
     assert_eq!(r["packages"]["boss"]["deleted"], 1, "{r}");
     assert_eq!(r["packages"]["boss"]["failed"], 1, "{r}");
+}
+
+// ---------------------------------------------------------------------------
+// The bounds an UNATTENDED run needs (backlog 8d77d670, the adversarial
+// review of the daily car): since design 97add747 a rule files this
+// delete every day with nobody reading the plan first, so every way the
+// keep set can come out smaller than the truth is a refusal here.
+// ---------------------------------------------------------------------------
+
+/// The trains, with one OPEN train that references a sha no closed
+/// train names (01d0001, old, otherwise deleted) and one that a closed
+/// train names too (1111111, contested).
+fn trains_with_open_references() -> String {
+    serde_json::json!({
+        "total": 3,
+        "data": [
+            {"status": "open", "steps": [
+                {"metadata": {"train_ref": "train/2026-09-17-0100@01d0001"}},
+                {"metadata": {"car_heads": ["1111111aaaabbbbccccddddeeeeffff000011112"]}}]},
+            {"status": "closed", "steps": [{"metadata": {"train_ref": "train/2026-09-17-0000@1111111"}}, {"metadata": {"merge_ref": "222222222222"}}]},
+            {"status": "closed", "steps": [{"metadata": {"train_ref": "train/2026-09-16-2300@1111111"}}]},
+        ]
+    })
+    .to_string()
+}
+
+/// M3 of the review. `landed_train_shas` answers the DISK SWEEP's
+/// question — which images are collectable — so it SUBTRACTS every sha
+/// an open train mentions. The prune used that answer as a KEEP set, so
+/// an open train made it keep LESS: an in-flight train's image, and a
+/// landed one an open train still names, were both deletable. The prune
+/// now keeps closed ∪ open.
+#[test]
+fn an_open_trains_sha_is_kept_by_the_prune() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("open-train-kept");
+    write_file(&c.stub.join("trains.json"), &trains_with_open_references());
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    let deleted = c.deleted();
+    for kept in [
+        "boss 01d0001".to_string(),
+        format!("boss-ci {}", forty("01d0001")),
+        format!("boss {}", digest("old1")),
+        "boss 1111111".to_string(),
+        format!("boss-ci {}", forty("1111111")),
+    ] {
+        assert!(
+            !deleted.contains(&kept),
+            "{kept} belongs to an OPEN train and was deleted: {deleted:?}\n{out}"
+        );
+    }
+    let r = c.record(&out);
+    assert_eq!(r["keep"]["landed_trains"], 2, "{r}");
+    assert!(
+        r["keep"]["open_trains"].as_u64().unwrap_or(0) >= 2,
+        "the record does not count the open trains' shas: {r}"
+    );
+    contains_all(
+        &out,
+        &["open train"],
+        "the kept reason names the open train",
+    );
+}
+
+/// Both meanings of the one read, pinned side by side: the sweep's
+/// COLLECTABLE set (closed minus open) and the prune's KEEP halves
+/// (closed, and open) — the lib answers each from the same reply.
+#[test]
+fn the_train_lookup_answers_collectable_and_keep_from_one_read() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("train-sets");
+    write_file(&c.stub.join("trains.json"), &trains_with_open_references());
+    let work = c.stub.join("sets");
+    std::fs::create_dir_all(&work).unwrap();
+    let lib = repo_root().join("infra/forge/landed-train-shas.lib.sh");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(
+            r#"set -uo pipefail
+. "$1"
+echo "landed: $(landed_train_shas curl http://sor.invalid:7900 20 t 2>/dev/null | paste -sd ' ')"
+train_sha_sets curl http://sor.invalid:7900 20 t "$2/closed" "$2/open" 2>/dev/null; echo "rc: $?"
+echo "closed: $(paste -sd ' ' "$2/closed")"
+echo "open: $(paste -sd ' ' "$2/open")"
+"#,
+        )
+        .arg("_")
+        .arg(&lib)
+        .arg(&work);
+    c.env(&mut cmd, &[]);
+    let out = cmd.output().expect("bash runs");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = |k: &str| -> Vec<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}: ")))
+            .unwrap_or_else(|| panic!("no `{k}:` line in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(line("rc"), vec!["0".to_string()], "{text}");
+    // The sweep: the contested sha is NOT collectable.
+    assert_eq!(line("landed"), vec!["2222222".to_string()], "{text}");
+    // The prune: both closed shas are keep keys, and the open train's.
+    assert_eq!(
+        line("closed"),
+        vec!["1111111".to_string(), "2222222".to_string()],
+        "{text}"
+    );
+    let open = line("open");
+    assert!(open.contains(&"01d0001".to_string()), "{text}");
+    assert!(open.contains(&"1111111".to_string()), "{text}");
+}
+
+/// M1 of the review. An untagged child that no LISTED tag references is
+/// an orphan only if the listing was whole: a short listing (fewer
+/// versions read than the forge's X-Total-Count) may have missed the tag
+/// that owns it, and deleting that child breaks the tag.
+///
+/// Made a refusal by the re-review of 1bef55a6 (finding 1): the short
+/// listing only held the orphans, and the rest was judged on it. With
+/// page 1 the newest versions and page 2 empty against a count of 25,
+/// the run planned 0, printed `deleted 0 of 0 … 100 percent; 0
+/// unclassified` and passed — the read percentage's denominator is the
+/// tags LISTED. Now a short listing, or a count that is not a number,
+/// deletes nothing and exits 2, and the count is proven digits before
+/// anything prints it (finding 3).
+#[test]
+fn a_listing_short_of_the_forges_count_is_refused() {
+    if !has("jq") {
+        return;
+    }
+    // More versions counted than listed.
+    let c = Case::new("short-listing");
+    write_file(&c.stub.join("total"), "30");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "REFUSED",
+            "the listing read 25 version(s) of the 30",
+            "Nothing was deleted",
+        ],
+        "a short listing",
+    );
+
+    // The reviewer's `trunc`: the second page never arrives.
+    let c = Case::new("trunc");
+    std::fs::remove_file(c.stub.join("page-2.json")).unwrap();
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "a truncated listing passed:\n{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &["REFUSED", "the listing read 20 version(s) of the 25"],
+        "trunc",
+    );
+    assert!(!out.contains("OK —"), "{out}");
+
+    // The reviewer's `inject`: a count that is not a number — here one
+    // shaped like the watch's own verdict — is refused, never printed,
+    // and nothing in the output reads as a verdict.
+    let c = Case::new("inject");
+    let injected = "OK x deleted 1 of 1 planned x listed 1 of 1 versions, indexes read 1 of 1 tag(s), 100 percent; 0 unclassified kept";
+    write_file(&c.stub.join("total-text"), injected);
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    assert!(out.contains("no numeric X-Total-Count"), "{out}");
+    assert!(
+        !out.contains(injected),
+        "the header reached the output:\n{out}"
+    );
+    assert!(
+        watch_groups(&out).is_none(),
+        "the watch reads a verdict in:\n{out}"
+    );
+
+    // A listing element that is not a version is a failure to read, not
+    // a page of fewer rows (re-review, finding 2).
+    let c = Case::new("bad-element");
+    let p2 = c.stub.join("page-2.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p2).unwrap()).unwrap();
+    v.as_array_mut().unwrap().push(serde_json::json!(7));
+    write_file(&p2, &v.to_string());
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 1, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    assert!(out.contains("cannot read as a version"), "{out}");
+}
+
+/// Re-review finding 2: the re-list had no completeness check and no
+/// positive control, so an empty or short re-list — holding none of the
+/// planned versions — read `OK — deleted 8 of 8` with nothing deleted.
+/// Each lie below fails the run. The forge's count after the deletes is
+/// 25 - 8 = 17.
+#[test]
+fn a_relist_that_cannot_show_the_registry_fails_the_run() {
+    if !has("jq") {
+        return;
+    }
+    for (name, file, body, needle) in [
+        (
+            "relist-empty",
+            "relist-empty",
+            "",
+            "the re-list read 0 version(s) of the 17",
+        ),
+        (
+            "relist-short",
+            "relist-short",
+            "",
+            "the re-list read 14 version(s) of the 17",
+        ),
+        (
+            "relist-bad-element",
+            "relist-body",
+            "[7]",
+            "cannot read as a version",
+        ),
+        (
+            "relist-hides-a-kept-version",
+            "relist-hide",
+            "boss bdf435d\n",
+            "version(s) this run KEPT are missing from the re-list (first: boss:bdf435d)",
+        ),
+    ] {
+        let c = Case::new(name);
+        write_file(&c.stub.join(file), body);
+        let (rc, out) = c.run(&["--for-real"]);
+        assert_eq!(
+            rc, 1,
+            "{name}: the run passed on a re-list that shows nothing:\n{out}"
+        );
+        assert!(!out.contains("OK —"), "{name}: an OK verdict:\n{out}");
+        contains_all(&out, &["FAILED", "could not be listed again", needle], name);
+        assert_eq!(c.record(&out)["relist"]["done"], false, "{name}");
+    }
+}
+
+/// M1, the other half, also a refusal since the re-review: every keep tag
+/// the cluster and the converge name — each live image, the rollback
+/// target, and `latest` — must be a LISTED version. One that is not means
+/// the listing does not show what is really there, and nothing is judged
+/// on it.
+#[test]
+fn a_listing_missing_a_keep_tag_is_refused() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("stamp-unlisted");
+    write_file(&c.stamp, "c0ffee1\n");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "REFUSED",
+            "keep tag(s) not in the listing",
+            "boss:c0ffee1 (stamp)",
+        ],
+        "the missing stamp is named",
+    );
+
+    let c = Case::new("latest-unlisted");
+    let p1 = c.stub.join("page-1.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p1).unwrap()).unwrap();
+    v.as_array_mut()
+        .unwrap()
+        .retain(|e| e["version"] != "latest");
+    write_file(&p1, &v.to_string());
+    write_file(&c.stub.join("total"), "24");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(out.contains("boss:latest"), "{out}");
+
+    // The default fixture's listing is whole and names every keep tag.
+    let whole = Case::new("listing-whole");
+    let (rc, out) = whole.run(&["--dry-run"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("listed 25 of 25 versions"), "{out}");
+}
+
+/// M2 of the review: a per-run ceiling. The largest real run deleted
+/// 1,337 (2026-09-17, a catch-up); a daily run plans a few hundred. A
+/// plan beyond the fixed limit, or beyond a fraction of the two
+/// packages' versions, is a keep set that came out wrong more often than
+/// a registry that really grew — refused before the first DELETE, naming
+/// the numbers.
+#[test]
+fn a_plan_beyond_the_ceiling_is_refused_before_any_delete() {
+    if !has("jq") {
+        return;
+    }
+    // Each refusal names the lift that fits it (backlog 1bef55a6 (3) and
+    // its review, findings 3 and 5): past the absolute bound, the hand
+    // verb's max_delete at the plan plus 20% (8 -> 10), never the bare
+    // plan, which the next push would refuse again; past the fraction, a
+    // larger keep_trains, which keeps more and so plans less.
+    for (env, value, needles) in [
+        (
+            "BOSS_PRUNE_MAX_DELETE",
+            "5",
+            vec![
+                "8",
+                "5",
+                "prune-registry-versions --for-real 10 10",
+                "plus 20%",
+            ],
+        ),
+        (
+            "BOSS_PRUNE_MAX_PERCENT",
+            "20",
+            vec![
+                "8 of 24",
+                "20%",
+                "prune-registry-versions --for-real 20",
+                "keep_trains",
+            ],
+        ),
+    ] {
+        let c = Case::new(&format!("ceiling-{env}"));
+        let (rc, out) = c.run_env(&["--for-real"], &[(env, value.to_string())]);
+        assert_eq!(rc, 2, "{env}={value}: {out}");
+        assert!(c.deleted().is_empty(), "{env}: {:?}", c.deleted());
+        let mut all = needles.clone();
+        all.extend(["REFUSED", "ceiling", "Nothing was deleted"]);
+        contains_all(&out, &all, env);
+        // A dry run shows the plan and says a real run would refuse.
+        let (rc, out) = c.run_env(&["--dry-run"], &[(env, value.to_string())]);
+        assert_eq!(rc, 0, "{env} dry run: {out}");
+        contains_all(&out, &["would be REFUSED", "ceiling"], "dry run");
+    }
+    // The fixed defaults, read off the script: one number each, here.
+    let src = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert!(src.contains("MAX_DELETE_DEFAULT=1500"), "the limit");
+    assert!(
+        src.contains("${BOSS_PRUNE_MAX_DELETE:-$MAX_DELETE_DEFAULT}"),
+        "the limit's seam"
+    );
+    assert!(
+        src.contains("${BOSS_PRUNE_MAX_PERCENT:-90}"),
+        "the fraction"
+    );
+}
+
+/// Re-review finding 4: the lift a refusal names must WORK. Past both
+/// bounds, max_delete would refuse again at the fraction, so the knob
+/// named is keep_trains; and a plan of 2,501..3,000, whose plan-plus-20%
+/// is past the cap, is named the cap — which lifts it.
+#[test]
+fn a_ceiling_refusal_names_a_lift_that_works() {
+    if !has("jq") {
+        return;
+    }
+    // Past the absolute bound AND the fraction.
+    let c = Case::new("ceiling-both");
+    let (rc, out) = c.run_env(
+        &["--for-real"],
+        &[
+            ("BOSS_PRUNE_MAX_DELETE", "5".to_string()),
+            ("BOSS_PRUNE_MAX_PERCENT", "20".to_string()),
+        ],
+    );
+    assert_eq!(rc, 2, "{out}");
+    contains_all(
+        &out,
+        &[
+            "beyond the ceiling of 5 per run",
+            "ALSO past the 20% fraction (8 of 24)",
+            "which max_delete does not lift",
+            "prune-registry-versions --for-real 20",
+        ],
+        "past both bounds",
+    );
+    assert!(
+        !out.contains("prune-registry-versions --for-real 10 10"),
+        "a max_delete that the fraction would refuse was suggested:\n{out}"
+    );
+
+    // A plan of 2,608, under the fraction: 2,600 old orphans (deleted)
+    // beside 300 fresh ones (kept) — 2,608 of 2,924 is 89%.
+    let c = Case::new("ceiling-2608");
+    let p1 = c.stub.join("page-1.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p1).unwrap()).unwrap();
+    let (old, fresh) = (hours_ago(5 * 24), hours_ago(2));
+    let rows = v.as_array_mut().unwrap();
+    for i in 0..2600u64 {
+        rows.push(version(
+            90_000 + i,
+            "boss",
+            &digest(&format!("bulk-old-{i}")),
+            &old,
+        ));
+    }
+    for i in 0..300u64 {
+        rows.push(version(
+            95_000 + i,
+            "boss",
+            &digest(&format!("bulk-new-{i}")),
+            &fresh,
+        ));
+    }
+    write_file(&p1, &v.to_string());
+    write_file(&c.stub.join("total"), "2925");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "the plan deletes 2608 version(s), beyond the ceiling of 1500 per run",
+            "prune-registry-versions --for-real 10 3000",
+        ],
+        "a plan of 2608 is named the cap",
+    );
+    // …and the named lift lifts it (a dry run, so the 2,608 DELETEs are
+    // not sent through the stub).
+    let (rc, out) = c.run(&["--dry-run", "10", "3000"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!out.contains("would be REFUSED"), "{out}");
+    assert!(out.contains("would delete 2608 version(s)"), "{out}");
+}
+
+/// Backlog 1bef55a6 (3): the percentage bound GROWS WITH THE BACKLOG.
+/// The keep set is roughly constant (ten landed trains, the live image,
+/// the rollback target, a day of pushes), so after a gap the plan's
+/// share of the registry climbs toward 100% — past 90% after about
+/// eight days without a run (ee6caa74 planned 89.6%) — exactly when the
+/// registry most needs pruning. And a packet could not lift it: the
+/// ceiling came only from BOSS_PRUNE_MAX_*, which the runner never
+/// passes. So the HAND verb takes a third argument, `max_delete`: the
+/// number of deletions the person filing it accepts, read off a dry run.
+///
+/// Bounded, not approved (review finding 3). The first cut let it lift
+/// the fraction too, up to 99999, for any filer; the review held that.
+/// Now it replaces the ABSOLUTE bound only, at most twice its default
+/// (3000), and the fraction always holds — its lift is a larger
+/// keep_trains, which keeps more and so plans less. It is on the packet
+/// (the args), in the record, and it still binds. The daily verb admits
+/// no argument, so the unattended run keeps both bounds at default.
+#[test]
+fn the_hand_verb_names_the_ceiling_it_accepts_in_its_argv() {
+    if !has("jq") {
+        return;
+    }
+    // The absolute bound alone would refuse this plan: 8 is past 5.
+    let low = [("BOSS_PRUNE_MAX_DELETE", "5".to_string())];
+    let c = Case::new("ceiling-argv-lifts");
+    let (rc, out) = c.run_env(&["--for-real", "10", "10"], &low);
+    assert_eq!(
+        rc, 0,
+        "a named ceiling the plan fits was not honoured:\n{out}"
+    );
+    assert_eq!(c.deleted().len(), 8, "{:?}", c.deleted());
+    let r = c.record(&out);
+    assert_eq!(r["ceiling"]["max_delete"], 10, "{r}");
+    assert_eq!(
+        r["ceiling"]["max_percent"], 90,
+        "the fraction is never lifted: {r}"
+    );
+    assert_eq!(r["ceiling"]["source"], "argv", "{r}");
+
+    // The fraction holds whatever max_delete names: 8 of 24 is past 20%.
+    let c = Case::new("ceiling-argv-fraction-holds");
+    let (rc, out) = c.run_env(
+        &["--for-real", "10", "3000"],
+        &[("BOSS_PRUNE_MAX_PERCENT", "20".to_string())],
+    );
+    assert_eq!(rc, 2, "max_delete lifted the fraction:\n{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "REFUSED",
+            "8 of 24",
+            "20%",
+            "keep_trains",
+            "prune-registry-versions --for-real 20",
+        ],
+        "the fraction's lift is keeping more",
+    );
+
+    // The named number still binds: a plan past it is refused, and the
+    // refusal suggests the plan plus 20%.
+    let c = Case::new("ceiling-argv-binds");
+    let (rc, out) = c.run(&["--for-real", "10", "5"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "REFUSED",
+            "beyond the ceiling of 5 this run's max_delete named",
+            "prune-registry-versions --for-real 10 10",
+            "Nothing was deleted",
+        ],
+        "a plan past the named ceiling",
+    );
+
+    // The cap is twice the default, and 3000 itself is admitted.
+    let c = Case::new("ceiling-argv-cap");
+    let (rc, out) = c.run(&["--dry-run", "10", "3000"]);
+    assert_eq!(rc, 0, "{out}");
+
+    // Unnamed, the defaults hold and the record says where they came from.
+    let c = Case::new("ceiling-default-source");
+    let (rc, out) = c.run(&["--dry-run"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.record(&out)["ceiling"]["source"], "default", "{out}");
+
+    // The shape and the cap are re-checked by the script, not left to
+    // the allowlist.
+    for bad in ["0", "08", "ten", "3001", "10000", "100000"] {
+        let c = Case::new(&format!("ceiling-argv-bad-{bad}"));
+        let (rc, out) = c.run(&["--for-real", "10", bad]);
+        assert_eq!(rc, 2, "max_delete {bad:?} was admitted:\n{out}");
+        assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+        contains_all(&out, &["max_delete", "REFUSED"], bad);
+    }
+    let c = Case::new("ceiling-argv-too-many");
+    let (rc, _) = c.run(&["--for-real", "10", "8", "extra"]);
+    assert_eq!(rc, 2, "a fourth argument was admitted");
+}
+
+/// L2 of the review: each outcome reaches the list file as it happens,
+/// so a run killed mid-way (the runner's timeout) leaves the file saying
+/// what went, not only the plan.
+#[test]
+fn each_outcome_reaches_the_list_file_as_it_happens() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("outcomes-streamed");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    let seen = std::fs::read_to_string(c.stub.join("listed-before-delete")).unwrap();
+    let counts: Vec<&str> = seen.lines().collect();
+    assert_eq!(
+        counts,
+        vec!["0", "1", "2", "3", "4", "5", "6", "7"],
+        "the list file did not grow one outcome per DELETE:\n{out}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,24 +1995,312 @@ fn a_tag_whose_index_cannot_be_read_is_kept_and_so_are_all_orphans() {
     assert_eq!(r["packages"]["boss"]["unclassified"], 4, "{r}");
 }
 
+/// Backlog 1bef55a6 (1), the review of the daily car: with no bearer
+/// every tag's children are unknown and every orphan is held, so the
+/// plan is ZERO by construction — and until this the run said `OK —
+/// deleted 0 of 0 planned` and exited 0, which the watch's `deleted =
+/// planned` passes. Every night would pass while the registry grew ~9 GB
+/// a day. A run that could read no index judged nothing: it still
+/// prints its record (the unclassified list is the evidence), and then
+/// FAILS, naming why, so the watch files its alarm off the exit.
 #[test]
-fn no_bearer_means_no_index_is_readable_and_no_tag_is_deleted() {
+fn no_bearer_means_no_index_is_readable_and_the_run_fails_rather_than_passing() {
     if !has("jq") {
         return;
     }
-    let c = Case::new("no-bearer");
-    write_file(&c.stub.join("no-token"), "");
+    for mode in ["--for-real", "--dry-run"] {
+        let c = Case::new(&format!("no-bearer{mode}"));
+        write_file(&c.stub.join("no-token"), "");
+        let (rc, out) = c.run(&[mode]);
+        assert_eq!(
+            rc, 1,
+            "{mode}: a run that could read no index answered as if it had judged the registry:\n{out}"
+        );
+        assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+        contains_all(
+            &out,
+            &[
+                "/v2/token",
+                "401",
+                "FAILED",
+                "no manifest index could be read",
+                "indexes read 0 of 13",
+                "no bearer",
+            ],
+            "the token refusal is named, as a failure",
+        );
+        assert!(!out.contains("OK —"), "{mode}: an OK verdict:\n{out}");
+        assert!(!out.contains("DRY RUN —"), "{mode}: a plan verdict:\n{out}");
+        let r = c.record(&out);
+        assert_eq!(r["packages"]["boss"]["deleted"], 0, "{r}");
+        assert_eq!(r["packages"]["boss"]["delete"], 0, "{r}");
+        assert_eq!(r["index"]["bearer"], false, "{r}");
+        assert_eq!(r["index"]["tags"], 13, "{r}");
+        assert_eq!(r["index"]["read"], 0, "{r}");
+    }
+}
+
+/// The same zero plan reached the other way: a bearer is minted, and
+/// every manifest read fails (a scope the bearer lacks, a registry that
+/// answers 404 to all of them). No index read is no index read.
+#[test]
+fn a_bearer_that_reads_no_index_fails_the_run_too() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("no-index-read");
+    for entry in std::fs::read_dir(&c.stub).unwrap() {
+        let p = entry.unwrap().path();
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("index-"))
+        {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
     let (rc, out) = c.run(&["--for-real"]);
-    assert_eq!(rc, 0, "{out}");
+    assert_eq!(rc, 1, "{out}");
     assert!(c.deleted().is_empty(), "{:?}", c.deleted());
     contains_all(
         &out,
-        &["/v2/token", "401", "index"],
-        "the token refusal is named",
+        &[
+            "FAILED",
+            "no manifest index could be read",
+            "indexes read 0 of 13",
+            "every manifest read failed",
+        ],
+        "every index unreadable",
     );
     let r = c.record(&out);
-    assert_eq!(r["packages"]["boss"]["deleted"], 0, "{r}");
-    assert_eq!(r["packages"]["boss"]["delete"], 0, "{r}");
+    assert_eq!(r["index"]["bearer"], true, "{r}");
+    assert_eq!(r["index"]["read"], 0, "{r}");
+}
+
+/// Backlog 1bef55a6 (LOW): a version another run deleted first answers
+/// 404 — it is GONE, which is what the plan asked for. Counted apart
+/// from `deleted` in the record, it made the verdict read `deleted 7 of
+/// 8 planned`, and the watch's `deleted = planned` filed an urgent alarm
+/// for a run that did its whole job. It is done because the RE-LIST no
+/// longer holds it, not because its DELETE said 404; the verdict says
+/// how many answered 404, and the record keeps the two apart.
+#[test]
+fn a_version_already_gone_counts_as_done_in_the_verdict() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("gone");
+    write_file(&c.stub.join("delete-gone-on"), &digest("orphan-old"));
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    contains_all(
+        &out,
+        &[
+            "OK — deleted 8 of 8 planned version(s)",
+            "shown gone by a re-list",
+            "1 of them already gone (404)",
+            &format!("GONE boss:{}", digest("orphan-old")),
+        ],
+        "a concurrent 404 is done",
+    );
+    let r = c.record(&out);
+    assert_eq!(r["deleted"], 7, "{r}");
+    assert_eq!(r["gone"], 1, "{r}");
+    assert_eq!(r["packages"]["boss"]["gone"], 1, "{r}");
+    assert_eq!(r["relist"]["done"], true, "{r}");
+    assert_eq!(r["relist"]["still_listed"], 0, "{r}");
+}
+
+/// Review finding 1 of backlog 1bef55a6 — BLOCKING, and a regression
+/// the first cut made: with every DELETE answering 404 (a moved Forgejo
+/// route answers that to everything) the run said `OK — deleted 8 of 8`
+/// and exited 0 while the record said deleted 0, gone 8. A 404 is the
+/// forge's claim, not an effect: the run lists the registry again, the
+/// eight are all still there, and it fails, naming the answer.
+#[test]
+fn a_run_whose_every_delete_answers_404_fails() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("all-404");
+    write_file(&c.stub.join("delete-code"), "404");
+    std::fs::copy(c.stub.join("notfound.json"), c.stub.join("delete-body")).unwrap();
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(
+        rc, 1,
+        "every DELETE answered 404 and the run passed:\n{out}"
+    );
+    assert!(!out.contains("OK —"), "an OK verdict:\n{out}");
+    contains_all(
+        &out,
+        &[
+            "FAILED",
+            "every one of the 8 planned DELETEs answered 404",
+            "the re-list still holds 8",
+            "STILL LISTED boss:01d0001",
+            "(its DELETE answered 404)",
+        ],
+        "all 404",
+    );
+    let r = c.record(&out);
+    assert_eq!(r["deleted"], 0, "{r}");
+    assert_eq!(r["gone"], 8, "{r}");
+    assert_eq!(r["relist"]["still_listed"], 8, "{r}");
+}
+
+/// A DELETE that answered 204 and removed nothing: the re-list still
+/// holds the version, and the run fails naming it — whatever the answer.
+#[test]
+fn a_planned_version_the_relist_still_holds_fails_the_run() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("survivor");
+    write_file(&c.stub.join("delete-survives"), &digest("orphan-old"));
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 1, "a survivor passed:\n{out}");
+    assert!(!out.contains("OK —"), "an OK verdict:\n{out}");
+    contains_all(
+        &out,
+        &[
+            "FAILED",
+            "still holds 1 of the 8 planned version(s)",
+            "7 are shown gone",
+            &format!(
+                "STILL LISTED boss:{} — orphan: referenced by no tag (its DELETE answered 204)",
+                digest("orphan-old")
+            ),
+        ],
+        "a survivor is named",
+    );
+    let r = c.record(&out);
+    assert_eq!(r["deleted"], 8, "the DELETEs all answered 204: {r}");
+    assert_eq!(r["relist"]["still_listed"], 1, "{r}");
+}
+
+/// Review finding 2: a pass that read one index of thirteen planned
+/// nothing and said `OK — deleted 0 of 0`. Under 90% read, it fails.
+#[test]
+fn a_pass_that_read_under_ninety_percent_of_its_indexes_fails() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("one-index");
+    for entry in std::fs::read_dir(&c.stub).unwrap() {
+        let p = entry.unwrap().path();
+        let n = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if n.starts_with("index-") && n != "index-boss-latest.json" {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 1, "{out}");
+    assert!(!out.contains("OK —"), "an OK verdict:\n{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    contains_all(
+        &out,
+        &[
+            "FAILED",
+            "too few manifest indexes could be read",
+            "indexes read 1 of 13",
+            "7 percent read, under the 90 percent floor",
+        ],
+        "one index of thirteen",
+    );
+    assert_eq!(c.record(&out)["index"]["read_pct"], 7);
+}
+
+/// The daily watch's own pattern, off its rule file — the regex
+/// `ops.judge` reads the verdict with (the tag_release_sh precedent: one
+/// fact, two files, compiled here and run over the script's real
+/// output). Returns the groups of the last matching line.
+fn watch_groups(out: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let path =
+        boss_testing::dispatcher_rules_dir().join("watch-prune-registry-versions-daily.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let src = doc["rule"][0]["do"][0]["args"]["verdict_pattern"]
+        .as_str()
+        .expect("verdict_pattern");
+    let inner = src
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("not an expr string literal: {src}"));
+    let re = regex::Regex::new(inner).unwrap();
+    let line = out.lines().map(str::trim).rfind(|l| re.is_match(l))?;
+    let caps = re.captures(line)?;
+    Some(
+        re.capture_names()
+            .flatten()
+            .filter_map(|n| Some((n.to_string(), caps.name(n)?.as_str().to_string())))
+            .collect(),
+    )
+}
+
+/// The clean line carries, in the shape the watch captures, what it
+/// could judge — and the groups are what the dispatcher test's `when`
+/// is evaluated over (prune_registry_versions_daily_rule.rs).
+#[test]
+fn the_watch_captures_what_the_run_could_judge_from_its_real_line() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("watch-groups");
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    let g = watch_groups(&out).unwrap_or_else(|| panic!("the watch reads no verdict in:\n{out}"));
+    assert_eq!(g["deleted"], "8");
+    assert_eq!(g["planned"], "8");
+    assert_eq!(g["listed"], "25");
+    assert_eq!(g["total"], "25");
+    assert_eq!(g["read_pct"], "100");
+    assert_eq!(g["unclassified"], "2");
+    // Anchored at the line's start (re-review finding 3): the same text
+    // behind any other prefix is no verdict.
+    let verdict = out
+        .lines()
+        .find(|l| l.starts_with("prune-registry-versions: OK — "))
+        .expect("the OK line");
+    let elsewhere = format!("prune-registry-versions: registry: the forge counts {verdict}");
+    assert!(watch_groups(&elsewhere).is_none(), "{elsewhere}");
+}
+
+/// Review finding 2's second case: every created_at in a shape `date`
+/// cannot parse. Every index reads and the listing is whole, but every
+/// version is held unclassified and the plan is 0. The first review
+/// asked the watch to refuse `planned 0 with unclassified > 0`; the
+/// re-review (finding 5) dropped that clause, because the live registry
+/// always holds permanent non-sha tags (rust1.96) and it would alarm on
+/// every quiet day. So this reads, and the watch passes, as a whole
+/// listing that planned nothing — the groups are pinned here so that
+/// choice stays visible; `when` over them is pinned beside the rule.
+#[test]
+fn an_unparseable_created_at_plans_nothing_and_the_watch_reads_it_so() {
+    if !has("jq") {
+        return;
+    }
+    let c = Case::new("bad-created-at");
+    for page in ["page-1.json", "page-2.json"] {
+        let p = c.stub.join(page);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for row in v.as_array_mut().unwrap() {
+            row["created_at"] = serde_json::json!("27/09/2026 03:00 PDT");
+        }
+        write_file(&p, &v.to_string());
+    }
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(c.deleted().is_empty(), "{:?}", c.deleted());
+    let g = watch_groups(&out).unwrap_or_else(|| panic!("the watch reads no verdict in:\n{out}"));
+    assert_eq!(g["planned"], "0", "{out}");
+    assert_eq!(g["read_pct"], "100", "{out}");
+    assert_eq!((g["listed"].as_str(), g["total"].as_str()), ("25", "25"));
+    let unclassified: u32 = g["unclassified"].parse().unwrap();
+    assert!(unclassified > 0, "{out}");
+    assert!(out.contains("created_at does not parse"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,9 +2313,14 @@ fn the_verb_file_is_a_mutating_forge_verb_with_mode_and_an_optional_keep_count()
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(v["hosts"], serde_json::json!(["forge"]));
-    assert_eq!(v["argv"], serde_json::json!([SCRIPT, "{1}", "{2}"]));
+    assert_eq!(v["argv"], serde_json::json!([SCRIPT, "{1}", "{2}", "{3}"]));
     let params = v["params"].as_array().unwrap();
-    assert_eq!(params.len(), 2);
+    assert_eq!(params.len(), 3);
+    // Backlog 1bef55a6 (3): the ceiling a hand run accepts, named on the
+    // packet. Optional (absent, the script's defaults hold), and its
+    // shape is the script's own re-check: 1..3000, no leading zero.
+    assert_eq!(params[2]["name"], "max_delete");
+    assert_eq!(params[2]["optional"], true);
     assert_eq!(params[0]["name"], "mode");
     assert_eq!(
         params[0]["one_of"],
@@ -1438,6 +2352,16 @@ fn the_verb_file_is_a_mutating_forge_verb_with_mode_and_an_optional_keep_count()
         for bad in ["0", "01", "-1", "1000", "ten", "1 0", ""] {
             assert!(!matches(pat, bad), "keep pattern admits {bad:?}");
         }
+        let pat = params[2]["pattern"].as_str().unwrap();
+        for ok in ["1", "1500", "3000"] {
+            assert!(matches(pat, ok), "max_delete pattern refuses {ok}");
+        }
+        for bad in ["0", "08", "10000", "-5", "all", ""] {
+            assert!(!matches(pat, bad), "max_delete pattern admits {bad:?}");
+        }
+        // The runner's numeric ceiling is the script's cap: twice the
+        // default absolute bound (review finding 3).
+        assert_eq!(params[2]["max"], 3000, "{}", params[2]);
     }
     let about = v["about"].as_str().unwrap();
     assert!(about.starts_with("MUTATING"), "{about}");
@@ -1459,12 +2383,51 @@ fn the_verb_file_is_a_mutating_forge_verb_with_mode_and_an_optional_keep_count()
         about.contains("read:package") && about.contains("write:package"),
         "about names the scopes"
     );
+    assert!(
+        about.contains("max_delete") && about.contains("1bef55a6"),
+        "about names the ceiling a hand run may name, and why"
+    );
     // ~1,400 versions: one listing page per 50, one manifest read per
     // tag, one DELETE per version — minutes, not the runner's 30 s.
     assert!(v["timeout"].as_i64().unwrap() >= 600, "{}", v["timeout"]);
     let script = repo_root().join(SCRIPT);
     use std::os::unix::fs::PermissionsExt;
     assert!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o111 != 0);
+}
+
+/// The daily twin (backlog 8d77d670, design 97add747): the same script
+/// with `--for-real` FIXED in its argv, so the delete a dispatcher rule
+/// files is a verb of its own that can only be that delete (a rule COULD
+/// pass the hand verb an args list since 4d53fae2; the daily rule sets
+/// none). It is a MUTATING verb run with no human filing it, so
+/// its `about` must carry the authorisation the verbs README requires:
+/// David, the design that asked, and the day he answered it. The rule
+/// half is pinned in
+/// crates/core/boss-dispatcher/tests/prune_registry_versions_daily_rule.rs.
+#[test]
+fn the_daily_verb_is_the_real_run_with_its_authorisation_on_record() {
+    let path = repo_root().join("infra/ops/verbs/prune-registry-versions-daily.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["hosts"], serde_json::json!(["forge"]));
+    assert_eq!(v["argv"], serde_json::json!([SCRIPT, "--for-real"]));
+    assert_eq!(v["params"], serde_json::json!([]));
+    let about = v["about"].as_str().unwrap();
+    assert!(about.starts_with("MUTATING"), "{about}");
+    for needle in [
+        "David",
+        "2026-09-27",
+        "97add747",
+        "8d77d670",
+        "prune-registry-versions-daily",
+        "keep_trains",
+    ] {
+        assert!(
+            about.contains(needle),
+            "about does not name {needle}: {about}"
+        );
+    }
+    assert!(v["timeout"].as_i64().unwrap() >= 600, "{}", v["timeout"]);
 }
 
 /// §9a: the registry and the stamp file the script defaults to are the
@@ -1494,7 +2457,14 @@ fn the_registry_and_the_stamp_are_the_ones_the_converge_declares() {
     );
     // The landed shas come from the one lib the sweep reads, not a copy.
     want("landed-train-shas.lib.sh");
-    want("landed_train_shas ");
+    // Its halves, not the sweep's difference (backlog 8d77d670, M3):
+    // a keep set adds what open trains carry.
+    want("train_sha_sets ");
+    assert!(
+        !src.lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains("landed_train_shas ")),
+        "the prune reads the sweep's collectable set (closed minus open) as a keep set"
+    );
     // No trace: `set -x` would print the curl config's header.
     assert!(
         !src.lines()

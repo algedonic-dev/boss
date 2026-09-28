@@ -30,11 +30,11 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support'
-  | 'system-monitoring' | 'inbox' | 'shipping' | 'views' | 'system-feedback'
-  | 'vendors' | 'marketing-assets' | 'calendar' | 'schedule' | 'jobs'
+  | 'system-monitoring' | 'inbox' | 'shipping' | 'views'
+  | 'vendors' | 'marketing-assets' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
-  // as the legacy ADMIN footer; these route names exist so the
-  // surfaces can land in role-keyed Work lists per the
+  // as the legacy ADMIN footer; these route names exist so a role's
+  // Class row can name the surfaces in `metadata.surfaces` per the
   // three-axis IA simplifier ("administering is someone's job").
   | 'policy' | 'workflows' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
   // The executor network — who moves work and where it goes.
@@ -67,7 +67,7 @@ export type RouteName =
 export const ROUTES: ReadonlyArray<RouteName> = [
   'shop', 'exec', 'catalog', 'accounts', 'assets', 'sales', 'service',
   'parts', 'products', 'finance', 'people', 'qa', 'warehouse', 'support', 'system-monitoring',
-  'shipping', 'vendors', 'marketing-assets', 'calendar',
+  'shipping', 'vendors', 'marketing-assets',
   'schedule', 'jobs',
   'policy', 'workflows', 'system-step-plugins', 'system-dispatcher',
   'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-yard', 'system-estate', 'system-subjects', 'system-kb', 'auth-admin',
@@ -102,9 +102,9 @@ export function canSeeRoute(role: Role, route: RouteName, row?: RoleRow): boolea
   // there is nothing to gate. What a View can READ is still policed
   // by the endpoints it reads through.
   if (route === 'views') return true;
-  // Feedback triage is IT work; the board itself is readable by any
-  // operator, and the Job/step writes behind it are policy-gated.
-  if (route === 'system-feedback') return true;
+  // 'system-feedback' was an always-on route here until car N3 of
+  // design e765b3fc (2026-09-25): the feedback board is the receiving
+  // station's panel on the Department Map now, which `system-yard` gates.
   const declared = declaredSurfaces(row);
   return declared ? declared.includes(route) : true;
 }

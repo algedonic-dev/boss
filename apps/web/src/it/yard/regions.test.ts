@@ -3,15 +3,21 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   REGION_NAMES,
+  bandText,
+  compactCountText,
   countText,
-  floorHref,
   floorSelection,
+  kpiText,
   lampOf,
   parseRegions,
+  regionHref,
+  stateText,
   trendText,
   type Region,
   type Trend,
 } from './regions';
+import { parseRoute } from '../../router';
+import { territoryOf } from './world';
 
 // The IT system map (design 0524fc95, car 2): the region cards read
 // from ONE endpoint, /api/yard/regions (car 1), each a door to its
@@ -34,10 +40,15 @@ const region = (over: Partial<Region> = {}): Region => ({
   name: 'dock',
   count: 3,
   bound: null,
+  bound_kind: null,
+  unit: '',
   state: 'clear',
   why: '3 cars parked',
+  band: null,
   trend: trend(),
+  kpi: [],
   machines: [],
+  places: [],
   ...over,
 });
 
@@ -49,12 +60,13 @@ const PAYLOAD = {
     { name: 'dock', count: 3, bound: 5, state: 'clear', why: '3 cars parked', trend: { metric: 'dock wait', unit: 'hours', current: 4.25, previous: 3, samples: 6, previous_samples: 5 } },
     { name: 'gates', count: 1, bound: 3, state: 'troubled', why: '1 bay holds a corpse — gate-run past its own deadline', trend: { metric: 'gate duration', unit: 'minutes', current: 11, previous: 9.5, samples: 20, previous_samples: 18 } },
     { name: 'track', count: 0, bound: 1, state: 'clear', why: 'no train in transit', trend: { metric: 'time at CI', unit: 'minutes', current: null, previous: 14, samples: 0, previous_samples: 4 } },
-    { name: 'shed', count: 2, state: 'busy', why: '2 landed cars await their probe', trend: { metric: 'time to proven', unit: 'hours', current: 1, previous: 1.5, samples: 3, previous_samples: 7 } },
+    { name: 'shed', count: 2, state: 'attention', why: '2 landed cars await their probe', trend: { metric: 'time to proven', unit: 'hours', current: 1, previous: 1.5, samples: 3, previous_samples: 7 } },
     { name: 'arrivals', count: 17, state: 'clear', why: '17 trains arrived in the window', trend: { metric: 'arrivals', unit: 'per day', current: 17, previous: 12, samples: 17, previous_samples: 12 } },
     { name: 'garage', count: 0, state: 'clear', why: 'nothing gated red', trend: { metric: 'reds', unit: 'per day', current: 0, previous: 2, samples: 0, previous_samples: 2 } },
-    { name: 'receiving', count: 4, state: 'busy', why: '4 inbound, oldest 5 days', trend: { metric: 'inbound', unit: 'per day', current: 4, previous: 6, samples: 4, previous_samples: 6 } },
+    { name: 'receiving', count: 4, state: 'attention', why: '4 inbound, oldest 5 days', trend: { metric: 'inbound', unit: 'per day', current: 4, previous: 6, samples: 4, previous_samples: 6 } },
     { name: 'marshalling', count: null, state: 'troubled', why: 'the station registry could not be read', trend: { metric: 'served', unit: 'per day', current: null, previous: null, samples: 0, previous_samples: 0 } },
     { name: 'shop-floor', count: 2, bound: 6, state: 'clear', why: '2 runs in flight, 1 crew on the floor', trend: { metric: 'build duration', unit: 'minutes', current: 64, previous: 58, samples: 5, previous_samples: 4 }, machines: [{ id: 'session:s1', name: 'claude@algedonic.dev', state: 'running', why: 'last prompt 3 min ago; 2 runs in flight' }] },
+    { name: 'publish', count: 1, state: 'troubled', why: 'https://mirror/pull/240 — the scan read failure — 109 alert(s) over 14 rule(s), no disposition recorded', trend: { metric: 'publishes', unit: 'per day', current: 1, previous: 1, samples: 1, previous_samples: 1 } },
   ],
 };
 
@@ -68,12 +80,19 @@ describe('parseRegions — the payload, parsed once', () => {
       name: 'gates',
       count: 1,
       bound: 3,
+      // An older payload carries no kind, unit, band or KPI: each reads
+      // as absent — never as a made-up value.
+      bound_kind: null,
+      unit: '',
       state: 'troubled',
       why: '1 bay holds a corpse — gate-run past its own deadline',
+      band: null,
       trend: { metric: 'gate duration', unit: 'minutes', current: 11, previous: 9.5, samples: 20, previous_samples: 18 },
+      kpi: [],
       // A payload with no machinery list draws no glyphs — never
       // invented idle ones (car 5, world-machines.test.ts).
       machines: [],
+      places: [],
     });
     // No bound on the wire (skip_serializing_if) reads as null, not 0.
     expect(m.regions[3]!.bound).toBeNull();
@@ -92,46 +111,106 @@ describe('parseRegions — the payload, parsed once', () => {
     const bad = { ...PAYLOAD, regions: [{ ...PAYLOAD.regions[0], state: 'fine' }] };
     expect(() => parseRegions(bad)).toThrow(/state/);
   });
+
+  // Car E of design 62de32ae: the server says how many of a region's
+  // own members stand at each of its places (decision 5), and names
+  // the plant that serves every region (decision 11).
+  it('parses the places a region counts and the plant that serves every region', () => {
+    const withBoth = {
+      ...PAYLOAD,
+      regions: PAYLOAD.regions.map((r) =>
+        r.name === 'shed'
+          ? { ...r, places: [{ name: 'inspection-shed', count: 1 }, { name: 'siding-event', count: 1 }] }
+          : r,
+      ),
+      plant: [{ id: 'runner:host:forge', name: 'forge runner', state: 'idle', why: 'last df answered exit 0' }],
+    };
+    const m = parseRegions(withBoth);
+    expect(m.regions[3]!.places).toEqual([
+      { name: 'inspection-shed', count: 1 },
+      { name: 'siding-event', count: 1 },
+    ]);
+    expect(m.regions[0]!.places).toEqual([]);
+    expect(m.plant.map((p) => p.id)).toEqual(['runner:host:forge']);
+    // An older server sends neither: no places, and no plant — never
+    // invented idle machines.
+    expect(parseRegions(PAYLOAD).plant).toEqual([]);
+    // A plant machine in a state this client does not know is refused,
+    // as a region's is.
+    expect(() => parseRegions({ ...withBoth, plant: [{ id: 'x', name: 'x', state: 'fine', why: '' }] })).toThrow(/state/);
+  });
 });
 
+/** The server's region names, read out of the constant that decides
+ *  them — `boss_jobs::regions::REGIONS` — never retyped here. */
+function serverRegions(): Readonly<{ declared: number; names: ReadonlyArray<string> }> {
+  const src = readFileSync(
+    join(import.meta.dir, '..', '..', '..', '..', '..', 'crates', 'core', 'boss-jobs', 'src', 'regions', 'mod.rs'),
+    'utf8',
+  );
+  const block = src.match(/pub const REGIONS: \[&str; (\d+)\] = \[([^\]]*)\];/);
+  expect(block, 'boss_jobs::regions::REGIONS is where the names live').not.toBeNull();
+  const names = [...block![2]!.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]!);
+  return { declared: Number(block![1]), names };
+}
+
 describe('the names are the server\'s, in map order', () => {
-  it('equal boss_jobs::regions::REGIONS (crates/core/boss-jobs/src/regions.rs)', () => {
+  it('equal boss_jobs::regions::REGIONS (crates/core/boss-jobs/src/regions/mod.rs)', () => {
     // A fact that lives twice gets an equality test (CLAUDE.md §9a): the
     // server's constant is the decision (0524fc95 Q2); this list is the
     // client's copy so the map can draw a card per name before the read
     // answers, and so a ninth name from a newer server is noticed.
-    const src = readFileSync(
-      join(import.meta.dir, '..', '..', '..', '..', '..', 'crates', 'core', 'boss-jobs', 'src', 'regions.rs'),
-      'utf8',
-    );
-    const block = src.match(/pub const REGIONS: \[&str; (\d+)\] = \[([^\]]*)\];/);
-    expect(block, 'boss_jobs::regions::REGIONS is where the names live').not.toBeNull();
-    const names = [...block![2]!.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]!);
-    expect(Number(block![1])).toBe(names.length);
-    expect([...REGION_NAMES] as string[]).toEqual(names);
+    const { declared, names } = serverRegions();
+    expect(declared).toBe(names.length);
+    expect([...REGION_NAMES] as string[]).toEqual([...names]);
   });
 });
 
-describe('floorHref — every card is a door to a floor that already exists', () => {
-  it('every region opens the world zoomed into it — the six on their yard panel, the two queue boards on their board', () => {
-    expect(floorHref('dock')).toBe('/it/yard/dock');
-    expect(floorHref('gates')).toBe('/it/yard/gates');
-    expect(floorHref('track')).toBe('/it/yard/track');
-    expect(floorHref('shed')).toBe('/it/yard/shed');
-    expect(floorHref('arrivals')).toBe('/it/yard/arrivals');
-    expect(floorHref('garage')).toBe('/it/yard/garage');
-    // Car 4 of design d2154293: these two were the only cards that
-    // left the world. They no longer do — their board mounts under
-    // the zoomed territory, like every other floor.
-    expect(floorHref('receiving')).toBe('/it/yard/receiving');
-    expect(floorHref('marshalling')).toBe('/it/yard/marshalling');
-    // The shop floor's board is the crew board, which was the floor
-    // before the region existed (backlog 94c6ffd0).
-    expect(floorHref('shop-floor')).toBe('/it/yard/shop-floor');
+// ONE DOOR PER REGION (backlog 594ffe96, 2026-09-25). The world map's
+// floorHref knew six yard regions and three boards and sent anything
+// else to /it/yard — which the router reads as the TRACK — so the
+// publish territory, the tenth region, opened the track's page, while
+// the transit map's own regionHref sent the same station to
+// /it/yard/publish. Two functions answered "where does a region link
+// lead" and disagreed on one region. Now one does, and this test walks
+// every name the SERVER serves — not the client's copy — through the
+// link, the router and the layout, so the page a link opens is the
+// region it names.
+//
+// A SELECTION, NOT A PAGE (design e765b3fc, car N1). The door no longer
+// swaps the map for the region's: the Department Map stays on top and
+// the station is SELECTED, its detail opening below it — `/it?at=<name>`.
+// The region's floor page that the detail linked to (`floorHref`) retired
+// with car N3: the panel carries the floor itself.
+describe('regionHref — every region the server serves is a selection on the Department Map', () => {
+  it('each name opens /it?at=<name>, the router reads it as that selection, and the map has its territory', () => {
+    const { names } = serverRegions();
+    expect(names).toContain('publish');
+    for (const name of names) {
+      const href = regionHref(name);
+      expect(href, name).toBe(`/it?at=${name}`);
+      const url = new URL(href, 'http://boss.test');
+      expect(parseRoute(url.pathname, url.search), name).toEqual({ kind: 'systemYard', at: name });
+      const territory: string | undefined = territoryOf(name)?.name;
+      expect(territory, name).toBe(name);
+    }
   });
 
-  it('a name this client does not know still opens the yard, never a dead link', () => {
-    expect(floorHref('siding')).toBe('/it/yard');
+  it('a name that is not a region — the plant, a newer server\'s eleventh — opens the map with nothing selected', () => {
+    expect(regionHref('siding')).toBe('/it');
+    expect(regionHref('plant')).toBe('/it');
+    expect(regionHref('')).toBe('/it');
+  });
+
+  it('is the only place a region link is built — no surface under src/ spells /it/yard/${…} or ?at=${…} itself', () => {
+    const root = join(import.meta.dir, '..', '..');
+    const spelled = [...new Bun.Glob('**/*.{ts,svelte}').scanSync(root)]
+      .filter((f) => !f.endsWith('.test.ts') && f !== join('it', 'yard', 'regions.ts'))
+      .filter((f) => {
+        const src = readFileSync(join(root, f), 'utf8');
+        return src.includes('/it/yard/${') || src.includes('?at=${');
+      });
+    expect(spelled).toEqual([]);
   });
 });
 
@@ -175,9 +254,92 @@ describe('trendText — this window against the previous, in the unit', () => {
 });
 
 describe('lampOf — the yard\'s own lamp for a state', () => {
-  it('clear is ok, busy is warn, troubled is err', () => {
+  it('clear is ok, attention is warn, troubled is err', () => {
     expect(lampOf('clear')).toBe('ok');
-    expect(lampOf('busy')).toBe('warn');
+    // Full is a GOOD state (design e765b3fc §4a): a working bottleneck
+    // lights no warning lamp.
+    expect(lampOf('full')).toBe('ok');
+    expect(lampOf('attention')).toBe('warn');
     expect(lampOf('troubled')).toBe('err');
+  });
+});
+
+// Design 62de32ae, "The IT map, round 3: meaning before drawing" — car A:
+// one vocabulary, every non-clear state with the declared band that
+// decided it and how long it has held, every count and KPI with its unit.
+describe('one state vocabulary, each state with its band (62de32ae decisions 1, 2, 5, 9)', () => {
+  it('the four words are the server\'s RegionState, in its order (CLAUDE.md §9a)', () => {
+    const src = readFileSync(
+      join(import.meta.dir, '..', '..', '..', '..', '..', 'crates', 'core', 'boss-jobs', 'src', 'regions', 'mod.rs'),
+      'utf8',
+    );
+    const block = src.match(/pub enum RegionState \{([^}]*)\}/);
+    expect(block, 'boss_jobs::regions::RegionState is where the words live').not.toBeNull();
+    const words = [...block![1]!.matchAll(/^\s*([A-Z][a-z]+),/gm)].map((m) => m[1]!.toLowerCase());
+    expect(words).toEqual(['clear', 'full', 'attention', 'troubled']);
+  });
+
+  it('parses full — a capacity region at its bound and moving (design e765b3fc §4a)', () => {
+    const full = { ...PAYLOAD, regions: [{ ...PAYLOAD.regions[1], state: 'full' }] };
+    expect(parseRegions(full).regions[0]!.state).toBe('full');
+  });
+
+  it('refuses the retired word rather than drawing a new meaning under it', () => {
+    const old = { ...PAYLOAD, regions: [{ ...PAYLOAD.regions[0], state: 'busy' }] };
+    expect(() => parseRegions(old)).toThrow(/state/);
+    const kind = { ...PAYLOAD, regions: [{ ...PAYLOAD.regions[0], bound_kind: 'quota' }] };
+    expect(() => parseRegions(kind)).toThrow(/bound kind/);
+  });
+
+  it('parses the band, the unit, the bound kind and the KPI the server sends', () => {
+    const wire = {
+      ...PAYLOAD,
+      regions: [
+        {
+          ...PAYLOAD.regions[6],
+          bound_kind: null,
+          unit: 'packets standing',
+          band: {
+            id: 'receiving-aging',
+            reads: 'oldest 5d > the 3-day triage band',
+            hold_minutes: 0,
+            since: '2026-09-18T00:00:00+00:00',
+            held_minutes: 2160,
+            held: '36h',
+          },
+          kpi: [{ name: 'oldest untriaged', value: 5, unit: 'days', text: 'oldest untriaged 5 days' }],
+        },
+      ],
+    };
+    const r = parseRegions(wire).regions[0]!;
+    expect(r.unit).toBe('packets standing');
+    expect(r.band?.reads).toBe('oldest 5d > the 3-day triage band');
+    expect(stateText(r)).toBe('attention for 36h');
+    expect(bandText(r)).toBe('oldest 5d > the 3-day triage band');
+    expect(kpiText(r)).toBe('oldest untriaged 5 days');
+    expect(countText(r)).toBe('4 packets standing');
+  });
+
+  it('a clear state, or one with no onset on record, is the bare word — never a made-up duration', () => {
+    expect(stateText(region())).toBe('clear');
+    expect(bandText(region())).toBeNull();
+    const noOnset = region({
+      state: 'attention',
+      band: { id: 'track-gate-waiting', reads: 'a train gate not filed for 10m', hold_minutes: 10, since: null, held_minutes: null, held: null },
+    });
+    expect(stateText(noOnset)).toBe('attention');
+    expect(stateText(undefined)).toBe('troubled');
+  });
+
+  it('a threshold is never drawn as room: the dock reads "6 cars parked · threshold 1", the gates "3 / 3 bays in use"', () => {
+    expect(countText(region({ count: 6, bound: 1, bound_kind: 'threshold', unit: 'cars parked' }))).toBe(
+      '6 cars parked · threshold 1',
+    );
+    expect(countText(region({ count: 3, bound: 3, bound_kind: 'capacity', unit: 'bays in use' }))).toBe(
+      '3 / 3 bays in use',
+    );
+    expect(compactCountText(region({ count: 6, bound: 1, bound_kind: 'threshold' }))).toBe('6 · threshold 1');
+    expect(compactCountText(region({ count: 3, bound: 3, bound_kind: 'capacity' }))).toBe('3 / 3');
+    expect(compactCountText(region({ count: null }))).toBe('no reading');
   });
 });

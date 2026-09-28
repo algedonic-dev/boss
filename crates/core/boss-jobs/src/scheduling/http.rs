@@ -9,10 +9,16 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use boss_clock_client::ClockClient;
 use boss_core::publisher::DomainPublisher;
+use boss_core::roles::{ANONYMOUS_VISITOR_IDS, PLATFORM_ADMIN_ROLE, is_anonymous_visitor_role};
+use boss_policy_client::writes::{require_reaching, require_reaching_row};
+use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource, User};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
+// Every read below asks `readable` first (backlog a621d091).
+use super::access::readable;
+use super::feed_token::{CalendarTokenSha256, mint_calendar_token};
 use super::ics::build_ics;
 use super::port::{SchedulingError, SchedulingRepository};
 use super::types::{AssignmentStatus, NewScheduledAssignment, NewTechAvailability};
@@ -26,6 +32,10 @@ pub struct SchedulingApiState {
     /// so sim mode produces sim-dated audit_log rows. Same trait as
     /// the rest of the workspace.
     pub clock: Arc<dyn ClockClient>,
+    /// Who may read or write whose schedule — the `schedule` resource's
+    /// grants, asked by every read (backlog a621d091,
+    /// `scheduling::access`) and every write (backlog 11721a25).
+    pub policy: Arc<dyn PolicyClient>,
 }
 
 pub fn router(state: SchedulingApiState) -> Router {
@@ -61,6 +71,14 @@ pub fn router(state: SchedulingApiState) -> Router {
             "/api/scheduling/techs/{emp_id}/calendar-token",
             get(get_calendar_token).post(rotate_calendar_token),
         )
+        .route(
+            "/api/scheduling/calendar-tokens/logged-raw",
+            get(count_logged_raw),
+        )
+        .route(
+            "/api/scheduling/calendar-tokens/logged-raw/revoke",
+            post(revoke_logged_raw),
+        )
         .route("/ics/{token}/calendar.ics", get(public_ics_feed))
         .with_state(shared)
 }
@@ -91,9 +109,10 @@ fn resolve_range(q: &RangeQuery) -> (DateTime<Utc>, DateTime<Utc>) {
     (from, to)
 }
 
-/// Resolve the outbox event stamp for this request. Scheduling
-/// handlers carry no CurrentUser extractor; the publisher's
-/// `default_actor` resolves the request identity from the task-local
+/// Resolve the outbox event stamp for this request. The write handlers
+/// read `CurrentUser` to authorize (backlog 11721a25); the event's
+/// actor is the same signed caller, which the publisher's
+/// `default_actor` resolves from the task-local
 /// context, and its clock probe settles `_simulated` — the same
 /// envelope the retired post-commit emits carried (outbox phase 2).
 /// The stamp mints wall-clock time itself: sim time is retired from
@@ -110,23 +129,85 @@ async fn event_stamp(state: &SchedulingApiState) -> boss_core::publisher::EventS
 
 async fn list_avail(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<RangeQuery>,
 ) -> Response {
+    let who = match readable(state.policy.as_ref(), &user).await {
+        Ok(who) => who,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = who.refusal(q.employee_id.as_deref()) {
+        return refused;
+    }
     let (from, to) = resolve_range(&q);
     match state
         .repo
         .list_availability(q.employee_id.as_deref(), from, to)
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(who.keep(rows, |r| &r.employee_id)).into_response(),
         Err(e) => err(e),
     }
 }
 
+// WHO MAY WRITE A SCHEDULE (backlog 11721a25, 2026-09-27). The reads
+// above asked policy from a621d091; every write beside them took no
+// caller, so anything reaching the jobs port — or any session the
+// gateway forwards — could add or remove anyone's availability, book or
+// cancel a tech, rewrite a shift, or materialise the company's week.
+// Each write now asks the reads' resource with its own action — Create
+// to add, Update to move an assignment's status, Delete to remove — in
+// a scope that reaches the employee it touches
+// (`boss_policy_client::writes::require_reaching`). A write by id asks
+// the ROW whose it is, never the request.
+
+/// Gate one write on `employee`'s schedule (`None`: every employee's).
+async fn may_write(
+    state: &SchedulingApiState,
+    user: &User,
+    action: Action,
+    employee: Option<&str>,
+) -> Result<(), Response> {
+    require_reaching(
+        state.policy.as_ref(),
+        user,
+        action,
+        Resource::schedule(),
+        employee,
+    )
+    .await
+}
+
+/// Gate one write BY ID on `owner`, the employee the stored row belongs
+/// to (`None`: no such row). The caller named an id, not a person, so a
+/// refusal names nobody and reads the same for a row outside the grant
+/// and for an id that does not exist (`require_reaching_row`; the
+/// adversarial review of this car, 2026-09-27). Only an `all` grant goes
+/// on to the write's own 404.
+async fn may_write_row(
+    state: &SchedulingApiState,
+    user: &User,
+    action: Action,
+    owner: Option<&str>,
+) -> Result<(), Response> {
+    require_reaching_row(
+        state.policy.as_ref(),
+        user,
+        action,
+        Resource::schedule(),
+        owner,
+    )
+    .await
+}
+
 async fn create_avail(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Json(body): Json<NewTechAvailability>,
 ) -> Response {
+    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.employee_id)).await {
+        return refused;
+    }
     // OUTBOX (phase 2): the adapter records the scheduling events
     // inside the domain transaction; nothing publishes post-commit.
     let stamp = event_stamp(&state).await;
@@ -138,8 +219,16 @@ async fn create_avail(
 
 async fn delete_avail(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let employee = match state.repo.get_availability(id).await {
+        Ok(row) => row.map(|r| r.employee_id),
+        Err(e) => return err(e),
+    };
+    if let Err(refused) = may_write_row(&state, &user, Action::Delete, employee.as_deref()).await {
+        return refused;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state).await;
     match state.repo.delete_availability(id, now, &stamp).await {
@@ -162,8 +251,16 @@ struct AssignQuery {
 
 async fn list_assign(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<AssignQuery>,
 ) -> Response {
+    let who = match readable(state.policy.as_ref(), &user).await {
+        Ok(who) => who,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = who.refusal(q.tech_id.as_deref()) {
+        return refused;
+    }
     let from = q.from.unwrap_or_else(Utc::now);
     let to = q.to.unwrap_or_else(|| from + Duration::days(7));
     match state
@@ -171,15 +268,19 @@ async fn list_assign(
         .list_assignments(q.tech_id.as_deref(), q.target_job_id, from, to)
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(who.keep(rows, |r| &r.tech_id)).into_response(),
         Err(e) => err(e),
     }
 }
 
 async fn create_assign(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Json(body): Json<NewScheduledAssignment>,
 ) -> Response {
+    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.tech_id)).await {
+        return refused;
+    }
     let stamp = event_stamp(&state).await;
     match state.repo.create_assignment(body, &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
@@ -189,19 +290,49 @@ async fn create_assign(
 
 async fn get_assign(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let who = match readable(state.policy.as_ref(), &user).await {
+        Ok(who) => who,
+        Err(refused) => return refused,
+    };
     match state.repo.get_assignment(id).await {
+        // The caller named an id, not an employee, so the refusal
+        // names nobody: echoing the row's tech_id would answer whose
+        // assignment it is, which is what is being refused.
+        Ok(Some(row)) if !who.admits(&row.tech_id) => super::access::not_in_scope(),
         Ok(Some(row)) => Json(row).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, id.to_string()).into_response(),
         Err(e) => err(e),
     }
 }
 
+/// Gate a write to assignment `id` on the tech the ROW books
+/// ([`may_write_row`]).
+async fn may_write_assignment(
+    state: &SchedulingApiState,
+    user: &User,
+    action: Action,
+    id: Uuid,
+) -> Result<(), Response> {
+    let tech = state
+        .repo
+        .get_assignment(id)
+        .await
+        .map_err(err)?
+        .map(|row| row.tech_id);
+    may_write_row(state, user, action, tech.as_deref()).await
+}
+
 async fn delete_assign(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(refused) = may_write_assignment(&state, &user, Action::Delete, id).await {
+        return refused;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state).await;
     match state.repo.delete_assignment(id, now, &stamp).await {
@@ -217,9 +348,13 @@ struct StatusBody {
 
 async fn update_assign_status(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
     Json(body): Json<StatusBody>,
 ) -> Response {
+    if let Err(refused) = may_write_assignment(&state, &user, Action::Update, id).await {
+        return refused;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state).await;
     match state
@@ -243,14 +378,22 @@ struct ShiftQuery {
 
 async fn list_shifts(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<ShiftQuery>,
 ) -> Response {
+    let who = match readable(state.policy.as_ref(), &user).await {
+        Ok(who) => who,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = who.refusal(q.employee_id.as_deref()) {
+        return refused;
+    }
     match state
         .repo
         .list_shift_patterns(q.employee_id.as_deref())
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(who.keep(rows, |r| &r.employee_id)).into_response(),
         Err(e) => err(e),
     }
 }
@@ -272,8 +415,12 @@ fn default_tz() -> String {
 
 async fn upsert_shift(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Json(body): Json<UpsertShiftBody>,
 ) -> Response {
+    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.employee_id)).await {
+        return refused;
+    }
     let eff = body
         .effective_from
         .unwrap_or_else(|| Utc::now().date_naive());
@@ -305,10 +452,16 @@ fn default_weeks_ahead() -> i64 {
     super::materialize::DEFAULT_WEEKS_AHEAD
 }
 
+/// Materialising writes availability for every employee with a shift
+/// pattern, so only an `all` grant reaches it.
 async fn materialize(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Json(body): Json<MaterializeBody>,
 ) -> Response {
+    if let Err(refused) = may_write(&state, &user, Action::Create, None).await {
+        return refused;
+    }
     match super::materialize::materialize_next(state.repo.as_ref(), body.weeks_ahead).await {
         Ok(inserted) => Json(serde_json::json!({ "inserted": inserted })).into_response(),
         Err(e) => err(e),
@@ -337,20 +490,73 @@ struct WeekGridQuery {
 const ICS_PAST_DAYS: i64 = 90;
 const ICS_FUTURE_DAYS: i64 = 180;
 
+// WHO MAY TOUCH A CALENDAR TOKEN (backlog 7ae9ccec, 2026-09-25). The
+// token is the whole authentication of the sessionless feed above, so
+// holding it IS reading the employee's schedule. Both handlers took no
+// caller until this car: a guest session (audit-readonly, which passes
+// has_global_read) could GET any employee's token through the gateway's
+// /api/scheduling/* proxy, and any signed-in employee could read or
+// rotate anyone's. Global READ is not this token's grant — the token is
+// the employee's own, like a password.
+//
+// - A read answers only the employee themself, and only THAT a feed
+//   exists and when it was made: the server keeps the token's SHA-256,
+//   never the token (backlog 4aaff4dc, design 3101c506), so there is no
+//   URL left to read. Anyone else, operator included, gets 403.
+// - A rotate is the employee, or a platform-admin revoking a leaked
+//   feed. The employee is handed the new URL once, in the response. An
+//   operator's rotate is a revocation: it writes the digest of a token
+//   nobody keeps, answers 404 when there is no feed to revoke, and its
+//   response carries no token.
+// - Until design 3101c506 this comment said "nobody else, operator
+//   included" reads a token — true of this handler, false of the
+//   system: the rotate wrote the token raw into its event, and the event
+//   tail hands every global-read role (a guest's audit-readonly among
+//   them) that payload. Only the digest now reaches the log, the bus or
+//   a backup, and the feeds whose tokens were logged before it are
+//   revoked by `revoke_calendar_tokens_logged_raw` below.
+// - An anonymous visitor's id — the CurrentUser fallback for a request
+//   with no x-boss-user (`anonymous`), or the guest session's fixed
+//   address — owns nothing, whatever the path says, and neither a
+//   read-only-floor role nor the headerless `guest` ever mints a token.
+//   Both are asked of boss_core::roles rather than spelled here: the
+//   first version of this car named `audit-readonly` alone, and the
+//   `visitor` role joined the floor the same day (design 2830b6b7).
+
+fn is_the_employee(user: &User, emp_id: &str) -> bool {
+    !ANONYMOUS_VISITOR_IDS.contains(&user.id.as_str()) && user.id == emp_id
+}
+
+fn may_rotate(user: &User, emp_id: &str) -> bool {
+    user.role == PLATFORM_ADMIN_ROLE
+        || (is_the_employee(user, emp_id) && !is_anonymous_visitor_role(&user.role))
+}
+
+fn not_yours(emp_id: &str, verb: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!("a calendar token is its employee's alone: only {emp_id} may {verb} it"),
+    )
+        .into_response()
+}
+
 async fn get_calendar_token(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(emp_id): Path<String>,
 ) -> Response {
-    match state.repo.calendar_token_for(&emp_id).await {
-        Ok(Some(t)) => Json(serde_json::json!({
+    if !is_the_employee(&user, &emp_id) {
+        return not_yours(&emp_id, "read");
+    }
+    match state.repo.calendar_feed_created_at(&emp_id).await {
+        Ok(Some(created_at)) => Json(serde_json::json!({
             "employee_id": emp_id,
-            "token": t,
-            "ics_url": format!("/ics/{t}/calendar.ics"),
+            "created_at": created_at,
         }))
         .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            format!("no calendar token for {emp_id}"),
+            format!("no calendar feed for {emp_id}"),
         )
             .into_response(),
         Err(e) => err(e),
@@ -359,28 +565,87 @@ async fn get_calendar_token(
 
 async fn rotate_calendar_token(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Path(emp_id): Path<String>,
 ) -> Response {
-    // Two v4 UUIDs concatenated = 256 bits of randomness. `simple()`
-    // format emits 32 hex chars per UUID, so the token is a 64-char
-    // URL-safe string.
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    if !may_rotate(&user, &emp_id) {
+        return not_yours(&emp_id, "rotate");
+    }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state).await;
+    if !is_the_employee(&user, &emp_id) {
+        // An operator's rotate is a revocation: the old URL stops
+        // working, no URL opens the new row, and the employee rotates
+        // their own feed for a new one.
+        let discarded = CalendarTokenSha256::of_a_discarded_token();
+        return match state
+            .repo
+            .revoke_calendar_token(&emp_id, &discarded, now, &stamp)
+            .await
+        {
+            Ok(()) => Json(serde_json::json!({
+                "employee_id": emp_id,
+                "revoked": true,
+            }))
+            .into_response(),
+            Err(e) => err(e),
+        };
+    }
+    // The only place the token exists on the server, and only for the
+    // length of this response: what is written is its digest.
+    let token = mint_calendar_token();
+    match state
+        .repo
+        .rotate_calendar_token(&emp_id, &CalendarTokenSha256::of(&token), now, &stamp)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "employee_id": emp_id,
+            "token": token,
+            "ics_url": format!("/ics/{token}/calendar.ics"),
+        }))
+        .into_response(),
+        Err(e) => err(e),
+    }
+}
+
+/// `GET /api/scheduling/calendar-tokens/logged-raw` — how many feeds
+/// still open with a token the audit log holds in the clear (minted
+/// before digests, not yet revoked). A count, so any caller may read
+/// it; the proof of this design reads it to zero.
+async fn count_logged_raw(State(state): State<Arc<SchedulingApiState>>) -> Response {
+    match state.repo.count_calendar_tokens_logged_raw().await {
+        Ok(n) => Json(serde_json::json!({ "logged_raw": n })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+/// `POST /api/scheduling/calendar-tokens/logged-raw/revoke` — revoke
+/// every feed whose token the log holds, one rotated event each, signed
+/// as the operator who runs it (backlog 4aaff4dc). Run once after the
+/// deploy that brings digests; bounded to the logged rows, so a second
+/// run answers `revoked: 0` and never breaks a feed re-subscribed since.
+/// A platform-admin's act only: it breaks every such employee's feed
+/// until they rotate their own.
+async fn revoke_logged_raw(
+    State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if user.role != PLATFORM_ADMIN_ROLE {
+        return (
+            StatusCode::FORBIDDEN,
+            "revoking the logged calendar tokens is a platform-admin's act",
+        )
+            .into_response();
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state).await;
     match state
         .repo
-        .rotate_calendar_token(&emp_id, &token, now, &stamp)
+        .revoke_calendar_tokens_logged_raw(now, &stamp)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "employee_id": emp_id,
-                "token": token,
-                "ics_url": format!("/ics/{token}/calendar.ics"),
-            })),
-        )
-            .into_response(),
+        Ok(n) => Json(serde_json::json!({ "revoked": n })).into_response(),
         Err(e) => err(e),
     }
 }
@@ -389,7 +654,10 @@ async fn public_ics_feed(
     State(state): State<Arc<SchedulingApiState>>,
     Path(token): Path<String>,
 ) -> Response {
-    let emp_id = match state.repo.employee_by_calendar_token(&token).await {
+    // Looked up by digest: the table holds nothing else. The digest
+    // itself opens nothing — it is not a token any row was minted from.
+    let presented = CalendarTokenSha256::of(&token);
+    let emp_id = match state.repo.employee_by_calendar_token(&presented).await {
         Ok(Some(e)) => e,
         Ok(None) => return (StatusCode::NOT_FOUND, "unknown calendar token").into_response(),
         Err(e) => return err(e),
@@ -429,8 +697,13 @@ async fn public_ics_feed(
 
 async fn week_grid(
     State(state): State<Arc<SchedulingApiState>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<WeekGridQuery>,
 ) -> Response {
+    let who = match readable(state.policy.as_ref(), &user).await {
+        Ok(who) => who,
+        Err(refused) => return refused,
+    };
     let from = q.from.unwrap_or_else(Utc::now);
     let to = q.to.unwrap_or_else(|| from + Duration::days(7));
     let emp_vec: Option<Vec<String>> = q.employees.as_deref().map(|s| {
@@ -440,7 +713,13 @@ async fn week_grid(
             .map(ToOwned::to_owned)
             .collect()
     });
-    let slice: Option<&[String]> = emp_vec.as_deref();
+    // Naming one employee outside scope refuses the whole grid rather
+    // than answering the part that is in it; naming nobody is everyone
+    // this caller may see.
+    if let Some(refused) = emp_vec.iter().flatten().find_map(|e| who.refusal(Some(e))) {
+        return refused;
+    }
+    let slice: Option<&[String]> = emp_vec.as_deref().or(who.only());
     match state.repo.week_grid(from, to, slice).await {
         Ok(rows) => Json(serde_json::json!({
             "from": from,

@@ -9,24 +9,25 @@
 
   import { session } from '@boss/web-kit/session/session.svelte';
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
-  import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
-  import { workForRole } from '@boss/web-kit/session/work-by-role';
+  import { canSeeRoute, type Role } from '@boss/web-kit/session/permissions';
   import { departmentLabel } from '@boss/web-kit/nav';
   import { departments } from '@boss/web-kit/session/departments.svelte';
   import { href, navigate } from '../router';
   import {
     ROUTE_CATALOG,
-    departmentJobsPath,
+    departmentRows,
+    inPerspective,
     type AppId,
     type NavItem,
     type NavGroup,
   } from './nav-catalog';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   // NavItem / NavGroup / ROUTE_CATALOG live in ./nav-catalog so both
   // this shell and App.svelte read the same registry — and so the
   // consistency test can import it instead of mirroring it by hand.
-  // `app` on each entry is the single answer to "which tab owns this
+  // `owner` on each entry is the single answer to "which tab owns this
   // surface"; it replaced this file's MODEL_ROUTES and App.svelte's
   // MODEL_KINDS, which had to agree and could silently stop agreeing.
 
@@ -104,94 +105,44 @@
     };
   });
 
-  // Per-department surface order. Each department app owns one group;
-  // the order is how someone in that department would scan it, not
-  // alphabetical. `visible()` then drops whatever the role or the
-  // tenant manifest blocks.
-  //
-  // The keys are department codes because apps ARE departments now.
-  // The previous version keyed off invented apps — `crm` held
-  // accounts + sales + support + shop + marketing assets, and
-  // `supply-chain` held six surfaces spanning four real departments —
-  // so a marketer and a salesperson shared one list and neither list
-  // matched an org chart anybody recognised.
-  //
-  // Only the ORDER lives here. Which department owns a surface is
-  // answered once, by `app` in the nav catalog, and the test beside
-  // this asserts these two agree — an entry here for a surface the
-  // catalog assigns elsewhere is exactly the drift that put pages
-  // under the wrong tab before.
-  const APP_SURFACES: Readonly<Partial<Record<AppId, ReadonlyArray<RouteName>>>> = {
-    sales: ['accounts', 'sales', 'shop'],
-    marketing: ['marketing-assets'],
-    support: ['support'],
-    service: ['service'],
-    qa: ['qa'],
-    executive: ['exec'],
-    finance: ['finance', 'vendors'],
-    warehouse: ['warehouse', 'parts'],
-    distribution: ['shipping'],
-    production: ['products', 'calendar'],
-    maintenance: ['catalog', 'assets'],
-    people: ['people'],
-  };
+  // A department's sidebar is DERIVED (car 2 of design 8c3e9599, backlog
+  // 64656a46): `departmentRows` — its own catalog surfaces in catalog
+  // order, then its Jobs row — so a department the registry adds gets
+  // its sidebar with no edit here. Two hand lists answered this until
+  // then: APP_SURFACES, each department's surface order, and IT_GROUPS,
+  // IT's seven rows. Both repeated what the catalog already held, and
+  // APP_SURFACES disagreed with it: it listed Sales' Accounts first while
+  // the tab opened on the pipeline. `visible()` then drops whatever the
+  // role or the tenant manifest blocks.
 
-  // The group header is the department's own label — the Class
-  // registry's display name, because a second spelling of "Finance" is
-  // a second thing to keep in step.
+  // The group header is the department's own label — the registry's
+  // display name, because a second spelling of "Finance" is a second
+  // thing to keep in step.
   function appGroupLabel(app: AppId): string {
     return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
-  // Work group is role-keyed: each role gets a tailored 3-5 item
-  // list of the surfaces they personally operate from. The same
-  // visible() filter still applies, so a brewery manifest that turns
-  // off a module hides it from Work too.
-  const WORK = $derived<NavGroup>({
+  // Work group is All jobs, for every role (backlog 0f9be7c0,
+  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
+  // each role row's `metadata.work` — but visible() drops every entry
+  // whose catalog owner is not home, so of any list only `jobs` could
+  // render and a list without it left Work empty. Each department app
+  // has its own sidebar; a role's surfaces are gated there, by the
+  // row's `surfaces`, and Work here is the same filter over one row.
+  const WORK: NavGroup = {
     label: 'Work',
-    items: workForRole(role).map((r) => ROUTE_CATALOG[r]),
-  });
+    items: [ROUTE_CATALOG.jobs],
+  };
 
-  // The IT department — seven rows. Six came from the 2026-08-31
-  // consolidation (packet 1f6d55e0), which established that families
-  // live as tabs on their surface rather than as sidebar rows;
-  // auth-admin stays reachable but unlisted, and the old Run / Define /
-  // Evolve / Platform grouping died with the /system prefix.
+  // Home — personal work, whichever domain it belongs to: "what am I
+  // meant to be doing" is one question, and its answer (All jobs, My
+  // Day) crosses every department freely.
   //
-  // The seventh is the Crew Board, and it is a deliberate exception to
-  // that rule rather than a drift back from it: David's decision on
-  // backlog 04c5bbc0 (2026-09-11) read the proposal to make it a tab in
-  // an existing family and overrode it — "Port the Crew Board as a new
-  // sidebar page in IT." The middle third of the operator surface is its
-  // own question, not a sub-view of Operate's incidents.
-  const IT_GROUPS: ReadonlyArray<NavGroup> = [
-    {
-      label: 'IT',
-      items: [
-        // The three yards and the Crew Board lead, in flow order —
-        // receiving, marshalling, train yard, crew — then the desk
-        // work (design 55417146 on feedback 92921c2f, 2026-09-18).
-        // The Train Yard is third here and still the /it landing:
-        // the landing is catalog order, not this list.
-        ROUTE_CATALOG['system-receiving'],
-        ROUTE_CATALOG['system-marshalling'],
-        ROUTE_CATALOG['system-yard'],
-        ROUTE_CATALOG['system-crew'],
-        ROUTE_CATALOG['system-incidents'],
-        ROUTE_CATALOG.workflows,
-        ROUTE_CATALOG['system-design'],
-        ROUTE_CATALOG['system-codebase'],
-        ROUTE_CATALOG['system-estate'],
-        ROUTE_CATALOG['system-kb'],
-      ],
-    },
-  ];
-
-  // Home — personal work, whichever domain it belongs to. The
-  // role-keyed Work list lives here rather than being repeated in
-  // every app: "what am I meant to be doing" is one question, and its
-  // answer crosses CRM, Operations and Finance freely.
-  const HOME_GROUPS = $derived<ReadonlyArray<NavGroup>>([
+  // Mine lists Home surfaces only. It carried Exec until backlog
+  // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
+  // Exec's catalog owner is executive — so it never rendered here; it is
+  // the Executive department's row, under a tab every role is offered.
+  const HOME_GROUPS: ReadonlyArray<NavGroup> = [
     WORK,
     {
       label: 'Mine',
@@ -202,54 +153,32 @@
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.views,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG.exec,
       ],
     },
-  ]);
+  ];
 
   // Every department group ends on its Jobs row — the department's in
   // / working / out over the packets whose workflow declares it
-  // (cc76f755, 2026-09-18). PermKey-less like the Audit Log link: the
-  // listing behind it is policy-scoped by the server, and a permKey
-  // would widen the RouteName vocabulary for a row every department
-  // has. For a department that owns no surface it is the whole group,
-  // which is the point: the tab used to open All jobs under Home with
-  // an empty sidebar here. IT keeps its own three thirds.
+  // (cc76f755, 2026-09-18) — IT's included, since car 2 of design
+  // 8c3e9599: every unit carries it. `departmentRows` says why it is
+  // permKey-less.
   let MAIN = $derived<ReadonlyArray<NavGroup>>(
-    activeApp === 'it'
-      ? IT_GROUPS
-      : activeApp === 'home'
-        ? HOME_GROUPS
-        : [
-            {
-              label: appGroupLabel(activeApp),
-              items: [
-                ...(APP_SURFACES[activeApp] ?? []).map((r: RouteName) => ROUTE_CATALOG[r]),
-                { id: 'department-jobs', label: 'Jobs', path: departmentJobsPath(activeApp) },
-              ],
-            },
-          ],
+    activeApp === 'home'
+      ? HOME_GROUPS
+      : [{ label: appGroupLabel(activeApp), items: departmentRows(activeApp) }],
   );
 
-  // A surface is in-perspective when its catalog `app` matches the
-  // app this shell is rendering. One comparison against one field —
-  // where this used to be a MODEL_ROUTES set here that had to agree
-  // with a MODEL_KINDS set in App.svelte, keyed off a different
-  // vocabulary (RouteName vs Route['kind']).
-  function inPerspective(i: NavItem): boolean {
-    // A permKey-less NavItem (e.g. a plain sub-page link like Audit
-    // Log / Atlas) carries no app of its own — it belongs to whatever
-    // group it's placed in, so it's always in-perspective.
-    if (i.permKey === undefined) return true;
-    return (ROUTE_CATALOG[i.permKey]?.app ?? 'home') === activeApp;
-  }
-
+  // A surface is in-perspective when its own catalog `owner` matches the
+  // app this shell is rendering — inPerspective in ./nav-catalog, where
+  // the test pinning every sidebar list imports it (72a88031). One
+  // comparison against one field, where this used to be a MODEL_ROUTES
+  // set here that had to agree with a MODEL_KINDS set in App.svelte.
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey, roleRow);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk && inPerspective(i);
+      return policyOk && moduleOk && inPerspective(i, activeApp);
     });
   }
 
@@ -306,7 +235,7 @@
             </div>
             {#each items as item (item.id)}
               <a
-                href={item.path}
+                href={safeLinkHref(item.path)}
                 class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
                 onclick={(e) => onLinkClick(e, item.path)}
               >
@@ -336,6 +265,13 @@
           <div class="shell-user-name">{user.name}</div>
           <div class="shell-user-role">{user.role}</div>
         </a>
+      {:else if session.value.kind === 'unresolved'}
+        <!-- Signed in, but the viewer's own people row did not answer.
+             The chrome says so on every page rather than rendering
+             nobody (backlog b4f68a65). -->
+        <p class="load-failed" role="alert" style="font-size:12px">
+          Couldn't load your employee record — {session.value.error}.
+        </p>
       {/if}
     </div>
   </aside>

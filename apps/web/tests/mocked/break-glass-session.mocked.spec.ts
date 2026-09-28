@@ -17,7 +17,7 @@
 // rollback, merge approval, auth administration — is a second surface,
 // deliberately not built here.
 
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route } from './_test';
 
 const json = (r: Route, b: unknown): Promise<void> =>
   r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(b) });

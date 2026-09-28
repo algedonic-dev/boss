@@ -82,6 +82,15 @@ const SHARED_VAR: &str = "/var/tmp";
 /// refuses, so this file cannot spell the two adjacent.
 const JOIN: &str = "join";
 
+/// `temp_dir`, held apart from its call parentheses: since backlog
+/// c0172bbc the lint judges EVERY `temp_dir()` call, not only a join of
+/// a literal, so a fixture that spelled one here would be a finding.
+const TEMP_DIR: &str = "temp_dir";
+
+/// The environment variable that names the temp root, split for the
+/// same reason: reading it is a temp root the lint now judges.
+const TMPDIR: &str = "TMPDIR";
+
 fn lint() -> PathBuf {
     repo_root().join("infra/lint/a-fixture-path-cannot-be-a-literal.sh")
 }
@@ -111,7 +120,8 @@ impl Tree {
 
     /// Add a tracked `.rs` file, expanding the placeholders that keep the
     /// refused shapes out of this file's own source: `%S` is `/tmp`, `%V`
-    /// is `/var/tmp`, `%J` is `join`.
+    /// is `/var/tmp`, `%J` is `join`, `%T` is `temp_dir`, `%D` is
+    /// `TMPDIR`.
     fn rs(&self, rel: &str, body: &str) -> &Tree {
         let path = self.0.join(rel);
         if let Some(parent) = path.parent() {
@@ -120,7 +130,9 @@ impl Tree {
         let expanded = body
             .replace("%S", SHARED)
             .replace("%V", SHARED_VAR)
-            .replace("%J", JOIN);
+            .replace("%J", JOIN)
+            .replace("%T", TEMP_DIR)
+            .replace("%D", TMPDIR);
         scratch::write_file(&path, &expanded);
         git(&self.0, &["add", rel]);
         self
@@ -199,8 +211,9 @@ fn the_scanner_proves_itself_on_every_invocation() {
 /// BEHAVIOUR 1 — a tree with no fixed temp path exits 0.
 ///
 /// Every shape here is one the repo uses and must keep using: the
-/// sanctioned `scratch` helpers, a pid-bearing `format!`, a `Uuid`, a
-/// `mktemp`-equivalent, and prose that merely MENTIONS a fixed path.
+/// sanctioned `scratch` helpers, a `format!` carrying the uid AND the
+/// pid, a `Uuid`, a `mktemp`-equivalent, and prose that merely MENTIONS
+/// a fixed path.
 #[test]
 fn a_hermetic_tree_is_clean() {
     let tree = Tree::new("clean");
@@ -211,19 +224,19 @@ fn a_hermetic_tree_is_clean() {
 use boss_testing::scratch;
 fn a() -> std::path::PathBuf { scratch::scratch_dir(\"boss-a\") }
 fn b() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(\"boss-b-{}\", std::process::id()))
+    std::env::%T().join(format!(\"boss-b-{}-{}\", current_uid(), std::process::id()))
 }
-fn c() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        \"boss-c-{tag}-{}\",
+fn c(uid: u32) -> std::path::PathBuf {
+    std::env::%T().join(format!(
+        \"boss-c-{tag}-{uid}-{}\",
         std::process::id()
     ))
 }
 fn d() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(\"boss-d-{}\", Uuid::new_v4()))
+    std::env::%T().join(format!(\"boss-d-{}\", Uuid::new_v4()))
 }
-/// A join of a computed name is not a literal and is not judged here.
-fn e(name: &std::path::Path) -> std::path::PathBuf { std::env::temp_dir().join(name) }
+/// Naming the root is not building a path under it: a prose mention.
+fn e() -> String { String::from(\"%S\") }
 ",
     );
     let out = tree.run();
@@ -246,13 +259,13 @@ fn a_fixed_temp_path_is_named_with_its_file_and_line() {
         "src/bad.rs",
         "\
 fn one() -> std::path::PathBuf {
-    std::env::temp_dir().%J(\"boss-thing-test\")
+    std::env::%T().%J(\"boss-thing-test\")
 }
 fn two() -> std::path::PathBuf {
     std::path::PathBuf::from(\"%S/boss-two-fixture\")
 }
 fn three(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().%J(format!(\"boss-pubreq-{name}\"))
+    std::env::%T().%J(format!(\"boss-pubreq-{name}\"))
 }
 fn four() -> String {
     String::from(\"%V/boss-four-fixture\")
@@ -287,6 +300,138 @@ fn four() -> String {
              re-derive is not a verdict (CLAUDE.md §Diagnosis):\n{msg}"
         );
     }
+}
+
+/// A pid is not an owner (backlog 307df975).
+///
+/// A computed name used to pass on the pid alone. The pid makes a path
+/// unique among LIVE processes; it says nothing about a leftover from
+/// one that has exited, and pids recycle — so root and uid 65534 on the
+/// dev pod draw the same `boss-gate-rebase-<pid>-<head>` sooner or
+/// later, and the loser's `remove_dir_all` is an EPERM the verb had
+/// discarded. `boss gate --rebase`'s own replay directory was exactly
+/// this shape and passed. The uid is what turns "a leftover I cannot
+/// remove" into "a leftover I can always remove", so a computed name
+/// now carries the uid as well as the pid; either alone is named.
+#[test]
+fn a_computed_name_without_the_uid_is_named() {
+    let tree = Tree::new("pid-without-uid");
+    tree.rs(
+        "src/replay.rs",
+        "\
+fn replay(attempt: usize, head: &str) -> std::path::PathBuf {
+    std::env::%T().%J(format!(
+        \"boss-gate-rebase-{}-{}-{}\",
+        std::process::id(),
+        attempt,
+        &head[..8]
+    ))
+}
+fn owned(uid: u32, head: &str) -> std::path::PathBuf {
+    std::env::%T().%J(format!(
+        \"boss-gate-rebase-{uid}-{}-{}\",
+        std::process::id(),
+        &head[..8]
+    ))
+}
+fn uid_only(uid: u32) -> std::path::PathBuf {
+    std::env::%T().%J(format!(\"boss-uid-only-{uid}\"))
+}
+",
+    );
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a pid-only and a uid-only name must each fail:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    assert!(
+        msg.contains("src/replay.rs:2") && msg.contains("src/replay.rs:17"),
+        "the pid-only replay path and the uid-only path must both be \
+         named:\n{msg}"
+    );
+    assert!(
+        !msg.contains("src/replay.rs:10"),
+        "a name carrying the uid AND the pid is the fix and must pass:\n{msg}"
+    );
+    assert!(
+        msg.contains("uid"),
+        "the verdict must say what is missing — the uid — or the author \
+         re-derives it from the lint's source:\n{msg}"
+    );
+}
+
+/// Every other way to reach the shared root is judged too (backlog
+/// c0172bbc).
+///
+/// After 307df975 only a join of a literal or a `format!` was judged,
+/// and "a computed name is not a literal" was stated as a hole. It was a
+/// live one: `boss upgrade` bound `env::temp_dir()` to a variable and
+/// downloaded a fixed artifact name into it with `--clobber`, so another
+/// uid's leftover made the download fail. The text cannot say what an
+/// expression evaluates to, so the rule is no longer "judge the name"
+/// but "a temp root is reached only through a helper that owns it":
+/// every `temp_dir()` call without the uid AND the pid, a Uuid or the
+/// scratch helpers in its statement is named, as is a `Path::new` of the
+/// bare root and a read of the variable that names it.
+#[test]
+fn a_temp_root_reached_any_other_way_is_named() {
+    let tree = Tree::new("other-roots");
+    tree.rs(
+        "src/roots.rs",
+        "\
+fn joined(name: &std::path::Path) -> std::path::PathBuf {
+    std::env::%T().%J(name)
+}
+fn bound(artifact: &str) -> std::path::PathBuf {
+    let dir = std::env::%T();
+    dir.%J(artifact)
+}
+fn literal_root() -> std::path::PathBuf {
+    std::path::Path::new(\"%S\").%J(\"x\")
+}
+fn var_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(\"%V\")
+}
+fn env_root() -> Option<String> {
+    std::env::var(\"%D\").ok()
+}
+fn env_os_root() -> Option<std::ffi::OsString> {
+    std::env::var_os(\"%D\")
+}
+fn owned() -> std::path::PathBuf {
+    std::env::%T().%J(format!(\"o-{}-{}\", current_uid(), std::process::id()))
+}
+fn stale_%T() {}
+",
+    );
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "every other route to the shared root must fail:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    for line in [2, 5, 9, 12, 15, 18] {
+        let at = format!("src/roots.rs:{line} ");
+        assert!(msg.contains(&at), "{at} must be named:\n{msg}");
+    }
+    for line in [21, 23] {
+        let at = format!("src/roots.rs:{line} ");
+        assert!(
+            !msg.contains(&at),
+            "{at} is the fix (uid AND pid) or merely a name ending in \
+             the word, and must pass:\n{msg}"
+        );
+    }
+    assert!(
+        msg.contains("expression"),
+        "a computed name must be named as one, so the author knows why \
+         the lint cannot read it:\n{msg}"
+    );
 }
 
 /// Instance ELEVEN, the one that motivated the lint, in its pre-fix

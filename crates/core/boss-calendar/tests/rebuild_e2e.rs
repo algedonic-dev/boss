@@ -51,9 +51,16 @@ fn build_app(pool: PgPool) -> (Router, Arc<dyn CalendarClient>) {
         calendar: calendar.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        // The write gate is not under test here (http.rs holds it); the
+        // writes still record their signed caller, `tester`.
+        policy: Arc::new(boss_policy_client::PermissivePolicyClient),
     };
     (router(state), calendar)
 }
+
+/// The caller every write here signs as — the `created_by` the rows
+/// carry, since a caller records only itself (backlog 11721a25).
+const TESTER: &str = r#"{"id":"tester","role":"platform-admin"}"#;
 
 /// Drain the outbox through the relay pipeline into audit_log.
 async fn drain_outbox(pool: &PgPool) -> u64 {
@@ -77,6 +84,7 @@ async fn post_reserve(app: &Router, req: &ReservationRequest) -> uuid::Uuid {
                 .method("POST")
                 .uri("/api/calendar/reservations")
                 .header("content-type", "application/json")
+                .header("x-boss-user", TESTER)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -94,7 +102,8 @@ async fn delete_reserve(app: &Router, id: uuid::Uuid) {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/calendar/reservations/{id}?actor=test"))
+                .uri(format!("/api/calendar/reservations/{id}"))
+                .header("x-boss-user", TESTER)
                 .body(Body::empty())
                 .unwrap(),
         )

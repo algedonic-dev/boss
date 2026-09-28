@@ -7,9 +7,29 @@
 // result the surface must branch on: `ok` continues, `failed` renders
 // inline and leaves state untouched.
 
+import { RELEASE, releaseMetadata, releaseUnconfirmed } from './holder';
+
+/// `presenceRequired` is set only on a 422 whose body says
+/// `required: "presence"` — the one refusal a surface answers with a
+/// passkey tap rather than showing (backlog 3ce3c15f). A 422 is also a
+/// malformed body, so the status alone cannot say which it was.
 export type StepWriteResult =
   | { kind: 'ok'; response: Response }
-  | { kind: 'failed'; error: string };
+  | { kind: 'failed'; error: string; presenceRequired?: true };
+
+function refusedForPresence(status: number, bodyText: string): boolean {
+  if (status !== 422) return false;
+  try {
+    const parsed: unknown = JSON.parse(bodyText);
+    return (
+      !!parsed &&
+      typeof parsed === 'object' &&
+      (parsed as Record<string, unknown>)['required'] === 'presence'
+    );
+  } catch {
+    return false;
+  }
+}
 
 const MAX_BODY_CHARS = 200;
 
@@ -70,6 +90,11 @@ const realSleep = (ms: number): Promise<void> =>
 export type WriteOpts = {
   policy?: RetryPolicy;
   sleep?: (ms: number) => Promise<void>;
+  /// Resend through an ambiguous failure even though the METHOD is not
+  /// on the idempotent list. Set only by a caller that knows its call
+  /// is: [`saveStep`]'s merge PATCH sets the same keys to the same
+  /// values however many times it lands.
+  idempotent?: boolean;
 };
 
 /// Whether a method may be resent after an AMBIGUOUS failure — one
@@ -100,7 +125,7 @@ export async function writeStep(
 ): Promise<StepWriteResult> {
   const policy = opts?.policy ?? WRITE_RETRY;
   const sleep = opts?.sleep ?? realSleep;
-  const idempotent = isIdempotent(init.method);
+  const idempotent = opts?.idempotent ?? isIdempotent(init.method);
 
   for (let attempt = 1; ; attempt += 1) {
     let result: StepWriteResult;
@@ -109,7 +134,10 @@ export async function writeStep(
       const response = await fetch(url, init);
       if (!response.ok) {
         const text = await response.text().catch(() => '');
-        result = { kind: 'failed', error: describeWriteFailure(response.status, text) };
+        const error = describeWriteFailure(response.status, text);
+        result = refusedForPresence(response.status, text)
+          ? { kind: 'failed', error, presenceRequired: true }
+          : { kind: 'failed', error };
         // A 4xx is an ANSWER and is never retried. Nor is a 500: the app
         // RAN and returned an error (`db down`, `registry unavailable`),
         // which the operator must see now, not after a backoff. A deploy
@@ -141,15 +169,229 @@ export async function writeStep(
   }
 }
 
-/// The standard step PUT (PATCH semantics server-side).
+/// A step write that carries METADATA, through the two doors (backlog
+/// e39a9d2a, Stage 1): the metadata keys through the step merge door
+/// (`PATCH …/steps/{id}/metadata`), then everything else — status,
+/// notes, assignee — through the step PUT, which then carries no
+/// metadata at all.
+///
+/// WHY NOT ONE PUT. The step PUT replaces `metadata` wholesale. The
+/// surfaces built it as `{...step.metadata, key: x || undefined}`, and
+/// JSON drops an undefined key, so emptying a field cleared it BY
+/// OMISSION — and anything written to the step since the surface read
+/// it (a claim, a hook's stamp) was dropped the same way, silently. The
+/// merge door changes only the keys it is sent, in one transaction
+/// against the row as it stands. So: send only the keys the surface
+/// owns, never a spread of the step's metadata; an emptied field goes
+/// as an explicit `null`, which the door deletes.
+///
+/// Merge FIRST: the step's required-at-done fields are validated when
+/// it flips to completed, so they must already be there. A refused
+/// merge stops the chain — no status flips on top of a write the
+/// server rejected. An empty metadata object sends no merge, and a
+/// body with nothing but metadata sends no PUT.
+export async function saveStep(
+  jobId: string,
+  stepId: string,
+  body: Readonly<{ metadata?: Readonly<Record<string, unknown>> } & Record<string, unknown>>,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  const { metadata, ...rest } = body;
+  const patch = Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([k, v]) => [k, v === undefined ? null : v]),
+  );
+  let result: StepWriteResult | null = null;
+  if (Object.keys(patch).length > 0) {
+    result = await writeStep(
+      `/api/jobs/${jobId}/steps/${stepId}/metadata`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      },
+      { ...opts, idempotent: true },
+    );
+    if (result.kind === 'failed') return result;
+  }
+  if (result === null || Object.keys(rest).length > 0) {
+    return writeStep(
+      `/api/jobs/${jobId}/steps/${stepId}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rest),
+      },
+      opts,
+    );
+  }
+  return result;
+}
+
+/// Start a step: the claim door, `POST …/steps/{id}/claim` — the one
+/// door a step becomes Active through (design 611fbffd, clause b of
+/// backlog 6ef4a36b). Every surface's Start was its own step PUT moving
+/// the status to active, so the record could not tell "X took this work" from
+/// "someone assigned X and started the clock", and nothing enforced
+/// "release, then claim". The door is a compare-and-set on a READY step
+/// (a loser gets 409 naming the holder), reserves the holder's calendar
+/// time exactly as the PUT did, and records who started it for whom.
+///
+/// `claimedFor` names the holder when it is not the caller — the step's
+/// nominee, or the picker's choice ([`claimedFor`](./holder.ts)). The
+/// server admits that only for the step's declared executor or a holder
+/// of `step-assign`, and its refusal is the surface's error.
+///
+/// Resent through a deploy roll like a PUT: the claim is idempotent for
+/// its holder, so a claim that landed before the blip answers the step
+/// it already took rather than taking it twice.
+export function startStep(
+  jobId: string,
+  stepId: string,
+  claimedFor?: string | null,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  const holder = (claimedFor ?? '').trim();
+  const query = holder ? `?claimed_for=${encodeURIComponent(holder)}` : '';
+  return writeStep(
+    `/api/jobs/${jobId}/steps/${stepId}/claim${query}`,
+    { method: 'POST' },
+    { ...opts, idempotent: true },
+  );
+}
+
+/// A release's outcome. `partial` is the third answer a two-write act
+/// owes: the merge landed — the reason recorded, the run edge cleared —
+/// and then the status write was refused, or the read-back does not
+/// bear the release out. It is neither success nor a clean failure,
+/// and a surface that rendered it as either would lie about the step.
+export type ReleaseResult =
+  | { kind: 'ok' }
+  | { kind: 'failed'; error: string }
+  | { kind: 'partial'; error: string };
+
+/// Release an active step — the three acts `boss step release` makes,
+/// so the page is a third way to hand a step back rather than a
+/// different one (backlog 6ef4a36b: the surfaces said a held step
+/// changes hands "by release", and offered no release):
+///
+/// 1. the merge door: the run edge cleared and the `released` stamp
+///    `{why, by, at, from_run}` recorded, in one write
+///    ([`releaseMetadata`]);
+/// 2. the PUT: [`RELEASE`] — `ready`, nobody's;
+/// 3. the read-back, because a 2xx is a claim and the step as it now
+///    reads is the fact ([`releaseUnconfirmed`]).
+///
+/// A blank reason writes nothing, as the CLI refuses a blank `--why`: the
+/// reason is the whole artifact a release leaves (the review of car
+/// 675f1858, #2). The next holder takes the step through the claim.
+export async function releaseStep(
+  jobId: string,
+  step: Readonly<{ id: string; metadata: Readonly<Record<string, unknown>> }>,
+  why: string,
+  by: string | null,
+  opts?: WriteOpts,
+): Promise<ReleaseResult> {
+  if (!why.trim()) {
+    return {
+      kind: 'failed',
+      error: 'a release needs a reason — it is the whole record a release leaves',
+    };
+  }
+  const stepUrl = `/api/jobs/${jobId}/steps/${step.id}`;
+  const merged = await writeStep(
+    `${stepUrl}/metadata`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(releaseMetadata(step.metadata, why, by, new Date().toISOString())),
+    },
+    { ...opts, idempotent: true },
+  );
+  if (merged.kind === 'failed') return merged;
+
+  const put = await writeStep(
+    stepUrl,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(RELEASE),
+    },
+    opts,
+  );
+  const readBack = await readStepBack(jobId, step.id, opts);
+  const standing =
+    typeof readBack === 'string' ? readBack : releaseUnconfirmed(readBack, why);
+  if (put.kind === 'failed') {
+    return {
+      kind: 'partial',
+      error:
+        `PARTIAL RELEASE — the reason is recorded and the run edge cleared, but the ` +
+        `status write was refused (${put.error}); ${standing ?? 'the step nonetheless reads back released'}. ` +
+        'Reload before acting on this step.',
+    };
+  }
+  if (standing !== null) {
+    return {
+      kind: 'partial',
+      error: `PARTIAL RELEASE — both writes were accepted, but ${standing}. Reload before acting on this step.`,
+    };
+  }
+  return { kind: 'ok' };
+}
+
+/// The step as the server now holds it, or a line saying why it could
+/// not be read.
+async function readStepBack(
+  jobId: string,
+  stepId: string,
+  opts?: WriteOpts,
+): Promise<
+  | Readonly<{ status: string; assignee_id: string | null; metadata: Record<string, unknown> }>
+  | string
+> {
+  const res = await writeStep(`/api/jobs/${jobId}/steps`, { method: 'GET' }, opts);
+  if (res.kind === 'failed') return `the step could not be read back (${res.error})`;
+  try {
+    const rows = (await res.response.json()) as ReadonlyArray<{
+      id: string;
+      status: string;
+      assignee_id: string | null;
+      metadata?: Record<string, unknown> | null;
+    }>;
+    const row = rows.find((r) => r.id === stepId);
+    if (!row) return 'the step is missing from the read-back';
+    return {
+      status: row.status,
+      assignee_id: row.assignee_id ?? null,
+      metadata: row.metadata ?? {},
+    };
+  } catch {
+    return 'the read-back was not the step list';
+  }
+}
+
+/// The standard step PUT (PATCH semantics server-side). A body that
+/// carries `metadata` belongs in [`saveStep`] instead.
+///
+/// `presenceTicket` is the ticket a passkey ceremony on THIS step just
+/// issued, handed over by the surface that ran it (backlog b568044a,
+/// 2026-09-25). The jobs API judges a presence-gated step again on the
+/// request that completes it, from that request's own header, so a
+/// completion sent bare after a presence stamp answered 422 and the step
+/// stayed ready. This function mints nothing and widens nothing: the
+/// gateway verifies the ticket and the jobs API re-checks its step,
+/// person, shape and expiry on this PUT exactly as on the stamp.
 export function putStep(
   jobId: string,
   stepId: string,
   body: unknown,
+  presenceTicket?: string,
 ): Promise<StepWriteResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (presenceTicket) headers['x-presence-ticket'] = presenceTicket;
   return writeStep(`/api/jobs/${jobId}/steps/${stepId}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
 }

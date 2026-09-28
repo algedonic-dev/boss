@@ -1,5 +1,5 @@
 //! `GET /api/workflows/{kind}/terminal-report` — Tier 1 of the
-//! experiments program (docs/design/network-experiments.md): measure
+//! experiments program (the network-experiments decision in docs/architecture-decisions.md): measure
 //! what version pinning already records.
 //!
 //! Per workflow version of one kind, over the jobs projection alone:
@@ -96,6 +96,7 @@ fn packet(
         status,
         priority: Priority::Standard,
         opened_on: opened,
+        opened_at: None,
         due_on: None,
         closed_on: closed,
         metadata: match outcome {

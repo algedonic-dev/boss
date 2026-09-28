@@ -14,9 +14,8 @@ use boss_core::primitives::ClassRef;
 use boss_core::publisher::DomainPublisher;
 use boss_inventory_client::InventoryClient;
 
-use boss_jobs_client::JobsClient;
 use boss_people_client::{PeopleClient, PeopleClientError};
-use boss_policy::{Action, Decision, Resource};
+use boss_policy::{Action, Decision, Resource, Scope};
 use boss_policy_client::{CurrentUser, PolicyClient};
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +64,6 @@ struct PaginatedResponse<T: Serialize> {
 /// None` and the route responds 503.
 pub struct InsightsClients {
     pub catalog: Arc<dyn CatalogClient>,
-    pub jobs: Arc<dyn JobsClient>,
     pub inventory: Arc<dyn InventoryClient>,
 }
 
@@ -83,10 +81,14 @@ pub struct AssetsApiState<R: AssetsRepository, B: EventBus> {
     /// binary). Kept `Option` so tests pass `None`.
     pub classes_client: Option<Arc<dyn ClassesClient>>,
     pub hub: SseHub,
-    /// Row-level authorization. None in tests that don't exercise
-    /// the policy path — those handlers skip the gate and allow the
-    /// request, preserving the existing test surface.
-    pub policy: Option<Arc<dyn PolicyClient>>,
+    /// Row-level authorization for every write here. Required: until
+    /// backlog 2b49ab60 (2026-09-27) this was an `Option` and `None`
+    /// let every write through — fail-open by configuration, guarded
+    /// only by a comment and a source pin on the binary. Now no
+    /// surface can be built without a client, the ledger's shape
+    /// (7048afa8); a test that wants the gate out of its way says so
+    /// by wiring `PermissivePolicyClient`.
+    pub policy: Arc<dyn PolicyClient>,
     pub insights_clients: Option<InsightsClients>,
     /// Authoritative clock. See `boss-clock-client`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
@@ -229,9 +231,8 @@ async fn active_asset_count_for_sku<R: AssetsRepository + 'static, B: EventBus +
 
 /// `GET /api/assets/{asset_id}/insights` — backs the SR 360 + Device
 /// 360 Insights sections. Fans out to catalog (failure modes + spare
-/// parts BOM), jobs (service history), and inventory (stock for
-/// high-usage parts). See [`crate::asset_insights`] for the shape
-/// and aggregator rules.
+/// parts BOM) and inventory (stock for high-usage parts). See
+/// [`crate::asset_insights`] for the shape and aggregator rules.
 async fn asset_insights<R: AssetsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<AssetsApiState<R, B>>>,
     Path(serial): Path<String>,
@@ -239,7 +240,7 @@ async fn asset_insights<R: AssetsRepository + 'static, B: EventBus + 'static>(
     let Some(clients) = &state.insights_clients else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "device-insights requires catalog/jobs/inventory clients — not configured",
+            "device-insights requires catalog/inventory clients — not configured",
         )
             .into_response();
     };
@@ -254,34 +255,17 @@ async fn asset_insights<R: AssetsRepository + 'static, B: EventBus + 'static>(
     };
 
     // Fetch the catalog model first so we know which SKUs to ask
-    // inventory about. Service history can run in parallel since it
-    // only needs the serial. An unidentified asset (no sku yet — it
-    // was Registered but not Identified) has no catalog model, so skip
+    // inventory about. An unidentified asset (no sku yet — it was
+    // Registered but not Identified) has no catalog model, so skip
     // the catalog call entirely; the model-derived panels render empty
     // until it's identified.
-    let sku = current_state.sku.clone();
-    let model_fut = async {
-        match &sku {
-            Some(s) => clients.catalog.model_summary_by_sku(s).await,
-            None => Ok(None),
-        }
+    let model_res = match &current_state.sku {
+        Some(s) => clients.catalog.model_summary_by_sku(s).await,
+        None => Ok(None),
     };
-    let (model_res, history_res) = tokio::join!(
-        model_fut,
-        clients.jobs.list_jobs(
-            Some("field-service"),
-            Some(&serial),
-            SERVICE_HISTORY_FETCH_LIMIT,
-        )
-    );
-
     let model = match model_res {
         Ok(m) => m,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("catalog: {e}")).into_response(),
-    };
-    let history = match history_res {
-        Ok(jobs) => crate::service_history::project_service_history(&jobs),
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("jobs: {e}")).into_response(),
     };
 
     let stock = if let Some(m) = &model {
@@ -304,18 +288,11 @@ async fn asset_insights<R: AssetsRepository + 'static, B: EventBus + 'static>(
     let insights = build_asset_insights(
         serial,
         model,
-        history,
         stock,
         boss_clock_client::now_from(&state.clock).await,
     );
     Json(insights).into_response()
 }
-
-/// Upper bound on the service-history rows we fetch from jobs. The
-/// aggregator further caps the preview to the frontend-visible top-N;
-/// this is just a server-side ceiling to keep the `/api/jobs` response
-/// bounded when a serial has a deep history.
-const SERVICE_HISTORY_FETCH_LIMIT: u32 = 50;
 
 async fn get_asset<R: AssetsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<AssetsApiState<R, B>>>,
@@ -470,36 +447,68 @@ async fn check_asset_classes(
     }
 }
 
+/// Policy: appending an asset event mutates an asset row, so both
+/// event doors ask Update on `Resource::asset()` — one question, asked
+/// one way. Until backlog 6c0f6547 (2026-09-26) only the single-event
+/// door asked; its batch twin asked nothing.
+async fn require_asset_update<R: AssetsRepository, B: EventBus>(
+    state: &AssetsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> Result<(), Response> {
+    require_asset_update_on(state.policy.as_ref(), user).await
+}
+
+/// Ask `policy` for Update on `Resource::asset()` — the question every
+/// asset write asks, the event doors here and the Parts writes in
+/// `asset_parts` — answering the response that refuses. A Deny is 403;
+/// a policy service that cannot answer refuses with the client error's
+/// own response (503 + Retry-After), never a pass.
+///
+/// An Allow counts only at scope `all` (backlog f922edea, 2026-09-27).
+/// These writes carry no row predicate — nothing reads a grant's team,
+/// territory or department against the asset written — so an
+/// `Allow { scope: Team }` used to pass as if it were `all`. Until a
+/// row predicate exists, a narrower grant is refused, naming the scope
+/// it held. Measured before refusing: no live policy rule grants a
+/// write on asset at any scope but `all`.
+pub(crate) async fn require_asset_update_on(
+    policy: &dyn PolicyClient,
+    user: &boss_policy_client::User,
+) -> Result<(), Response> {
+    match policy.check(user, Action::Update, Resource::asset()).await {
+        Ok(Decision::Allow { scope: Scope::All }) => Ok(()),
+        Ok(Decision::Allow { scope }) => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "update on asset is granted to role {} only at scope {}; this write has no \
+                 row predicate, so only scope all admits it",
+                user.role,
+                scope.to_db_string(),
+            ),
+        )
+            .into_response()),
+        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
+        Err(e) => Err(e.into_response()),
+    }
+}
+
 async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<AssetsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
     Json(event): Json<AssetEvent>,
 ) -> Response {
+    // Policy first (backlog f922edea): a refused caller drives no
+    // class-registry call, and cannot tell a registered taxonomy code
+    // (403) from an unregistered one (400).
+    if let Err(resp) = require_asset_update(&state, &user).await {
+        return resp;
+    }
     // Class-registry gate, before any persistence. The event's
     // taxonomy field(s) (source/coverage/condition) live in the JSONB
     // payload with no schema CHECK — this is the only enforcement
     // point. Permissive when no registry is wired (test path).
     if let Err(resp) = check_asset_classes(state.classes_client.as_ref(), &event).await {
         return resp;
-    }
-    // Policy: appending an asset event mutates an asset row. Gate as
-    // Action::Update on Resource::asset() when a policy client is wired
-    // (production). Test path (policy: None) bypasses to preserve the
-    // existing unit surface.
-    if let Some(ref policy) = state.policy {
-        match policy.check(&user, Action::Update, Resource::asset()).await {
-            Ok(Decision::Allow { .. }) => {}
-            Ok(Decision::Deny { reason }) => {
-                return (StatusCode::FORBIDDEN, reason).into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("policy check failed: {e}"),
-                )
-                    .into_response();
-            }
-        }
     }
     if let Err(resp) =
         validate_actor_ids(state.people_client.as_ref(), std::slice::from_ref(&event)).await
@@ -521,8 +530,17 @@ async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
 
 async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<AssetsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
     Json(events): Json<Vec<AssetEvent>>,
 ) -> Response {
+    // The single-event door's question, once for the whole batch, and
+    // FIRST. It used to run after the per-event registry loop below,
+    // so a refused caller fanned out one class-registry call per event
+    // and learned which taxonomy codes are registered from 400-vs-403
+    // (backlog f922edea).
+    if let Err(resp) = require_asset_update(&state, &user).await {
+        return resp;
+    }
     // Class-registry gate, per event, before any persistence. The
     // batch is all-or-nothing (`batch_append`), so one unregistered
     // taxonomy code rejects the whole batch — there is no unvalidated
@@ -583,8 +601,8 @@ mod tests {
     use tower::ServiceExt;
 
     /// Build an assets router with the given (optional) Class registry.
-    /// No policy (None → allow), permissive people client, recording
-    /// bus, wall clock. Exercises the `check_asset_classes` ingest gate.
+    /// Permissive policy, permissive people client, recording bus,
+    /// wall clock. Exercises the `check_asset_classes` ingest gate.
     fn app_with_classes(classes_client: Option<Arc<dyn ClassesClient>>) -> Router {
         app_with(classes_client, Arc::new(AlwaysExistsPeople))
     }
@@ -593,22 +611,70 @@ mod tests {
         classes_client: Option<Arc<dyn ClassesClient>>,
         people_client: Arc<dyn PeopleClient>,
     ) -> Router {
+        app_over(
+            classes_client,
+            people_client,
+            Arc::new(boss_policy_client::PermissivePolicyClient),
+        )
+        .0
+    }
+
+    /// The router plus the store behind it, so a test can read what a
+    /// request left in it.
+    fn app_over(
+        classes_client: Option<Arc<dyn ClassesClient>>,
+        people_client: Arc<dyn PeopleClient>,
+        policy: Arc<dyn PolicyClient>,
+    ) -> (Router, Arc<InMemoryAssets>) {
         let assets = Arc::new(InMemoryAssets::new());
         let bus = RecordingEventBus::new();
         let publisher =
             DomainPublisher::new(bus.clone() as Arc<dyn boss_core::port::EventBus>, "assets");
         let state = AssetsApiState {
-            assets,
+            assets: assets.clone(),
             bus,
             publisher,
             people_client,
             classes_client,
             hub: SseHub::new(),
-            policy: None,
+            policy,
             insights_clients: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };
-        router(state)
+        (router(state), assets)
+    }
+
+    /// Backlog 6c0f6547 (2026-09-26): the single-event door asked
+    /// policy for Update on asset and its batch twin asked nothing, so
+    /// a caller refused one event at a time could append any number of
+    /// them at once. The batch now asks the same question, before it
+    /// writes anything.
+    #[tokio::test]
+    async fn a_denied_caller_cannot_append_asset_events_through_the_batch_door() {
+        let (app, assets) = app_over(
+            None,
+            Arc::new(AlwaysExistsPeople),
+            Arc::new(boss_policy_client::FakePolicyClient::deny_all()),
+        );
+        let event = received_event_with_source("evt-batch-denied", "oem-new");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/assets/events/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&vec![event.clone()]).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            assets.events_for(&event.asset_id).await.unwrap().is_empty(),
+            "a refused batch must append nothing"
+        );
     }
 
     /// A `Received` event whose intake `source` is the given code.
@@ -754,5 +820,156 @@ mod tests {
         };
         let resp = post_event_req(app, &event).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── Grant-shaped policy tests (backlog f922edea) ───────────────
+    //
+    // The deny-all test above passes whatever a door asks, so the
+    // review of 6c0f6547 mutated the batch to ask Delete on invoice and
+    // no test noticed. These grant one role exactly one question and
+    // read which doors open.
+
+    const TECH: &str = "field-tech";
+
+    fn grant(rules: &[(Action, Resource, Scope)]) -> Arc<dyn PolicyClient> {
+        let builder = rules
+            .iter()
+            .fold(boss_policy_client::FakePolicyClient::builder(), |b, r| {
+                b.allow(TECH, r.0, r.1.clone(), r.2.clone())
+            });
+        Arc::new(builder.build())
+    }
+
+    async fn send_as_tech(app: Router, uri: &str, body: serde_json::Value) -> Response {
+        let user = serde_json::json!({"id": "emp-gate", "role": TECH}).to_string();
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-boss-user", user)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// (single-event door, batch door) statuses for a tech holding
+    /// `rules`, each on a fresh store.
+    async fn doors_under(rules: &[(Action, Resource, Scope)]) -> (StatusCode, StatusCode) {
+        let event = received_event_with_source("evt-grant", "oem-new");
+        let (app, _) = app_over(None, Arc::new(AlwaysExistsPeople), grant(rules));
+        let single = send_as_tech(
+            app,
+            "/api/assets/events",
+            serde_json::to_value(&event).unwrap(),
+        )
+        .await
+        .status();
+        let (app, _) = app_over(None, Arc::new(AlwaysExistsPeople), grant(rules));
+        let batch = send_as_tech(
+            app,
+            "/api/assets/events/batch",
+            serde_json::to_value(vec![event]).unwrap(),
+        )
+        .await
+        .status();
+        (single, batch)
+    }
+
+    #[tokio::test]
+    async fn update_on_asset_opens_both_event_doors() {
+        assert_eq!(
+            doors_under(&[(Action::Update, Resource::asset(), Scope::All)]).await,
+            (StatusCode::CREATED, StatusCode::OK)
+        );
+    }
+
+    #[tokio::test]
+    async fn another_verb_or_another_resource_opens_neither_event_door() {
+        for rules in [
+            vec![(Action::Update, Resource::invoice(), Scope::All)],
+            vec![(Action::Delete, Resource::invoice(), Scope::All)],
+            vec![(Action::Create, Resource::asset(), Scope::All)],
+            vec![(Action::Delete, Resource::asset(), Scope::All)],
+        ] {
+            assert_eq!(
+                doors_under(&rules).await,
+                (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+                "{rules:?}"
+            );
+        }
+    }
+
+    /// No row predicate reads a grant's scope on these writes, so a
+    /// grant narrower than `all` used to pass as `all`. Refused now.
+    #[tokio::test]
+    async fn update_on_asset_below_scope_all_opens_neither_event_door() {
+        for scope in [Scope::Team, Scope::Self_, Scope::Territory] {
+            assert_eq!(
+                doors_under(&[(Action::Update, Resource::asset(), scope.clone())]).await,
+                (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+                "{scope:?}"
+            );
+        }
+    }
+
+    /// A class registry that answers yes and counts every question.
+    struct CountingClasses(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ClassesClient for CountingClasses {
+        async fn class_exists(
+            &self,
+            _class_ref: &ClassRef,
+        ) -> Result<bool, boss_classes_client::ClassesClientError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn list_for_subject_kind(
+            &self,
+            _subject_kind: &str,
+        ) -> Result<Vec<boss_core::primitives::Class>, boss_classes_client::ClassesClientError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    /// Policy is asked before the class registry on both doors: a
+    /// refused caller cannot fan out one registry call per event, nor
+    /// read which codes are registered from 400-vs-403.
+    #[tokio::test]
+    async fn a_refused_caller_asks_the_class_registry_nothing() {
+        let classes = Arc::new(CountingClasses(Default::default()));
+        let events: Vec<AssetEvent> = (0..5)
+            .map(|n| received_event_with_source(&format!("evt-fan-{n}"), "oem-new"))
+            .collect();
+        for (uri, body) in [
+            (
+                "/api/assets/events",
+                serde_json::to_value(&events[0]).unwrap(),
+            ),
+            (
+                "/api/assets/events/batch",
+                serde_json::to_value(&events).unwrap(),
+            ),
+        ] {
+            let (app, _) = app_over(
+                Some(classes.clone() as Arc<dyn ClassesClient>),
+                Arc::new(AlwaysExistsPeople),
+                Arc::new(boss_policy_client::FakePolicyClient::deny_all()),
+            );
+            assert_eq!(
+                send_as_tech(app, uri, body).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            classes.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused caller must not reach the class registry"
+        );
     }
 }

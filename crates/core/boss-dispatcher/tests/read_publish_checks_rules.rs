@@ -14,13 +14,15 @@
 //! packet closed, PR #238 was merged over 64 unread alerts and #239
 //! stalled on 109, and nothing in the record said so.
 
-use boss_dispatcher::rules::expr::{NoHelpers, Value};
+use boss_core::calendar::Cadence;
+use boss_dispatcher::rules::expr::{Expr, NoHelpers, Value};
 use boss_dispatcher::rules::registry::{MatchedInvocation, Registry, match_event};
 
 mod common;
 
 const FILING: &str = "read-publish-checks-on-read-checks-ready";
 const ANSWER: &str = "complete-publish-read-checks-on-read-publish-checks-answered";
+const REREAD: &str = "reread-publish-pr-every-15-minutes";
 
 fn rule(name: &str) -> Registry {
     common::authored_rule(name)
@@ -164,6 +166,105 @@ fn an_answered_read_request_hands_the_handler_the_edge_the_fields_and_the_failur
         arg(inv, "on_failure"),
         Value::String("annotate-and-alert".into()),
         "a deadline passed or an unreadable GitHub must annotate the step and file the alert"
+    );
+}
+
+/// THE RE-READ (backlog c6cb678b). A check slower than the scan — the
+/// mirror's full Gate, up to 180 minutes — is `not yet` on the one read
+/// the step-ready rule files, so the step stays open; this is what reads
+/// it again. Unguarded (the verb is the idempotence), filing the SAME
+/// verb for the same host as the step-ready rule. Every fifteen minutes
+/// since backlog 663589cd: the same verb now asks what became of every
+/// publish PR, and #244 alarmed 22 hours past its close when only the
+/// daily drift verb asked.
+#[test]
+fn the_re_read_rule_re_files_the_same_forge_read_every_fifteen_minutes_unguarded() {
+    let reg = rule(REREAD);
+    let r = reg
+        .rules()
+        .iter()
+        .find(|r| r.name == REREAD)
+        .expect("the re-read rule is declared");
+    let schedule = r.schedule().expect("a timer, not an event rule");
+    assert_eq!(
+        schedule.cadence,
+        Cadence::EveryNMinutes(15),
+        "a close must not alarm for longer than a quarter hour"
+    );
+    assert!(
+        r.when.is_none(),
+        "no guard: a guard the silence roster cannot read declares a cadence it does not keep"
+    );
+    let step = r.do_steps.first().expect("one handler");
+    assert_eq!(step.handler, "jobs.spawn");
+    let lit = |k: &str| {
+        step.args
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_else(|| panic!("arg {k} missing"))
+    };
+    assert_eq!(
+        lit("kind"),
+        Expr::Literal(Value::String("ops-request".into()))
+    );
+    assert_eq!(
+        lit("metadata.verb"),
+        Expr::Literal(Value::String("read-publish-checks".into())),
+        "the same verb the step-ready rule files"
+    );
+    assert_eq!(
+        lit("metadata.host"),
+        Expr::Literal(Value::String("forge".into()))
+    );
+}
+
+/// THE RE-READ'S ANSWER IS READ (backlog fd808d90). A clock firing names
+/// no packet, so the re-read files no `for_publish`; the verb writes it
+/// onto its own request before it answers (read_publish_checks_sh.rs
+/// pins that half). What this side must hold is that the answer rule is
+/// the re-read's reader at all: it selects on the verb the re-read
+/// files, and it follows the edge by the key the verb writes. On
+/// 2026-09-27 eight re-reads refused publish 8d7a3507, closed
+/// `answered`, and reached neither the step nor an alert.
+#[test]
+fn the_answer_rule_reads_the_re_reads_requests_by_their_verb() {
+    let reread = rule(REREAD);
+    let r = reread
+        .rules()
+        .iter()
+        .find(|r| r.name == REREAD)
+        .expect("the re-read rule is declared");
+    let filed_verb = r.do_steps[0]
+        .args
+        .iter()
+        .find(|(n, _)| n == "metadata.verb")
+        .map(|(_, e)| e.clone())
+        .expect("the re-read names its verb");
+    assert!(
+        !r.do_steps[0]
+            .args
+            .iter()
+            .any(|(n, _)| n == "metadata.for_publish"),
+        "a clock has no packet to name; the verb names it"
+    );
+
+    let out = match_event(
+        &rule(ANSWER),
+        "jobs.job.closed",
+        &closed("ops-request", "answered"),
+        &NoHelpers,
+    );
+    let inv = &out.matched[0].invocations[0];
+    assert_eq!(
+        Expr::Literal(arg(inv, "verb")),
+        filed_verb,
+        "the answer rule reads the verb the re-read files"
+    );
+    assert_eq!(
+        arg(inv, "link"),
+        Value::String("for_publish".into()),
+        "the key infra/forge/read-publish-checks.sh writes onto its request"
     );
 }
 

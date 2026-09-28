@@ -717,13 +717,13 @@ fn a_skipped_instances_hostname_is_served_by_the_source_gateway_until_provisione
     assert_eq!(rc, 0, "{err}");
     assert_eq!(
         out.trim(),
-        "boss.algedonic.dev → boss; www.algedonic.dev → boss (site); playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin)"
+        "boss.algedonic.dev → boss; www.algedonic.dev → boss (site); playground.algedonic.dev → boss (boss-playground skipped: secrets absent); id.algedonic.dev → https://10.20.0.31:443 (origin); dev.algedonic.dev → ssh://boss-dev-ssh.boss-dev.svc.cluster.local:22 (origin)"
     );
     let (rc, out, err) = run_render_env(&repo_root(), &["--summary"], &[]);
     assert_eq!(rc, 0, "{err}");
     assert_eq!(
         out.trim(),
-        "boss.algedonic.dev → boss; www.algedonic.dev → boss (site); playground.algedonic.dev → boss-playground; id.algedonic.dev → https://10.20.0.31:443 (origin)",
+        "boss.algedonic.dev → boss; www.algedonic.dev → boss (site); playground.algedonic.dev → boss-playground; id.algedonic.dev → https://10.20.0.31:443 (origin); dev.algedonic.dev → ssh://boss-dev-ssh.boss-dev.svc.cluster.local:22 (origin)",
         "applied: the field says the hostname is its own instance's again"
     );
 
@@ -848,20 +848,16 @@ exit 0
 
 /// sha256 of a text, by the same tool the runner uses.
 fn sha256_hex(text: &str) -> String {
-    use std::io::Write;
     let mut child = Command::new("sh")
         .args(["-c", "sha256sum | cut -d' ' -f1"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(text.as_bytes())
-        .unwrap();
+    // Its exit status is the verdict, not the write (backlog d93cc7d5).
+    boss_testing::feed_stdin(&mut child, text.as_bytes());
     let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "sha256sum: {:?}", out.status);
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

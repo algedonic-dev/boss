@@ -46,14 +46,27 @@ publish-github-pr: FAILED — pushing publish/2026-09-18 to the forge (http://10
 const FAILED_LINE: &str = "publish-github-pr: FAILED — pushing publish/2026-09-18 to the forge (http://10.20.0.15:3000/david/boss.git) as david: fatal: detected dubious ownership in repository at '/var/lib/boss-publish/boss.git' To add an exception for this directory, call:  \tgit config --global --add safe.directory /var/lib/boss-publish/boss.git . Without it on the forge, the push mirror prunes the PR's head at the next train";
 
 const PR_URL: &str = "https://github.com/algedonic-dev/boss/pull/241";
+/// The snapshot the PR's head holds — what read-publish-checks reads
+/// the checks of, and refuses the packet without (backlog 1f0aa60d).
+const SNAPSHOT: &str = "28554177812cc9645ab0eff2158574c25286f34a";
 
 /// The verb's happy path, as infra/forge/publish-github-pr.sh prints it.
 fn opened_output() -> String {
     format!(
-        "publish-github-pr: packet 254177e2 — open-pr ready; publishing forge main as publish/2026-09-18\n\
-         publish-github-pr: pushed publish/2026-09-18 to the forge as david — the mirror carries it\n\
-         publish-github-pr: pushed dauld:publish/2026-09-18\n\
-         publish-github-pr: opened {PR_URL}\n\
+        "publish-github-pr: packet 254177e2 — open-pr ready; publishing forge main as publish/2026-09-18-<snapshot>\n\
+         publish-github-pr: snapshot {SNAPSHOT} (tree t of forge f, parent mirror m) — branch publish/2026-09-18-28554177812c\n\
+         publish-github-pr: pushed publish/2026-09-18-28554177812c to the forge as david — the off-site push carries it too\n\
+         publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
+         publish-github-pr: opened {PR_URL} at {SNAPSHOT}\n\
+         publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
+    )
+}
+
+/// The re-run's line: the PR found open for the run's own branch.
+fn reused_output() -> String {
+    format!(
+        "publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
+         publish-github-pr: PR already open for dauld:publish/2026-09-18-28554177812c — reusing {PR_URL} at {SNAPSHOT}\n\
          publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
     )
 }
@@ -227,12 +240,32 @@ async fn mock_jobs(
                       Json(body): Json<serde_json::Value>| {
                     let writes = writes.clone();
                     async move {
+                        // The step PUT as the decided end state of
+                        // design 93d2bddb has it (e39a9d2a): a body
+                        // carrying metadata is refused 409 and routed
+                        // to the merge door below. Recorded as
+                        // "PUT (409)", so a test sees the attempt.
+                        if body.get("metadata").is_some() {
+                            writes.lock().unwrap().push((
+                                "PUT (409)".into(),
+                                format!("/api/jobs/{id}/steps/{step_id}"),
+                                body,
+                            ));
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                Json(json!({
+                                    "error": "a step PUT carries no metadata",
+                                    "merge_door":
+                                        format!("/api/jobs/{id}/steps/{step_id}/metadata"),
+                                })),
+                            );
+                        }
                         writes.lock().unwrap().push((
                             "PUT".into(),
                             format!("/api/jobs/{id}/steps/{step_id}"),
                             body,
                         ));
-                        Json(json!({ "ok": true }))
+                        (axum::http::StatusCode::OK, Json(json!({ "ok": true })))
                     }
                 },
             )
@@ -377,16 +410,56 @@ async fn an_opened_pr_completes_the_open_pr_step_with_its_url() {
     let puts: Vec<_> = w.iter().filter(|(m, _, _)| m == "PUT").collect();
     assert_eq!(puts.len(), 1, "exactly the open-pr step completed: {w:?}");
     assert_eq!(puts[0].1, format!("/api/jobs/{PUBLISH}/steps/{OPEN_PR}"));
-    let body = &puts[0].2;
-    assert_eq!(body["status"], "completed");
     assert_eq!(
-        body["metadata"]["pr_url"], PR_URL,
+        puts[0].2,
+        json!({ "status": "completed" }),
+        "the flip carries the status alone (e39a9d2a)"
+    );
+    // The fields ride the step merge door, before the flip.
+    let body = step_patch(&w);
+    let merge_path = format!("/api/jobs/{PUBLISH}/steps/{OPEN_PR}/metadata");
+    let merge_at = w
+        .iter()
+        .position(|(m, p, _)| m == "PATCH" && *p == merge_path)
+        .unwrap();
+    let flip_at = w.iter().position(|(m, _, _)| m == "PUT").unwrap();
+    assert!(merge_at < flip_at, "merge first, then flip: {w:?}");
+    assert_eq!(body["pr_url"], PR_URL, "copied from the verb's line");
+    // The head the PR stands on, from the same line: without it the
+    // next machine step (read-publish-checks) refuses the packet, which
+    // is how 8d7a3507 stalled after a hand completion (backlog 1f0aa60d).
+    assert_eq!(
+        body["snapshot_commit"], SNAPSHOT,
         "copied from the verb's line"
     );
-    assert_eq!(body["metadata"]["published_by"]["car"], REQUEST);
+    assert_eq!(body["published_by"]["car"], REQUEST);
     assert!(
         !w.iter().any(|(m, _, _)| m == "POST"),
         "nothing to alert: {w:?}"
+    );
+}
+
+/// The reuse line completes the step the same way — url AND snapshot.
+#[tokio::test]
+async fn a_reused_pr_completes_the_open_pr_step_with_its_url_and_snapshot() {
+    let (base, writes) = mock_jobs(
+        vec![request("0", &reused_output()), publish("ready", json!({}))],
+        vec![],
+    )
+    .await;
+    handler(base)
+        .invoke(&rule_args(), &ctx())
+        .await
+        .expect("runs");
+
+    let w = writes.lock().unwrap().clone();
+    let body = step_patch(&w);
+    assert_eq!(body["pr_url"], PR_URL, "{w:?}");
+    assert_eq!(body["snapshot_commit"], SNAPSHOT, "{w:?}");
+    assert_eq!(
+        w.iter().filter(|(m, _, _)| m == "PUT").count(),
+        1,
+        "the step completed: {w:?}"
     );
 }
 
@@ -665,4 +738,161 @@ async fn a_refused_tag_release_is_alerted_by_its_reason_not_its_epilogue() {
         "and not the epilogue after it: {failed_line}"
     );
     assert_eq!(step_patch_on(&w, RELEASE, TAG_STEP)["failed"], failed_line);
+}
+
+/// THE READ-CHECKS LEG, FROM THE CLOCK (backlog fd808d90, measured
+/// 2026-09-27). `reread-publish-pr-every-15-minutes` files
+/// read-publish-checks every quarter hour, and between 14:00Z and 15:45Z
+/// eight of those runs refused publish 8d7a3507 (exit 2, its open-pr
+/// step carries no `snapshot_commit`), closed `answered`, and reached
+/// nothing: a timer names no packet, so the requests carried no
+/// `for_publish`, and this rule follows only that edge. The verb now
+/// writes the edge onto its own request before it refuses
+/// (read_publish_checks_sh.rs pins that half); these cases pin what the
+/// answer rule does with it — and that a refusal repeated every fifteen
+/// minutes is ONE alert, not ninety-six a day.
+const READ_RULE: &str = "complete-publish-read-checks-on-read-publish-checks-answered";
+const READ_PUBLISH: &str = "8d7a3507-27c4-4e92-b308-6f8043201b03";
+const READ_CHECKS: &str = "4c3b2a19-0817-4f6e-9d5c-4b3a29180716";
+/// One of the eight silent re-reads, and the step-ready request whose
+/// alert (487e67bf) was the only one filed.
+const REREAD_REQUEST: &str = "6378fa4d-9e8f-4a7b-8c6d-5e4f3a2b1c0d";
+const EARLIER_REQUEST: &str = "bd6aae0a-f748-42f3-b92c-11507a4ef313";
+const EARLIER_ALERT: &str = "487e67bf-1a2b-4c3d-8e4f-5a6b7c8d9e0f";
+/// The refusal, as the verb printed it on every one of the eight.
+const REFUSED_LINE: &str = "read-publish-checks: REFUSED — packet 8d7a3507: the open-pr step recorded no head sha (metadata.snapshot_commit is 'empty') — publish-github-pr writes it when it pushes; nothing was read";
+
+/// A clock-spawned read request as it closes now: the edge the verb
+/// wrote, the refusal, exit 2.
+fn reread_request() -> serde_json::Value {
+    json!({
+        "id": REREAD_REQUEST, "kind": "ops-request", "status": "closed",
+        "title": "re-read the mirror PRs and their checks from the forge — what GitHub says of each publish PR",
+        "subject": { "subject_kind": "custom", "id": "github-mirror-checks" },
+        "metadata": { "host": "forge", "verb": "read-publish-checks", "area": "platform",
+                      "for_publish": READ_PUBLISH, "outcome": "answered",
+                      "spawned_by_rule": "reread-publish-pr-every-15-minutes" },
+        "steps": [
+            { "id": "rr-execute", "spec_slug": "execute", "status": "completed",
+              "metadata": { "disposition": "answered", "exit_code": "2", "runner_host": "forge",
+                            "output": format!(
+                                "read-publish-checks: request 6378fa4d names publish {READ_PUBLISH} (for_publish)\n{REFUSED_LINE}\n") } },
+        ],
+    })
+}
+
+/// Publish 8d7a3507 at read-checks, the step carrying `read_checks`.
+fn publish_at_read_checks(read_checks: serde_json::Value) -> serde_json::Value {
+    json!({
+        "id": READ_PUBLISH, "kind": "publish-to-github", "status": "open",
+        "title": "Publish to the public GitHub mirror",
+        "subject": { "subject_kind": "custom", "id": "github-mirror" },
+        "metadata": { "snapshot_commit": SNAPSHOT },
+        "steps": [
+            { "id": OPEN_PR, "spec_slug": "open-pr", "status": "completed",
+              "metadata": { "pr_url": PR_URL } },
+            { "id": READ_CHECKS, "spec_slug": "read-checks", "status": "ready",
+              "metadata": read_checks },
+            { "id": "s-judge", "spec_slug": "judge-checks", "status": "pending", "metadata": {} },
+        ],
+    })
+}
+
+/// The alert the first refusal filed, still open.
+fn open_alert(step: &str, verb: &str) -> serde_json::Value {
+    json!({ "id": EARLIER_ALERT, "kind": "backlog-item", "status": "open",
+            "metadata": { "for_request": EARLIER_REQUEST, "for_packet": READ_PUBLISH,
+                          "step": step, "verb": verb } })
+}
+
+async fn answer_reread(
+    open_items: Vec<serde_json::Value>,
+    read_checks: serde_json::Value,
+) -> Vec<(String, String, serde_json::Value)> {
+    let (base, writes) = mock_jobs(
+        vec![reread_request(), publish_at_read_checks(read_checks)],
+        open_items,
+    )
+    .await;
+    handler(base)
+        .invoke(
+            &rule_args_of(READ_RULE),
+            &ctx_for(READ_RULE, REREAD_REQUEST),
+        )
+        .await
+        .expect("runs");
+    writes.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_clock_spawned_refusal_troubles_read_checks_and_files_the_alert() {
+    let w = answer_reread(vec![], json!({ "ops_verb": "read-publish-checks" })).await;
+    assert!(
+        !w.iter().any(|(m, _, _)| m == "PUT"),
+        "a refusal completes nothing: {w:?}"
+    );
+    let posts: Vec<_> = w.iter().filter(|(m, _, _)| m == "POST").collect();
+    assert_eq!(posts.len(), 1, "one alert: {w:?}");
+    assert_eq!(posts[0].2["metadata"]["for_packet"], READ_PUBLISH);
+    assert_eq!(posts[0].2["metadata"]["step"], "read-checks");
+    assert_eq!(posts[0].2["metadata"]["failed"], REFUSED_LINE);
+    let note = step_patch_on(&w, READ_PUBLISH, READ_CHECKS);
+    assert_eq!(note["failed"], REFUSED_LINE, "the refusal, on the step");
+    assert_eq!(note["failed_exit"], "2");
+    assert_eq!(note["failed_source"], REREAD_REQUEST);
+    assert_eq!(note["alert"], MINTED);
+}
+
+/// The next quarter hour refuses again, from a NEW request. The alert
+/// the first one filed is still open for this packet's step, so it is
+/// the alert — a twin per firing would be ninety-six urgent items a day
+/// for one stuck publish, the silence traded for noise.
+#[tokio::test]
+async fn a_refusal_repeated_on_the_same_step_reuses_the_open_alert() {
+    let w = answer_reread(
+        vec![open_alert("read-checks", "read-publish-checks")],
+        json!({ "ops_verb": "read-publish-checks" }),
+    )
+    .await;
+    assert!(!w.iter().any(|(m, _, _)| m == "POST"), "no twin: {w:?}");
+    let note = step_patch_on(&w, READ_PUBLISH, READ_CHECKS);
+    assert_eq!(
+        note["alert"], EARLIER_ALERT,
+        "the step points at the open alert"
+    );
+    assert_eq!(note["failed_source"], REREAD_REQUEST);
+}
+
+/// And when the step already says exactly this, under that alert, there
+/// is nothing new to write: the request itself is the record that it
+/// happened again.
+#[tokio::test]
+async fn a_refusal_the_step_already_carries_under_its_open_alert_writes_nothing() {
+    let w = answer_reread(
+        vec![open_alert("read-checks", "read-publish-checks")],
+        json!({ "ops_verb": "read-publish-checks", "failed": REFUSED_LINE, "failed_exit": "2",
+                "failed_source": EARLIER_REQUEST, "alert": EARLIER_ALERT }),
+    )
+    .await;
+    assert!(w.is_empty(), "{w:?}");
+}
+
+/// An open alert about ANOTHER step or verb on the same packet is not
+/// this failure's alert.
+#[tokio::test]
+async fn an_open_alert_for_another_step_on_the_packet_is_not_reused() {
+    let w = answer_reread(
+        vec![open_alert("open-pr", "publish-github-pr")],
+        json!({ "ops_verb": "read-publish-checks" }),
+    )
+    .await;
+    assert_eq!(
+        w.iter().filter(|(m, _, _)| m == "POST").count(),
+        1,
+        "a new alert for read-checks: {w:?}"
+    );
+    assert_eq!(
+        step_patch_on(&w, READ_PUBLISH, READ_CHECKS)["alert"],
+        MINTED
+    );
 }

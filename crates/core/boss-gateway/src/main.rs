@@ -6,9 +6,13 @@ use axum::extract::State;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(test)]
+mod a_path_cannot_climb_out_of_its_route;
+#[cfg(test)]
+mod a_read_only_session_cannot_write;
 mod api;
+mod dot_segments;
 mod inquiries;
-mod perf;
 mod plugin_files;
 mod proxy;
 mod public_reads;
@@ -16,12 +20,14 @@ mod role_headers;
 mod site;
 mod sponsors;
 mod static_files;
-mod timing;
 mod visits;
 
+// perf + timing live in the library so a test can drive the real
+// request timer and read what it logs (backlog d9f64c4a).
+use boss_gateway::{perf, timing};
 use perf::PerfCollector;
 
-use boss_gateway::local_auth::{self, CredentialStore, LocalAuthState};
+use boss_gateway::local_auth::{self, CredentialStore, GuestAccess, LocalAuthState};
 
 /// Auth provider — picks which middleware mints the
 /// `boss_session` cookie.
@@ -52,6 +58,10 @@ pub(crate) struct AppState {
     pub session_key: Vec<u8>,
     pub proxy_client: reqwest::Client,
     pub perf: Arc<PerfCollector>,
+    /// The estate machine token the gateway stamps on what it forwards —
+    /// the mounted `current` slot every service's gate accepts from,
+    /// re-read in the background (design 6805c764, car 2).
+    pub machine_token: Arc<boss_core::machine_token::Source>,
 }
 
 /// Auth-event staging (docs/architecture-decisions.md §Policy &
@@ -104,9 +114,10 @@ async fn main() -> Result<()> {
     // 240e03f3); loopback stays the default, the manifest widens it.
     let listen = std::env::var("BOSS_LISTEN")
         .unwrap_or_else(|_| format!("127.0.0.1:{}", boss_ports::prod("gateway")));
-    let session_key_path: std::path::PathBuf = std::env::var("BOSS_SESSION_KEY")
-        .unwrap_or_else(|_| "/var/lib/boss-gateway/session.key".into())
-        .into();
+    // Resolved by boss-core because the jobs API reads the same file to
+    // verify presence tickets (backlog 72fe3640): one path rule, one
+    // format, for the minter and the verifier.
+    let session_key_path = boss_core::presence::session_key_path();
     let session_key = load_or_create_session_key(&session_key_path)
         .with_context(|| format!("loading session key from {}", session_key_path.display()))?;
 
@@ -165,7 +176,13 @@ async fn main() -> Result<()> {
             // variable also decided whether the simulator ran, so
             // turning off synthetic activity silently withdrew guest
             // access, and neither effect was visible from the name.
-            guest_access: std::env::var("BOSS_GUEST_ACCESS").as_deref() == Ok("1"),
+            //
+            // Since design 2830b6b7 (2026-09-25) the one question has
+            // three answers — no guest, a basic `visitor`, or the
+            // system-audit read — and "1" means basic.
+            guest_access: GuestAccess::from_env_or_off(
+                std::env::var("BOSS_GUEST_ACCESS").ok().as_deref(),
+            ),
             mail: boss_gateway::mail::from_env(),
             // The IdP front door (idm-kanidm.md). Absent config →
             // None → the oidc routes answer that they are off, the
@@ -189,6 +206,9 @@ async fn main() -> Result<()> {
         session_key,
         proxy_client,
         perf: Arc::new(PerfCollector::new()),
+        machine_token: boss_core::machine_token::Source::watch(
+            boss_core::machine_token::token_dir(),
+        ),
     });
 
     // The sessionless read set — the tenant's declaration, resolved
@@ -197,11 +217,18 @@ async fn main() -> Result<()> {
     // but does not parse is refused here too, naming the file and
     // toml's line (api.rs `load_tenant_toml`, backlog 4f1ba1f9): the
     // configuration the router is built from, not a boot check.
-    let declared = api::load_tenant_toml()
+    let manifest = api::load_tenant_toml()
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("reading the tenant manifest")?
-        .map(|t| t.gateway.public_reads)
-        .unwrap_or_default();
+        .context("reading the tenant manifest")?;
+    // How many modules are on, said once at boot (design 1054c099;
+    // backlog fa77e3d7): prod ran with `modules = {}` — every
+    // module-gated surface off — and no line anywhere said so. Zero is
+    // legitimate, so it warns rather than refuses.
+    match api::modules_boot_line(manifest.as_ref()) {
+        (0, line) => tracing::warn!("{line}"),
+        (_, line) => tracing::info!("{line}"),
+    }
+    let declared = manifest.map(|t| t.gateway.public_reads).unwrap_or_default();
     let public_reads = public_reads::PublicReads::resolve(&declared)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("resolving [gateway] public_reads from the tenant manifest")?;
@@ -211,7 +238,7 @@ async fn main() -> Result<()> {
 
     let app = app
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            state.perf.clone(),
             timing::request_timer,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -258,6 +285,14 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(|host| inquiries::Door::new(host, Arc::new(inquiries::Services::from_env())));
     let app = inquiries::mount(app, door);
+
+    // The door every request enters, OUTERMOST (dot_segments.rs,
+    // backlog 1d9b7db7): a path with a `.` or `..` segment, raw or
+    // percent-encoded, is answered 400 before the site, the inquiry
+    // door or any route sees it — reqwest would otherwise resolve it
+    // after routing, and the upstream would receive a path no route
+    // matched. Last, so nothing added above can run ahead of it.
+    let app = dot_segments::mount(app);
 
     tracing::info!(listen = %listen, static_dir = %static_files::static_dir(), "boss-gateway starting");
     let listener = TcpListener::bind(&listen).await?;
@@ -379,7 +414,7 @@ fn build_router(
             "/api/dispatcher/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
         )
-        // `/api/workflows[/*]`, `/api/jobs/summary` and `/api/jobs/live`
+        // `/api/workflows[/*]` and `/api/jobs/live`
         // are registered by `public_reads::mount` below — the reads
         // an instance MAY answer without a session, each routed by
         // the tenant's `[gateway] public_reads` declaration (design
@@ -461,6 +496,48 @@ fn build_router(
             "/api/yard/borders",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // The ROUTES the Department Map draws (design e765b3fc, car R3):
+        // the served sections, exits and entries. Car R3 landed its fetch
+        // in train #718 without this route, so /it's routes read would
+        // have 404'd at the human door — `every_api_path_the_web_fetches
+        // _is_routed` red on main — and car M2, which rides these routes,
+        // routes it with its own reads.
+        .route(
+            "/api/yard/routes",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The MOVES record (design e765b3fc): each packet that moved on
+        // the map, and the stream the map's live layer holds open (car
+        // M2, flight `it-map-live`). Served by the jobs upstream since
+        // car M1, and routed in the car that first fetches it — the
+        // stations shape again otherwise. The proxy streams the body,
+        // as it does `/api/events/stream`.
+        .route(
+            "/api/yard/moves",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/yard/moves/stream",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // Every dispatcher rule's newest firing and dead-letters, read by
+        // the rules list at /it/registry/rules (backlog 43c4451a). Same
+        // upstream as the borders, whose record it re-reads, and routed
+        // in the car that adds the fetch.
+        .route(
+            "/api/yard/rule-firings",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The flights read (design c4c2a607, backlog 73c31776): the
+        // codes on for THIS session, which the jobs upstream resolves
+        // from the signed `x-boss-user` the role-header layer sets. The
+        // SPA reads it inlined on index.html (static_files.rs); this
+        // route is the same answer for a fetch, routed in the car that
+        // adds the read so it never ships unreachable at the door.
+        .route(
+            "/api/flights/mine",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // The agent-run record — which actor built what, and what it
         // cost. `GET /api/agent-runs[?actor_id=&branch=&since=]` lists
         // the rows and `/cost` rolls them up; both live on the jobs
@@ -485,6 +562,16 @@ fn build_router(
         )
         .route(
             "/api/agent-runs/{*rest}",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The agents registry's list — the IT Agents tab's one roster
+        // read (backlog 62988516; David 2026-09-26: agents get a page in
+        // IT, never the People roster). Bare and GET only, as the
+        // agent-run reads above: `POST /api/agents/batch` is `boss
+        // tenant publish`'s door and reaches boss-jobs-api directly, so
+        // it stays a catch-all miss here.
+        .route(
+            "/api/agents",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         // Surface opens (backlog 628f182b): the SPA posts each route
@@ -614,8 +701,6 @@ fn build_router(
             "/api/it/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::LEDGER)),
         )
-        // Policy proxy carries a graceful-fallback for my-scope POST so
-        // pages don't log 502s if the policy upstream is down.
         .route(
             "/api/policy/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::POLICY)),
@@ -689,39 +774,11 @@ fn build_router(
             "/api/calendar/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CALENDAR)),
         )
-        // Observability aggregator — /api/snapshot is the cybernetics
-        // rollup (and /api/snapshot/capabilities the startup census).
-        // Two strict matchers (no trailing path) plus a wildcard for
-        // sub-paths. Session-gated like every other read since
-        // 2026-09-17 (backlog b03f38de): it was public for the unauth
-        // landing-page mode, which no longer reads it — nothing in
-        // apps/web fetches this path — so the pin's only effect in
-        // prod was to answer anyone with the demo-agents figures and
-        // `demo_mode: true`. Pinned by
-        // `the_snapshot_refuses_a_sessionless_caller` below.
-        .route(
-            "/api/snapshot",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
-        .route(
-            "/api/snapshot/{*rest}",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
-        // The IT Monitoring page probes /api/<port-name>/health for
-        // every PORTS entry. boss-observability exposes its routes
-        // under different prefixes (/api/events, /api/snapshot,
-        // /api/agents), so without this alias the monitoring page
-        // shows it as 'down' even when running. Session-gated like
-        // every other health path that page reads (`/api/jobs/health`
-        // rides the gated `/api/jobs/{*rest}`): it sat on the
-        // sessionless proxy until backlog 240e03f3 (2026-09-19) with
-        // nothing but that page reading it, and the page holds a
-        // session. Pinned by
-        // `the_observability_health_alias_refuses_a_sessionless_caller`.
-        .route(
-            "/api/observability/health",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::OBSERVABILITY)),
-        )
+        // /api/snapshot, /api/snapshot/* and /api/observability/health
+        // proxied to boss-observability until 2026-09-23, when it
+        // retired as superseded-by (backlog 467175e7, car B); each is
+        // now a catch-all miss, pinned by
+        // `the_retired_observability_routes_are_misses` below.
         // Simulator UX — boss-simulator hosts both the /simulator SPA
         // bundle and its /simulator/api/* control+status surface. The
         // whole prefix is proxied (not stripped); the service nests its
@@ -773,39 +830,13 @@ fn build_router(
     if let Some(la) = local_auth_state {
         // Passkey ceremony (docs/design/presence.md, packet 7218c3f1):
         // best-effort mount — a malformed BOSS_PUBLIC_URL must degrade
-        // to "no passkey routes", never crash the front door.
+        // to "no passkey routes", never crash the front door. The route
+        // list is `passkey_router`'s, the one the tests drive; it was
+        // spelled out here as well until backlog 3bddce66 (2026-09-23).
         let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
-            Ok(pk) => {
-                let pk = std::sync::Arc::new(pk);
-                app.route(
-                    "/api/auth/passkey/register/begin",
-                    axum::routing::post(boss_gateway::passkey::register_begin)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/register/finish",
-                    axum::routing::post(boss_gateway::passkey::register_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/begin",
-                    axum::routing::post(boss_gateway::passkey::assert_begin).with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/assert/finish",
-                    axum::routing::post(boss_gateway::passkey::assert_finish)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials",
-                    axum::routing::get(boss_gateway::passkey::credentials_list)
-                        .with_state(pk.clone()),
-                )
-                .route(
-                    "/api/auth/passkey/credentials/{credential_id}",
-                    axum::routing::delete(boss_gateway::passkey::credentials_remove).with_state(pk),
-                )
-            }
+            Ok(pk) => app.merge(boss_gateway::passkey::passkey_router(std::sync::Arc::new(
+                pk,
+            ))),
             Err(e) => {
                 tracing::warn!(error = %e, "passkey ceremony not mounted");
                 app
@@ -939,9 +970,23 @@ async fn handle_perf(State(state): State<Arc<AppState>>) -> axum::Json<perf::Per
 
 /// Clears all recorded histograms. Useful before/after a specific
 /// benchmark or fix so percentiles aren't diluted by old data.
-async fn handle_perf_reset(State(state): State<Arc<AppState>>) -> &'static str {
+///
+/// The gateway's one own write that is not an auth ceremony, and until
+/// backlog 07e797b4 it answered anyone — no session asked for. It now
+/// passes the same edge gate as every proxied write: a session (401),
+/// and not a read-only one (the named 403).
+async fn handle_perf_reset(
+    State(state): State<Arc<AppState>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(refusal) = proxy::writer_gate(&headers, &method, uri.path(), &state) {
+        return refusal;
+    }
     state.perf.reset();
-    "ok"
+    "ok".into_response()
 }
 
 /// Load the HMAC session key from disk, or generate one on first run.
@@ -950,12 +995,7 @@ fn load_or_create_session_key(path: &Path) -> Result<Vec<u8>> {
     use std::io::Write;
     if path.exists() {
         let hex = std::fs::read_to_string(path)?;
-        let bytes = hex_decode(hex.trim())
-            .ok_or_else(|| anyhow::anyhow!("session key file is not valid hex"))?;
-        if bytes.len() < 32 {
-            anyhow::bail!("session key must be at least 32 bytes");
-        }
-        return Ok(bytes);
+        return Ok(boss_core::presence::parse_session_key(&hex)?);
     }
 
     tracing::info!(path = %path.display(), "generating new session key");
@@ -989,36 +1029,19 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// What this gateway writes, the shared reader reads back — the jobs
+    /// API verifies presence tickets with the key through that reader
+    /// (backlog 72fe3640). Its reject cases live beside it in boss-core.
     #[test]
-    fn hex_roundtrip() {
-        let bytes = [0x00, 0x01, 0xaf, 0xff, 0x7e];
+    fn a_written_key_reads_back_through_the_shared_parser() {
+        let bytes: Vec<u8> = (0u8..32).map(|b| b.wrapping_mul(37)).collect();
         let hex = hex_encode(&bytes);
-        assert_eq!(hex, "0001afff7e");
-        assert_eq!(hex_decode(&hex), Some(bytes.to_vec()));
-    }
-
-    #[test]
-    fn hex_decode_rejects_odd_length() {
-        assert_eq!(hex_decode("abc"), None);
-    }
-
-    #[test]
-    fn hex_decode_rejects_non_hex() {
-        assert_eq!(hex_decode("zz"), None);
+        assert_eq!(&hex[..6], "00254a");
+        assert_eq!(boss_core::presence::parse_session_key(&hex), Ok(bytes));
     }
 
     #[test]
@@ -1070,6 +1093,7 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
+            machine_token: Default::default(),
         });
         build_router(local_auth, reads).with_state(state)
     }
@@ -1085,7 +1109,6 @@ mod routing_tests {
     const DEMO_PUBLIC: &[&str] = &[
         "/api/workflows",
         "/api/workflows/some-kind",
-        "/api/jobs/summary",
         "/api/jobs/live",
         "/api/events/public-tail",
     ];
@@ -1093,11 +1116,10 @@ mod routing_tests {
     fn demo() -> public_reads::PublicReads {
         public_reads::PublicReads::resolve(&[
             "/api/workflows".to_string(),
-            "/api/jobs/summary".to_string(),
             "/api/jobs/live".to_string(),
             "/api/events/public-tail".to_string(),
         ])
-        .expect("the demo tenant's four are declarable")
+        .expect("the demo tenant's three are declarable")
     }
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String) {
@@ -1153,6 +1175,9 @@ mod routing_tests {
     /// order, which is the assumption this pins — including the two
     /// shapes that motivated the per-service bare matchers (a list
     /// endpoint with no trailing segment, and a nested path).
+    // tree-wide pin — the pages that fetch these live in apps/web, which
+    // no changed-file map attributes to this crate, so every scoped gate
+    // runs it (`tree_wide_pins` in infra/gate.sh; backlog cb2157f9).
     #[tokio::test]
     async fn no_service_route_is_shadowed_by_the_catch_all() {
         const REAL: &[&str] = &[
@@ -1200,6 +1225,16 @@ mod routing_tests {
             // David's screen; `every_api_path_the_web_fetches_is_routed`
             // below now derives this list from the bundle instead.
             "/api/yard/regions",
+            // The moves record (design e765b3fc, cars M1 and M2): served
+            // by the jobs upstream since M1 and first fetched by the map's
+            // live layer in M2, so routed in the car that reads it.
+            "/api/yard/moves",
+            "/api/yard/moves/stream",
+            // The served routes the map draws (car R3), fetched since #718.
+            "/api/yard/routes",
+            // The flights read (73c31776): inlined on index.html, and
+            // the same answer for a page the gateway did not serve.
+            "/api/flights/mine",
             // The agent-run record — what each actor built and what it
             // cost. Shipped on the jobs upstream in train #294 and
             // unreachable at the human door ever since: the Crew Board
@@ -1210,6 +1245,10 @@ mod routing_tests {
             // time from an empty panel.
             "/api/agent-runs",
             "/api/agent-runs/cost",
+            // The agents registry's list (backlog 62988516): served by
+            // the jobs upstream since f56155f0 and first fetched by the
+            // IT Agents tab, so routed in the car that reads it.
+            "/api/agents",
             // Surface opens (628f182b): the SPA's write and the
             // Codebase page's roll-up read, both on the jobs upstream.
             // Listed on the day they shipped, so the fourth instance
@@ -1324,7 +1363,7 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
-            guest_access: true,
+            guest_access: GuestAccess::Basic,
             oidc: None,
             mail: boss_gateway::mail::from_env(),
             public_url: "https://boss.test".into(),
@@ -1344,6 +1383,14 @@ mod routing_tests {
     /// must resolve on this router to something other than the
     /// catch-all. A page cannot fetch a route the gateway does not have
     /// without redding the gate.
+    ///
+    /// Which gate is the catch: this reads apps/web/src, and a web-only
+    /// car maps to no crate, so until cb2157f9 it never ran on the car
+    /// that needed it — map car R3 shipped `/api/yard/routes` unrouted
+    /// in train #718, the fifth instance.
+    // tree-wide pin — it reads apps/web/src, which no changed-file map
+    // attributes to this crate, so every scoped gate runs it
+    // (`tree_wide_pins` in infra/gate.sh; backlog cb2157f9).
     #[tokio::test]
     async fn every_api_path_the_web_fetches_is_routed() {
         let paths = api_paths_the_web_fetches();
@@ -1369,7 +1416,7 @@ mod routing_tests {
         );
     }
 
-    /// The four former landing-page pins, on an instance whose manifest
+    /// The declarable landing-page reads, on an instance whose manifest
     /// declares none of them (design 11e60367 Q1, backlog b4afd7b9):
     /// each answers 401 like any other /api route — the session gate
     /// refuses before anything is forwarded — and none has fallen
@@ -1414,6 +1461,27 @@ mod routing_tests {
         }
     }
 
+    /// The packet summary is session-gated EVEN on the demo tenant
+    /// (backlog 19f08bd6): it left the publishable table because it
+    /// counts what the caller may read, so a sessionless GET meets the
+    /// gate through `/api/jobs/{*rest}` like every other packet read —
+    /// 401 before anything is forwarded — and never the catch-all.
+    #[tokio::test]
+    async fn the_jobs_summary_is_session_gated_on_the_demo_tenant() {
+        for path in ["/api/jobs/summary", "/api/jobs/summary?status=closed"] {
+            let (status, body) = get(app_declaring(None, &demo()), path).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "`{path}` must meet the session gate: {body}"
+            );
+            assert!(
+                !body.contains(MISS),
+                "`{path}` reached the /api catch-all: {body}"
+            );
+        }
+    }
+
     /// A declaration opens a GET, never a write: on the demo tenant, a
     /// POST to `/api/workflows` still meets the session gate (and not
     /// a 405 — the strict matcher chains the other methods through
@@ -1449,7 +1517,9 @@ mod routing_tests {
     /// route rather than left to review.
     #[tokio::test]
     async fn the_agent_run_reads_refuse_a_sessionless_caller() {
-        for path in ["/api/agent-runs", "/api/agent-runs/cost"] {
+        // The registry's list rides the same rule (backlog 62988516): it
+        // carries each agent's hourly budget, the other half of cost.
+        for path in ["/api/agent-runs", "/api/agent-runs/cost", "/api/agents"] {
             let (status, body) = get(app(), path).await;
             assert_eq!(
                 status,
@@ -1463,50 +1533,28 @@ mod routing_tests {
         }
     }
 
-    /// The observability snapshot needs a session like every other read
-    /// (backlog b03f38de, 2026-09-17). It was pinned public for the
-    /// unauth landing-page mode, which no longer reads it — no SPA
-    /// consumer is left — so the pin's only effect in prod was to hand
-    /// anyone the demo-agents figures with `demo_mode: true`. Same
-    /// discriminator as the agent-run reads: 401 before any upstream.
+    /// boss-observability retired as superseded-by (backlog 467175e7,
+    /// car B, 2026-09-23), and its three routes left with it: the
+    /// snapshot, its sub-paths, and the health alias the old IT
+    /// Monitoring page probed. Each is now an honest 404 from the /api
+    /// catch-all — a route left proxying to a service no pod starts
+    /// would answer 502 forever, which reads as an outage rather than
+    /// as a thing that does not exist. Nothing in apps/web fetches any
+    /// of them (`every_api_path_the_web_fetches_is_routed` would say).
     #[tokio::test]
-    async fn the_snapshot_refuses_a_sessionless_caller() {
-        for path in ["/api/snapshot", "/api/snapshot/capabilities"] {
+    async fn the_retired_observability_routes_are_misses() {
+        for path in [
+            "/api/snapshot",
+            "/api/snapshot/capabilities",
+            "/api/observability/health",
+        ] {
             let (status, body) = get(app(), path).await;
-            assert_eq!(
-                status,
-                StatusCode::UNAUTHORIZED,
-                "`{path}` must be gated by the session proxy: {body}"
-            );
+            assert_eq!(status, StatusCode::NOT_FOUND, "`{path}`: {body}");
             assert!(
-                !body.contains(MISS),
-                "`{path}` reached the /api catch-all: {body}"
+                body.contains(MISS),
+                "`{path}` must reach the /api catch-all, not a proxy: {body}"
             );
         }
-    }
-
-    /// The observability health alias needs a session like every other
-    /// `/api/<service>/health` (backlog 240e03f3, the hardening
-    /// inventory's audit of the two unconditional public routes,
-    /// 2026-09-19). It was pinned public for the IT Monitoring page,
-    /// which reads it WITH a session like the other health paths it
-    /// probes (`/api/jobs/health` rides `/api/jobs/{*rest}`, gated) —
-    /// so the pin's only effect was a sessionless `{"status":"ok"}`
-    /// on every instance. Nothing else reads it: no manifest probe, no
-    /// observer, no script (grep on 2026-09-19). Same discriminator as
-    /// the snapshot: 401 before any upstream.
-    #[tokio::test]
-    async fn the_observability_health_alias_refuses_a_sessionless_caller() {
-        let (status, body) = get(app(), "/api/observability/health").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "`/api/observability/health` must be gated by the session proxy: {body}"
-        );
-        assert!(
-            !body.contains(MISS),
-            "`/api/observability/health` reached the /api catch-all: {body}"
-        );
     }
 
     /// The gateway's own liveness answer keeps answering a stranger,
@@ -1583,7 +1631,7 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
-            guest_access: true,
+            guest_access: GuestAccess::Basic,
             oidc: None,
             mail: boss_gateway::mail::from_env(),
             public_url: "https://boss.test".into(),
@@ -1618,7 +1666,7 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
-            guest_access: false,
+            guest_access: GuestAccess::Off,
             oidc: None,
             mail: boss_gateway::mail::from_env(),
             public_url: "https://boss.test".into(),

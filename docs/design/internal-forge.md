@@ -103,6 +103,8 @@ Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'd
 
 **Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
+**Superseded in part, 2026-09-27 (backlog 67931115, design 1f35a3e8, decided by David).** Forge main is no longer pushed to GitHub. The target, dauld/boss-mirror, is a fork of the public algedonic-dev/boss, and a fork of a public repository is public, so the disaster-recovery copy of main was publishing every train unsigned and outside the publish flow's secrets scan. `infra/forge/offsite-push.json` now declares `publish/*` only, and `the_public_fork_is_declared_publish_branches_only` (crates/core/boss-testing/tests/offsite_push_sh.rs) refuses any other branch in it. The off-site copy of main moves to a private repository outside the fork network, created by David, with its push credential minted through the credential broker; until that lands, forge main has no off-site copy on GitHub.
+
 
 ### Q5: Do forge events land on the outbox? (resolved)
 

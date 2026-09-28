@@ -44,6 +44,7 @@ fn job_owned_by(id: &str, owner: &str) -> Job {
         status: JobStatus::Open,
         priority: Priority::Standard,
         opened_on: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        opened_at: None,
         due_on: None,
         closed_on: None,
         metadata: serde_json::Value::Null,
@@ -51,6 +52,10 @@ fn job_owned_by(id: &str, owner: &str) -> Job {
         partition: boss_core::partition::Partition::Real,
     }
 }
+
+/// The key the test "gateway" signs presence tickets with; the API
+/// under test verifies with the same one (backlog 72fe3640).
+const PRESENCE_KEY: &[u8] = b"policy-gated-presence-key-0123456789";
 
 fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
@@ -60,6 +65,9 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
     let step_registry = Arc::new(StepRegistry::v1());
     let state = JobsApiState {
         step_registry,
+        presence_key: Some(Arc::new(boss_jobs::http::PresenceKey::fixed(
+            PRESENCE_KEY.to_vec(),
+        ))),
         ..JobsApiState::minimal(
             jobs.clone(),
             bus,
@@ -670,12 +678,13 @@ async fn put_step_done_rejects_unresolved_blockers() {
 }
 
 #[tokio::test]
-async fn auto_close_stamps_step_completed_on_when_supplied() {
+async fn auto_close_stamps_closed_on_from_the_closing_steps_completed_on() {
     // When the last step on a Job flips to done, the auto-transition
-    // closes the Job. closed_on should anchor on the step's
-    // completed_on (which carries the sim-day in sim runs) rather
-    // than wall-clock NOW(). Mirrors the contract the step-completion
-    // → invoice flow already enforces.
+    // closes the Job. closed_on anchors on the step's completed_on,
+    // the day the server stamped at the flip (the sim day on a
+    // simulated instance, from the clock port). This test used to send
+    // the day in the body; a caller no longer chooses it (f3e78bdf) —
+    // `a_completion_is_dated_by_one_server_instant` pins that refusal.
     let policy: Arc<dyn PolicyClient> = Arc::new(
         // The step PUT first clears a coarse (Update, step) gate before
         // the mechanics under test run; grant it to the caller's role.
@@ -694,7 +703,6 @@ async fn auto_close_stamps_step_completed_on_when_supplied() {
     let only_id = only.id;
     jobs.add_step(&only).await.unwrap();
 
-    let sim_day = NaiveDate::from_ymd_opt(2027, 3, 14).unwrap();
     let resp = app
         .oneshot(
             Request::builder()
@@ -702,33 +710,35 @@ async fn auto_close_stamps_step_completed_on_when_supplied() {
                 .uri(format!("/api/jobs/{}/steps/{}", job.id, only_id))
                 .header("content-type", "application/json")
                 .header("x-boss-user", user_header(&tech))
-                .body(Body::from(
-                    serde_json::json!({
-                        "status":"completed",
-                        "completed_on": sim_day.to_string(),
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(r#"{"status":"completed"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
+    let done = jobs.get_step(&only_id).await.unwrap().expect("step exists");
+    assert!(done.completed_on.is_some(), "the flip dates the step");
     let after = jobs.get_job(&job.id).await.unwrap().expect("job exists");
     assert_eq!(after.status, JobStatus::Closed);
     assert_eq!(
-        after.closed_on,
-        Some(sim_day),
+        after.closed_on, done.completed_on,
         "closed_on must anchor on the closing step's completed_on"
     );
 }
 
 #[tokio::test]
-async fn put_step_active_allowed_with_open_blockers() {
-    // The gate fires only at `done`. Moving to `active` (or any
-    // non-terminal status) is always fine; a tech may stage work
-    // while waiting on a sign-off upstream.
+async fn put_step_opening_is_refused_with_open_blockers() {
+    // This test used to pin the opposite: the gate fired only at `done`,
+    // so a tech could stage work on a Pending step while a sign-off
+    // upstream was still open. That became a hole once the gate began
+    // trusting a step stored Active as one the engine had opened: a
+    // hand move to `active`, then a bare completion, skipped the gate
+    // entirely (backlog 36352452). Leaving Pending by hand is now judged
+    // by the same gate as completing — and once the blocker is done,
+    // the same move lands. The move is to `ready`: a PUT to `active`
+    // is refused before any gate, naming the claim door (backlog
+    // 6ef4a36b), so it would pin nothing about blockers.
     let policy: Arc<dyn PolicyClient> = Arc::new(
         // The step PUT first clears a coarse (Update, step) gate before
         // the mechanics under test run; grant it to the caller's role.
@@ -750,22 +760,32 @@ async fn put_step_active_allowed_with_open_blockers() {
     let gated_id = gated.id;
     jobs.add_step(&gated).await.unwrap();
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/api/jobs/{}/steps/{}", job.id, gated_id))
-                .header("content-type", "application/json")
-                .header("x-boss-user", user_header(&tech))
-                .body(Body::from(r#"{"status":"active"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let start = || {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/jobs/{}/steps/{}", job.id, gated_id))
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header(&tech))
+            .body(Body::from(r#"{"status":"ready"}"#))
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(start()).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a Pending step is not opened past an open blocker"
+    );
+    let after = jobs.get_step(&gated_id).await.unwrap().expect("step");
+    assert_eq!(after.status, StepStatus::Pending);
+
+    let mut approved = jobs.get_step(&blocker_id).await.unwrap().expect("step");
+    approved.status = StepStatus::Completed;
+    jobs.update_step(&approved).await.unwrap();
+    let resp = app.oneshot(start()).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::NO_CONTENT,
-        "active transition must be allowed even with open blockers"
+        "with the blocker done, the same move lands"
     );
 }
 
@@ -838,8 +858,8 @@ async fn an_ordinary_step_still_stamps_and_records_session_assurance() {
 ///
 /// This is the test that would catch a bypass being added later: if
 /// someone makes the endpoint honour a caller-supplied assurance (the
-/// body, a query param — anything other than the gateway-vouched
-/// `x-boss-presence` header), this starts returning 200 and the
+/// body, a query param — anything other than a gateway-SIGNED ticket
+/// in `x-boss-presence`), this starts returning 200 and the
 /// control becomes decoration.
 #[tokio::test]
 async fn a_step_requiring_presence_refuses_without_a_ceremony_ticket() {
@@ -869,18 +889,20 @@ async fn a_step_requiring_presence_refuses_without_a_ceremony_ticket() {
     );
 }
 
-/// The sign-off request with the gateway's presence header attached.
-/// In production the edge strips every inbound `x-boss-*` header and
-/// re-injects this one only after verifying a passkey ticket, so its
-/// presence at this service means the gateway vouched. See
-/// role_headers.rs; the machine token guards the service port itself.
+/// The sign-off request with the gateway's presence header attached:
+/// the ticket signed with the gateway's key, which this service verifies
+/// itself before believing a word of it — the machine door is reachable
+/// without the gateway, so a header it merely carries proves nothing
+/// (backlog 72fe3640; the forgeries are pinned in
+/// tests/presence/mod.rs and the files beside it that use it).
 async fn post_sign_off_with_presence(
     app: Router,
     user: &User,
     step: &Step,
     role: &str,
-    presence: &serde_json::Value,
+    ticket: &boss_core::presence::PresenceTicket,
 ) -> axum::http::Response<Body> {
+    let signed = ticket.encode(PRESENCE_KEY).expect("a ticket signs");
     app.oneshot(
         Request::builder()
             .method("POST")
@@ -890,7 +912,7 @@ async fn post_sign_off_with_presence(
             ))
             .header("content-type", "application/json")
             .header("x-boss-user", user_header(user))
-            .header("x-boss-presence", presence.to_string())
+            .header("x-boss-presence", signed)
             .body(Body::from(format!("{{\"role\":\"{role}\"}}")))
             .unwrap(),
     )
@@ -898,7 +920,23 @@ async fn post_sign_off_with_presence(
     .unwrap()
 }
 
-/// The ceremony's happy path: a gateway-vouched presence header whose
+/// A ticket as the gateway's `assert_finish` mints it, unexpired.
+fn presence_ticket(
+    user: &User,
+    step: &Step,
+    shape_hash: String,
+    nonce: &str,
+) -> boss_core::presence::PresenceTicket {
+    boss_core::presence::PresenceTicket {
+        i: user.id.clone(),
+        s: step.id.to_string(),
+        h: shape_hash,
+        n: nonce.to_string(),
+        e: boss_core::presence::now_epoch() + 60,
+    }
+}
+
+/// The ceremony's happy path: a gateway-signed presence ticket whose
 /// binding matches the step's CURRENT shape produces a Presence stamp
 /// carrying the challenge nonce — the audit trail from stamp back to
 /// the exact single-use ceremony that produced it.
@@ -913,12 +951,7 @@ async fn a_matching_presence_header_produces_a_presence_stamp_with_its_nonce() {
     jobs.add_step(&step).await.unwrap();
 
     let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
-    let presence = serde_json::json!({
-        "employee_id": user.id,
-        "step_id": step.id.to_string(),
-        "shape_hash": shape,
-        "nonce": "ceremony-nonce-1",
-    });
+    let presence = presence_ticket(&user, &step, shape, "ceremony-nonce-1");
     let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -946,12 +979,12 @@ async fn a_stale_presence_header_downgrades_to_session_and_refuses() {
     step.assurance_required = Some(boss_core::job::Assurance::Presence);
     jobs.add_step(&step).await.unwrap();
 
-    let presence = serde_json::json!({
-        "employee_id": user.id,
-        "step_id": step.id.to_string(),
-        "shape_hash": "a-hash-from-before-the-step-was-edited",
-        "nonce": "ceremony-nonce-2",
-    });
+    let presence = presence_ticket(
+        &user,
+        &step,
+        "a-hash-from-before-the-step-was-edited".into(),
+        "ceremony-nonce-2",
+    );
     let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();

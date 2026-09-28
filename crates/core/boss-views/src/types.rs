@@ -3,8 +3,9 @@
 //! A **View** is a saved composition over the Information API. It is
 //! deliberately NOT a gadget: it holds a query and a layout, never
 //! records. Its content is computed from the same projections every
-//! other surface reads, so two people running the same View see the
-//! same numbers because there is only one set of numbers.
+//! other surface reads, scoped to whoever runs it — so two people
+//! running one View see the same rows only if their policy grants the
+//! same rows, and `ViewResults::scope` says which case a result is.
 //!
 //! See `docs/architecture-decisions.md` §Step UX & frontend (the
 //! folded home of the Views / department-apps decisions).
@@ -36,6 +37,14 @@ pub enum ViewSource {
 }
 
 impl ViewSource {
+    /// Every source, in the order the composer offers them.
+    pub const ALL: [ViewSource; 4] = [
+        ViewSource::Jobs,
+        ViewSource::Steps,
+        ViewSource::Subjects,
+        ViewSource::Events,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ViewSource::Subjects => "subjects",
@@ -200,4 +209,60 @@ pub struct ViewResults {
     /// is worse than one that admits it stopped early — an operator
     /// who cannot tell the difference will act on the wrong number.
     pub truncated: bool,
+    /// Whose rows these are: every row of the source, or only those
+    /// the caller's policy lets them read (backlog 5392cf23).
+    ///
+    /// Scope is the CALLER's, so a shared View run by a narrower role
+    /// shows that role its own rows — two people running one View can
+    /// see different numbers, and this is the field that says so. A
+    /// caller who may read none of the source is refused (403), never
+    /// answered with zero rows.
+    pub scope: ResultScope,
+}
+
+/// Which rows of a source a result was drawn from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResultScope {
+    /// Every row of the source.
+    All,
+    /// Only rows the caller owns or is assigned — the policy grant was
+    /// narrower than the source.
+    Owners,
+}
+
+/// What each source offers a View author, served by
+/// `GET /api/views/sources` (backlog 4a8939b5).
+///
+/// The page used to keep its own copies of all three facts — the
+/// fields, the pushable names, the ceiling — "in step with query.rs by
+/// hand", and two had drifted. Served from the resolver's own lists,
+/// they cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSources {
+    /// How many candidate rows one View may scan (`query::SCAN_CEILING`).
+    pub scan_ceiling: i64,
+    pub sources: Vec<SourceSchema>,
+}
+
+/// One source's shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSchema {
+    pub source: ViewSource,
+    /// Every field a row of this source carries, in the order the
+    /// column picker offers them.
+    pub fields: Vec<String>,
+    /// The fields a filter term on which is answered by the database
+    /// rather than over the newest rows only.
+    pub pushable: Vec<PushableField>,
+}
+
+/// A field a filter can push into SQL, and how: `text` by equality or
+/// set, `timestamp` by a range, `json` through a dotted path
+/// (`payload.sku`, `metadata.department`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushableField {
+    pub field: String,
+    #[serde(rename = "type")]
+    pub column_type: crate::pushdown::ColumnType,
 }

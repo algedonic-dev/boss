@@ -5,13 +5,17 @@
 # 2026-08-22): "let's make experiments packets with promoted / retired
 # terminal states" — so there is no experiments table and no
 # experiments registry; the network's own machinery carries its own
-# A/Bs. The protocol below was authored and iterated LIVE (v1→v5,
-# 2026-08-26) through the registry, and real experiments have run
-# through it; this entry is the residue, carried here so a fresh
-# deployment ships the protocol at all. The seed binary inserts only
-# when the kind is absent, so live registries that have already moved
-# past this body are never touched. The body is the live v5 row,
-# verbatim.
+# A/Bs. The body below is the text the protocol reached as its v5 on
+# the retired second stack (iterated there v1→v5, 2026-08-26, where
+# its runs also happened); this instance holds none of that history.
+# Here it was seeded as v1, and no protocol-experiment packet has ever
+# existed on it (read 2026-09-27, page-audit ec8351f4; backlog
+# 1baeb936). The first one opens at the threshold David decided on
+# 2026-09-23 (design d8771dec, answering 8af3aed1): the first draft
+# workflow version, on a kind with 20+ terminals a day, that adds,
+# removes or reorders a step — opened as a Tier 2 split instead of
+# published. The seed binary inserts only when the kind is absent, so
+# a registry that has already moved past this body is never touched.
 #
 # Q4 (same review): experimenting is limited to the IT department +
 # platform-admins for now — enforced the way every platform protocol

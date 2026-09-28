@@ -12,20 +12,27 @@
   //
   // Per-step depth badges come from `/api/views/fleet/{kind}` — the
   // server-truth aggregate — while the item cards under a node come
-  // from the same open-jobs fetch the board uses. The two can
-  // disagree under the 200-job cap; the node shows the server count
-  // and the panel says "N of M shown" when they differ, rather than
-  // pretending the cap doesn't exist.
+  // from the open-jobs read. That read was one page of 200 until
+  // 2026-09-27, when open backlog-items stood at 361 and the cards
+  // under a node silently lost the oldest 161 (backlog b68a9dde); it
+  // now reads every open packet of the kind (`fetchEvery`), and a read
+  // that stops short fails the board, naming how many of how many it
+  // held. The panel still says "N of M shown" if the two disagree.
   //
   // Every fetch decodes defensively at the call site: the route-smoke
   // crawl runs this surface against an adversarial mock, and garbage
   // must render as an empty state, not a crash.
-  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  // A BOARD, NOT A PAGE (design e765b3fc, car N3, 2026-09-25): its two
+  // mount sites — the feedback and backlog boards — are station panels on
+  // the Department Map, under the map's own page heading and the
+  // station's, so the board heads itself as a section of that panel
+  // rather than as a second page title.
   import StepDag, { type DagEdge, type DagNode } from './StepDag.svelte';
   import { workflowToDag } from './workflowToDag';
   import { type Fork, readFork } from './fork';
   import { currentStep, groupByPosition, positionOf } from './position';
   import type { Job } from './types';
+  import { fetchEvery, wholeOrThrow } from '../data/paginated';
 
   type Props = Readonly<{
     kind: string;
@@ -62,7 +69,7 @@
     try {
       const [specRes, jobsRes, fleetRes] = await Promise.all([
         fetch(`/api/workflows/${encodeURIComponent(kind)}`),
-        fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&status=open&limit=200`),
+        fetchEvery<Job>(`/api/jobs?kind=${encodeURIComponent(kind)}&status=open&full=true`),
         fetch(`/api/views/fleet/${encodeURIComponent(kind)}`),
       ]);
       if (!specRes.ok) throw new Error(`workflow ${kind}: HTTP ${specRes.status}`);
@@ -71,10 +78,7 @@
       specSteps = Array.isArray(steps) ? steps : [];
       fork = readFork(spec);
 
-      if (!jobsRes.ok) throw new Error(`jobs: HTTP ${jobsRes.status}`);
-      const jobsBody: unknown = await jobsRes.json();
-      const data = (jobsBody as { data?: unknown } | null)?.data;
-      jobs = Array.isArray(data) ? (data as ReadonlyArray<Job>) : [];
+      jobs = wholeOrThrow(jobsRes);
 
       // Fleet counts are an enhancement, not a dependency — a failed
       // aggregate read degrades to client-side counts.
@@ -186,7 +190,10 @@
   }
 </script>
 
-<PageHeader {title} {subtitle} />
+<header class="tf-head">
+  <h3 class="tf-title">{title}</h3>
+  {#if subtitle}<p class="tf-sub">{subtitle}</p>{/if}
+</header>
 
 {#if loading}
   <p class="tf-msg">Reading the queue…</p>
@@ -258,12 +265,23 @@
 {/if}
 
 <style>
+  .tf-head { margin: 0 0 12px; }
+  .tf-title {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: var(--ls-eyebrow);
+    text-transform: uppercase;
+    color: var(--signal);
+  }
+  .tf-sub { margin: 4px 0 0; font-size: 13px; color: var(--static); max-width: 72ch; }
   .tf-msg {
     margin: 16px 0;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .tf-err {
-    color: var(--err, #e2685c);
+    color: var(--err);
   }
   .tf-queue {
     margin-top: 18px;
@@ -277,7 +295,7 @@
   .tf-queue-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .tf-items {
     list-style: none;
@@ -295,23 +313,23 @@
     width: 100%;
     text-align: left;
     padding: 8px 12px;
-    border: 1px solid var(--hairline, #2A3138);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
-    background: var(--card, var(--ink, #12161C));
+    background: var(--card);
     cursor: pointer;
   }
   .tf-item.selected {
-    border-color: var(--signal, #5FD4A8);
+    border-color: var(--signal);
   }
   .tf-item-pri {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .tf-item-pri[data-pri='urgent'],
   .tf-item-pri[data-pri='emergency'] {
-    color: var(--err, #e2685c);
+    color: var(--err);
   }
   .tf-item-title {
     flex: 1;
@@ -319,20 +337,20 @@
   }
   .tf-item-age {
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .tf-hint {
     margin-top: 10px;
     font-size: 13px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .tf-route {
     margin-left: 6px;
     padding: 3px 10px;
-    border: 1px solid var(--signal, #5FD4A8);
+    border: 1px solid var(--signal);
     border-radius: 999px;
     background: transparent;
-    color: var(--signal, #5FD4A8);
+    color: var(--signal);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;

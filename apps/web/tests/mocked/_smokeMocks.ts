@@ -13,11 +13,15 @@
 
 import type { Page, Route } from '@playwright/test';
 // The world's own layout, so the empty leg below cannot list a region
-// or a hop the map does not draw (backlog 94c6ffd0: both lists were
-// typed out here and went stale the day a ninth region landed).
-// world.ts is pinned to the server's REGIONS and BORDERS by
-// world.test.ts and borders.test.ts, so this is one definition deep.
-import { BORDERS, TERRITORIES } from '../../src/it/yard/world';
+// the map does not draw (backlog 94c6ffd0: the list was typed out here
+// and went stale the day a ninth region landed). world.ts is pinned to
+// the server's REGIONS by world.test.ts, so this is one definition deep.
+// The map draws no edge list of its own since car R3 of design e765b3fc,
+// so the borders and routes the empty leg answers are the shared test
+// fixture's — the borders pinned equal to the server's by borders.test.ts.
+import { TERRITORIES } from '../../src/it/yard/world';
+import { BORDERS, routesPayload } from '../fixtures/yard';
+import LIVE_RECORDING from './live-tenant-manifest.json' with { type: 'json' };
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -31,6 +35,79 @@ export const MODULES_ON: Readonly<Record<string, boolean>> = {
   calendar: true, equipment: true, exec: true, finance: true, 'marketing-assets': true,
   parts: true, qa: true, shipping: true, support: true, warehouse: true, shop: true, sim: true,
 };
+
+/// The LIVE tenant's modules: the `modules` of the manifest the live
+/// gateway served, read out of live-tenant-manifest.json — a RECORDING,
+/// with the time it was taken and the read that took it, never a shape
+/// typed here. MODULES_ON above is shaped so a module gate cannot be
+/// seen at all — every gate answers "on" — which is how /ux/support
+/// stayed gated on 'shipping' and labelled "Shipments" with no mocked
+/// spec able to notice (backlog 5b2f3240, gap 10 of the /ux/support
+/// audit). A spec that pins a gate "as live" installs this shape through
+/// installTenantManifest, after installSmokeMocks.
+///
+/// This was a literal `{}` documented as the live manifest of
+/// 2026-09-19, and it went on saying so after the instance began serving
+/// eleven keys with exec, finance and support true — so every spec that
+/// rendered "the live instance" rendered those three off, and the
+/// products spec kept a second, correct copy beside it (41454ce1). A
+/// mocked run cannot read the instance, so the recording cannot refresh
+/// itself; what it can do is carry its date into every test title that
+/// renders it, and be one file to overwrite — the body verbatim from the
+/// read it names — after which every "as live" leg re-judges the page
+/// against the new shape and fails by name where the page changed.
+export const MODULES_LIVE: Readonly<Record<string, boolean>> = LIVE_RECORDING.body.modules;
+
+/// When the recording above was taken (UTC, as `date -u` read it). Specs
+/// put it in the titles of their live legs, so a reader of a run sees
+/// how old "live" is.
+export const LIVE_MANIFEST_RECORDED_AT: string = LIVE_RECORDING.recorded_at;
+
+/// A manifest listing no modules: what the gateway answers when it finds
+/// no tenant.toml (api.rs `tenant_manifest_now`), and what the live one
+/// served until it did not. Every module is off. This is its own shape,
+/// not "live", so a leg that means "nothing listed" keeps meaning it
+/// whatever the recording says.
+export const MODULES_NONE: Readonly<Record<string, boolean>> = {};
+
+/// The manifest body a spec serves: the recording's body verbatim —
+/// its display_name, tenant_id and labels, whatever the live gateway
+/// sent — with only `modules` replaced by the shape the leg is about.
+/// The name was typed five more times until backlog af138621: here as
+/// 'Algedonic Ales'/'brewery', a tenant the instance stopped being, and
+/// in four specs' own inline helpers as the live name. A recording that
+/// changes now changes every one of them. `labels` defaults to empty
+/// because the live body omits it when the tenant sets none.
+export function tenantManifest(
+  modules: Readonly<Record<string, boolean>>,
+): Readonly<Record<string, unknown>> {
+  return { labels: {}, ...LIVE_RECORDING.body, modules };
+}
+
+/// `GET /api/tenant/manifest` with the given modules — the one place a
+/// spec says which tenant it is rendering for. Registered routes win in
+/// reverse order, so calling this after installSmokeMocks replaces the
+/// all-on manifest the crawl needs.
+///
+/// `inline: true` also carries it the way a SERVED page does: the
+/// gateway inlines the manifest into index.html as
+/// `window.__BOSS_TENANT_MANIFEST__` (5578e42d), so the shell is `ready`
+/// before its first paint. The mocked dev-server does not inline, so a
+/// leg that pins a gated page's first paint needs this; a leg that pins
+/// the fetch fallback leaves it off.
+export async function installTenantManifest(
+  page: Page,
+  modules: Readonly<Record<string, boolean>>,
+  opts: Readonly<{ inline?: boolean }> = {},
+): Promise<void> {
+  const body = tenantManifest(modules);
+  await page.route(/\/api\/tenant\/manifest$/, (r) => json(r, body));
+  if (opts.inline) {
+    await page.addInitScript((b) => {
+      (globalThis as { __BOSS_TENANT_MANIFEST__?: unknown }).__BOSS_TENANT_MANIFEST__ = b;
+    }, body);
+  }
+}
 
 /// The platform's department Classes (01-registries.sql) as `/api/classes`
 /// rows — the EMPLOYEE DRAWER: the values an employee's `department`
@@ -48,16 +125,22 @@ export const DEPARTMENT_CLASSES: ReadonlyArray<Record<string, unknown>> = [
 
 /// The departments registry as `GET /api/departments` serves it — the
 /// chrome bar derives its tabs from these since dc5788ba, so a mock
-/// with no departments is a bar with no department tabs. The SAME
-/// codes as the drawer above, derived rather than listed a second
-/// time: which roster answers is the point of that car, and the mock
-/// has no second org chart to tell them apart with. The endpoint has
-/// already dropped retired rows and sorted, so the wire carries
-/// neither field. Shared with the chrome specs that mock no other
-/// backend.
-export const DEPARTMENTS: ReadonlyArray<Record<string, unknown>> = DEPARTMENT_CLASSES.map((c) => ({
-  code: c.code, display_name: c.display_name, function: 'operations',
-}));
+/// with no departments is a bar with no department tabs. The codes of
+/// the drawer above, derived rather than listed a second time, PLUS the
+/// three demo departments the drawer does not carry and a crawled page
+/// is owned by — production (Products), distribution (Shipments) and
+/// maintenance (Equipment, Assets). Since car 2 of design 8c3e9599 a
+/// page whose owning department is not a row renders not found, so a
+/// mock roster without them would crawl three departments' pages as
+/// not-found pages. The endpoint has already dropped retired rows and
+/// sorted, so the wire carries neither field. Shared with the chrome
+/// specs that mock no other backend.
+export const DEPARTMENTS: ReadonlyArray<Record<string, unknown>> = [
+  ...DEPARTMENT_CLASSES.map((c) => ({ code: c.code, display_name: c.display_name })),
+  { code: 'production', display_name: 'Production' },
+  { code: 'distribution', display_name: 'Distribution' },
+  { code: 'maintenance', display_name: 'Maintenance' },
+].map((d) => ({ ...d, function: 'operations' }));
 
 /// `GET /api/departments` — the bare list, not the per-department
 /// readiness read, which the SPA does not make.
@@ -129,18 +212,206 @@ export const SHELL_ENDPOINTS: ReadonlyArray<RegExp> = [
 /// list where an object is due is a malformed read, not an empty one.
 export const JOBS_LIVE = /\/api\/jobs\/live$/;
 export const JOBS_SUMMARY = /\/api\/jobs\/summary(\?|$)/;
+/// The queue read (`{data, total}`, boss-jobs list_assignments). My Day
+/// tolerated a `[]` here; /ux/exec's "Waiting on you" parses the shape
+/// and paints a list as a failed read, so the empty leg answers the
+/// empty queue the server gives (page audit a1d62870, 2026-09-27).
+export const JOBS_ASSIGNMENTS = /\/api\/jobs\/assignments(\?|$)/;
 export const YARD_STATUS = /\/api\/yard\/status$/;
 export const YARD_REGIONS = /\/api\/yard\/regions(\?|$)/;
 export const YARD_BORDERS = /\/api\/yard\/borders(\?|$)/;
+export const YARD_ROUTES = /\/api\/yard\/routes(\?|$)/;
 export const WORKFLOW_DETAIL = /\/api\/workflows\/[^/]+$/;
 export const DISPATCHER_RULES = /\/api\/dispatcher\/rules$/;
 export const GATEWAY_PERF = /\/api\/gateway\/perf$/;
 export const MARKETING_ASSET_DETAIL = /\/api\/catalog\/marketing-assets\/[^/]+$/;
 export const VIEW_RESULTS = /\/api\/views\/[^/]+\/results/;
+/// What each View source offers (backlog 4a8939b5): one object the
+/// composer reads its column picker, pushdown hint and scan ceiling
+/// from. Under the `[]` catch-all the page reports a malformed read on
+/// the failure marker — right for a broken backend, wrong for a floor.
+export const VIEW_SOURCES = /\/api\/views\/sources$/;
+/// The shape boss-views serves there, abridged to the fields the specs
+/// read (query.rs `view_sources`; its own test pins the real one).
+export const VIEW_SOURCES_FIXTURE = {
+  scan_ceiling: 5000,
+  sources: [
+    {
+      source: 'jobs',
+      fields: ['id', 'kind', 'subject_kind', 'subject_id', 'title', 'owner_id', 'status', 'priority',
+        'opened_on', 'closed_on', 'tags', 'created_at', 'partition', 'metadata'],
+      pushable: [
+        { field: 'kind', type: 'text' }, { field: 'status', type: 'text' },
+        { field: 'owner_id', type: 'text' }, { field: 'created_at', type: 'timestamp' },
+        { field: 'partition', type: 'text' }, { field: 'metadata', type: 'json' },
+      ],
+    },
+    {
+      source: 'steps',
+      fields: ['id', 'job_id', 'kind', 'title', 'assignee_id', 'status', 'sort_order', 'blocked_by',
+        'completed_on', 'notes', 'created_at', 'updated_at', 'metadata'],
+      pushable: [
+        { field: 'status', type: 'text' }, { field: 'kind', type: 'text' },
+        { field: 'assignee_id', type: 'text' }, { field: 'metadata', type: 'json' },
+      ],
+    },
+    {
+      source: 'subjects',
+      fields: ['kind', 'id', 'label', 'created_at', 'retired_at'],
+      pushable: [
+        { field: 'kind', type: 'text' }, { field: 'id', type: 'text' },
+        { field: 'label', type: 'text' }, { field: 'created_at', type: 'timestamp' },
+      ],
+    },
+    {
+      source: 'events',
+      fields: ['id', 'event_id', 'kind', 'source', 'timestamp', 'subject_kind', 'subject_id', 'payload'],
+      pushable: [
+        { field: 'kind', type: 'text' }, { field: 'source', type: 'text' },
+        { field: 'subject_kind', type: 'text' }, { field: 'subject_id', type: 'text' },
+        { field: 'timestamp', type: 'timestamp' }, { field: 'payload', type: 'json' },
+      ],
+    },
+  ],
+} as const;
 export const SHIPMENT_DETAIL = /\/api\/shipping\/shipments\/[^/]+$/;
+/// The persona's own employee record, the one detail row the crawls open
+/// at /ux/people/emp-001 (backlog 1a83fe98). Spelled with the id rather
+/// than `[^/]+`, because /api/people/accounts is a list, not a person.
+export const EMPLOYEE_DETAIL = /\/api\/people\/emp-001$/;
+/// ANY one person, for the floor's 404 (backlog d50e5828): one path
+/// segment under /api/people. `accounts` is excluded because it is the
+/// one list at that depth the SPA reads; every other single segment the
+/// SPA asks for there is a person id (ownerNames.ts, EmployeePage.svelte).
+/// A future read of a list at that depth 404s under the floor — loud, and
+/// fixed by mocking it — where a person read used to get 200 [] quietly.
+export const PERSON_DETAIL = /\/api\/people\/(?!accounts(\?|$))[^/?]+(\?|$)/;
+/// The viewer's own people row, answered for each employee a spec signs
+/// in as. The shell's session resolves the gateway probe's employee_id
+/// by reading `/api/people/{id}` — one row, not the roster it used to
+/// read and search (backlog b4f68a65) — so a spec that mocks a persona
+/// answers that read beside its `/api/session`. Each route is spelled
+/// with its id, like EMPLOYEE_DETAIL, so no list under /api/people/ is
+/// answered with a person.
+export async function servePeopleRows(
+  page: Page,
+  rows: ReadonlyArray<Readonly<{ id: string }>>,
+): Promise<void> {
+  for (const row of rows) {
+    const id = encodeURIComponent(row.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    await page.route(new RegExp(`/api/people/${id}$`), (r) => json(r, row));
+  }
+}
+/// The audit log's size-and-growth read (boss-events AuditStats). The
+/// fixture /it/operate/audit sat in DEFERRED waiting for ("snapshot .length
+/// needs a faithful fixture"; page audit 65a273d5, gap 0398c4d0): a `[]`
+/// here paints `undefined.toLocaleString()` and the page throws.
+export const EVENTS_STATS = /\/api\/events\/stats$/;
+/// The churn watchlist's scores, `{ accounts }` (RiskScoreListSchema):
+/// a `[]` is a wrong shape the page reports on the failure marker.
+export const RISK_SCORES = /\/api\/people\/accounts\/risk-scores(\?|$)/;
+/// The audit log's live stream. Not an object, but not a list either: a
+/// JSON `[]` is not an event stream, so the EventSource fails and the
+/// page says the stream is down, on the failure marker (sweep c3e4edcc).
+export const EVENTS_STREAM = /\/api\/events\/stream(\?|$)/;
+/// The /ux/finance statements (page audit 3f964c57, backlog e0732f75):
+/// the fixtures the route sat in DEFERRED waiting for ("statements
+/// .reduce needs object-shaped fixtures"). Each is a single object the
+/// page reads fields off — under the `[]` catch-all the commerce
+/// summary's `ar_aging.reduce`, AP aging's `total_invoice_count
+/// .toLocaleString()` and every statement's `revenue.length` throw.
+export const COMMERCE_SUMMARY = /\/api\/commerce\/summary$/;
+export const AP_AGING = /\/api\/inventory\/ap-aging$/;
+/// The `{ data: [...] }` envelopes the marshalling board and /it/design
+/// read through the shared envelope reader (src/data/shape.ts,
+/// backlog 67825067): a bare `[]` there is a malformed read the page
+/// paints as its failure line, which is right for a broken backend and
+/// wrong for the empty leg.
+export const STATIONS_LOAD = /\/api\/stations\/load$/;
+export const STATIONS_FLOW = /\/api\/stations\/flow(\?|$)/;
+export const QUEUE_AGE = /\/api\/jobs\/queue-age$/;
+export const DESIGN_STATION_QUEUES = /\/api\/stations\/design-(review|decided)\/queue$/;
+export const LEDGER_STATEMENTS =
+  /\/api\/ledger\/(income-statement|balance-sheet|cash-flow|trial-balance|deferred-revenue-runoff|tax-liability)(\?|$)/;
+export const EMPTY_COMMERCE_SUMMARY = {
+  revenue_ttm: [], total_revenue_ttm_cents: 0, total_cogs_ttm_cents: 0,
+  total_gross_margin_ttm_cents: 0, ar_aging: [], total_outstanding_cents: 0,
+  total_invoice_count: 0, revenue_by_month: [], currency: 'USD',
+} as const;
+/// The /ux/assets counts (boss-assets' AssetsSummary). The page checks
+/// its shape since backlog e1cb1ef3 and paints a `[]` as a failed read,
+/// which is right for a broken backend and wrong for the empty leg — so
+/// the floor answers the empty summary a registry with no assets gives:
+/// every active phase counted, each at 0.
+export const ASSETS_SUMMARY = /\/api\/assets\/summary$/;
+export const EMPTY_ASSETS_SUMMARY = {
+  phase_counts: ['registered', 'received', 'shipped', 'installed', 'out-for-service', 'decommissioned']
+    .map((phase) => ({ phase, count: 0 })),
+  total_systems: 0, in_field_count: 0, open_tickets_total: 0, sku_counts: [], warranty_expiring_30d: 0,
+} as const;
+export const EMPTY_AP_AGING = {
+  buckets: [], total_outstanding_cents: 0, total_invoice_count: 0, currency: 'USD',
+} as const;
+/// The empty-but-valid body of each ledger statement (apps/web/src/finance
+/// ledger.ts's types), keyed by the path LEDGER_STATEMENTS matched. The
+/// cash-flow path answers two shapes, told apart by `?method=direct`.
+export function emptyLedgerStatement(url: string): unknown {
+  const u = new URL(url);
+  const period = { from: '2026-01-01', to: '2026-09-03' };
+  switch (u.pathname.split('/').pop()) {
+    case 'income-statement':
+      return { ...period, revenue: [], total_revenue_cents: 0, cogs: [], total_cogs_cents: 0,
+        gross_profit_cents: 0, operating_expenses: [], total_operating_expenses_cents: 0,
+        net_income_cents: 0, currency: 'USD' };
+    case 'balance-sheet':
+      return { as_of: '2026-09-03', assets: [], total_assets_cents: 0, liabilities: [],
+        total_liabilities_cents: 0, equity: [], total_equity_cents: 0, imbalance_cents: 0,
+        balanced: true, currency: 'USD' };
+    case 'cash-flow':
+      return u.searchParams.get('method') === 'direct'
+        ? { ...period, method: 'direct', cash_in_from_customers_cents: 0, cash_out_to_vendors_cents: 0,
+            cash_out_to_employees_cents: 0, cash_out_to_authorities_cents: 0, net_change_in_cash_cents: 0,
+            gl_cash_pool_delta_cents: 0, gl_cash_1000_delta_cents: 0, reconciliation_gap_cents: 0,
+            reconciled: true, currency: 'USD' }
+        : { ...period, net_income_cents: 0, operating_activities: [], working_capital_adjustments: [],
+            non_cash_adjustments: [], cash_from_operations_cents: 0, investing_activities: [],
+            cash_from_investing_cents: 0, financing_activities: [], cash_from_financing_cents: 0,
+            net_change_in_cash_cents: 0, cash_start_cents: 0, cash_end_cents: 0,
+            reconciliation_gap_cents: 0, reconciled: true, currency: 'USD' };
+    case 'trial-balance':
+      return { as_of: '2026-09-03', rows: [], total_debits_cents: 0, total_credits_cents: 0,
+        balanced: true, currency: 'USD' };
+    case 'deferred-revenue-runoff':
+      return { as_of: '2026-09-03', horizon_months: 12, deferred_account_balance_cents: 0,
+        schedules_remaining_cents: 0, drift_cents: 0, months: [], beyond_horizon_cents: 0, currency: 'USD' };
+    default:
+      return { as_of: '2026-09-03', liabilities: [], accrued_filings: [], next_due: null, currency: 'USD' };
+  }
+}
+/// The live read's figures on 2026-09-23 21:44Z (the audit's controls_md,
+/// read 1), trimmed to two days and three kinds.
+export const AUDIT_STATS = {
+  total_rows: 384521,
+  table_bytes: 515522560,
+  oldest_at: '2026-09-16T23:54:00Z',
+  newest_at: '2026-09-23T21:44:00Z',
+  rows_last_24h: 78516,
+  rows_last_7d: 420000,
+  per_day: [
+    { day: '2026-09-22', rows: 71000 },
+    { day: '2026-09-23', rows: 73907 },
+  ],
+  top_kinds: [
+    { kind: 'jobs.step.updated', rows: 120000 },
+    { kind: 'dispatcher.rule.fired', rows: 60000 },
+    { kind: 'credential.rotate.verified', rows: 3 },
+  ],
+} as const;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
-  JOBS_LIVE, JOBS_SUMMARY, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
-  MARKETING_ASSET_DETAIL, VIEW_RESULTS, SHIPMENT_DETAIL,
+  JOBS_LIVE, JOBS_SUMMARY, JOBS_ASSIGNMENTS, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, YARD_ROUTES, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
+  MARKETING_ASSET_DETAIL, VIEW_RESULTS, VIEW_SOURCES, SHIPMENT_DETAIL, EMPLOYEE_DETAIL, EVENTS_STATS, RISK_SCORES, EVENTS_STREAM,
+  COMMERCE_SUMMARY, AP_AGING, LEDGER_STATEMENTS, ASSETS_SUMMARY,
+  STATIONS_LOAD, STATIONS_FLOW, QUEUE_AGE, DESIGN_STATION_QUEUES,
   // `{data, total}`, not a list: a bare `[]` here is the shape a wrong
   // endpoint answers, and the bar reads it as a failed roster rather
   // than an empty one — deliberately, so the org chart cannot go
@@ -163,10 +434,18 @@ export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
 /// answers 401 — the gateway's answer for that session, and what
 /// SignInControl reads as "Sign in". A spec that needs a persona mocks
 /// `/api/people` + `/api/session` itself (installSmokeMocks does). A
-/// detail read for an id nothing seeded answers 404, the registry's
-/// own answer for a kind it does not hold; a spec that relies on a 404
-/// for its error-state rendering now gets it from here rather than
-/// from the dev-server's miss.
+/// detail read for an id nothing seeded answers 404 — the server's own
+/// answer for an id it does not hold — but ONLY for the detail paths
+/// named in the loop at the end (a workflow, a marketing asset, a
+/// shipment, a view's results, a person); every other single-resource
+/// path still falls to the `[]` catch-all. People joined the loop on
+/// 2026-09-26 (backlog d50e5828): until then an unseeded
+/// /api/people/{id} answered 200 [] while this comment said 404. There
+/// is no general "unknown id" 404, because a path's shape does not say
+/// whether it is a detail or a list (/api/people/accounts is a list at
+/// the depth a person sits). A spec that relies on a 404 for its
+/// error-state rendering gets it from here rather than from the
+/// dev-server's miss.
 export async function installApiFloor(page: Page): Promise<void> {
   await page.route('**/api/**', (r) => json(r, []));
 
@@ -189,10 +468,29 @@ export async function installApiFloor(page: Page): Promise<void> {
   // 204 fails the EventSource cleanly — no reconnect — so the client
   // falls back to its poll, which the objects below answer.
   await page.route(/\/api\/.+\/stream(\?|$)/, (r) => r.fulfill({ status: 204 }));
+  // Except the audit log's, the one stream whose refusal a page reports
+  // as a failed read: its "Live stream down" line wears the failure
+  // marker since sweep c3e4edcc, so under the 204 the empty leg found a
+  // marker on a healthy backend. A well-formed empty stream that ends
+  // instead — the browser waits `retry` to reconnect, and the page says
+  // it is reconnecting, which is no failure.
+  await page.route(EVENTS_STREAM, (r) =>
+    r.fulfill({
+      status: 200,
+      headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+      body: 'retry: 3600000\n\n',
+    }),
+  );
 
   // Live job state (objects, not lists — `[]` would break these).
   await page.route(JOBS_LIVE, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(JOBS_SUMMARY, (r) => json(r, { counts: {}, total: 0 }));
+  // The churn watchlist's scores: `{ accounts }` (RiskScoreListSchema).
+  // Under the `[]` catch-all the page parses a wrong shape and says so on
+  // the failure marker (sweep c3e4edcc) — right for a broken backend,
+  // wrong for the empty leg.
+  await page.route(RISK_SCORES, (r) =>
+    json(r, { accounts: [], total_scored: 0, scored_as_of: null, stale_after_hours: 26 }));
   // The yard status read-model (object, not a list). An empty-but-well-
   // formed payload so the page renders its "no trains / no cars" states.
   await page.route(YARD_STATUS, (r) =>
@@ -224,9 +522,8 @@ export async function installApiFloor(page: Page): Promise<void> {
     }),
   );
   // The map's RAILS (design d2154293, car 2), for the same reason: the
-  // empty leg is a quiet border per declared hop, not a failed read.
-  // The hops are world.ts's, which the server's table is pinned equal
-  // to.
+  // empty leg is a quiet border per hop the server answers, not a failed
+  // read.
   await page.route(YARD_BORDERS, (r) =>
     json(r, {
       window_hours: 24,
@@ -241,12 +538,38 @@ export async function installApiFloor(page: Page): Promise<void> {
     }),
   );
 
+  // The map's ROUTES (design e765b3fc, car R3): the transit map draws
+  // exactly what this read serves, so the empty leg answers the shared
+  // fixture's — the live shape of 2026-09-26 — rather than a failed read.
+  await page.route(YARD_ROUTES, (r) => json(r, routesPayload()));
+
   // The other object reads, empty; the detail reads, absent.
   await page.route(DISPATCHER_RULES, (r) => json(r, { rules: [], handler_emits: {}, system_edges: [] }));
   await page.route(GATEWAY_PERF, (r) => json(r, { endpoints: [], window_started_at: '2026-01-01T00:00:00Z' }));
-  for (const detail of [WORKFLOW_DETAIL, MARKETING_ASSET_DETAIL, SHIPMENT_DETAIL, VIEW_RESULTS]) {
+  await page.route(EVENTS_STATS, (r) => json(r, {
+    total_rows: 0, table_bytes: 0, oldest_at: null, newest_at: null,
+    rows_last_24h: 0, rows_last_7d: 0, per_day: [], top_kinds: [],
+  }));
+  await page.route(JOBS_ASSIGNMENTS, (r) => json(r, { data: [], total: 0 }));
+  await page.route(COMMERCE_SUMMARY, (r) => json(r, EMPTY_COMMERCE_SUMMARY));
+  await page.route(AP_AGING, (r) => json(r, EMPTY_AP_AGING));
+  await page.route(LEDGER_STATEMENTS, (r) => json(r, emptyLedgerStatement(r.request().url())));
+  await page.route(ASSETS_SUMMARY, (r) => json(r, EMPTY_ASSETS_SUMMARY));
+  // The envelope reads, well-formed and empty: every station answered
+  // and nothing stands, so the board paints its clear state and the
+  // design page its two empty lines (backlog 67825067).
+  await page.route(STATIONS_LOAD, (r) => json(r, { data: [], total: 0, distinct_packets: 0 }));
+  await page.route(STATIONS_FLOW, (r) => json(r, { window_hours: 24, as_of: '2026-09-03T12:00:00Z', data: [] }));
+  await page.route(QUEUE_AGE, (r) => json(r, { data: [], total: 0, now: '2026-09-03T12:00:00Z' }));
+  await page.route(DESIGN_STATION_QUEUES, (r) => {
+    const station = /design-(review|decided)/.exec(r.request().url())?.[0] ?? 'design-review';
+    return json(r, { station, kind: 'batch', discipline: [], total: 0, data: [], steps: {} });
+  });
+  for (const detail of [WORKFLOW_DETAIL, MARKETING_ASSET_DETAIL, SHIPMENT_DETAIL, VIEW_RESULTS, PERSON_DETAIL]) {
     await page.route(detail, (r) => json(r, 'not found', 404));
   }
+  // The Views composer's sources (an object; see VIEW_SOURCES).
+  await page.route(VIEW_SOURCES, (r) => json(r, VIEW_SOURCES_FIXTURE));
 }
 
 export async function installSmokeMocks(page: Page): Promise<void> {
@@ -263,6 +586,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
 
   // Identity / session: a persona, so `/api/auth/me` is someone.
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await page.route(EMPLOYEE_DETAIL, (r) => json(r, EMP));
   await page.route(/\/api\/session$/, (r) => json(r, {}));
   await page.route(/\/api\/auth\/me$/, (r) => json(r, {}));
 
@@ -327,14 +651,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // something deterministic to read. A module is on only when listed
   // true (ce68f137), so the playground persona lists every module the
   // SPA gates — the crawl has to reach the pages behind them.
-  await page.route(/\/api\/tenant\/manifest$/, (r) =>
-    json(r, {
-      display_name: 'Algedonic Ales',
-      tenant_id: 'brewery',
-      modules: MODULES_ON,
-      labels: {},
-    }),
-  );
+  await installTenantManifest(page, MODULES_ON);
   await page.route(/\/api\/views(\?|$)/, (r) =>
     json(r, [
       {
@@ -354,7 +671,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
     json(r, {
       view_id: 'view-1', source: 'jobs', layout: 'table',
       rows: [{ id: 'j-1', status: 'open' }],
-      matched: 1, truncated: false,
+      matched: 1, truncated: false, scope: 'all',
     }),
   );
   await page.route(/\/api\/shipping\/shipments(\?|$)/, (r) => json(r, [SHIPMENT]));

@@ -7,7 +7,7 @@ use boss_core::primitives::{Class, ClassRef};
 use boss_core::publisher::EventStamp;
 use std::sync::RwLock;
 
-use crate::port::{ClassError, ClassRepository, declared_event};
+use crate::port::{ClassError, ClassRepository, declared_event, retired_event, updated_event};
 
 /// Trivial in-memory store. Holds a snapshot of `Class` rows; lookups
 /// are linear scans because the registry is tiny (≤ 100 rows in
@@ -63,34 +63,42 @@ impl ClassRepository for InMemoryClasses {
         }))
     }
 
-    async fn update(&self, class: &Class) -> Result<bool, ClassError> {
+    async fn update(&self, class: &Class, stamp: &EventStamp) -> Result<bool, ClassError> {
         let mut rows = self.rows.write().expect("rwlock poisoned");
+        let mut events = self.events.write().expect("rwlock poisoned");
         match rows
             .iter_mut()
             .find(|c| c.subject_kind == class.subject_kind && c.code == class.code)
         {
             Some(existing) => {
                 // Key and retirement are not part of the editable body.
-                let retired_at = existing.retired_at;
-                *existing = class.clone();
-                existing.retired_at = retired_at;
+                let mut next = class.clone();
+                next.retired_at = existing.retired_at;
+                // The Pg adapter's shape: no change, no write, no fact.
+                if let Some(event) = updated_event(stamp, existing, &next)? {
+                    *existing = next;
+                    events.push(event);
+                }
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
-    async fn retire(&self, class_ref: &ClassRef) -> Result<bool, ClassError> {
+    async fn retire(&self, class_ref: &ClassRef, stamp: &EventStamp) -> Result<bool, ClassError> {
         let mut rows = self.rows.write().expect("rwlock poisoned");
+        let mut events = self.events.write().expect("rwlock poisoned");
         match rows
             .iter_mut()
             .find(|c| c.subject_kind == class_ref.subject_kind && c.code == class_ref.code)
         {
             Some(existing) => {
                 // Keep the original stamp on a repeat call — when it
-                // was withdrawn is a fact, not a counter.
+                // was withdrawn is a fact, not a counter — and record
+                // the fact only for the call that set it.
                 if existing.retired_at.is_none() {
                     existing.retired_at = Some(chrono::Utc::now());
+                    events.push(retired_event(stamp, existing));
                 }
                 Ok(true)
             }

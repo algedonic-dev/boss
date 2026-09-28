@@ -1,3 +1,7 @@
+# EVERY KEY HERE IS READ BACK BY ITS EFFECT in
+# src/bunfig-keys-take-effect.test.ts, which also refuses a key it does
+# not name — bun ignores some keys without a word (backlog ae162cb4).
+#
 # Registers bun-plugin-svelte with Bun's Fullstack Dev Server so
 # `dev-server.ts`'s HTML entrypoint (index.html) gets bundled +
 # hot-reloaded when .svelte / .ts / .css files change. No effect

@@ -1,0 +1,35 @@
+# svelte-check warnings, per file — the ratchet infra/lint/svelte-check.sh
+# holds every file to (backlog 68056e4e). `<count>\t<path>`, the path as
+# svelte-check prints it, relative to apps/web. A file gaining a warning
+# fails the gate; a file losing one passes and names the line to lower
+# here. Measured 2026-09-27 on origin/main 33cd12f5 with the tests
+# included: 74 warnings in 28 files. Lower a line in the car that fixes
+# its warnings; never raise one.
+1	../../libs/web-kit/src/FeedbackControl.svelte
+1	../../libs/web-kit/src/ui/Tabs.svelte
+2	src/auth/AuthAdminPage.svelte
+5	src/auth/LoginPage.svelte
+1	src/finance/FinancePage.svelte
+1	src/hr/HrPage.svelte
+1	src/it/ItTabs.svelte
+10	src/it/yard/WorldMap.svelte
+4	src/jobs/JobsListPage.svelte
+2	src/jobs/StepDag.svelte
+1	src/people/OrgTreeNode.svelte
+2	src/policy/EditPolicyFlyout.svelte
+1	src/qa/QaPage.svelte
+1	src/shipping/ShippingPage.svelte
+1	src/shop/ShopProductPage.svelte
+1	src/steps/ApprovalSurface.svelte
+5	src/steps/GenericSurface.svelte
+1	src/steps/HandoffSurface.svelte
+3	src/steps/InspectionSurface.svelte
+5	src/steps/IntakeSurface.svelte
+2	src/steps/ProcurementSurface.svelte
+6	src/steps/ProductionConsumeSurface.svelte
+7	src/steps/ReceivingSurface.svelte
+4	src/steps/RepairSurface.svelte
+2	src/steps/SchedulingSurface.svelte
+2	src/steps/ShipmentSurface.svelte
+1	src/support/SupportPage.svelte
+1	src/warehouse/WarehousePage.svelte

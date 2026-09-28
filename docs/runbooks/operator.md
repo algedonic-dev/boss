@@ -34,7 +34,7 @@ kubectl -n boss logs deploy/boss --tail=200   # the pod's launcher + services
 Reading a host is an **ops-request**, never ssh: `boss ops <host>
 <verb> [args] --wait` files a packet the host's runner answers
 (`infra/ops/verbs/` is the allowlist; `df`, `uptime`, `unit-status`,
-`journal-tail`, `pod-logs`, `disk-report` are the reads). The forge's
+`journal-tail`, `pod-logs`, `disk-report`, `forge-log` are the reads). The forge's
 and boss-gcp's journals are also readable over HTTP on `:19531`
 (`infra/forge/OPERATIONS.md` §Reading the host from the pod).
 
@@ -247,7 +247,9 @@ kubectl -n boss logs job/<name> --all-containers
 On the forge: `boss ops forge disk-report --wait`, then
 `boss ops forge reclaim-disk <floor-GB> --wait` (bounded; the
 per-train CI images in the system docker daemon are the usual
-culprit — `infra/forge/OPERATIONS.md` §1). On the cluster: the
+culprit — `infra/forge/OPERATIONS.md` §1). On boss-gcp: `boss ops
+boss-gcp disk-report --wait` reads the root by directory (read-only;
+no reclaim verb serves that host yet). On the cluster: the
 `boss-backups` PVC is capped by retention; Longhorn volume usage is
 `kubectl get volumes.longhorn.io -n longhorn-system`.
 

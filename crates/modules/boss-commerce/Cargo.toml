@@ -59,6 +59,10 @@ name = "agreements_audit_chain"
 required-features = ["postgres"]
 
 [[test]]
+name = "an_invoice_is_created_once_per_id"
+required-features = ["postgres"]
+
+[[test]]
 name = "financial_facts_e2e"
 required-features = ["postgres"]
 
@@ -67,11 +71,23 @@ name = "gl_drift"
 required-features = ["postgres"]
 
 [[test]]
+name = "invoice_transitions"
+required-features = ["postgres"]
+
+[[test]]
+name = "open_ar_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "outbox_invoice_pg"
 required-features = ["postgres"]
 
 [[test]]
 name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_agreements_upsert_asks_policy"
 required-features = ["postgres"]
 
 [[test]]

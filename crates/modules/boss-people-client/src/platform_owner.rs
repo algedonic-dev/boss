@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use boss_core::http_client;
+use boss_core::http_client::{self, HttpClientError};
 use boss_core::platform_owner::{self, Holder, PlatformOwner, PlatformOwnerError};
 use boss_core::roles::PLATFORM_ADMIN_ROLE;
 
@@ -51,6 +51,16 @@ fn resolve(rows: Vec<HolderRow>) -> Result<String, PlatformOwnerError> {
         role: PLATFORM_ADMIN_ROLE,
     })
 }
+
+/// Who the read signs as: its own automation at the operator tier.
+/// The roster answers a caller by grant (backlog cda177ef, 2026-09-27),
+/// and one with no `x-boss-user` is nobody — this adapter sent none,
+/// for every verb that files a packet and for the dispatcher's alarms.
+/// Operator tier is machinery, which the roster admits whatever the
+/// role; the role is platform-admin as well, the shape every other
+/// automation signs with, so the read passes on the core defaults even
+/// where a door asks policy first.
+pub const PLATFORM_OWNER_READER: &str = r#"{"id":"automation:platform-owner","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
 
 /// Production adapter over reqwest, with the per-process cache.
 pub struct ReqwestPlatformOwner {
@@ -111,10 +121,30 @@ impl ReqwestPlatformOwner {
     }
 
     async fn read(&self) -> Result<String, PlatformOwnerError> {
-        let rows: Vec<HolderRow> = http_client::get_json::<People, _>(&self.http, &self.url())
+        let rows = self
+            .signed_rows()
             .await
             .map_err(|e| PlatformOwnerError::Unreachable(e.to_string()))?;
         resolve(rows)
+    }
+
+    /// `http_client::get_json`'s ladder, with the request signed as
+    /// [`PLATFORM_OWNER_READER`] — the one thing the shared helper
+    /// cannot carry.
+    async fn signed_rows(&self) -> Result<Vec<HolderRow>, HttpClientError<People>> {
+        let resp = self
+            .http
+            .get(self.url())
+            .header("x-boss-user", PLATFORM_OWNER_READER)
+            .send()
+            .await
+            .map_err(|e| HttpClientError::Unreachable(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(HttpClientError::UnexpectedStatus(resp.status().as_u16()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| HttpClientError::MalformedBody(e.to_string()))
     }
 }
 
@@ -194,10 +224,10 @@ mod tests {
                 };
                 let mut buf = vec![0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
+                // The whole request head, so a test can read a header
+                // as well as the request line it starts with.
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                log.lock()
-                    .unwrap()
-                    .push(req.lines().next().unwrap_or_default().to_string());
+                log.lock().unwrap().push(req);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -226,6 +256,31 @@ mod tests {
         assert!(
             lines[0].starts_with("GET /api/people?role=platform-admin&status=active "),
             "{lines:?}"
+        );
+    }
+
+    /// THE READ SIGNS (backlog cda177ef). The roster answers a caller
+    /// by grant now, and a request with no `x-boss-user` is nobody; the
+    /// adapter sent none, so every verb that files a packet and the
+    /// dispatcher's alarms would have lost their owner the day the
+    /// roster stopped answering strangers. It signs as its own
+    /// automation at the operator tier — machinery, the tier the
+    /// roster admits whatever the role.
+    #[tokio::test]
+    async fn the_read_signs_as_machinery_at_the_operator_tier() {
+        let (base, seen) = stub(r#"[{"id":"emp-first","hire_date":"2026-09-16"}]"#).await;
+        let port = ReqwestPlatformOwner::new(&base).with_override(None);
+        assert_eq!(port.platform_owner().await.unwrap(), "emp-first");
+        let request = seen.lock().unwrap()[0].clone();
+        let header = request
+            .lines()
+            .find_map(|l| l.strip_prefix("x-boss-user: "))
+            .unwrap_or_else(|| panic!("the read carried no x-boss-user: {request}"));
+        assert_eq!(header, PLATFORM_OWNER_READER);
+        assert!(
+            header.contains(r#""access_tier":"operator""#)
+                && header.contains(r#""id":"automation:platform-owner""#),
+            "{header}"
         );
     }
 

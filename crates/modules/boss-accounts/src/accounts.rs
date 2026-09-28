@@ -1,6 +1,6 @@
 //! Accounts API — customer account directory.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -14,6 +14,15 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use boss_assets_client::{AssetsClient, AssetsClientError};
+
+/// Page bounds for `GET /api/people/accounts` — the same pair
+/// boss-assets and boss-commerce use. `MAX_LIST_LIMIT` is public so a
+/// caller that wants "every account" can ask for the most it may have
+/// and then read `total` to learn whether it got them (backlog
+/// 2d1d298e: this read had no LIMIT at all, so it answered the whole
+/// table and nothing said how big that was).
+pub const DEFAULT_LIST_LIMIT: i64 = 100;
+pub const MAX_LIST_LIMIT: i64 = 1000;
 
 #[derive(Clone)]
 pub struct AccountsState {
@@ -199,6 +208,29 @@ pub struct AccountWithContacts {
     pub contacts: Vec<AccountContact>,
 }
 
+/// The account-team role `mirror_territory_rep` writes.
+const TERRITORY_REP: &str = "territory-rep";
+
+/// Gate the territory-rep mirror through the ONE account-team-role
+/// validator every other team write takes (assign, batch, unassign) —
+/// backlog 5d9eea99: the mirror wrote `territory-rep` into
+/// `account_team_members` without asking the registry, so on an
+/// instance with no such `account_team_role` Class it recorded a code
+/// the registry did not know. Only runs when the mirror will: an
+/// account with no rep, or no date to stamp one, writes no team row.
+/// 422, the status assign and batch answer for the same refusal.
+async fn check_territory_rep(
+    classes: Option<&Arc<dyn ClassesClient>>,
+    account: &Account,
+) -> Result<(), Response> {
+    if account.territory_rep_id.is_none() || account.customer_since.is_none() {
+        return Ok(());
+    }
+    crate::account_team_members::validate_role(classes, TERRITORY_REP)
+        .await
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e).into_response())
+}
+
 /// Upsert the `(account_id, territory-rep)` row in
 /// `account_team_members` so the join table mirrors
 /// `accounts.territory_rep_id`. Called inside `create_account` +
@@ -231,15 +263,62 @@ async fn mirror_territory_rep(
     Ok(evt)
 }
 
-async fn list_accounts(State(state): State<AccountsState>) -> Response {
-    let rows: Result<Vec<Account>, _> =
-        sqlx::query_as("SELECT id, name, director, city, state, tier, customer_since, territory_rep_id, account_type FROM accounts ORDER BY id")
-            .fetch_all(state.pool.as_ref())
-            .await;
+#[derive(Deserialize)]
+struct ListParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
 
-    match rows {
-        Ok(accounts) => Json(accounts).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+/// The `{data, total, limit, offset}` envelope every boss-* list
+/// endpoint answers. `total` is the DB-wide count, so `total >
+/// data.len()` is how a caller knows the page is capped.
+#[derive(Serialize)]
+struct AccountsPage {
+    data: Vec<Account>,
+    total: i64,
+    limit: i64,
+    offset: i64,
+}
+
+/// `GET /api/people/accounts` — one bounded page of the directory.
+///
+/// Until 2026-09-23 this was an unbounded `SELECT … ORDER BY id`
+/// answered as a bare array (backlog 2d1d298e, from the /ux/support
+/// page audit): no caller could cap-check it, so the page that read it
+/// beside two enveloped reads had two honesty levels in one render.
+async fn list_accounts(
+    State(state): State<AccountsState>,
+    Query(params): Query<ListParams>,
+) -> Response {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let total: Result<i64, _> = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(state.pool.as_ref())
+        .await;
+    let rows: Result<Vec<Account>, _> = sqlx::query_as(
+        "SELECT id, name, director, city, state, tier, customer_since, territory_rep_id, account_type \
+         FROM accounts ORDER BY id LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.pool.as_ref())
+    .await;
+
+    match (rows, total) {
+        (Ok(data), Ok(total)) => Json(AccountsPage {
+            data,
+            total,
+            limit,
+            offset,
+        })
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -276,12 +355,16 @@ async fn create_account(
     Json(body): Json<AccountWithContacts>,
 ) -> Response {
     // Registry gates before any write: account_type is always present
-    // (NOT NULL DEFAULT), tier only when Some.
+    // (NOT NULL DEFAULT), tier only when Some, the mirrored team role
+    // only when a rep will be mirrored.
     if let Err(resp) = check_account_type(state.classes.as_ref(), &body.account.account_type).await
     {
         return resp;
     }
     if let Err(resp) = check_tier(state.classes.as_ref(), body.account.tier.as_deref()).await {
+        return resp;
+    }
+    if let Err(resp) = check_territory_rep(state.classes.as_ref(), &body.account).await {
         return resp;
     }
 
@@ -417,12 +500,16 @@ async fn update_account(
     Json(body): Json<AccountWithContacts>,
 ) -> Response {
     // Registry gates before any write (same as create): account_type
-    // is always present, tier only when Some.
+    // is always present, tier only when Some, the mirrored team role
+    // only when a rep will be mirrored.
     if let Err(resp) = check_account_type(state.classes.as_ref(), &body.account.account_type).await
     {
         return resp;
     }
     if let Err(resp) = check_tier(state.classes.as_ref(), body.account.tier.as_deref()).await {
+        return resp;
+    }
+    if let Err(resp) = check_territory_rep(state.classes.as_ref(), &body.account).await {
         return resp;
     }
 
@@ -769,3 +856,78 @@ async fn list_account_facts(
 // directly would be an audit-chain bypass for a table that should be
 // derived, not written. Restore via a step-effects subscriber if
 // facts ever need to land outside the jobs pipeline.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_classes_client::FakeClassesClient;
+    use boss_core::primitives::Class;
+
+    fn team_role(code: &str) -> Class {
+        Class {
+            subject_kind: "employee".into(),
+            code: code.into(),
+            display_name: code.into(),
+            parent_code: None,
+            member_attribute: Some("account_team_role".into()),
+            metadata: serde_json::Value::Null,
+            sort_order: 0,
+            retired_at: None,
+        }
+    }
+
+    fn account(rep: Option<&str>, since: Option<NaiveDate>) -> Account {
+        Account {
+            id: "acct-1".into(),
+            name: None,
+            director: None,
+            city: None,
+            state: None,
+            tier: None,
+            customer_since: since,
+            territory_rep_id: rep.map(str::to_string),
+            account_type: default_account_type(),
+        }
+    }
+
+    /// Backlog 5d9eea99: the territory-rep mirror writes an account
+    /// team row, so it answers to the same `account_team_role` check
+    /// as every other team write — refused where the registry does not
+    /// declare `territory-rep`, allowed where it does, and not asked at
+    /// all when no row will be written.
+    #[tokio::test]
+    async fn the_territory_rep_mirror_takes_the_team_role_check() {
+        let since = NaiveDate::from_ymd_opt(2026, 1, 1);
+        let undeclared: Arc<dyn ClassesClient> =
+            Arc::new(FakeClassesClient::with_classes(vec![team_role(
+                "customer-success",
+            )]));
+        let declared: Arc<dyn ClassesClient> =
+            Arc::new(FakeClassesClient::with_classes(vec![team_role(
+                TERRITORY_REP,
+            )]));
+
+        let refused = check_territory_rep(Some(&undeclared), &account(Some("emp-1"), since)).await;
+        assert_eq!(
+            refused.map_err(|r| r.status()).err(),
+            Some(StatusCode::UNPROCESSABLE_ENTITY),
+            "an undeclared territory-rep role must be refused before the mirror writes it"
+        );
+        assert!(
+            check_territory_rep(Some(&declared), &account(Some("emp-1"), since))
+                .await
+                .is_ok()
+        );
+        // No rep, or no date: the mirror writes nothing, so nothing is asked.
+        assert!(
+            check_territory_rep(Some(&undeclared), &account(None, since))
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_territory_rep(Some(&undeclared), &account(Some("emp-1"), None))
+                .await
+                .is_ok()
+        );
+    }
+}

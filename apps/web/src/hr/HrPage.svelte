@@ -1,9 +1,14 @@
 <script lang="ts">
   // HR admin — port of apps/web/src/hr/HrPage.tsx.
   //
-  // Five tabs: Overview, Workflows (onboarding/offboarding task
-  // tracking with POST mutations), Requisitions (placeholder),
-  // Certifications, Headcount.
+  // Four tabs: Overview, Workflows (onboarding/offboarding task
+  // tracking with POST mutations), Certifications, Headcount.
+  //
+  // A fifth, Requisitions, went with page audit b959394e (backlog
+  // 0ab0fbac): it said the requisitions API was not implemented when it
+  // is, and the page printed five requisition zeros no read had made.
+  // Nothing on this instance produces a requisition; the boss-people
+  // API stays for the example tenants.
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
@@ -11,30 +16,32 @@
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import {
-    humanizeClassCode,
+    classLabel,
     type Department,
     type Employee,
   } from '../people/types';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import { tenureYears, expiringCerts } from '../people/utils';
   import {
     workflowSurfaces,
     type WorkflowSpec,
   } from '../workflows/workflowTypes';
-  import { fetchRemote } from '../data/remote';
+  import { fetchEvery, wholeOrThrow } from '../data/paginated';
   import {
-    fetchEmployeeTasks,
+    fetchJobTasks,
     fetchStepProgress,
     hrJobRows,
     type TasksRead,
   } from './hr-tasks';
-  import { href } from '../router';
+  import { countedRoster, headcount, rosterHeader } from '../people/roster-counts';
+  import { readStateOfLoad } from '../data/readState';
+  import { href, navigate } from '../router';
 
-  type Tab = 'overview' | 'requisitions' | 'certs' | 'headcount' | 'workflows';
+  type Tab = 'overview' | 'certs' | 'headcount' | 'workflows';
 
   const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
     { id: 'overview', label: 'Overview' },
     { id: 'workflows', label: 'Workflows' },
-    { id: 'requisitions', label: 'Requisitions' },
     { id: 'certs', label: 'Certifications' },
     { id: 'headcount', label: 'Headcount' },
   ];
@@ -72,8 +79,15 @@
     };
   });
 
-  let active = $derived(roster.filter((e) => e.status === 'active'));
-  let onLeave = $derived(roster.filter((e) => e.status === 'on-leave'));
+  // Every count on the page is taken over `counted`: the roster less the
+  // rows whose role's Class says `counts_in_headcount: false` (backlog
+  // ad2da739). The title read "2 active employees" for one person, and
+  // Contractors 1 was emp-audit, the System Audit Account. The rule and
+  // the set are roster-counts.ts's, shared with /ux/people.
+  let roleClasses = $derived(classesFor('employee', 'role'));
+  let counted = $derived(countedRoster(roster, roleClasses));
+  let active = $derived(counted.filter((e) => e.status === 'active'));
+  let onLeave = $derived(counted.filter((e) => e.status === 'on-leave'));
   let expiring90 = $derived(expiringCerts(90, roster));
   let expiring30 = $derived(expiringCerts(30, roster));
   let avgTenure = $derived(
@@ -82,17 +96,32 @@
       : '0',
   );
 
+  // The header is /ux/people's, through the same helper (backlog
+  // d8d48a49): it printed "0 active employees" while the roster was
+  // loading and above "Couldn't load the roster". A count is stated
+  // only for a roster that was read.
+  let header = $derived(
+    rosterHeader(
+      readStateOfLoad(loading, rosterFailed),
+      headcount(roster, roleClasses),
+      expiring90.length,
+    ),
+  );
+
   let byDept = $derived.by(() => {
-    const m = new Map<Department, { active: number; onLeave: number; openReqs: number }>();
-    for (const e of roster) {
+    const m = new Map<Department, { active: number; onLeave: number }>();
+    for (const e of counted) {
       if (!e.department) continue;
-      const entry = m.get(e.department) ?? { active: 0, onLeave: 0, openReqs: 0 };
+      const entry = m.get(e.department) ?? { active: 0, onLeave: 0 };
       if (e.status === 'active') entry.active++;
       if (e.status === 'on-leave') entry.onLeave++;
       m.set(e.department, entry);
     }
     return [...m.entries()].sort((a, b) => b[1].active - a[1].active);
   });
+  // Headcount rows are labelled from the department's Class display_name
+  // (backlog 8677728c: `operations` printed Operations for Operations / IT).
+  let departmentClasses = $derived(classesFor('employee', 'department'));
 
   // ------------------------------------------------------------
   // Workflows tab — HR workflows driven through the canonical
@@ -150,7 +179,9 @@
   let hrKinds = $state<HrKind[]>([]);
 
   let workflows = $state<ActiveWorkflow[]>([]);
-  let selectedEmp = $state<string | null>(null);
+  /// The Job whose tasks are open — a row is a Job, not an employee
+  /// (backlog 5b27ed56): one person can have a hire and a leave open.
+  let selectedJob = $state<string | null>(null);
   /// The task read as a discriminated union, not a list. There is no
   /// fourth option: `ready` (with a possibly-empty list), `failed`, or
   /// `no-job`, and the template has to branch to render anything — so a
@@ -160,7 +191,6 @@
   let workflowsLoading = $state(true);
   let startTarget = $state('');
 
-  let workflowsApiAvailable = $state<boolean | null>(null);
   /// Non-null when the registry or jobs reads behind the workflows
   /// tab FAILED — rendered instead of "No HR workflows / No active
   /// workflows", which are claims only successful reads get to make
@@ -197,44 +227,51 @@
     // kinds, grouped by Subject (Employee). We query
     // /api/jobs?kind={k}&status=open for each kind, then count
     // steps via /api/jobs/{id}/steps.
-    try {
-      const results: ActiveWorkflow[] = [];
-      for (const { kind, label } of hrKinds) {
-        // `hrJobRows` owns the envelope and the subject read, and it
-        // THROWS on a shape it does not recognise — so a wrong key
-        // lands here as a failure instead of as an empty department.
-        // See ./hr-tasks for the two it was getting wrong.
-        const res = await fetchRemote(
-          `/api/jobs?kind=${encodeURIComponent(kind)}&status=open&limit=200`,
-          hrJobRows,
-        );
-        if (res.kind === 'failed') {
-          // A failed kind is a failed list — skipping it would render
-          // the remainder as if it were everything.
-          workflowsFailed = `${kind} jobs: ${res.error}`;
-          continue;
-        }
-        for (const j of res.data) {
-          // `null` when the step read failed — the progress column says
-          // "unknown" rather than drawing a 0% bar over a read that
-          // never landed.
-          const progress = await fetchStepProgress(j.id);
-          const empMatch = roster.find((e) => e.id === j.employeeId);
-          results.push({
-            employee_id: j.employeeId,
-            employee_name: empMatch?.name ?? j.employeeId,
-            workflow: label,
-            job_id: j.id,
-            total_tasks: progress?.total ?? null,
-            done_tasks: progress?.done ?? null,
-          });
-        }
+    //
+    // No outer try/catch (backlog 44e13444): every read below reports
+    // its own failure — fetchEvery and fetchStepProgress return one,
+    // and the hrJobRows throw is caught per kind — so the catch that
+    // set a "not yet wired" flag was unreachable, and the words it
+    // guarded described endpoints the page has not driven since #101.
+    const results: ActiveWorkflow[] = [];
+    for (const { kind, label } of hrKinds) {
+      // `hrJobRows` owns the envelope and the subject read, and it
+      // THROWS on a shape it does not recognise — so a wrong key
+      // lands here as a failure instead of as an empty department.
+      // See ./hr-tasks for the two it was getting wrong.
+      //
+      // EVERY open packet of the kind, not one page of 200 (backlog
+      // b68a9dde): a read that stops short is a failed kind, named
+      // with how many of how many it held.
+      const res = await fetchEvery<unknown>(
+        `/api/jobs?kind=${encodeURIComponent(kind)}&status=open`,
+      );
+      let rows: ReturnType<typeof hrJobRows>;
+      try {
+        rows = hrJobRows(wholeOrThrow(res));
+      } catch (e) {
+        // A failed kind is a failed list — skipping it would render
+        // the remainder as if it were everything.
+        workflowsFailed = `${kind} jobs: ${e instanceof Error ? e.message : String(e)}`;
+        continue;
       }
-      workflows = results;
-      workflowsApiAvailable = true;
-    } catch {
-      workflowsApiAvailable = false;
+      for (const j of rows) {
+        // `null` when the step read failed — the progress column says
+        // "unknown" rather than drawing a 0% bar over a read that
+        // never landed.
+        const progress = await fetchStepProgress(j.id);
+        const empMatch = roster.find((e) => e.id === j.employeeId);
+        results.push({
+          employee_id: j.employeeId,
+          employee_name: empMatch?.name ?? j.employeeId,
+          workflow: label,
+          job_id: j.id,
+          total_tasks: progress?.total ?? null,
+          done_tasks: progress?.done ?? null,
+        });
+      }
     }
+    workflows = results;
     workflowsLoading = false;
   }
 
@@ -248,32 +285,31 @@
     }
   });
 
-  async function loadTasks(empId: string): Promise<void> {
-    // #101 — Tasks = Steps of the employee's open HR Job. Pick
-    // the most recent matching Job and fetch its Steps. Lower
-    // resolution than the prior /api/people/{id}/tasks endpoint
-    // (which surfaced the per-employee task aggregation across
-    // all workflows) but accurate against the Job model. A
-    // future enhancement could merge multiple Jobs' steps.
+  async function loadTasks(jobId: string): Promise<void> {
+    // #101 — Tasks = Steps of the row's HR Job. Keyed by the Job, not
+    // the employee (backlog 5b27ed56): the employee-keyed read took the
+    // first open HR Job it found, so a second Job for the same person
+    // could not be opened at all.
     //
     // The read itself lives in ./hr-tasks — one `TasksRead`, three
     // outcomes kept apart. See that module for why.
-    selectedEmp = empId;
+    selectedJob = jobId;
     tasksLoading = true;
-    tasks = await fetchEmployeeTasks(empId, workflows);
+    tasks = await fetchJobTasks(jobId, workflows);
     tasksLoading = false;
   }
 
   async function updateTask(taskId: string, status: string): Promise<void> {
-    // #101 — Step transitions go through PUT /api/jobs/{job}/steps/{step}.
-    const w = workflows.find((x) => x.employee_id === selectedEmp);
-    if (!w) return;
-    await fetch(`/api/jobs/${w.job_id}/steps/${taskId}`, {
+    // #101 — Step transitions go through PUT /api/jobs/{job}/steps/{step},
+    // on the Job whose tasks are open (backlog 5b27ed56).
+    if (!selectedJob) return;
+    const jobId = selectedJob;
+    await fetch(`/api/jobs/${encodeURIComponent(jobId)}/steps/${taskId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status }),
     });
-    if (selectedEmp) await loadTasks(selectedEmp);
+    await loadTasks(jobId);
     await fetchWorkflows();
   }
 
@@ -284,8 +320,12 @@
     // confirms / overrides before the Job opens. Same path
     // operators use for every other workflow in BOSS. `kind` is a
     // discovered HR Workflow (surfaces ⊇ ['hr']).
+    //
+    // Through the router, like every other in-app link (backlog
+    // 603a4185): it set window.location.href, a full reload of the
+    // shell that ignored the /dashboard mount href() honours.
     const url = `/jobs?new=1&kind=${encodeURIComponent(kind)}&subject_kind=employee&subject_id=${encodeURIComponent(startTarget)}`;
-    window.location.href = url;
+    navigate(href(url));
   }
 
   let activeRoster = $derived(
@@ -294,11 +334,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <PageHeader
-    eyebrow="HR admin"
-    title={`${active.length} active employees`}
-    subtitle={`${onLeave.length} on leave · 0 open reqs (0 headcount) · ${expiring90.length} certs expiring in 90d`}
-  />
+  <PageHeader eyebrow="HR admin" title={header.title} subtitle={header.subtitle} />
 
   <nav class="tabs" role="tablist">
     {#each TABS as t (t.id)}
@@ -317,9 +353,10 @@
   <div class="tab-panel" style="padding:0 32px 32px">
     {#if loading}
       <p class="empty">Loading…</p>
-    {:else if rosterFailed && tab !== 'workflows' && tab !== 'requisitions'}
+    {:else if rosterFailed && tab !== 'workflows'}
       <!-- Overview, certs and headcount all derive from the roster —
-           with the roster fetch failed their zeros would be fiction. -->
+           with the roster fetch failed their zeros would be fiction.
+           The Workflows tab says it above its picker instead. -->
       <p class="empty load-failed" role="alert">
         Couldn't load the roster — {rosterFailed}
       </p>
@@ -327,12 +364,11 @@
       <div class="tab-grid">
         <Section title="At a glance">
             <dl class="kv">
-              <dt>Total headcount</dt><dd class="num">{roster.length}</dd>
+              <dt>Total headcount</dt><dd class="num">{counted.length}</dd>
               <dt>Active</dt><dd class="num">{active.length}</dd>
               <dt>On leave</dt><dd class="num">{onLeave.length}</dd>
-              <dt>Contractors</dt><dd class="num">{roster.filter((e) => e.employment_type === 'contractor').length}</dd>
+              <dt>Contractors</dt><dd class="num">{counted.filter((e) => e.employment_type === 'contractor').length}</dd>
               <dt>Avg tenure</dt><dd>{avgTenure} years</dd>
-              <dt>Open requisitions</dt><dd class="num">0</dd>
             </dl>
         </Section>
 
@@ -341,7 +377,7 @@
               <p class="empty">Nothing urgent today.</p>
             {:else}
               <div style="margin-bottom:12px">
-                <h4 style="font-size:13px; font-weight:600; color:#dc2626; margin:0 0 4px">
+                <h4 style="font-size:13px; font-weight:600; color:var(--err); margin:0 0 4px">
                   {expiring30.length} cert{expiring30.length > 1 ? 's' : ''} expiring in 30 days
                 </h4>
                 {#each expiring30.slice(0, 5) as { employee, cert } (`${employee.id}-${cert.name}`)}
@@ -358,12 +394,21 @@
     {:else if tab === 'workflows'}
       <div>
         <Section title="Start Workflow">
+            {#if rosterFailed}
+              <!-- Backlog e2f7cbb8: with the roster read failed, the
+                   picker below has no one in it and the rows print raw
+                   ids — an emptiness that is unknown, not real. -->
+              <p class="load-failed" role="alert" style="font-size:13px">
+                Couldn't load the roster — {rosterFailed}. The employee list
+                below is unknown, not empty.
+              </p>
+            {/if}
             {#if workflowsFailed && hrKinds.length === 0}
               <p class="load-failed" role="alert" style="font-size:13px">
                 Couldn't load HR workflows — {workflowsFailed}
               </p>
             {:else if hrKinds.length === 0}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 No HR workflows are published in this deployment.
                 Workflows appear here once they declare
                 <code>metadata.surfaces ⊇ ["hr"]</code>.
@@ -378,7 +423,7 @@
                 </select>
                 {#each hrKinds as k (k.kind)}
                   <button
-                    class="hr-action-btn"
+                    class="btn btn-sm"
                     onclick={() => startWorkflow(k.kind)}
                     disabled={!startTarget}
                   >
@@ -391,21 +436,13 @@
 
         <Section title="Active Workflows">
             {#if workflowsLoading}
-              <p style="color:#78716c; font-size:13px">Loading...</p>
+              <p style="color:var(--static); font-size:13px">Loading...</p>
             {:else if workflowsFailed}
               <p class="load-failed" role="alert" style="font-size:13px">
                 Couldn't load active workflows — {workflowsFailed}
               </p>
-            {:else if workflowsApiAvailable === false}
-              <p style="color:#78716c; font-size:13px">
-                Active-workflows list is not yet wired in this deployment.
-                The per-employee <code>onboard</code> / <code>offboard</code>
-                writes above work, but the cross-employee aggregation endpoint
-                (<code>GET /api/people/workflows</code>) hasn't been
-                implemented yet.
-              </p>
             {:else if workflows.length === 0}
-              <p style="color:#78716c; font-size:13px">No active workflows.</p>
+              <p style="color:var(--static); font-size:13px">No active workflows.</p>
             {:else}
               <table class="data-table">
                 <thead>
@@ -417,7 +454,9 @@
                   </tr>
                 </thead>
                 <tbody>
-                  {#each workflows as w (`${w.employee_id}-${w.workflow}`)}
+                  <!-- Keyed by the Job (backlog 5b27ed56): one person
+                       with two open Jobs of a kind was a duplicate key. -->
+                  {#each workflows as w (w.job_id)}
                     {@const counted = w.total_tasks !== null && w.done_tasks !== null}
                     {@const pct =
                       w.total_tasks !== null && w.done_tasks !== null && w.total_tasks > 0
@@ -439,7 +478,7 @@
                           <div class="hr-progress">
                             <div class="hr-progress-bar" style={`width:${pct}%`}></div>
                           </div>
-                          <span style="font-size:11px; color:#78716c">
+                          <span style="font-size:11px; color:var(--static)">
                             {w.done_tasks}/{w.total_tasks} tasks ({pct}%)
                           </span>
                         {:else}
@@ -449,7 +488,7 @@
                         {/if}
                       </td>
                       <td>
-                        <button class="hr-detail-btn" onclick={() => loadTasks(w.employee_id)}>
+                        <button class="hr-detail-btn" onclick={() => loadTasks(w.job_id)}>
                           View tasks
                         </button>
                       </td>
@@ -465,11 +504,12 @@
              section for a failed read exactly as it hid it for an
              employee with no tasks — so an outage read as a finished
              onboarding. -->
-        {#if selectedEmp && tasks !== null}
-          {@const empName = roster.find((e) => e.id === selectedEmp)?.name ?? selectedEmp}
-          <Section title={`Tasks — ${empName}`}>
+        {#if selectedJob && tasks !== null}
+          {@const row = workflows.find((w) => w.job_id === selectedJob)}
+          {@const empName = row?.employee_name ?? selectedJob}
+          <Section title={row ? `Tasks — ${empName}, ${row.workflow}` : `Tasks — ${selectedJob}`}>
             {#if tasksLoading}
-              <p style="color:#78716c; font-size:13px">Loading…</p>
+              <p style="color:var(--static); font-size:13px">Loading…</p>
             {:else if tasks.kind === 'failed'}
               <p class="load-failed" role="alert" style="font-size:13px">
                 Couldn't read {empName}'s onboarding steps — {tasks.error}.
@@ -477,13 +517,12 @@
                 below this line are unknown, not absent.
               </p>
             {:else if tasks.kind === 'no-job'}
-              <p style="color:#78716c; font-size:13px">
-                {empName} has no open HR workflow in the list above, so
-                there are no steps to show. Start one from
-                <strong>Start Workflow</strong> above.
+              <p style="color:var(--static); font-size:13px">
+                This Job is no longer among the open HR workflows above,
+                so there are no steps to show.
               </p>
             {:else if tasks.data.length === 0}
-              <p style="color:#78716c; font-size:13px">
+              <p style="color:var(--static); font-size:13px">
                 This workflow has no steps — the Job was read and it is
                 genuinely empty.
               </p>
@@ -517,14 +556,6 @@
             {/if}
           </Section>
         {/if}
-      </div>
-    {:else if tab === 'requisitions'}
-      <div class="tab-grid">
-        <Section title="Requisitions" wide>
-            <p class="empty">
-              Requisition data will be available once the requisitions API is implemented.
-            </p>
-        </Section>
       </div>
     {:else if tab === 'certs'}
       <div class="tab-grid">
@@ -561,7 +592,7 @@
                       <td>{cert.expires_on ?? '—'}</td>
                       <td class="num">
                         {#if daysLeft !== null && daysLeft <= 30}
-                          <span style="color:#dc2626; font-weight:600">{daysLeft}d</span>
+                          <span style="color:var(--err); font-weight:600">{daysLeft}d</span>
                         {:else}
                           <span>{daysLeft}d</span>
                         {/if}
@@ -582,26 +613,20 @@
                   <th>Department</th>
                   <th class="num">Active</th>
                   <th class="num">On leave</th>
-                  <th class="num">Open reqs</th>
-                  <th class="num">Target</th>
                 </tr>
               </thead>
               <tbody>
                 {#each byDept as [dept, counts] (dept)}
                   <tr>
-                    <td>{humanizeClassCode(dept)}</td>
+                    <td>{classLabel(dept, departmentClasses)}</td>
                     <td class="num">{counts.active}</td>
                     <td class="num">{counts.onLeave || '—'}</td>
-                    <td class="num">{counts.openReqs || '—'}</td>
-                    <td class="num">{counts.active + counts.openReqs}</td>
                   </tr>
                 {/each}
                 <tr style="font-weight:600">
                   <td>Total</td>
                   <td class="num">{active.length}</td>
                   <td class="num">{onLeave.length}</td>
-                  <td class="num">0</td>
-                  <td class="num">{active.length}</td>
                 </tr>
               </tbody>
             </table>

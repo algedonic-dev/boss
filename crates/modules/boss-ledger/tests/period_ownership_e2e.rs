@@ -87,6 +87,7 @@ async fn period_of_entry(db: &TestDb, fact_id: Uuid) -> (String, String) {
 #[tokio::test]
 async fn a_year_end_close_is_owned_by_the_year_not_december() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let year_period = Uuid::new_v4();
     let fact = seed_and_post(
         &db,
@@ -110,13 +111,14 @@ async fn a_year_end_close_is_owned_by_the_year_not_december() {
 #[tokio::test]
 async fn an_ordinary_posting_on_dec_31_still_belongs_to_december() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let fact = seed_and_post(
         &db,
         "finance.invoice.issued",
         dec31(2025),
         &json!({
             "invoice_id": "inv-dec-31",
-            "line_items": [{ "category": "contracts", "amount_cents": 50_000 }],
+            "line_items": [{ "category": "distribution", "amount_cents": 50_000 }],
         }),
     )
     .await;
@@ -133,6 +135,7 @@ async fn an_ordinary_posting_on_dec_31_still_belongs_to_december() {
 #[tokio::test]
 async fn a_locked_years_close_does_not_re_project() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let year_period = Uuid::new_v4();
     let fact = seed_and_post(
         &db,
@@ -185,6 +188,7 @@ async fn a_locked_years_close_does_not_re_project() {
 #[tokio::test]
 async fn rust_and_sql_agree() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     for kind in [
         PERIOD_CLOSED_FACT,
         "finance.invoice.issued",

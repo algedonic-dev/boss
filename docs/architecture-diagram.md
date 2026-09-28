@@ -50,8 +50,8 @@ highest level it splits into three things:
 - **Work** — how state changes. Jobs + Steps (coordination), the
   Workflow / StepPlugin / StepType registries (workflows as data),
   automation runners that turn events into work (`boss-dispatcher`
-  step side-effect rules, `boss-cybernetics` agent runtime, tenant
-  tick engines), and policy (row-level authorization as rows, not
+  step side-effect rules, tenant tick engines), agents claiming steps
+  through the same claim door as humans (`boss dispatch`), and policy (row-level authorization as rows, not
   code).
 
 <img src="architecture/00-state-surfaces-work.svg" alt="state surfaces work" width="900">
@@ -59,7 +59,7 @@ highest level it splits into three things:
 This is MVC stretched to company scale, with one important caveat:
 classic MVC's "Controller" is a thin router between Model and View.
 BOSS's Work layer is a **substantive coordination layer** — Jobs
-are stateful, registries are authoring surfaces, cybernetics reacts
+are stateful, registries are authoring surfaces, the dispatcher reacts
 to events with new work. So we use MVC only as a *shape* analogy;
 the company-native vocabulary (State / Surfaces / Work) is clearer.
 
@@ -108,8 +108,13 @@ a single event backbone.
 
 ## 2. Service map
 
-**"Which thing calls which thing."** Groups every shipped service by
-role and shows how cross-service calls are shaped.
+**"Which thing calls which thing."** Draws every service in the port
+registry (`crates/core/boss-ports`), grouped by crate tier, and shows
+how cross-service calls are shaped. Each service node names its
+registry row as `<name> :<port>`, and `boss-ports`'s
+`service_map_agreement` test holds the drawing equal to the registry:
+a row not drawn, or a node with no row, fails by name (backlog
+f1d84e3f).
 
 <img src="architecture/02-service-map.svg" alt="service map" width="1100">
 
@@ -120,40 +125,35 @@ role and shows how cross-service calls are shaped.
   for v0.1 — file-backed email/password credentials), and
   reverse-proxies to every `/api/*` route. The gateway is HTTP-only —
   TLS termination is the reverse proxy's job, not the gateway's.
-- **Primitive services** (yellow) own the four primitives.
-- **Domain services** (blue) own transactional slices — commerce,
-  inventory, shipping, messages, people. Each has its own Postgres
-  schema + event stream; no shared tables across services.
-- **Cross-cutting services** (green) are universal rails — policy,
-  ledger, content, ml, docs, sim. Called from many places but own
-  their own narrow slice of data.
-- **Runtime automation** (purple) subscribes to NATS and reacts to
-  events — `boss-dispatcher` runs the step side-effect rules off
-  `step.done.<kind>`, `boss-cybernetics` is the VSM agent runtime
-  (per-VM inbox + budget caps + agent dispatch), `boss-observability`
-  fans NATS out to browsers as SSE and serves health.
-- **External adapters** (pink) are library crates, not services.
-  They expose a port trait any service can consume. None ship in
-  v1; future candidates: payroll, banks, shipping carriers, CRMs.
+- **Tier 1** (yellow) is the core state-machine OS — jobs, policy,
+  the registries, events, clock, calendar, content, search, views —
+  plus its runtime daemons (purple): `boss-dispatcher` runs the step
+  side-effect rules off `step.done.<kind>`, and `boss-event-relay`
+  moves the event outbox into `audit_log` and NATS.
+- **Tier 2** (blue) is the company-modeling modules — people,
+  accounts, commerce, inventory, shipping, ledger, messages and the
+  rest. Each has its own Postgres schema + event stream; no shared
+  tables across services.
+- **Orchestrators** (pale yellow) fan out across both tiers — the ML
+  API and the `/simulator` UX.
+- **Tier 3** (pink) is the one example tenant, Algedonic Ales: the
+  brewery sim daemon, which drives the public API.
 - **Cross-service client crates** are the narrow HTTP contract. If
   `boss-assets-api` needs to ask `boss-people-api` "does this employee
   exist," it calls `PeopleClient::employee_exists()` — a trait method
   on a tiny crate, backed by reqwest in prod and a fake in tests. No
   service ever talks to another service's database directly.
 
-**Audit-tier overlay.**
-The colour groups above are operational ("which subsystem") but
-the audit-bar split is orthogonal. Four tiers in the workspace
-today:
+**The tiers, crate by crate.** Four tiers in the workspace today:
 
-- **Tier 1 — core state-machine OS** (`crates/core/`, 28 crates).
+- **Tier 1 — core state-machine OS** (`crates/core/`, 25 crates).
   `boss-gateway`, `boss-jobs-api`, `boss-dispatcher`, `boss-policy-api`,
   `boss-classes-api`, `boss-locations-api`,
   `boss-subject-kinds-api`, `boss-calendar-api`,
-  `boss-content-api`, `boss-cybernetics`, plus the libraries
+  `boss-content-api`, plus the libraries
   (`boss-core`, `boss-events`, `boss-ml`,
-  `boss-testing`, `boss-ports`, `boss-nats`,
-  `boss-observability`) and matching `*-client` crates. Yellow +
+  `boss-testing`, `boss-ports`, `boss-nats`) and matching
+  `*-client` crates. Yellow +
   most of the rails. **Tightest review bar; correctness protocol
   non-negotiable.**
 - **Tier 2 — company-modeling layer** (`crates/modules/`,
@@ -169,9 +169,8 @@ today:
   `boss-cli`, `boss-sim`,
   `boss-ml-api` (wires the Tier-1 ML framework + Tier-2 plugins),
   `boss-simulator` (the standalone `/simulator` UX service).
-- **Tenants** (`crates/tenants/`, 2 crates).
-  `boss-brewery-engine` (Algedonic Ales) and
-  `boss-used-device-shop-engine`. Outside the tier system;
+- **Tenants** (`crates/tenants/`, 1 crate).
+  `boss-brewery-engine` (Algedonic Ales). Outside the tier system;
   tenant-shaped.
 
 A Tier-1 LIBRARY crate must NOT depend on a Tier-2 crate
@@ -183,23 +182,29 @@ which runs cleanly today (0 violations across 27 core crates).
 
 ## 3. Deployment topology
 
-**Where the bits run.** One primary VM, a designed-but-unbuilt
-secondary, scratch + prod stacks isolated by port offset + database.
+**Where the bits run** — for a deployer of the open-source release:
+the quickstart, `infra/oss-quickstart/` (backlog 34717528, decided
+2026-09-25).
 
 <img src="architecture/03-deployment.svg" alt="deployment" width="900">
 
 **Key facts:**
 
-- Everything runs on one VM today — the gateway, prod + scratch
-  services, daemons, Postgres, and NATS, in a single region.
-- **Scratch stack** is a full parallel universe on ports `+1000` with
-  its own `boss_scratch` database. Driven by the simulator; safe to
-  drop and recreate without touching production data.
-- **External integrations** — GitHub (source repo; hosts the `boss`
-  CLI releases for `boss upgrade`), banks/payroll (designed
-  under `external-financial-actors.md`, not deployed). File
-  attachments use local-disk storage (`LocalDiskStorage`), not a
-  cloud object store.
+- Docker compose runs Postgres, NATS and one `boss-services`
+  container. Its launcher (`services-launcher.sh`) starts every
+  service in the port registry that the tenant manifest's `[modules]`
+  asks for, platform services always, and the gateway last.
+- A one-shot `boss-init` runs on every start: it converges the
+  schema and seeds the platform Workflow bundle, and on first start
+  provisions the bootstrap-admin credential and primes the sim clock.
+- The gateway listens on host port 4443 over plain HTTP. TLS belongs
+  to a reverse proxy in front of it (`infra/caddy/Caddyfile` is the
+  reference); the compose file does not bundle one.
+- Credentials and attachment bytes live in the `boss-auth` and
+  `boss-files` volumes; back up `boss-files` with `postgres-data`.
+- Where a given instance actually runs — ours is a cluster — is data
+  in its estate registry, rendered live at `/it/estate`. The diagram
+  does not draw it, because a drawing would be a second copy.
 
 ---
 

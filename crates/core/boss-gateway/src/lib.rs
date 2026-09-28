@@ -9,7 +9,11 @@
 pub mod audit;
 pub mod break_glass;
 pub mod local_auth;
+#[cfg(test)]
+pub(crate) mod login_doubles;
 pub mod mail;
 pub mod oidc;
 pub mod passkey;
+pub mod perf;
 pub mod session;
+pub mod timing;

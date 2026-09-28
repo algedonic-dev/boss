@@ -50,7 +50,6 @@ hex = "0.4"
 boss-core = { path = "../../core/boss-core" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }
-boss-classes-client = { path = "../../core/boss-classes-client" }
 boss-events = { path = "../../core/boss-events" }
 boss-nats = { path = "../../core/boss-nats" }
 boss-policy = { path = "../../core/boss-policy" }
@@ -151,4 +150,16 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_posting_path_reads_the_tax_kinds_row"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_ledger_read_gate"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_posting_path_reads_the_revenue_category_class"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_ledger_write_and_its_fact_commit_together"
 required-features = ["postgres"]

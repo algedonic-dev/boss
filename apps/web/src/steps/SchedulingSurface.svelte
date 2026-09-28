@@ -9,9 +9,19 @@
   // The full calendar conflict view is overkill for the surface;
   // the Calendar KB page in the sidebar handles that.
 
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { untrack } from 'svelte';
+  import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { releaseStep, saveStep, startStep } from './stepWrite';
+  import {
+    HOLDER_LOCKED_NOTE,
+    askReleaseReason,
+    claimedFor,
+    gestureFields,
+    holderLocked,
+    startable,
+  } from './holder';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   type StepData = {
     id: string;
@@ -52,6 +62,15 @@
     void step.id;
     writeError = null;
   });
+  /// The picker follows the step it shows, and an active step's holder
+  /// is not offered for change — GenericSurface says why (backlogs
+  /// 848477c3, 650ebd0c, 0f42efa0).
+  let holderKey = $derived(`${step.id}\u0000${step.assignee_id ?? ''}`);
+  $effect(() => {
+    void holderKey;
+    assigneeId = untrack(() => step.assignee_id ?? '');
+  });
+  let locked = $derived(holderLocked(step));
   let terminal = $derived(_isTerminal(step.status));
 
   let employees = $state<Employee[]>([]);
@@ -76,26 +95,69 @@
   // trim down for the input + restore on save.
   let scheduledAtForInput = $derived(scheduledAt.slice(0, 16));
 
-  async function persist(status?: string): Promise<void> {
+  // What Schedule still needs (backlog 2f14cdd8, decided 2026-09-24).
+  // The jobs↔calendar hook reserves only when the step goes active
+  // with all three — a when, a positive duration, an assignee — and
+  // answers NoOp otherwise, so a button that enabled on the date alone
+  // made a step active with no reservation and nothing on screen to
+  // say so. The button waits for all three and the line beside it
+  // names what is missing; required-at-done validation is unchanged.
+  let scheduleMissing = $derived(
+    [
+      scheduledAt ? null : 'date/time',
+      typeof durationMinutes === 'number' && durationMinutes > 0 ? null : 'duration',
+      assigneeId ? null : 'assignee',
+    ].filter((m): m is string => m !== null),
+  );
+
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // The keys this surface owns, through the merge door; an emptied
+      // field is sent as null and deleted, where it used to be cleared
+      // by omission from a wholesale PUT (backlog e39a9d2a).
+      // `status` only when the gesture moves the step, and the holder
+      // only when the picker changed it — never the snapshot's own
+      // (backlog 6ef4a36b; GenericSurface says why). Schedule saves the
+      // window and then claims for the picked holder, and the claim door
+      // reserves their time as the step PUT did (design 611fbffd, a+b).
       const body = {
-        ...step,
-        job_id: jobId,
         notes: notes || undefined,
-        status: status ?? step.status,
-        assignee_id: assigneeId || null,
+        ...gestureFields(step, assigneeId, status),
         metadata: {
-          ...step.metadata,
           location: location || undefined,
           scheduled_at: scheduledAt || undefined,
           duration_minutes:
             typeof durationMinutes === 'number' ? durationMinutes : undefined,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(assigneeId));
+      }
       if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
+      onUpdate();
+    } finally {
+      saving = false;
+    }
+  }
+
+  /// The release the note beside the picker names (backlog 6ef4a36b),
+  /// with its reason asked first and a partial release left on screen
+  /// (the review of car 675f1858, #2).
+  async function release(): Promise<void> {
+    const why = askReleaseReason();
+    if (why === null) return;
+    saving = true;
+    writeError = null;
+    try {
+      const by = session.value.kind === 'ready' ? session.value.user.id : null;
+      const res = await releaseStep(jobId, step, why, by);
+      if (res.kind !== 'ok') {
         writeError = res.error;
         return;
       }
@@ -157,13 +219,16 @@
     <select
       id={`assignee-${step.id}`}
       bind:value={assigneeId}
-      disabled={terminal || saving}
+      disabled={terminal || saving || locked}
     >
       <option value="">— unassigned —</option>
       {#each employees as e (e.id)}
         <option value={e.id}>{e.name} · {e.role}</option>
       {/each}
     </select>
+    {#if locked}
+      <span class="step-meta-row small step-holder-locked">{HOLDER_LOCKED_NOTE}</span>
+    {/if}
   </div>
 
   <div class="step-field">
@@ -182,19 +247,31 @@
   {/if}
 
   <div class="step-actions">
-    {#if !terminal && isPending(step.status)}
+    {#if startable(step)}
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist('active')}
-        disabled={saving || !scheduledAt}
-        title={!scheduledAt ? 'Pick a date/time first' : ''}
+        class="btn btn-primary"
+        onclick={() => persist(undefined, true)}
+        disabled={saving || scheduleMissing.length > 0}
       >
         Schedule
+      </button>
+      {#if scheduleMissing.length > 0}
+        <span class="step-schedule-missing">Missing: {scheduleMissing.join(', ')}</span>
+      {/if}
+    {/if}
+    {#if locked}
+      <button
+        class="btn"
+        onclick={release}
+        disabled={saving}
+        title="Hand this step back — it returns to ready, and the next holder claims it"
+      >
+        Release
       </button>
     {/if}
     {#if !terminal && step.status === 'active'}
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || !scheduledAt}
       >
@@ -216,5 +293,10 @@
   }
   .step-duration {
     flex: 0 0 140px;
+  }
+  .step-schedule-missing {
+    align-self: center;
+    font-size: 0.85em;
+    color: var(--static);
   }
 </style>

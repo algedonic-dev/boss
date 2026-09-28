@@ -58,6 +58,11 @@
 //! 1 in 3000 with the pipeline pinned to one contended cpu. The roster
 //! test refuses that shape; the lints use here-strings, which are written
 //! whole before grep starts and are not pipelines.
+//!
+//! tree-wide pin — two of its tests walk every shell under infra/, which
+//! no changed-file map attributes to this crate, so every scoped gate
+//! runs it whatever its scope (`tree_wide_pins` in infra/gate.sh; found
+//! unmarked by backlog bc978312, ~4 s).
 
 use boss_testing::repo_root;
 use std::path::{Path, PathBuf};
@@ -80,6 +85,23 @@ fn real_git() -> PathBuf {
         }
     }
     panic!("no git on PATH — these tests drive real git");
+}
+
+/// Git in this file reads the FIXTURE's config and nothing the host brings.
+///
+/// `safe.directory` is honoured only from the system file, the global file
+/// and the command-line channel (`GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS`),
+/// and a GitHub runner's /etc/gitconfig sets it to `*` — which switched off
+/// every ownership sub-case below on the public mirror (backlog a8d8c956;
+/// `a_host_that_trusts_every_directory_does_not_reach_the_fixture`). All four
+/// channels are closed, the shape `the_gate_reads_a_foreign_owned_checkout.rs`
+/// already uses. Silencing the gate's own scoped `safe.directory` slot costs
+/// nothing here: it names the real checkout, never a fixture.
+fn isolated(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env_remove("GIT_CONFIG_PARAMETERS")
 }
 
 struct Fixture {
@@ -189,7 +211,7 @@ exec {} "$@"
     }
 
     fn git(&self, args: &[&str]) {
-        let out = Command::new(real_git())
+        let out = isolated(&mut Command::new(real_git()))
             .args(args)
             .current_dir(&self.dir)
             .output()
@@ -216,8 +238,26 @@ exec {} "$@"
     /// a shimmed git must refuse (empty = the real git); `foreign_owner`
     /// sets the ownership refusal instead.
     fn run(&self, lint: &str, break_git: &str, foreign_owner: bool) -> (i32, String) {
+        self.run_on_host(&[], lint, break_git, foreign_owner)
+    }
+
+    /// `run`, on a host whose environment carries `host` — the variables a
+    /// machine hands every process it starts, set BEFORE anything this
+    /// harness decides, the order a real host's arrive in. `isolated` then
+    /// closes git's config channels over them.
+    fn run_on_host(
+        &self,
+        host: &[(&str, &Path)],
+        lint: &str,
+        break_git: &str,
+        foreign_owner: bool,
+    ) -> (i32, String) {
         let mut cmd = Command::new("bash");
-        cmd.arg(format!("infra/lint/{lint}.sh"))
+        for (key, value) in host {
+            cmd.env(key, value);
+        }
+        isolated(&mut cmd)
+            .arg(format!("infra/lint/{lint}.sh"))
             .current_dir(&self.dir)
             // The lints resolve `forge/main`, `origin/main`, then `main`.
             // The fixture has only `main`, and naming it explicitly keeps
@@ -329,7 +369,7 @@ const OWNER_SAID: &str = "dubious ownership";
 #[test]
 fn the_foreign_owner_refusal_is_available_on_this_git() {
     let fx = Fixture::new("owner-probe");
-    let out = Command::new(real_git())
+    let out = isolated(&mut Command::new(real_git()))
         .args(["status", "--short"])
         .current_dir(&fx.dir)
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
@@ -351,6 +391,74 @@ fn the_foreign_owner_refusal_is_available_on_this_git() {
          delete the ownership sub-cases rather than leaving them \
          decorative. git said: {text:?}"
     );
+}
+
+/// A host that trusts every directory must not reach the fixture.
+///
+/// MEASURED 2026-09-27 (backlog a8d8c956). The public mirror's Gate on
+/// publish PR #246 went red on `a_new_style_has_a_caller_reads_the_tree_or_
+/// says_it_could_not` while the same tree was green on the cluster gate.
+/// Nothing about the lint differed: GitHub's ubuntu runner image appends
+/// `[safe] directory = *` to /etc/gitconfig (actions/runner-images,
+/// images/ubuntu/scripts/build/install-git.sh, for actions/checkout#760),
+/// so on that host `GIT_TEST_ASSUME_DIFFERENT_OWNER` produces no refusal
+/// at all. Every ownership sub-case in this file then ran a HEALTHY git,
+/// the lint read the fixture and answered it — exit 1 naming `.orphan`,
+/// correctly — and the assertion that it must refuse failed. Reproduced
+/// on the dev pod with the runner's stanza in a file named by
+/// `GIT_CONFIG_SYSTEM`: the same seven tests red (the probe above and six
+/// lints); the annotation named only the first, because the gate
+/// annotates a check's first failing line.
+///
+/// So the host's config is planted here the way the runner delivers it,
+/// through the system file and through the global one, and every lint's
+/// ownership case must still refuse. The first leg proves the plant is
+/// the runner's condition — a raw git under it DOES read a repository it
+/// is told another user owns — so the second cannot pass vacuously.
+#[test]
+fn a_host_that_trusts_every_directory_does_not_reach_the_fixture() {
+    let fx = Fixture::new("trusting-host");
+    let host_dir = boss_testing::scratch_dir("lint-cannot-read-trusting-host");
+    let trusting = host_dir.join("gitconfig");
+    boss_testing::write_file(&trusting, "[safe]\n\tdirectory = *\n");
+
+    for channel in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
+        let host: &[(&str, &Path)] = &[(channel, trusting.as_path())];
+
+        let raw = Command::new(real_git())
+            .args(["ls-files"])
+            .current_dir(&fx.dir)
+            .env(channel, &trusting)
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .output()
+            .expect("spawn git ls-files");
+        assert!(
+            raw.status.success(),
+            "the plant is not the runner's condition: with `safe.directory = *` \
+             named by {channel}, git still refused a repository it was told \
+             another user owns, so the lint cases below would prove nothing. \
+             git said: {}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
+
+        for lint in LINTS {
+            let (code, out) = fx.run_on_host(host, lint, "", true);
+            assert_eq!(
+                code, CANNOT_ANSWER,
+                "{lint} did not refuse a fixture git was told another user owns, \
+                 on a host whose {channel} trusts every directory (a GitHub \
+                 runner's /etc/gitconfig). The harness let the host's config \
+                 reach the fixture, so the ownership sub-case ran a healthy git. \
+                 Output:\n{out}"
+            );
+            assert!(
+                out.contains(OWNER_SAID),
+                "{lint} refused, but not with git's ownership words, under a \
+                 trusting {channel}:\n{out}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&host_dir);
 }
 
 // ---------------------------------------------------------------------
@@ -653,6 +761,180 @@ fn steptype_bundle_ratchet_allows_a_widened_enum_and_still_refuses_a_shrunk_one(
         out.contains("field_type"),
         "the failure must say what it refused:\n{out}"
     );
+}
+
+/// Every `[[step_type]]` block of a bundle as `(text, declares a
+/// required field)`, a block running to the next header or the end of
+/// the file — read out of the real bundle so the cases below cannot
+/// drift from its idiom.
+fn kind_blocks(bundle: &str) -> Vec<(String, bool)> {
+    let mut blocks: Vec<String> = Vec::new();
+    for line in bundle.split_inclusive('\n') {
+        if line.starts_with("[[step_type]]") {
+            blocks.push(String::new());
+        }
+        if let Some(b) = blocks.last_mut() {
+            b.push_str(line);
+        }
+    }
+    blocks
+        .into_iter()
+        .map(|b| {
+            let required = b.lines().any(|l| l.trim() == "required = true");
+            (b, required)
+        })
+        .collect()
+}
+
+/// The `kind = "…"` a `[[step_type]]` block declares.
+fn kind_name(block: &str) -> String {
+    block
+        .lines()
+        .find_map(|l| l.strip_prefix("kind = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a step_type block declares its kind")
+        .to_string()
+}
+
+/// The retired-kinds record the ratchet reads, relative to the repo root.
+const RETIRED_KINDS: &str = "infra/lint/steptype-retired-kinds.txt";
+
+/// Remove the first all-optional kind from a fixture's bundle, commit it,
+/// and hand back the kind's name — the shape of every retirement case.
+fn retire_an_all_optional_kind(fx: &Fixture, retired_rows: Option<&str>) -> String {
+    let path = fx.dir.join("crates/core/boss-jobs/seeds/step_types.toml");
+    let bundle = std::fs::read_to_string(&path).expect("readable");
+    let (optional, _) = kind_blocks(&bundle)
+        .into_iter()
+        .find(|(b, required)| !required && b.contains("[[step_type.fields]]"))
+        .expect("the bundle declares a kind whose every field is optional");
+    let kind = kind_name(&optional);
+    boss_testing::write_file(&path, &bundle.replacen(&optional, "", 1));
+    if let Some(rows) = retired_rows {
+        fx.write(RETIRED_KINDS, &rows.replace("{kind}", &kind));
+    }
+    fx.commit("retire an all-optional kind");
+    kind
+}
+
+/// A KIND LEAVES THE BUNDLE ONLY AS A RECORDED ACT (backlog adaecf05).
+///
+/// Car 5 of a8991c86 (design 2ea444f5, the `marketing-launch` retirement)
+/// let any kind that declared no required field leave on the reasoning
+/// that an unknown kind validates permissively. True of validation, and
+/// beside the point: 17 kinds on the 2026-09-26 bundle require nothing —
+/// `task`, `outcome`, `trigger` and `sign-off` among them, with 1670
+/// `outcome`, 1246 `task` and 37 `sign-off` steps in flight that day —
+/// and the dispatcher reads an unknown kind as decision-shaped, so every
+/// one of those steps would have been routed to a person by a one-line
+/// deletion the lint waved through. The header even said whether anything
+/// was in flight was "the car's measurement, not this lint's", and no car
+/// was asked to record one.
+///
+/// So a kind may leave only with a row in the retired-kinds record naming
+/// it, the car that retires it, and an in-flight count measured at 0.
+/// Pinned four ways: without a row the removal is refused and the
+/// refusal names the kind and the record; with a row it passes; a row
+/// whose measured count is not 0 is refused; and a kind that declared a
+/// required field is still refused even with a row — it loosens first,
+/// which is legal on its own, and leaves in a later car.
+#[test]
+fn steptype_bundle_ratchet_lets_a_kind_leave_only_with_a_retired_row() {
+    let lint = "steptype-bundle-ratchet";
+
+    let fx = Fixture::new("steptype-retire-unrecorded");
+    let kind = retire_an_all_optional_kind(&fx, None);
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a kind removed with no retired-kinds row must be refused, required field or not — \
+         an in-flight step of an unknown kind is routed to a person:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("`{kind}`")) && out.contains(RETIRED_KINDS),
+        "the refusal must name the kind and the record that would admit it:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-recorded");
+    retire_an_all_optional_kind(
+        &fx,
+        Some(
+            "# kind car in_flight measured_at\n{kind} ship-a-change:0000abcd 0 2026-09-26T19:56Z\n",
+        ),
+    );
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 0,
+        "a kind retired with a row carrying its car and a measured in-flight count of 0 \
+         strands nothing, so the ratchet must let it through:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-in-flight");
+    let kind = retire_an_all_optional_kind(
+        &fx,
+        Some("{kind} ship-a-change:0000abcd 37 2026-09-26T19:56Z\n"),
+    );
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a row that measured steps still in flight admits nothing:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("`{kind}`")) && out.contains("in flight"),
+        "the refusal must name the kind and the count it refused:\n{out}"
+    );
+
+    let fx = Fixture::new("steptype-retire-required");
+    let path = fx.dir.join("crates/core/boss-jobs/seeds/step_types.toml");
+    let bundle = std::fs::read_to_string(&path).expect("readable");
+    let (required, _) = kind_blocks(&bundle)
+        .into_iter()
+        .find(|(_, required)| *required)
+        .expect("the bundle declares a kind with a required field");
+    let kind = kind_name(&required);
+    boss_testing::write_file(&path, &bundle.replacen(&required, "", 1));
+    fx.write(
+        RETIRED_KINDS,
+        &format!("{kind} ship-a-change:0000abcd 0 2026-09-26T19:56Z\n"),
+    );
+    fx.commit("remove a kind with a required field");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "a kind that required a field promised it to every reader of its done metadata; \
+         removing the kind withdraws that promise with no version to pin against:\n{out}"
+    );
+    assert!(
+        out.contains("is removed here"),
+        "the failure must say what it refused:\n{out}"
+    );
+}
+
+/// The live record's first row is the retirement that opened this door:
+/// `marketing-launch`, measured at 0 in flight. And every row it carries
+/// is one the ratchet would admit — four columns, a count of exactly 0 —
+/// so a malformed row is found here rather than on the day its kind leaves.
+#[test]
+fn the_retired_kinds_record_admits_only_what_it_says() {
+    let body = std::fs::read_to_string(repo_root().join(RETIRED_KINDS))
+        .unwrap_or_else(|e| panic!("{RETIRED_KINDS} is readable: {e}"));
+    let rows: Vec<Vec<&str>> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows.first().map(|r| r[0]),
+        Some("marketing-launch"),
+        "the record's first row is the marketing-launch retirement:\n{body}"
+    );
+    for row in &rows {
+        assert!(
+            row.len() == 4 && row[2] == "0",
+            "a retired-kinds row is `kind car in_flight measured_at` with in_flight 0: {row:?}"
+        );
+    }
 }
 
 #[test]

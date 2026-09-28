@@ -225,7 +225,10 @@ impl Recorder {
         }
     }
 
-    /// Views dropped since the count was last taken.
+    /// Views dropped since the count was last taken. Only tests read it
+    /// here; the drain task holds its own handle on the count (backlog
+    /// 6764c8b3).
+    #[cfg(test)]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

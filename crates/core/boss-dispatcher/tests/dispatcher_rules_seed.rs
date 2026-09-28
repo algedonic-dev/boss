@@ -628,16 +628,23 @@ async fn a_name_the_seed_retired_is_free_for_a_tenant_to_take_over() {
         version: product_version as u32,
         why: Some("a cross-protocol reactor".into()),
     };
-    let draft = create_draft(&db.pool, &file, Some("tenant:brewery"))
-        .await
-        .expect("a name whose only rows are retired is free for a tenant");
+    let draft = create_draft(
+        &db.pool,
+        &file,
+        Some("tenant:brewery"),
+        "automation:tenant-seed",
+    )
+    .await
+    .expect("a name whose only rows are retired is free for a tenant");
     assert_eq!(draft.source.as_deref(), Some("tenant:brewery"));
     assert_eq!(
         draft.version,
         product_version + 1,
         "the takeover lands above the retired history, never on a version it reuses"
     );
-    let live = publish(&db.pool, name).await.expect("publish the takeover");
+    let live = publish(&db.pool, name, "automation:tenant-seed")
+        .await
+        .expect("publish the takeover");
     assert_eq!(
         (live.version, live.status.as_str()),
         (draft.version, "active")

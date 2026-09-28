@@ -18,7 +18,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
-  fetchEmployeeTasks,
+  fetchJobTasks,
   hrJobRows,
   stepProgress,
   taskRows,
@@ -52,7 +52,7 @@ const STEP = {
 describe('the three outcomes of an onboarding-task read are distinct', () => {
   test('a non-ok steps read is failed — NOT an employee with no tasks', async () => {
     stubFetch(async () => new Response('steps down', { status: 503 }));
-    const res = await fetchEmployeeTasks('emp-001', [JOB]);
+    const res = await fetchJobTasks('job-abc', [JOB]);
     expect(res.kind).toBe('failed');
     if (res.kind === 'failed') expect(res.error).toContain('503');
   });
@@ -61,14 +61,14 @@ describe('the three outcomes of an onboarding-task read are distinct', () => {
     stubFetch(async () => {
       throw new TypeError('Failed to fetch');
     });
-    const res = await fetchEmployeeTasks('emp-001', [JOB]);
+    const res = await fetchJobTasks('job-abc', [JOB]);
     expect(res.kind).toBe('failed');
     if (res.kind === 'failed') expect(res.error).toContain('Failed to fetch');
   });
 
   test('a malformed payload is failed — garbage is not an empty onboarding', async () => {
     stubFetch(async () => new Response('{"steps":"soon"}', { status: 200 }));
-    const res = await fetchEmployeeTasks('emp-001', [JOB]);
+    const res = await fetchJobTasks('job-abc', [JOB]);
     expect(res.kind).toBe('failed');
   });
 
@@ -76,13 +76,13 @@ describe('the three outcomes of an onboarding-task read are distinct', () => {
     stubFetch(async () => {
       throw new Error('must not be called — there is no Job to read');
     });
-    const res = await fetchEmployeeTasks('emp-404', [JOB]);
+    const res = await fetchJobTasks('job-404', [JOB]);
     expect(res.kind).toBe('no-job');
   });
 
   test('a Job with no steps is ready-and-empty — empty still reads as empty', async () => {
     stubFetch(async () => new Response('[]', { status: 200 }));
-    const res = await fetchEmployeeTasks('emp-001', [JOB]);
+    const res = await fetchJobTasks('job-abc', [JOB]);
     expect(res.kind).toBe('ready');
     if (res.kind === 'ready') expect(res.data).toHaveLength(0);
   });
@@ -92,7 +92,7 @@ describe('the three outcomes of an onboarding-task read are distinct', () => {
       expect(url).toContain('/api/jobs/job-abc/steps');
       return new Response(JSON.stringify([STEP]), { status: 200 });
     });
-    const res = await fetchEmployeeTasks('emp-001', [JOB]);
+    const res = await fetchJobTasks('job-abc', [JOB]);
     expect(res.kind).toBe('ready');
     if (res.kind !== 'ready') return;
     expect(res.data[0]).toEqual({
@@ -111,13 +111,39 @@ describe('the three outcomes of an onboarding-task read are distinct', () => {
   });
 });
 
+// Backlog 5b27ed56 (page audit b959394e). The read was keyed by
+// EMPLOYEE and took the first open HR Job it found, so a person with a
+// hire and a terminate open at once had one Job whose tasks could not be
+// opened at all: the second row's "View tasks" showed the first Job's
+// steps. A row is a Job, so the read is keyed by the Job.
+describe('one employee with two open HR Jobs', () => {
+  const HIRE: HrJobRef = { employee_id: 'emp-001', job_id: 'job-hire', workflow: 'Onboarding' };
+  const LEAVE: HrJobRef = { employee_id: 'emp-001', job_id: 'job-leave', workflow: 'Offboarding' };
+
+  test("each row reads its own Job's steps, not the employee's first Job", async () => {
+    const read: string[] = [];
+    stubFetch(async (url) => {
+      read.push(url);
+      return new Response(JSON.stringify([STEP]), { status: 200 });
+    });
+    const res = await fetchJobTasks('job-leave', [HIRE, LEAVE]);
+    expect(read).toEqual(['/api/jobs/job-leave/steps']);
+    expect(res.kind).toBe('ready');
+    if (res.kind === 'ready') {
+      expect(res.data[0]?.job_id).toBe('job-leave');
+      expect(res.data[0]?.workflow).toBe('Offboarding');
+      expect(res.data[0]?.employee_id).toBe('emp-001');
+    }
+  });
+});
+
 describe('taskRows refuses to invent an empty list', () => {
   test('throws on a non-array payload so fetchRemote reports failed', () => {
-    expect(() => taskRows({ oops: true }, JOB, 'emp-001')).toThrow();
+    expect(() => taskRows({ oops: true }, JOB)).toThrow();
   });
 
   test('maps an array of steps', () => {
-    expect(taskRows([STEP], JOB, 'emp-001')).toHaveLength(1);
+    expect(taskRows([STEP], JOB)).toHaveLength(1);
   });
 });
 
@@ -226,5 +252,31 @@ describe('HrPage cannot render a failed task read as an empty one', () => {
 
   test('a failed row count renders as unknown, never as 0 of 0', () => {
     expect(code).toMatch(/total_tasks:\s*number\s*\|\s*null/);
+  });
+});
+
+// Page audit b959394e, the source-level halves of three decisions. The
+// mocked spec hr-page.mocked.spec.ts proves each one renders; these pin
+// the shape a plausible refactor would put back.
+describe('HrPage, page audit b959394e', () => {
+  test('rows are keyed by the Job, never by employee + workflow (5b27ed56)', () => {
+    expect(code).toMatch(/\{#each workflows as w \(w\.job_id\)\}/);
+    expect(code).not.toMatch(/employee_id\}-\$\{w\.workflow/);
+  });
+
+  test('the header is rosterHeader(), shared with /ux/people (d8d48a49)', () => {
+    expect(code).toMatch(/rosterHeader\(/);
+    expect(code).not.toMatch(/active employees`/);
+  });
+
+  test('no dead "not yet wired" branch and no requisition literals (44e13444, 0ab0fbac)', () => {
+    expect(code).not.toMatch(/workflowsApiAvailable/);
+    expect(code).not.toMatch(/requisition/i);
+    expect(code).not.toMatch(/openReqs/);
+  });
+
+  test('Start goes through the router, not a full reload (603a4185)', () => {
+    expect(code).not.toMatch(/window\.location\.href\s*=/);
+    expect(code).toMatch(/navigate\(href\(/);
   });
 });

@@ -536,8 +536,7 @@ mod tests {
     /// carrying the real migration-numbers lint, and whatever the cars
     /// dropped into `infra/postgres/schema/`.
     fn consist_fixture(name: &str, migrations: &[String]) -> (Scratch, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("boss-consist-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = boss_testing::scratch_dir(&format!("boss-consist-{name}"));
         let guard = Scratch(root.clone());
         let lint = root.join("infra/lint");
         let schema = root.join("infra/postgres/schema");
@@ -545,6 +544,7 @@ mod tests {
         std::fs::create_dir_all(&schema).expect("mkdir schema");
         let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../infra/lint/migration-numbers-unique.sh");
+        // mode-bits-ok: the consist runs every lint as bash <path>, read-only
         std::fs::copy(&real, lint.join("migration-numbers-unique.sh"))
             .unwrap_or_else(|e| panic!("copy {}: {e}", real.display()));
         // And what the lint sources: every lint reads infra/lint/lib/
@@ -689,10 +689,8 @@ mod tests {
     /// The tamest failure mode of all: a tree with no lints in it.
     #[test]
     fn a_tree_with_no_lint_directory_proceeds_with_a_warning() {
-        let root = std::env::temp_dir().join(format!("boss-consist-{}-bare", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = boss_testing::scratch_dir("boss-consist-bare");
         let _g = Scratch(root.clone());
-        std::fs::create_dir_all(&root).expect("mkdir");
         let verdict = consist_check(&root, &policy());
         assert!(
             matches!(verdict, ConsistVerdict::Proceed { ran: 0, .. }),
@@ -761,11 +759,8 @@ mod tests {
     /// panic), and it must leave the tree untouched.
     #[test]
     fn a_failed_freshen_does_not_abort_and_changes_nothing() {
-        let root =
-            std::env::temp_dir().join(format!("boss-freshen-{}-noremote", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = boss_testing::scratch_dir("boss-freshen-noremote");
         let _g = Scratch(root.clone());
-        std::fs::create_dir_all(&root).expect("mkdir");
         git_ok(&root, &["init", "-q", "-b", "main"]);
         git_ok(&root, &["config", "user.email", "t@example.com"]);
         git_ok(&root, &["config", "user.name", "t"]);
@@ -840,6 +835,7 @@ mod tests {
     #[test]
     fn a_lint_that_declares_a_consist_skip_is_left_out_on_the_same_boarding() {
         let (_g, tree) = consist_fixture("declared-skip", &twelve_migrations());
+        // mode-bits-ok: a new file, created 0644, run as bash <path>
         std::fs::write(
             tree.join("infra/lint/needs-a-database.sh"),
             "#!/usr/bin/env bash\n\
@@ -874,6 +870,7 @@ mod tests {
     #[test]
     fn a_consist_skip_with_no_reason_warns_by_name_and_the_train_departs() {
         let (_g, tree) = consist_fixture("mute-skip", &twelve_migrations());
+        // mode-bits-ok: a new file, created 0644, run as bash <path>
         std::fs::write(
             tree.join("infra/lint/mute.sh"),
             "#!/usr/bin/env bash\n# consist: skip\nexit 0\n",
@@ -932,6 +929,7 @@ mod tests {
         // The real ran=0 tree — a skip declaration with no reason —
         // reads the same way, naming the lint.
         let (_g, tree) = consist_fixture("mute-skip-unchecked", &twelve_migrations());
+        // mode-bits-ok: a new file, created 0644, run as bash <path>
         std::fs::write(
             tree.join("infra/lint/mute.sh"),
             "#!/usr/bin/env bash\n# consist: skip\nexit 0\n",

@@ -125,7 +125,6 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
         &policy_base,
         &seeds_dir.join("policy_rules.toml"),
         false,
-        "brewery-policy-bootstrap",
         None,
     )?;
 
@@ -177,8 +176,15 @@ fn wait_for_people_projection(people_base: &str) -> Result<()> {
     let url = format!("{}/api/people", people_base.trim_end_matches('/'));
     let (mut prev, mut stable) = (0usize, 0u32);
     for _ in 0..90 {
+        // Signed: the roster answers a caller by grant, and one with no
+        // identity is refused (backlog cda177ef) — which this loop would
+        // read as an empty roster for all 90 seconds.
         let count = client
             .get(&url)
+            .header(
+                "x-boss-user",
+                r#"{"id":"automation:brewery-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#,
+            )
             .send()
             .ok()
             .and_then(|r| r.json::<serde_json::Value>().ok())

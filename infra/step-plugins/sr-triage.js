@@ -28,7 +28,9 @@
     }
     for (const child of children.flat()) {
       if (child == null || child === false) continue;
-      el.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+      // A string child is a Text node by append's definition (backlog
+      // 4a359b51 — the reason is at sign-off.js's h()).
+      el.append(child instanceof Node ? child : String(child));
     }
     return el;
   }
@@ -43,7 +45,7 @@
 
   function mount(container, { step, jobId, onUpdate }) {
     const meta = step.metadata || {};
-    const isDone = step.status === 'done' || step.status === 'waived';
+    const isDone = step.status === 'completed' || step.status === 'skipped';
     let outcome = String(meta.triage_outcome || '');
     let saving = false;
 
@@ -81,8 +83,10 @@
 
     const saveDraftBtn = h('button', { className: 'step-btn' }, 'Save draft');
     const completeBtn = h('button', { className: 'step-btn step-btn-primary' }, 'Complete triage');
-    saveDraftBtn.addEventListener('click', () => save(step.status === 'pending' ? 'active' : step.status));
-    completeBtn.addEventListener('click', () => save('done'));
+    // A draft save leaves a pending step pending: a step becomes Active
+    // only through a claim (design 611fbffd, clause b of backlog 6ef4a36b).
+    saveDraftBtn.addEventListener('click', () => save(null));
+    completeBtn.addEventListener('click', () => save('completed'));
 
     function field(label, input) {
       return h(
@@ -150,7 +154,15 @@
           jira_issue_key: jiraInput.value.trim() || null,
           triage_outcome: outcome || null,
         };
-        const body = { ...step, job_id: jobId, status: status || step.status, metadata: nextMeta };
+        // A draft save sends NO status and NO holder (backlog 6ef4a36b).
+        // It sent the status drawn at page load (`status || step.status`)
+        // beside the drawn holder, so a page read while the step was
+        // Ready, saved after someone claimed it, sent the release body
+        // `{status: ready, assignee_id: null}` and took the step off its
+        // holder. The server keeps both as they stand; only Complete
+        // names a status.
+        const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
+        const body = { ...drawn, job_id: jobId, metadata: nextMeta, ...(status ? { status } : {}) };
         await fetch(
           `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
           {

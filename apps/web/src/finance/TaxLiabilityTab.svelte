@@ -62,7 +62,7 @@
 {#if loading && !data}
   <p class="empty">Loading tax liability…</p>
 {:else if !data}
-  <p class="empty">Tax liability unavailable.</p>
+  <p class="empty load-failed" role="alert">Tax liability unavailable.</p>
 {:else}
   {@const d = data}
   {@const totalLiabilityCents = d.liabilities.reduce((s, r) => s + r.balance_cents, 0)}
@@ -100,7 +100,7 @@
             {#each d.liabilities as r (r.account_code)}
               <tr>
                 <td class="mono">{r.account_code} · {r.account_name}</td>
-                <td style="color:#78716c; font-size:13px">
+                <td style="color:var(--static); font-size:13px">
                   {LIABILITY_DESCRIPTION[r.account_code] ?? ''}
                 </td>
                 <td class="num">{formatUsd(r.balance_cents)}</td>

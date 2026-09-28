@@ -59,6 +59,18 @@ TimeoutStartSec=10min
 # READ a foreign clone and wrong everywhere else (infra/gate.sh says why),
 # and nothing here needs root.
 User=david
+# THE CODE-BRANCH COUNTER, NAMED (backlog c4d60110). Every packet from
+# 2026-09-17 to 2026-09-27 — 11 of 11 — filed code_branches_on_kind
+# null, "No boss-leaked-policy on this machine": nothing had put the
+# counter on this host, and the script's search found none. The
+# converge now takes it out of the cluster image beside the CLI
+# (infra/estate/install-cli-from-image.sh, `cli_leaked_policy` on the
+# converge packet), and this line names where it lands, through
+# `current` so every converge moves it with the checkout. Named and
+# absent is filed as `unrunnable:` naming this path — never a search
+# for some other copy. The path is held equal to the installer's store
+# by codebase_metrics_unit_user.rs.
+Environment=BOSS_LEAKED_POLICY_BIN=/opt/boss-cli/current/boss-leaked-policy
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-codebase-metrics "Codebase metrics"
 ExecStart=/opt/boss/infra/codebase-metrics.sh file --repo /opt/boss --ref main
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-codebase-metrics run

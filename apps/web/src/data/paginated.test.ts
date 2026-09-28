@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from 'bun:test';
-import { fetchPaged, normalise, isCapped } from './paginated';
+import { fetchPaged, normalise, isCapped, fetchEvery, wholeOrThrow } from './paginated';
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -89,5 +89,113 @@ describe('isCapped', () => {
 
   it('returns false for null', () => {
     expect(isCapped(null)).toBe(false);
+  });
+});
+
+// EVERY ROW, OR A STATEMENT THAT IT STOPPED (backlog b68a9dde). Seven
+// pages read `/api/jobs?…&limit=200` once and kept the page; two of
+// them lost rows on 2026-09-27 (ship-a-change had 978 packets, open
+// backlog-items 361). `fetchEvery` pages by offset until the rows it
+// holds reach the `total` the server reports, or answers `truncated`
+// naming how far it got — never a smaller list dressed as the whole.
+type Row = { id: string };
+
+/** A server holding `n` rows, answering `limit`/`offset` like the
+ *  jobs API does, and recording every URL it was asked for. */
+function serverOf(n: number, asked: string[] = []): () => Promise<Response> {
+  const rows: Row[] = Array.from({ length: n }, (_, i) => ({ id: `r${i}` }));
+  return (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    asked.push(url);
+    const q = new URL(url, 'http://x').searchParams;
+    const limit = Number(q.get('limit'));
+    const offset = Number(q.get('offset'));
+    return new Response(
+      JSON.stringify({ data: rows.slice(offset, offset + limit), total: n, limit, offset }),
+      { status: 200 },
+    );
+  }) as unknown as () => Promise<Response>;
+}
+
+describe('fetchEvery', () => {
+  it('reads page after page until the rows held reach the total', async () => {
+    const asked: string[] = [];
+    stubFetch(serverOf(5, asked));
+    const res = await fetchEvery<Row>('/api/jobs?kind=k&status=open', { page: 2 });
+    expect(res.kind).toBe('ready');
+    if (res.kind === 'ready') {
+      expect(res.data.map((r) => r.id)).toEqual(['r0', 'r1', 'r2', 'r3', 'r4']);
+      expect(res.total).toBe(5);
+    }
+    // The caller's filter survives in its own order; the helper owns
+    // limit and offset.
+    expect(asked).toEqual([
+      '/api/jobs?kind=k&status=open&limit=2&offset=0',
+      '/api/jobs?kind=k&status=open&limit=2&offset=2',
+      '/api/jobs?kind=k&status=open&limit=2&offset=4',
+    ]);
+  });
+
+  it('an answer inside one page is one read, at the jobs API page size', async () => {
+    const asked: string[] = [];
+    stubFetch(serverOf(3, asked));
+    const res = await fetchEvery<Row>('/api/jobs?kind=k');
+    expect(res.kind).toBe('ready');
+    expect(asked).toEqual(['/api/jobs?kind=k&limit=1000&offset=0']);
+  });
+
+  it('a failed page fails the read — a part is never answered as the whole', async () => {
+    let n = 0;
+    stubFetch(async () => {
+      n += 1;
+      return n === 1
+        ? new Response(JSON.stringify({ data: [{ id: 'a' }], total: 2 }), { status: 200 })
+        : new Response('down', { status: 503 });
+    });
+    const res = await fetchEvery<Row>('/api/jobs?kind=k', { page: 1 });
+    expect(res.kind).toBe('failed');
+    if (res.kind === 'failed') expect(res.error).toContain('503');
+  });
+
+  it('stops at its ceiling and says so, with how many it holds of how many', async () => {
+    stubFetch(serverOf(10));
+    const res = await fetchEvery<Row>('/api/jobs?kind=k', { page: 2, ceiling: 4 });
+    expect(res.kind).toBe('truncated');
+    if (res.kind === 'truncated') {
+      expect(res.data.length).toBe(4);
+      expect(res.total).toBe(10);
+    }
+    expect(() => wholeOrThrow(res)).toThrow(/4 of 10/);
+  });
+
+  it('a server that ignores offset is truncated, not a loop', async () => {
+    let calls = 0;
+    stubFetch(async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ data: [{ id: 'a' }, { id: 'b' }], total: 9 }), {
+        status: 200,
+      });
+    });
+    const res = await fetchEvery<Row>('/api/jobs?kind=k', { page: 2 });
+    expect(res.kind).toBe('truncated');
+    expect(calls).toBe(2);
+  });
+
+  it('refuses a URL that already names a limit or an offset', async () => {
+    stubFetch(serverOf(1));
+    const res = await fetchEvery<Row>('/api/jobs?kind=k&limit=200');
+    expect(res.kind).toBe('failed');
+  });
+
+  it('an envelope under a wrong key fails rather than reading as empty', async () => {
+    stubFetch(async () => new Response(JSON.stringify({ jobs: [{ id: 'a' }] }), { status: 200 }));
+    const res = await fetchEvery<Row>('/api/jobs?kind=k');
+    expect(res.kind).toBe('failed');
+  });
+
+  it('wholeOrThrow hands back the rows of a whole read', async () => {
+    stubFetch(serverOf(3));
+    const rows = wholeOrThrow(await fetchEvery<Row>('/api/jobs?kind=k'));
+    expect(rows.length).toBe(3);
   });
 });

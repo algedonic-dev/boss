@@ -205,7 +205,9 @@ for row in $rows; do
     on 2026-09-15; the unit pins the system of record inline and the drop-in is dead"
     installed=$((installed + 1))
 done
-[ "$installed" -ge 10 ] \
+# Seven since 2026-09-27: the seven legacy-stack chores left the roster
+# with their roles.toml section (backlog 0f9a7a47).
+[ "$installed" -ge 7 ] \
     || units_fail "only $installed timer pairs landed — the scrape or the mode broke,
     so a green result here would mean nothing"
 [ -f "$tmp/etc/boss-gcp-converge.service" ] && [ -f "$tmp/etc/boss-gcp-converge.timer" ] \
@@ -253,15 +255,16 @@ fi
 grep -q "boss-gcp-converge" <<<"$out" \
     || fail "the refusal of a twice-named stem does not name the stem: $out"
 
-# The installer under roles: legacy-stack only, so the observer and the
-# ML batch (other roles) must be reported, not installed.
+# The installer under roles: ml-batch-host only, so the observer (another
+# role) must be reported, not installed. Until 2026-09-27 this ran under
+# legacy-stack; that section left roles.toml with its Class (backlog
+# 0f9a7a47), and ml-batch-host is the other role with a unit row.
 mkdir -p "$tmp/etc-roles"
 : >"$tmp/systemctl-roles.log"
-# THE FOUR ROLES THE HOST DECLARED ON 2026-09-12 FIRST — including one
-# that maps to NO units (wireguard-bastion: `units = []`). A fixture, not
-# the live set: legacy-stack left boss-gcp's node_roles on 2026-09-14
-# (d5941ef3 car 3) and stays in roles.toml as vocabulary, so this still
-# exercises a role with units beside an empty one. Measured 2026-09-12 18:55Z on
+# THREE ROLES WITH UNITS FIRST — beside one that maps to NO units
+# (wireguard-bastion: `units = []`). A fixture, not the live set (the
+# host also declares cluster-operator and ops-runner, both empty), so
+# this exercises a role with units beside an empty one. Measured 2026-09-12 18:55Z on
 # boss-gcp, three converges in a row: the roles read worked, the
 # installer printed its header and died with exit 1 and not one more
 # line, because `role_units` piped awk into `grep -oE '"[^"]+"'`, an
@@ -271,26 +274,28 @@ mkdir -p "$tmp/etc-roles"
 mkdir -p "$tmp/etc-all"
 : >"$tmp/systemctl-all.log"
 sum_all="$tmp/summary-all-roles.json"
-BOSS_NODE_ROLES=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion UNITS_SUMMARY="$sum_all" \
+BOSS_NODE_ROLES=ml-batch-host,off-cluster-observer,wireguard-bastion UNITS_SUMMARY="$sum_all" \
     units_run "$tmp/systemctl-all.log" "$tmp/etc-all" "$tmp/unitlib" "$tmp/units-all.out" \
-    || { cat "$tmp/units-all.out" >&2; fail "units mode with the host's four roles (one with units = []) exited non-zero — an empty role must install nothing, not kill the converge"; }
-# Those four roles plus [always] name the whole roles.toml roster, so
+    || { cat "$tmp/units-all.out" >&2; fail "units mode with three of the host's roles (one with units = []) exited non-zero — an empty role must install nothing, not kill the converge"; }
+# Those three roles plus [always] name the whole roles.toml roster, so
 # every stem must land — the empty role adds nothing and removes nothing.
 for stem in $timer_stems; do
-    [ -f "$tmp/etc-all/$stem.service" ] || fail "$stem was not installed under boss-gcp's own four roles (one of them empty)"
+    [ -f "$tmp/etc-all/$stem.service" ] || fail "$stem was not installed under three of boss-gcp's own roles (one of them empty)"
 done
 
 sum_roles="$tmp/summary-roles.json"
-BOSS_NODE_ROLES=legacy-stack UNITS_SUMMARY="$sum_roles" \
+BOSS_NODE_ROLES=ml-batch-host UNITS_SUMMARY="$sum_roles" \
     units_run "$tmp/systemctl-roles.log" "$tmp/etc-roles" "$tmp/unitlib" "$tmp/units-roles.out" \
-    || { cat "$tmp/units-roles.out" >&2; fail "units mode with BOSS_NODE_ROLES=legacy-stack exited non-zero"; }
+    || { cat "$tmp/units-roles.out" >&2; fail "units mode with BOSS_NODE_ROLES=ml-batch-host exited non-zero"; }
 touch "$tmp/systemctl-roles.log"
-in_role=$(awk '$0=="[always]"||$0=="[roles.legacy-stack]"{on=1;next} /^\[/{on=0} on&&/^units/' "$roles_toml" | grep -oE '"[^"]+"' | tr -d '"')
+in_role=$(awk '$0=="[always]"||$0=="[roles.ml-batch-host]"{on=1;next} /^\[/{on=0} on&&/^units/' "$roles_toml" | grep -oE '"[^"]+"' | tr -d '"')
+grep -qxF boss-ml-inference-batch <<<"$in_role" \
+    || fail "[roles.ml-batch-host] no longer names boss-ml-inference-batch — this check needs a role WITH units; pick another"
 for stem in $timer_stems; do
     if grep -qxF "$stem" <<<"$in_role"; then
-        [ -f "$tmp/etc-roles/$stem.service" ] || fail "$stem is in the legacy-stack/always roster and was NOT installed under BOSS_NODE_ROLES=legacy-stack"
+        [ -f "$tmp/etc-roles/$stem.service" ] || fail "$stem is in the ml-batch-host/always roster and was NOT installed under BOSS_NODE_ROLES=ml-batch-host"
     else
-        [ -f "$tmp/etc-roles/$stem.service" ] && fail "$stem is outside the legacy-stack roster and was installed anyway under BOSS_NODE_ROLES=legacy-stack"
+        [ -f "$tmp/etc-roles/$stem.service" ] && fail "$stem is outside the ml-batch-host roster and was installed anyway under BOSS_NODE_ROLES=ml-batch-host"
         grep -q "NOT IN ROLE $stem" "$tmp/units-roles.out" \
             || fail "$stem is outside the roster and the units mode did not REPORT it by name (NOT IN ROLE $stem)"
         grep -q "enable --now $stem.timer" "$tmp/systemctl-roles.log" \
@@ -298,10 +303,10 @@ for stem in $timer_stems; do
     fi
 done
 not_in_role=$(grep -c 'NOT IN ROLE ' "$tmp/units-roles.out" || true)
-[ "$not_in_role" -ge 1 ] || fail "BOSS_NODE_ROLES=legacy-stack reported nothing as NOT IN ROLE — the observer and the ML batch are outside it"
+[ "$not_in_role" -ge 1 ] || fail "BOSS_NODE_ROLES=ml-batch-host reported nothing as NOT IN ROLE — the observer is outside it"
 [ "$(jq -r '.units_not_in_role // ""' "$sum_roles")" = "$not_in_role" ] \
     || fail "the summary says units_not_in_role='$(jq -r '.units_not_in_role // ""' "$sum_roles")'; the run reported $not_in_role — the packet must carry the count a reader with no host access needs"
-[ "$(jq -r '.node_roles // ""' "$sum_roles")" = "legacy-stack" ] \
+[ "$(jq -r '.node_roles // ""' "$sum_roles")" = "ml-batch-host" ] \
     || fail "the summary does not record which roles the roster was derived from"
 grep -q 'NOT IN ROLE boss-estate-observe-host' "$sum_roles" \
     || fail "the summary's anomalies do not name the observer as NOT IN ROLE — a report that reaches only the journal is a report a reader without host access never sees"
@@ -618,9 +623,13 @@ chmod +x "$tmp/bin/cli-installer-ok"
 
 # The registry the converge reads its roles from is a FILE here — the
 # harness never touches the network — shaped like /api/estate/nodes.
+# boss-gcp's roles MINUS cluster-operator, whose converge block installs
+# talosctl into /usr/local/bin — a path the gate's uid 65534 cannot
+# write, so declaring it here reds the gate (1c4cf1be, 2026-09-27) —
+# and ops-runner, which adds nothing a stub installer can observe.
 nodes_json="$tmp/nodes.json"
 cat >"$nodes_json" <<'JSON'
-{"data":[{"id":"boss-gcp","role":"bastion","roles":["legacy-stack","ml-batch-host","off-cluster-observer","wireguard-bastion"]},
+{"data":[{"id":"boss-gcp","role":"bastion","roles":["ml-batch-host","off-cluster-observer","wireguard-bastion"]},
          {"id":"w-1","role":"talos-worker","roles":[]}]}
 JSON
 run_converge() { # <dir> <installer> -> output; returns the script's status
@@ -681,7 +690,7 @@ grep -q "args=units" "$tmp/calls.log" \
 # The CLI step runs AFTER the units, with the sha the tree now sits at.
 grep -q "sha=$want" "$tmp/calls.log" \
     || fail "the converge did not hand the CLI step the converged sha $want (calls: $(cat "$tmp/calls.log"))"
-[ "$(head -n 1 "$tmp/calls.log")" = "stub installer: args=units roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" ] \
+[ "$(head -n 1 "$tmp/calls.log")" = "stub installer: args=units roles=ml-batch-host,off-cluster-observer,wireguard-bastion" ] \
     || fail "the CLI step must run after the units, never instead of them (calls: $(cat "$tmp/calls.log"))"
 grep -q "${want:0:8}" <<<"$out" \
     || fail "the converge does not say which commit it converged on:
@@ -702,9 +711,9 @@ grep -q "args=units" "$tmp/calls.log" \
 # 6b. THE HOST'S ROLES REACH THE INSTALLER, read off the registry — and
 #     a registry that does not answer leaves them empty, installs every
 #     row, and says so, instead of stopping the converge.
-grep -q "roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
+grep -q "roles=ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
     || fail "the converge did not hand boss-gcp's declared roles to the installer as BOSS_NODE_ROLES (calls: $(cat "$tmp/calls.log"))"
-grep -q "declares roles: legacy-stack" <<<"$out" \
+grep -q "declares roles: ml-batch-host" <<<"$out" \
     || fail "the converge does not say which roles it read:
 $out"
 : >"$tmp/calls.log"
@@ -737,7 +746,7 @@ $out"
 out=$(CONVERGE_NODE_ID=boss-gcp CONVERGE_ROLES_CACHE="$tmp/roles.cache.gcp" CONVERGE_NODES_URL="file://$tmp/no-such-registry.json" run_converge "$clean" "$tmp/bin/installer-ok") \
     || fail "an unreachable registry STOPPED the converge that had a cache:
 $out"
-grep -q "roles=legacy-stack,ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
+grep -q "roles=ml-batch-host,off-cluster-observer,wireguard-bastion" "$tmp/calls.log" \
     || fail "a dark registry must drive the installer with the CACHED declaration (calls: $(cat "$tmp/calls.log"))"
 grep -q "cached declaration" <<<"$out" \
     || fail "the converge does not say the roles came from the cache:

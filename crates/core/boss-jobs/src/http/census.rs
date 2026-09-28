@@ -1,6 +1,6 @@
 //! `POST /api/network/census` — where the packet-loss census lands.
 //!
-//! The census (docs/design/packet-loss.md, decided in review
+//! The census (the packet-loss decision in docs/architecture-decisions.md, decided in review
 //! `9fb9904f`) is computed by the dispatcher's `network.census`
 //! handler over this API's own read surfaces — /api/jobs totals,
 //! /api/stations, each station's queue. Q3's ruling is that the

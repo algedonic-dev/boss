@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { RiskScoreListSchema } from './schemas';
+import { AccountSchema, RiskScoreListSchema } from './schemas';
 
 // The crash this schema exists to stop: WatchlistPage cast the payload
 // and read `.length` off the result, so a response without `accounts`
@@ -7,16 +7,26 @@ import { RiskScoreListSchema } from './schemas';
 // "Cannot read properties of undefined (reading 'length')"
 // under the route-smoke suite's adversarial mock (feedback 2fe1c8c1).
 
+const factors = {
+  days_since_last_invoice: 40,
+  open_ticket_count: 2,
+  has_active_contract: true,
+  days_since_last_note: null,
+};
+const row = {
+  account_id: 'acct-1',
+  account_name: 'Algedonic Ales',
+  score: 72,
+  top_factor: 'days_since_last_invoice',
+  factors,
+  scored_at: '2026-09-27T02:31:04.118Z',
+  stale: false,
+};
 const ok = {
-  accounts: [
-    {
-      account_id: 'acct-1',
-      account_name: 'Algedonic Ales',
-      score: 72,
-      top_factor: 'days_since_last_invoice',
-      factors: { days_since_last_invoice: 40, open_ticket_count: 2 },
-    },
-  ],
+  accounts: [row],
+  total_scored: 1,
+  scored_as_of: '2026-09-27T02:31:04.118Z',
+  stale_after_hours: 26,
 };
 
 describe('RiskScoreListSchema', () => {
@@ -38,23 +48,118 @@ describe('RiskScoreListSchema', () => {
   /** A score the table sorts on must be a NUMBER; a string sorts wrong
    *  and silently, which is worse than refusing. */
   test('refuses a non-numeric score', () => {
-    const bad = { accounts: [{ ...ok.accounts[0], score: 'high' }] };
+    const bad = { ...ok, accounts: [{ ...row, score: 'high' }] };
     expect(RiskScoreListSchema.safeParse(bad).success).toBe(false);
   });
 
-  /** `factors` is deliberately permissive: the page reads a few keys and
-   *  tolerates absent ones, so a backend adding a field must not become
-   *  a hard parse failure. */
-  test('tolerates an absent or extended factors bag', () => {
-    const noFactors = { accounts: [{ ...ok.accounts[0], factors: undefined }] };
-    expect(RiskScoreListSchema.safeParse(noFactors).success).toBe(true);
-    const extra = {
-      accounts: [{ ...ok.accounts[0], factors: { brand_new_signal: 1 } }],
-    };
+  /** Backlog 4b981df2 (page audit 08b0c4f8 GAP 10): this test ACCEPTED
+   *  a row without `factors`, while WatchlistPage dereferences
+   *  `s.factors.*` in its sort and its table with no guard — so such a
+   *  row parsed clean and then threw a TypeError in render, past the
+   *  try that sets the error state. The server always sends all four
+   *  keys (boss-accounts `RiskFactors`, and a prediction without
+   *  factors is a 500 there), so a row missing one is a wrong shape and
+   *  is REFUSED here, where the page turns a refusal into its error
+   *  state. */
+  test('REFUSES a row without factors — the page reads them unguarded', () => {
+    const noFactors = Object.fromEntries(Object.entries(row).filter(([k]) => k !== 'factors'));
+    expect(RiskScoreListSchema.safeParse({ ...ok, accounts: [noFactors] }).success).toBe(false);
+    const nullFactors = { ...ok, accounts: [{ ...row, factors: null }] };
+    expect(RiskScoreListSchema.safeParse(nullFactors).success).toBe(false);
+  });
+
+  test('refuses a factors bag missing a key the page reads', () => {
+    for (const key of Object.keys(factors)) {
+      const missing = Object.fromEntries(Object.entries(factors).filter(([k]) => k !== key));
+      const bad = { ...ok, accounts: [{ ...row, factors: missing }] };
+      expect(RiskScoreListSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+
+  test('refuses a ticket count that is not a number — it sorts the table', () => {
+    const bad = { ...ok, accounts: [{ ...row, factors: { ...factors, open_ticket_count: '2' } }] };
+    expect(RiskScoreListSchema.safeParse(bad).success).toBe(false);
+  });
+
+  /** A backend ADDING a signal must not become a hard parse failure:
+   *  only the keys the page reads are required. */
+  test('tolerates an extended factors bag', () => {
+    const extra = { ...ok, accounts: [{ ...row, factors: { ...factors, brand_new_signal: 1 } }] };
     expect(RiskScoreListSchema.safeParse(extra).success).toBe(true);
   });
 
   test('an empty account list is valid — zero at-risk accounts is a real answer', () => {
-    expect(RiskScoreListSchema.safeParse({ accounts: [] }).success).toBe(true);
+    const empty = { accounts: [], total_scored: 0, scored_as_of: null, stale_after_hours: 26 };
+    expect(RiskScoreListSchema.safeParse(empty).success).toBe(true);
+  });
+
+  /** Backlog 8ddaefcd (page audit 08b0c4f8 GAP 12): the read carried no
+   *  time, so a batch that stopped weeks ago painted like last night's.
+   *  The server always sends each score's `scored_at` and `stale`, and
+   *  the list's `scored_as_of` (null only when nothing is scored) and
+   *  `stale_after_hours` (boss-accounts `RiskScoreList`) — so a payload
+   *  without them is a wrong shape, never a fresh one. */
+  test('keeps the as-of time, the per-row time and the stale flag', () => {
+    const r = RiskScoreListSchema.safeParse({ ...ok, accounts: [{ ...row, stale: true }] });
+    expect(r.success).toBe(true);
+    if (!r.success) return;
+    expect(r.data.scored_as_of).toBe('2026-09-27T02:31:04.118Z');
+    expect(r.data.stale_after_hours).toBe(26);
+    expect(r.data.accounts[0]!.scored_at).toBe('2026-09-27T02:31:04.118Z');
+    expect(r.data.accounts[0]!.stale).toBe(true);
+  });
+
+  test('REFUSES a payload that does not say when it was scored', () => {
+    const without = (o: object, key: string) =>
+      Object.fromEntries(Object.entries(o).filter(([k]) => k !== key));
+    expect(RiskScoreListSchema.safeParse(without(ok, 'scored_as_of')).success).toBe(false);
+    expect(RiskScoreListSchema.safeParse(without(ok, 'stale_after_hours')).success).toBe(false);
+    for (const key of ['scored_at', 'stale']) {
+      const bad = { ...ok, accounts: [without(row, key)] };
+      expect(RiskScoreListSchema.safeParse(bad).success).toBe(false);
+    }
+    expect(RiskScoreListSchema.safeParse({ ...ok, accounts: [{ ...row, stale: 'no' }] }).success)
+      .toBe(false);
+  });
+
+  /** Backlog 9269d612 (page audit 08b0c4f8 GAP 8): the schema dropped
+   *  `total_scored`, so the page counted the rows it got — a 200-row cap
+   *  read as "200 accounts scored". The server always sends it
+   *  (boss-accounts `RiskScoreList`), so a payload without it is a wrong
+   *  shape, and the count survives the parse. */
+  test('keeps total_scored — the count past the page', () => {
+    const r = RiskScoreListSchema.safeParse({ ...ok, total_scored: 350 });
+    expect(r.success && r.data.total_scored).toBe(350);
+  });
+
+  test('REFUSES a payload without a numeric total_scored', () => {
+    expect(RiskScoreListSchema.safeParse({ accounts: [row] }).success).toBe(false);
+    expect(RiskScoreListSchema.safeParse({ ...ok, total_scored: '1' }).success).toBe(false);
+  });
+});
+
+// Backlog d2c9e79f: the schema pinned `tier` to platinum/gold/silver,
+// citing a DB CHECK that 22-accounts.sql does not have — `tier` is
+// plain TEXT, and a tier is an (account, tier) Class row a tenant adds
+// without a deploy. The account detail validates with this schema, so
+// an account on a tenant-added tier refused to load.
+describe('AccountSchema tier', () => {
+  const account = (tier: unknown) => ({
+    id: 'acct-1', name: 'One', director: null, city: null, state: null,
+    tier, customer_since: null, territory_rep_id: null,
+  });
+
+  test('accepts a tier the seeded trio does not name — the registry decides, not the schema', () => {
+    expect(AccountSchema.safeParse(account('bronze')).success).toBe(true);
+  });
+
+  test('accepts an untiered account and the seeded tiers', () => {
+    for (const t of [null, 'platinum', 'gold', 'silver']) {
+      expect(AccountSchema.safeParse(account(t)).success).toBe(true);
+    }
+  });
+
+  test('still refuses a tier that is not a string', () => {
+    expect(AccountSchema.safeParse(account(3)).success).toBe(false);
   });
 });

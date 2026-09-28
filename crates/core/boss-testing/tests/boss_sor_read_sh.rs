@@ -329,7 +329,10 @@ fn the_reader_defaults_to_the_jobs_api() {
     let actor = "{\"id\":\"automation:x\",\"role\":\"audit-readonly\"}";
     for (case, path) in [
         ("default-yard", "/api/yard/status"),
-        ("default-jobs", "/api/jobs?kind=pr-train&status=open"),
+        (
+            "default-jobs",
+            "/api/jobs/3603b554-25f0-4346-bee2-9f045afa84d7",
+        ),
         ("default-agents", "/api/agents"),
         ("default-lookalike", "/api/peoples/x"),
         ("default-eventsish", "/api/eventsource"),
@@ -355,13 +358,62 @@ fn the_reader_without_a_table_reads_every_path_on_the_base() {
     let actor = "{\"id\":\"automation:x\",\"role\":\"audit-readonly\"}";
     for (case, path) in [
         ("no-table-events", "/api/events/tail?limit=1"),
-        ("no-table-jobs", "/api/jobs"),
+        ("no-table-jobs", "/api/jobs/summary"),
     ] {
         let (rc, _, stderr, argv) = run_reader(case, &[path], &reader_env(actor, None));
         assert_eq!(rc, 0, "{case}: stderr: {stderr}");
         assert_eq!(
             url_read(&argv),
             format!("http://sor.invalid:7900{path}"),
+            "{case}: argv:\n{argv}"
+        );
+    }
+}
+
+/// A RECORDED PROBE READS THE LIST WHOLE (backlog 9b473d4a). The job
+/// list serves each step without its `metadata` when the read says
+/// `full=false` — and by default once that flips — and probes already
+/// recorded on open cars read a listed
+/// step's metadata (`[.steps[] | select(.spec_slug == "execute") |
+/// .metadata.exit_code]`, cars f3b1b9a2, bf800cc1 and b8c4267f,
+/// measured 2026-09-27). A probe is program text frozen on its car, so
+/// the door it reads through asks for the shape it was written
+/// against: a list read gains `full=true` unless it names `full`
+/// itself, and every other path is read as given.
+#[test]
+fn a_probes_list_read_asks_for_the_whole_step_unless_it_says() {
+    let actor = "{\"id\":\"automation:x\",\"role\":\"audit-readonly\"}";
+    for (case, path, want) in [
+        (
+            "list-query",
+            "/api/jobs?kind=ops-request&status=closed&limit=50",
+            "/api/jobs?kind=ops-request&status=closed&limit=50&full=true",
+        ),
+        ("list-bare", "/api/jobs", "/api/jobs?full=true"),
+        (
+            "list-says-slim",
+            "/api/jobs?kind=x&full=false",
+            "/api/jobs?kind=x&full=false",
+        ),
+        (
+            "list-says-full-first",
+            "/api/jobs?full=true&kind=x",
+            "/api/jobs?full=true&kind=x",
+        ),
+        ("one-packet", "/api/jobs/abc", "/api/jobs/abc"),
+        (
+            "summary",
+            "/api/jobs/summary?kind=x",
+            "/api/jobs/summary?kind=x",
+        ),
+        ("lookalike", "/api/jobsx?kind=x", "/api/jobsx?kind=x"),
+    ] {
+        let (rc, _, stderr, argv) =
+            run_reader(case, &[path], &reader_env(actor, Some(PORTS_TABLE)));
+        assert_eq!(rc, 0, "{case}: stderr: {stderr}");
+        assert_eq!(
+            url_read(&argv),
+            format!("http://sor.invalid:7900{want}"),
             "{case}: argv:\n{argv}"
         );
     }

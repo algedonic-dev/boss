@@ -107,6 +107,50 @@ field_type = "array"
 required = true
 filled_by = "filer"
 item_keys = ["anchor", "title", "proposal"]
+# A question may BIND the exhibits it is asked about (design 26a89f11):
+# an element's `exhibits` key lists exhibit anchors, and the review
+# surface renders those exhibits beside the question. A binding to an
+# anchor the step does not carry is refused as it is written.
+binds = "exhibits"
+
+# EXHIBITS — a proposal whose substance is visual rides INSIDE the
+# packet, not behind a claude.ai link (design 26a89f11, David
+# 2026-09-23, all five questions accepted). `[{anchor, title, html |
+# file_ref}]`: the markdown stays the record's prose, and each exhibit is a
+# self-contained HTML rendering — a theme board, a layout, a motion
+# prototype — that review-design.js renders ONLY in an
+# `<iframe sandbox="allow-scripts">` (never allow-same-origin) by srcdoc
+# under CSP `default-src 'none'` with inline style and script only. The
+# surface runs in the reviewer's authenticated session and any actor may
+# write step metadata, so the sandbox is the protection, not the author
+# list.
+#
+# INLINE, BOUNDED, FROZEN. The html rides in step metadata up to 256 KB
+# (`item_value_max_bytes`, measured in UTF-8 bytes of the string) and is
+# frozen with the rest of the step when the review completes.
+#
+# ABOVE THE BOUND, A FILE_REF. A larger rendering is attached to this
+# step in the file store (content-addressed; `boss design --exhibit`
+# attaches it through the `boss attach` path and reads it back before it
+# records anything) and the element carries `file_ref` — the file's id —
+# with the `sha256` and `size_bytes` that read-back confirmed. The review
+# surface fetches the bytes, checks them against that sha256, and hands
+# them to the SAME sandboxed frame. `item_one_of` holds the choice: every
+# exhibit carries exactly one of `html` and `file_ref` — both is refused
+# as it is written, neither at done.
+#
+# Not required: most designs carry no exhibit, and `boss design
+# --exhibit` writes it onto this step (not bound through
+# metadata_defaults, which would leave an unexpanded token on every
+# design that has none).
+[[workflow.step.fields]]
+name = "exhibits"
+field_type = "array"
+required = false
+filled_by = "filer"
+item_keys = ["anchor", "title"]
+item_one_of = ["html", "file_ref"]
+item_value_max_bytes = 262144
 
 # The answers, and the contract that makes the review a review: every
 # question's anchor must be resolved before the step can complete.
@@ -132,6 +176,13 @@ title = "fold"
 kind = "task"
 ready_when = "steps.review.done"
 title_template = "Fold it into current truth"
+# WHO EXECUTES THE FOLD (2026-09-23). The fold is agent work — a car
+# that writes the settled paragraphs into docs/architecture-decisions.md
+# and then records `boss fold` — but the step declared no agent block,
+# so `boss dispatch` refused it by name and 34 answered designs waited
+# at this step with no way to hand them out (the last fold car was
+# briefed by hand). The builder profile, because the output is a car.
+agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
 metadata_defaults = { procedure = """State what CURRENT TRUTH gains from this doc now that its questions are answered, and where. 'Nothing' is a legitimate answer and still has to be written down with its reason — that is the whole point of the step existing.
 
 The fold is the current-truth reading, assembled per topic, with the decision history beside it rather than inlined (Q2). Today that is docs/architecture-decisions.md, maintained by hand because merging prose has nuance a generator cannot judge. This step does not automate that judgement; it makes skipping it visible.

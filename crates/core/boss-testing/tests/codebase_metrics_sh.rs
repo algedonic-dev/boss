@@ -428,6 +428,11 @@ fn the_row_carries_the_two_headline_ratios_and_says_what_it_could_not_count() {
         "an honest 'not measured' has to say why: {out:#}"
     );
     assert!(
+        why.starts_with("refused: "),
+        "the counter ran and refused — a different verdict from a counter \
+         that could not run, and the row says which: {why}"
+    );
+    assert!(
         why.contains("registry kinds") || why.contains("CANNOT ANSWER") || why.contains("refused"),
         "the reason must name the REFUSAL it came from, not a generic blank — \
          a reader has to be able to tell 'this box could not look' from \
@@ -537,11 +542,14 @@ fn the_snapshot_counts_the_code_branches_and_names_where_they_are() {
 
 #[test]
 fn a_machine_with_no_counter_says_so_instead_of_reporting_zero() {
-    // boss-gcp's converge deliberately does not build, so the counter is
-    // present on a box only once somebody built it there. That box must
-    // report "unmeasured here" — never 0 leaked branches, which is the
-    // same defect as a query against the wrong deployment answering
-    // `total: 0`: well-formed, confident and wrong.
+    // A box without the counter must report "unmeasured here" — never 0
+    // leaked branches, which is the same defect as a query against the
+    // wrong deployment answering `total: 0`: well-formed, confident and
+    // wrong. Since backlog c4d60110 boss-gcp's converge puts the counter
+    // down beside the CLI and the unit names it, so a named path that is
+    // not there is the case that matters: the converge failed to pull
+    // it, and the row must say so as a VERDICT (`unrunnable:`) a reader
+    // or a probe can tell apart from a count.
     let fx = Fixture::with_a_leaked_branch("no-counter");
     let absent = fx.dir.join("no-such-counter");
     let out = Command::new("bash")
@@ -574,6 +582,14 @@ fn a_machine_with_no_counter_says_so_instead_of_reporting_zero() {
         why.contains(absent.to_string_lossy().as_ref()),
         "the reason must NAME the path it could not run, so the fix is one \
          command away rather than a hunt: {why}"
+    );
+    assert!(
+        why.starts_with("unrunnable: "),
+        "a null count carries a verdict, not only prose: {why}"
+    );
+    assert!(
+        why.contains("install-cli-from-image.sh"),
+        "the reason names the door that should have put it there: {why}"
     );
     // The rest of the row is untouched — the registry half is still
     // counted exactly, which is the point of keeping the two independent.

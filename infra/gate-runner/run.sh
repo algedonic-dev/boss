@@ -106,18 +106,37 @@ report_once() { # verdict, note
         5??|000) echo "gate-runner: report: GET packet answered HTTP $code"; return 75 ;;
         *) echo "gate-runner: report: GET packet answered HTTP $code"; return 1 ;;
     esac
-    step_id=$(printf '%s' "$body" | python3 -c '
+    local picked step_status stored_verdict
+    picked=$(printf '%s' "$body" | python3 -c '
 import sys, json
 j = json.load(sys.stdin)
 j = j.get("data", j)
-hits = [s["id"] for s in j["steps"] if s.get("spec_slug") == "record-verdict"]
+hits = [s for s in j["steps"] if s.get("spec_slug") == "record-verdict"]
 if len(hits) != 1:
     sys.stderr.write(
         "gate-runner: expected exactly one record-verdict step, found %d"
         " (slugs: %s) - the gate-run protocol and this runner disagree\n"
         % (len(hits), [s.get("spec_slug") for s in j["steps"]]))
     sys.exit(1)
-print(hits[0])') || return 1
+s = hits[0]
+v = (s.get("metadata") or {}).get("verdict")
+print("%s %s %s" % (s["id"], s.get("status") or "-", v if isinstance(v, str) and v else "-"))') || return 1
+    read -r step_id step_status stored_verdict <<<"$picked"
+    # A RETRY AFTER A WRITE THAT LANDED. A timeout can hide a completion
+    # the SoR did record; the next attempt then finds the step terminal,
+    # and the merge door below refuses a terminal step outright (the PUT
+    # had an idempotent re-send carve-out; the merge door has none). If
+    # the step already carries THIS verdict the report is done, and
+    # saying so is the truth. A terminal step carrying anything else
+    # falls through to the merge, whose 409 is the loud refusal a frozen
+    # step is owed (cf0021ae).
+    case "$step_status" in
+        completed|skipped)
+            if [ "$stored_verdict" = "$1" ]; then
+                echo "gate-runner: report: record-verdict step is already $step_status and already carries verdict $1 - nothing to write"
+                return 0
+            fi ;;
+    esac
     # A PER-INVOCATION file, not a fixed /tmp path: the block is lifted
     # verbatim by boss-testing's gate_runner_report_retry and run
     # concurrently there, where a shared name is a race that empties one
@@ -143,25 +162,125 @@ try:
     receipt = json.dumps(body, separators=(",", ":"))
 except Exception:
     pass
-print(json.dumps({"status": "completed",
-                  "metadata": {"verdict": verdict, "receipt": receipt}}))
+print(json.dumps({"verdict": verdict, "receipt": receipt}))
 PY
+    # TWO WRITES: THE KEYS THROUGH THE MERGE DOOR, THEN THE STATUS ALONE.
+    #
+    # This was one PUT of {status, metadata: {verdict, receipt}} with no
+    # read before it. The step PUT REPLACES metadata wholesale, and the
+    # registry materializes keys onto every step at admission
+    # (metadata_defaults, authority_role, station, audience, claimable),
+    # so that body silently shed every key the runner did not think to
+    # send - on every gate verdict (backlog e39a9d2a, correction
+    # 2026-09-23). The server is to REFUSE such a body in that item's
+    # last car, and a runner still sending it then would stop every gate
+    # from reporting. PATCH .../steps/{id}/metadata merges against the
+    # row as it stands, in one transaction, so it cannot race; the PUT
+    # that follows carries nothing to drop.
+    #
+    # ORDER IS LOAD-BEARING: a step's required-at-done fields are
+    # validated when it flips to completed, so the verdict must be on
+    # the row before the PUT arrives. A merge that lands followed by a
+    # PUT that meets a roll is retried whole by `report`: the second
+    # merge rewrites the same two keys, carrying the later attempt's
+    # story, which is the one that is true.
+    report_write PATCH "$payload" \
+        "$JOBS_API/api/jobs/$GATE_RUN_JOB_ID/steps/$step_id/metadata" "merge verdict" \
+        || { rc=$?; rm -f "$payload"; return "$rc"; }
+    printf '%s' '{"status":"completed"}' > "$payload"
+    # A COMPLETION THAT LOST THE STEP RACE IS SENT ONCE MORE (backlog
+    # 2a6d0b86). The step PUT refuses, 409 code STEP_CHANGED_CODE, a write
+    # whose read another write moved before it landed (car 88123ae0) -
+    # where it used to answer success and erase that write. The refusal
+    # means nothing was written, and this body is status-only, so it
+    # carries nothing that can be stale: the same body goes once more,
+    # as boss dispatch's briefed completion does. A second loss, or any
+    # other refusal, stands - refused by name, never looped. Before
+    # this, the one 409 refused the report outright and the conductor
+    # closed the gate-run `lost` over a real green or red.
+    local url="$JOBS_API/api/jobs/$GATE_RUN_JOB_ID/steps/$step_id"
     rc=0
-    out=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' -X PUT \
-        -H "x-boss-user: $ACTOR" -H "Content-Type: application/json" \
-        -d @"$payload" \
-        "$JOBS_API/api/jobs/$GATE_RUN_JOB_ID/steps/$step_id") || rc=$?
+    report_write PUT "$payload" "$url" "PUT completion" || rc=$?
+    if [ "$rc" -eq 76 ]; then
+        echo "gate-runner: report: PUT completion lost the step race to another write - nothing was written; sending the same status-only body once more"
+        rc=0
+        report_write PUT "$payload" "$url" "PUT completion (resent)" || rc=$?
+        if [ "$rc" -eq 76 ]; then
+            echo "gate-runner: report: PUT completion lost the step race twice - refused in the server's words above, not resent again"
+            rc=1
+        fi
+    fi
     rm -f "$payload"
+    return "$rc"
+}
+
+# The `code` the step PUT's 409 carries when the row moved between the
+# handler's read and its write (car 88123ae0) - the one refusal a resend
+# answers (above). The runner matches the CODE, never the `error` words,
+# which are a person's and free to move (backlog 2aa2b19e: the words
+# were copied here byte for byte and went stale when the compare widened
+# to the whole row). Its definition is
+# boss_jobs::step_metadata_write::STEP_CHANGED_CODE; boss-testing's
+# the_step_race_is_matched_by_its_code holds this line to it by name.
+STEP_CHANGED_CODE='step_changed'
+
+# DELETE AFTER ONE RELEASE (the review of car 24eb9471). The words a
+# server from before the code answered the same race with, and nothing
+# else: while a jobs API that predates the code can still be what this
+# runner reports to, those exact words are the race too. Its definition
+# is boss_jobs::step_metadata_write::STEP_CHANGED_ERROR_BEFORE_THE_CODE,
+# which carries the same deletion note; the same pin holds this line to
+# it by name.
+STEP_CHANGED_WORDS_BEFORE_THE_CODE='step changed while this write was computed — its metadata is no longer what the write read, so writing it would erase the other write'
+
+# Is this response body the step-race refusal - an object whose `code`
+# is STEP_CHANGED_CODE, or (for one release) whose `error` is exactly
+# the old words? The words are compared as BYTES: os.fsencode undoes
+# whatever the locale did to argv, so the em dash cannot make an exact
+# match miss.
+report_step_changed() { # response body file
+    python3 - "$1" "$STEP_CHANGED_CODE" "$STEP_CHANGED_WORDS_BEFORE_THE_CODE" <<'PY'
+import json, os, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        said = json.load(f)
+except Exception:
+    sys.exit(1)
+if not isinstance(said, dict):
+    sys.exit(1)
+code, err = said.get("code"), said.get("error")
+old = isinstance(err, str) and err.encode("utf-8") == os.fsencode(sys.argv[3])
+sys.exit(0 if code == sys.argv[2] or old else 1)
+PY
+}
+
+# One report write, classified the way every report write is: 0 landed,
+# 75 nobody answered (a roll - retry), 76 the step PUT lost the race to
+# another write and wrote nothing (resend once), 1 refused (about the
+# write itself). A refusal prints the server's words beside its status:
+# a bare "HTTP 409" sent the reader of the Job log to the API to find
+# out which refusal it was.
+report_write() { # method, body file, url, label
+    local rc=0 out said
+    said=$(mktemp) || return 1
+    out=$(curl -s --max-time 20 -o "$said" -w '%{http_code}' -X "$1" \
+        -H "x-boss-user: $ACTOR" -H "Content-Type: application/json" \
+        -d @"$2" "$3") || rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "gate-runner: report: PUT verdict failed (curl exit $rc)"
+        rm -f "$said"
+        echo "gate-runner: report: $4 failed (curl exit $rc)"
         report_transient_curl "$rc" && return 75
         return 1
     fi
     case "$out" in
-        2??) return 0 ;;
-        5??|000) echo "gate-runner: report: PUT verdict answered HTTP $out"; return 75 ;;
-        *) echo "gate-runner: report: PUT verdict answered HTTP $out"; return 1 ;;
+        2??) rm -f "$said"; return 0 ;;
+        5??|000) rm -f "$said"; echo "gate-runner: report: $4 answered HTTP $out"; return 75 ;;
     esac
+    echo "gate-runner: report: $4 answered HTTP $out: $(head -c 2000 "$said" | tr '\n' ' ')"
+    rc=1
+    if [ "$out" = 409 ] && report_step_changed "$said"; then rc=76; fi
+    rm -f "$said"
+    return "$rc"
 }
 
 report() { # verdict, note
@@ -466,6 +585,7 @@ RAW_TAIL = 200         # lines of gate.log when nothing can be parsed
 PER_CHECK = 5          # named failures per check on the receipt
 TOTAL_ENTRIES = 40     # entries on the whole receipt
 ENTRY_CHARS = 400      # characters per entry
+MESSAGE_LINES = 12     # lines of one panic message kept, before the entry's own clip
 QUOTE_LINES = 3        # raw lines quoted for a check this cannot parse
 EXCERPT_CHARS = 6000   # characters of `fails_excerpt` per failed check
 EXCERPT_TOTAL = 24000  # characters of `fails_excerpt` on the whole receipt
@@ -527,6 +647,9 @@ RE_LISTED = re.compile(r"^ {4}(\S+)$")
 # (backlog 2dc742c1, 2026-09-22). Both formats carry it.
 RE_PANIC_OLD = re.compile(r"^thread '([^']*)'(?: \(\d+\))? panicked at '(.*)', (\S+)$")
 RE_PANIC_NEW = re.compile(r"^thread '([^']*)'(?: \(\d+\))? panicked at (\S+):$")
+# Where a panic's message stops: cargo's hint, a captured backtrace, or
+# the `failures:` roll-call that follows the last block.
+RE_MESSAGE_END = re.compile(r"^(note: run with `RUST_BACKTRACE|stack backtrace:$|failures:$)")
 RE_ERROR = re.compile(r"^\s*(error(\[E\d{4}\])?|Error|ERROR)\b[: ]")
 RE_ARROW = re.compile(r"^\s*--> (\S+)")
 
@@ -586,9 +709,29 @@ def panics(body):
             continue
         m = RE_PANIC_NEW.match(line)
         if m:
-            msg = body[i + 1].strip() if i + 1 < len(body) else ""
-            out.append((block or m.group(1) or None, m.group(2), msg))
+            out.append((block or m.group(1) or None, m.group(2), message_after(body, i)))
     return out
+
+
+def message_after(body, i):
+    """A current-format panic's message: EVERY line after the header up
+    to cargo's own `note:` (or a backtrace, the next block, the roll-call),
+    not the first one. Gate-run 2510ac65 (2026-09-24, backlog b53dca8c)
+    recorded an assertion's header - "... and that relaunching is safe:"
+    - and dropped the lines it introduced, which held the cause ("refused
+    every connection for 0s"); only the excerpt had them. Bounded to
+    MESSAGE_LINES, saying what it left; `clip` bounds the entry itself."""
+    lines = []
+    for nxt in body[i + 1:]:
+        if RE_MESSAGE_END.match(nxt) or RE_STDOUT.match(nxt) \
+                or RE_PANIC_OLD.match(nxt) or RE_PANIC_NEW.match(nxt):
+            break
+        if nxt.strip():
+            lines.append(nxt.strip())
+    if len(lines) > MESSAGE_LINES:
+        lines = lines[:MESSAGE_LINES] + ["(+%d more message line(s); the excerpt has them)" % (
+            len(lines) - MESSAGE_LINES)]
+    return " ".join(lines)
 
 
 # Playwright's own verdict lines, in the order a reader acts on them:

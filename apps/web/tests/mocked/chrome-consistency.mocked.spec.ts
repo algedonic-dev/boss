@@ -10,7 +10,7 @@
 // with the same tenant identity, on every surface — including the two
 // that render outside AppShell.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './_test';
 import { mountPage } from './_helpers';
 import { AA_FLOOR, describeUnreadable, measureContrast } from './_contrast';
 import { DEPARTMENT_CLASSES, installApiFloor } from './_smokeMocks';
@@ -87,6 +87,29 @@ test.describe('chrome bar', () => {
       `chrome controls below ${AA_FLOOR}:1 contrast in light theme:\n${describeUnreadable(
         unreadable,
       )}`,
+    ).toEqual([]);
+  });
+
+  // Enamel draws headers as bands, white on night ink, and the chrome bar
+  // is the widest one (backlog 7eb59678 car 2). Measured in the page, so
+  // a scoped rule that loses the cascade fails here, not in review — and
+  // the words the bar carries OUTSIDE a button or link (the brand, the
+  // system time) are measured too, since a band inverts every one of them.
+  test('is an enamel band, and every word on it stays legible', async ({ page }) => {
+    await mountPage(page, '/ux/jobs');
+    const bar = page.locator('.perspective-tabs').first();
+    await expect(bar).toHaveCSS('background-color', 'rgb(14, 27, 46)');
+
+    // Where you are is cut out of the band: the page's white ground.
+    const here = bar.locator('[aria-current="page"]').first();
+    await expect(here).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+
+    const measured = await measureContrast(bar, 'span, button, a');
+    expect(measured.length, 'no words found on the chrome bar').toBeGreaterThan(3);
+    const unreadable = measured.filter((m) => m.ratio < AA_FLOOR);
+    expect(
+      unreadable,
+      `chrome words below ${AA_FLOOR}:1 on the band:\n${describeUnreadable(unreadable)}`,
     ).toEqual([]);
   });
 

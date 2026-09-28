@@ -26,8 +26,8 @@ type MountFn = (
 ) => unknown;
 
 /// Enough DOM for this bundle's h() helper: instanceof Node checks,
-/// createTextNode, replaceChildren, setAttribute. Anything else it
-/// reaches for throws, which is the signal we want.
+/// createTextNode, append, replaceChildren, setAttribute. Anything else
+/// it reaches for throws, which is the signal we want.
 class FakeNode {
   className = '';
   textContent = '';
@@ -37,6 +37,16 @@ class FakeNode {
   appendChild(c: FakeNode) {
     this.children.push(c);
     return c;
+  }
+  // As the DOM's: a string is a Text node, never markup (4a359b51).
+  append(...cs: Array<FakeNode | string>) {
+    for (const c of cs) {
+      if (typeof c === 'string') {
+        const t = new FakeNode();
+        t.textContent = c;
+        this.children.push(t);
+      } else this.children.push(c);
+    }
   }
   replaceChildren(...cs: FakeNode[]) {
     this.children = cs;
@@ -169,5 +179,28 @@ describe('the review-design bundle with nothing to review', () => {
     const text = allText(container);
     expect(text).toContain('First brick?');
     expect(text).not.toContain('nothing to review');
+  });
+
+  // d9af15ba: the bundle mapped each question's `body` and then rendered
+  // `q.body_md`, which nothing sets, so a question's body never showed.
+  test("a question's body is shown, as its characters", async () => {
+    const step = {
+      id: 'step-1',
+      kind: 'review-design',
+      status: 'ready',
+      metadata: {
+        resolutions: [],
+        questions: [
+          { anchor: 'Q1', title: 'First brick?', body: 'Which crate moves first, and <b>why</b>?' },
+        ],
+      },
+    };
+    const { mount } = loadBundle(() => Promise.reject(new Error('no fetch expected')));
+    const container = new FakeNode();
+    mount(container, { step, jobId: 'job-1', onUpdate() {} });
+    await settled();
+
+    // A Text node's content, never parsed: the tag arrives as characters.
+    expect(allText(container)).toContain('Which crate moves first, and <b>why</b>?');
   });
 });

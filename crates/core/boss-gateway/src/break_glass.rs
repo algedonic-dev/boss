@@ -764,6 +764,7 @@ pub async fn assert_finish(
         BREAK_GLASS_ACTOR,
         None,
         crate::audit::AuthMethod::BreakGlass,
+        None,
     );
 
     let (set_cookie, sess) = mint_session(&state.session_key);

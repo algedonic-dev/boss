@@ -9,13 +9,22 @@ use async_trait::async_trait;
 use boss_core::job::{Job, JobId, JobStatus, Step, StepId, StepStatus};
 use chrono::{DateTime, Utc};
 
-use crate::port::{JobFilter, JobScope, JobsError, JobsRepository, LaunchCalendarRow};
+use crate::port::{
+    Admission, JobFilter, JobScope, JobsError, JobsRepository, StepVersion, spent_nonce,
+};
 
 #[derive(Default)]
 pub struct InMemoryJobs {
     inner: Mutex<State>,
     recorded: Mutex<Vec<boss_core::event::Event>>,
     refusals: Mutex<Vec<crate::refusals::RecordedRefusal>>,
+    /// The step-plugin registry a new step's `step_plugin_version` is
+    /// stamped from — this adapter's `step_plugins` table. `None` is
+    /// an empty registry: no plugin serves any kind, so every step is
+    /// written at the version its caller gave, exactly as the Pg
+    /// adapter writes against a table with no active row (backlog
+    /// 82448947).
+    step_plugins: Option<std::sync::Arc<dyn crate::step_plugins::StepPluginRegistry>>,
 }
 
 #[derive(Default)]
@@ -31,6 +40,11 @@ struct State {
     /// instant per step. The lens's labelled lower-bound fallback for
     /// steps that never passed through `Ready`.
     step_touched_at: HashMap<String, DateTime<Utc>>,
+    /// The in-memory mirror of the Pg row's `xmin`: the version each
+    /// step row is at, moved by every write ([`touch_step`]) and by no
+    /// read — what a judged write is held to (backlog 6ec22d71).
+    step_version: HashMap<String, i64>,
+    last_step_version: i64,
     /// The in-memory mirror of `jobs.created_at`: the admission
     /// instant, written once in `create_job_at` from the same `now`
     /// the Pg adapter binds into that column. `list_jobs` breaks
@@ -41,17 +55,273 @@ struct State {
     /// The estate as declared through `declare_estate_nodes` — empty
     /// until a test declares one, exactly as a fresh database is.
     estate: Vec<crate::port::EstateNode>,
+    /// Packets whose steps read fails, set by
+    /// [`InMemoryJobs::fail_steps_read`].
+    unreadable_steps: BTreeSet<String>,
+    /// Packets whose close write fails, set by
+    /// [`InMemoryJobs::fail_job_close`].
+    unclosable_jobs: BTreeSet<String>,
+    /// Packets whose own row read fails, set by
+    /// [`InMemoryJobs::fail_job_read`].
+    unreadable_jobs: BTreeSet<String>,
+    /// Packets the next `get_job` does not see yet, set by
+    /// [`InMemoryJobs::miss_next_job_read`].
+    unseen_once: BTreeSet<String>,
+    /// Merges that land the moment a step is next read, set by
+    /// [`InMemoryJobs::merge_after_next_read`].
+    merge_after_read: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Changes that land just before a step's next judged write, set by
+    /// [`InMemoryJobs::change_before_next_judged_write`].
+    change_before_write: HashMap<String, StepChange>,
+    /// Changes that land on a job row the moment it is next read, set
+    /// by [`InMemoryJobs::change_job_after_next_read`].
+    job_change_after_read: HashMap<String, JobChange>,
 }
+
+/// A change another writer lands on a step row (test hook).
+type StepChange = Box<dyn FnOnce(&mut Step) + Send>;
+/// A change another writer lands on a job row (test hook).
+type JobChange = Box<dyn FnOnce(&mut Job) + Send>;
 
 impl InMemoryJobs {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Stamp new steps from `registry`, as the Pg adapter stamps from
+    /// the `step_plugins` table in its own database — pass the same
+    /// registry the test publishes through.
+    pub fn with_step_plugins(
+        mut self,
+        registry: std::sync::Arc<dyn crate::step_plugins::StepPluginRegistry>,
+    ) -> Self {
+        self.step_plugins = Some(registry);
+        self
+    }
+
     /// Events the outbox paths recorded — test visibility (the
     /// in-memory analogue of the Pg adapter's in-tx recording).
     pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
         self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Make every later `list_steps` of this packet fail with a
+    /// storage error — the in-memory stand-in for a steps read the
+    /// database could not answer. It exists so a reader's handling of
+    /// that failure is testable: until 2026-09-23 the station queue and
+    /// load answered it with `unwrap_or_default()`, which read as "this
+    /// packet has no steps" and dropped it from every station whose
+    /// predicate reads step state (backlog c11e9d3c).
+    pub fn fail_steps_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_steps.insert(job_key(job_id));
+        }
+    }
+
+    /// Make every later `close_job_at` of this packet fail with a
+    /// storage error, so a closer's handling of a close it could not
+    /// write is testable: until backlog 29a7ea09 the catch-all close
+    /// discarded that error with `let _ =` and answered 204, leaving a
+    /// packet whose every step was terminal open with nobody told.
+    pub fn fail_job_close(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unclosable_jobs.insert(job_key(job_id));
+        }
+    }
+
+    /// Make every later `get_job` of this packet fail with a storage
+    /// error, so a handler's answer to a packet it could not read is
+    /// testable: the step PUT read it with `.ok().flatten()`, so a
+    /// failed read became "no packet", the protocol gate read no
+    /// protocol, and the step was judged as if it had none (backlog
+    /// 5186c5e1).
+    pub fn fail_job_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_jobs.insert(job_key(job_id));
+        }
+    }
+
+    /// Make the NEXT `get_job` of this packet answer `None` although it
+    /// exists — the read a writer took a moment before another writer's
+    /// admission of the same id committed. The in-memory stand-in for
+    /// two first admissions both passing the create handler's
+    /// existence check (backlog 9d2af748): the one that reaches the
+    /// adapter second must write nothing. One-shot.
+    pub fn miss_next_job_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unseen_once.insert(job_key(job_id));
+        }
+    }
+
+    /// Let another writer change this job row — through `change` — straight
+    /// AFTER its next `get_job` answers: the reader gets the row as it
+    /// stood, and the row moves under it. The job-row twin of
+    /// [`Self::merge_after_next_read`]: the stand-in for a step-driven
+    /// close committing between the job PUT's read and its write (backlog
+    /// 29a7ea09). One-shot.
+    pub fn change_job_after_next_read(
+        &self,
+        job_id: &JobId,
+        change: impl FnOnce(&mut Job) + Send + 'static,
+    ) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .job_change_after_read
+                .insert(job_key(job_id), Box::new(change));
+        }
+    }
+
+    /// Land `patch` on this step's metadata (null removes, as the merge
+    /// door does) straight AFTER its next `get_step` answers — the
+    /// reader gets the row as it stood, and the row moves under it. The
+    /// in-memory stand-in for a merge committing between a
+    /// read-modify-write handler's read and its write, which is how
+    /// run 6b6fe011 lost `prompt_bytes` on 2026-09-25 while both writes
+    /// answered 204 (backlog e381689d). One-shot.
+    pub fn merge_after_next_read(
+        &self,
+        step_id: &StepId,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.merge_after_read.insert(step_key(step_id), patch);
+        }
+    }
+
+    /// Let another writer change this step — ANY column, through `change`
+    /// — just before the next judged write of it
+    /// (`update_step_if_unchanged_at`) is judged: the row moves between
+    /// that writer's read and its write, whichever read it was. The
+    /// stand-in for a claim, an assignment or a completion committing
+    /// inside a read-modify-write's window without touching metadata,
+    /// which a metadata-only compare let through (backlog 6ec22d71).
+    /// Unlike [`Self::merge_after_next_read`] it does not care which
+    /// read the writer took, so it reaches the re-evaluator and the
+    /// terminal close, whose reads are list reads. One-shot.
+    pub fn change_before_next_judged_write(
+        &self,
+        step_id: &StepId,
+        change: impl FnOnce(&mut Step) + Send + 'static,
+    ) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .change_before_write
+                .insert(step_key(step_id), Box::new(change));
+        }
+    }
+
+    /// The one whole-row step write behind both `update_step_at` (`read`
+    /// = `None`) and `update_step_if_unchanged_at` — the Pg adapter's
+    /// `write_step`, judged under this adapter's lock as that one judges
+    /// under its row lock (backlogs e381689d, 6ec22d71).
+    fn write_step(
+        &self,
+        step: &Step,
+        read: Option<StepVersion>,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        let mut state = self.inner.lock().expect("poisoned");
+        let key = step_key(&step.id);
+        if read.is_some()
+            && let Some(change) = state.change_before_write.remove(&key)
+            && let Some(row) = state.steps.get_mut(&key)
+        {
+            // Another writer's write: it moves the version as any does.
+            change(row);
+            bump_version(&mut state, &key);
+        }
+        let Some(existing) = state.steps.get(&key) else {
+            return Err(JobsError::StepNotFound(step.id));
+        };
+        if let Some(read) = read {
+            if version_of(&state, &key) != read {
+                return Err(JobsError::StepChanged { id: step.id });
+            }
+            if matches!(existing.status, StepStatus::Completed | StepStatus::Skipped)
+                && crate::port::terminal_write_moves_frozen(existing, step)
+            {
+                return Err(JobsError::TerminalStep {
+                    id: step.id,
+                    status: format!("{:?}", existing.status).to_lowercase(),
+                });
+            }
+        }
+        // Mirror the SQL adapter: the generic update never writes the
+        // stamp fields — stamps are append-only via append_sign_off,
+        // requirements are set at materialization —
+        // and terminal statuses are immutable at the row, so a write
+        // merged against a stale pre-completion fetch cannot demote.
+        let mut next = step.clone();
+        next.sign_offs = existing.sign_offs.clone();
+        // ...except a VOID, which the write carries onto the row's own
+        // stamps (design 87329a13): the PUT that moves a step's shape
+        // kills its live stamps on its copy, and the row must record
+        // that. `apply_voids` only lands a void, never lifts one, adds
+        // or drops a stamp — the Pg adapter's `write_step`, as Rust. A
+        // terminal row keeps what it completed with.
+        if !matches!(existing.status, StepStatus::Completed | StepStatus::Skipped) {
+            next.apply_voids(&step.sign_offs);
+        }
+        next.sign_offs_required = existing.sign_offs_required.clone();
+        // The SQL UPDATE never names `spec_slug`, and writes `fields`
+        // on a live row while freezing them on a terminal one (a07cfddd).
+        // This adapter did the opposite of both — stored the slug,
+        // froze the fields everywhere — so the two answered one write
+        // two ways (backlog b433bdf3). Now it says what the SQL says.
+        next.spec_slug = existing.spec_slug.clone();
+        // Nor does it name `assurance_required` or `step_plugin_version`:
+        // this adapter stored a body's, so `null` lowered a Presence
+        // step here while Pg kept it (backlog 36352452). A re-pin writes
+        // both through its own statement, never through this one.
+        next.assurance_required = existing.assurance_required;
+        next.step_plugin_version = existing.step_plugin_version;
+        if matches!(existing.status, StepStatus::Completed | StepStatus::Skipped) {
+            next.fields = existing.fields.clone();
+            next.status = existing.status;
+            next.completed_on = existing.completed_on;
+            next.completed_by = existing.completed_by.clone();
+            next.completed_at = existing.completed_at;
+            next.metadata = existing.metadata.clone();
+            // What was completed stays what was completed — the Pg
+            // UPDATE's CASE on the same three (backlog 42e7c6b9).
+            next.title = existing.title.clone();
+            next.assignee_id = existing.assignee_id.clone();
+            next.notes = existing.notes.clone();
+        }
+        // The ready stamp is written once, at the write that lands the
+        // step in Ready, and no later write moves it — the COALESCE in
+        // the Pg adapter's UPDATE.
+        if next.status == StepStatus::Ready {
+            state.step_ready_at.entry(key.clone()).or_insert(now);
+        }
+        touch_step(&mut state, key.clone(), now);
+        state.steps.insert(key, next);
+        drop(state);
+        self.record_all(events);
+        Ok(())
+    }
+
+    /// `step` as this adapter will write it: a `step_plugin_version`
+    /// of 0 takes the active plugin version for its kind, 0 again when
+    /// nothing serves the kind, and a non-zero one is kept — the rule
+    /// the Pg adapter's `active_plugin_version` lookup applies inside
+    /// its step INSERT. Resolved before the state lock, which an await
+    /// must not hold.
+    async fn stamp_plugin_version(&self, step: &Step) -> Result<Step, JobsError> {
+        let mut stamped = step.clone();
+        let Some(registry) = self.step_plugins.as_ref() else {
+            return Ok(stamped);
+        };
+        if stamped.step_plugin_version != 0 {
+            return Ok(stamped);
+        }
+        match registry.get_active(&step.kind).await {
+            Ok(active) => stamped.step_plugin_version = active.version,
+            Err(crate::step_plugins::StepPluginError::NotFound(_)) => {}
+            Err(e) => return Err(JobsError::Storage(e.to_string())),
+        }
+        Ok(stamped)
     }
 
     fn record_all(&self, events: &[boss_core::event::Event]) {
@@ -69,6 +339,26 @@ fn step_key(id: &StepId) -> String {
     id.to_string()
 }
 
+/// Every write to a step row lands here: the `updated_at` mirror, and
+/// the version the Pg adapter's `xmin` is — moved by every write,
+/// whatever column it touched (backlog 6ec22d71).
+fn touch_step(state: &mut State, key: String, now: DateTime<Utc>) {
+    bump_version(state, &key);
+    state.step_touched_at.insert(key, now);
+}
+
+/// A fresh version for this row from one counter, so a version is never
+/// reused — the `xmin` of a transaction that has already committed.
+fn bump_version(state: &mut State, key: &str) {
+    state.last_step_version += 1;
+    let next = state.last_step_version;
+    state.step_version.insert(key.to_string(), next);
+}
+
+fn version_of(state: &State, key: &str) -> StepVersion {
+    StepVersion::new(state.step_version.get(key).copied().unwrap_or(0))
+}
+
 fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     if let Some(ref kind) = filter.kind
         && &job.kind != kind
@@ -84,6 +374,14 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     // packet, the same as the SQL adapter's `kind = ANY('{}')`.
     if let Some(ref kinds) = filter.kinds
         && !kinds.contains(&job.kind)
+    {
+        return false;
+    }
+    // The packet's own department word, else its kind's declaration —
+    // the rule lives on the filter so this adapter and the SQL one's
+    // CASE have one statement of it to be pinned against.
+    if let Some(ref department) = filter.department
+        && !department.keeps(&job.kind, &job.metadata)
     {
         return false;
     }
@@ -206,7 +504,7 @@ fn insert_step_locked(state: &mut State, step: &Step, now: chrono::DateTime<chro
         if step.status == StepStatus::Ready {
             state.step_ready_at.insert(key.clone(), now);
         }
-        state.step_touched_at.insert(key, now);
+        touch_step(state, key, now);
     }
     inserted
 }
@@ -220,7 +518,7 @@ impl JobsRepository for InMemoryJobs {
         now: chrono::DateTime<chrono::Utc>,
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
-    ) -> Result<(), JobsError> {
+    ) -> Result<Admission, JobsError> {
         // Same refusal as the Pg adapter, before the lock: nothing is
         // written for a graph whose events do not pair with its rows.
         if steps.len() != step_events.len() {
@@ -237,8 +535,12 @@ impl JobsRepository for InMemoryJobs {
         // Mirror the Pg replay guard per row: an existing id is a
         // no-op that records nothing — and keeps its original
         // admission instant.
+        let mut stamped = Vec::with_capacity(steps.len());
+        for step in steps {
+            stamped.push(self.stamp_plugin_version(step).await?);
+        }
         let mut recorded = Vec::with_capacity(job_events.len() + step_events.len());
-        {
+        let admission = {
             let mut state = self.inner.lock().expect("poisoned");
             let key = job_key(&job.id);
             let inserted = match state.jobs.entry(key.clone()) {
@@ -248,23 +550,44 @@ impl JobsRepository for InMemoryJobs {
                     true
                 }
             };
+            // The job row decides for the whole graph, as it does in
+            // the Pg adapter (backlog 9d2af748): the steps carry fresh
+            // ids, so an existing packet under this id takes no step
+            // and records nothing.
             if inserted {
                 state.job_created_at.insert(key, now);
                 recorded.extend_from_slice(job_events);
-            }
-            for (step, event) in steps.iter().zip(step_events) {
-                if insert_step_locked(&mut state, step, now) {
-                    recorded.push(event.clone());
+                for (step, event) in stamped.iter().zip(step_events) {
+                    if insert_step_locked(&mut state, step, now) {
+                        recorded.push(event.clone());
+                    }
                 }
+                Admission::Admitted
+            } else {
+                Admission::AlreadyAdmitted
             }
-        }
+        };
         self.record_all(&recorded);
-        Ok(())
+        Ok(admission)
     }
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
-        let state = self.inner.lock().expect("poisoned");
-        Ok(state.jobs.get(&job_key(id)).cloned())
+        let mut state = self.inner.lock().expect("poisoned");
+        if state.unreadable_jobs.contains(&job_key(id)) {
+            return Err(JobsError::Storage(format!(
+                "job {id} unreadable (injected by fail_job_read)"
+            )));
+        }
+        if state.unseen_once.remove(&job_key(id)) {
+            return Ok(None);
+        }
+        let read = state.jobs.get(&job_key(id)).cloned();
+        if let Some(change) = state.job_change_after_read.remove(&job_key(id))
+            && let Some(row) = state.jobs.get_mut(&job_key(id))
+        {
+            change(row);
+        }
+        Ok(read)
     }
 
     async fn resolve_job_id_prefix(&self, prefix: &str) -> Result<Vec<JobId>, JobsError> {
@@ -284,6 +607,7 @@ impl JobsRepository for InMemoryJobs {
     async fn update_job_at(
         &self,
         job: &Job,
+        read: JobStatus,
         _now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
@@ -293,12 +617,32 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
-            // Mirror the Pg adapter: the partition is decided at
-            // admission and immutable — an update carries no
-            // authority over it. The storage enforces this rather
-            // than trusting every caller to.
+            // A finished packet's status does not move, and a finished
+            // row is written only by a writer that read it finished —
+            // the Pg adapter's WHERE clause, mirrored (backlogs 570e72bd,
+            // 29a7ea09).
+            if matches!(existing.status, JobStatus::Closed | JobStatus::Cancelled)
+                && (job.status != existing.status || read != existing.status)
+            {
+                return Err(JobsError::TerminalJob {
+                    id: job.id,
+                    status: format!("{:?}", existing.status).to_lowercase(),
+                });
+            }
+            // Mirror the Pg adapter: the partition and the admission
+            // instant are decided at admission and immutable — an
+            // update carries no authority over either. The storage
+            // enforces this rather than trusting every caller to.
             let mut next = job.clone();
             next.partition = existing.partition;
+            next.opened_at = existing.opened_at;
+            // So are the kind and the version the packet was admitted
+            // under (backlog b433bdf3). This adapter stored the body's
+            // version while the Pg adapter kept its own — the two
+            // disagreed — and both stored the body's kind. A version
+            // moves through `repin_workflow_version_at`, never here.
+            next.kind = existing.kind.clone();
+            next.workflow_version = existing.workflow_version;
             state.jobs.insert(key, next);
         }
         self.record_all(events);
@@ -339,6 +683,77 @@ impl JobsRepository for InMemoryJobs {
         );
         self.record_all(&[event]);
         Ok(merged)
+    }
+
+    async fn close_job_at(
+        &self,
+        id: &JobId,
+        closed_on: chrono::NaiveDate,
+        owned: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<Option<Job>, JobsError> {
+        // Mirror the Pg adapter's one UPDATE: under the lock, only an
+        // open row closes, and only the close's own fields move.
+        let closed = {
+            let mut state = self.inner.lock().expect("poisoned");
+            if state.unclosable_jobs.contains(&job_key(id)) {
+                return Err(JobsError::Storage(format!(
+                    "close of job {id} failed (injected by fail_job_close)"
+                )));
+            }
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            if job.status != JobStatus::Open {
+                return Ok(None);
+            }
+            let mut md = match &job.metadata {
+                serde_json::Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            md.extend(owned.iter().map(|(k, v)| (k.clone(), v.clone())));
+            job.metadata = serde_json::Value::Object(md);
+            job.status = JobStatus::Closed;
+            job.closed_on = Some(closed_on);
+            job.clone()
+        };
+        let mut events = vec![stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&closed).unwrap_or_default(),
+        )];
+        events.extend(markers(&closed));
+        self.record_all(&events);
+        Ok(Some(closed))
+    }
+
+    async fn append_step_correction_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError> {
+        // Under the lock, against the row as it stands — the Pg
+        // adapter's one UPDATE, as Rust.
+        let (job, index) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let (md, index) = crate::corrections::appended(&job.metadata, entry);
+            job.metadata = md;
+            (job.clone(), index)
+        };
+        let updated = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        );
+        let corrected = stamp.event(
+            crate::events::STEP_CORRECTED,
+            crate::corrections::corrected_payload(&id.to_string(), entry, index),
+        );
+        self.record_all(&[updated, corrected]);
+        Ok((job, index))
     }
 
     async fn list_estate_nodes(&self) -> Result<Vec<crate::port::EstateNode>, JobsError> {
@@ -415,28 +830,74 @@ impl JobsRepository for InMemoryJobs {
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &crate::port::EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError> {
+    ) -> Result<crate::port::EventPage, JobsError> {
         // `recorded` is append-order, so newest-first is a reverse —
         // the same ordering contract the Pg impl gets from
         // `ORDER BY timestamp DESC`.
         //
-        // ORDER MATTERS: both filters run BEFORE `take`, mirroring a
+        // ORDER MATTERS: every filter runs BEFORE `take`, mirroring a
         // WHERE clause preceding its LIMIT. Taking first and filtering
-        // after would reproduce the very defect this argument exists to
+        // after would reproduce the very defect these arguments exist to
         // fix, and would do it only in this adapter — a divergence the
         // Pg pairing test in estate_readers_pg.rs is there to catch.
-        let rows = self
+        // `total` is counted over the same filtered set, before `take`.
+        let matched: Vec<boss_core::event::Event> = self
             .recorded_events()
             .into_iter()
             .rev()
             .filter(|e| e.kind == kind)
             .filter(|e| {
-                scope.is_none_or(|want| {
+                window.scope.as_deref().is_none_or(|want| {
                     e.payload.get("scope").and_then(|s| s.as_str()) == Some(want)
                 })
             })
+            // The row's host as the SQL's COALESCE reads it: its `host`
+            // stamp, else its first node's id (111996f5).
+            .filter(|e| {
+                window.host.as_deref().is_none_or(|want| {
+                    let text = |v: &serde_json::Value| match v {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    };
+                    let host = e
+                        .payload
+                        .get("host")
+                        .and_then(text)
+                        .or_else(|| e.payload.pointer("/nodes/0/id").and_then(text));
+                    host.as_deref() == Some(want)
+                })
+            })
+            .filter(|e| window.since.is_none_or(|since| e.timestamp >= since))
+            .filter(|e| window.until.is_none_or(|until| e.timestamp < until))
+            .collect();
+        // `latest_per` (backlog 725532ab): the first row of each group
+        // is its newest, because `matched` is already newest-first —
+        // and it runs before `take`, as `DISTINCT ON` runs before the
+        // Pg LIMIT. The group is the key's value as `->>` reads it: a
+        // JSON null or an absent key is the one NULL group.
+        let matched: Vec<boss_core::event::Event> = match window.latest_per.as_deref() {
+            None => matched,
+            Some(key) => {
+                let mut seen = std::collections::HashSet::new();
+                matched
+                    .into_iter()
+                    .filter(|e| {
+                        let group = match e.payload.get(key) {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(serde_json::Value::String(s)) => Some(s.clone()),
+                            Some(other) => Some(other.to_string()),
+                        };
+                        seen.insert(group)
+                    })
+                    .collect()
+            }
+        };
+        let total = matched.len() as i64;
+        let rows = matched
+            .into_iter()
             .take(limit.max(0) as usize)
             .map(|e| {
                 serde_json::json!({
@@ -448,7 +909,7 @@ impl JobsRepository for InMemoryJobs {
                 })
             })
             .collect();
-        Ok(rows)
+        Ok(crate::port::EventPage { rows, total })
     }
 
     async fn step_flow_cube(
@@ -548,23 +1009,85 @@ impl JobsRepository for InMemoryJobs {
         &self,
         id: &JobId,
         to_version: i32,
+        plan: &crate::repin::RepinPlan,
+        record: &serde_json::Value,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
-        // One column, under the lock, and the event carries the row as
-        // it stands afterwards — same shape as the metadata merge above.
-        let repinned = {
+        // The whole move under one lock — the Pg adapter's transaction,
+        // as Rust — and every event built from the rows as they stand
+        // afterwards.
+        let (repinned, rewritten, inserted, invalidated) = {
             let mut state = self.inner.lock().expect("poisoned");
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
             job.workflow_version = to_version;
-            job.clone()
+            job.metadata = crate::repin::appended(&job.metadata, record);
+            let repinned = job.clone();
+            let mut rewritten = Vec::new();
+            let mut invalidated = Vec::new();
+            for r in &plan.reprojected {
+                let key = step_key(&r.step.id);
+                let Some(stored) = state.steps.get(&key) else {
+                    return Err(JobsError::StepNotFound(r.step.id));
+                };
+                // A row that finished since the plan was read keeps what
+                // it ran under; only its place in the list moves.
+                let next = if matches!(stored.status, StepStatus::Completed | StepStatus::Skipped) {
+                    Step {
+                        sort_order: r.step.sort_order,
+                        ..stored.clone()
+                    }
+                } else {
+                    // A re-projection that moves an open step's text moves
+                    // its shape, and kills its live stamps like any edit
+                    // (design 87329a13) — or a move to another version
+                    // and back would revive them.
+                    let mut next = Step {
+                        status: stored.status,
+                        sign_offs: stored.sign_offs.clone(),
+                        ..r.step.clone()
+                    };
+                    let before = stored.shape_hash();
+                    invalidated.extend(crate::events::void_stamps_if_moved(
+                        stamp, &before, &mut next,
+                    ));
+                    next
+                };
+                touch_step(&mut state, key.clone(), stamp.timestamp);
+                state.steps.insert(key, next.clone());
+                rewritten.push(next);
+            }
+            let inserted: Vec<Step> = plan
+                .inserted
+                .iter()
+                .filter(|s| insert_step_locked(&mut state, s, stamp.timestamp))
+                .cloned()
+                .collect();
+            (repinned, rewritten, inserted, invalidated)
         };
-        let event = stamp.event(
+        let mut events = vec![stamp.event(
             crate::events::JOB_UPDATED,
             serde_json::to_value(&repinned).unwrap_or_default(),
-        );
-        self.record_all(&[event]);
+        )];
+        events.extend(rewritten.iter().map(|s| {
+            stamp.event(
+                crate::events::STEP_UPDATED,
+                crate::events::step_state_payload(s),
+            )
+        }));
+        events.extend(invalidated);
+        events.extend(inserted.iter().map(|s| {
+            stamp.event(
+                crate::events::STEP_CREATED,
+                crate::events::step_state_payload(s),
+            )
+        }));
+        events.push(stamp.event(
+            crate::events::JOB_REPINNED,
+            crate::repin::repinned_payload(&id.to_string(), record),
+        ));
+        self.record_all(&events);
         Ok(repinned)
     }
 
@@ -612,9 +1135,10 @@ impl JobsRepository for InMemoryJobs {
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
+        let step = self.stamp_plugin_version(step).await?;
         let inserted = {
             let mut state = self.inner.lock().expect("poisoned");
-            insert_step_locked(&mut state, step, now)
+            insert_step_locked(&mut state, &step, now)
         };
         if inserted {
             self.record_all(events);
@@ -623,48 +1147,56 @@ impl JobsRepository for InMemoryJobs {
     }
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError> {
-        let state = self.inner.lock().expect("poisoned");
-        Ok(state.steps.get(&step_key(id)).cloned())
+        Ok(self.get_step_versioned(id).await?.map(|(step, _)| step))
     }
 
+    async fn get_step_versioned(
+        &self,
+        id: &StepId,
+    ) -> Result<Option<(Step, StepVersion)>, JobsError> {
+        let mut state = self.inner.lock().expect("poisoned");
+        let key = step_key(id);
+        let read = state
+            .steps
+            .get(&key)
+            .cloned()
+            .map(|s| (s, version_of(&state, &key)));
+        if let Some(patch) = state.merge_after_read.remove(&key)
+            && let Some(row) = state.steps.get_mut(&key)
+        {
+            let mut md = row.metadata.as_object().cloned().unwrap_or_default();
+            for (k, v) in patch {
+                if v.is_null() {
+                    md.remove(&k);
+                } else {
+                    md.insert(k, v);
+                }
+            }
+            row.metadata = serde_json::Value::Object(md);
+            // The merge door's write, so it moves the version as one.
+            bump_version(&mut state, &key);
+        }
+        Ok(read)
+    }
+
+    #[cfg(feature = "test-support")]
     async fn update_step_at(
         &self,
         step: &Step,
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut state = self.inner.lock().expect("poisoned");
-        let key = step_key(&step.id);
-        let Some(existing) = state.steps.get(&key) else {
-            return Err(JobsError::StepNotFound(step.id));
-        };
-        // Mirror the SQL adapter: the generic update never writes the
-        // stamp fields — stamps are append-only via append_sign_off,
-        // requirements are set at materialization —
-        // and terminal statuses are immutable at the row, so a write
-        // merged against a stale pre-completion fetch cannot demote.
-        let mut next = step.clone();
-        next.sign_offs = existing.sign_offs.clone();
-        next.sign_offs_required = existing.sign_offs_required.clone();
-        next.fields = existing.fields.clone();
-        if matches!(existing.status, StepStatus::Completed | StepStatus::Skipped) {
-            next.status = existing.status;
-            next.completed_on = existing.completed_on;
-            next.completed_by = existing.completed_by.clone();
-            next.completed_at = existing.completed_at;
-            next.metadata = existing.metadata.clone();
-        }
-        // The ready stamp is written once, at the write that lands the
-        // step in Ready, and no later write moves it — the COALESCE in
-        // the Pg adapter's UPDATE.
-        if next.status == StepStatus::Ready {
-            state.step_ready_at.entry(key.clone()).or_insert(now);
-        }
-        state.step_touched_at.insert(key.clone(), now);
-        state.steps.insert(key, next);
-        drop(state);
-        self.record_all(events);
-        Ok(())
+        self.write_step(step, None, now, events)
+    }
+
+    async fn update_step_if_unchanged_at(
+        &self,
+        step: &Step,
+        read: StepVersion,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        self.write_step(step, Some(read), now, events)
     }
 
     async fn merge_step_metadata_at(
@@ -676,8 +1208,10 @@ impl JobsRepository for InMemoryJobs {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no other field moves, a terminal
         // row refuses rather than silently freezing, and the
-        // STEP_UPDATED event is built from the post-merge row.
-        let merged = {
+        // STEP_UPDATED event is built from the post-merge row — with
+        // the stamps a moved shape killed voided on it, and their
+        // invalidation event recorded after it (design 87329a13).
+        let (merged, invalidated) = {
             let mut state = self.inner.lock().expect("poisoned");
             let key = step_key(id);
             let Some(step) = state.steps.get_mut(&key) else {
@@ -700,36 +1234,50 @@ impl JobsRepository for InMemoryJobs {
                     md.insert(k.clone(), v.clone());
                 }
             }
+            let shape_before = step.shape_hash();
             step.metadata = serde_json::Value::Object(md);
+            let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, step);
             let merged = step.clone();
             // Mirrors the SQL's `updated_at = stamp.timestamp`.
-            state.step_touched_at.insert(key, stamp.timestamp);
-            merged
+            touch_step(&mut state, key, stamp.timestamp);
+            (merged, invalidated)
         };
         let event = stamp.event(
             crate::events::STEP_UPDATED,
             crate::events::step_state_payload(&merged),
         );
         self.record_all(&[event]);
+        self.record_all(invalidated.as_slice());
         Ok(merged)
     }
 
-    async fn claim_step_at(
+    async fn claim_step_displacing_at(
         &self,
         step_id: &StepId,
         actor: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<Step, JobsError> {
-        let claimed = {
+        let (claimed, invalidated) = {
             let mut state = self.inner.lock().expect("poisoned");
             let key = step_key(step_id);
             let Some(existing) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*step_id));
             };
+            // Exact spelling only: no alias admission here, unlike the
+            // Pg adapter — the port doc on `claim_step_at` states the
+            // gap (backlog 28dcc735).
             let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
+            // A Ready step held by a holder the route named displaceable
+            // is free to this claim (backlog 5d1c0b7a) — the same rule
+            // as the Pg WHERE clause, by exact spelling in both.
+            let displaced = existing
+                .assignee_id
+                .as_ref()
+                .is_some_and(|h| displaceable.contains(h));
             let claimable = existing.status == StepStatus::Ready
-                && (existing.assignee_id.is_none() || held_by_actor);
+                && (existing.assignee_id.is_none() || held_by_actor || displaced);
             let idempotent = existing.status == StepStatus::Active && held_by_actor;
             if !claimable && !idempotent {
                 return Err(JobsError::ClaimConflict {
@@ -737,15 +1285,28 @@ impl JobsRepository for InMemoryJobs {
                     status: format!("{:?}", existing.status).to_lowercase(),
                 });
             }
+            // A new holder does not inherit the previous run's edge
+            // (9562f6df). No alias table here, so the holder is `actor`
+            // exactly — the Pg adapter admits its aliases too.
+            let shape_before = existing.shape_hash();
+            if crate::agent_runs::claim_changes_holder(existing.assignee_id.as_deref(), actor, &[])
+            {
+                existing.metadata = crate::agent_runs::without_edge(&existing.metadata);
+            }
             existing.assignee_id = Some(actor.to_string());
             existing.status = StepStatus::Active;
+            // The edge is inside the shape, so dropping it is an edit of
+            // the signed content, and it voids like one (backlog
+            // 4174c4a9) — or writing the edge back would revive them.
+            let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, existing);
             let claimed = existing.clone();
             // A claim bumps `updated_at` in the Pg adapter; the ready
             // stamp, already written at the flip, stays put.
-            state.step_touched_at.insert(key, now);
-            claimed
+            touch_step(&mut state, key, stamp.timestamp);
+            (claimed, invalidated)
         };
         self.record_all(events);
+        self.record_all(invalidated.as_slice());
         Ok(claimed)
     }
 
@@ -753,19 +1314,45 @@ impl JobsRepository for InMemoryJobs {
         &self,
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
-        now: chrono::DateTime<chrono::Utc>,
+        event_stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        {
+        let written = {
             let mut state = self.inner.lock().expect("poisoned");
             let key = step_key(step_id);
             let Some(existing) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*step_id));
             };
+            // The stamp lands only on the shape it signs, judged under
+            // the lock the push writes through (backlog 4174c4a9).
+            let current = existing.shape_hash();
+            if current != stamp.shape_hash {
+                return Err(JobsError::StampOffShape {
+                    id: *step_id,
+                    signed: stamp.shape_hash.clone(),
+                    current,
+                });
+            }
+            // A ticket stamps its step once (backlog 3977b3d2): its
+            // nonce on any stamp here, live or voided, is a replay.
+            if let Some(nonce) = spent_nonce(&existing.sign_offs, stamp) {
+                return Err(JobsError::NonceSpent {
+                    id: *step_id,
+                    nonce,
+                });
+            }
             existing.sign_offs.push(stamp.clone());
+            let written = existing.clone();
             // Mirrors the sign-off UPDATE's `updated_at = $3`.
-            state.step_touched_at.insert(key, now);
-        }
+            touch_step(&mut state, key, event_stamp.timestamp);
+            written
+        };
+        // The row as the append left it, recorded before the caller's
+        // marker — the Pg adapter's order (backlog f146a13a).
+        self.record_all(&[event_stamp.event(
+            crate::events::STEP_UPDATED,
+            crate::events::step_state_payload(&written),
+        )]);
         self.record_all(events);
         Ok(())
     }
@@ -775,16 +1362,40 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    /// This adapter holds no step-plugin registry, so no plugin serves
+    /// any kind: 0, which is what its step insert stores (backlog
+    /// aba364fe).
+    async fn active_step_plugin_version(&self, _kind: &str) -> Result<i32, JobsError> {
+        Ok(0)
+    }
+
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError> {
+        Ok(self
+            .list_steps_versioned(job_id)
+            .await?
+            .into_iter()
+            .map(|(step, _)| step)
+            .collect())
+    }
+
+    async fn list_steps_versioned(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Vec<(Step, StepVersion)>, JobsError> {
         let state = self.inner.lock().expect("poisoned");
         let job_key = job_id.to_string();
-        let mut steps: Vec<Step> = state
+        if state.unreadable_steps.contains(&job_key) {
+            return Err(JobsError::Storage(format!(
+                "steps of job {job_key} unreadable (injected by fail_steps_read)"
+            )));
+        }
+        let mut steps: Vec<(Step, StepVersion)> = state
             .steps
-            .values()
-            .filter(|s| s.job_id.to_string() == job_key)
-            .cloned()
+            .iter()
+            .filter(|(_, s)| s.job_id.to_string() == job_key)
+            .map(|(key, s)| (s.clone(), version_of(&state, key)))
             .collect();
-        steps.sort_by_key(|s| s.sort_order);
+        steps.sort_by_key(|(s, _)| s.sort_order);
         Ok(steps)
     }
 
@@ -885,141 +1496,48 @@ impl JobsRepository for InMemoryJobs {
         Ok(n as i64)
     }
 
+    async fn jobs_pinned_to_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<crate::port::PinnedJobs, JobsError> {
+        let state = self.inner.lock().expect("poisoned");
+        let pinned: Vec<JobId> = state
+            .jobs
+            .values()
+            .filter(|j| j.kind == kind && j.workflow_version == version)
+            .map(|j| j.id)
+            .collect();
+        // The lowest UUID, as the Pg adapter's ORDER BY id picks it.
+        let first = pinned
+            .iter()
+            .min_by_key(|id| *id.inner().as_uuid())
+            .copied();
+        Ok(crate::port::PinnedJobs {
+            count: pinned.len() as i64,
+            first,
+        })
+    }
+
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,
+        scope: &JobScope,
     ) -> Result<Vec<(String, i64)>, JobsError> {
+        // Status + scope through `matches_filter`, so these counts and
+        // `list_jobs`'s totals cannot disagree about whose packets they
+        // are (CLAUDE.md §9a — one definition of the scope rule).
+        let filter = JobFilter {
+            status,
+            scope: scope.clone(),
+            ..Default::default()
+        };
         let state = self.inner.lock().expect("poisoned");
         let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-        for job in state.jobs.values() {
-            if let Some(want) = status
-                && job.status != want
-            {
-                continue;
-            }
+        for job in state.jobs.values().filter(|j| matches_filter(j, &filter)) {
             *counts.entry(job.kind.clone()).or_insert(0) += 1;
         }
         Ok(counts.into_iter().collect())
-    }
-
-    async fn jobs_tier_distribution(
-        &self,
-        status: Option<JobStatus>,
-    ) -> Result<Vec<(String, i32, i64)>, JobsError> {
-        let state = self.inner.lock().expect("poisoned");
-        let mut counts: std::collections::BTreeMap<(String, i32), i64> =
-            std::collections::BTreeMap::new();
-        for job in state.jobs.values() {
-            if let Some(want) = status
-                && job.status != want
-            {
-                continue;
-            }
-            let min_pending = state
-                .steps
-                .values()
-                .filter(|s| s.job_id.to_string() == job.id.to_string())
-                .filter(|s| {
-                    // Tier = lowest sort_order still awaiting work
-                    // (non-terminal). v2 has no Blocked.
-                    matches!(
-                        s.status,
-                        StepStatus::Pending | StepStatus::Ready | StepStatus::Active,
-                    )
-                })
-                .map(|s| s.sort_order)
-                .min();
-            let tier = min_pending.unwrap_or(-1);
-            *counts.entry((job.kind.clone(), tier)).or_insert(0) += 1;
-        }
-        Ok(counts
-            .into_iter()
-            .map(|((kind, tier), n)| (kind, tier, n))
-            .collect())
-    }
-
-    async fn list_launch_calendar(
-        &self,
-        from: chrono::NaiveDate,
-        to: chrono::NaiveDate,
-    ) -> Result<Vec<LaunchCalendarRow>, JobsError> {
-        use boss_core::primitives::Subject as _;
-        let state = self.inner.lock().expect("poisoned");
-        let mut out = Vec::new();
-        for job in state.jobs.values() {
-            if job.kind != "marketing-motion" {
-                continue;
-            }
-            if matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) {
-                continue;
-            }
-
-            // Tier = min sort_order of any non-done step, or -1.
-            let (tier, launch_step) = state.steps.values().filter(|s| s.job_id == job.id).fold(
-                (None::<i32>, None::<&Step>),
-                |(tier, launch), s| {
-                    let new_tier = if matches!(
-                        s.status,
-                        StepStatus::Pending | StepStatus::Ready | StepStatus::Active,
-                    ) {
-                        Some(tier.map_or(s.sort_order, |t| t.min(s.sort_order)))
-                    } else {
-                        tier
-                    };
-                    // property, not kind: the launch step is whichever
-                    // step carries launch_date (no-step-kind-match rule)
-                    let new_launch = if s.metadata.get("launch_date").is_some() {
-                        Some(s)
-                    } else {
-                        launch
-                    };
-                    (new_tier, new_launch)
-                },
-            );
-            let current_tier = Some(tier.unwrap_or(-1));
-
-            let (launch_date, launch_channel) = match launch_step {
-                Some(s) => {
-                    let d = s
-                        .metadata
-                        .get("launch_date")
-                        .and_then(|v| v.as_str())
-                        .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok());
-                    let c = s
-                        .metadata
-                        .get("launch_channel")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (d, c)
-                }
-                None => (None, None),
-            };
-
-            if let Some(d) = launch_date
-                && (d < from || d > to)
-            {
-                continue;
-            }
-
-            let subject_id = Some(job.subject.id().to_string());
-
-            out.push(LaunchCalendarRow {
-                job_id: job.id,
-                title: job.title.clone(),
-                owner_id: Some(job.owner_id.clone()),
-                subject_id,
-                status: job.status,
-                current_tier,
-                launch_date,
-                launch_channel,
-            });
-        }
-        out.sort_by(|a, b| {
-            a.launch_date
-                .cmp(&b.launch_date)
-                .then(a.title.cmp(&b.title))
-        });
-        Ok(out)
     }
 
     async fn resolve_blockers(
@@ -1077,26 +1595,21 @@ pub fn blockers_satisfied(statuses: &[(StepId, StepStatus)]) -> bool {
 /// Compute the job status from its steps.
 ///
 /// v2 has no per-step Blocked state, so a Job is `Open` until every
-/// step reaches a terminal state (`Completed` / `Skipped`), at which
-/// point it's `Closed` (or `PendingSignOff` if a completed step still
-/// awaits sign-off). External pauses are a dispatcher concern, not a
-/// derived status here.
+/// step reaches a terminal state (`Completed` / `Skipped`) with every
+/// sign-off it requires collected, at which point it's `Closed`.
+/// External pauses are a dispatcher concern, not a derived status here.
 pub fn compute_job_status(steps: &[Step]) -> JobStatus {
-    if steps.is_empty() {
-        return JobStatus::Open;
-    }
     let all_terminal = steps
         .iter()
         .all(|s| matches!(s.status, StepStatus::Completed | StepStatus::Skipped));
-    if all_terminal {
-        // Defensive: completion validation refuses to complete a step
-        // with unsatisfied stamps, so this state should be unreachable
-        // under the sign-off contract; kept while the PendingSignOff
-        // status exists.
-        let unsigned = steps.iter().any(|s| !s.sign_offs_satisfied());
-        if unsigned {
-            return JobStatus::PendingSignOff;
-        }
+    // An outstanding sign-off keeps the Job `Open`, never `Closed`.
+    // Completion validation refuses to complete a step with
+    // unsatisfied stamps, so this arm is defensive; it answered
+    // `PendingSignOff` until that status was retired (backlog
+    // 3c3dc8f3), and open is the live status that says the same thing
+    // — the Job is not done.
+    let signed = steps.iter().all(|s| s.sign_offs_satisfied());
+    if !steps.is_empty() && all_terminal && signed {
         return JobStatus::Closed;
     }
     JobStatus::Open
@@ -1109,6 +1622,7 @@ mod tests {
     use chrono::{NaiveDate, TimeZone};
 
     use super::*;
+    use crate::port::DepartmentFilter;
 
     fn test_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 4, 16).unwrap()
@@ -1204,6 +1718,45 @@ mod tests {
     /// tests/postgres_filter.rs. Both assert the total, because a
     /// total that disagrees with the rows is the failure this exists
     /// to remove.
+    /// Backlog ce8b7d66: the pin count the draft-discard route refuses
+    /// on counts EVERY status (a closed packet ran under that text) and
+    /// names the lowest id — the same packet the Pg adapter names
+    /// (`a_workflow_version_number_is_never_reused_pg.rs`).
+    #[tokio::test]
+    async fn the_pin_count_names_every_packet_on_the_pair() {
+        let repo = InMemoryJobs::new();
+        let open = make_job("intake-review").with_workflow_version(4);
+        let mut closed = make_job("intake-review").with_workflow_version(4);
+        closed.status = JobStatus::Closed;
+        repo.create_job(&open).await.unwrap();
+        repo.create_job(&closed).await.unwrap();
+        repo.create_job(&make_job("intake-review").with_workflow_version(3))
+            .await
+            .unwrap();
+        repo.create_job(&make_job("exit-review").with_workflow_version(4))
+            .await
+            .unwrap();
+
+        let pinned = repo
+            .jobs_pinned_to_workflow("intake-review", 4)
+            .await
+            .unwrap();
+        assert_eq!(pinned.count, 2);
+        let lowest = if open.id.to_string() < closed.id.to_string() {
+            open.id
+        } else {
+            closed.id
+        };
+        assert_eq!(pinned.first, Some(lowest));
+
+        let none = repo
+            .jobs_pinned_to_workflow("intake-review", 9)
+            .await
+            .unwrap();
+        assert_eq!(none.count, 0);
+        assert!(none.first.is_none());
+    }
+
     fn make_job_with(kind: &str, metadata: serde_json::Value) -> Job {
         let mut j = make_job(kind);
         j.metadata = metadata;
@@ -1302,6 +1855,122 @@ mod tests {
         assert_eq!(got.status, JobStatus::Open);
     }
 
+    /// Backlog 29a7ea09, the shape measured on car 6b23d135: two closers
+    /// both read the packet open, a third writer merges a key, the
+    /// terminal close lands, and the catch-all close — whose copy of
+    /// the row predates both — lands after it. The close writes only
+    /// what it owns, so the merged key survives the first close, and
+    /// the second close finds the row no longer open and writes
+    /// nothing, so the outcome survives the second.
+    #[tokio::test]
+    async fn a_close_keeps_a_key_merged_after_the_closers_read_the_row() {
+        let repo = InMemoryJobs::new();
+        let mut job = make_job_with("ship-a-change", serde_json::json!({ "branch": "fix/x" }));
+        job.status = JobStatus::Open;
+        repo.create_job(&job).await.unwrap();
+
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("test".into()),
+        );
+        let obj = |v: serde_json::Value| match v {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!("test patches are objects"),
+        };
+        // Between the closers' reads and their writes.
+        repo.merge_job_metadata_at(
+            &job.id,
+            &obj(serde_json::json!({ "merged_sha": "abc123" })),
+            &stamp,
+        )
+        .await
+        .unwrap();
+
+        let marker = |j: &Job| {
+            vec![stamp.event(
+                crate::events::JOB_CLOSED,
+                serde_json::json!({ "id": j.id.to_string(), "outcome": j.metadata.get("outcome") }),
+            )]
+        };
+        let first_day = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let closed = repo
+            .close_job_at(
+                &job.id,
+                first_day,
+                &obj(serde_json::json!({
+                    "outcome": "disproved",
+                    "closed_at": "2026-09-24T22:18:10.556307Z",
+                })),
+                &stamp,
+                &marker,
+            )
+            .await
+            .unwrap()
+            .expect("an open packet closes");
+        assert_eq!(closed.status, JobStatus::Closed);
+        assert_eq!(closed.closed_on, Some(first_day));
+        assert_eq!(closed.metadata["outcome"], "disproved");
+        assert_eq!(
+            closed.metadata["merged_sha"], "abc123",
+            "a key merged after the closer read the row must survive the close: {:#}",
+            closed.metadata
+        );
+        assert_eq!(closed.metadata["branch"], "fix/x");
+
+        let events_before = repo.recorded_events().len();
+        let second = repo
+            .close_job_at(
+                &job.id,
+                NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+                &obj(serde_json::json!({ "closed_at": "2026-09-24T22:18:10.586476Z" })),
+                &stamp,
+                &marker,
+            )
+            .await
+            .unwrap();
+        assert!(second.is_none(), "a closed packet does not close twice");
+        assert_eq!(
+            repo.recorded_events().len(),
+            events_before,
+            "the losing close records nothing"
+        );
+
+        let stored = repo.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.closed_on, Some(first_day));
+        assert_eq!(stored.metadata["outcome"], "disproved");
+        assert_eq!(stored.metadata["merged_sha"], "abc123");
+        assert_eq!(stored.metadata["closed_at"], "2026-09-24T22:18:10.556307Z");
+
+        // The state event is the post-close row, the marker is built
+        // from it, in that order.
+        let recorded = repo.recorded_events();
+        let tail: Vec<&str> = recorded[recorded.len() - 2..]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            [crate::events::JOB_UPDATED, crate::events::JOB_CLOSED]
+        );
+        let updated = &recorded[recorded.len() - 2].payload;
+        assert_eq!(updated["status"], "closed");
+        assert_eq!(updated["metadata"]["merged_sha"], "abc123");
+        assert_eq!(recorded[recorded.len() - 1].payload["outcome"], "disproved");
+
+        let missing = make_job("ship-a-change");
+        let err = repo
+            .close_job_at(
+                &missing.id,
+                first_day,
+                &obj(serde_json::json!({})),
+                &stamp,
+                &marker,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JobsError::NotFound(_)), "got: {err}");
+    }
+
     #[tokio::test]
     async fn update_unknown_job_errors() {
         let repo = InMemoryJobs::new();
@@ -1371,6 +2040,65 @@ mod tests {
         };
         let (_, total) = repo.list_jobs(&both, 100, 0).await.unwrap();
         assert_eq!(total, 0);
+    }
+
+    /// `department` keeps the packets IN one department: the packet's
+    /// own `metadata.department` when it names one, else its kind's
+    /// declaration (backlog 481d7939 — retros and page-audits name
+    /// their department and their kinds declare none). The same legs
+    /// run against the Postgres adapter in `tests/postgres_filter.rs`.
+    #[tokio::test]
+    async fn department_keeps_what_a_packet_names_else_what_its_kind_declares() {
+        let repo = InMemoryJobs::new();
+        let named = |kind: &str, dept: serde_json::Value| {
+            let mut j = make_job(kind);
+            j.metadata = serde_json::json!({ "department": dept });
+            j
+        };
+        for j in [
+            make_job("receive-a-payout"),                    // kind declares finance
+            named("department-retro", "finance".into()),     // names finance
+            named("page-audit", "warehouse".into()),         // names warehouse
+            named("receive-a-payout", "sales".into()),       // its own word wins
+            named("receive-a-payout", "".into()),            // "" names nothing
+            named("receive-a-payout", serde_json::json!(7)), // a non-string names nothing
+            named("backlog-item", serde_json::Value::Null),  // nothing, kind declares nothing
+        ] {
+            repo.create_job(&j).await.unwrap();
+        }
+        let dept = |code: &str, kinds: &[&str]| JobFilter {
+            department: Some(DepartmentFilter {
+                code: code.into(),
+                declaring_kinds: kinds.iter().map(|k| k.to_string()).collect(),
+            }),
+            ..Default::default()
+        };
+
+        let (_, total) = repo
+            .list_jobs(&dept("finance", &["receive-a-payout"]), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            total, 4,
+            "the plain payout, the finance retro, and the two naming no word"
+        );
+
+        let (jobs, total) = repo
+            .list_jobs(&dept("warehouse", &[]), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "no kind declares warehouse; one packet names it");
+        assert_eq!(jobs[0].kind, "page-audit");
+
+        let (jobs, total) = repo.list_jobs(&dept("sales", &[]), 100, 0).await.unwrap();
+        assert_eq!(total, 1, "a packet's own word beats its kind's");
+        assert_eq!(jobs[0].kind, "receive-a-payout");
+
+        let (_, total) = repo
+            .list_jobs(&dept("no-such-department-zz", &[]), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0, "nothing names or declares it: none, not all");
     }
 
     // `opened_on` is a DATE. On 2026-09-07 one day held 398 closed
@@ -1801,8 +2529,10 @@ mod tests {
             Step::new(job_id, "generic", "QA", 0).with_sign_offs_required(vec!["qa-lead".into()]);
         s.status = StepStatus::Completed;
         // no stamp collected — sign-off outstanding (defensive state;
-        // completion validation normally prevents reaching this)
-        assert_eq!(compute_job_status(&[s]), JobStatus::PendingSignOff);
+        // completion validation normally prevents reaching this). The
+        // Job is not done, so it stays open; it read `PendingSignOff`
+        // until that status was retired (backlog 3c3dc8f3).
+        assert_eq!(compute_job_status(&[s]), JobStatus::Open);
     }
 
     #[test]
@@ -1839,9 +2569,9 @@ mod tests {
         let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
 
         let mut live = make_job("user-feedback");
-        // Blocked, not Open: live is live regardless of age, and this
+        // Draft, not Open: live is live regardless of age, and this
         // is the half of the rule a bare `closed_on >= x` deletes.
-        live.status = JobStatus::Blocked;
+        live.status = JobStatus::Draft;
         let mut recent = make_job("user-feedback");
         recent.status = JobStatus::Closed;
         recent.closed_on = Some(d(8, 14));
@@ -1944,5 +2674,189 @@ mod tests {
         let (rows, _) = repo.list_jobs(&only_open, 100, 0).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, open.id);
+    }
+
+    /// THE IN-MEMORY CLAIM HAS NO ALIAS NOTION, AND SAYS SO (backlog
+    /// 28dcc735). The Pg claim admits a holder spelled by any alias of
+    /// the claimant (`actor_aliases`, backlog d7fef617); this adapter
+    /// has no alias source and compares spellings exactly. Giving it
+    /// one would mint a second identity registry to keep in step with
+    /// the table, so the port doc states the rule as adapter-scoped
+    /// instead, and this test pins the gap the doc names: the day this
+    /// adapter learns aliases, this fails and the port doc changes
+    /// with it.
+    #[tokio::test]
+    async fn an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source() {
+        let repo = InMemoryJobs::default();
+        let job = make_job("backlog-item");
+        repo.create_job(&job).await.unwrap();
+        let mut step =
+            Step::new(job.id, "task", "Build it", 0).with_assignee("claude@algedonic.dev");
+        step.status = StepStatus::Ready;
+        repo.add_step(&step).await.unwrap();
+
+        let refused = repo
+            .claim_step_at(
+                &step.id,
+                "agent-claude",
+                &boss_core::publisher::EventStamp::new(
+                    "jobs",
+                    boss_core::actor::ActorId::automation("test"),
+                ),
+                &[],
+            )
+            .await;
+        match refused {
+            Err(JobsError::ClaimConflict { holder, status }) => {
+                assert_eq!(holder.as_deref(), Some("claude@algedonic.dev"));
+                assert_eq!(status, "ready");
+            }
+            other => panic!("the in-memory claim must refuse an aliased holder, got {other:?}"),
+        }
+    }
+
+    /// The port doc is the contract a THIRD adapter is written against,
+    /// so the alias rule the Pg adapter enforces must be in it, scoped
+    /// to that adapter, with both pins named (backlog 28dcc735: until
+    /// then it described neither adapter fully). `include_str!` of the
+    /// Pg test makes a renamed or deleted pin a compile error here
+    /// rather than a dangling name in prose.
+    #[test]
+    fn the_port_doc_states_the_alias_rule_and_names_both_pins() {
+        const PORT: &str = include_str!("port.rs");
+        const PG_PIN: &str = include_str!("../tests/step_claim_admits_an_aliased_holder_pg.rs");
+        let end = PORT
+            .find("    async fn claim_step_at(")
+            .expect("the port declares claim_step_at");
+        let doc: Vec<&str> = PORT[..end]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect();
+        let doc = doc.into_iter().rev().collect::<Vec<_>>().join("\n");
+        for needle in [
+            "actor_aliases",
+            "step_claim_admits_an_aliased_holder_pg",
+            "an_aliased_holder_is_refused_in_memory_because_it_has_no_alias_source",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "the claim_step_at port doc must name {needle}; it reads:\n{doc}"
+            );
+        }
+        assert!(
+            PG_PIN.contains("fn a_claim_as_the_registered_id_takes_a_step_held_by_its_alias"),
+            "the Pg pin the port doc names must still hold the admission test"
+        );
+    }
+
+    /// The `///` block directly above `decl` in the port.
+    fn port_doc_above(decl: &str) -> String {
+        const PORT: &str = include_str!("port.rs");
+        let end = PORT
+            .find(decl)
+            .unwrap_or_else(|| panic!("the port declares {decl}"));
+        let doc: Vec<&str> = PORT[..end]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect();
+        doc.into_iter().rev().collect::<Vec<_>>().join("\n")
+    }
+
+    /// The two step-and-subject writes the Pg adapter made and the port
+    /// never stated (backlog 82448947, found beside 28dcc735's alias
+    /// rule): the plugin-version stamp on every step insert, and the
+    /// identity row a birth-by-job subject is minted with at
+    /// admission. Each doc must state its rule and name the test that
+    /// holds it; `include_str!` of each pin makes a renamed or deleted
+    /// pin a compile error here rather than a dangling name in prose.
+    #[test]
+    fn the_port_doc_states_the_plugin_stamp_and_the_subject_mint_and_names_their_pins() {
+        const STAMP_PIN: &str =
+            include_str!("../tests/the_adapters_agree_on_a_steps_plugin_version_pg.rs");
+        const MINT_PIN: &str = include_str!("../tests/subject_existence_pg.rs");
+
+        let add_step = port_doc_above("    async fn add_step_at(");
+        for needle in [
+            "step_plugin_version",
+            "step_plugins",
+            "the_adapters_agree_on_a_steps_plugin_version_pg",
+        ] {
+            assert!(
+                add_step.contains(needle),
+                "the add_step_at port doc must name {needle}; it reads:\n{add_step}"
+            );
+        }
+
+        let admit = port_doc_above("    async fn create_job_with_steps_at(");
+        for needle in [
+            "add_step_at",
+            "subjects",
+            "birth",
+            "subject_existence_pg",
+            "birth_by_workflows_pass_gate_and_create_mints_identity",
+            "in-memory adapter",
+        ] {
+            assert!(
+                admit.contains(needle),
+                "the create_job_with_steps_at port doc must name {needle}; it reads:\n{admit}"
+            );
+        }
+
+        for pin in [
+            "fn the_in_memory_adapter_stamps_a_steps_plugin_version",
+            "fn the_pg_adapter_stamps_a_steps_plugin_version",
+        ] {
+            assert!(
+                STAMP_PIN.contains(pin),
+                "the stamp pin must still hold {pin}"
+            );
+        }
+        assert!(
+            MINT_PIN.contains("fn birth_by_workflows_pass_gate_and_create_mints_identity"),
+            "the Pg pin the port doc names must still hold the mint test"
+        );
+    }
+
+    /// The in-memory half of backlog f146a13a: a sign-off records the
+    /// row it wrote as a STEP_UPDATED carrying the stamp, BEFORE the
+    /// caller's marker — the Pg adapter's order, pinned there by
+    /// `tests/a_sign_off_stamp_survives_a_rebuild_pg.rs`.
+    #[tokio::test]
+    async fn a_sign_off_records_the_row_it_wrote_before_the_marker() {
+        let repo = InMemoryJobs::default();
+        let job = make_job("ops-request");
+        repo.create_job(&job).await.unwrap();
+        let step =
+            Step::new(job.id, "sign-off", "Approve", 0).with_sign_offs_required(vec!["qa".into()]);
+        repo.add_step(&step).await.unwrap();
+        let stamp = boss_core::job::SignOffStamp {
+            authority_id: "emp-1".into(),
+            role: "qa".into(),
+            stamped_at: Utc::now(),
+            shape_hash: step.shape_hash(),
+            assurance: Default::default(),
+            presence_nonce: None,
+            voided_at: None,
+            voided_by_event: None,
+        };
+        let es = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::human("emp-1"),
+        );
+        let marker = es.event(crate::events::STEP_SIGNED_OFF, serde_json::json!({}));
+        let before = repo.recorded_events().len();
+        repo.append_sign_off(&step.id, &stamp, &es, &[marker])
+            .await
+            .unwrap();
+        let recorded = repo.recorded_events();
+        let kinds: Vec<&str> = recorded[before..].iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [crate::events::STEP_UPDATED, crate::events::STEP_SIGNED_OFF]
+        );
+        let written: Step = serde_json::from_value(recorded[before].payload.clone()).unwrap();
+        assert_eq!(written.sign_offs, vec![stamp]);
     }
 }

@@ -63,8 +63,8 @@ export type HrJobRef = Readonly<{
 /// - `failed` — the read did not happen (non-ok, network throw, or a
 ///              payload that would not parse). The page must say THAT,
 ///              and must not describe the onboarding.
-/// - `no-job` — nothing failed and there is nothing to read: this
-///              employee has no open HR Job in the current list.
+/// - `no-job` — nothing failed and there is nothing to read: the Job
+///              is not in the current list of open HR Jobs.
 export type TasksRead =
   | Exclude<Remote<ReadonlyArray<WorkflowTask>>, { kind: 'loading' }>
   | { kind: 'no-job' };
@@ -88,18 +88,14 @@ const strOrNull = (v: unknown): string | null =>
 /// an array, which is the point: `fetchRemote` turns the throw into
 /// `{kind:'failed'}`, so a malformed response is a failure rather than
 /// an employee with nothing to do.
-export function taskRows(
-  raw: unknown,
-  job: HrJobRef,
-  empId: string,
-): ReadonlyArray<WorkflowTask> {
+export function taskRows(raw: unknown, job: HrJobRef): ReadonlyArray<WorkflowTask> {
   if (!Array.isArray(raw)) {
     throw new Error('steps: expected an array');
   }
   return (raw as ReadonlyArray<RawStep>).map((s) => ({
     id: str(s.id),
     job_id: job.job_id,
-    employee_id: empId,
+    employee_id: job.employee_id,
     workflow: job.workflow,
     task: str(s.title),
     category: str(s.kind),
@@ -111,17 +107,24 @@ export function taskRows(
   }));
 }
 
-/// Read one employee's HR tasks. Never returns an empty list to mean
+/// Read one HR Job's tasks. Never returns an empty list to mean
 /// anything other than "this Job has no steps".
-export async function fetchEmployeeTasks(
-  empId: string,
+///
+/// Keyed by the JOB (backlog 5b27ed56, page audit b959394e). It was
+/// keyed by the employee and read the first open HR Job it found for
+/// them, so a person with a hire and a terminate open at once had a
+/// second row whose "View tasks" showed the first Job's steps, and the
+/// second Job's tasks could not be opened at all. A row is a Job.
+/// `no-job` is a Job no longer in the open list the rows came from.
+export async function fetchJobTasks(
+  jobId: string,
   workflows: ReadonlyArray<HrJobRef>,
 ): Promise<TasksRead> {
-  const job = workflows.find((w) => w.employee_id === empId);
+  const job = workflows.find((w) => w.job_id === jobId);
   if (!job) return { kind: 'no-job' };
   return fetchRemote(
     `/api/jobs/${encodeURIComponent(job.job_id)}/steps`,
-    (raw) => taskRows(raw, job, empId),
+    (raw) => taskRows(raw, job),
   );
 }
 

@@ -94,8 +94,9 @@ pub(super) async fn create_payroll_run(
         return Json(PayrollRunView::from(existing)).into_response();
     }
 
-    let run = match crate::payroll::create_run(
-        &state.pool,
+    post_payroll_run(
+        &state,
+        &user,
         crate::payroll::NewPayrollRun {
             id: &body.id,
             run_date: body.run_date,
@@ -107,21 +108,25 @@ pub(super) async fn create_payroll_run(
         },
     )
     .await
-    {
-        Ok(r) => r,
-        Err(e) => return ledger_err(e),
-    };
+}
 
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => return storage_err(e),
-    };
-
+/// The one payroll write both doors share: the run header, its lines,
+/// the `finance.payroll.run` fact, its journal entry and the
+/// `ledger.payroll.run` event, in ONE transaction (backlog 016a2763).
+/// The run used to commit on the pool before the transaction recording
+/// its fact opened, so a refused post (a locked period) or a crash left
+/// a run with no fact behind it — and because both doors short-circuit
+/// on an existing run id, that fact could never be recorded afterwards.
+async fn post_payroll_run(
+    state: &LedgerApiState,
+    user: &boss_policy_client::User,
+    new: crate::payroll::NewPayrollRun<'_>,
+) -> Response {
     // Carry the per-employee lines in the fact payload so payroll_runs
     // AND payroll_run_lines are both pure projections of the log
     // (rebuilt by crate::rebuild_payroll). The aggregate JE rule reads
     // only the totals, so the GL is unaffected.
-    let lines_json = match serde_json::to_value(&body.lines) {
+    let lines_json = match serde_json::to_value(new.lines) {
         Ok(v) => v,
         Err(e) => {
             return ledger_err(crate::error::LedgerError::Storage(format!(
@@ -129,6 +134,26 @@ pub(super) async fn create_payroll_run(
             )));
         }
     };
+
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return storage_err(e),
+    };
+
+    let created = match crate::payroll::create_run_in_tx(&mut tx, new).await {
+        Ok(c) => c,
+        Err(e) => return ledger_err(e),
+    };
+    let run = created.run;
+    // Gate the fact + event on the insert actually happening. Each
+    // door's `get` short-circuit catches the ordinary repeat POST; this
+    // catches the concurrent one, where the loser must not append a
+    // second run for one the winner already logged.
+    if !created.inserted {
+        let _ = tx.rollback().await;
+        return Json(PayrollRunView::from(run)).into_response();
+    }
+
     let payload = serde_json::json!({
         "run_id": run.id,
         "run_date": run.run_date,
@@ -172,10 +197,9 @@ pub(super) async fn create_payroll_run(
     }
 
     // Outbox phase 2: the audit event records in the SAME tx as the
-    // fact + JE, so a crash can no longer commit the run without its
-    // rebuild source.
+    // run, the fact and the JE.
     {
-        let stamp = super::event_stamp(&state, &user).await;
+        let stamp = super::event_stamp(state, user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,
@@ -317,13 +341,11 @@ pub(super) async fn synthesize_payroll_run(
     let total_gross: i64 = lines.iter().map(|l| l.gross_cents).sum();
     let employer_tax = (total_gross * body.employer_cost_bps) / 10_000;
 
-    // From here on this mirrors create_payroll_run's body almost
-    // verbatim — same persistence + fact emission + journal-entry
-    // posting + after-commit canonical event publish. Kept
-    // duplicated for now (the two callers' validation differs;
-    // refactor when a third caller appears).
-    let run = match crate::payroll::create_run(
-        &state.pool,
+    // From here on the synthesized run is written exactly as a
+    // submitted one: one shared write, one transaction.
+    post_payroll_run(
+        &state,
+        &user,
         crate::payroll::NewPayrollRun {
             id: &id,
             run_date: body.run_date,
@@ -335,92 +357,6 @@ pub(super) async fn synthesize_payroll_run(
         },
     )
     .await
-    {
-        Ok(r) => r,
-        Err(e) => return ledger_err(e),
-    };
-
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => return storage_err(e),
-    };
-
-    // Carry the per-employee lines in the fact payload so payroll_runs
-    // AND payroll_run_lines are both pure projections of the log
-    // (rebuilt by crate::rebuild_payroll). The aggregate JE rule reads
-    // only the totals, so the GL is unaffected.
-    let lines_json = match serde_json::to_value(&lines) {
-        Ok(v) => v,
-        Err(e) => {
-            return ledger_err(crate::error::LedgerError::Storage(format!(
-                "serialize payroll lines: {e}"
-            )));
-        }
-    };
-    let payload = serde_json::json!({
-        "run_id": run.id,
-        "run_date": run.run_date,
-        "period_start": run.period_start,
-        "period_end": run.period_end,
-        "gross_cents": run.gross_cents,
-        "withheld_cents": run.withheld_cents,
-        "employer_tax_cents": run.employer_tax_cents,
-        "net_cents": run.net_cents,
-        "employee_count": run.employee_count,
-        "provider": run.provider,
-        "lines": lines_json,
-    });
-    let live_fact_id = match crate::events::record_fact_in_tx(
-        &mut tx,
-        crate::events::FactWrite {
-            kind: "finance.payroll.run",
-            happened_on: run.run_date,
-            payload: &payload,
-            source_table: Some("payroll_runs"),
-            source_id: Some(&run.id),
-            // Matches the event source ("ledger") — the projection's
-            // created_by fallback — so rebuilt facts match live ones.
-            created_by: "ledger",
-        },
-    )
-    .await
-    {
-        Ok(rec) => rec.id,
-        Err(e) => return ledger_err(e),
-    };
-
-    let fact = crate::types::FactRef {
-        id: live_fact_id,
-        kind: "finance.payroll.run",
-        happened_on: run.run_date,
-        payload: &payload,
-    };
-    if let Err(e) = crate::postgres::post_fact_in_tx(&mut tx, &fact).await {
-        return ledger_err(e);
-    }
-
-    // Outbox phase 2: the audit event records in the SAME tx as the
-    // fact + JE, so a crash can no longer commit the run without its
-    // rebuild source.
-    {
-        let stamp = super::event_stamp(&state, &user).await;
-        if let Err(e) = crate::events::record_ledger_event_in_tx(
-            &mut tx,
-            &stamp,
-            "ledger.payroll.run",
-            payload.clone(),
-        )
-        .await
-        {
-            return ledger_err(e);
-        }
-    }
-
-    if let Err(e) = tx.commit().await {
-        return storage_err(e);
-    }
-
-    Json(PayrollRunView::from(run)).into_response()
 }
 
 #[derive(Deserialize)]

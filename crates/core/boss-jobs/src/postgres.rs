@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::port::{
-    AssignmentRow, JobFilter, JobScope, JobsError, JobsRepository, LaunchCalendarRow,
+    Admission, AssignmentRow, JobFilter, JobScope, JobsError, JobsRepository, StepVersion,
+    spent_nonce,
 };
 
 pub struct PgJobs {
@@ -31,6 +32,197 @@ impl PgJobs {
             db_url: None,
             nats_url: None,
         }
+    }
+
+    /// The one whole-row step write behind both the test-support
+    /// `update_step_at` (`read` = `None`, no judgement)
+    /// and [`JobsRepository::update_step_if_unchanged_at`] (`read` = the
+    /// version the caller's copy was read at). One UPDATE, so the two
+    /// doors cannot disagree about anything but the judgement.
+    async fn write_step(
+        &self,
+        step: &Step,
+        read: Option<StepVersion>,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // THE JUDGEMENT (backlogs e381689d, 6ec22d71), under the row's
+        // lock so nothing can land between it and the UPDATE below. The
+        // row must still be the version the caller read — `xmin`, moved
+        // by every write to it, so ANY column any writer changed
+        // refuses: a claim's status and holder erased by an assignment
+        // PUT computed before it was exactly what a metadata compare
+        // let through. And a terminal row read at that version still
+        // refuses a write that would move a column it freezes: the
+        // UPDATE's CASEs would keep the row's value while the caller's
+        // `jobs.step.updated` recorded the write's, and the rebuild
+        // replays the event. Compared on the parsed row — the same
+        // parse the caller's copy came from — so no value the parse
+        // cannot hold exactly reads as a change.
+        //
+        // The row is read under its lock on BOTH doors now, because the
+        // write carries the caller's voids onto the row's own stamps
+        // below (design 87329a13) and must do so against the stamps as
+        // they stand, not as the caller read them.
+        let row = sqlx::query_as::<_, VersionedStepRow>(&format!(
+            "{VERSIONED_STEP_SELECT} WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(*step.id.inner().as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Err(JobsError::StepNotFound(step.id));
+        };
+        let row_version = row.row_version;
+        let current = row_to_step(row.step)?;
+        if let Some(read) = read {
+            if StepVersion::new(row_version) != read {
+                return Err(JobsError::StepChanged { id: step.id });
+            }
+            if matches!(current.status, StepStatus::Completed | StepStatus::Skipped)
+                && crate::port::terminal_write_moves_frozen(&current, step)
+            {
+                return Err(JobsError::TerminalStep {
+                    id: step.id,
+                    status: step_status_str(current.status).to_string(),
+                });
+            }
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE steps SET kind = $2,
+                -- What was completed stays what was completed (backlog
+                -- 42e7c6b9): these three were written with no terminal
+                -- CASE, so a bare PUT retitled a completed presence step
+                -- after its ceremony and the record showed a passkey
+                -- approval of a title no passkey saw. The handler
+                -- refuses such a write by name; this keeps a stale
+                -- whole-row copy from moving them either.
+                title = CASE
+                    WHEN status IN ('completed', 'skipped') THEN title
+                    ELSE $3
+                END,
+                assignee_id = CASE
+                    WHEN status IN ('completed', 'skipped') THEN assignee_id
+                    ELSE $4
+                END,
+                -- Terminal statuses are immutable at the row (the
+                -- state-machine invariant): a write whose merge was
+                -- computed against a pre-completion fetch (dispatcher
+                -- assign retries, JetStream redeliveries, any racing
+                -- read-modify-write) cannot demote a Completed/Skipped
+                -- step back to live.
+                status = CASE
+                    WHEN status IN ('completed', 'skipped') THEN status
+                    ELSE $5
+                END,
+                completed_on = CASE
+                    WHEN status IN ('completed', 'skipped') THEN completed_on
+                    ELSE $8
+                END,
+                sort_order = $6, blocked_by = $7,
+                metadata = CASE
+                    WHEN status IN ('completed', 'skipped') THEN metadata
+                    ELSE $9
+                END,
+                notes = CASE
+                    WHEN status IN ('completed', 'skipped') THEN notes
+                    ELSE $10
+                END,
+                embedded_job = $11, updated_at = $12,
+                -- The ready stamp is written ONCE, at the write that
+                -- lands the step in `ready` (a pending → ready
+                -- promotion arrives here), and no later write moves it
+                -- — the property `updated_at` cannot have, and the one
+                -- the queue-age lens (2a0b034e) exists to read. The
+                -- inner CASE reads the OLD `status`: a terminal row
+                -- keeps its status above, so it must not gain a stamp
+                -- here either.
+                became_ready_at = COALESCE(became_ready_at, CASE
+                    WHEN status NOT IN ('completed', 'skipped')
+                         AND $5 = 'ready' THEN $12
+                END),
+                -- The authored completion contract (`fields`) takes
+                -- the same freeze as metadata: live rows accept the
+                -- write, terminal rows keep theirs. This column was
+                -- absent from the list entirely, so a 204'd update
+                -- silently dropped it and every step's contract was
+                -- write-once at materialization (a07cfddd).
+                fields = CASE
+                    WHEN status IN ('completed', 'skipped') THEN fields
+                    ELSE $13
+                END,
+                -- Who and when (c17871fe): the handler stamps both at
+                -- the flip to `completed`, and the row freezes them
+                -- with the status — the same CASE `completed_on` takes,
+                -- so a stale re-PUT can no more re-attribute a finished
+                -- step than it can demote one.
+                completed_by = CASE
+                    WHEN status IN ('completed', 'skipped') THEN completed_by
+                    ELSE $14
+                END,
+                completed_at = CASE
+                    WHEN status IN ('completed', 'skipped') THEN completed_at
+                    ELSE $15
+                END
+            WHERE id = $1
+            "#,
+        )
+        .bind(*step.id.inner().as_uuid())
+        .bind(&step.kind)
+        .bind(&step.title)
+        .bind(&step.assignee_id)
+        .bind(step_status_str(step.status))
+        .bind(step.sort_order)
+        .bind(blocked_by_uuids(&step.blocked_by))
+        .bind(step.completed_on)
+        .bind(&step.metadata)
+        .bind(&step.notes)
+        .bind(step.embedded_job.map(|j| *j.inner().as_uuid()))
+        .bind(now)
+        .bind(serde_json::to_value(&step.fields).unwrap_or_default())
+        .bind(step.completed_by.as_ref().map(ToString::to_string))
+        .bind(step.completed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(JobsError::StepNotFound(step.id));
+        }
+        // THE VOIDS (design 87329a13). The UPDATE above never names
+        // `sign_offs` — stamps are appended by `append_sign_off` alone,
+        // so a read-modify-write cannot clobber one — but a PUT that
+        // moved the step's shape killed its live stamps on its copy,
+        // and the row must record that in this same transaction, beside
+        // the STEP_UPDATED and the invalidation event that say so. Only
+        // a void crosses (`apply_voids`): nothing is added, dropped or
+        // revived, whatever copy of the stamps the caller holds. A
+        // terminal row keeps what it completed with.
+        if !matches!(current.status, StepStatus::Completed | StepStatus::Skipped) {
+            let mut kept = current.clone();
+            kept.apply_voids(&step.sign_offs);
+            if kept.sign_offs != current.sign_offs {
+                write_sign_offs(&mut tx, &kept).await?;
+            }
+        }
+        // OUTBOX (phase 2): the caller's events (STEP_UPDATED +
+        // completion/ready/done markers) record with the row.
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Constructor variant that retains the connection URLs for the
@@ -78,6 +270,7 @@ struct JobRow {
     status: String,
     priority: String,
     opened_on: chrono::NaiveDate,
+    opened_at: Option<chrono::DateTime<chrono::Utc>>,
     due_on: Option<chrono::NaiveDate>,
     closed_on: Option<chrono::NaiveDate>,
     metadata: serde_json::Value,
@@ -86,7 +279,7 @@ struct JobRow {
 }
 
 #[derive(sqlx::FromRow)]
-struct StepRow {
+pub(crate) struct StepRow {
     id: uuid::Uuid,
     job_id: uuid::Uuid,
     kind: String,
@@ -107,6 +300,57 @@ struct StepRow {
     embedded_job: Option<uuid::Uuid>,
     completed_by: Option<String>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A step row with the version it was read at — `xmin`, the id of the
+/// transaction that last wrote the row, which EVERY write moves and no
+/// read does ([`StepVersion`], backlog 6ec22d71). Selected with the row
+/// in one statement, so the version is the version of exactly the
+/// values read.
+#[derive(sqlx::FromRow)]
+struct VersionedStepRow {
+    #[sqlx(flatten)]
+    step: StepRow,
+    row_version: i64,
+}
+
+/// `xid` has no integer cast; its text form is the unsigned 32-bit id,
+/// which a bigint holds whole.
+const VERSIONED_STEP_SELECT: &str = "SELECT id, job_id, kind, title, spec_slug, assignee_id, \
+     status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, \
+     completed_on, metadata, notes, step_plugin_version, embedded_job, completed_by, \
+     completed_at, xmin::text::bigint AS row_version FROM steps";
+
+/// A step's `step_shape_hash` as the row stands, read under the row's
+/// lock — the "before" a content write compares its result to, so the
+/// stamps it leaves behind are judged against what they were attesting
+/// at the write, not at some earlier read (design 87329a13). `None`
+/// when there is no such row; the caller's own statement says why.
+async fn shape_under_lock(
+    conn: &mut sqlx::PgConnection,
+    id: &StepId,
+) -> Result<Option<String>, JobsError> {
+    let row: Option<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT title, metadata FROM steps WHERE id = $1 FOR UPDATE")
+            .bind(*id.inner().as_uuid())
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+    Ok(row.map(|(title, metadata)| boss_core::job::step_shape_hash(&title, &metadata)))
+}
+
+/// Write back a step's stamps after a void — the one statement besides
+/// `append_sign_off` that names `sign_offs`, and every caller hands it
+/// the row's own stamps with voids landed on them and nothing else
+/// changed (design 87329a13).
+async fn write_sign_offs(conn: &mut sqlx::PgConnection, step: &Step) -> Result<(), JobsError> {
+    sqlx::query("UPDATE steps SET sign_offs = $2 WHERE id = $1")
+        .bind(*step.id.inner().as_uuid())
+        .bind(serde_json::to_value(&step.sign_offs).map_err(|e| JobsError::Storage(e.to_string()))?)
+        .execute(conn)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 /// Joined row backing [`PgJobs::list_assignments`] — a `StepRow`
@@ -149,6 +393,7 @@ fn row_to_job(r: JobRow) -> Job {
         status: parse_job_status(&r.status),
         priority: parse_priority(&r.priority),
         opened_on: r.opened_on,
+        opened_at: r.opened_at,
         due_on: r.due_on,
         closed_on: r.closed_on,
         metadata: r.metadata,
@@ -161,11 +406,11 @@ fn row_to_job(r: JobRow) -> Job {
 /// (20260915221611) makes an unknown word unreachable; if one ever
 /// arrives it reads as the SIMULATED company, never real — the one
 /// direction a partition read is allowed to be wrong in.
-fn parse_partition(s: &str) -> Partition {
+pub(crate) fn parse_partition(s: &str) -> Partition {
     s.parse().unwrap_or(Partition::Simulated)
 }
 
-fn row_to_step(r: StepRow) -> Result<Step, JobsError> {
+pub(crate) fn row_to_step(r: StepRow) -> Result<Step, JobsError> {
     Ok(Step {
         id: StepId::from_uuid(r.id),
         job_id: JobId::from_uuid(r.job_id),
@@ -229,12 +474,14 @@ fn parse_subject(kind: &str, ref_id: &str) -> Subject {
     Subject::new(kind, ref_id)
 }
 
-fn parse_job_status(s: &str) -> JobStatus {
+/// The `jobs.status` column read back. Its CHECK constraint
+/// (20260924123307) admits exactly these four words — `blocked` and
+/// `pending-sign-off` were retired with their enum variants (backlog
+/// 3c3dc8f3) — so the fallback arm is unreachable from a real row.
+pub(crate) fn parse_job_status(s: &str) -> JobStatus {
     match s {
         "draft" => JobStatus::Draft,
         "open" => JobStatus::Open,
-        "blocked" => JobStatus::Blocked,
-        "pending-sign-off" => JobStatus::PendingSignOff,
         "closed" => JobStatus::Closed,
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Draft,
@@ -245,8 +492,6 @@ pub(crate) fn job_status_str(s: JobStatus) -> &'static str {
     match s {
         JobStatus::Draft => "draft",
         JobStatus::Open => "open",
-        JobStatus::Blocked => "blocked",
-        JobStatus::PendingSignOff => "pending-sign-off",
         JobStatus::Closed => "closed",
         JobStatus::Cancelled => "cancelled",
     }
@@ -269,6 +514,27 @@ pub(crate) fn priority_str(p: Priority) -> &'static str {
         Priority::Standard => "standard",
         Priority::Scheduled => "scheduled",
     }
+}
+
+/// `JobFilter::kind_prefix` as the LIKE pattern that matches it as TEXT:
+/// LIKE's own metacharacters (`%`, `_`, and `\`, its default escape)
+/// are escaped, then one `%` is appended.
+///
+/// The prefix used to be formatted straight into the pattern, so `_`
+/// matched any character and `?kind_prefix=%` answered every packet,
+/// while the in-memory adapter's `starts_with` — and the port's "prefix
+/// match on kind" — read it literally. Found by the adapter-parity
+/// suite's first run (backlog 67c15125,
+/// `tests/the_adapters_agree_on_every_list_filter_pg.rs`).
+fn kind_prefix_pattern(prefix: &str) -> String {
+    prefix
+        .chars()
+        .flat_map(|c| match c {
+            '%' | '_' | '\\' => vec!['\\', c],
+            _ => vec![c],
+        })
+        .chain(std::iter::once('%'))
+        .collect()
 }
 
 /// Strict inverse of [`step_status_str`] — for DB round-trips, where
@@ -342,7 +608,18 @@ async fn insert_step_in_tx(
     // so republishing the plugin later doesn't retroactively change
     // which bundle the step is pinned against. Caller-supplied
     // non-zero values win (bulk replay seeding its own versions);
-    // zero triggers the lookup.
+    // zero triggers the lookup. Every writer that records a
+    // STEP_CREATED stamps BEFORE building it, through
+    // `active_step_plugin_version` (the same query), so the event
+    // carries the row's value (backlog aba364fe); this lookup is what a
+    // step written with no event gets.
+    //
+    // RESIDUAL: a handler's stamp is read outside this transaction.
+    // A kind with NO active plugin that gets its first one published
+    // between that read and this INSERT is written here at the new
+    // version while its event says 0 — milliseconds wide, and only
+    // on a kind's first publish (a republish moves an already
+    // non-zero stamp nowhere).
     let version = if step.step_plugin_version != 0 {
         step.step_plugin_version
     } else {
@@ -413,7 +690,7 @@ impl JobsRepository for PgJobs {
         now: chrono::DateTime<chrono::Utc>,
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
-    ) -> Result<(), JobsError> {
+    ) -> Result<Admission, JobsError> {
         // Refused before BEGIN: a short zip would commit rows the log
         // does not hold (the port doc says why that is a rebuild
         // divergence, not an inconvenience).
@@ -460,9 +737,9 @@ impl JobsRepository for PgJobs {
         let result = sqlx::query(
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
-                              status, priority, opened_on, due_on, closed_on, metadata, tags,
+                              status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags,
                               workflow_version, created_at, updated_at, partition, simulated)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, $18)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -475,6 +752,11 @@ impl JobsRepository for PgJobs {
         .bind(job_status_str(job.status))
         .bind(priority_str(job.priority))
         .bind(job.opened_on)
+        // The admission instant (backlog 6c2eba00). Written HERE and
+        // nowhere else: the UPDATE below leaves the column out, the
+        // same way it leaves `partition` out, so a later PUT carrying
+        // a different value cannot move when the packet arrived.
+        .bind(job.opened_at)
         .bind(job.due_on)
         .bind(job.closed_on)
         .bind(&job.metadata)
@@ -499,12 +781,26 @@ impl JobsRepository for PgJobs {
         // with the row — and only when the INSERT actually inserted.
         // The ON CONFLICT replay guard doubles as the event gate: a
         // re-emitted Job (deterministic sim runs) records nothing.
-        if result.rows_affected() > 0 {
-            for event in job_events {
-                boss_events::outbox::record_event_in_tx(&mut tx, event)
-                    .await
-                    .map_err(JobsError::Storage)?;
-            }
+        //
+        // AND THE JOB ROW DECIDES FOR THE WHOLE GRAPH (backlog
+        // 9d2af748). The steps below carry ids minted fresh by every
+        // materialization, so their own guard cannot see a second
+        // admission; a job row that did not insert means another
+        // admission under this id holds the packet — committed before
+        // this INSERT, or committed while it waited on the unique
+        // index — and this one writes nothing more. The transaction
+        // is rolled back, not committed: the birth-subject row above is
+        // the winner's to have written.
+        if result.rows_affected() == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return Ok(Admission::AlreadyAdmitted);
+        }
+        for event in job_events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
         }
         // The materialized graph rides the SAME transaction (backlog
         // f2ba226e): every step row and its STEP_CREATED, or nothing.
@@ -523,12 +819,12 @@ impl JobsRepository for PgJobs {
         tx.commit()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(())
+        Ok(Admission::Admitted)
     }
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1",
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -537,13 +833,32 @@ impl JobsRepository for PgJobs {
         Ok(row.map(row_to_job))
     }
 
+    /// One query for the set, not one per packet: the scope cut of a
+    /// 50,000-row `all_assigned` read judges every row's packet
+    /// (backlog 046832d3, review finding #6). Same columns as
+    /// [`Self::get_job`], so a packet reads the same either way.
+    async fn get_jobs(&self, ids: &[JobId]) -> Result<Vec<Job>, JobsError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| *id.inner().as_uuid()).collect();
+        let rows = sqlx::query_as::<_, JobRow>(
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = ANY($1)",
+        )
+        .bind(&uuids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(row_to_job).collect())
+    }
+
     /// One ordered `LIMIT 1` instead of the default's walk over every
     /// closed packet of the kind: `closed_on` is a DATE, so the
     /// admission instant then id break the tie the way `list_jobs`
     /// does, and the answer is deterministic on a busy day.
     async fn newest_closed_job(&self, kind: &str) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, partition \
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition \
              FROM jobs WHERE kind = $1 AND status = 'closed' \
              ORDER BY closed_on DESC NULLS LAST, opened_on DESC, created_at DESC, id LIMIT 1",
         )
@@ -573,6 +888,7 @@ impl JobsRepository for PgJobs {
     async fn update_job_at(
         &self,
         job: &Job,
+        read: JobStatus,
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
@@ -582,22 +898,37 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        // `partition` (and its derived `simulated`) is deliberately
-        // absent from the SET list: a Job's origin is decided at
-        // admission and never revisited.
+        // `partition` (and its derived `simulated`) and `opened_at`
+        // are deliberately absent from the SET list: a Job's origin
+        // and the instant it was admitted are decided at admission and
+        // never revisited.
         // The storage enforces the immutability rather than trusting
-        // every caller to (same rule as rebuild.rs's upsert).
+        // every caller to (same rule as rebuild.rs's upsert). `kind`
+        // and `workflow_version` are absent for the same reason: they
+        // name the protocol the packet was admitted under (backlog
+        // b433bdf3), and a version moves only through
+        // `repin_workflow_version_at`.
+        //
+        // A FINISHED STATUS DOES NOT MOVE (backlog 570e72bd): the WHERE
+        // is the compare-and-set the job PUT's read-then-judge could not
+        // be. A row stored closed or cancelled is written only by a
+        // write that keeps that status; anything else matches no row
+        // and is named below, never answered as a write that landed.
+        // And only by a writer that READ it finished ($14): a writer
+        // that read the row open and closes it has lost to a close that
+        // committed after its read, and its body would erase what that
+        // close stamped (backlog 29a7ea09, the hand close).
         let result = sqlx::query(
             r#"
-            UPDATE jobs SET kind = $2, subject_kind = $3, subject_id = $4,
-                title = $5, owner_id = $6, status = $7, priority = $8,
-                opened_on = $9, due_on = $10, closed_on = $11, metadata = $12,
-                tags = $13, updated_at = $14
+            UPDATE jobs SET subject_kind = $2, subject_id = $3,
+                title = $4, owner_id = $5, status = $6, priority = $7,
+                opened_on = $8, due_on = $9, closed_on = $10, metadata = $11,
+                tags = $12, updated_at = $13
             WHERE id = $1
+              AND (status NOT IN ('closed', 'cancelled') OR (status = $6 AND status = $14))
             "#,
         )
         .bind(*job.id.inner().as_uuid())
-        .bind(&job.kind)
         .bind(subj_kind)
         .bind(subj_ref)
         .bind(&job.title)
@@ -610,15 +941,29 @@ impl JobsRepository for PgJobs {
         .bind(&job.metadata)
         .bind(&job.tags)
         .bind(now)
+        .bind(job_status_str(read))
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(JobsError::NotFound(job.id));
+            // No row matched: either there is none, or it is finished
+            // and this write would move its status, or its writer read
+            // it before it finished. Read which, in the
+            // same transaction, so the refusal names the stored status.
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+                    .bind(*job.id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return Err(match stored {
+                Some(status) => JobsError::TerminalJob { id: job.id, status },
+                None => JobsError::NotFound(job.id),
+            });
         }
         // OUTBOX (phase 2): the caller's events (JOB_UPDATED + status
-        // markers) record with the row (the NotFound above returns
+        // markers) record with the row (the refusals above return
         // pre-recording).
         for event in events {
             boss_events::outbox::record_event_in_tx(&mut tx, event)
@@ -669,7 +1014,7 @@ impl JobsRepository for PgJobs {
                 updated_at = $4
             WHERE id = $1
             RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
-                      status, priority, opened_on, due_on, closed_on, metadata, tags, partition
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             "#,
         )
         .bind(*id.inner().as_uuid())
@@ -698,6 +1043,148 @@ impl JobsRepository for PgJobs {
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(job)
+    }
+
+    async fn close_job_at(
+        &self,
+        id: &JobId,
+        closed_on: chrono::NaiveDate,
+        owned: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<Option<Job>, JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // ONE statement is both halves of the contract. The merge is
+        // `merge_job_metadata_at`'s — against the row as it stands, so
+        // a key another writer merged after this closer read the row
+        // survives (29a7ea09). The `status = 'open'` guard is the
+        // compare-and-set: a closer whose copy predates another close
+        // matches no row, so it cannot write a closed row back over it.
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE jobs SET
+                status = 'closed',
+                closed_on = $2,
+                metadata = (CASE WHEN jsonb_typeof(metadata) = 'object'
+                                 THEN metadata ELSE '{}'::jsonb END) || $3::jsonb,
+                updated_at = $4
+            WHERE id = $1 AND status = 'open'
+            RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
+            "#,
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(closed_on)
+        .bind(serde_json::Value::Object(owned.clone()))
+        .bind(stamp.timestamp)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            // No open row: either there is no such packet, or it is
+            // already closed / cancelled / draft and this close lost.
+            let exists =
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
+                    .bind(*id.inner().as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return if exists {
+                Ok(None)
+            } else {
+                Err(JobsError::NotFound(*id))
+            };
+        };
+        let job = row_to_job(row);
+        // OUTBOX (phase 2): the state event is the POST-close row — the
+        // rebuild replays it as full row state, so one built from the
+        // caller's copy would replay the very loss this write refuses —
+        // then the caller's markers, built from that same row, all in
+        // the write's transaction.
+        let mut events = vec![stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        )];
+        events.extend(markers(&job));
+        for event in &events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(Some(job))
+    }
+
+    async fn append_step_correction_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // ONE statement is the atomicity, as in `merge_job_metadata_at`:
+        // the append happens against the row as it stands at write
+        // time, so two corrections landing together both survive. The
+        // CASEs fold a non-object metadata and a non-list under the key
+        // to empty, the rule `corrections::appended` states in Rust.
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE jobs SET
+                metadata = (CASE WHEN jsonb_typeof(metadata) = 'object'
+                                 THEN metadata ELSE '{}'::jsonb END)
+                           || jsonb_build_object(
+                                'corrections',
+                                (CASE WHEN jsonb_typeof(metadata -> 'corrections') = 'array'
+                                      THEN metadata -> 'corrections' ELSE '[]'::jsonb END)
+                                || jsonb_build_array($2::jsonb)),
+                updated_at = $3
+            WHERE id = $1
+            RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
+            "#,
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(entry.clone())
+        .bind(stamp.timestamp)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Err(JobsError::NotFound(*id));
+        };
+        let job = row_to_job(row);
+        // Our entry is the last one: RETURNING is the row as THIS
+        // update left it, under its row lock.
+        let index = crate::corrections::list(&job.metadata)
+            .len()
+            .saturating_sub(1);
+        let updated = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        );
+        let corrected = stamp.event(
+            crate::events::STEP_CORRECTED,
+            crate::corrections::corrected_payload(&id.to_string(), entry, index),
+        );
+        for event in [&updated, &corrected] {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok((job, index))
     }
 
     async fn list_estate_nodes(&self) -> Result<Vec<crate::port::EstateNode>, JobsError> {
@@ -811,22 +1298,40 @@ impl JobsRepository for PgJobs {
     async fn recent_events_by_kind(
         &self,
         kind: &str,
-        scope: Option<&str>,
+        window: &crate::port::EventWindow,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, JobsError> {
+    ) -> Result<crate::port::EventPage, JobsError> {
         // The SQL lives in boss-events, which owns audit_log — this
         // crate already writes through its `record_event_in_tx`, and
         // reading through its helper keeps the table's ownership in
         // one place rather than growing a second copy of the query.
-        // `scope` travels down WITH the limit rather than being applied
-        // to the page that comes back: filtering here would leave a
-        // slow series exactly as unreadable as it was before.
-        let rows = boss_events::tail_http::recent_by_kind(&self.pool, kind, scope, limit)
-            .await
-            .map_err(JobsError::Storage)?;
-        rows.into_iter()
+        // The whole window travels down WITH the limit rather than
+        // being applied to the page that comes back: filtering here
+        // would leave a slow series, or an old window, exactly as
+        // unreadable as it was before.
+        let page = boss_events::tail_http::recent_by_kind(
+            &self.pool,
+            kind,
+            &boss_events::tail_http::KindWindow {
+                scope: window.scope.as_deref(),
+                host: window.host.as_deref(),
+                since: window.since,
+                until: window.until,
+                latest_per: window.latest_per.as_deref(),
+            },
+            limit,
+        )
+        .await
+        .map_err(JobsError::Storage)?;
+        let rows = page
+            .rows
+            .into_iter()
             .map(|r| serde_json::to_value(r).map_err(|e| JobsError::Storage(e.to_string())))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::port::EventPage {
+            rows,
+            total: page.total,
+        })
     }
 
     async fn step_flow_cube(
@@ -880,6 +1385,8 @@ impl JobsRepository for PgJobs {
         &self,
         id: &JobId,
         to_version: i32,
+        plan: &crate::repin::RepinPlan,
+        record: &serde_json::Value,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
         let mut tx = self
@@ -888,18 +1395,31 @@ impl JobsRepository for PgJobs {
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         // The one column update_job deliberately cannot reach, in its
-        // own statement, so re-pinning is always an explicit act.
+        // own statement, so re-pinning is always an explicit act — and
+        // the record of the move appended in the same statement, with
+        // the fold `repin::appended` states in Rust (a non-object
+        // metadata or a non-list under the key reads as empty).
         let row = sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE jobs SET workflow_version = $2, updated_at = $3
+            UPDATE jobs SET
+                workflow_version = $2,
+                metadata = (CASE WHEN jsonb_typeof(metadata) = 'object'
+                                 THEN metadata ELSE '{}'::jsonb END)
+                           || jsonb_build_object(
+                                'repins',
+                                (CASE WHEN jsonb_typeof(metadata -> 'repins') = 'array'
+                                      THEN metadata -> 'repins' ELSE '[]'::jsonb END)
+                                || jsonb_build_array($4::jsonb)),
+                updated_at = $3
             WHERE id = $1
             RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
-                      status, priority, opened_on, due_on, closed_on, metadata, tags, partition
+                      status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             "#,
         )
         .bind(*id.inner().as_uuid())
         .bind(to_version)
         .bind(stamp.timestamp)
+        .bind(record.clone())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -907,13 +1427,112 @@ impl JobsRepository for PgJobs {
             return Err(JobsError::NotFound(*id));
         };
         let job = row_to_job(row);
-        let event = stamp.event(
+        let mut events = vec![stamp.event(
             crate::events::JOB_UPDATED,
             serde_json::to_value(&job).unwrap_or_default(),
-        );
-        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+        )];
+
+        // Each re-projected row. The same freeze `update_step_at`
+        // states: a row that is completed or skipped by the time this
+        // runs keeps every column the spec projects — it ran under that
+        // text — and only its place in the list moves. RETURNING is the
+        // row as this statement left it, which is what its state event
+        // must carry.
+        for r in &plan.reprojected {
+            let s = &r.step;
+            // The re-projection moves an open step's text, so it moves
+            // its shape; the stamps it leaves behind die as at any edit
+            // (design 87329a13), or a move to another version and back
+            // would revive them. A terminal row keeps its text under the
+            // CASEs below, so its shape does not move and nothing dies.
+            let shape_before = shape_under_lock(&mut tx, &s.id).await?;
+            let row = sqlx::query_as::<_, StepRow>(
+                r#"
+                UPDATE steps SET
+                    sort_order = $2,
+                    kind = CASE WHEN status IN ('completed', 'skipped') THEN kind ELSE $3 END,
+                    title = CASE WHEN status IN ('completed', 'skipped') THEN title ELSE $4 END,
+                    assignee_id = CASE WHEN status IN ('completed', 'skipped')
+                                       THEN assignee_id ELSE $5 END,
+                    blocked_by = CASE WHEN status IN ('completed', 'skipped')
+                                      THEN blocked_by ELSE $6 END,
+                    metadata = CASE WHEN status IN ('completed', 'skipped')
+                                    THEN metadata ELSE $7 END,
+                    fields = CASE WHEN status IN ('completed', 'skipped') THEN fields ELSE $8 END,
+                    sign_offs_required = CASE WHEN status IN ('completed', 'skipped')
+                                              THEN sign_offs_required ELSE $9 END,
+                    assurance_required = CASE WHEN status IN ('completed', 'skipped')
+                                              THEN assurance_required ELSE $10 END,
+                    updated_at = $11
+                WHERE id = $1
+                RETURNING id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
+                          blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
+                          completed_on, metadata, notes, step_plugin_version, embedded_job,
+                          completed_by, completed_at
+                "#,
+            )
+            .bind(*s.id.inner().as_uuid())
+            .bind(s.sort_order)
+            .bind(&s.kind)
+            .bind(&s.title)
+            .bind(&s.assignee_id)
+            .bind(blocked_by_uuids(&s.blocked_by))
+            .bind(&s.metadata)
+            .bind(serde_json::to_value(&s.fields).unwrap_or_default())
+            .bind(serde_json::to_value(&s.sign_offs_required).unwrap_or_default())
+            .bind(
+                s.assurance_required
+                    .and_then(|a| serde_json::to_value(a).ok())
+                    .and_then(|v| v.as_str().map(str::to_string)),
+            )
+            .bind(stamp.timestamp)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(JobsError::Storage)?;
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+            let Some(row) = row else {
+                return Err(JobsError::StepNotFound(s.id));
+            };
+            let mut written = row_to_step(row)?;
+            let invalidated = match &shape_before {
+                Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut written),
+                None => None,
+            };
+            if invalidated.is_some() {
+                write_sign_offs(&mut tx, &written).await?;
+            }
+            events.push(stamp.event(
+                crate::events::STEP_UPDATED,
+                crate::events::step_state_payload(&written),
+            ));
+            events.extend(invalidated);
+        }
+
+        // Each inserted row is stamped with its plugin version HERE, in
+        // the move's transaction, and its STEP_CREATED is built from the
+        // stamped step — the event carries what the row stores, so a
+        // replay rebuilds it (backlog aba364fe). The insert's own stamp
+        // then keeps the non-zero value it is handed.
+        for s in &plan.inserted {
+            let mut s = s.clone();
+            if s.step_plugin_version == 0 {
+                s.step_plugin_version = active_plugin_version(&mut *tx, &s.kind).await?;
+            }
+            if insert_step_in_tx(&mut tx, &s, stamp.timestamp).await? > 0 {
+                events.push(stamp.event(
+                    crate::events::STEP_CREATED,
+                    crate::events::step_state_payload(&s),
+                ));
+            }
+        }
+        events.push(stamp.event(
+            crate::events::JOB_REPINNED,
+            crate::repin::repinned_payload(&id.to_string(), record),
+        ));
+        for event in &events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
         tx.commit()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -933,11 +1552,19 @@ impl JobsRepository for PgJobs {
         }
 
         // Static query with NULL-OR predicates — sidesteps dynamic
-        // query construction. `$4` is the kind_prefix pattern already
-        // formatted with a trailing %; pass NULL when no prefix.
+        // query construction. `$4` is the kind_prefix pattern, escaped
+        // and given its trailing % (`kind_prefix_pattern`); NULL when
+        // no prefix.
         // Policy-scope binds ($7..$9) default to NULL / empty arrays
         // when scope is `All`, which the NULL-OR guards short-circuit.
-        let prefix_pattern = filter.kind_prefix.as_ref().map(|p| format!("{p}%"));
+        let prefix_pattern = filter.kind_prefix.as_deref().map(kind_prefix_pattern);
+        // The department filter is two binds: its code and its
+        // declaring kinds, both NULL when no department was asked for.
+        let department_code = filter.department.as_ref().map(|d| d.code.as_str());
+        let department_kinds = filter
+            .department
+            .as_ref()
+            .map(|d| d.declaring_kinds.as_slice());
 
         // Translate the scope into three mutually-exclusive parameter
         // sets. Exactly one of scope_owner / scope_owners /
@@ -962,7 +1589,7 @@ impl JobsRepository for PgJobs {
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
             SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status,
-                   priority, opened_on, due_on, closed_on, metadata, tags, partition
+                   priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
               -- $13 is the terminal retention window. With it, $2 is
@@ -1017,6 +1644,26 @@ impl JobsRepository for PgJobs {
               -- department nobody declares answers zero packets
               -- instead of every packet (cc76f755).
               AND ($16::text[] IS NULL OR kind = ANY($16))
+              -- $17 is a department code and $18 the kinds whose
+              -- workflow declares it (DepartmentFilter::keeps): a
+              -- packet naming a department (a non-empty string, the
+              -- rule of department::carried) is in THAT one; a packet
+              -- naming none is in its kind's. Retros and page-audits
+              -- name theirs and their kinds declare none (481d7939).
+              AND (
+                $17::text IS NULL
+                OR CASE WHEN jsonb_typeof(metadata->'department') = 'string'
+                             AND metadata->>'department' <> ''
+                        THEN metadata->>'department' = $17
+                        ELSE kind = ANY($18::text[])
+                   END
+              )
+              -- $19 is one priority. The port carried the field and the
+              -- in-memory adapter honoured it while this query bound
+              -- nothing for it, so an `urgent` listing answered every
+              -- packet (backlog 74569e94: the top board's outranks read
+              -- was its first caller).
+              AND ($19::text IS NULL OR priority = $19)
               -- opened_on is a DATE: a busy day is one big tie, and a
               -- LIMIT over an arbitrary order returns an arbitrary
               -- subset (2026-09-07 held 398 closed pr-trains; the
@@ -1045,6 +1692,9 @@ impl JobsRepository for PgJobs {
             .bind(filter.partition.map(Partition::as_str))
             .bind(filter.metadata_has.as_deref())
             .bind(filter.kinds.as_deref())
+            .bind(department_code)
+            .bind(department_kinds)
+            .bind(filter.priority.map(priority_str))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1086,6 +1736,19 @@ impl JobsRepository for PgJobs {
               -- Same kind-set clause as the list query, for the same
               -- reason.
               AND ($14::text[] IS NULL OR kind = ANY($14))
+              -- Same department clause as the list query, for the same
+              -- reason.
+              AND (
+                $15::text IS NULL
+                OR CASE WHEN jsonb_typeof(metadata->'department') = 'string'
+                             AND metadata->>'department' <> ''
+                        THEN metadata->>'department' = $15
+                        ELSE kind = ANY($16::text[])
+                   END
+              )
+              -- Same priority clause as the list query, for the same
+              -- reason.
+              AND ($17::text IS NULL OR priority = $17)
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -1102,6 +1765,9 @@ impl JobsRepository for PgJobs {
         .bind(filter.partition.map(Partition::as_str))
         .bind(filter.metadata_has.as_deref())
         .bind(filter.kinds.as_deref())
+        .bind(department_code)
+        .bind(department_kinds)
+        .bind(filter.priority.map(priority_str))
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1138,121 +1804,42 @@ impl JobsRepository for PgJobs {
     }
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError> {
-        let row = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job, completed_by, completed_at FROM steps WHERE id = $1",
-        )
+        Ok(self.get_step_versioned(id).await?.map(|(step, _)| step))
+    }
+
+    async fn get_step_versioned(
+        &self,
+        id: &StepId,
+    ) -> Result<Option<(Step, StepVersion)>, JobsError> {
+        let row = sqlx::query_as::<_, VersionedStepRow>(&format!(
+            "{VERSIONED_STEP_SELECT} WHERE id = $1"
+        ))
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        row.map(row_to_step).transpose()
+        row.map(|r| Ok((row_to_step(r.step)?, StepVersion::new(r.row_version))))
+            .transpose()
     }
 
+    #[cfg(feature = "test-support")]
     async fn update_step_at(
         &self,
         step: &Step,
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| JobsError::Storage(e.to_string()))?;
-        let result = sqlx::query(
-            r#"
-            UPDATE steps SET kind = $2, title = $3, assignee_id = $4,
-                -- Terminal statuses are immutable at the row (the
-                -- state-machine invariant): a write whose merge was
-                -- computed against a pre-completion fetch (dispatcher
-                -- assign retries, JetStream redeliveries, any racing
-                -- read-modify-write) cannot demote a Completed/Skipped
-                -- step back to live.
-                status = CASE
-                    WHEN status IN ('completed', 'skipped') THEN status
-                    ELSE $5
-                END,
-                completed_on = CASE
-                    WHEN status IN ('completed', 'skipped') THEN completed_on
-                    ELSE $8
-                END,
-                sort_order = $6, blocked_by = $7,
-                metadata = CASE
-                    WHEN status IN ('completed', 'skipped') THEN metadata
-                    ELSE $9
-                END,
-                notes = $10, embedded_job = $11, updated_at = $12,
-                -- The ready stamp is written ONCE, at the write that
-                -- lands the step in `ready` (a pending → ready
-                -- promotion arrives here), and no later write moves it
-                -- — the property `updated_at` cannot have, and the one
-                -- the queue-age lens (2a0b034e) exists to read. The
-                -- inner CASE reads the OLD `status`: a terminal row
-                -- keeps its status above, so it must not gain a stamp
-                -- here either.
-                became_ready_at = COALESCE(became_ready_at, CASE
-                    WHEN status NOT IN ('completed', 'skipped')
-                         AND $5 = 'ready' THEN $12
-                END),
-                -- The authored completion contract (`fields`) takes
-                -- the same freeze as metadata: live rows accept the
-                -- write, terminal rows keep theirs. This column was
-                -- absent from the list entirely, so a 204'd update
-                -- silently dropped it and every step's contract was
-                -- write-once at materialization (a07cfddd).
-                fields = CASE
-                    WHEN status IN ('completed', 'skipped') THEN fields
-                    ELSE $13
-                END,
-                -- Who and when (c17871fe): the handler stamps both at
-                -- the flip to `completed`, and the row freezes them
-                -- with the status — the same CASE `completed_on` takes,
-                -- so a stale re-PUT can no more re-attribute a finished
-                -- step than it can demote one.
-                completed_by = CASE
-                    WHEN status IN ('completed', 'skipped') THEN completed_by
-                    ELSE $14
-                END,
-                completed_at = CASE
-                    WHEN status IN ('completed', 'skipped') THEN completed_at
-                    ELSE $15
-                END
-            WHERE id = $1
-            "#,
-        )
-        .bind(*step.id.inner().as_uuid())
-        .bind(&step.kind)
-        .bind(&step.title)
-        .bind(&step.assignee_id)
-        .bind(step_status_str(step.status))
-        .bind(step.sort_order)
-        .bind(blocked_by_uuids(&step.blocked_by))
-        .bind(step.completed_on)
-        .bind(&step.metadata)
-        .bind(&step.notes)
-        .bind(step.embedded_job.map(|j| *j.inner().as_uuid()))
-        .bind(now)
-        .bind(serde_json::to_value(&step.fields).unwrap_or_default())
-        .bind(step.completed_by.as_ref().map(ToString::to_string))
-        .bind(step.completed_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        self.write_step(step, None, now, events).await
+    }
 
-        if result.rows_affected() == 0 {
-            return Err(JobsError::StepNotFound(step.id));
-        }
-        // OUTBOX (phase 2): the caller's events (STEP_UPDATED +
-        // completion/ready/done markers) record with the row.
-        for event in events {
-            boss_events::outbox::record_event_in_tx(&mut tx, event)
-                .await
-                .map_err(JobsError::Storage)?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(())
+    async fn update_step_if_unchanged_at(
+        &self,
+        step: &Step,
+        read: StepVersion,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        self.write_step(step, Some(read), now, events).await
     }
 
     async fn merge_step_metadata_at(
@@ -1278,6 +1865,10 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // The shape the stamps were attesting, under the lock the merge
+        // below then writes through (design 87329a13). A missing row
+        // reads None here and is named by the disambiguation below.
+        let shape_before = shape_under_lock(&mut tx, id).await?;
         // ONE statement is the atomicity, and the terminal freeze
         // rides its WHERE clause: a step that completed between the
         // caller's read and this write matches no row, instead of
@@ -1320,7 +1911,20 @@ impl JobsRepository for PgJobs {
                 None => JobsError::StepNotFound(*id),
             });
         };
-        let step = row_to_step(row)?;
+        let mut step = row_to_step(row)?;
+        // A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
+        // 87329a13, backlog c085256d). A merge that moved the shape
+        // voids every live stamp on the row here, in this transaction,
+        // and the invalidation event listing them records beside the
+        // STEP_UPDATED — the void is part of the edit, not a note about
+        // it that a failed second write could lose.
+        let invalidated = match &shape_before {
+            Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut step),
+            None => None,
+        };
+        if invalidated.is_some() {
+            write_sign_offs(&mut tx, &step).await?;
+        }
         // OUTBOX (phase 2): the STEP_UPDATED state event is built from
         // the POST-merge row this transaction just produced and
         // records with it — same rule as the job merge.
@@ -1331,17 +1935,23 @@ impl JobsRepository for PgJobs {
         boss_events::outbox::record_event_in_tx(&mut tx, &event)
             .await
             .map_err(JobsError::Storage)?;
+        if let Some(event) = &invalidated {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
         tx.commit()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(step)
     }
 
-    async fn claim_step_at(
+    async fn claim_step_displacing_at(
         &self,
         step_id: &StepId,
         actor: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<Step, JobsError> {
         let mut tx = self
@@ -1349,6 +1959,11 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // The shape the stamps were attesting, under the lock the CAS
+        // below then writes through: dropping the run edge moves it, and
+        // the stamps it moved off die in this transaction (backlog
+        // 4174c4a9). A missing row reads None and is named below.
+        let shape_before = shape_under_lock(&mut tx, step_id).await?;
         // The compare half of the CAS lives in the WHERE clause, so
         // two racing claims serialize on the row lock and exactly one
         // sees a matching predicate. Idempotent re-claim by the
@@ -1366,30 +1981,63 @@ impl JobsRepository for PgJobs {
         // Directional on purpose — an alias claiming a step the
         // registered id holds is not `me`, because nothing signs as
         // the alias any more.
-        let row = sqlx::query(
+        //
+        // AND A NEW HOLDER DOES NOT INHERIT THE PREVIOUS RUN'S EDGE
+        // (backlog 9562f6df). When the stored holder is not `me` —
+        // which the WHERE below admits only as NULL — the claim hands
+        // the step to a different executor, so the `agent_run` edge
+        // ($4) the last run left is dropped in the same statement. The
+        // SET reads the OLD `assignee_id`, and a holder in `me` (the
+        // claimant, or its alias being respelled) keeps the edge: a
+        // re-claim is idempotent. Same rule as
+        // `agent_runs::claim_changes_holder`, which the route uses for
+        // the event it records.
+        //
+        // AND A READY STEP HELD BY A DISPLACEABLE HOLDER IS FREE TO THIS
+        // CLAIM (backlog 5d1c0b7a): $5 is the list the route authorised
+        // — the step's declared executor and the caller of a claim made
+        // for someone else — compared by exact spelling, as in the
+        // in-memory adapter. Such a holder is not `me`, so the CASE
+        // above drops its run edge. Never an active step.
+        let row = sqlx::query_as::<_, StepRow>(
             r#"
             WITH me AS (
                 SELECT $2::text AS id
                 UNION
                 SELECT alias FROM actor_aliases WHERE actor_id = $2
             )
-            UPDATE steps SET assignee_id = $2, status = 'active', updated_at = $3
+            UPDATE steps SET
+                assignee_id = $2,
+                status = 'active',
+                updated_at = $3,
+                metadata = CASE
+                    WHEN assignee_id IS NULL OR assignee_id NOT IN (SELECT id FROM me)
+                    THEN metadata - $4::text
+                    ELSE metadata
+                END
             WHERE id = $1
               AND (
-                    (status = 'ready' AND (assignee_id IS NULL OR assignee_id IN (SELECT id FROM me)))
+                    (status = 'ready' AND (assignee_id IS NULL
+                                           OR assignee_id IN (SELECT id FROM me)
+                                           OR assignee_id = ANY($5::text[])))
                  OR (status = 'active' AND assignee_id IN (SELECT id FROM me))
               )
-            RETURNING id
+            RETURNING id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
+                      blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
+                      completed_on, metadata, notes, step_plugin_version, embedded_job,
+                      completed_by, completed_at
             "#,
         )
         .bind(*step_id.inner().as_uuid())
         .bind(actor)
-        .bind(now)
+        .bind(stamp.timestamp)
+        .bind(crate::agent_runs::EDGE_KEY)
+        .bind(displaceable)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
 
-        if row.is_none() {
+        let Some(row) = row else {
             // Lost the race (or the step was never claimable). Read
             // the row in the same tx so the conflict names the truth
             // the claimant collided with.
@@ -1403,9 +2051,23 @@ impl JobsRepository for PgJobs {
                 None => Err(JobsError::StepNotFound(*step_id)),
                 Some((holder, status)) => Err(JobsError::ClaimConflict { holder, status }),
             };
+        };
+        // A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
+        // 87329a13), and the run edge is inside the shape: a claim that
+        // dropped it voids every live stamp here, and the invalidation
+        // records after the caller's events, as the merge door's does
+        // after its STEP_UPDATED (backlog 4174c4a9). A re-claim by the
+        // holder moves nothing and voids nothing.
+        let mut claimed = row_to_step(row)?;
+        let invalidated = match &shape_before {
+            Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut claimed),
+            None => None,
+        };
+        if invalidated.is_some() {
+            write_sign_offs(&mut tx, &claimed).await?;
         }
 
-        for event in events {
+        for event in events.iter().chain(invalidated.as_ref()) {
             boss_events::outbox::record_event_in_tx(&mut tx, event)
                 .await
                 .map_err(JobsError::Storage)?;
@@ -1422,7 +2084,7 @@ impl JobsRepository for PgJobs {
         &self,
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
-        now: chrono::DateTime<chrono::Utc>,
+        event_stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let mut tx = self
@@ -1430,22 +2092,77 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        let result = sqlx::query(
-            "UPDATE steps SET sign_offs = sign_offs || $2::jsonb, updated_at = $3 \
-             WHERE id = $1",
+        // THE STAMP LANDS ONLY ON THE SHAPE IT SIGNS (backlog 4174c4a9).
+        // The sign-off door built it from a read taken before its policy
+        // and presence checks; a write in that gap moved the row, and an
+        // append that did not look would leave the stamp alive on a
+        // shape it never signed — past the edit that should have voided
+        // it — for a later write back to the signed shape to make count.
+        // Judged under the row lock the append writes through.
+        let Some(current) = shape_under_lock(&mut tx, step_id).await? else {
+            return Err(JobsError::StepNotFound(*step_id));
+        };
+        if current != stamp.shape_hash {
+            return Err(JobsError::StampOffShape {
+                id: *step_id,
+                signed: stamp.shape_hash.clone(),
+                current,
+            });
+        }
+        // A TICKET STAMPS ITS STEP ONCE (backlog 3977b3d2). The row is
+        // locked above, in this transaction, so the stamps read here are
+        // the ones the append lands beside: a concurrent replay waits on
+        // the lock and then sees this stamp's nonce.
+        if stamp.presence_nonce.is_some() {
+            let (on_step,): (serde_json::Value,) =
+                sqlx::query_as("SELECT sign_offs FROM steps WHERE id = $1")
+                    .bind(*step_id.inner().as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            let on_step: Vec<boss_core::job::SignOffStamp> =
+                serde_json::from_value(on_step).map_err(|e| JobsError::Storage(e.to_string()))?;
+            if let Some(nonce) = spent_nonce(&on_step, stamp) {
+                return Err(JobsError::NonceSpent {
+                    id: *step_id,
+                    nonce,
+                });
+            }
+        }
+        let row = sqlx::query_as::<_, StepRow>(
+            r#"
+            UPDATE steps SET sign_offs = sign_offs || $2::jsonb, updated_at = $3
+            WHERE id = $1
+            RETURNING id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
+                      blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
+                      completed_on, metadata, notes, step_plugin_version, embedded_job,
+                      completed_by, completed_at
+            "#,
         )
         .bind(*step_id.inner().as_uuid())
         .bind(serde_json::to_value(stamp).map_err(|e| JobsError::Storage(e.to_string()))?)
-        .bind(now)
-        .execute(&mut *tx)
+        .bind(event_stamp.timestamp)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        if result.rows_affected() == 0 {
+        let Some(row) = row else {
             return Err(JobsError::StepNotFound(*step_id));
-        }
+        };
+        // THE LOG CARRIES THE STAMP (backlog f146a13a). The rebuild
+        // replays state events and skips markers, and this path recorded
+        // only the door's STEP_SIGNED_OFF marker — so a stamp no later
+        // edit or completion carried was dropped by every replay. The
+        // STEP_UPDATED is built from the row THIS UPDATE returned, under
+        // its lock, and records first, the caller's marker after it: the
+        // merge door's rule.
+        let written = row_to_step(row)?;
+        let updated = event_stamp.event(
+            crate::events::STEP_UPDATED,
+            crate::events::step_state_payload(&written),
+        );
         // OUTBOX (phase 2): the caller's STEP_SIGNED_OFF marker
         // records with the stamp append.
-        for event in events {
+        for event in std::iter::once(&updated).chain(events) {
             boss_events::outbox::record_event_in_tx(&mut tx, event)
                 .await
                 .map_err(JobsError::Storage)?;
@@ -1454,6 +2171,18 @@ impl JobsRepository for PgJobs {
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    async fn active_step_plugin_version(&self, kind: &str) -> Result<i32, JobsError> {
+        active_plugin_version(&self.pool, kind).await
+    }
+
+    async fn repair_step_plugin_versions(
+        &self,
+        write: bool,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::plugin_version_repair::RepairReport, JobsError> {
+        crate::plugin_version_repair::pg::repair(&self.pool, write, stamp).await
     }
 
     async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError> {
@@ -1477,14 +2206,28 @@ impl JobsRepository for PgJobs {
     }
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError> {
-        let rows = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job, completed_by, completed_at FROM steps WHERE job_id = $1 ORDER BY sort_order",
-        )
+        Ok(self
+            .list_steps_versioned(job_id)
+            .await?
+            .into_iter()
+            .map(|(step, _)| step)
+            .collect())
+    }
+
+    async fn list_steps_versioned(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Vec<(Step, StepVersion)>, JobsError> {
+        let rows = sqlx::query_as::<_, VersionedStepRow>(&format!(
+            "{VERSIONED_STEP_SELECT} WHERE job_id = $1 ORDER BY sort_order"
+        ))
         .bind(*job_id.inner().as_uuid())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        rows.into_iter().map(row_to_step).collect()
+        rows.into_iter()
+            .map(|r| Ok((row_to_step(r.step)?, StepVersion::new(r.row_version))))
+            .collect()
     }
 
     async fn list_assignments(
@@ -1622,6 +2365,28 @@ impl JobsRepository for PgJobs {
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(n)
+    }
+
+    async fn jobs_pinned_to_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<crate::port::PinnedJobs, JobsError> {
+        // Every status, served by the `jobs_kind_version` index; the
+        // lowest id is the one named, as the in-memory adapter picks.
+        let (count, first): (i64, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(id::text)::uuid FROM jobs \
+             WHERE kind = $1 AND workflow_version = $2",
+        )
+        .bind(kind)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(crate::port::PinnedJobs {
+            count,
+            first: first.map(JobId::from_uuid),
+        })
     }
 
     async fn workflow_terminal_report(
@@ -1886,149 +2651,48 @@ impl JobsRepository for PgJobs {
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,
+        scope: &JobScope,
     ) -> Result<Vec<(String, i64)>, JobsError> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT kind, COUNT(*)::BIGINT FROM jobs \
-             WHERE ($1::text IS NULL OR status = $1) \
-             GROUP BY kind ORDER BY kind",
-        )
-        .bind(status.map(job_status_str))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(rows)
-    }
-
-    async fn jobs_tier_distribution(
-        &self,
-        status: Option<JobStatus>,
-    ) -> Result<Vec<(String, i32, i64)>, JobsError> {
-        // Per-job tier = min(sort_order) over non-done steps, or -1
-        // when every step is terminal. One CTE pass so we don't walk
-        // the steps table twice. Ordered so the frontend receives a
-        // deterministic serialization.
-        let rows: Vec<(String, i32, i64)> = sqlx::query_as(
-            r#"
-            WITH per_job AS (
-              SELECT j.id,
-                     j.kind,
-                     COALESCE(
-                       MIN(s.sort_order) FILTER (
-                         WHERE s.status IN ('pending', 'ready', 'active')
-                       ),
-                       -1
-                     ) AS tier
-              FROM jobs j
-              LEFT JOIN steps s ON s.job_id = j.id
-              WHERE ($1::text IS NULL OR j.status = $1)
-              GROUP BY j.id, j.kind
-            )
-            SELECT kind, tier, COUNT(*)::BIGINT
-            FROM per_job
-            GROUP BY kind, tier
-            ORDER BY kind, tier
-            "#,
-        )
-        .bind(status.map(job_status_str))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(rows)
-    }
-
-    async fn list_launch_calendar(
-        &self,
-        from: chrono::NaiveDate,
-        to: chrono::NaiveDate,
-    ) -> Result<Vec<LaunchCalendarRow>, JobsError> {
-        // Every open/pending/pending-sign-off marketing-motion joined
-        // to its single launch step (the one carrying launch_date). We pull the
-        // launch_date + launch_channel out of step metadata in SQL so
-        // the caller doesn't have to fetch the step rows separately.
-        // `current_tier` mirrors the computation in
-        // `jobs_tier_distribution` (min non-done sort_order; -1 when
-        // everything is terminal).
-        //
-        // The date window is applied inclusively on both ends. Motions
-        // whose launch step has no date yet (launch_date IS NULL) are
-        // intentionally returned — the UI buckets them under
-        // "unscheduled" at the top of the list.
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: uuid::Uuid,
-            title: String,
-            owner_id: String,
-            subject_id: String,
-            status: String,
-            current_tier: Option<i32>,
-            launch_date: Option<chrono::NaiveDate>,
-            launch_channel: Option<String>,
+        // Same short-circuit as `list_jobs`: policy said "nothing".
+        if matches!(scope, JobScope::None) {
+            return Ok(Vec::new());
         }
-        let rows: Vec<Row> = sqlx::query_as::<_, Row>(
+        // The three scope binds are `list_jobs`'s $7..$9, verbatim, so
+        // a caller's counts are the totals the list hands it (backlog
+        // 19f08bd6 — this counted every packet for any caller).
+        let (scope_owner, scope_owners, scope_accounts): (
+            Option<&str>,
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+        ) = match scope {
+            JobScope::All => (None, None, None),
+            JobScope::None => unreachable!("short-circuited above"),
+            JobScope::OwnerIs(u) => (Some(u.as_str()), None, None),
+            JobScope::OwnerIn(us) => (None, Some(us.clone()), None),
+            JobScope::AccountIn(ps) => (None, None, Some(ps.clone())),
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
             r#"
-            WITH launches AS (
-              SELECT
-                s.job_id,
-                -- jsonb -> text then cast to date is tolerant of both
-                -- string values ("2026-05-15") and missing keys.
-                NULLIF(s.metadata ->> 'launch_date', '')::date AS launch_date,
-                NULLIF(s.metadata ->> 'launch_channel', '')    AS launch_channel
-              FROM steps s
-              -- property, not kind: the launch step is whichever step
-              -- carries a launch_date (no-step-kind-match rule)
-              WHERE s.metadata ? 'launch_date'
-            ),
-            tiers AS (
-              SELECT j.id AS job_id,
-                     COALESCE(
-                       MIN(s.sort_order) FILTER (
-                         WHERE s.status IN ('pending','ready','active')
-                       ),
-                       -1
-                     ) AS current_tier
-              FROM jobs j
-              LEFT JOIN steps s ON s.job_id = j.id
-              GROUP BY j.id
-            )
-            SELECT j.id,
-                   j.title,
-                   j.owner_id,
-                   j.subject_id,
-                   j.status,
-                   t.current_tier,
-                   l.launch_date,
-                   l.launch_channel
-            FROM jobs j
-            LEFT JOIN launches l ON l.job_id = j.id
-            LEFT JOIN tiers t    ON t.job_id = j.id
-            WHERE j.kind = 'marketing-motion'
-              AND j.status NOT IN ('closed','cancelled')
+            SELECT kind, COUNT(*)::BIGINT FROM jobs
+            WHERE ($1::text IS NULL OR status = $1)
+              AND ($2::text IS NULL OR owner_id = $2)
+              AND ($3::text[] IS NULL OR owner_id = ANY($3))
               AND (
-                l.launch_date IS NULL
-                OR l.launch_date BETWEEN $1 AND $2
+                $4::text[] IS NULL
+                OR (subject_kind IN ('account', 'employee')
+                    AND subject_id = ANY($4))
               )
-            ORDER BY l.launch_date NULLS FIRST, j.title
+            GROUP BY kind ORDER BY kind
             "#,
         )
-        .bind(from)
-        .bind(to)
+        .bind(status.map(job_status_str))
+        .bind(scope_owner)
+        .bind(scope_owners.as_deref())
+        .bind(scope_accounts.as_deref())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| LaunchCalendarRow {
-                job_id: JobId::from_uuid(r.id),
-                title: r.title,
-                owner_id: Some(r.owner_id),
-                subject_id: Some(r.subject_id),
-                status: parse_job_status(&r.status),
-                current_tier: r.current_tier,
-                launch_date: r.launch_date,
-                launch_channel: r.launch_channel,
-            })
-            .collect())
+        Ok(rows)
     }
 
     async fn resolve_blockers(

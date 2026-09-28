@@ -45,41 +45,34 @@ export type ViewResults = Readonly<{
   /// a count presented as complete when it isn't is worse than no
   /// count.
   truncated: boolean;
+  /// Every row of the source, or only the rows the CALLER may read
+  /// (backlog 5392cf23). A View is scoped to whoever runs it, so a
+  /// shared View can show two people different numbers; this is what
+  /// says so. A caller who may read none of the source gets a 403,
+  /// never zero rows.
+  scope: ResultScope;
 }>;
 
-/// Fields each source offers, for the column picker and as a hint for
-/// what a filter can name. Kept in step with the SELECT lists in
-/// boss-views' query.rs by hand — the alternative is a schema endpoint,
-/// which is worth building when a fourth source appears.
-export const SOURCE_FIELDS: Readonly<Record<ViewSource, ReadonlyArray<string>>> = {
-  subjects: ['kind', 'id', 'label', 'created_at', 'retired_at'],
-  jobs: [
-    'id',
-    'kind',
-    'subject_kind',
-    'subject_id',
-    'title',
-    'owner_id',
-    'status',
-    'priority',
-    'opened_on',
-    'closed_on',
-    'tags',
-    'created_at',
-  ],
-  steps: [
-    'id',
-    'job_id',
-    'kind',
-    'title',
-    'assignee_id',
-    'status',
-    'sort_order',
-    'blocked_by',
-    'completed_on',
-    'notes',
-    'created_at',
-    'updated_at',
-  ],
-  events: ['id', 'event_id', 'kind', 'source', 'timestamp', 'payload'],
-};
+export type ResultScope = 'all' | 'owners';
+
+/// `GET /api/views/sources` — what each source offers a View author,
+/// served from the lists boss-views' resolver selects and pushes with
+/// (backlog 4a8939b5). The page used to keep its own copies of the
+/// fields, the pushable names and the ceiling, "in step with query.rs
+/// by hand"; two of the three had drifted.
+export type ViewSources = Readonly<{
+  scan_ceiling: number;
+  sources: ReadonlyArray<SourceSchema>;
+}>;
+
+export type SourceSchema = Readonly<{
+  source: ViewSource;
+  /// Every field a row carries, in the column picker's order.
+  fields: ReadonlyArray<string>;
+  /// The fields a filter term on which the database answers.
+  pushable: ReadonlyArray<PushableField>;
+}>;
+
+/// `text` pushes by equality or a set, `timestamp` by a range, `json`
+/// through a dotted path (`payload.sku`, `metadata.department`).
+export type PushableField = Readonly<{ field: string; type: 'text' | 'timestamp' | 'json' }>;

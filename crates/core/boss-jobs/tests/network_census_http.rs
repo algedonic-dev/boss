@@ -1,6 +1,6 @@
 //! `POST /api/network/census` — the census handler's one write.
 //!
-//! The packet-loss census (docs/design/packet-loss.md, decided in
+//! The packet-loss census (the packet-loss decision in docs/architecture-decisions.md, decided in
 //! review 9fb9904f) is COMPUTED in the dispatcher's `network.census`
 //! handler, over the jobs API's own read surfaces. What it computes
 //! has to land on the audit log as one event per firing — the

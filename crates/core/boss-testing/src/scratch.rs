@@ -65,6 +65,35 @@
 //! narrowing it is to never hold the file open for writing in this
 //! process at all — `write_exec` streams the body to a child that does
 //! the writing and has exited before the call returns.
+//!
+//! ## …and so is one rewritten
+//!
+//! `write_exec` covers the file a test CREATES executable. A test that
+//! copies a door in with `write_exec` and then EDITS it with
+//! `write_file` — to make an uncommitted change, say — truncates a file
+//! that is already executable, the mode bits survive the write, and the
+//! exec that follows is the same race without a single chmod the
+//! `an_executable_is_written_by_write_exec` pin can see. Train 07:52
+//! went red on it (`a_door_knows_its_copy_is_stale.rs:232`, `run
+//! boss-api: Text file busy`; backlog c9511f54, 2026-09-24). So
+//! `write_file` asks first: a path that is already executable goes
+//! through the same child writer, in place, mode kept. Measured with
+//! four spawning threads: 6 of 50 rewritten executables refused before,
+//! 0 after. Writing to a temporary name and renaming it into place is
+//! NOT a fix — the rename moves the same inode a sibling's child still
+//! holds open, and measured 2 of 50.
+//!
+//! ## …and so is one copied
+//!
+//! `std::fs::copy` keeps the source's execute bit and writes the
+//! destination through a descriptor this process holds, so a script a
+//! test copies into a fixture tree — which the code under test then
+//! execs by path — is the same race again. `undeclared_objects_sh.rs`
+//! was the live site: it copied `undeclared-objects.sh` (`0755` in the
+//! tree), rewrote it with a raw `std::fs::write`, and the lint ran it as
+//! `"$DERIVE" --list` (backlog eed361e0, 2026-09-26). `copy_exec` reads
+//! the source and hands it to the same child writer, then carries the
+//! source's mode over.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -134,8 +163,20 @@ pub fn create_dir(path: &Path) {
 ///
 /// A bare `unwrap()` on a write reports the errno and not the file,
 /// which is the whole diagnosis.
+///
+/// A path that is ALREADY executable is rewritten by the child writer
+/// `write_exec` uses, keeping its mode (module note, "…and so is one
+/// rewritten").
 pub fn write_file(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    use std::os::unix::fs::PermissionsExt;
+    let executable = std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if executable {
+        write_through_a_child(path, body);
+    } else {
+        std::fs::write(path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
 }
 
 /// Write an executable file (mode `0755`), naming the path on failure.
@@ -146,8 +187,39 @@ pub fn write_file(path: &Path, body: &str) {
 /// keeps it past our exec (module note, "Why an executable is written
 /// by a child process"). The child has exited before this returns.
 pub fn write_exec(path: &Path, body: &str) {
-    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    write_through_a_child(path, body);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", path.display()));
+}
+
+/// Copy `from` to `to` keeping the source's mode, the bytes written by
+/// the child writer `write_exec` uses (module note, "…and so is one
+/// copied"). Naming both paths on failure.
+///
+/// `std::fs::copy` keeps the execute bit AND holds the destination open
+/// for writing in this process, so a copied script the code under test
+/// then execs by path is the `write_exec` race with no chmod in sight.
+pub fn copy_exec(from: &Path, to: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let fail = |what: &str, e: std::io::Error| -> ! {
+        panic!("copy {} -> {}: {what}: {e}", from.display(), to.display())
+    };
+    let body = std::fs::read(from).unwrap_or_else(|e| fail("read the source", e));
+    let mode = std::fs::metadata(from)
+        .unwrap_or_else(|e| fail("stat the source", e))
+        .permissions()
+        .mode();
+    write_through_a_child(to, &body);
+    std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode & 0o7777))
+        .unwrap_or_else(|e| fail("carry the source's mode", e));
+}
+
+/// `body` into `path` by a `sh -c 'cat > "$1"'` that has exited before
+/// this returns, so this process never holds `path` open for writing.
+/// Truncates in place: an existing file keeps its inode and its mode.
+fn write_through_a_child(path: &Path, body: impl AsRef<[u8]>) {
+    use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("sh")
         .args(["-c", "cat > \"$1\"", "sh"])
@@ -160,7 +232,7 @@ pub fn write_exec(path: &Path, body: &str) {
     let stdin = child.stdin.take();
     stdin
         .expect("a piped stdin")
-        .write_all(body.as_bytes())
+        .write_all(body.as_ref())
         .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     let out = child
         .wait_with_output()
@@ -171,8 +243,6 @@ pub fn write_exec(path: &Path, body: &str) {
         path.display(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", path.display()));
 }
 
 #[cfg(test)]
@@ -311,6 +381,146 @@ mod tests {
              write_exec left its file open for writing in this process \
              while a sibling thread spawned"
         );
+    }
+
+    /// An executable REWRITTEN through `write_file` — a test editing a
+    /// copied door, then running it — can be run at once while siblings
+    /// spawn. The truncating write keeps the mode bits, so the file is an
+    /// executable this process held open for writing without a single
+    /// chmod the `write_exec` pin could see: train 07:52 went red on
+    /// exactly this in `a_door_knows_its_copy_is_stale` (`run boss-api:
+    /// Text file busy`, backlog c9511f54, 2026-09-24).
+    #[test]
+    fn an_executable_rewritten_by_write_file_can_be_execd_while_siblings_spawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch_dir("boss-scratch-rewrite-race");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").output();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0;
+        for i in 0..50 {
+            let exe = dir.join(format!("exe-{i}"));
+            write_exec(&exe, "#!/bin/sh\nexit 1\n");
+            write_file(&exe, "#!/bin/sh\nexit 0\n# an edit in progress\n");
+            match std::process::Command::new(&exe).output() {
+                Ok(o) => assert!(o.status.success(), "{} ran the old body", exe.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => busy += 1,
+                Err(e) => panic!("exec {}: {e}", exe.display()),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for s in spawners {
+            s.join().expect("a spawner thread ends");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            busy, 0,
+            "{busy} of 50 executables rewritten by write_file answered ExecutableFileBusy: \
+             the rewrite held the file open for writing in this process while a sibling \
+             thread spawned"
+        );
+    }
+
+    /// An executable COPIED in by `copy_exec` — a door or a derivation
+    /// carried into a fixture tree, which the script under test then
+    /// execs by path — can be run at once while siblings spawn.
+    /// `std::fs::copy` holds the destination open for writing in this
+    /// process and keeps the source's execute bit, so it is the
+    /// `write_exec` race with no chmod the pin can see: the shape of
+    /// `undeclared_objects_sh.rs`, whose lint runs `"$DERIVE" --list` on
+    /// a copy (backlog eed361e0, 2026-09-26).
+    #[test]
+    fn an_executable_copied_by_copy_exec_can_be_execd_while_siblings_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch_dir("boss-scratch-copy-race");
+        let source = dir.join("source");
+        write_exec(&source, "#!/bin/sh\nexit 0\n");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").output();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0;
+        for i in 0..50 {
+            let exe = dir.join(format!("copy-{i}"));
+            copy_exec(&source, &exe);
+            match std::process::Command::new(&exe).output() {
+                Ok(o) => assert!(o.status.success(), "{} failed", exe.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => busy += 1,
+                Err(e) => panic!("exec {}: {e}", exe.display()),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for s in spawners {
+            s.join().expect("a spawner thread ends");
+        }
+        let mode = std::fs::metadata(dir.join("copy-0"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            busy, 0,
+            "{busy} of 50 executables copied by copy_exec answered ExecutableFileBusy: \
+             the copy held the file open for writing in this process while a sibling \
+             thread spawned"
+        );
+        assert_eq!(mode & 0o777, 0o755, "the copy keeps the source's mode");
+    }
+
+    /// `copy_exec` keeps the source's mode whatever it is: a data file
+    /// copied alongside the scripts of a tree must not come out
+    /// executable, and its bytes arrive whole.
+    #[test]
+    fn copy_exec_keeps_a_plain_files_mode_and_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("boss-scratch-copy-plain");
+        let from = dir.join("verb.json");
+        let to = dir.join("copy.json");
+        write_file(&from, "{\"verb\":\"x\"}\n");
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod the source");
+        copy_exec(&from, &to);
+        let mode = std::fs::metadata(&to).expect("stat").permissions().mode();
+        let body = std::fs::read_to_string(&to).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(body, "{\"verb\":\"x\"}\n");
+        assert_eq!(
+            mode & 0o777,
+            0o640,
+            "the copy must carry the source's mode, not the writer's umask"
+        );
+    }
+
+    /// `write_file` over a plain file stays a plain in-process write: the
+    /// child writer is for executables only, and a data file must not
+    /// come out executable because it went through the same function.
+    #[test]
+    fn a_plain_file_rewritten_by_write_file_stays_plain() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("boss-scratch-rewrite-plain");
+        let p = dir.join("data.json");
+        write_file(&p, "{}\n");
+        write_file(&p, "{\"a\":1}\n");
+        let mode = std::fs::metadata(&p).expect("stat").permissions().mode();
+        assert_eq!(std::fs::read_to_string(&p).expect("read"), "{\"a\":1}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode & 0o111, 0, "a plain file came out executable");
     }
 
     /// A root that cannot be cleared must REFUSE, naming the path —

@@ -53,7 +53,13 @@
 #             `agent-run-dies-when-building-is-silent` once the packet
 #             has not moved for 2x this step's `duration_hours`. A
 #             builder that dies is a packet that ages, which is the whole
-#             reason the run is a packet.
+#             reason the run is a packet. A run whose `host` pod is
+#             gone or terminal is ended the same way within fifteen
+#             minutes by the cluster observer
+#             (infra/cluster/manifests/boss-estate-observe.yaml, backlog
+#             5d1b64b3), with a `host_gone` object beside the result —
+#             unless a gate-run naming it is open or green, whose
+#             verdict ends it instead.
 #
 # WHY `delivered` EXISTS, AND WHY IT IS NOT SPELLED `reported` (backlog
 # a9c6ed5b, 2026-09-19). Until it did, an analyst run could not close
@@ -98,9 +104,13 @@
 #
 # The metadata schema names what `boss dispatch` writes: `packet` (the
 # step's job), `step` (its slug), `agent` (the actor id), `model`,
-# `budget_usd`, `effort`, `worktree`, `host`, and what later hands add —
+# `budget_usd`, `effort`, `host`, and what later hands add —
 # `gate_run` and `car` (by the landing rule's evidence), `spend_usd` and
 # `tokens` (by the report). Only the dispatch-time keys are required.
+# `worktree` is no longer written at dispatch (backlog a3355e14): it was
+# the DISPATCHER's cwd, not the builder's. The builder's worktree is
+# stamped by its gate and lands as `building`'s `gate_run.worktree`;
+# the top-level property stays for the packets filed before.
 # ---------------------------------------------------------------------------
 
 [[workflow]]

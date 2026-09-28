@@ -571,8 +571,8 @@ describe('lastVerbReading', () => {
 describe('the boarding rule line is the server sentence', () => {
   const here = (f: string): string => readFileSync(join(import.meta.dir, f), 'utf8');
   const lens = here('yard-status.ts');
-  const yard = here('YardPage.svelte');
-  const statusPage = here('YardStatusPage.svelte');
+  const yard = here('FloorDeck.svelte');
+  const statusPage = here('YardStatusPanel.svelte');
 
   test('the lens composes no boarding sentence of its own', () => {
     expect(lens).not.toContain('function boardsWhen');
@@ -589,7 +589,7 @@ describe('the boarding rule line is the server sentence', () => {
     expect(yard.slice(rule, rule + 200)).toContain('{boardingRule}');
   });
 
-  test("the yard status page renders boarding.summary as the dock's sentence", () => {
+  test("the yard status panel renders boarding.summary as the dock's sentence", () => {
     expect(statusPage).toContain('{s.boarding.summary}');
     expect(statusPage).not.toContain('boardsWhen');
   });
@@ -757,7 +757,7 @@ describe('clockText', () => {
 // no time of day of its own. Pinned on the source, in the
 // yard-page-order idiom, so the W1 hook cannot quietly reopen.
 describe('the conductor block renders the server hold', () => {
-  const src = readFileSync(join(import.meta.dir, 'YardPage.svelte'), 'utf8');
+  const src = readFileSync(join(import.meta.dir, 'FloorDeck.svelte'), 'utf8');
 
   test('the boards row is the hold — primary line, next beneath, last board as a clock time', () => {
     expect(src).toContain('boardHold(status.data.boarding)');

@@ -20,6 +20,15 @@
 //! 4. Nothing resolves → the create is rejected. A Job with no
 //!    responsible human is the modeling error Q7 exists to end.
 //!
+//! The owner is who is ACCOUNTABLE, never who FILED. Replacing an
+//! agent's or a rule's id here is right for the owner — the Self/Team
+//! policy scope, the `notify_on_done` wait-is-over signal and the
+//! terminal notification route on it — but it left the person credited
+//! with the filing on every such packet (all 984 ops-requests closed in
+//! two days read `emp-david`, backlog 958edca6). The filer is recorded
+//! beside it, at the same admission, as `metadata.opened_by`
+//! ([`crate::opened_by`]).
+//!
 //! Same opt-in shape as the subject-existence gate:
 //! `JobsApiState::roster: Option<Arc<dyn RosterLookup>>`; `None`
 //! skips resolution (in-memory adapters without an upstream stack).
@@ -61,6 +70,35 @@ pub fn is_automation_shaped(owner: &str) -> bool {
         || owner == "bootstrap"
 }
 
+/// Whether admission keeps `requested` as the owner exactly as sent —
+/// the one rule [`resolve_owner`] applies first, and the one the
+/// already-admitted comparison in the create handler asks, so a re-send
+/// is compared on the owner only when admission would have stored it
+/// (backlog dc7c91cc, SF-B: a departed owner is replaced by a role
+/// holder, and comparing the SENT id with the stored one refused every
+/// byte-identical re-send, forever). `roster` is `None` where no
+/// resolution runs, and then a human-shaped owner is kept.
+pub async fn kept_as_sent(roster: Option<&dyn RosterLookup>, requested: &str) -> bool {
+    if is_automation_shaped(requested) {
+        return false;
+    }
+    let Some(roster) = roster else {
+        return true;
+    };
+    match roster.is_active_employee(requested).await {
+        Ok(true) => true,
+        // A human-shaped id that isn't on the active roster (departed
+        // employee, typo) falls through to role resolution rather than
+        // silently owning work.
+        Ok(false) => false,
+        // Roster unavailable: keep the caller's human-shaped choice
+        // rather than wedging creates on a people-api blip.
+        // Automation-shaped owners do NOT get this grace — they have no
+        // claim to keep.
+        Err(_) => true,
+    }
+}
+
 /// Resolve the responsible human for a job. `requested` is whatever
 /// the caller put on the wire; `job_id` seeds the deterministic
 /// spread; `owner_role` / `step_fallback_role` come from the kind
@@ -73,20 +111,8 @@ pub async fn resolve_owner(
     owner_role: Option<&str>,
     step_fallback_role: Option<&str>,
 ) -> Result<String, String> {
-    if !is_automation_shaped(requested) {
-        match roster.is_active_employee(requested).await {
-            Ok(true) => return Ok(requested.to_string()),
-            Ok(false) => {
-                // A human-shaped id that isn't on the active roster
-                // (departed employee, typo) falls through to role
-                // resolution rather than silently owning work.
-            }
-            // Roster unavailable: keep the caller's human-shaped
-            // choice rather than wedging creates on a people-api
-            // blip. Automation-shaped owners below do NOT get this
-            // grace — they have no claim to keep.
-            Err(_) => return Ok(requested.to_string()),
-        }
+    if kept_as_sent(Some(roster), requested).await {
+        return Ok(requested.to_string());
     }
 
     for role in [owner_role, step_fallback_role].into_iter().flatten() {

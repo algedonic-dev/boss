@@ -71,6 +71,7 @@ async fn written_off_fact_count(db: &TestDb, source_id: &str) -> i64 {
 #[tokio::test]
 async fn write_off_flips_once_and_double_delivery_converges() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let repo = PgCommerce::new(db.pool.clone());
     repo.create_invoice(&invoice("inv-step-wo-1", InvoiceStatus::PAST_DUE))
         .await
@@ -108,6 +109,7 @@ async fn write_off_from_outstanding_is_allowed() {
     // off ar-aging's emission), so an invoice still `outstanding`
     // writes off cleanly rather than dead-ending the drive.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let repo = PgCommerce::new(db.pool.clone());
     repo.create_invoice(&invoice("inv-step-wo-2", InvoiceStatus::OUTSTANDING))
         .await
@@ -128,6 +130,7 @@ async fn write_off_paid_invoice_conflicts() {
     // drift — refuse loudly instead of silently double-counting (cash
     // received AND bad-debt expense).
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let repo = PgCommerce::new(db.pool.clone());
     repo.create_invoice(&invoice("inv-step-wo-3", InvoiceStatus::PAID))
         .await
@@ -147,6 +150,7 @@ async fn write_off_paid_invoice_conflicts() {
 #[tokio::test]
 async fn write_off_missing_invoice_not_found() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let repo = PgCommerce::new(db.pool.clone());
 
     let err = repo

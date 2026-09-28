@@ -5,7 +5,7 @@
 because of a bad push but not even realizing we were the cause is a
 big problem." And: "I want to understand thoroughly what happened here
 so that we can implement a protocol to avoid it."
-**Related**: [packet-loss.md](./packet-loss.md) ·
+**Related**: [packet-loss, folded into the decision record](../architecture-decisions.md) ·
 [deployment-as-network.md](./deployment-as-network.md) ·
 [design-conformance.md](./design-conformance.md) ·
 [schema-migrations.md](./schema-migrations.md)

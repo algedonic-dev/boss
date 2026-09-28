@@ -1,9 +1,10 @@
 # Bill (vendor-invoice) category → GL debit account-code mapping.
 # Loaded once at first call by `boss_ledger::rules::bill_approved()`
 # via `include_str!` + `OnceLock<HashMap<String, &'static str>>`.
-# Same data-as-data shape as `revenue_accounts.toml` — adding a
-# bill category for a new kind of spend is a row here, not a new
-# match arm in the posting rule.
+# Adding a bill category for a new kind of spend is a row here, not
+# a new match arm in the posting rule. (Its revenue twin,
+# `revenue_accounts.toml`, moved onto the revenue-category Classes as
+# `metadata.gl_account` on 2026-09-26, backlog aa860c6d.)
 #
 # A bill's `bill_category` selects what the approved bill debits;
 # the credit is always 2100 Accounts Payable. Inventory bills clear

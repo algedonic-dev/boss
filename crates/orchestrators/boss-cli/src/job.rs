@@ -284,10 +284,14 @@ pub(crate) fn render_packet(job: &Value, width: usize) -> String {
 /// An EMPTY queue says so in words. A header with no rows under it reads
 /// identically to a failed read, which is precisely the
 /// indistinguishable-from-a-true-negative class this verb exists to end.
-pub(crate) fn station_table(body: &Value, width: usize) -> String {
+///
+/// A body with no rows array REFUSES (backlog 7b7e0529): read as zero
+/// rows, a station answering an error envelope printed "empty", which is
+/// that same class one layer down.
+pub(crate) fn station_table(body: &Value, width: usize) -> Result<String> {
     let g = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("-");
     let total = body.get("total").and_then(Value::as_u64).unwrap_or(0);
-    let rows = crate::gate::rows(Some(body.clone()));
+    let rows = crate::train::rows(Some(body.clone()))?;
     let discipline = body
         .get("discipline")
         .and_then(Value::as_array)
@@ -316,7 +320,7 @@ pub(crate) fn station_table(body: &Value, width: usize) -> String {
     );
     if rows.is_empty() {
         out.push_str("  (empty — the station holds nothing)\n");
-        return out;
+        return Ok(out);
     }
     let kw = rows
         .iter()
@@ -339,7 +343,7 @@ pub(crate) fn station_table(body: &Value, width: usize) -> String {
         out.push_str(&fit(&line, width));
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 /// What the packet holds NOW for each key the patch sent — the whole
@@ -393,7 +397,7 @@ fn width() -> usize {
 }
 
 /// One page of the job list.
-const RESOLVE_PAGE: usize = 500;
+pub(crate) const RESOLVE_PAGE: usize = 500;
 
 /// How many closed rows a prefix lookup will read before giving up.
 ///
@@ -425,13 +429,23 @@ pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> 
         let path = format!("/api/jobs?status={status}&limit={RESOLVE_PAGE}&offset={offset}");
         crate::gate::api(http, reqwest::Method::GET, &path, None).await
     };
+    resolve_through(page, job_ref).await
+}
+
+/// [`fetch_and_resolve`] over any page reader — the seam its tests go
+/// through, so the paging rules are pinned without a socket.
+pub(crate) async fn resolve_through<F, Fut>(page: F, job_ref: &str) -> Result<String>
+where
+    F: Fn(&'static str, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
     let id_of = |row: &Value| {
         row.get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .context("matched a job with no id")
     };
-    let open = crate::gate::rows(page("open", 0).await?);
+    let open = crate::train::rows(page("open", 0).await?)?;
     match resolve(&open, job_ref) {
         Ok(row) => return id_of(row),
         Err(e) if e.to_string().starts_with("no job matches") => {}
@@ -440,15 +454,15 @@ pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> 
     let mut read = 0usize;
     let mut to_read = RESOLVE_CLOSED_MAX;
     while read < to_read {
-        let body = page("closed", read).await?;
-        let total = body
-            .as_ref()
-            .and_then(|b| b.get("total"))
-            .and_then(Value::as_u64)
-            .map(|t| usize::try_from(t).unwrap_or(usize::MAX))
-            .unwrap_or(0);
-        to_read = closed_rows_to_read(total);
-        let rows = crate::gate::rows(body);
+        // A page without its `total` is refused, never read as zero
+        // closed jobs (backlog 10776b6c): zero set the depth to nothing
+        // and the verb answered "no job matches" for a packet it had
+        // not looked for.
+        let body = page("closed", read)
+            .await?
+            .context("a closed-jobs page answered no JSON body")?;
+        to_read = closed_rows_to_read(crate::train::list_total(&body)?);
+        let rows = crate::train::rows(Some(body))?;
         if rows.is_empty() {
             break;
         }
@@ -502,7 +516,7 @@ pub async fn station(name: &str, raw: bool) -> Result<()> {
     .await?
     .with_context(|| format!("the station read for {name:?} returned no body"))?;
     if raw {
-        let packets: Vec<Value> = crate::gate::rows(Some(body.clone()))
+        let packets: Vec<Value> = crate::train::rows(Some(body.clone()))?
             .iter()
             .map(|r| {
                 json!({
@@ -530,7 +544,7 @@ pub async fn station(name: &str, raw: bool) -> Result<()> {
             }))?
         );
     } else {
-        print!("{}", station_table(&body, width()));
+        print!("{}", station_table(&body, width())?);
     }
     Ok(())
 }
@@ -665,7 +679,7 @@ pub async fn list(
         .as_ref()
         .and_then(|b| b.get("total"))
         .and_then(Value::as_u64);
-    let rows = crate::gate::rows(body);
+    let rows = crate::train::rows(body)?;
     let w = width();
     for r in &rows {
         println!("{}", list_line(r, w));
@@ -732,6 +746,14 @@ fn resolve_channel(kind: &str, flag: Option<&str>, md: &Option<Value>) -> Result
     Ok(None)
 }
 
+/// What a filing records about its own origin, beside the lane:
+/// `--source` and `--area` (design 3036296f mechanism D; the rules are
+/// in `item_source`).
+pub struct Origin {
+    pub source: Option<String>,
+    pub area: Option<String>,
+}
+
 pub async fn file(
     kind: &str,
     title: &str,
@@ -739,8 +761,8 @@ pub async fn file(
     metadata: Option<std::path::PathBuf>,
     subject_id: Option<String>,
     channel: Option<String>,
+    origin: Origin,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
     let md = match &metadata {
         Some(p) => Some(
             serde_json::from_str(
@@ -751,10 +773,52 @@ pub async fn file(
         ),
         None => None,
     };
+    let filing = Filing {
+        kind,
+        title,
+        priority: priority.as_deref(),
+        subject_id: subject_id.as_deref(),
+        channel: channel.as_deref(),
+        metadata: md,
+    };
+    let report = file_on(&crate::steps::Wire::live()?, filing, origin).await?;
+    println!("{report}");
+    Ok(())
+}
+
+/// One filing, as `boss job file` was handed it — the metadata file
+/// already read.
+pub(crate) struct Filing<'a> {
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub priority: Option<&'a str>,
+    pub subject_id: Option<&'a str>,
+    pub channel: Option<&'a str>,
+    pub metadata: Option<Value>,
+}
+
+/// [`file`] on an explicit wire — the base and the caller as values, so
+/// a test drives the whole verb against the REAL jobs router and its
+/// admission (backlog 443eedc9: the CLI and admission each owned
+/// `opened_by`, and the two landed cars refused every filing).
+/// Answers the report the verb prints.
+pub(crate) async fn file_on(
+    wire: &crate::steps::Wire,
+    filing: Filing<'_>,
+    origin: Origin,
+) -> Result<String> {
+    let Filing {
+        kind,
+        title,
+        priority,
+        subject_id,
+        channel,
+        metadata: md,
+    } = filing;
     // The lane is RECORDED here, at the point it is known, rather than
     // inferred later from the title's words (c5dc81a1).
     let mut md = md;
-    if let Some(lane) = resolve_channel(kind, channel.as_deref(), &md)? {
+    if let Some(lane) = resolve_channel(kind, channel, &md)? {
         match md.get_or_insert_with(|| json!({})).as_object_mut() {
             Some(o) => {
                 o.insert(crate::channels::RECORDED_KEY.to_string(), json!(lane));
@@ -762,21 +826,45 @@ pub async fn file(
             None => bail!("--metadata must be a JSON object to carry the input lane"),
         }
     }
+    // What produced it, and where it lands — recorded as data, and
+    // refused for a finding that names nothing (9b473d4a). Judged on
+    // the lane as it now stands, flag or metadata alike, and every
+    // check that needs no socket runs before the one that does.
+    let lane = md
+        .as_ref()
+        .and_then(|m| m.get(crate::channels::RECORDED_KEY))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let source =
+        crate::item_source::requested(kind, lane.as_deref(), origin.source.as_deref(), &md)?;
+    let area = crate::item_source::area(origin.area.as_deref(), &md)?;
     // The packet is owned by whoever filed it. This used to stamp the
     // train conductor's id on every hand-filed packet — the same
     // mis-attribution `completed_by` exposed on steps (backlog
     // 5083d6f5). Resolved BEFORE the POST so an unnamed caller is
     // refused with the fix rather than filing under automation.
-    let owner = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    let body = envelope(
-        kind,
-        title,
-        priority.as_deref(),
-        subject_id.as_deref(),
-        &owner,
-        md,
-    );
-    let created = crate::gate::api(&http, reqwest::Method::POST, "/api/jobs", Some(body))
+    let owner = wire.signer(&reqwest::Method::POST, "/api/jobs")?;
+    let source = match &source {
+        Some(s) => {
+            let get =
+                |path: String| async move { wire.call(reqwest::Method::GET, &path, None).await };
+            Some(crate::item_source::pin(get, s).await?)
+        }
+        None => None,
+    };
+    // Who FILED it is not sent: admission stamps `opened_by` from the
+    // signed caller, as the login door resolved it, and refuses a body
+    // naming anyone else (958edca6). Sending it here refused every
+    // filing on 2026-09-27 (backlog 443eedc9) — see item_source::merge.
+    let md = crate::item_source::merge(md, source, area)?;
+    let origin_keys = [crate::item_source::SOURCE_KEY, crate::item_source::AREA_KEY];
+    let recorded: serde_json::Map<String, Value> = origin_keys
+        .iter()
+        .filter_map(|k| md.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    let body = envelope(kind, title, priority, subject_id, &owner, Some(md));
+    let created = wire
+        .call(reqwest::Method::POST, "/api/jobs", Some(body))
         .await?
         .context("the create returned no body")?;
     let id = created
@@ -786,19 +874,31 @@ pub async fn file(
         .to_string();
 
     // A 201 is a claim; the read-back is the fact.
-    let job = crate::gate::api(
-        &http,
-        reqwest::Method::GET,
-        &format!("/api/jobs/{id}"),
-        None,
-    )
-    .await?
-    .context("created a job the API will not read back")?;
-    println!(
-        "boss job: filed {id}  \"{}\" — confirmed by reading it back",
-        job.get("title").and_then(Value::as_str).unwrap_or("?")
+    let job = wire
+        .call(reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
+        .await?
+        .context("created a job the API will not read back")?;
+    // The origin is the point of the filing's record, so it is read back
+    // like a patch's keys: a packet that lost it is not called filed.
+    let (report, all_took) = confirm_patch(
+        job.get("metadata").unwrap_or(&Value::Null),
+        &Value::Object(recorded),
     );
-    Ok(())
+    if !all_took {
+        bail!("filed {id}, but its origin did not land as sent:\n{report}");
+    }
+    // The filer as admission recorded it — read back, not assumed: it is
+    // the resolved actor, which may not be the login this verb signed with.
+    let filer = job
+        .get("metadata")
+        .and_then(|m| m.get(crate::item_source::OPENED_BY_KEY))
+        .map_or_else(|| "(not recorded)".to_string(), Value::to_string);
+    Ok(format!(
+        "boss job: filed {id}  \"{}\" — confirmed by reading it back\n  {}: {filer}\n{}",
+        job.get("title").and_then(Value::as_str).unwrap_or("?"),
+        crate::item_source::OPENED_BY_KEY,
+        report.trim_end()
+    ))
 }
 
 pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
@@ -841,8 +941,450 @@ pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `--to 3` or `--to v3` — the version the way `boss job get` prints it
+/// (`kind v3`) or bare.
+pub(crate) fn parse_version(s: &str) -> Result<i32> {
+    s.trim()
+        .trim_start_matches(['v', 'V'])
+        .parse::<i32>()
+        .with_context(|| format!("--to {s:?} is not a protocol version (e.g. 3 or v3)"))
+}
+
+/// A judged move as an operator reads it: from, to, the verdict, each
+/// obstacle by step, then what the move writes — each step re-projected
+/// with what changed on it and what it kept, and each step inserted.
+/// Pure, over the body `GET /api/jobs/{id}/convert` answers (the POST's
+/// answer carries the same two lists).
+pub(crate) fn render_move(body: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let n = |k: &str| body.get(k).and_then(Value::as_i64).unwrap_or_default();
+    let list = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let words = |v: &Value| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    let _ = writeln!(out, "v{} -> v{}", n("from"), n("to"));
+    for o in list("obstacles") {
+        let step = o
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("(protocol)");
+        let why = o.get("reason").and_then(Value::as_str).unwrap_or("?");
+        let _ = writeln!(out, "  refused  {step}: {why}");
+    }
+    for r in list("reprojected") {
+        let step = r.get("step").and_then(Value::as_str).unwrap_or("?");
+        let _ = write!(out, "  re-project  {step}: {}", words(&r["changed"]));
+        if r.get("kept").is_some() {
+            let _ = write!(out, "  (kept as written: {})", words(&r["kept"]));
+        }
+        out.push('\n');
+    }
+    for i in list("inserted") {
+        let step = i.get("step").and_then(Value::as_str).unwrap_or("?");
+        let _ = writeln!(out, "  insert  {step}");
+    }
+    out
+}
+
+/// `boss job convert <packet> [--to vN] [--dry-run]` — move a packet to
+/// another version of its protocol, or preview the move (design
+/// 7cf202a9 Q1; the CLI twin of `/api/jobs/{id}/convert`).
+///
+/// The dry run is a READ (`GET`), so it can be run across a cohort
+/// before anyone moves a packet (Q5) and needs no actor. The move is a
+/// write, and the API refuses it to anyone who may not publish a
+/// protocol version (Q4). Either way the verb asks the preview first
+/// and prints it, so a refusal names each obstacle by step instead of
+/// arriving as a 409 inside an error line.
+///
+/// CONFIRMATION OVER STATUS CODES: after a move, the packet is read back
+/// and the verb FAILS unless it is pinned to the target and its
+/// `repins` record grew by one.
+pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<()> {
+    let to = to.map(parse_version).transpose()?;
+    let http = reqwest::Client::new();
+    let id = fetch_and_resolve(&http, job_ref).await?;
+    let query = to.map(|v| format!("?to_version={v}")).unwrap_or_default();
+    let preview = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}/convert{query}"),
+        None,
+    )
+    .await?
+    .context("the conversion preview returned no body")?;
+    if preview.get("reason").is_some() {
+        println!(
+            "boss job convert: {id} — {} (v{})",
+            preview["reason"].as_str().unwrap_or("nothing to do"),
+            preview["workflow_version"]
+        );
+        return Ok(());
+    }
+    print!("{}", render_move(&preview));
+    let convertible = preview.get("convertible").and_then(Value::as_bool) == Some(true);
+    if dry_run {
+        println!(
+            "boss job convert: {id} — dry run, nothing written ({})",
+            if convertible {
+                "convertible"
+            } else {
+                "refused"
+            }
+        );
+        return Ok(());
+    }
+    if !convertible {
+        bail!(
+            "{id} cannot be moved to v{} — the obstacles above name each step",
+            preview["to"]
+        );
+    }
+
+    let before = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the packet before moving it")?;
+    let body = match to {
+        Some(v) => json!({ "to_version": v }),
+        None => json!({}),
+    };
+    crate::gate::api(
+        &http,
+        reqwest::Method::POST,
+        &format!("/api/jobs/{id}/convert"),
+        Some(body),
+    )
+    .await?;
+
+    // The status code said yes; the packet is the authority.
+    let after = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the moved packet back")?;
+    let repins = |job: &Value| {
+        job.pointer("/metadata/repins")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    if after["workflow_version"] != preview["to"] || repins(&after) != repins(&before) + 1 {
+        bail!(
+            "the API answered the move but the packet does not show it: pinned v{}, {} repins \
+             record(s) (was {})",
+            after["workflow_version"],
+            repins(&after),
+            repins(&before)
+        );
+    }
+    println!(
+        "boss job convert: {id} moved to v{} — confirmed by reading it back",
+        after["workflow_version"]
+    );
+    Ok(())
+}
+
+/// PURE: the `outcome` a CLOSED packet's metadata owes — derived from
+/// its completed declared terminal under the version it is pinned to,
+/// by the one rule every close uses
+/// ([`boss_jobs::WorkflowSpec::completed_terminal_outcome`]) — or
+/// `None` when it already records it, or the refusal. Never invented:
+/// a packet that closed with no completed terminal has no outcome to
+/// derive, and a recorded outcome that disagrees is not overwritten.
+pub(crate) fn owed_outcome(
+    job: &Value,
+    spec: &boss_jobs::WorkflowSpec,
+) -> std::result::Result<Option<String>, String> {
+    let id = job.get("id").and_then(Value::as_str).unwrap_or("?");
+    let id = &id[..8.min(id.len())];
+    let status = job.get("status").and_then(Value::as_str).unwrap_or("?");
+    if status != "closed" {
+        return Err(format!(
+            "packet {id} is {status} — an outcome is written by the close, and this repairs \
+             only a close that lost it"
+        ));
+    }
+    let steps = job
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let derived = spec
+        .completed_terminal_outcome(steps.iter().map(|s| {
+            (
+                s.get("sort_order")
+                    .and_then(Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok())
+                    .unwrap_or(-1),
+                s.get("status").and_then(Value::as_str) == Some("completed"),
+            )
+        }))
+        .ok_or_else(|| {
+            format!(
+                "packet {id} closed with no completed declared terminal under {} v{} — there \
+                 is no outcome to derive, and none is invented",
+                spec.kind, spec.version
+            )
+        })?;
+    match job.pointer("/metadata/outcome").and_then(Value::as_str) {
+        Some(recorded) if recorded == derived => Ok(None),
+        Some(recorded) => Err(format!(
+            "packet {id} records outcome {recorded:?} but its completed terminal declares \
+             {derived:?} — a recorded outcome is not overwritten; read the packet"
+        )),
+        None => Ok(Some(derived.to_string())),
+    }
+}
+
+/// `boss job outcome <packet> [--dry-run]` — write the `outcome` a
+/// closed packet lost, re-derived from its completed terminal step
+/// (228c9a7d). Car 6b23d135 closed through `disproved` and a racing
+/// catch-all close erased the outcome its terminal close had stamped;
+/// the server no longer writes that close without it, and this is the
+/// door for a packet closed before it did — not a hand PATCH of a value
+/// someone read off the steps. Confirmed by reading the packet back.
+pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
+    let http = reqwest::Client::new();
+    let id = fetch_and_resolve(&http, job_ref).await?;
+    let job = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the packet")?;
+    let kind = job
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("packet {id} has no kind"))?;
+    let version = job
+        .get("workflow_version")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("packet {id} is pinned to no version"))?;
+    let spec: boss_jobs::WorkflowSpec = serde_json::from_value(
+        crate::gate::api(
+            &http,
+            reqwest::Method::GET,
+            &format!("/api/workflows/{kind}/versions/{version}"),
+            None,
+        )
+        .await?
+        .with_context(|| format!("{kind} v{version} is not in the registry"))?,
+    )
+    .with_context(|| format!("{kind} v{version} did not read as a protocol version"))?;
+    let owed = owed_outcome(&job, &spec).map_err(|e| anyhow!("boss job outcome: REFUSED — {e}"))?;
+    let Some(owed) = owed else {
+        println!("boss job outcome: {id} already records its terminal's outcome — nothing to do");
+        return Ok(());
+    };
+    if dry_run {
+        println!(
+            "boss job outcome: {id} — dry run, would write outcome {owed:?} (its completed \
+             terminal under {kind} v{version})"
+        );
+        return Ok(());
+    }
+    let sent = json!({ "outcome": owed });
+    crate::gate::api(
+        &http,
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{id}/metadata"),
+        Some(sent.clone()),
+    )
+    .await?;
+    let after = crate::gate::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the packet back")?;
+    let (report, took) = confirm_patch(
+        &after.get("metadata").cloned().unwrap_or_else(|| json!({})),
+        &sent,
+    );
+    print!("{report}");
+    if !took {
+        bail!("the API answered but packet {id} does not hold the outcome that was sent");
+    }
+    println!(
+        "boss job outcome: {id} records outcome {owed:?}, derived from its completed terminal \
+         — confirmed by reading it back"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// 228c9a7d: the outcome a closed packet owes is its completed
+    /// terminal's — 6b23d135's shape — and nothing else is written: an
+    /// open packet, a close with no completed terminal, and a recorded
+    /// outcome that disagrees are each refused by name; one that agrees
+    /// is nothing to do.
+    #[test]
+    fn a_lost_outcome_is_re_derived_from_the_completed_terminal() {
+        use serde_json::json;
+        let spec: boss_jobs::WorkflowSpec = serde_json::from_value(json!({
+            "kind": "ship-a-change", "version": 3, "status": "active",
+            "label": "Ship a change", "category": "engineering",
+            "subject_kinds": ["custom"], "owning_team": "platform",
+            "created_at": "2026-09-24T00:00:00Z",
+            "steps": [
+                {"title": "review", "kind": "task", "ready_when": "true"},
+                {"title": "merged", "kind": "outcome", "ready_when": "true",
+                 "terminal": {"outcome": "merged"}},
+                {"title": "disproved", "kind": "outcome", "ready_when": "true",
+                 "terminal": {"outcome": "disproved"}},
+            ],
+        }))
+        .unwrap();
+        let car = json!({
+            "id": "6b23d135-1bde-47cc-9bd5-5612c741b9f2", "status": "closed",
+            "metadata": {"merged": "true", "disproved": "true"},
+            "steps": [
+                {"sort_order": 0, "status": "completed"},
+                {"sort_order": 1, "status": "skipped"},
+                {"sort_order": 2, "status": "completed"},
+            ],
+        });
+        assert_eq!(
+            super::owed_outcome(&car, &spec),
+            Ok(Some("disproved".to_string()))
+        );
+
+        let mut repaired = car.clone();
+        repaired["metadata"]["outcome"] = json!("disproved");
+        assert_eq!(super::owed_outcome(&repaired, &spec), Ok(None));
+
+        let mut other = car.clone();
+        other["metadata"]["outcome"] = json!("merged");
+        let e = super::owed_outcome(&other, &spec).unwrap_err();
+        assert!(e.contains("not overwritten"), "{e}");
+
+        let mut open = car.clone();
+        open["status"] = json!("open");
+        let e = super::owed_outcome(&open, &spec).unwrap_err();
+        assert!(e.contains("6b23d135 is open"), "{e}");
+
+        let mut catch_all = car.clone();
+        catch_all["steps"][2]["status"] = json!("skipped");
+        let e = super::owed_outcome(&catch_all, &spec).unwrap_err();
+        assert!(e.contains("none is invented"), "{e}");
+    }
+
+    #[test]
+    fn a_version_reads_bare_or_as_printed() {
+        assert_eq!(super::parse_version("3").unwrap(), 3);
+        assert_eq!(super::parse_version("v8").unwrap(), 8);
+        assert!(super::parse_version("latest").is_err());
+    }
+
+    /// The preview names every step the move touches, and what it kept.
+    #[test]
+    fn a_rendered_move_names_each_step_and_what_it_kept() {
+        let out = super::render_move(&serde_json::json!({
+            "from": 1, "to": 3, "convertible": true, "obstacles": [],
+            "reprojected": [
+                {"step": "measure", "changed": ["`procedure`"]},
+                {"step": "file", "changed": [], "kept": ["`procedure`"]},
+            ],
+            "inserted": [{"step": "draft-design"}],
+        }));
+        assert!(out.starts_with("v1 -> v3\n"), "{out}");
+        assert!(out.contains("re-project  measure: `procedure`"), "{out}");
+        assert!(out.contains("(kept as written: `procedure`)"), "{out}");
+        assert!(out.contains("insert  draft-design"), "{out}");
+    }
+
+    /// A refusal names each obstacle by step.
+    #[test]
+    fn a_rendered_refusal_names_the_step() {
+        let out = super::render_move(&serde_json::json!({
+            "from": 2, "to": 7, "convertible": false,
+            "obstacles": [{"step": "measure", "reason": "required field `x` added"}],
+        }));
+        assert!(
+            out.contains("refused  measure: required field `x` added"),
+            "{out}"
+        );
+    }
+
+    /// A closed page with no `total` is refused, never read as zero
+    /// closed jobs (backlog 10776b6c). Counted as 0, it set the read
+    /// depth to 0, the loop never ran, and the verb said "no job
+    /// matches … give the full uuid" for a packet it had not looked for.
+    #[tokio::test]
+    async fn a_closed_page_without_a_total_refuses_rather_than_matching_nothing() {
+        let why = super::resolve_through(
+            |status, _offset| async move {
+                anyhow::Ok(Some(match status {
+                    "open" => serde_json::json!({"data": [], "total": 0}),
+                    _ => serde_json::json!({"data": [{"id": "abcdef12-0000-4000-8000-000000000000"}]}),
+                }))
+            },
+            "abcdef12",
+        )
+        .await
+        .expect_err("a page that cannot say how many closed jobs exist decides nothing")
+        .to_string();
+        assert!(why.contains("total"), "{why}");
+        assert!(!why.contains("no job matches"), "{why}");
+    }
+
+    /// And with its total, the same page resolves the prefix.
+    #[tokio::test]
+    async fn a_closed_page_with_its_total_resolves_the_prefix() {
+        let id = super::resolve_through(
+            |status, _offset| async move {
+                anyhow::Ok(Some(match status {
+                    "open" => serde_json::json!({"data": [], "total": 0}),
+                    _ => serde_json::json!({
+                        "data": [{"id": "abcdef12-0000-4000-8000-000000000000"}],
+                        "total": 1
+                    }),
+                }))
+            },
+            "abcdef12",
+        )
+        .await
+        .expect("resolved");
+        assert_eq!(id, "abcdef12-0000-4000-8000-000000000000");
+    }
+
+    /// A STATION THAT DID NOT ANSWER IS NOT AN EMPTY ONE (backlog
+    /// 7b7e0529): a body with no rows array refuses rather than printing
+    /// "(empty — the station holds nothing)".
+    #[test]
+    fn a_station_body_with_no_rows_refuses_rather_than_reading_empty() {
+        let body = serde_json::json!({"error": "no such station", "total": 0});
+        let why = super::station_table(&body, 120)
+            .expect_err("an error envelope is not an empty queue")
+            .to_string();
+        assert!(why.contains("cannot be read as zero"), "{why}");
+    }
+
     #[test]
     fn a_prefix_lookup_reads_the_whole_closed_set_when_it_fits_and_the_bound_when_not() {
         assert_eq!(super::closed_rows_to_read(0), 0);
@@ -1131,7 +1673,7 @@ mod tests {
               "title": "ESTATE ALARM: disk_tight:w-1 persisted", "metadata": {} }
           ]
         });
-        let out = station_table(&body, 120);
+        let out = station_table(&body, 120).expect("a station body with rows");
 
         // The station's own facts, which are the reason to ask a station
         // rather than list jobs: depth, discipline, and the WIP limit.
@@ -1156,11 +1698,8 @@ mod tests {
         // defect class this verb exists for.
         let empty = json!({"station": "loading-dock", "kind": "batch",
                            "discipline": ["priority"], "total": 0, "data": []});
-        assert!(
-            station_table(&empty, 120).contains("empty"),
-            "{}",
-            station_table(&empty, 120)
-        );
+        let empty = station_table(&empty, 120).expect("an empty queue is an answer");
+        assert!(empty.contains("empty"), "{empty}");
     }
 
     #[test]
@@ -1308,5 +1847,160 @@ mod tests {
         assert_eq!(list_footer(3, Some(3)), "boss job: 3 row(s)");
         // A body with no `total` cannot claim more than it shows.
         assert_eq!(list_footer(3, None), "boss job: 3 row(s)");
+    }
+
+    // ------------------------------------------------------------------
+    // `boss job file` against the REAL admission (backlog 443eedc9).
+    //
+    // Measured 2026-09-27: two cars landed within hours, each right on
+    // its own gate — the CLI stamped `opened_by` from BOSS_ACTOR, and
+    // admission (958edca6) began stamping it from the signed caller and
+    // refusing a create whose value names anyone else. On the live
+    // stack the login door rewrites `claude@algedonic.dev` to
+    // `agent-claude` before admission reads it, so the CLI's value
+    // named "someone else" and EVERY backlog-item filing answered 422.
+    // Neither car's tests could see the other half. This drives the
+    // verb's own create path through the jobs router, its admission
+    // and the login door as the binary mounts it, in memory — so the
+    // two can never contradict again without a red here (CLAUDE.md §9a).
+    // ------------------------------------------------------------------
+    mod filing_meets_admission {
+        use std::sync::Arc;
+
+        use boss_jobs::registry::seedable_platform_workflows;
+        use boss_jobs::{
+            InMemoryJobs, InMemoryWorkflows, JobFilter, JobsRepository, WorkflowRegistry,
+        };
+        use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+        use serde_json::json;
+
+        use super::super::{Filing, Origin, file_on};
+
+        /// The login the CLI signs with (BOSS_ACTOR on the pod) and the
+        /// actor the agents registry maps it to — the two spellings the
+        /// live refusal named.
+        const LOGIN: &str = "claude@algedonic.dev";
+        const AGENT: &str = "agent-claude";
+
+        async fn serve() -> (String, Arc<InMemoryJobs>) {
+            let jobs = Arc::new(InMemoryJobs::new());
+            let policy: Arc<dyn PolicyClient> = Arc::new(
+                FakePolicyClient::builder()
+                    .allow(
+                        "platform-admin",
+                        Action::Create,
+                        Resource::job(),
+                        Scope::All,
+                    )
+                    .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
+                    .build(),
+            );
+            let bus = boss_testing::RecordingEventBus::new();
+            let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
+            let publisher = boss_core::publisher::DomainPublisher::new(bus_dyn, "jobs");
+            let kinds = Arc::new(InMemoryWorkflows::new());
+            for spec in seedable_platform_workflows() {
+                kinds.seed(spec).expect("seed platform kind");
+            }
+            let state = boss_jobs::http::JobsApiState {
+                kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
+                ..boss_jobs::http::JobsApiState::minimal(
+                    jobs.clone(),
+                    bus,
+                    publisher.clone(),
+                    policy,
+                    Arc::new(boss_clock_client::WallClockClient),
+                )
+            };
+            // The login door, layered the way boss_jobs_api.rs mounts it.
+            let agents =
+                Arc::new(boss_jobs::agents::InMemoryAgents::new().with_agent(AGENT, [LOGIN]));
+            let door = Arc::new(boss_jobs::agents::LoginDoor::new(agents, publisher));
+            let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn_with_state(
+                door,
+                boss_jobs::agents::resolve_login,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (format!("http://{addr}"), jobs)
+        }
+
+        fn wire(base: String) -> crate::steps::Wire {
+            crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: LOGIN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+        }
+
+        fn filing(metadata: Option<serde_json::Value>) -> Filing<'static> {
+            Filing {
+                kind: "backlog-item",
+                title: "A backlog item filed through the verb",
+                priority: None,
+                subject_id: None,
+                channel: Some("roadmap"),
+                metadata,
+            }
+        }
+
+        fn no_origin() -> Origin {
+            Origin {
+                source: None,
+                area: Some("cli".into()),
+            }
+        }
+
+        async fn stored(jobs: &InMemoryJobs) -> Vec<boss_core::job::Job> {
+            jobs.list_jobs(&JobFilter::default(), 10, 0)
+                .await
+                .unwrap()
+                .0
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_verb_files_and_admission_records_the_signer_as_filer() {
+            let (base, jobs) = serve().await;
+            let report = file_on(&wire(base), filing(None), no_origin())
+                .await
+                .expect("admitted");
+            assert!(report.contains("boss job: filed"), "{report}");
+            let rows = stored(&jobs).await;
+            assert_eq!(rows.len(), 1, "one packet landed");
+            let md = &rows[0].metadata;
+            // Admission's spelling — the actor the login resolved to.
+            assert_eq!(md["opened_by"], AGENT, "{md}");
+            assert_eq!(md["input_channel"], "roadmap", "{md}");
+            assert_eq!(md["area"], "cli", "{md}");
+            assert!(
+                report.contains(AGENT),
+                "the report names the filer: {report}"
+            );
+        }
+
+        /// The CLI no longer judges the filer; admission does, once. A
+        /// metadata file naming someone else still never lands.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_metadata_file_naming_another_filer_is_refused_by_admission() {
+            let (base, jobs) = serve().await;
+            let err = file_on(
+                &wire(base),
+                filing(Some(json!({"opened_by": "emp-david"}))),
+                no_origin(),
+            )
+            .await
+            .expect_err("another filer");
+            let said = format!("{err:#}");
+            assert!(
+                said.contains("422") && said.contains("emp-david") && said.contains(AGENT),
+                "{said}"
+            );
+            assert!(stored(&jobs).await.is_empty(), "nothing landed");
+        }
     }
 }

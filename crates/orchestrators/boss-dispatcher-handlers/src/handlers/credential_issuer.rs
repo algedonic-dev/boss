@@ -49,14 +49,19 @@ pub struct MintedToken {
 
 /// The Forgejo token API, verified against the live forge
 /// (16.0.2+gitea-1.22.0 at the time of writing):
-///   GET    /api/v1/admin/users/{u}/tokens          — list
-///   POST   /api/v1/admin/users/{u}/tokens          — mint (201 → {id, sha1})
-///   DELETE /api/v1/admin/users/{u}/tokens/{ref}    — revoke by id, or name
+///   GET    /api/v1/admin/users/{u}/tokens?page=&limit=  — list, paged
+///   POST   /api/v1/admin/users/{u}/tokens               — mint (201 → {id, sha1})
+///   DELETE /api/v1/admin/users/{u}/tokens/{id}          — revoke
 /// All three accept admin token auth (`Authorization: token …`),
 /// unlike the non-admin `/users/{u}/tokens` route, which wants
 /// BasicAuth. Errors are plain strings so fakes stay trivial.
 #[async_trait]
 pub trait ForgeTokenIssuer: Send + Sync {
+    /// The user's WHOLE ledger, or an error — never a page of it. Every
+    /// judgement the broker makes (which token a last eight names, whether
+    /// a named token is already gone, whether a DELETE took) reads absence
+    /// off this list, so a truncated one reads a live token as revoked
+    /// (round-3 review of car 85b7b55f, F1c).
     async fn list_tokens(&self, user: &str) -> Result<Vec<TokenInfo>, String>;
     async fn create_token(
         &self,
@@ -64,9 +69,16 @@ pub trait ForgeTokenIssuer: Send + Sync {
         name: &str,
         scopes: &[String],
     ) -> Result<MintedToken, String>;
-    /// Delete by id-or-name. `Ok(false)` = already absent, which a
-    /// re-run treats as success (the point of revoking is absence).
-    async fn delete_token(&self, user: &str, token_ref: &str) -> Result<bool, String>;
+    /// Delete by the NUMERIC id a ledger row carries — never by a name or
+    /// any other string. The forge's route takes either, and a string
+    /// reaches the URL path: `../../../../repos/david/boss` there is
+    /// resolved by the client to `/api/v1/repos/david/boss` and sent with
+    /// the broker's admin root token (round-3 review of car 85b7b55f,
+    /// F1d). An `i64` has no spelling but digits and a sign, and the only
+    /// ids the broker holds are the ones the ledger listed. `Ok(false)` =
+    /// already absent, which a re-run treats as success (the point of
+    /// revoking is absence).
+    async fn delete_token(&self, user: &str, token_id: i64) -> Result<bool, String>;
     /// Verify by effect: authenticate a repo read with `token`.
     async fn repo_readable_with(&self, token: &str, repo: &str) -> Result<bool, String>;
 }
@@ -121,41 +133,158 @@ impl ForgejoAdmin {
     fn auth(&self) -> String {
         format!("token {}", self.root_token)
     }
+
+    /// `/api/v1/admin/users/{user}/tokens` — the one place the admin token
+    /// routes are spelled, and the one place `user` is judged against the
+    /// forge's grammar before it enters a path.
+    fn tokens_url(&self, user: &str) -> Result<String, String> {
+        Ok(format!(
+            "{}/api/v1/admin/users/{}/tokens",
+            self.base.trim_end_matches('/'),
+            forge_username(user)?
+        ))
+    }
+}
+
+/// Tokens asked for per page. Forgejo clamps a `limit` above its
+/// MAX_RESPONSE_ITEMS (50 by default, lower if configured) down to it, so
+/// a page may come back SHORTER than this with more to follow: a short
+/// page is never read as the end, only an empty one is.
+const TOKEN_PAGE: usize = 50;
+
+/// Pages read before a listing is refused as unbounded — ten thousand
+/// tokens at the default page, far past any user this estate holds.
+const TOKEN_PAGES_MAX: usize = 200;
+
+/// The forge's own username grammar, applied before `user` becomes part of
+/// an admin URL path signed with the broker's root token (backlog
+/// cd2745b2, round-4 review of car c4cbc6b5, A4). `forge_user` is rule-arg
+/// data, and percent-encoding it is no defence — `%2e%2e` normalises back
+/// to `..` — so a name the forge could never hold never reaches a URL.
+///
+/// Forgejo's rule (`modules/validation`, `IsValidUsername`, as in Gitea
+/// 1.22 on which the estate's forge 16.0.2 is built): an ASCII letter or
+/// digit, then letters, digits, `-`, `.` and `_`; no two of `-._` in a
+/// row, none last; at most 40 characters (the user form's `MaxSize(40)`).
+/// Every `user` the adapter below puts in a path passes through here.
+pub fn forge_username(user: &str) -> Result<&str, String> {
+    const MAX: usize = 40;
+    let special = |c: char| matches!(c, '-' | '.' | '_');
+    let mut chars = user.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || special(c));
+    let runs_ok = !user
+        .as_bytes()
+        .windows(2)
+        .any(|w| special(w[0] as char) && special(w[1] as char));
+    let last_ok = !user.ends_with(special);
+    if first_ok && rest_ok && runs_ok && last_ok && user.len() <= MAX {
+        Ok(user)
+    } else {
+        Err(format!(
+            "forge_user {user:?} is not a forge username (an ASCII letter or digit, then \
+             letters, digits and -._ with none doubled or last, at most {MAX} characters); \
+             it never enters an admin URL"
+        ))
+    }
+}
+
+/// One listed row, or `None` when the row lacks an id or a name.
+fn token_row(r: &JsonValue) -> Option<TokenInfo> {
+    Some(TokenInfo {
+        id: r.get("id")?.as_i64()?,
+        name: r.get("name")?.as_str()?.to_string(),
+        token_last_eight: r
+            .get("token_last_eight")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 #[async_trait]
 impl ForgeTokenIssuer for ForgejoAdmin {
+    /// Read page after page until the forge answers an empty one (round-3
+    /// review of car 85b7b55f, F1c: `?limit=50`, never paged, dropped the
+    /// sixty-first token — the oldest, which a leaked one usually is — out
+    /// of every judgement). Each way the result could be partial is
+    /// refused rather than returned: a page repeating an id already read (a
+    /// forge ignoring `page`), a row with no id or name, a total that
+    /// disagrees with the forge's own `X-Total-Count`, a count that moves
+    /// between pages, or more pages than any real ledger has.
+    ///
+    /// The count is held from page one and compared on EVERY page (round-4
+    /// review of car c4cbc6b5, A2; backlog 796d8e64). Compared only at the
+    /// empty page, a token revoked mid-listing went unseen: every later row
+    /// shifts one place toward the front, the row crossing the page
+    /// boundary is never read, and the rows read still add up to the
+    /// forge's final count.
     async fn list_tokens(&self, user: &str) -> Result<Vec<TokenInfo>, String> {
-        let url = format!(
-            "{}/api/v1/admin/users/{user}/tokens?limit=50",
-            self.base.trim_end_matches('/')
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth())
-            .send()
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("GET {url} returned {status}"));
+        let base = self.tokens_url(user)?;
+        let mut all: Vec<TokenInfo> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut first_total: Option<Option<usize>> = None;
+        for page in 1..=TOKEN_PAGES_MAX {
+            let url = format!("{base}?page={page}&limit={TOKEN_PAGE}");
+            let resp = self
+                .client
+                .get(&url)
+                .header("Authorization", self.auth())
+                .send()
+                .await
+                .map_err(|e| format!("GET {url}: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("GET {url} returned {status}"));
+            }
+            let total = resp
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<usize>().ok());
+            let count = |t: Option<usize>| t.map_or("no count".to_string(), |t| t.to_string());
+            match first_total {
+                None => first_total = Some(total),
+                Some(first) if first != total => {
+                    return Err(format!(
+                        "GET {base}: page 1 counted {} tokens and page {page} counts {}; \
+                         refusing a ledger that moved while it was read",
+                        count(first),
+                        count(total)
+                    ));
+                }
+                Some(_) => {}
+            }
+            let rows: Vec<JsonValue> = resp.json().await.map_err(|e| format!("{url}: {e}"))?;
+            if rows.is_empty() {
+                return match total {
+                    Some(t) if t != all.len() => Err(format!(
+                        "GET {base}: read {} tokens to an empty page, but the forge counts \
+                         {t}; refusing a ledger that moved or was cut short while it was read",
+                        all.len()
+                    )),
+                    _ => Ok(all),
+                };
+            }
+            for r in &rows {
+                let t = token_row(r).ok_or_else(|| {
+                    format!("GET {url}: a listed token carries no id or name; refusing a ledger with a row it cannot read")
+                })?;
+                if !seen.insert(t.id) {
+                    return Err(format!(
+                        "GET {url}: page {page} repeats token id {}, already read on an earlier \
+                         page — the forge is not paging this listing; refusing a ledger that may \
+                         be partial",
+                        t.id
+                    ));
+                }
+                all.push(t);
+            }
         }
-        let rows: Vec<JsonValue> = resp.json().await.map_err(|e| format!("{url}: {e}"))?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                Some(TokenInfo {
-                    id: r.get("id")?.as_i64()?,
-                    name: r.get("name")?.as_str()?.to_string(),
-                    token_last_eight: r
-                        .get("token_last_eight")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-            })
-            .collect())
+        Err(format!(
+            "GET {base}: still listing after {TOKEN_PAGES_MAX} pages of {TOKEN_PAGE}; refusing an \
+             unbounded ledger"
+        ))
     }
 
     async fn create_token(
@@ -164,10 +293,7 @@ impl ForgeTokenIssuer for ForgejoAdmin {
         name: &str,
         scopes: &[String],
     ) -> Result<MintedToken, String> {
-        let url = format!(
-            "{}/api/v1/admin/users/{user}/tokens",
-            self.base.trim_end_matches('/')
-        );
+        let url = self.tokens_url(user)?;
         let resp = self
             .client
             .post(&url)
@@ -195,11 +321,8 @@ impl ForgeTokenIssuer for ForgejoAdmin {
         Ok(MintedToken { id, sha1 })
     }
 
-    async fn delete_token(&self, user: &str, token_ref: &str) -> Result<bool, String> {
-        let url = format!(
-            "{}/api/v1/admin/users/{user}/tokens/{token_ref}",
-            self.base.trim_end_matches('/')
-        );
+    async fn delete_token(&self, user: &str, token_id: i64) -> Result<bool, String> {
+        let url = format!("{}/{token_id}", self.tokens_url(user)?);
         let resp = self
             .client
             .delete(&url)
@@ -368,7 +491,7 @@ impl ForgeTokenIssuer for Unconfigured {
     async fn create_token(&self, _u: &str, _n: &str, _s: &[String]) -> Result<MintedToken, String> {
         Err(self.0.clone())
     }
-    async fn delete_token(&self, _u: &str, _t: &str) -> Result<bool, String> {
+    async fn delete_token(&self, _u: &str, _t: i64) -> Result<bool, String> {
         Err(self.0.clone())
     }
     async fn repo_readable_with(&self, _t: &str, _r: &str) -> Result<bool, String> {
@@ -622,6 +745,9 @@ pub struct AccessPolicySpec {
 ///   GET  /accounts/{a}/access/apps/{id}/policies      — the policies on one
 ///   POST /accounts/{a}/access/apps {name, domain, type, session_duration}
 ///   POST /accounts/{a}/access/apps/{id}/policies {name, decision, include, precedence}
+///   GET  /accounts/{a}/access/apps/{id}               — one application (its `aud`)
+///   GET  /accounts/{a}/access/apps/ca                 — every short-lived-certificate CA
+///   POST /accounts/{a}/access/apps/{id}/ca            — generate one application's CA
 /// Account-scoped: the account id comes from the zone (`zone_info`).
 /// There is deliberately no update and no delete: a DRIFT application
 /// is corrected FROM THE READ (fix the declaration or the dashboard),
@@ -642,6 +768,18 @@ pub trait AccessApps: Send + Sync {
         app_id: &str,
         spec: &AccessPolicySpec,
     ) -> Result<(), String>;
+    /// The public key of the application's short-lived-certificate
+    /// CA, or `None` when Cloudflare has generated none for it. That
+    /// absence is what `cloudflared access ssh` reports as "bad ca
+    /// application" (incident 55d001b0, 2026-09-23).
+    async fn short_lived_ca(
+        &self,
+        account_id: &str,
+        app_id: &str,
+    ) -> Result<Option<String>, String>;
+    /// Generates the application's CA; returns its public key.
+    async fn create_short_lived_ca(&self, account_id: &str, app_id: &str)
+    -> Result<String, String>;
 }
 
 /// The one shape the connector accepts: `cloudflared`'s
@@ -1155,6 +1293,61 @@ impl AccessApps for CloudflareApi {
             .await
             .map(|_| ())
     }
+
+    /// A CA names its application by `aud`, not by id, so the
+    /// application is read for its `aud` and the account's CA list is
+    /// matched on it. The dashboard now offers only the account-wide
+    /// Access-for-Infrastructure CA, which signs nothing
+    /// `cloudflared access ssh` asks for; this per-application CA is
+    /// reachable through the API alone.
+    async fn short_lived_ca(
+        &self,
+        account_id: &str,
+        app_id: &str,
+    ) -> Result<Option<String>, String> {
+        let aurl = self.url(&format!("/accounts/{account_id}/access/apps/{app_id}"));
+        let app = self
+            .call(self.client.get(&aurl), &format!("GET {aurl}"))
+            .await?;
+        let aud = app
+            .get("aud")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("GET {aurl}: the application carries no aud"))?;
+        let url = self.url(&format!(
+            "/accounts/{account_id}/access/apps/ca?per_page=1000"
+        ));
+        let cas = self
+            .call(self.client.get(&url), &format!("GET {url}"))
+            .await?;
+        // An account with no per-application CA answers `null`
+        // (observation e41e3836, 2026-09-23).
+        let rows = match &cas {
+            JsonValue::Null => return Ok(None),
+            JsonValue::Array(rows) => rows,
+            other => return Err(format!("GET {url}: result is not a list of CAs: {other}")),
+        };
+        Ok(rows
+            .iter()
+            .find(|ca| ca.get("aud").and_then(JsonValue::as_str) == Some(aud))
+            .and_then(|ca| ca.get("public_key").and_then(JsonValue::as_str))
+            .map(str::to_string))
+    }
+
+    async fn create_short_lived_ca(
+        &self,
+        account_id: &str,
+        app_id: &str,
+    ) -> Result<String, String> {
+        let url = self.url(&format!("/accounts/{account_id}/access/apps/{app_id}/ca"));
+        let result = self
+            .call(self.client.post(&url), &format!("POST {url}"))
+            .await?;
+        result
+            .get("public_key")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("POST {url}: response result carries no public_key"))
+    }
 }
 
 /// `kubectl rollout restart` is a PATCH of a pod-template annotation
@@ -1308,6 +1501,12 @@ impl AccessApps for Unconfigured {
     ) -> Result<(), String> {
         Err(self.0.clone())
     }
+    async fn short_lived_ca(&self, _a: &str, _i: &str) -> Result<Option<String>, String> {
+        Err(self.0.clone())
+    }
+    async fn create_short_lived_ca(&self, _a: &str, _i: &str) -> Result<String, String> {
+        Err(self.0.clone())
+    }
 }
 
 #[async_trait]
@@ -1317,6 +1516,195 @@ impl WorkloadRestarter for Unconfigured {
     }
     async fn restart_deployment(&self, _n: &str, _d: &str, _r: &str) -> Result<bool, String> {
         Err(self.0.clone())
+    }
+}
+
+#[cfg(test)]
+mod forgejo_tests {
+    use super::*;
+    use crate::handlers::forge_stub::{self, StubToken};
+
+    fn leak() -> StubToken {
+        StubToken::new(7, "push-20260818", "old-value-1eaked01")
+    }
+
+    /// Round-3 review of car 85b7b55f, F1c: the listing asked for one page
+    /// of fifty and never paged, so the sixty-first token — the oldest,
+    /// which a leaked one usually is — was simply not in the ledger every
+    /// judgement read.
+    #[tokio::test]
+    async fn a_ledger_longer_than_one_page_is_read_to_its_end() {
+        let mut tokens = vec![leak()];
+        tokens.extend(forge_stub::newer_tokens(60));
+        let forge = forge_stub::serve(tokens, 50).await;
+        let all = ForgejoAdmin::new(forge.url.clone(), "root")
+            .list_tokens("david")
+            .await
+            .expect("listed");
+        assert_eq!(all.len(), 61);
+        assert!(
+            all.iter()
+                .any(|t| t.id == 7 && t.token_last_eight == "1eaked01"),
+            "the oldest token is in the ledger"
+        );
+    }
+
+    /// A forge whose MAX_RESPONSE_ITEMS is below the page asked for answers
+    /// SHORT pages with more to follow — so a short page is not the end;
+    /// only an empty one is.
+    #[tokio::test]
+    async fn a_forge_that_clamps_the_page_below_the_ask_is_still_read_to_its_end() {
+        let mut tokens = vec![leak()];
+        tokens.extend(forge_stub::newer_tokens(60));
+        let forge = forge_stub::serve(tokens, 30).await;
+        let all = ForgejoAdmin::new(forge.url.clone(), "root")
+            .list_tokens("david")
+            .await
+            .expect("listed");
+        assert_eq!(all.len(), 61);
+        assert!(all.iter().any(|t| t.id == 7));
+    }
+
+    /// A forge that answers every page with page one would otherwise be
+    /// read forever, or — stopped early — as a whole ledger it is not.
+    #[tokio::test]
+    async fn a_forge_that_ignores_the_page_is_refused() {
+        let mut tokens = vec![leak()];
+        tokens.extend(forge_stub::newer_tokens(60));
+        let forge = forge_stub::serve(tokens, 50).await;
+        forge.state.lock().unwrap().ignores_page = true;
+        let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .list_tokens("david")
+            .await
+            .expect_err("a ledger that may be partial is refused");
+        assert!(err.contains("repeats token id"), "{err}");
+    }
+
+    /// The forge's own count of the ledger disagrees with what the pages
+    /// held: a token was added or revoked mid-read, or a page was lost.
+    #[tokio::test]
+    async fn a_ledger_that_disagrees_with_the_forges_count_is_refused() {
+        let mut tokens = vec![leak()];
+        tokens.extend(forge_stub::newer_tokens(60));
+        let forge = forge_stub::serve(tokens, 50).await;
+        forge.state.lock().unwrap().claims_total = Some(62);
+        let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .list_tokens("david")
+            .await
+            .expect_err("61 read, 62 counted");
+        assert!(err.contains("counts 62"), "{err}");
+    }
+
+    /// Round-4 review of car c4cbc6b5, A2 (backlog 796d8e64): a token
+    /// revoked while the listing is between pages shifts every later row
+    /// one place toward the front, so the row crossing the page boundary
+    /// is never read — and the pages still add up to the forge's FINAL
+    /// count, which is all the empty-page check compared. Here 1059 goes
+    /// after page one and 1009 slides onto page one, unread: 60 rows read,
+    /// 60 counted at the end, one live token missing from the ledger.
+    #[tokio::test]
+    async fn a_ledger_that_moves_between_pages_is_refused() {
+        let mut tokens = vec![leak()];
+        tokens.extend(forge_stub::newer_tokens(60));
+        let forge = forge_stub::serve(tokens, 50).await;
+        forge.state.lock().unwrap().deletes_after_page_one = Some(1059);
+        let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .list_tokens("david")
+            .await
+            .expect_err("page one counted 61, page two counts 60");
+        assert!(
+            err.contains("page 1 counted 61 tokens and page 2 counts 60"),
+            "{err}"
+        );
+    }
+
+    /// Round-4 review, A1 (backlog 796d8e64): the refusal of a row the
+    /// adapter cannot read had no test. Either half missing is refused —
+    /// never skipped, which would read a live token as absent.
+    #[tokio::test]
+    async fn a_listed_row_without_an_id_or_a_name_is_refused() {
+        for stray in [
+            json!({"name": "no-id", "token_last_eight": "n0id0000"}),
+            json!({"id": 9, "token_last_eight": "n0name00"}),
+            json!({"id": "9", "name": "id-as-text", "token_last_eight": "t3xt0000"}),
+        ] {
+            let forge = forge_stub::serve(vec![leak()], 50).await;
+            forge.state.lock().unwrap().stray_row = Some(stray.clone());
+            let err = ForgejoAdmin::new(forge.url.clone(), "root")
+                .list_tokens("david")
+                .await
+                .expect_err("a row the adapter cannot read");
+            assert!(err.contains("carries no id or name"), "{stray}: {err}");
+        }
+    }
+
+    /// Backlog cd2745b2 (round-4 review of c4cbc6b5, A4): `forge_user` is
+    /// rule-arg data interpolated into the admin URL path, signed with the
+    /// broker's root token. Percent-encoding is no defence (`%2e%2e`
+    /// normalises), so a name outside the forge's own username grammar
+    /// never becomes a URL at all.
+    #[test]
+    fn the_forge_username_grammar_is_the_forges() {
+        for ok in ["david", "d", "boss-gcp", "a.b_c-d", "A1", &"x".repeat(40)] {
+            assert_eq!(forge_username(ok), Ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "-david",
+            "_david",
+            "david-",
+            "david.",
+            "da--vid",
+            "da._vid",
+            "david/boss",
+            "../../repos/david/boss",
+            "%2e%2e",
+            "david?x=1",
+            "david#f",
+            "da vid",
+            "dávid",
+            &"x".repeat(41),
+        ] {
+            let err = forge_username(bad).expect_err(bad);
+            assert!(err.contains("forge_user"), "{bad}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forge_user_outside_the_grammar_reaches_no_forge_route() {
+        let forge = forge_stub::serve(vec![leak()], 50).await;
+        let admin = ForgejoAdmin::new(forge.url.clone(), "root");
+        let user = "../../../repos/david/boss";
+        admin.list_tokens(user).await.expect_err("list");
+        admin
+            .create_token(user, "n", &["write:repository".to_string()])
+            .await
+            .expect_err("mint");
+        admin.delete_token(user, 7).await.expect_err("delete");
+        assert!(
+            forge.state.lock().unwrap().requests.is_empty(),
+            "no request of any kind: {:?}",
+            forge.state.lock().unwrap().requests
+        );
+    }
+
+    /// Round-3 review, F1d: the DELETE path carries a NUMBER, never a
+    /// string — the id is the only reference the adapter accepts.
+    #[tokio::test]
+    async fn a_delete_names_the_token_by_its_number() {
+        let forge = forge_stub::serve(vec![leak()], 50).await;
+        let admin = ForgejoAdmin::new(forge.url.clone(), "root");
+        assert!(admin.delete_token("david", 7).await.expect("deleted"));
+        assert!(!admin.delete_token("david", 7).await.expect("absent"));
+        assert_eq!(
+            forge.deletes(),
+            vec![
+                "/api/v1/admin/users/david/tokens/7".to_string(),
+                "/api/v1/admin/users/david/tokens/7".to_string(),
+            ]
+        );
     }
 }
 
@@ -1358,5 +1746,77 @@ mod cloudflare_tests {
         assert_eq!(installed_tunnel_id(""), None);
         assert_eq!(installed_tunnel_id("not json"), None);
         assert_eq!(installed_tunnel_id(r#"{"token":"x"}"#), None);
+    }
+
+    /// A Cloudflare v4 stub for the short-lived-certificate CA reads:
+    /// two applications, one CA, and the CA names its application by
+    /// `aud` — so the adapter must match on `aud`, never on id.
+    async fn ca_stub(cas: serde_json::Value) -> String {
+        use axum::extract::Path;
+        use axum::{Json as AxJson, Router, routing::get, routing::post};
+        let envelope = |result: serde_json::Value| {
+            AxJson(json!({"success": true, "errors": [], "result": result}))
+        };
+        let app = Router::new()
+            .route(
+                "/accounts/{a}/access/apps/ca",
+                get(move || {
+                    let cas = cas.clone();
+                    async move { envelope(cas) }
+                }),
+            )
+            .route(
+                "/accounts/{a}/access/apps/{id}",
+                get(move |Path((_a, id)): Path<(String, String)>| async move {
+                    envelope(json!({"id": id, "aud": format!("aud-of-{id}")}))
+                }),
+            )
+            .route(
+                "/accounts/{a}/access/apps/{id}/ca",
+                post(move |Path((_a, id)): Path<(String, String)>| async move {
+                    envelope(json!({"id": "ca-new", "aud": format!("aud-of-{id}"), "public_key": "ecdsa-sha2-nistp256 NEW"}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn an_application_ca_is_found_by_its_aud_and_generated_when_absent() {
+        let base = ca_stub(json!([
+            {"id": "ca-1", "aud": "aud-of-app-dev", "public_key": "ecdsa-sha2-nistp256 DEV"},
+        ]))
+        .await;
+        let api = CloudflareApi::new(base, "token");
+        assert_eq!(
+            api.short_lived_ca("acct", "app-dev").await.unwrap(),
+            Some("ecdsa-sha2-nistp256 DEV".to_string())
+        );
+        assert_eq!(
+            api.short_lived_ca("acct", "app-www").await.unwrap(),
+            None,
+            "another application's CA is not this one's"
+        );
+        assert_eq!(
+            api.create_short_lived_ca("acct", "app-www").await.unwrap(),
+            "ecdsa-sha2-nistp256 NEW"
+        );
+    }
+
+    /// Measured 2026-09-23 (observation e41e3836): an account holding
+    /// no per-application CA answered the list `success: true` with a
+    /// result that was not a list, and the handler refused it without
+    /// saying what it was. An empty account is `null`; anything else
+    /// is refused QUOTING the result, so the next surprise names itself.
+    #[tokio::test]
+    async fn an_account_without_cas_answers_null_and_that_is_none() {
+        let api = CloudflareApi::new(ca_stub(serde_json::Value::Null).await, "token");
+        assert_eq!(api.short_lived_ca("acct", "app-dev").await.unwrap(), None);
+
+        let api = CloudflareApi::new(ca_stub(json!({"surprise": 1})).await, "token");
+        let err = api.short_lived_ca("acct", "app-dev").await.unwrap_err();
+        assert!(err.contains(r#"{"surprise":1}"#), "{err}");
     }
 }

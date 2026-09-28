@@ -115,7 +115,12 @@ function parseRequest(v: unknown): PublishRequest | null {
   const execute = (Array.isArray(r.steps) ? r.steps : [])
     .map(rec)
     .find((s) => s !== null && str(s.spec_slug) === 'execute');
-  const em = execute ? (rec(execute.metadata) ?? {}) : {};
+  // Only a COMPLETED execute answers: the runner lands its keys through
+  // the merge door before the status (backlog 2aa2b19e), so keys on an
+  // open step are an answer the server has not taken (review of car
+  // 24eb9471).
+  const answered = execute !== undefined && execute !== null && str(execute.status) === 'completed';
+  const em = answered ? (rec(execute.metadata) ?? {}) : {};
   const d = str(em.disposition);
   return {
     id,
@@ -149,7 +154,7 @@ export function parsePublishRequests(raw: unknown): ReadonlyArray<PublishRequest
 export const PUBLISH_REQUESTS_QUERY = `/api/jobs?kind=ops-request&metadata=${encodeURIComponent(JSON.stringify({ verb: PUBLISH_VERB }))}`;
 
 export function loadPublishRequests(limit = 40): Promise<Exclude<Remote<ReadonlyArray<PublishRequest>>, { kind: 'loading' }>> {
-  return fetchRemote(`${PUBLISH_REQUESTS_QUERY}&limit=${limit}`, parsePublishRequests);
+  return fetchRemote(`${PUBLISH_REQUESTS_QUERY}&limit=${limit}&full=true`, parsePublishRequests);
 }
 
 /** This kind's latest request — by `opened_at`, not API order; an

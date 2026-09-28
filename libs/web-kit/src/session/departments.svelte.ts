@@ -71,3 +71,14 @@ export function departments(): ReadonlyArray<Department> {
   const st = registry.value;
   return st.kind === 'ready' ? st.rows : [];
 }
+
+/// The roster once the registry has ANSWERED, else `null` — while it
+/// loads and while its read fails. For the question `departments()`
+/// cannot answer: is this code NOT a department here? An empty list
+/// from a registry that has not answered is not "no departments", and
+/// apps/web renders a department's pages as not found on this answer
+/// alone (backlog 64656a46, car 2 of design 8c3e9599).
+export function departmentRoster(): ReadonlyArray<Department> | null {
+  const st = registry.value;
+  return st.kind === 'ready' ? st.rows : null;
+}

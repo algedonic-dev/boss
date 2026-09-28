@@ -1,0 +1,176 @@
+# THE HAND-OFFS — every place a rule, a cadence or a verb turns one
+# packet into another on the IT map (design e765b3fc §2b, source 2; car
+# R2 on feedback 84cba7e2).
+#
+# WHY THIS FILE EXISTS. The map's routes are DERIVED: `crate::routes`
+# walks each protocol a region can hold and records every place the
+# packet crosses from one region to another (source 1). A protocol
+# cannot say when a DIFFERENT packet takes over — a gate-run's green
+# filing a car, a merged train's cars peeling off into the shed. That
+# filing is code (a dispatcher handler, the conductor, a `boss` verb),
+# and the rules' own `why` already says so: "decisions a protocol row
+# has no way to express". So it is declared, here, in data, and the
+# server reads it (compiled into boss-jobs) as the second source of a
+# route. A move the record makes on a route neither source declares is
+# drawn dashed red and troubles its region (source 3).
+#
+# ONE FILE FOR RULES, CADENCES AND VERBS, not a field on each rule's own
+# file. The design placed a rule's declaration in its file; the jobs API
+# that serves the routes cannot read the dispatcher's rule directory (it
+# is neither in its image nor its registry), and two closed key sets —
+# the dispatcher's RawRule and the cadence row — would each have grown a
+# field only this reader reads. One file the server compiles in is one
+# copy, and the pin below holds every row to the file it names, so a
+# rule renamed or retired fails the test that names this row.
+#
+# EACH ROW:
+#   by   — who makes the move: `rule:<name>` (infra/dispatcher/rules/
+#          <name>.toml), `cadence:<name>` (infra/platform/cadence/
+#          <name>.toml) or `verb:<name>` (a `boss <name>` subcommand).
+#   from — `<kind>@<step>`: the packet handed off, standing where its
+#          protocol puts it while that step is ready (or once it closed
+#          on that step, for a terminal). Omitted for a filing onto the
+#          map from nowhere.
+#   to   — `<kind>@<step>`: the packet that continues, standing where
+#          its protocol puts it while that step is ready. Omitted when
+#          the maker takes the packet OFF the map without a terminal:
+#          absorbed into a packet already standing (a green carried onto
+#          the car it re-gated), or released by a reading the maker
+#          writes onto it (a publish PR GitHub answers closed).
+#   why  — the move, in a sentence, with where it is made.
+#
+# Each `kind@step` is resolved by the SAME walk the protocol routes come
+# from, through the one placement function — so this file names steps,
+# never regions, and cannot draw a line by hand. Pinned by
+# `routes::tests::every_declared_hand_off_is_walked_and_names_its_maker`
+# (and, for verbs, boss-cli's `every_hand_off_verb_is_a_subcommand`).
+
+[[hand_off]]
+by = "rule:auto-park-on-gate-green"
+from = "gate-run@record-verdict"
+to = "ship-a-change@review"
+why = "A green gate files the car it vouches for: the gate-run leaves its bay and the car stands on the loading dock (handlers/jobs_auto_park.rs)."
+
+[[hand_off]]
+by = "cadence:train-board-on-dock-depth"
+from = "ship-a-change@review"
+to = "pr-train@collect"
+why = "The dock's depth fires a train, and the cars it collects ride it from the dock; the train is made up where they stood, so this hand-off crosses no border."
+
+# A LANDED CAR LEAVES ITS TRAIN AT THE GATES, NOT ON THE TRACK (backlog
+# 47880c86). The design drew route H from the track, and this row named
+# pr-train@deployed. The conductor's own order says otherwise: it closes
+# every boarded car (merged=true, which readies `proven`) BEFORE it
+# completes the train's `merged` step, and holds that step pending until
+# every car closed ("ORDER IS LOAD-BEARING", train/conductor.rs,
+# close_boarded_cars). So each car peels off while the train still stands
+# at the gates awaiting `merged`; the train reaches the track after it.
+# Measured on the moves record 2026-09-26: 54 cars gates -> shed, each
+# beside its train's gates -> track in the same tick, and not one track ->
+# shed.
+[[hand_off]]
+by = "cadence:train-reconcile"
+from = "pr-train@merged"
+to = "ship-a-change@proven"
+why = "A merged train's reconcile writes merged=true on the cars it carried BEFORE it completes the train's merged step (train/conductor.rs, close_boarded_cars), so each car leaves the train at the gates for the shed to await its proof, and the train then departs onto the track (design e765b3fc §1, route H)."
+
+[[hand_off]]
+by = "cadence:train-reconcile"
+from = "pr-train@ci"
+to = "ship-a-change@review"
+why = "A train refused at its gate is disassembled, and the cars it did not strike go back to the dock unstruck (pr-train `cancelled`, train_gate.rs; design e765b3fc §1, route C)."
+
+[[hand_off]]
+by = "rule:an-abandoned-step-is-reclaimed-when-its-run-died"
+from = "agent-run@building"
+to = "backlog-item@build"
+why = "A run that died two hours ago releases the step it held: the step goes back to ready, unassigned, at its station (handler jobs.reclaim_abandoned_step; design e765b3fc §1, route G)."
+
+[[hand_off]]
+by = "verb:dispatch"
+from = "backlog-item@build"
+to = "agent-run@briefed"
+why = "boss dispatch claims a ready step at its station and files the run that will execute it on the shop floor."
+
+# DISPATCH FROM RECEIVING (backlog 47880c86). An item's `triage` step is
+# dispatchable too — it carries an analyst agent block — and an item
+# stands in receiving until triage completes, so the run it files leaves
+# from there. Measured 2026-09-26: 27 runs receiving -> shop-floor, e.g.
+# run 29526d60 on item eed361e0's `triage` at 14:00:43, four minutes
+# before that triage completed.
+[[hand_off]]
+by = "verb:dispatch"
+from = "backlog-item@triage"
+to = "agent-run@briefed"
+why = "boss dispatch claims an untriaged item's triage step at its station and files the analyst run that measures it; the item still stands in receiving, the run on the shop floor."
+
+[[hand_off]]
+by = "verb:gate"
+from = "agent-run@building"
+to = "gate-run@record-verdict"
+why = "boss gate, run by a builder, files the gate-run that takes its branch into a bay."
+
+[[hand_off]]
+by = "verb:gate"
+from = "gate-run@failed"
+to = "gate-run@record-verdict"
+why = "A re-gate after a red: boss gate files a fresh gate-run on the branch the garage holds, and the branch goes back into a bay (design e765b3fc §1, route F)."
+
+[[hand_off]]
+by = "verb:park"
+from = "gate-run@green"
+to = "ship-a-change@review"
+why = "boss park files a car from a green gate-run by hand, copying its receipt; a green no car claimed stood in the garage as stranded."
+
+[[hand_off]]
+by = "rule:auto-park-on-gate-green"
+from = "gate-run@record-verdict"
+why = "A green on a branch whose car already stands on the dock refreshes that car in place (ParkAction::Refresh, the receipt copied to regate_receipt): the gate-run leaves its bay and the map, and nothing new is filed."
+
+[[hand_off]]
+by = "verb:rerail"
+from = "gate-run@green"
+why = "boss rerail --finish carries a green that stood in the garage onto the car at the dock as its regate_receipt; the gate-run leaves the map, absorbed into the car (design e765b3fc §1, route F)."
+
+# THE AUTO-PARK HAND-OFF, TAKEN FROM THE GARAGE (backlog e23005c0). The
+# rule fires on the green, and between the verdict and the handler's
+# write the green gate-run is exactly what the garage's stranded lane
+# says it is: a green no car claims. A reading that falls in that gap —
+# measured 2026-09-26, 5 greens left the garage, not the gates — sees the
+# hand-off taken from where the closed green stands, so it is declared
+# from the terminal too: to the car it files, or off the map when the
+# car already stood on the dock and was refreshed in place.
+[[hand_off]]
+by = "rule:auto-park-on-gate-green"
+from = "gate-run@green"
+to = "ship-a-change@review"
+why = "A green the reading saw before the auto-park handler acted stood in the garage as stranded; the car the handler files stands on the dock (handlers/jobs_auto_park.rs)."
+
+[[hand_off]]
+by = "rule:auto-park-on-gate-green"
+from = "gate-run@green"
+why = "A green the reading saw before the auto-park handler acted stood in the garage as stranded; the handler refreshes the car already on the dock in place, and the gate-run leaves the map (ParkAction::Refresh)."
+
+# A RED LEAVES THE GARAGE WHEN A NEWER GATE SUPERSEDES IT (backlog
+# e23005c0; 2 on 2026-09-26, e.g. fix/a-key-its-protocol-reserves-refuses-
+# every-other-writer at 16:39:28 and 19:59:02). The garage holds a
+# branch's MOST RECENT gate-run when it is red (yard.rs::garage), so a
+# re-gate on the branch — the builder's `boss gate`, or the dock's
+# re-gate of the car — takes the red off the map. When the new gate-run
+# is filed in the same reading the diff draws one garage -> gates hand-off
+# (the `verb:gate` row above); when not, the red leaves by this one.
+[[hand_off]]
+by = "verb:gate"
+from = "gate-run@failed"
+why = "A re-gate on the branch supersedes the red the garage held: the garage keeps a branch's most recent gate-run, and the red leaves the map (yard.rs::garage)."
+
+[[hand_off]]
+by = "rule:publish-to-github-daily"
+from = "pr-train@arrived"
+to = "publish-to-github@read-checks"
+why = "What the arrived trains landed on main is what the daily publish carries to the mirror: the rule files the publish packet on target origin/main, and once its pull request is open it stands in the publish region. The trains are not consumed — each leaves arrivals by its own terminal when it ages out of the window (backlog d085dc47; the grey reads-main connector of design e765b3fc)."
+
+[[hand_off]]
+by = "rule:refresh-publish-drift-daily"
+from = "publish-to-github@read-checks"
+why = "The daily mirror-drift measurement reads the pull request's state off GitHub and writes it onto the packet as pr_state; a PR GitHub answers closed awaits nothing, and the packet leaves the publish region (regions/publish.rs::publish_prs)."

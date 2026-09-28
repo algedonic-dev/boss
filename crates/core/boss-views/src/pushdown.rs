@@ -79,8 +79,11 @@ use boss_expr::{BinaryOp, Expr, UnaryOp, Value};
 use chrono::{DateTime, NaiveDate, Utc};
 
 /// What a pushable column holds, so a literal is only pushed where the
-/// database can compare it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// database can compare it. Served as `text` / `timestamp` / `json` by
+/// `GET /api/views/sources`, which is how the page names what narrows a
+/// filter (backlog 4a8939b5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ColumnType {
     Text,
     Timestamp,

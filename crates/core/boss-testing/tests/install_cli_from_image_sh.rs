@@ -28,7 +28,8 @@
 //! and its token endpoint hands out a pull token with no credentials,
 //! so the pull is curl + tar. Both defects are pinned here: the tag in
 //! the URL is the short sha (and the full sha is never requested), and
-//! nothing on PATH but curl, jq, tar, gzip and sha256sum is needed.
+//! nothing on PATH but curl, jq, tar, gzip, sha256sum and flock (the
+//! store lock concurrent installs take turns on, backlog 9e1f037a) is needed.
 //!
 //! What each case pins: the binary lands under a per-FULL-sha
 //! generation and `/usr/local/bin/boss` is a wrapper that names that
@@ -60,7 +61,9 @@
 //! `not yet`, exit 0 — the forge converges every ten minutes and builds
 //! the image on the same host a few minutes after each train, so a red
 //! there would be a red on every train; and a real refusal still reds
-//! the converge with the units installed and reported.
+//! the converge with the units installed and reported. boss-gcp's
+//! converge took the same treatment on 2026-09-26 (backlog f15ff5f2),
+//! with a limit on the wait's age that reds a build that is not coming.
 //!
 //! Nothing here touches a host or a registry. `curl` is a stub on
 //! every path.
@@ -103,11 +106,18 @@ fn sha256_of(path: &Path) -> String {
 }
 
 /// How the fixture image is shaped: the base layer always carries
-/// `usr/local/bin/boss`; the top layer is a small unrelated file, or a
-/// whiteout for the binary, or is declared with a non-gzip media type.
+/// `usr/local/bin/boss` and, unless `no_counter`, `usr/local/bin/boss-
+/// leaked-policy` beside it — the real image's shape, where one
+/// `COPY --from=rust-build /out/ /usr/local/bin/` puts every workspace
+/// binary in one layer (measured on boss:c033e6a, 2026-09-27: layer 4
+/// of 33 carries both). The top layer is a small unrelated file, or a
+/// whiteout for the CLI or for the counter, or is declared with a
+/// non-gzip media type.
 #[derive(Clone, Copy, Default)]
 struct Image {
     top_whiteout: bool,
+    top_counter_whiteout: bool,
+    no_counter: bool,
     top_zstd: bool,
 }
 
@@ -153,12 +163,25 @@ impl Case {
             &base.join("usr/local/bin/boss"),
             "#!/bin/sh\necho \"boss 0.1.0 built from ${STUB_BOSS_SAYS:-${BOSS_BUILD_COMMIT:-unknown}}\"\n",
         );
-        let base_blob = tar_gz(&base, &["usr/local/bin/boss"], &fix);
+        // The code-branch counter the codebase-metrics chore runs
+        // (backlog c4d60110): a stub that prints its own name, so a test
+        // can run the installed copy and know which file answered.
+        let mut base_members = vec!["usr/local/bin/boss"];
+        if !image.no_counter {
+            write_exec(
+                &base.join("usr/local/bin/boss-leaked-policy"),
+                "#!/bin/sh\necho stub-boss-leaked-policy\n",
+            );
+            base_members.push("usr/local/bin/boss-leaked-policy");
+        }
+        let base_blob = tar_gz(&base, &base_members, &fix);
         // Layer 1 (top): unrelated, or the whiteout that deletes the
-        // binary from every layer below it.
+        // binary (or the counter) from every layer below it.
         let top = root.join("layer-top");
         let top_member = if image.top_whiteout {
             "usr/local/bin/.wh.boss"
+        } else if image.top_counter_whiteout {
+            "usr/local/bin/.wh.boss-leaked-policy"
         } else {
             "etc/motd"
         };
@@ -213,7 +236,9 @@ impl Case {
         // credentials; manifests and blobs need the bearer token.
         // STUB_TOKEN_DOWN makes the token endpoint unreachable (curl
         // exit 7); STUB_CORRUPT_BLOB serves every blob with bytes
-        // appended, so no blob hashes to its digest.
+        // appended, so no blob hashes to its digest; STUB_BLOB_DELAY
+        // holds every blob fetch open that many seconds, the window in
+        // which a second install of the same sha used to land.
         write_exec(
             &bin.join("curl"),
             r#"#!/usr/bin/env bash
@@ -259,6 +284,7 @@ case "$path" in
   v2/david/boss/blobs/sha256:*)
     d="${path##*/}"
     if [ -f "$STUB_REGISTRY/blobs/$d" ]; then
+      [ -n "${STUB_BLOB_DELAY:-}" ] && sleep "$STUB_BLOB_DELAY"
       cp "$STUB_REGISTRY/blobs/$d" "$out"
       [ -n "${STUB_CORRUPT_BLOB:-}" ] && echo corrupt >> "$out"
       if [ -n "${STUB_VANISHING_BLOB:-}" ]; then rm -f "$out"; printf 200; exit 0; fi
@@ -526,6 +552,108 @@ fn a_second_tick_at_the_same_sha_fetches_nothing_and_still_verifies() {
     assert!(v.contains(&format!("built from {SHA_A}")), "{v}");
 }
 
+// ---------------------------------------------------------------------------
+// THE CODE-BRANCH COUNTER, BESIDE THE CLI (backlog c4d60110). The daily
+// codebase-metrics chore on boss-gcp filed `code_branches_on_kind: null`
+// on 11 of 11 packets (2026-09-17..27) because `boss-leaked-policy` was
+// on no path it looked at. The image already carries it — the deploy
+// runner copies every `boss-*` release binary into /usr/local/bin, in
+// the same layer as the CLI — so the counter rides the CLI's own door:
+// the same pull, the same digest-verified layer, the same per-sha
+// generation, and `current/boss-leaked-policy` is the path the unit
+// names. It never costs the CLI: an image without it installs the CLI
+// and says `absent:` on the packet, and the chore then records why it
+// could not count.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_counter_lands_beside_the_cli_in_the_same_generation() {
+    if !tools() {
+        return;
+    }
+    let c = Case::new("counter");
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(rc, 0, "{out}");
+    let counter = c.store.join(SHA_A).join("boss-leaked-policy");
+    assert!(
+        counter.is_file(),
+        "the counter lands in the generation named by the full sha, beside boss: {out}"
+    );
+    // The path the unit names — through `current`, so it moves with
+    // every converge and never names a sha.
+    let via_current = c.store.join("current").join("boss-leaked-policy");
+    let ran = Command::new(&via_current)
+        .output()
+        .expect("current/boss-leaked-policy runs");
+    assert_eq!(
+        String::from_utf8_lossy(&ran.stdout).trim(),
+        "stub-boss-leaked-policy",
+        "current/boss-leaked-policy is the image's counter, executable: {out}"
+    );
+    assert_eq!(c.summary("cli_leaked_policy"), "installed", "{out}");
+
+    // A tick that finds the generation already on disk pulls nothing and
+    // still reports what the generation holds.
+    let _ = std::fs::remove_file(&c.summary);
+    c.clear_requests();
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(c.requests().is_empty(), "{:?}", c.requests());
+    assert_eq!(c.summary("cli_leaked_policy"), "installed", "{out}");
+}
+
+#[test]
+fn an_image_without_the_counter_still_installs_the_cli_and_says_absent() {
+    if !tools() {
+        return;
+    }
+    let c = Case::with_image(
+        "no-counter",
+        Image {
+            no_counter: true,
+            ..Image::default()
+        },
+    );
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(
+        rc, 0,
+        "the counter is the chore's, never the CLI's precondition: {out}"
+    );
+    let (_, v) = c.version_through_link();
+    assert!(v.contains(&format!("built from {SHA_A}")), "{v}");
+    assert!(!c.store.join(SHA_A).join("boss-leaked-policy").exists());
+    let got = c.summary("cli_leaked_policy");
+    assert!(
+        got.starts_with("absent:") && got.contains("usr/local/bin/boss-leaked-policy"),
+        "the packet names what is missing, not a blank: {got}"
+    );
+}
+
+#[test]
+fn a_whiteout_of_the_counter_above_it_is_absent_not_installed() {
+    if !tools() {
+        return;
+    }
+    let c = Case::with_image(
+        "counter-whiteout",
+        Image {
+            top_counter_whiteout: true,
+            ..Image::default()
+        },
+    );
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        !c.store.join(SHA_A).join("boss-leaked-policy").exists(),
+        "a layer above deletes it, so the runtime has none and neither may the host: {out}"
+    );
+    let got = c.summary("cli_leaked_policy");
+    assert!(
+        got.starts_with("absent:") && got.contains("whiteout"),
+        "{got}"
+    );
+}
+
 #[test]
 fn a_new_sha_flips_current_and_keeps_the_previous_generation_on_disk() {
     if !tools() {
@@ -775,6 +903,72 @@ fn a_fetch_that_leaves_no_bytes_is_refused_as_no_bytes_not_as_a_mismatch() {
         c.current().is_none() && !c.link.exists(),
         "nothing is installed: {out}"
     );
+}
+
+/// CONCURRENT INSTALLS OF ONE SHA TAKE TURNS (backlog 9e1f037a). On the
+/// dev pod the installer has many callers for the SAME sha at the same
+/// moment — every builder's shim runs it before a write verb once a
+/// train lands, and polls it every 30 s while the image is late, beside
+/// the reclaim sidecar's hourly pass — and each run used to `rm -rf` and
+/// refill ONE staging directory, `.staging-<sha>`, with no lock.
+/// Measured 2026-09-23 against the real forge registry, image
+/// 10.20.0.15:3000/david/boss:8c122d9 — the image the packet's refusal
+/// named: alone it installs clean (layer 4 carries the binary, digest
+/// verified); two to four concurrent runs into one store gave 12
+/// refusals in 14, none of them true — "layer 26 is '', not a gzip
+/// tar", "has no amd64/linux manifest", "lists no layers", "layer 4 is
+/// not a readable gzip tar", "layer 9 arrived with no bytes" — and one
+/// run walked PAST layer 4 to layer 3, the only way the packet's refusal
+/// could have named layer 1 at all. A refusal that blames the image for
+/// a collision between two installers sends its reader to the registry.
+#[test]
+fn concurrent_installs_of_one_sha_take_turns_and_pull_the_image_once() {
+    if !tools() || !has("flock") {
+        return;
+    }
+    let c = Case::new("concurrent");
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            let mut cmd = Command::new("bash");
+            cmd.arg(repo_root().join(SCRIPT)).arg(SHA_A);
+            c.env(&mut cmd, &[("STUB_BLOB_DELAY", "0.4".into())]);
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("install-cli-from-image.sh starts")
+        })
+        .collect();
+    let outs: Vec<_> = children
+        .into_iter()
+        .map(|ch| {
+            ch.wait_with_output()
+                .expect("install-cli-from-image.sh ends")
+        })
+        .collect();
+    for out in &outs {
+        let t = text(out);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "every concurrent install confirms — none refuses over another's staging: {t}"
+        );
+        assert!(t.contains("CONFIRMED"), "{t}");
+    }
+    assert_eq!(c.current().as_deref(), Some(SHA_A));
+    let blobs = c
+        .requests()
+        .iter()
+        .filter(|u| u.contains("/blobs/"))
+        .count();
+    assert_eq!(
+        blobs,
+        2,
+        "the two layers are pulled ONCE: the runs that waited find the generation \
+         the first one installed and fetch nothing: {:?}",
+        c.requests()
+    );
+    let (_, v) = c.version_through_link();
+    assert!(v.contains(&format!("built from {SHA_A}")), "{v}");
 }
 
 /// A layer ABOVE the one carrying the binary that whites it out means
@@ -1065,6 +1259,11 @@ impl Converge {
             )
             .env("BOSS_NODE_ROLES_CACHE", self.case.root.join("roles.cache"))
             .env("STUB_CALLS", &self.calls);
+        // A case's own env wins over the defaults above — how a case
+        // swaps the real CLI installer for a stub with one exit code.
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
         let out = cmd.output().expect("boss-gcp-converge.sh runs");
         (out.status.code().unwrap_or(-1), text(&out))
     }
@@ -1155,12 +1354,18 @@ fn a_cli_failure_does_not_stop_the_units_converge_and_is_on_the_packet() {
     );
 }
 
-/// boss-gcp's converge is UNCHANGED by the not-yet exit (9f00a805 car
-/// 1 moved the installer and retargeted nothing else): a tag the
-/// registry lacks is still a failed converge there, healed by its next
-/// half-hourly tick, and the packet says which state it is in.
+/// boss-gcp's converge WAITS on a tag the registry lacks, the way the
+/// forge's does (backlog f15ff5f2). Until 2026-09-26 it redded there:
+/// the tick after every train ran before the deploy runner had pushed
+/// the image, systemd recorded 75/TEMPFAIL, and the unit observer filed
+/// an URGENT alarm that the next tick closed by itself — 7 of them
+/// between 2026-09-23 and 2026-09-26, none a fault (alarm 4c79e76d:
+/// train #713 landed 16:14Z, the tick 404'd at 16:41:58Z, the image
+/// rolled 16:43:49Z). The wait is on the packet — `cli_result` from the
+/// installer, `cli_wait_minutes` from the converge — and nothing reads
+/// FAILED.
 #[test]
-fn the_gcp_converge_still_reds_on_a_tag_the_registry_lacks() {
+fn the_gcp_converge_waits_on_a_tag_the_registry_lacks_and_records_the_wait() {
     if !tools() || !has("git") {
         return;
     }
@@ -1168,15 +1373,113 @@ fn the_gcp_converge_still_reds_on_a_tag_the_registry_lacks() {
     // Forget the image for the commit the tree converges to.
     write_file(&cv.case.fix.join("tags"), "");
     let (rc, out) = cv.run(&[]);
-    assert_ne!(rc, 0, "{out}");
-    assert!(cv.installer_calls().contains("args=units"), "{out}");
-    assert_eq!(cv.case.summary("cli_sha"), cv.want);
-    assert!(
-        cv.case.summary("cli_result").starts_with("not yet"),
-        "{}",
-        cv.case.summary("cli_result")
+    assert_eq!(
+        rc, 0,
+        "an image the deploy runner has not built yet is a wait, not a red converge: {out}"
     );
-    assert!(out.contains("the CLI step FAILED"), "{out}");
+    assert!(cv.installer_calls().contains("args=units"), "{out}");
+    let c = &cv.case;
+    assert_eq!(c.summary("converge_sha"), cv.want, "{out}");
+    assert_eq!(c.summary("cli_sha"), cv.want);
+    assert!(
+        c.summary("cli_result").starts_with("not yet")
+            && c.summary("cli_result").contains("HTTP 404"),
+        "the installer's own verdict rides the packet: {}",
+        c.summary("cli_result")
+    );
+    assert!(
+        !c.summary("cli_wait_minutes").is_empty(),
+        "the converge records how long the CLI has waited: {out}"
+    );
+    assert_eq!(
+        c.summary("cli_exit"),
+        "",
+        "a wait is not an exit to report: {out}"
+    );
+    assert!(
+        !out.contains("FAILED"),
+        "nothing about a failure — this is a wait, not a fault: {out}"
+    );
+    assert!(
+        out.contains("next tick"),
+        "the converge says what happens next: {out}"
+    );
+}
+
+/// THE WAIT HAS A LIMIT. A CLI still `not yet` long after the commit it
+/// lacks landed is no longer the deploy runner's few minutes — it is a
+/// build that is not coming, and the host's CLI is falling behind the
+/// tree: the 2026-09-15 defect this step exists to prevent. Past
+/// BOSS_GCP_CONVERGE_CLI_WAIT_MAX_MIN the converge reds, naming the age
+/// — the alarm is the age of the wait, not the first tick after every
+/// train. A limit of 0 makes any wait too long.
+#[test]
+fn a_cli_wait_past_its_limit_reds_the_gcp_converge_naming_the_age() {
+    if !tools() || !has("git") {
+        return;
+    }
+    let cv = Converge::new("not-yet-too-long");
+    write_file(&cv.case.fix.join("tags"), "");
+    let (rc, out) = cv.run(&[("BOSS_GCP_CONVERGE_CLI_WAIT_MAX_MIN", "0".into())]);
+    assert_eq!(rc, 75, "a wait past its limit reds the converge: {out}");
+    assert!(cv.installer_calls().contains("args=units"), "{out}");
+    let c = &cv.case;
+    assert_eq!(c.summary("cli_exit"), "75", "{out}");
+    assert!(!c.summary("cli_wait_minutes").is_empty(), "{out}");
+    assert!(
+        out.contains("the CLI step FAILED") && out.contains("limit 0 min"),
+        "the red names the age and the limit it crossed: {out}"
+    );
+    assert!(
+        c.summary("anomalies").contains("not built"),
+        "and the packet says why: {}",
+        c.summary("anomalies")
+    );
+}
+
+/// The converge's verdict turns on the CLI step's EXIT CODE alone, so a
+/// stub pins it without a registry: 75 is a recorded wait and exit 0;
+/// any other non-zero is still a failed converge carrying its exit.
+#[test]
+fn a_stubbed_cli_step_exit_75_is_a_wait_and_exit_1_is_a_red() {
+    if !tools() || !has("git") {
+        return;
+    }
+    let cv = Converge::new("stub-cli");
+    let stub = |rc: i32| {
+        let p = cv.case.bin.join(format!("cli-exit-{rc}"));
+        write_exec(
+            &p,
+            &format!("#!/usr/bin/env bash\necho \"stub cli step: sha=$1 exit {rc}\"\nexit {rc}\n"),
+        );
+        p
+    };
+    let wait = stub(75);
+    let (rc, out) = cv.run(&[(
+        "BOSS_GCP_CONVERGE_CLI_INSTALLER",
+        wait.display().to_string(),
+    )]);
+    assert_eq!(rc, 0, "exit 75 from the CLI step is a wait: {out}");
+    assert!(out.contains("stub cli step: sha="), "{out}");
+    assert!(
+        !cv.case.summary("cli_wait_minutes").is_empty(),
+        "the converge records the wait itself, even when the step recorded nothing: {out}"
+    );
+    assert_eq!(cv.case.summary("cli_exit"), "", "{out}");
+
+    let bad = stub(1);
+    let (rc, out) = cv.run(&[("BOSS_GCP_CONVERGE_CLI_INSTALLER", bad.display().to_string())]);
+    assert_eq!(
+        rc, 1,
+        "any other non-zero exit still reds the converge: {out}"
+    );
+    assert!(out.contains("the CLI step FAILED (exit 1)"), "{out}");
+    assert_eq!(cv.case.summary("cli_exit"), "1", "{out}");
+    assert_eq!(
+        cv.case.summary("cli_wait_minutes"),
+        "",
+        "a refusal is not a wait: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------

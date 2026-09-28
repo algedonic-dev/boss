@@ -58,18 +58,16 @@ export type OutboundShipmentSummary = {
   recent: ReadonlyArray<OutboundShipmentRow>;
 };
 
-export type RefurbStageCount = { stage: string; count: number };
-
-export type RefurbWipSummary = {
-  total_in_flight: number;
-  by_stage: ReadonlyArray<RefurbStageCount>;
-};
+/// The shipping leg as the server read it (backlog 89cf07d8): it fails
+/// alone, naming why, rather than taking inventory's own two summaries
+/// down with it. Mirrors boss-inventory's `OutboundShipmentsRead`.
+export type OutboundShipmentsRead =
+  | { kind: 'ok'; summary: OutboundShipmentSummary }
+  | { kind: 'unavailable'; reason: string };
 
 export type WarehouseStatus = {
   parts_stock: PartsStockSummary;
   inbound_pos: InboundPoSummary;
-  outbound_shipments: OutboundShipmentSummary;
-  refurb_wip: RefurbWipSummary;
-  ready_for_sale_count: number;
+  outbound_shipments: OutboundShipmentsRead;
   as_of: string;
 };

@@ -9,9 +9,22 @@
 //!
 //!   * THE CANDIDATE SET IS READ FROM THE SEEDS: every class row in
 //!     examples/*/seeds/classes.{json,toml}, every `[[location]]` id,
-//!     every `[[account]]` code, every tenant id — counted here by an
+//!     every `[[account]]` code, every `[[department]]` code (backlog
+//!     7edf0e97: the thirteen rows migration 20260919181324 seeds into
+//!     every instance are the brewery's roster), every tenant id —
+//!     counted here by an
 //!     independent read of the same files, so an extraction that
-//!     silently dropped a file would show as a count.
+//!     silently dropped a file would show as a count. The same goes
+//!     for infra/postgres/retired-examples/*/, the rows a RETIRED
+//!     example's seeds carried that the migrations still seed.
+//!   * A RETIRED EXAMPLE'S MIGRATION ROWS OUTLIVE IT (backlog a8991c86,
+//!     car 6). 01-registries.sql seeds the used-device shop's 26 roles,
+//!     ten departments, three account types, one location kind and a
+//!     companies row on every instance and cannot be edited, so with
+//!     examples/used-device-shop deleted (car 7) those rows must stay
+//!     candidates. The list that keeps them names only rows the
+//!     migration seeds, with the migration's own member_attribute, and
+//!     this tree, without the example, still carries every one of them.
 //!   * THE PLATFORM'S ROWS ARE IN NO EXAMPLE SEED. The set is what an
 //!     instance may lose, so the rows the platform's own baseline and
 //!     schema need (the bootstrap admin's role/department/location,
@@ -42,10 +55,15 @@
 //!     the same BOSS_TENANT_DIR and tenant mount the boss container has.
 
 use boss_testing::{create_dir, repo_root, scratch_dir, write_file};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCRIPT: &str = "infra/postgres/example-reference-rows.sh";
+/// Where a retired example's migration-seeded rows are declared — beside
+/// the script, so it ships wherever the script does (the image copies
+/// infra/postgres whole).
+const RETIRED: &str = "infra/postgres/retired-examples";
 
 fn run(args: &[&str], examples: Option<&Path>) -> (i32, String, String) {
     let mut cmd = Command::new("bash");
@@ -87,14 +105,17 @@ fn toml_headers(p: &Path, header: &str) -> usize {
         .count()
 }
 
-/// (subject_kind, code) of every class row an example seed carries,
-/// read with the product's own TOML/JSON parsers rather than the
-/// script's awk — the independent read.
+/// (subject_kind, code) of every class row an example seed — live or
+/// retired — carries, read with the product's own TOML/JSON parsers
+/// rather than the script's awk — the independent read.
 fn seeded_classes() -> Vec<(String, String)> {
     let mut rows = Vec::new();
-    let examples = repo_root().join("examples");
-    for entry in std::fs::read_dir(&examples).unwrap() {
-        let d = entry.unwrap().path();
+    let root = repo_root();
+    let dirs = [root.join("examples"), root.join(RETIRED)]
+        .into_iter()
+        .flat_map(|r| std::fs::read_dir(r).unwrap())
+        .map(|e| e.unwrap().path());
+    for d in dirs {
         let json = d.join("seeds/classes.json");
         if json.is_file() {
             let v: serde_json::Value =
@@ -144,7 +165,7 @@ fn seeds_is_the_example_tenants_own_rows_counted_independently() {
     assert_eq!(
         v["locations"].as_array().unwrap().len(),
         toml_headers(&brewery.join("locations.toml"), "location"),
-        "locations = the brewery's [[location]] ids (the device shop declares none: it sits at the platform's default locations)"
+        "locations = the brewery's [[location]] ids (the retired device shop declared none: it sat at the platform's default locations)"
     );
     assert_eq!(
         v["gl_accounts"].as_array().unwrap().len(),
@@ -176,6 +197,15 @@ fn seeds_is_the_example_tenants_own_rows_counted_independently() {
         "sales_tax_rates = the brewery's [[sales_tax_rate]] states"
     );
     assert_eq!(v["sales_tax_rates"].as_array().unwrap().len(), 27);
+    // The department roster (backlog 7edf0e97): the brewery's
+    // departments.toml carries the thirteen rows migration
+    // 20260919181324 seeds into every instance.
+    assert_eq!(
+        v["departments"].as_array().unwrap().len(),
+        toml_headers(&brewery.join("departments.toml"), "department"),
+        "departments = the brewery's [[department]] codes"
+    );
+    assert_eq!(v["departments"].as_array().unwrap().len(), 13);
     let sources: Vec<&str> = v["sources"]
         .as_array()
         .unwrap()
@@ -187,10 +217,162 @@ fn seeds_is_the_example_tenants_own_rows_counted_independently() {
         "brewery/seeds/locations.toml",
         "brewery/seeds/chart_of_accounts.toml",
         "brewery/seeds/tax.toml",
-        "used-device-shop/seeds/classes.toml",
+        "brewery/seeds/departments.toml",
+        "retired-examples/used-device-shop/seeds/classes.toml",
     ] {
         assert!(sources.contains(&s), "sources names {s}: {sources:?}");
     }
+}
+
+/// Every (subject_kind, member_attribute, code) an `INSERT INTO classes
+/// (subject_kind, code, display_name, member_attribute, …)` statement of
+/// 01-registries.sql seeds — read from the migration's text, the way
+/// psql would see each tuple: the quoted fields in column order.
+fn migration_classes() -> BTreeSet<(String, String, String)> {
+    let sql = std::fs::read_to_string(repo_root().join("infra/postgres/schema/01-registries.sql"))
+        .unwrap();
+    let mut rows = BTreeSet::new();
+    let mut inside = false;
+    for line in sql.lines().map(str::trim) {
+        if line
+            .starts_with("INSERT INTO classes (subject_kind, code, display_name, member_attribute")
+        {
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with('(') {
+            // Odd pieces of a split on the quote are the quoted fields:
+            // subject_kind, code, display_name, member_attribute.
+            let q: Vec<&str> = line.split('\'').collect();
+            rows.insert((q[1].to_string(), q[7].to_string(), q[3].to_string()));
+        }
+        if line.ends_with(';') {
+            inside = false;
+        }
+    }
+    assert!(
+        rows.len() > 100,
+        "the reader found the migration's class tuples ({} of them) — a reader that found none would certify nothing",
+        rows.len()
+    );
+    rows
+}
+
+/// The ids 01-registries.sql's `INSERT INTO companies` seeds.
+fn migration_companies() -> BTreeSet<String> {
+    let sql = std::fs::read_to_string(repo_root().join("infra/postgres/schema/01-registries.sql"))
+        .unwrap();
+    let stmt = sql
+        .split("INSERT INTO companies (id, name) VALUES")
+        .nth(1)
+        .expect("01-registries.sql seeds companies")
+        .split(';')
+        .next()
+        .unwrap();
+    stmt.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('('))
+        .map(|l| l.split('\'').nth(1).unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn the_retired_device_shop_rows_are_the_ones_its_migration_seeds_and_outlive_its_example() {
+    let root = repo_root();
+    let dir = root.join(RETIRED).join("used-device-shop");
+    let classes: toml::Value =
+        toml::from_str(&std::fs::read_to_string(dir.join("seeds/classes.toml")).unwrap()).unwrap();
+    let retired: BTreeSet<(String, String, String)> = classes["class"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["subject_kind"].as_str().unwrap().to_string(),
+                r["member_attribute"].as_str().unwrap().to_string(),
+                r["code"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    // Every row it names is a row the migration seeds, under the same
+    // member_attribute — nothing invented, nothing mis-keyed.
+    let migration = migration_classes();
+    let invented: Vec<_> = retired.difference(&migration).collect();
+    assert!(
+        invented.is_empty(),
+        "the retired list names rows 01-registries.sql does not seed: {invented:?}"
+    );
+    // And it names every one the car-0 measure counted (2026-09-24): 26
+    // roles, ten departments, three account types, one location kind.
+    // Together with the fresh-schema run in example_reference_rows_sql.rs
+    // (without examples/used-device-shop, what remains is exactly what
+    // the platform names), this is the equality: the rows not kept by
+    // the platform nor carried by the brewery are all here, and nothing
+    // here is not the migration's.
+    let count = |kind: &str, attr: &str| {
+        retired
+            .iter()
+            .filter(|(k, a, _)| k == kind && a == attr)
+            .count()
+    };
+    assert_eq!(count("employee", "role"), 26);
+    assert_eq!(count("employee", "department"), 10);
+    assert_eq!(count("account", "type"), 3);
+    assert_eq!(count("location", "kind"), 1);
+    assert_eq!(retired.len(), 40, "and nothing else: {retired:?}");
+
+    let manifest = std::fs::read_to_string(dir.join("tenant.toml")).unwrap();
+    assert!(
+        manifest.contains("\ntenant_id = \"used-device-shop\"\n"),
+        "the manifest names the companies row: {manifest}"
+    );
+    assert!(migration_companies().contains("used-device-shop"));
+
+    // This tree: the example is gone (car 7), and every row is still a
+    // candidate — the hazard the measure recorded, closed. The assert
+    // first, so the rest cannot pass on a tree that still has it.
+    assert!(
+        !root.join("examples/used-device-shop").exists(),
+        "examples/used-device-shop was deleted by car 7 of backlog a8991c86"
+    );
+    let (rc, out, err) = run(&["seeds"], None);
+    assert_eq!(rc, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let keys: BTreeSet<String> = class_keys(&v).into_iter().collect();
+    for (kind, _, code) in &retired {
+        assert!(
+            keys.contains(&format!("{kind}:{code}")),
+            "{kind}:{code} is a candidate without examples/used-device-shop"
+        );
+    }
+    assert_eq!(strs(&v, "companies"), ["brewery", "used-device-shop"]);
+    assert!(
+        strs(&v, "sources")
+            .contains(&"retired-examples/used-device-shop/seeds/classes.toml".to_string()),
+        "{out}"
+    );
+    // A retired example is not an example: its tenant id is not one
+    // `boot` keeps the rows for.
+    let t = scratch_dir("example-reference-rows-retired-id");
+    write(
+        &t.join("tenant.toml"),
+        "[meta]\ntenant_id = \"used-device-shop\"\n",
+    );
+    let (rc, out, _) = run(&["boot", t.to_str().unwrap()], None);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.starts_with("evict: tenant used-device-shop"), "{out}");
+
+    // A missing list is a refusal, never a smaller set (CLAUDE.md
+    // §Doors: a wrong path answers instead of erroring).
+    let out = Command::new("bash")
+        .arg(root.join(SCRIPT))
+        .arg("seeds")
+        .env("BOSS_RETIRED_EXAMPLES_DIR", "/nonexistent/retired")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/retired"));
 }
 
 /// The rows the platform itself needs, derived from the files that
@@ -293,16 +475,6 @@ fn boot_keeps_for_an_example_and_evicts_for_a_company() {
         "{out}"
     );
 
-    let (rc, out, _) = run(
-        &[
-            "boot",
-            root.join("examples/used-device-shop").to_str().unwrap(),
-        ],
-        None,
-    );
-    assert_eq!(rc, 3, "{out}");
-    assert!(out.contains("used-device-shop is an example"), "{out}");
-
     let company = scratch_dir("example-reference-rows-company");
     write(
         &company.join("tenant.toml"),
@@ -364,6 +536,10 @@ fn an_attribute_the_script_cannot_judge_is_a_refusal() {
         &t.join("seeds/tax.toml"),
         "[[tax_kind]]\nkind = \"sales\"\nliability_account = \"1000\"\n\n[[sales_tax_rate]]\nstate = \"CA\"\njurisdiction = \"US-CA\"\nrate_bps = 725\n",
     );
+    write(
+        &t.join("seeds/departments.toml"),
+        "[[department]]\ncode = \"cellar\"\ndisplay_name = \"Cellar\"\nfunction = \"operations\"\n",
+    );
     let (rc, out, _) = run(&["seeds"], Some(&examples));
     assert_eq!(rc, 0, "seeds reads the set: {out}");
     let tenant = plain_tenant("unmapped");
@@ -404,6 +580,7 @@ fn the_sql_shapes_are_a_read_only_plan_and_one_transaction_per_table() {
         [
             "-- retire-example-reference-rows:delete companies",
             "-- retire-example-reference-rows:delete locations",
+            "-- retire-example-reference-rows:delete departments",
             "-- retire-example-reference-rows:delete tax_kinds",
             "-- retire-example-reference-rows:delete sales_tax_rates",
             "-- retire-example-reference-rows:delete gl_accounts",
@@ -413,13 +590,14 @@ fn the_sql_shapes_are_a_read_only_plan_and_one_transaction_per_table() {
     );
     assert_eq!(
         del.matches("\nBEGIN;\n").count(),
-        6,
+        7,
         "one transaction per table"
     );
-    assert_eq!(del.matches("\nCOMMIT;\n").count(), 6);
+    assert_eq!(del.matches("\nCOMMIT;\n").count(), 7);
     for t in [
         "companies",
         "locations",
+        "departments",
         "tax_kinds",
         "sales_tax_rate_by_state",
         "gl_accounts",
@@ -447,6 +625,8 @@ fn the_sql_shapes_are_a_read_only_plan_and_one_transaction_per_table() {
         "tax_kinds",
         "tax_filings.kind",
         "gl_posting_rules.lines",
+        "jobs.metadata.department",
+        "workflows.metadata.department",
     ] {
         assert!(
             plan.contains(&format!("'{reason}'")),
@@ -532,8 +712,10 @@ fn the_two_doors_call_the_one_derivation() {
 }
 
 /// The measured hole (86835bf9): a tenant declaring a code an example
-/// also declares. The fixture re-declares the device shop's `sales`
-/// department, the brewery's taproom location and its `1100` account
+/// also declares. The fixture re-declares the retired device shop's
+/// `sales` department (a candidate through infra/postgres/
+/// retired-examples/ since car 7), the brewery's taproom location, its
+/// `1100` account and its `it` department (backlog 7edf0e97)
 /// — beside its own rows, which are no example's and change nothing.
 fn redeclaring_tenant(name: &str) -> PathBuf {
     let t = scratch_dir(&format!("example-reference-rows-redeclares-{name}"));
@@ -561,6 +743,13 @@ fn redeclaring_tenant(name: &str) -> PathBuf {
     write(
         &t.join("seeds/tax.toml"),
         "[[tax_kind]]\nkind = \"sales\"\nliability_account = \"1100\"\n\n[[tax_kind]]\nkind = \"gross-receipts\"\nliability_account = \"1100\"\n\n[[sales_tax_rate]]\nstate = \"CA\"\njurisdiction = \"US-CA\"\nrate_bps = 725\n\n[[sales_tax_rate]]\nstate = \"HI\"\njurisdiction = \"US-HI\"\nrate_bps = 400\n",
+    );
+    // The brewery's `it` department, and a retired `warehouse` —
+    // a code the tenant declares withdrawn is still its declaration,
+    // never residue (backlog 7edf0e97) — beside `hosting`, no example's.
+    write(
+        &t.join("seeds/departments.toml"),
+        "[[department]]\ncode = \"it\"\ndisplay_name = \"IT\"\nfunction = \"operations\"\n\n[[department]]\ncode = \"warehouse\"\ndisplay_name = \"Warehouse\"\nfunction = \"operations\"\nretired = true\n\n[[department]]\ncode = \"hosting\"\ndisplay_name = \"Hosting\"\nfunction = \"operations\"\n",
     );
     t
 }
@@ -618,6 +807,13 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
     assert!(strs(&v, "tax_kinds").contains(&"income".to_string()));
     assert!(!strs(&v, "sales_tax_rates").contains(&"CA".to_string()));
     assert!(strs(&v, "sales_tax_rates").contains(&"TX".to_string()));
+    assert!(!strs(&v, "departments").contains(&"it".to_string()));
+    assert!(!strs(&v, "departments").contains(&"warehouse".to_string()));
+    assert!(strs(&v, "departments").contains(&"production".to_string()));
+    assert_eq!(
+        strs(&v, "departments").len(),
+        strs(&plain, "departments").len() - 2
+    );
 
     let d = &v["declared_by_tenant"];
     assert_eq!(
@@ -634,6 +830,7 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
     assert_eq!(strs(d, "companies"), Vec::<String>::new());
     assert_eq!(strs(d, "tax_kinds"), ["sales"]);
     assert_eq!(strs(d, "sales_tax_rates"), ["CA"]);
+    assert_eq!(strs(d, "departments"), ["it", "warehouse"]);
     assert_eq!(d["directory"], tenant);
     assert!(
         plain["declared_by_tenant"].is_null(),
@@ -667,6 +864,17 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
         assert!(
             !kinds.contains(r#""sales""#) && kinds.contains(r#""income""#),
             "the re-declared kind is not a candidate: {kinds}"
+        );
+        let departments = sql
+            .split(r#""departments":["#)
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("the SQL embeds the departments candidates");
+        assert!(
+            !departments.contains(r#""it""#)
+                && !departments.contains(r#""warehouse""#)
+                && departments.contains(r#""production""#),
+            "a department the tenant declares, retired or live, is not a candidate: {departments}"
         );
     }
     // A tenant declaring nothing an example does leaves the set whole.

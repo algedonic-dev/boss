@@ -90,7 +90,7 @@ impl Tree {
         for tool in ["cargo", "bun"] {
             boss_testing::write_exec(&bin.join(tool), "#!/usr/bin/env bash\nexit 0\n");
         }
-        for web in ["apps/web", "libs/web-kit"] {
+        for web in ["apps/web", "apps/simulator", "libs/web-kit"] {
             boss_testing::create_dir(&tree.join(web));
         }
         boss_testing::write_exec(

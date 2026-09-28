@@ -27,7 +27,10 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../../router';
-  import type { Job, Step } from '../../jobs/types';
+  import type { Job } from '../../jobs/types';
+  import { standingOf } from '../../jobs/position';
+  import { fetchEvery, wholeOrThrow } from '../../data/paginated';
+  import { armOf, concludedCard, measuredLine, outcomeOf, stepField } from './experimentCard';
 
   type LoadState =
     | { kind: 'loading' }
@@ -39,13 +42,14 @@
   async function fetchExperiments(): Promise<void> {
     load = { kind: 'loading' };
     try {
-      const res = await fetch('/api/jobs?kind=protocol-experiment&limit=200');
-      if (!res.ok) {
-        load = { kind: 'failed', message: `the jobs API answered ${res.status}` };
-        return;
-      }
-      const body = await res.json();
-      const jobs = (body?.data ?? body ?? []) as ReadonlyArray<Job>;
+      // EVERY experiment, running and concluded: the archive is the
+      // point of the page, and one page of 200 would have dropped the
+      // oldest conclusions in silence once the kind passed 200
+      // (backlog b68a9dde). A read that stops short fails, saying how
+      // many of how many it held.
+      const jobs = wholeOrThrow(
+        await fetchEvery<Job>('/api/jobs?kind=protocol-experiment&full=true'),
+      );
       load = { kind: 'ready', jobs };
     } catch (e) {
       load = { kind: 'failed', message: e instanceof Error ? e.message : String(e) };
@@ -66,34 +70,15 @@
     ),
   );
 
-  const stepsOf = (j: Job): ReadonlyArray<Step> =>
-    [...(j.steps ?? [])].sort((a, b) => a.sort_order - b.sort_order);
+  // The readers live in experimentCard.ts, pinned there by its unit
+  // test and here by experiments-page.mocked.spec.ts (page-audit
+  // ec8351f4).
 
-  const stepMeta = (j: Job, slug: string): Record<string, unknown> =>
-    (stepsOf(j).find((s) => s.spec_slug === slug)?.metadata ?? {}) as Record<string, unknown>;
-
-  const field = (j: Job, slug: string, key: string): string => {
-    const v = stepMeta(j, slug)[key];
-    return typeof v === 'string' ? v : v == null ? '' : String(v);
-  };
-
-  /// The step someone can act on now — what the experiment is waiting for.
-  const waitingOn = (j: Job): string => {
-    const s = stepsOf(j).find((x) => x.status === 'ready' || x.status === 'active');
-    return s?.spec_slug ?? '';
-  };
-
-  const outcomeOf = (j: Job): string => {
-    const o = (j.metadata as Record<string, unknown> | undefined)?.outcome;
-    return typeof o === 'string' ? o : '';
-  };
-
-  /// v5 widened the arms from workflow versions to anything: the
-  /// `state` fields are now `control` / `candidate` (free text). The
-  /// `*_version` names survive only on packets stated under v1–v4, so
-  /// they are the fallback, not the field.
-  const armOf = (j: Job, which: 'control' | 'candidate'): string =>
-    field(j, 'state', which) || field(j, 'state', `${which}_version`);
+  /// The step someone can act on now — what the experiment is waiting
+  /// for — with its status beside it, so a terminal like `promoted`
+  /// standing ready does not read as already promoted (3102fe7a).
+  const waitingOn = (j: Job): string =>
+    standingOf({ ...j, steps: [...(j.steps ?? [])].sort((a, b) => a.sort_order - b.sort_order) }) ?? '';
 </script>
 
 <PageHeader
@@ -115,9 +100,13 @@
   <section class="exp-running" aria-label="Running experiments">
     <h2 class="exp-h2">Running <span class="exp-count">{running.length}</span></h2>
     {#if running.length === 0}
+      <!-- Zero is the decided state, not a lapse: experimentation starts
+           at a named threshold (design d8771dec, David 2026-09-23), so
+           the empty panel says when it will fill (backlog 071ffd8b). -->
       <p class="exp-empty">
-        No experiment is running. Changes are shipping on judgement alone — which is
-        fine for the obvious ones, and is how three predictions went wrong on 2026-08-26.
+        No experiment is running. One opens at the first draft workflow version, on a
+        kind with 20+ terminals a day, that adds, removes or reorders a step. Its author
+        opens it as a split instead of publishing.
       </p>
     {:else}
       {#each running as j (j.id)}
@@ -126,16 +115,16 @@
             <a class="exp-title" href={href(`/ux/jobs/${j.id}`)}>{j.title}</a>
             <span class="exp-waiting">waiting on: {waitingOn(j) || '—'}</span>
           </header>
-          {#if field(j, 'state', 'hypothesis')}
+          {#if stepField(j, 'state', 'hypothesis')}
             <dl class="exp-dl">
               <dt>Hypothesis</dt>
-              <dd>{field(j, 'state', 'hypothesis')}</dd>
+              <dd>{stepField(j, 'state', 'hypothesis')}</dd>
               <dt>Metric</dt>
-              <dd>{field(j, 'state', 'metric')}</dd>
+              <dd>{stepField(j, 'state', 'metric')}</dd>
               <dt>Arms</dt>
               <dd>{armOf(j, 'control')} vs {armOf(j, 'candidate')}</dd>
               <dt>Decision rule</dt>
-              <dd>{field(j, 'state', 'decision_rule')}</dd>
+              <dd>{stepField(j, 'state', 'decision_rule')}</dd>
             </dl>
           {:else}
             <p class="exp-note">
@@ -153,6 +142,7 @@
       <p class="exp-empty">Nothing concluded yet.</p>
     {:else}
       {#each concluded as j (j.id)}
+        {@const c = concludedCard(j)}
         <article class="exp-card exp-card-done">
           <header class="exp-card-head">
             <a class="exp-title" href={href(`/ux/jobs/${j.id}`)}>{j.title}</a>
@@ -160,17 +150,26 @@
           </header>
           <dl class="exp-dl">
             <dt>Predicted</dt>
-            <dd>{field(j, 'state', 'hypothesis') || '—'}</dd>
-            <dt>Measured</dt>
-            <dd>
-              control {field(j, 'measure', 'control_result') || '—'} · candidate
-              {field(j, 'measure', 'candidate_result') || '—'} · n={field(j, 'measure', 'samples') || '?'}
-            </dd>
-            <dt>Decided</dt>
-            <dd>{field(j, 'decide', 'decision') || '—'}</dd>
-            {#if field(j, 'decide', 'confounds')}
-              <dt>Confounds</dt>
-              <dd class="exp-confounds">{field(j, 'decide', 'confounds')}</dd>
+            <dd>{c.predicted || '—'}</dd>
+            {#if c.kind === 'abandoned'}
+              <!-- Abandoned closes after `state` with no measure or decide:
+                   the terminal's reason is the record (backlog baf0c973). -->
+              <dt>Abandoned</dt>
+              <dd class="exp-abandoned-reason">{c.reason || '—'}</dd>
+            {:else}
+              <!-- Source and the floor stated in advance sit beside n; the
+                   decision sits over its reading against the rule written
+                   before the result (backlog 3633a918). -->
+              <dt>Measured</dt>
+              <dd class="exp-measured">{measuredLine(c.measured)}</dd>
+              <dt>Decided</dt>
+              <dd class="exp-decided">{c.decision || '—'}</dd>
+              <dt>Against stated rule</dt>
+              <dd class="exp-against-rule">{c.againstRule || '—'}</dd>
+              {#if c.confounds}
+                <dt>Confounds</dt>
+                <dd class="exp-confounds">{c.confounds}</dd>
+              {/if}
             {/if}
           </dl>
         </article>
@@ -183,12 +182,12 @@
   .exp-msg,
   .exp-empty,
   .exp-note {
-    color: var(--text-muted);
+    color: var(--static);
     font-size: 0.9rem;
   }
   .exp-failed {
-    border: 1px solid var(--danger, #b3261e);
-    border-radius: var(--radius, 6px);
+    border: 1px solid var(--err);
+    border-radius: var(--radius);
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
   }
@@ -200,12 +199,12 @@
     margin: 1.25rem 0 0.5rem;
   }
   .exp-count {
-    color: var(--text-muted);
+    color: var(--static);
     font-weight: 400;
   }
   .exp-card {
     border: 1px solid var(--border);
-    border-radius: var(--radius, 6px);
+    border-radius: var(--radius);
     padding: 0.75rem 1rem;
     margin-bottom: 0.75rem;
   }
@@ -221,7 +220,7 @@
   .exp-waiting,
   .exp-outcome {
     font-size: 0.8rem;
-    color: var(--text-muted);
+    color: var(--static);
     white-space: nowrap;
   }
   .exp-dl {
@@ -232,12 +231,12 @@
     font-size: 0.875rem;
   }
   .exp-dl dt {
-    color: var(--text-muted);
+    color: var(--static);
   }
   .exp-dl dd {
     margin: 0;
   }
   .exp-confounds {
-    color: var(--text-muted);
+    color: var(--static);
   }
 </style>

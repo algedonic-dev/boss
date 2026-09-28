@@ -869,14 +869,15 @@ fn shipped_verbs(root: &Path) -> PathBuf {
 
 /// One open ops-request for boss-gcp carrying the verb and args, run
 /// through `ops-runner.sh` against a stubbed system of record: the stub
-/// `curl` answers the jobs read with the packet, records the PUT, and
+/// `curl` answers the jobs read with the packet, keeps what it recorded on the step, and
 /// serves the registry row the script reads.
 fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json::Value>) {
     write_exec(
         &c.bin.join("curl"),
-        r#"#!/bin/sh
-for a in "$@"; do case "$a" in @*) cp "${a#@}" "$STUB_PUT"; exit 0;; esac; done
-out=""; code=0; url=""
+        &[
+            "#!/bin/sh\n",
+            boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
+            r#"out=""; code=0; url=""
 while [ $# -gt 0 ]; do
   case "$1" in -o) out="$2"; shift ;; -w) code=1 ;; http*) url="$1" ;; esac
   shift
@@ -886,6 +887,8 @@ case "$url" in
 esac
 cat "$STUB_JOBS"
 "#,
+        ]
+        .concat(),
     );
     write_file(
         &c.root.join("jobs.json"),
@@ -893,8 +896,8 @@ cat "$STUB_JOBS"
             r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"boss-gcp","verb":"publish-workflow","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}]}}"#
         ),
     );
-    let put = c.root.join("put.json");
-    let _ = std::fs::remove_file(&put);
+    let step_md = c.root.join("step-metadata.json");
+    let _ = std::fs::remove_file(&step_md);
     let out = Command::new("sh")
         .arg(repo_root().join("infra/ops/ops-runner.sh"))
         .env_clear()
@@ -910,7 +913,7 @@ cat "$STUB_JOBS"
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", c.root.join("jobs.json"))
-        .env("STUB_PUT", &put)
+        .env("STUB_STEP_METADATA", &step_md)
         .env("BOSS_PUBLISH_WORKFLOW_REPO", &c.repo)
         .env("STUB_LIVE", &c.live)
         .env("STUB_LIVE_AFTER", &c.live_after)
@@ -924,10 +927,7 @@ cat "$STUB_JOBS"
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let meta = std::fs::read_to_string(&put)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("PUT payload is JSON"))
-        .map(|v| v["metadata"].clone());
+    let meta = boss_testing::ops_runner_stub::step_metadata_written(&step_md);
     (text, meta)
 }
 

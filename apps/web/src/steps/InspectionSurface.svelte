@@ -8,12 +8,13 @@
   // from the session user. The backend policy check rejects
   // unauthorized callers.
 
-  import { isPending, type StepStatus } from '../jobs/types';
+  import { type StepStatus } from '../jobs/types';
+  import { claimedFor, startable } from './holder';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
-  import { describeWriteFailure, putStep } from './stepWrite';
+  import { describeWriteFailure, putStep, saveStep, startStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -102,27 +103,32 @@
     session.value.kind === 'ready' ? session.value.user.id : null,
   );
 
-  async function save(newStatus?: string): Promise<void> {
+  /// A Start saves and then claims, for the stored nominee (design
+  /// 611fbffd, clause b) — never a status PUT.
+  async function save(newStatus?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
-      const body: Record<string, unknown> = {
-        ...step,
-        job_id: jobId,
+      const required = step.sign_offs_required ?? [];
+      const completing = newStatus === 'completed' && required.length > 0;
+      // The keys this surface owns, through the merge door; an emptied
+      // field is sent as null and deleted, where it used to be cleared
+      // by omission from a wholesale PUT (backlog e39a9d2a).
+      const body = {
+        ...(newStatus && !completing ? { status: newStatus } : {}),
         metadata: {
-          ...step.metadata,
           overall_result: result || undefined,
           inspector_notes: notes || undefined,
         },
       };
-      const required = step.sign_offs_required ?? [];
-      const completing = newStatus === 'completed' && required.length > 0;
-      if (newStatus && !completing) body.status = newStatus;
       // Metadata first, then stamps attesting the final shape, then
       // the status flip. Server gates the completion. Every leg is
       // checked — a refused write aborts the chain and renders inline
       // instead of stamping/completing on top of it (packet cc9d7fc6).
-      const wrote = await putStep(jobId, step.id, body);
+      let wrote = await saveStep(jobId, step.id, body);
+      if (wrote.kind === 'ok' && start) {
+        wrote = await startStep(jobId, step.id, claimedFor(step.assignee_id));
+      }
       if (wrote.kind === 'failed') {
         writeError = wrote.error;
         return;
@@ -204,18 +210,18 @@
       {/if}
 
       <div class="step-actions">
-        {#if isPending(step.status)}
+        {#if startable(step)}
           <button
-            class="step-btn step-btn-primary"
-            onclick={() => save('active')}
+            class="btn btn-primary"
+            onclick={() => save(undefined, true)}
             disabled={saving}
           >Start inspection</button>
         {:else if step.status === 'active'}
-          <button class="step-btn" onclick={() => save()} disabled={saving}>
+          <button class="btn" onclick={() => save()} disabled={saving}>
             Save progress
           </button>
           <button
-            class="step-btn step-btn-primary"
+            class="btn btn-primary"
             onclick={() => save('completed')}
             disabled={saving || !result}
           >Complete inspection</button>

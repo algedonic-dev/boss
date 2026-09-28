@@ -43,11 +43,7 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response();
+            return e.into_response();
         }
     };
     if matches!(predicate, boss_policy_client::Predicate::None) {
@@ -194,15 +190,12 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
             .map(str::to_string)
     };
     let car_branches: Vec<String> = cars.iter().filter_map(branch_of).collect();
-    // Branches whose car reached a terminal. The garage drops these: work
-    // that settled is not work awaiting rework, and its last gate-run
-    // under that branch name stays red forever. Derived from the read we
-    // already did rather than a second query.
-    let settled_car_branches: Vec<String> = cars
-        .iter()
-        .filter(|c| c.status == JobStatus::Closed)
-        .filter_map(branch_of)
-        .collect();
+    // Branches no car awaits: a closed car's own, and every name a car
+    // was re-railed off (its `rerail_origins`). The garage and limbo drop
+    // these: work that settled or moved is not work awaiting rework, and
+    // its last gate-run under that branch name stays red forever. Derived
+    // from the read we already did rather than a second query.
+    let settled_car_branches: Vec<String> = yard::settled_car_branches(&cars);
 
     // The dock, via the station registry — the one authoritative path,
     // the same one the departure board uses. `None` when the row cannot
@@ -362,7 +355,15 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
             if out.iter().any(|(seen, _)| seen.id == job.id) {
                 continue;
             }
-            let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
+            // A failed steps read FAILS the request, as it does for the
+            // trains above and for the same reason: a gate-run's steps
+            // ARE its verdict. Read as empty, a green run had no green,
+            // and its stranded car fell out of the stranded lane with a
+            // 200 (backlog f6c97006).
+            let steps = match state.jobs.list_steps(&job.id).await {
+                Ok(steps) => steps,
+                Err(e) => return Err(steps_unreadable(&job.id, &e)),
+            };
             out.push((job, steps));
         }
         out
@@ -402,34 +403,12 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // the cluster converge and of each host converge, WITH their steps
     // — the evidence (`build_head`, `unchanged`, `converge_sha`) is on
     // the `run` step, which is why the web's converge card fetches these
-    // packets with steps too. A read that fails leaves the kind absent,
+    // packets with steps too. A read that fails leaves the window empty,
     // and every row it would have decided says `unread` rather than
     // "converging" (a limit is not a filter, and an empty read is not a
-    // reading of "not yet").
-    let converges = {
-        let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
-        for kind in
-            std::iter::once(crate::landing::CLUSTER_CONVERGE).chain(crate::landing::HOST_CONVERGES)
-        {
-            let filter = JobFilter {
-                kind: Some(kind.to_string()),
-                scope: scope.clone(),
-                ..Default::default()
-            };
-            let Ok((rows, _)) = state
-                .jobs
-                .list_jobs(&filter, crate::landing::CONVERGE_WINDOW, 0)
-                .await
-            else {
-                continue;
-            };
-            for job in rows {
-                let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
-                out.push((job, steps));
-            }
-        }
-        out
-    };
+    // reading of "not yet"). See [`converge_window`] for why the window
+    // is read whole or not at all.
+    let converges = converge_window(state, &scope).await.unwrap_or_default();
 
     // Every read that can fail QUIETLY states whether it answered: the
     // dock from the `Option` `dock_cars` already returns, the cadence
@@ -502,6 +481,47 @@ fn with_gate_run_window(mut v: serde_json::Value, truncated: bool) -> serde_json
     v
 }
 
+/// The converge packets the sidings lane judges landings on, WITH their
+/// steps — or `None` when any read of them failed, which the caller
+/// hands on as an empty window and every row it would decide reads
+/// `unread`.
+///
+/// WHOLE OR NOT AT ALL (backlog f6c97006). A converge's evidence is on
+/// its `run` step, so the steps read is the reading. It used to answer
+/// `unwrap_or_default()`: a landed converge read as a packet with no
+/// run, inside a window that reaches the merge — so the row said
+/// "converging", a confident not-yet in place of an unread. Dropping
+/// only the one packet, or only its kind, is no better: the infra row
+/// judges every host the window shows, and a host missing from it is
+/// the estate observer's finding, not a failed read, so the remaining
+/// hosts would land the car without it. A list read that fails is the
+/// same case and is answered the same way.
+async fn converge_window<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    scope: &crate::port::JobScope,
+) -> Option<Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>> {
+    let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
+    for kind in
+        std::iter::once(crate::landing::CLUSTER_CONVERGE).chain(crate::landing::HOST_CONVERGES)
+    {
+        let filter = JobFilter {
+            kind: Some(kind.to_string()),
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        let (rows, _) = state
+            .jobs
+            .list_jobs(&filter, crate::landing::CONVERGE_WINDOW, 0)
+            .await
+            .ok()?;
+        for job in rows {
+            let steps = state.jobs.list_steps(&job.id).await.ok()?;
+            out.push((job, steps));
+        }
+    }
+    Some(out)
+}
+
 /// One board rule's newest firing, by the read the conductor makes
 /// (`last_firing(&rule.name)`). `Ok(None)` both for no such rule and for
 /// a rule that has never fired — each an ANSWER; `Err` only when the read
@@ -550,7 +570,12 @@ async fn dock_cars<R: JobsRepository + 'static, B: EventBus + 'static>(
             scope,
             ..Default::default()
         };
-        if let Ok((jobs, _)) = state.jobs.list_jobs(&filter, MAX_LIMIT, 0).await {
+        // Every open car of the kind, never one page: the dock is a
+        // station read like the two in stations.rs, and dropped its
+        // total the same way (backlog f71d1e81).
+        if let Ok(jobs) =
+            crate::list_every::list_every(state.jobs.as_ref(), &filter, MAX_LIMIT).await
+        {
             let mut members = Vec::new();
             for job in jobs {
                 // A failed steps read makes the dock UNREAD, which is

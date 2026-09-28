@@ -50,6 +50,7 @@ export type CommerceSummary = {
 };
 
 import { fetchPaged, type PagedResult } from '../data/paginated';
+import { ApAgingSchema, CommerceSummarySchema } from './schemas';
 
 /// The invoice list, failure included. The old signature swallowed a
 /// failed fetch into an empty page, so an outage rendered "No
@@ -59,11 +60,15 @@ export function loadInvoices(): Promise<PagedResult<Invoice>> {
   return fetchPaged<Invoice>(`${API_BASE}/invoices?limit=1000`);
 }
 
+/// A 200 whose body is not the shape answers null, like a failed read:
+/// the cast these used to make let `[]` through as a summary, and the
+/// overview died on `undefined.toLocaleString()` (backlog 9045a570).
 export async function loadCommerceSummary(): Promise<CommerceSummary | null> {
   try {
     const r = await fetch(`${API_BASE}/summary`);
     if (!r.ok) return null;
-    return (await r.json()) as CommerceSummary;
+    const parsed = CommerceSummarySchema.safeParse(await r.json());
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
@@ -73,7 +78,8 @@ export async function loadApAging(): Promise<ApAging | null> {
   try {
     const r = await fetch('/api/inventory/ap-aging');
     if (!r.ok) return null;
-    return (await r.json()) as ApAging;
+    const parsed = ApAgingSchema.safeParse(await r.json());
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }

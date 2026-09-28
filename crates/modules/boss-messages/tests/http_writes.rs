@@ -10,6 +10,11 @@ use boss_testing::TestRequest;
 use common::{MessageTestApp, message_fixture};
 use serde_json::json;
 
+/// The machinery that sends, reads and expires on others' behalf signs
+/// as an operator-tier automation: a request with no `x-boss-user` is
+/// refused by every scoped door since backlog e84de48e (2026-09-25).
+const OPERATOR: &str = r#"{"id":"automation:messages-test","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
+
 // ---------------------------------------------------------------------------
 // POST /api/messages/send — compose
 // ---------------------------------------------------------------------------
@@ -26,6 +31,7 @@ async fn post_send_returns_201_created() {
     });
 
     let resp = TestRequest::post("/api/messages/send")
+        .header("x-boss-user", OPERATOR)
         .json(&body)
         .send(&app.router)
         .await;
@@ -45,6 +51,7 @@ async fn post_send_emits_message_sent_event() {
     });
 
     TestRequest::post("/api/messages/send")
+        .header("x-boss-user", OPERATOR)
         .json(&body)
         .send(&app.router)
         .await
@@ -65,6 +72,7 @@ async fn post_send_returns_new_message_id() {
     });
 
     let resp = TestRequest::post("/api/messages/send")
+        .header("x-boss-user", OPERATOR)
         .json(&body)
         .send(&app.router)
         .await;
@@ -85,6 +93,7 @@ async fn post_read_returns_200_ok() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     let resp = TestRequest::post("/api/messages/msg-read-1/read")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await;
 
@@ -97,6 +106,7 @@ async fn post_read_emits_message_read_event() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     TestRequest::post("/api/messages/msg-read-2/read")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await
         .assert_status(StatusCode::OK);
@@ -118,6 +128,7 @@ async fn delete_existing_message_returns_204() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     let resp = TestRequest::delete("/api/messages/msg-del-1")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await;
 
@@ -130,6 +141,7 @@ async fn delete_existing_message_emits_deleted_event() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     TestRequest::delete("/api/messages/msg-del-2")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await
         .assert_status(StatusCode::NO_CONTENT);
@@ -146,6 +158,7 @@ async fn delete_nonexistent_message_returns_404() {
     let app = MessageTestApp::new();
 
     let resp = TestRequest::delete("/api/messages/msg-missing")
+        .header("x-boss-user", common::operator())
         .send(&app.router)
         .await;
 
@@ -157,6 +170,7 @@ async fn delete_nonexistent_message_does_not_emit_event() {
     let app = MessageTestApp::new();
 
     TestRequest::delete("/api/messages/msg-missing")
+        .header("x-boss-user", common::operator())
         .send(&app.router)
         .await
         .assert_status(StatusCode::NOT_FOUND);
@@ -174,6 +188,7 @@ async fn archive_existing_message_returns_204() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     let resp = TestRequest::post("/api/messages/msg-arch-1/archive")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await;
 
@@ -186,6 +201,7 @@ async fn archive_existing_message_emits_archived_event() {
     let app = MessageTestApp::with_messages(vec![msg]);
 
     TestRequest::post("/api/messages/msg-arch-2/archive")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await
         .assert_status(StatusCode::NO_CONTENT);
@@ -202,6 +218,7 @@ async fn archive_nonexistent_message_returns_404() {
     let app = MessageTestApp::new();
 
     let resp = TestRequest::post("/api/messages/msg-missing/archive")
+        .header("x-boss-user", common::operator())
         .send(&app.router)
         .await;
 
@@ -213,6 +230,7 @@ async fn archive_nonexistent_message_does_not_emit_event() {
     let app = MessageTestApp::new();
 
     TestRequest::post("/api/messages/msg-missing/archive")
+        .header("x-boss-user", common::operator())
         .send(&app.router)
         .await
         .assert_status(StatusCode::NOT_FOUND);
@@ -237,6 +255,7 @@ async fn get_thread_returns_reply_chain() {
     let app = MessageTestApp::with_messages(vec![root, reply1, reply2]);
 
     let resp = TestRequest::get("/api/messages/msg-root/thread")
+        .header("x-boss-user", common::signed_in("emp-recipient"))
         .send(&app.router)
         .await;
     resp.assert_status(StatusCode::OK);
@@ -265,6 +284,7 @@ async fn compose_with_reply_to_creates_reply() {
     });
 
     let resp = TestRequest::post("/api/messages/send")
+        .header("x-boss-user", OPERATOR)
         .json(&body)
         .send(&app.router)
         .await;
@@ -275,6 +295,7 @@ async fn compose_with_reply_to_creates_reply() {
 
     // Fetch the new message and verify reply_to is set.
     let fetch = TestRequest::get(format!("/api/messages/{new_id}"))
+        .header("x-boss-user", common::signed_in("emp-2"))
         .send(&app.router)
         .await;
     fetch.assert_status(StatusCode::OK);
@@ -298,6 +319,7 @@ async fn get_inbox_returns_messages_for_recipient() {
     let app = MessageTestApp::with_messages(vec![m1, m2, m3]);
 
     let resp = TestRequest::get("/api/messages/inbox/emp-42")
+        .header("x-boss-user", OPERATOR)
         .send(&app.router)
         .await;
     resp.assert_status(StatusCode::OK);
@@ -312,6 +334,7 @@ async fn get_inbox_for_unknown_employee_returns_empty_list() {
     let app = MessageTestApp::new();
 
     let resp = TestRequest::get("/api/messages/inbox/emp-ghost")
+        .header("x-boss-user", OPERATOR)
         .send(&app.router)
         .await;
     resp.assert_status(StatusCode::OK);
@@ -320,8 +343,229 @@ async fn get_inbox_for_unknown_employee_returns_empty_list() {
     assert!(msgs.is_empty());
 }
 
+/// Backlog 8578b91e (page audit 5477d9eb, GAP 2): the inbox read was
+/// `SELECT *` by recipient, so an archived row came back to a page
+/// whose MessageKind knows only `direct` and `signal` — counted in
+/// All, drawn with the direct glyph, counted Unread when the expire
+/// rule had archived an unread signal, and offered Mark read. Archived
+/// is the inbox's exit (backlog 5963a322 puts the Archive control on
+/// the page), so the read leaves it out unless it is asked for.
+fn archived_and_kept(recipient: &str) -> Vec<Message> {
+    let mut kept = message_fixture("msg-kept");
+    kept.recipient_id = recipient.to_string();
+    let mut archived = message_fixture("msg-archived");
+    archived.recipient_id = recipient.to_string();
+    archived.archived_at = Some(chrono::Utc::now());
+    vec![kept, archived]
+}
+
+#[tokio::test]
+async fn get_inbox_leaves_out_archived_rows() {
+    let app = MessageTestApp::with_messages(archived_and_kept("emp-42"));
+
+    let resp = TestRequest::get("/api/messages/inbox/emp-42")
+        .header("x-boss-user", OPERATOR)
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+
+    let msgs: Vec<Message> = resp.assert_json();
+    let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["msg-kept"]);
+}
+
+#[tokio::test]
+async fn get_inbox_with_include_archived_returns_them_too() {
+    let app = MessageTestApp::with_messages(archived_and_kept("emp-42"));
+
+    let resp = TestRequest::get("/api/messages/inbox/emp-42?include_archived=true")
+        .header("x-boss-user", OPERATOR)
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+
+    let msgs: Vec<Message> = resp.assert_json();
+    let mut ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["msg-archived", "msg-kept"]);
+}
+
+/// The page's Archive control is this round trip: the write records
+/// its event, and the next inbox read no longer carries the row.
+#[tokio::test]
+async fn an_archived_message_leaves_the_inbox_read_and_records_its_event() {
+    let mut m = message_fixture("msg-done");
+    m.recipient_id = "emp-42".to_string();
+    let app = MessageTestApp::with_messages(vec![m]);
+
+    TestRequest::post("/api/messages/msg-done/archive")
+        .header("x-boss-user", common::signed_in("emp-42"))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    app.assert_recorded("messages.message.archived");
+
+    let resp = TestRequest::get("/api/messages/inbox/emp-42")
+        .header("x-boss-user", OPERATOR)
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let msgs: Vec<Message> = resp.assert_json();
+    assert!(msgs.is_empty(), "archived row still in the inbox: {msgs:?}");
+}
+
+/// The unread count is a question about the same inbox, so an unread
+/// row the expire rule archived (it leaves `read_at` NULL) is not
+/// counted in it either — and not when the count is narrowed to the
+/// kind the archived row still carries (backlog 9bda9726: archive is a
+/// state beside kind, so `?kind=direct` must not count an archived
+/// direct back into the badge). `archived` is no longer a kind to ask
+/// for; the inbox read's `include_archived` is where archived rows are.
+#[tokio::test]
+async fn get_unread_leaves_out_archived_rows_whatever_the_kind() {
+    let app = MessageTestApp::with_messages(archived_and_kept("emp-42"));
+
+    let count = |uri: &'static str, router: axum::Router| async move {
+        let resp = TestRequest::get(uri)
+            .header("x-boss-user", OPERATOR)
+            .send(&router)
+            .await;
+        resp.assert_status(StatusCode::OK);
+        let v: serde_json::Value = resp.assert_json();
+        v["count"].as_u64().unwrap()
+    };
+    assert_eq!(
+        count("/api/messages/unread/emp-42", app.router.clone()).await,
+        1
+    );
+    assert_eq!(
+        count(
+            "/api/messages/unread/emp-42?kind=direct",
+            app.router.clone()
+        )
+        .await,
+        1,
+        "the archived direct is not counted back in by its kind"
+    );
+}
+
+/// Backlog 9bda9726 (idempotence): the Archive control pressed twice —
+/// or a retried request — answers 204 both times and records ONE
+/// `messages.message.archived`. The second archive used to update the
+/// row again and record a second event.
+#[tokio::test]
+async fn archiving_twice_records_one_event() {
+    let app = MessageTestApp::with_messages(vec![message_fixture("msg-twice")]);
+
+    for _ in 0..2 {
+        TestRequest::post("/api/messages/msg-twice/archive")
+            .header("x-boss-user", common::signed_in("emp-recipient"))
+            .send(&app.router)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+    app.assert_recorded("messages.message.archived");
+}
+
 // Silence unused warnings for MessageKind when only used in fixture.
 #[allow(dead_code)]
 fn _kind_marker() -> MessageKind {
     MessageKind::direct()
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/messages/expire — with an id prefix, the notices about a step
+// ---------------------------------------------------------------------------
+
+/// The notice an assignee got when a step became theirs, in the shape
+/// the dispatcher's notifier sends it: a `direct`, id
+/// `notify:{step}:{recipient}`, linked to the step.
+fn step_notice(id: &str, recipient: &str, step_path: &str) -> Message {
+    let mut m = message_fixture(id);
+    m.sender_id = "automation:dispatcher".to_string();
+    m.recipient_id = recipient.to_string();
+    m.entity_ref = Some(boss_messages::types::EntityRef {
+        entity_type: "step".to_string(),
+        entity_id: "s1".to_string(),
+        entity_path: Some(step_path.to_string()),
+    });
+    m
+}
+
+/// Backlog 0b2bac00: the unread-direct count is the badge and the
+/// "waiting on you" headline, and a notice about a step that has ended
+/// must leave it. Before this, the expire door moved signals only, so a
+/// direct notice outlived its step for good.
+#[tokio::test]
+async fn post_expire_with_an_id_prefix_retires_a_steps_direct_notice() {
+    let step = "/jobs/job-1/steps/s1";
+    let mut from_a_person = step_notice("msg-human", "emp-d", step);
+    from_a_person.sender_id = "emp-colleague".to_string();
+    let app = MessageTestApp::with_messages(vec![
+        step_notice("notify:s1:emp-d", "emp-d", step),
+        from_a_person,
+    ]);
+
+    let unread_direct = |router: axum::Router| async move {
+        let resp = TestRequest::get("/api/messages/unread/emp-d?kind=direct")
+            .header("x-boss-user", OPERATOR)
+            .send(&router)
+            .await;
+        resp.assert_status(StatusCode::OK);
+        let v: serde_json::Value = resp.assert_json();
+        v["count"].as_u64().unwrap()
+    };
+    assert_eq!(unread_direct(app.router.clone()).await, 2);
+
+    let resp = TestRequest::post("/api/messages/expire")
+        .header("x-boss-user", OPERATOR)
+        .json(&json!({ "entity_path_prefix": step, "id_prefix": "notify:" }))
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let v: serde_json::Value = resp.assert_json();
+    assert_eq!(v["expired"], 1);
+
+    assert_eq!(
+        unread_direct(app.router.clone()).await,
+        1,
+        "the notice left the count; the person's question did not"
+    );
+    let event = app.assert_recorded("messages.message.archived");
+    assert_eq!(event.payload["id"], "notify:s1:emp-d");
+}
+
+/// An empty id prefix would match every id under the path — a person's
+/// direct included — so it is refused, as an empty path already is.
+/// 422, because the dispatcher's POST reads that as permanent: the same
+/// body fails the same way on every retry.
+#[tokio::test]
+async fn post_expire_refuses_an_empty_id_prefix() {
+    let step = "/jobs/job-1/steps/s1";
+    let app = MessageTestApp::with_messages(vec![step_notice("notify:s1:emp-d", "emp-d", step)]);
+
+    let resp = TestRequest::post("/api/messages/expire")
+        .header("x-boss-user", OPERATOR)
+        .json(&json!({ "entity_path_prefix": step, "id_prefix": " " }))
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    app.assert_not_recorded("messages.message.archived");
+}
+
+/// Without an id prefix the door is what it was: unread signals only,
+/// and a direct stays — the job-close rule relies on exactly that.
+#[tokio::test]
+async fn post_expire_without_an_id_prefix_still_leaves_a_direct() {
+    let step = "/jobs/job-1/steps/s1";
+    let app = MessageTestApp::with_messages(vec![step_notice("notify:s1:emp-d", "emp-d", step)]);
+
+    let resp = TestRequest::post("/api/messages/expire")
+        .header("x-boss-user", OPERATOR)
+        .json(&json!({ "entity_path_prefix": "/jobs/job-1" }))
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let v: serde_json::Value = resp.assert_json();
+    assert_eq!(v["expired"], 0);
 }

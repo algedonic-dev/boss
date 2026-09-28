@@ -14,6 +14,14 @@
 //!   from audit_log alone, so the deep-check discipline owns this
 //!   table like any other.
 //!
+//! A write-through leans on its caller's domain event for the fact (an
+//! `accounts.account.created` names the account; the TOML sources map
+//! it to its identity row). The mint door has no domain event, so it
+//! stages its own — [`SUBJECT_MINTED`] / [`SUBJECT_RELABELLED`] — in
+//! the write's transaction, and the rebuild replays them (backlog
+//! 92473357). Until 2026-09-27 it staged nothing, and every identity
+//! it minted was gone after the first rebuild.
+//!
 //! The FK onto `subject_kinds(kind)` makes the vocabulary gate
 //! structural: no identity row can exist for an unregistered kind.
 //!
@@ -26,9 +34,42 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use boss_core::event::Event;
 use boss_core::publish::{FieldChange, KeptRow, ModeQuery, PublishMode, UpdatedRow};
+use boss_core::publisher::EventStamp;
+use boss_policy_client::CurrentUser;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
+
+/// A subject identity was minted through the mint door: `subject_kind`,
+/// `id` and the `label` it was minted with (`null` when none).
+pub const SUBJECT_MINTED: &str = "subjects.subject.minted";
+/// A held subject's label was replaced under `?mode=take`: `from` the
+/// label it held, to `label`.
+pub const SUBJECT_RELABELLED: &str = "subjects.subject.relabelled";
+
+/// The fact of a mint. Public so a write-through whose own domain
+/// event names no identity can stage it beside [`record_subject_in_tx`]
+/// and be rebuilt by the same pass.
+pub fn minted_event(stamp: &EventStamp, kind: &str, id: &str, label: Option<&str>) -> Event {
+    stamp.event(
+        SUBJECT_MINTED,
+        serde_json::json!({"subject_kind": kind, "id": id, "label": label}),
+    )
+}
+
+fn relabelled_event(
+    stamp: &EventStamp,
+    kind: &str,
+    id: &str,
+    from: Option<&str>,
+    label: &str,
+) -> Event {
+    stamp.event(
+        SUBJECT_RELABELLED,
+        serde_json::json!({"subject_kind": kind, "id": id, "from": from, "label": label}),
+    )
+}
 
 const UPSERT_SQL: &str = "INSERT INTO subjects (kind, id, label) VALUES ($1, $2, $3) \
      ON CONFLICT (kind, id) \
@@ -54,24 +95,6 @@ pub async fn record_subject_in_tx(
     Ok(())
 }
 
-/// Pool-level upsert for callers with no surrounding transaction
-/// (the HTTP mint, seeds, backfills).
-pub async fn upsert_subject(
-    pool: &PgPool,
-    kind: &str,
-    id: &str,
-    label: Option<&str>,
-) -> Result<(), String> {
-    sqlx::query(UPSERT_SQL)
-        .bind(kind)
-        .bind(id)
-        .bind(label)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// What the mint door did with one declaration: the batch doors'
 /// answer shape (`boss_core::publish`), for a batch of one.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -92,12 +115,18 @@ pub struct SubjectPublishOutcome {
 /// erases an earlier label). Until 2026-09-18 the mint was the upsert
 /// below, so the company's label was overwritten with `tenant.toml`'s
 /// display name at every tenant publish — every boot.
+///
+/// An insert stages [`SUBJECT_MINTED`] and a take-mode relabel stages
+/// [`SUBJECT_RELABELLED`], each in this transaction, signed with
+/// `stamp`; a kept or unchanged declaration moves nothing and records
+/// nothing (backlog 92473357).
 pub async fn publish_subject(
     pool: &PgPool,
     kind: &str,
     id: &str,
     label: Option<&str>,
     mode: PublishMode,
+    stamp: &EventStamp,
 ) -> Result<SubjectPublishOutcome, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let held: Option<(Option<String>,)> =
@@ -120,20 +149,27 @@ pub async fn publish_subject(
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| e.to_string())?;
+            boss_events::outbox::record_event_in_tx(&mut tx, &minted_event(stamp, kind, id, label))
+                .await?;
             out.inserted = 1;
         }
         Some((current,)) => {
-            let differs = label.is_some_and(|l| current.as_deref() != Some(l));
-            if !differs {
+            let differs = label.filter(|l| current.as_deref() != Some(*l));
+            if differs.is_none() {
                 out.unchanged = 1;
-            } else if mode.is_take() {
+            } else if let Some(new_label) = differs.filter(|_| mode.is_take()) {
                 sqlx::query("UPDATE subjects SET label = $3 WHERE kind = $1 AND id = $2")
                     .bind(kind)
                     .bind(id)
-                    .bind(label)
+                    .bind(new_label)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| e.to_string())?;
+                boss_events::outbox::record_event_in_tx(
+                    &mut tx,
+                    &relabelled_event(stamp, kind, id, current.as_deref(), new_label),
+                )
+                .await?;
                 out.updated.push(UpdatedRow {
                     id: id.to_string(),
                     changes: vec![FieldChange::new("label", &current, label)],
@@ -232,12 +268,33 @@ struct SubjectBody {
 async fn post_subject(
     State(state): State<SubjectsApiState>,
     Query(ModeQuery { mode }): Query<ModeQuery>,
+    CurrentUser(user): CurrentUser,
     axum::Json(body): axum::Json<SubjectBody>,
 ) -> Response {
     if body.kind.trim().is_empty() || body.id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "kind and id are required").into_response();
     }
-    mint(&state, &body.kind, &body.id, body.label.as_deref(), mode).await
+    let stamp = mint_stamp(&user);
+    mint(
+        &state,
+        &body.kind,
+        &body.id,
+        body.label.as_deref(),
+        mode,
+        &stamp,
+    )
+    .await
+}
+
+/// The stamp the mint door signs its fact with: the actor the request
+/// signed with (`x-boss-user`, the id `boss tenant publish` sends); a
+/// caller with no identity — the sim's birth routes — is this service's
+/// own automation, never anonymous (the classes door's shape).
+fn mint_stamp(user: &boss_policy_client::User) -> EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("subjects".into()));
+    EventStamp::new("subjects", actor)
 }
 
 /// The mint's answer: 201 with the outcome when the row was inserted,
@@ -249,8 +306,9 @@ async fn mint(
     id: &str,
     label: Option<&str>,
     mode: PublishMode,
+    stamp: &EventStamp,
 ) -> Response {
-    match publish_subject(&state.pool, kind, id, label, mode).await {
+    match publish_subject(&state.pool, kind, id, label, mode, stamp).await {
         Ok(out) if out.inserted == 1 => (StatusCode::CREATED, axum::Json(out)).into_response(),
         Ok(out) => axum::Json(out).into_response(),
         // The FK rejection = unregistered kind → the caller's error,
@@ -299,6 +357,7 @@ async fn post_subject_for_kind(
     State(state): State<SubjectsApiState>,
     Path(kind): Path<String>,
     Query(ModeQuery { mode }): Query<ModeQuery>,
+    CurrentUser(user): CurrentUser,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     // Tolerant extraction: birth payloads are synthesized event
@@ -311,7 +370,16 @@ async fn post_subject_for_kind(
     if parsed.id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "id is required").into_response();
     }
-    mint(&state, &kind, &parsed.id, parsed.label.as_deref(), mode).await
+    let stamp = mint_stamp(&user);
+    mint(
+        &state,
+        &kind,
+        &parsed.id,
+        parsed.label.as_deref(),
+        mode,
+        &stamp,
+    )
+    .await
 }
 
 const IDENTITY_SOURCES_TOML: &str = include_str!("../seeds/subject_identity_sources.toml");
@@ -346,6 +414,10 @@ struct IdentitySource {
 ///    identical shape to locations: seed-only reference identity, so
 ///    it survives an epoch rollover's truncate-and-reproject (which a
 ///    prepare-only write-through does not).
+/// 5. the mint door's own facts, [`SUBJECT_MINTED`] and
+///    [`SUBJECT_RELABELLED`] — LAST, so a label the door set (a
+///    take-mode relabel of the company included) wins over a reference
+///    table's name, as it does in the live table.
 pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     let sources: SourcesToml = toml::from_str(IDENTITY_SOURCES_TOML).map_err(|e| e.to_string())?;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -435,6 +507,37 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("companies reference pass: {e}"))?;
+    total += res.rows_affected();
+
+    // The mint door's facts (backlog 92473357). One row per (kind, id)
+    // inside the statement — a mint and its relabels are several events
+    // for one row, and ON CONFLICT cannot touch a row twice — carrying
+    // the NEWEST non-null label (a mint with no label never erases one,
+    // the COALESCE rule of the live upsert). A kind no longer registered
+    // is skipped rather than aborting the whole rebuild on the FK, as
+    // the job-subject pass does.
+    let res = sqlx::query(
+        "INSERT INTO subjects (kind, id, label) \
+         SELECT ev.subject_kind, ev.subject_id, ev.label FROM ( \
+             SELECT payload->>'subject_kind' AS subject_kind, \
+                    payload->>'id' AS subject_id, \
+                    (array_agg(payload->>'label' ORDER BY id DESC) \
+                        FILTER (WHERE payload->>'label' IS NOT NULL))[1] AS label \
+               FROM audit_log \
+              WHERE kind IN ($1, $2) \
+                AND payload->>'subject_kind' IS NOT NULL \
+                AND payload->>'id' IS NOT NULL \
+              GROUP BY 1, 2 \
+         ) ev \
+         WHERE EXISTS (SELECT 1 FROM subject_kinds k WHERE k.kind = ev.subject_kind) \
+         ON CONFLICT (kind, id) DO UPDATE \
+            SET label = COALESCE(EXCLUDED.label, subjects.label)",
+    )
+    .bind(SUBJECT_MINTED)
+    .bind(SUBJECT_RELABELLED)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("mint door pass: {e}"))?;
     total += res.rows_affected();
 
     tx.commit().await.map_err(|e| e.to_string())?;

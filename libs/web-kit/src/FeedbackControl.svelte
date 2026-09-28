@@ -286,19 +286,19 @@
     font-size: 12px;
     padding: 3px 12px;
     border-radius: 999px;
-    border: 1px solid #d6d3d1;
-    background: #fff;
-    color: #57534e;
+    border: 1px solid var(--hairline);
+    background: var(--ink);
+    color: var(--static);
     cursor: pointer;
   }
   .fb-kind-on {
-    background: #1c1917;
-    border-color: #1c1917;
-    color: #fff;
+    background: var(--band);
+    border-color: var(--border-strong);
+    color: var(--on-band);
   }
   .fb-kind-note {
     font-size: 11px;
-    color: #78716c;
+    color: var(--static);
     margin-left: auto;
   }
   .fb-triage {
@@ -306,7 +306,7 @@
     align-items: center;
     gap: 6px;
     font-size: 12px;
-    color: #57534e;
+    color: var(--static);
     margin-top: 8px;
   }
 
@@ -325,27 +325,29 @@
      Matching `.signin-btn` rather than inventing another treatment:
      the two are the only bordered buttons in the bar, and they sat
      one gap apart with different borders, radii, and padding. */
-  /* Ghost button, §04 — matches .signin-btn beside it. */
+  /* Ghost button, §04 — matches .signin-btn beside it. The bar is an
+     enamel band now (backlog 7eb59678 car 2), so the word and frame are
+     the band's white, and hover fills the frame white under ink. */
   .fb-trigger {
     background: transparent;
-    border: 1px solid var(--hairline, #2a3138);
-    border-radius: var(--radius, 0);
+    border: 1px solid var(--band-rule);
+    border-radius: var(--radius);
     padding: 5px 12px;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 11px;
     font-weight: 500;
     text-transform: uppercase;
-    letter-spacing: var(--ls-nav, 0.14em);
+    letter-spacing: var(--ls-nav);
     line-height: 1.4;
-    color: var(--fog, #e8ecef);
+    color: var(--on-band);
     cursor: pointer;
     white-space: nowrap;
     transition: background 0.1s, color 0.1s, border-color 0.1s;
   }
   .fb-trigger:hover {
-    background: var(--fog, #e8ecef);
-    color: var(--void, #0d1014);
-    border-color: var(--fog, #e8ecef);
+    background: var(--on-band);
+    color: var(--band);
+    border-color: var(--on-band);
   }
   .fb-trigger:focus-visible,
   .fb-send:focus-visible {
@@ -365,18 +367,23 @@
     gap: 8px;
     padding: 12px;
     border-radius: 8px;
-    background: var(--card, #fff);
-    color: var(--text, #1c1917);
-    border: 1px solid var(--border, #e7e5e4);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  /* On a phone the chrome bar scrolls sideways and so clips anything
+     hanging out of it (PerspectiveTabs, car G of design 62de32ae): the
+     panel pins under the band, the screen's width less a margin. */
+  @media (max-width: 720px) {
+    .fb-panel { position: fixed; top: 52px; left: 8px; right: 8px; width: auto; }
   }
   .fb-label {
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
   .fb-panel code {
     font-size: 11px;
-    background: var(--bg, #f5f5f4);
+    background: var(--bg);
     padding: 1px 4px;
     border-radius: 3px;
   }
@@ -384,7 +391,7 @@
     font: inherit;
     font-size: 13px;
     padding: 6px;
-    border: 1px solid var(--border, #e7e5e4);
+    border: 1px solid var(--border);
     border-radius: 4px;
     resize: vertical;
   }
@@ -395,7 +402,7 @@
   }
   .fb-hint {
     font-size: 11px;
-    color: var(--text-dim, #a8a29e);
+    color: var(--text-dim);
     margin-right: auto;
   }
   .fb-send {
@@ -403,8 +410,8 @@
     font-size: 12px;
     padding: 4px 12px;
     border-radius: 4px;
-    border: 1px solid var(--border, #e7e5e4);
-    background: var(--bg, #f5f5f4);
+    border: 1px solid var(--border);
+    background: var(--bg);
     color: inherit;
     cursor: pointer;
   }
@@ -418,7 +425,7 @@
   }
   .fb-err {
     font-size: 12px;
-    color: #b91c1c;
+    color: var(--err);
     margin: 0;
   }
 </style>

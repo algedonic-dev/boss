@@ -9,8 +9,16 @@
 # needs BOSS_DISPATCHER_BIND=0.0.0.0:7950 set on the pod (boss.yaml) —
 # the sanctioned widening knob that same config comment names. Reads
 # (GET /api/dispatcher/rules) are open, matching the jobs door's read
-# posture. ClusterIP, not LoadBalancer: in-cluster automation only,
-# narrower than the jobs door's LAN LoadBalancer.
+# posture. The WRITES are not the door's to guard, and this comment
+# used to imply they needed no guard: until backlog 847af5c7
+# (2026-09-27) draft, publish and retire took no caller, so any pod
+# could change what the dispatcher enforces through this port. The
+# service now authorizes each one itself — no x-boss-user is 401, a
+# caller without Create/Publish/Retire on `dispatcher-rule`
+# (platform-admin by default) is 403, an unreachable policy service is
+# 503 — and stamps the signed caller on the row. ClusterIP, not
+# LoadBalancer: in-cluster automation only, narrower than the jobs
+# door's LAN LoadBalancer.
 #
 # Born 2026-09-01 (backlog a757b72a).
 apiVersion: v1

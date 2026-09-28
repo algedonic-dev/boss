@@ -89,6 +89,14 @@ fn an_answered_ops_request_hands_the_handler_the_publish_edge_and_the_failure_mo
     let done: serde_json::Value =
         serde_json::from_str(&done).expect("done_metadata is a JSON object");
     assert_eq!(done["pr_url"], "{pr_url}");
+    // And the head the PR stands on: read-publish-checks refuses an
+    // open-pr without it (v2, backlog 1f0aa60d — 8d7a3507, alert
+    // 487e67bf).
+    assert!(
+        pattern.contains("(?P<snapshot_commit>"),
+        "the pattern names the snapshot_commit group: {pattern}"
+    );
+    assert_eq!(done["snapshot_commit"], "{snapshot_commit}");
     // A verb that printed FAILED must not leave the step untouched —
     // the five silent hours were exactly that. The handler's failure
     // mode annotates the open step and files the alert.

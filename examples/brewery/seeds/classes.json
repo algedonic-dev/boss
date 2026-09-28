@@ -26,7 +26,6 @@
       "surfaces": [
         "exec",
         "marketing-assets",
-        "calendar",
         "jobs",
         "people",
         "policy",
@@ -392,7 +391,6 @@
       "surfaces": [
         "exec",
         "marketing-assets",
-        "calendar",
         "jobs"
       ]
     }
@@ -405,7 +403,6 @@
     "sort_order": 101,
     "metadata": {
       "surfaces": [
-        "calendar",
         "jobs",
         "marketing-assets"
       ]
@@ -419,8 +416,7 @@
     "sort_order": 102,
     "metadata": {
       "surfaces": [
-        "marketing-assets",
-        "calendar"
+        "marketing-assets"
       ]
     }
   },
@@ -432,7 +428,6 @@
     "sort_order": 110,
     "metadata": {
       "surfaces": [
-        "calendar",
         "schedule"
       ]
     }
@@ -445,7 +440,6 @@
     "sort_order": 111,
     "metadata": {
       "surfaces": [
-        "calendar",
         "schedule"
       ]
     }
@@ -965,49 +959,70 @@
     "code": "wholesale",
     "display_name": "Wholesale beer",
     "member_attribute": "revenue_category",
-    "sort_order": 10
+    "sort_order": 10,
+    "metadata": {
+      "gl_account": "4100"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "retail",
     "display_name": "Retail (DTC)",
     "member_attribute": "revenue_category",
-    "sort_order": 20
+    "sort_order": 20,
+    "metadata": {
+      "gl_account": "4110"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "taproom",
     "display_name": "Taproom pours",
     "member_attribute": "revenue_category",
-    "sort_order": 30
+    "sort_order": 30,
+    "metadata": {
+      "gl_account": "4120"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "event-package",
     "display_name": "Event packages",
     "member_attribute": "revenue_category",
-    "sort_order": 40
+    "sort_order": 40,
+    "metadata": {
+      "gl_account": "4130"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "distribution",
     "display_name": "Distribution",
     "member_attribute": "revenue_category",
-    "sort_order": 50
+    "sort_order": 50,
+    "metadata": {
+      "gl_account": "4140"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "merchandise",
     "display_name": "Merchandise",
     "member_attribute": "revenue_category",
-    "sort_order": 60
+    "sort_order": 60,
+    "metadata": {
+      "gl_account": "4110"
+    }
   },
   {
     "subject_kind": "invoice",
     "code": "uncategorized",
     "display_name": "Uncategorized",
     "member_attribute": "revenue_category",
-    "sort_order": 70
+    "sort_order": 70,
+    "metadata": {
+      "gl_account": "4140"
+    }
   },
   {
     "subject_kind": "vendor",

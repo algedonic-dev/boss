@@ -3,6 +3,7 @@
 
 import { formatMoney } from '@boss/web-kit/ui/money';
 import { appToday } from '@boss/web-kit/sim-clock';
+import { failedRead, failedWithReason, okRead, type ReadState } from '../data/readState';
 
 const API_BASE = '/api/ledger';
 
@@ -211,10 +212,11 @@ export type ManualEntryLineInput = {
   memo: string | null;
 };
 
+/// No author field: the ledger records the signed caller as the entry's
+/// author and refuses a body naming anyone else (backlog 7bf42e2b).
 export type ManualEntryInput = {
   posted_on: string;
   memo: string | null;
-  created_by: string | null;
   lines: ReadonlyArray<ManualEntryLineInput>;
 };
 
@@ -295,9 +297,40 @@ export function loadTrialBalance(asOf: string | null): Promise<TrialBalanceRespo
   return getJson<TrialBalanceResponse>(url);
 }
 
-export async function loadPeriods(): Promise<Period[]> {
-  const body = await getJson<Period[]>(`${API_BASE}/periods`);
-  return body ?? [];
+/// One GET whose failure is kept, reason and all. `getJson` answers
+/// null for a failure, which the statement tabs can tell from a body
+/// (a statement is never null); a LIST cannot, and folding its null
+/// into [] is how a ledger outage read "No periods yet." (backlog
+/// 1a2b67c9, page audit 3f964c57). Same shape as WarehousePage's read.
+async function readJson<T>(url: string): Promise<{ read: ReadState; body: T | null }> {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return { read: failedWithReason(r.status, await r.text()), body: null };
+    return { read: okRead, body: (await r.json()) as T };
+  } catch (e) {
+    return { read: failedRead(e instanceof Error ? e.message : String(e)), body: null };
+  }
+}
+
+/// The periods list and whether the read that built it worked — an
+/// empty `periods` means "no periods" only when `read` is ok.
+export type PeriodsRead = Readonly<{ read: ReadState; periods: ReadonlyArray<Period> }>;
+
+export async function loadPeriods(): Promise<PeriodsRead> {
+  const { read, body } = await readJson<Period[]>(`${API_BASE}/periods`);
+  return { read, periods: body ?? [] };
+}
+
+/// The journal entry a financial fact posted, for /ux/finance?fact=
+/// (entity-href's `fact` kind; backlog 2ab44d55). `entryId` null is "this
+/// fact posted no entry" only when `read` is ok.
+export async function loadEntryIdForFact(
+  factId: string,
+): Promise<Readonly<{ read: ReadState; entryId: string | null }>> {
+  const { read, body } = await readJson<LedgerEntry[]>(
+    `${API_BASE}/entries?fact_id=${encodeURIComponent(factId)}&limit=1`,
+  );
+  return { read, entryId: body?.[0]?.id ?? null };
 }
 
 export async function loadAccounts(): Promise<Account[]> {
@@ -319,21 +352,24 @@ export type EntriesPage = Readonly<{
   /// available" from "we received exactly the cap" — an over-fetch by
   /// one row sharpens the signal (cap+1 → trim and mark capped).
   capped: boolean;
+  /// Whether the read worked. An empty `data` is "no entries for this
+  /// account" only when this is ok (backlog 1a2b67c9).
+  read: ReadState;
 }>;
 
 export async function loadEntriesForAccount(
   accountCode: string | null,
 ): Promise<EntriesPage> {
-  if (!accountCode) return { data: [], capped: false };
+  if (!accountCode) return { data: [], capped: false, read: okRead };
   const probe = ENTRIES_PER_ACCOUNT_CAP + 1;
-  const body = await getJson<LedgerEntry[]>(
+  const { read, body } = await readJson<LedgerEntry[]>(
     `${API_BASE}/entries?account_code=${accountCode}&limit=${probe}`,
   );
   const rows = body ?? [];
   if (rows.length > ENTRIES_PER_ACCOUNT_CAP) {
-    return { data: rows.slice(0, ENTRIES_PER_ACCOUNT_CAP), capped: true };
+    return { data: rows.slice(0, ENTRIES_PER_ACCOUNT_CAP), capped: true, read };
   }
-  return { data: rows, capped: false };
+  return { data: rows, capped: false, read };
 }
 
 export function loadEntryDetail(entryId: string | null): Promise<LedgerEntryDetail | null> {
@@ -342,84 +378,17 @@ export function loadEntryDetail(entryId: string | null): Promise<LedgerEntryDeta
 }
 
 // ---------------------------------------------------------------------------
-// IT-panel activity projections (bank settlements, payroll runs, tax filings)
-// ---------------------------------------------------------------------------
-
-export type BankSettlement = {
-  id: string;
-  invoice_id: string;
-  received_on: string;
-  expected_settle_on: string;
-  settled_on: string | null;
-  amount_cents: number;
-  bank_provider: string;
-  payment_method: 'ach' | 'wire' | 'check' | 'card';
-  status: 'pending' | 'settled' | 'returned';
-};
-
-export type PayrollRun = {
-  id: string;
-  run_date: string;
-  period_start: string;
-  period_end: string;
-  gross_cents: number;
-  employer_tax_cents: number;
-  withheld_cents: number;
-  net_cents: number;
-  employee_count: number;
-  provider: string;
-  status: 'draft' | 'submitted' | 'posted';
-};
-
-export async function loadBankSettlements(limit: number): Promise<BankSettlement[]> {
-  const body = await getJson<BankSettlement[]>(
-    `${API_BASE}/bank-settlements?limit=${limit}`,
-  );
-  return body ?? [];
-}
-
-export async function loadPayrollRuns(limit: number): Promise<PayrollRun[]> {
-  const body = await getJson<PayrollRun[]>(
-    `${API_BASE}/payroll-runs?limit=${limit}`,
-  );
-  return body ?? [];
-}
-
-export async function loadTaxFilings(
-  status: 'accrued' | 'filed' | 'paid' | null,
-): Promise<TaxFiling[]> {
-  const qs = status ? `?status=${status}` : '';
-  const body = await getJson<TaxFiling[]>(`${API_BASE}/tax-filings${qs}`);
-  return body ?? [];
-}
-
-/// Lookup the single journal entry produced by a projection row.
-/// Two round trips: list entries by (source_table, source_id) →
-/// fetch the first entry's detail.
-export async function loadEntryBySource(
-  sourceTable: string | null,
-  sourceId: string | null,
-): Promise<LedgerEntryDetail | null> {
-  if (!sourceTable || !sourceId) return null;
-  const qs = new URLSearchParams({
-    source_table: sourceTable,
-    source_id: sourceId,
-    limit: '1',
-  }).toString();
-  const summaries = await getJson<LedgerEntry[]>(`${API_BASE}/entries?${qs}`);
-  if (!summaries || summaries.length === 0) return null;
-  return loadEntryDetail(summaries[0]!.id);
-}
-
-// ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function lockPeriod(id: string, lockedBy: string): Promise<string> {
+/// The ledger records the signed caller as the locker; the page sent the
+/// literal 'operator' until backlog 975c228f, which the Periods table
+/// then showed as "Locked by".
+export async function lockPeriod(id: string): Promise<string> {
   const resp = await fetch(`${API_BASE}/periods/${id}/lock`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ locked_by: lockedBy }),
+    body: JSON.stringify({}),
   });
   if (!resp.ok) throw new Error(`lock failed: ${resp.status} ${await resp.text()}`);
   const body = (await resp.json()) as { checksum: string };
@@ -453,7 +422,7 @@ export async function reverseEntry(
   }));
   const memo =
     `Reverses entry ${source.id}` + (source.memo ? ` — ${source.memo}` : '');
-  return createManualEntry({ posted_on: today, memo, created_by: null, lines });
+  return createManualEntry({ posted_on: today, memo, lines });
 }
 
 /// Format a USD cent value for display. Delegates to the shared

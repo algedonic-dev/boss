@@ -1,6 +1,6 @@
 //! Postgres contract for `workflow_terminal_report` — the one-query
 //! override behind `GET /api/workflows/{kind}/terminal-report`
-//! (experiments Tier 1, docs/design/network-experiments.md).
+//! (experiments Tier 1, the network-experiments decision in docs/architecture-decisions.md).
 //!
 //! The port's default implementation computes the report in Rust over
 //! `list_jobs`; the Pg adapter answers with a single SQL statement.
@@ -41,6 +41,7 @@ fn packet(
         status,
         priority: Priority::Standard,
         opened_on: opened,
+        opened_at: None,
         due_on: None,
         closed_on: closed,
         metadata: match outcome {

@@ -5,14 +5,13 @@ import { MACHINERY_STRIP_H, machineryStrip } from './world-machines';
 import type { Machine } from './regions';
 import {
   PLATFORM_REGIONS,
-  crewPlatforms,
   hasPlatforms,
   marshallingPlatforms,
   platformLayout,
   receivingPlatforms,
+  withPlaces,
   type Platform,
 } from './world-interior';
-import type { AgentRun, Crew, Session } from '../crew/crew';
 import type { Siding } from '../marshalling/marshalling';
 import type { InboundRow } from '../receiving/receiving';
 
@@ -41,9 +40,12 @@ const inbound = (over: Partial<InboundRow> & Pick<InboundRow, 'id' | 'openedOn'>
   status: 'open',
   closedOn: null,
   priority: 'standard',
-  channel: 'feedback',
-  channelBasis: 'recorded',
+  lane: 'user-feedback',
+  laneBasis: 'recorded',
+  source: { basis: 'missing', kind: null, key: null, id: null, branch: null },
+  area: null,
   ready: [],
+  takenIn: false,
   ...over,
 });
 
@@ -118,65 +120,97 @@ describe('the marshalling interior — one platform per station', () => {
   });
 });
 
-describe('the receiving interior — one platform per channel', () => {
+describe('the receiving interior — one platform per lane the server read', () => {
   const today = '2026-09-20';
   const days = ['2026-09-19', '2026-09-20'];
 
-  it('stands the open packets of each channel and counts what left in the window', () => {
+  it('stands the open packets of each lane and counts what left in the window', () => {
     const p = receivingPlatforms(
       [
-        inbound({ id: 'a', openedOn: '2026-09-19', channel: 'feedback' }),
-        inbound({ id: 'b', openedOn: '2026-09-20', channel: 'feedback' }),
-        inbound({ id: 'c', openedOn: '2026-09-01', channel: 'feedback', status: 'closed', closedOn: '2026-09-20' }),
+        inbound({ id: 'a', openedOn: '2026-09-19', lane: 'user-feedback' }),
+        inbound({ id: 'b', openedOn: '2026-09-20', lane: 'user-feedback' }),
+        inbound({ id: 'c', openedOn: '2026-09-01', lane: 'user-feedback', status: 'closed', closedOn: '2026-09-20' }),
       ],
       today,
       days,
     );
-    const feedback = byName(p, 'feedback');
+    const feedback = byName(p, 'user-feedback');
     expect(feedback.standing).toBe(2);
     expect(feedback.rate).toBe(1);
     expect(feedback.bound).toBeNull();
     expect(feedback.note).toContain('oldest 1 d');
   });
 
-  it('flags the packets past the stale band, from the head — the oldest stand at the front', () => {
+  // THE PARTITION (design 62de32ae decision 4): a packet an actor has
+  // taken in is marshalling's, however long it stays open — so the
+  // interior stands what the region's header counts.
+  it('stands nothing an actor has taken in, open or not', () => {
     const p = receivingPlatforms(
       [
-        inbound({ id: 'old', openedOn: '2026-08-01', channel: 'design' }),
-        inbound({ id: 'new', openedOn: '2026-09-20', channel: 'design' }),
+        inbound({ id: 'untriaged', openedOn: '2026-09-19', lane: 'discovery-while-working' }),
+        inbound({ id: 'triaged', openedOn: '2026-08-01', lane: 'discovery-while-working', takenIn: true }),
       ],
       today,
       days,
     );
-    const design = byName(p, 'design');
+    const session = byName(p, 'discovery-while-working');
+    expect(session.standing).toBe(1);
+    expect(session.flag).toEqual({ from: 'head', n: 0 });
+  });
+
+  it('flags the packets past the stale band, from the head — the oldest stand at the front', () => {
+    const p = receivingPlatforms(
+      [
+        inbound({ id: 'old', openedOn: '2026-08-01', lane: 'design-resolution' }),
+        inbound({ id: 'new', openedOn: '2026-09-20', lane: 'design-resolution' }),
+      ],
+      today,
+      days,
+    );
+    const design = byName(p, 'design-resolution');
     expect(design.standing).toBe(2);
     expect(design.flag).toEqual({ from: 'head', n: 1 });
   });
 
-  it('names every channel, even an empty one — a track nothing stands on is an answer', () => {
+  it('always names the unclassified lane, even empty — a track nothing stands on is an answer', () => {
     const p = receivingPlatforms([], today, days);
-    expect(p.map((x) => x.name)).toContain('unrecorded');
+    expect(p.map((x) => x.name)).toEqual(['unclassified']);
     expect(p.every((x) => x.standing === 0)).toBe(true);
   });
 
-  it('puts the channels holding flagged work first, then the deepest', () => {
+  // Backlog 1eea4554: the page's own six channels put 61 of 64 standing
+  // cars on one platform. A lane is the server's reading, in its spelling.
+  it('draws a platform per lane the rows carry, and nothing the rows do not', () => {
     const p = receivingPlatforms(
       [
-        inbound({ id: 'a', openedOn: '2026-09-20', channel: 'session' }),
-        inbound({ id: 'b', openedOn: '2026-09-20', channel: 'session' }),
-        inbound({ id: 'c', openedOn: '2026-08-01', channel: 'monitoring' }),
+        inbound({ id: 'a', openedOn: '2026-09-20', lane: 'review-finding' }),
+        inbound({ id: 'b', openedOn: '2026-09-20', lane: 'unclassified', laneBasis: 'unclassified' }),
       ],
       today,
       days,
     );
-    expect(p[0]!.name).toBe('monitoring');
-    expect(p[1]!.name).toBe('session');
+    expect(p.map((x) => x.name).sort()).toEqual(['review-finding', 'unclassified']);
+  });
+
+  it('puts the lanes holding flagged work first, then the deepest', () => {
+    const p = receivingPlatforms(
+      [
+        inbound({ id: 'a', openedOn: '2026-09-20', lane: 'discovery-while-working' }),
+        inbound({ id: 'b', openedOn: '2026-09-20', lane: 'discovery-while-working' }),
+        inbound({ id: 'c', openedOn: '2026-08-01', lane: 'telemetry/monitoring' }),
+      ],
+      today,
+      days,
+    );
+    expect(p[0]!.name).toBe('telemetry/monitoring');
+    expect(p[1]!.name).toBe('discovery-while-working');
   });
 });
 
 describe('where the platforms go inside the outline', () => {
   const t = territoryOf('marshalling')!;
   const platform = (name: string, standing: number | null, bound: number | null = null): Platform => ({
+    key: name,
     name,
     standing,
     bound,
@@ -292,52 +326,56 @@ describe('where the platforms go inside the outline', () => {
   });
 });
 
+it('keys a queue platform by the queue it is, so the region map keys never collide', () => {
+  const marshalled = marshallingPlatforms([siding({ station: 'q.a', depth: 1 }), siding({ station: 'q.b', depth: 2 })], 24);
+  expect(marshalled.map((p) => p.key).sort()).toEqual(['q.a', 'q.b']);
+  const received = receivingPlatforms([], '2026-09-24', []);
+  expect(received.map((p) => p.key)).toEqual(received.map((p) => p.name));
+});
+
 // ---------------------------------------------------------------------
-// THE SHOP FLOOR'S PLATFORMS (backlog 94c6ffd0) — a crew is a platform,
-// its open runs are what stands on it.
+// EACH STATION AT MARSHALLING'S OWN COUNT (design 62de32ae, the rest of
+// decision 5; car E on backlog c3105b2a). Live on 2026-09-24 the
+// platforms drew each station's full depth — 562 standings under a head
+// of 236 — because the station reads carry no partition. The server's
+// `places` carry it, and the platform stands what they say.
 // ---------------------------------------------------------------------
 
-describe('crewPlatforms — a platform per crew, the busiest first', () => {
-  const session = (over: Partial<Session> = {}): Session => ({
-    id: 's1',
-    title: 'a session',
-    actor: 'claude@algedonic.dev',
-    host: 'boss-dev',
-    cwd: '/work/boss',
-    startedAt: '2026-09-22T09:00:00Z',
-    lastActiveAt: '2026-09-22T09:30:00Z',
-    promptCount: 12,
-    untrackedRuns: 0,
-    ...over,
-  });
-  const run = (id: string): AgentRun =>
-    ({ id, title: 'a run', packet: null, step: null, agent: null, model: null,
-       budgetUsd: null, effort: null, host: null, at: 'building', openedAt: null,
-       session: null }) as AgentRun;
+describe('withPlaces — the platforms at the partition the server counted', () => {
+  const deep = marshallingPlatforms(
+    [
+      siding({ station: 'q.platform-admin.task', depth: 321, wipLimit: 24, overLimit: true }),
+      siding({ station: 'a.platform-admin.opus', depth: 303 }),
+      siding({ station: 'sign-off', depth: 7 }),
+    ],
+    24,
+  );
+  const places = [
+    { name: 'q.platform-admin.task', count: 88 },
+    { name: 'a.platform-admin.opus', count: 80 },
+    { name: 'sign-off', count: 7 },
+  ];
 
-  it('stands the runs on their crew, busiest first, and never invents a rate', () => {
-    const busy: Crew = { session: session({ id: 's1', actor: 'a@x' }), runs: [run('r1'), run('r2')], idle: false };
-    const quiet: Crew = { session: session({ id: 's2', actor: 'b@x', promptCount: 3 }), runs: [], idle: true };
-    const platforms = crewPlatforms([quiet, busy], []);
-    expect(platforms.map((p) => p.name)).toEqual(['a@x', 'b@x']);
-    expect(platforms[0]!.standing).toBe(2);
-    // What a crew FINISHED in the window is not in this read, so the
-    // rate is unknown — a 0 would say the crew shipped nothing.
-    expect(platforms[0]!.rate).toBeNull();
-    expect(platforms[0]!.note).toContain('at work');
-    expect(platforms[1]!.note).toContain('idle');
+  it('stands each station at the members the partition left there, and says its full depth', () => {
+    const p = withPlaces(deep, places);
+    expect(p.map((x) => x.standing)).toEqual([88, 80, 7]);
+    expect(byName(p, 'q.platform-admin.task').note).toStartWith('88 of the 321 here are marshalling’s');
+    // A station whose depth IS its partition says nothing extra.
+    expect(byName(p, 'sign-off').note).toBe(byName(deep, 'sign-off').note);
   });
 
-  it('says so when a crew\'s silence could not be judged', () => {
-    const unknown: Crew = { session: session(), runs: [], idle: null };
-    expect(crewPlatforms([unknown], [])[0]!.note).toContain('silence not measured');
+  it('never flags more packets than the platform stands', () => {
+    const p = byName(withPlaces(deep, places), 'q.platform-admin.task');
+    expect(p.flag).toEqual({ from: 'tail', n: 88 });
   });
 
-  it('gives the runs no session claims a platform of their own rather than dropping them', () => {
-    const platforms = crewPlatforms([], [run('r9')]);
-    expect(platforms).toHaveLength(1);
-    expect(platforms[0]!.name).toBe('no session');
-    expect(platforms[0]!.standing).toBe(1);
-    expect(platforms[0]!.flag).toEqual({ from: 'tail', n: 1 });
+  it('leaves a platform the server has no place for as it was — an older server, or a station it did not read', () => {
+    expect(withPlaces(deep, [])).toEqual(deep);
+    expect(byName(withPlaces(deep, places.slice(0, 1)), 'a.platform-admin.opus').standing).toBe(303);
+  });
+
+  it('keeps a count nobody could take unknown', () => {
+    const unknown: Platform = { ...deep[0]!, standing: null };
+    expect(withPlaces([unknown], places)[0]!.standing).toBeNull();
   });
 });

@@ -10,18 +10,28 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use boss_core::publisher::DomainPublisher;
-use boss_policy::{Action, Decision, Resource};
+use boss_policy::{Action, Resource, Scope, User};
 use boss_policy_client::{CurrentUser, PolicyClient};
 
 use crate::port::{PeopleError, PeopleRepository};
 use crate::types::Employee;
+
+/// The employee fields `Resource::compensation()` governs: a caller
+/// sees them on a row only where `Read` on that resource is granted,
+/// in that grant's scope (backlog c7484d0e, 2026-09-23 — every roster
+/// read had handed every salary to any signed-in viewer). The grants
+/// are policy rows: platform-admin in the core defaults, the tenants'
+/// HR and finance roles in their seeds.
+const COMPENSATION_FIELDS: &[&str] = &["annual_salary_cents"];
 
 pub struct PeopleApiState<R: PeopleRepository> {
     pub people: Arc<R>,
     pub publisher: Option<DomainPublisher>,
     /// Row-level authorization. None in tests that don't exercise
     /// the policy path — those handlers skip the gate and allow the
-    /// request, preserving the existing test surface.
+    /// request, preserving the existing test surface. The one
+    /// exception is pay: None is no compensation grant, so reads
+    /// redact it (see `compensation_scope`).
     pub policy: Option<Arc<dyn PolicyClient>>,
     /// SubjectKind registry — opt-in validator for tenant-extensible
     /// Subject discriminators. Today the boss-people surface accepts
@@ -101,14 +111,26 @@ struct ListEmployeesQuery {
 /// role→active-employees lookup the dispatcher's notifier +
 /// auto-assign need, and the SPA directory. `role` and `status` are
 /// exact-match, `email` is case-insensitive; absent = no constraint.
+///
+/// Only the rows the caller's `employee` Read grant covers
+/// ([`crate::grants::roster_scope`]; backlog cda177ef) — a caller with
+/// no grant is refused, not handed an empty list, because a refusal
+/// read as an empty roster is the false-empty the web's ReadState
+/// exists to name.
 async fn list_employees<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<ListEmployeesQuery>,
 ) -> Response {
+    let scope = match crate::grants::roster_scope(state.policy.as_ref(), &user).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     match state.people.all_employees().await {
         Ok(employees) => {
             let filtered: Vec<Employee> = employees
                 .into_iter()
+                .filter(|e| shows(Some(&scope), &user, e))
                 .filter(|e| q.role.as_ref().is_none_or(|r| e.role.as_ref() == Some(r)))
                 .filter(|e| {
                     q.status
@@ -123,18 +145,102 @@ async fn list_employees<R: PeopleRepository + 'static>(
                     })
                 })
                 .collect();
-            Json(filtered).into_response()
+            let pay = compensation_scope(&state, &user).await;
+            rows_response(&filtered, pay.as_ref(), &user)
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The scope in which `user` may read compensation, or `None` for
+/// nowhere — [`crate::grants::compensation_scope`], which the change
+/// log asks too: no policy wired is no grant, and a policy service
+/// that cannot answer is no grant either. The rows themselves are
+/// [`crate::grants::roster_scope`]'s question, asked separately: the
+/// dispatcher's notifier and auto-assign read them by role and never
+/// need the pay.
+async fn compensation_scope<R: PeopleRepository + 'static>(
+    state: &PeopleApiState<R>,
+    user: &User,
+) -> Option<Scope> {
+    crate::grants::compensation_scope(state.policy.as_ref(), user).await
+}
+
+/// Whether a compensation grant in `scope` covers `emp`'s row, in the
+/// vocabulary every other grant uses ([`crate::grants::covers`]).
+fn covers(scope: &Scope, user: &User, emp: &Employee) -> bool {
+    crate::grants::covers(scope, user, &emp.id, emp.department.as_deref())
+}
+
+/// Whether a roster read in `scope` shows `emp` ([`crate::grants::shows`]).
+fn shows(scope: Option<&Scope>, user: &User, emp: &Employee) -> bool {
+    crate::grants::shows(scope, user, &emp.id, emp.department.as_deref())
+}
+
+/// The refusal for a row the caller's grant does not cover. It names
+/// neither the row nor whether one exists.
+fn outside_scope() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "that employee row is outside your employee Read grant",
+    )
+        .into_response()
+}
+
+/// One employee row as `user` may see it. A row the grant does not
+/// cover loses the compensation KEYS — absent, not zero and not null:
+/// a zero is a claim about pay, and the tenant publish reads an
+/// explicit null as a declaration. A caller that writes such a row
+/// back keeps the stored pay (see [`update_employee`]).
+fn employee_json(
+    emp: &Employee,
+    pay: Option<&Scope>,
+    user: &User,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut row = serde_json::to_value(emp)?;
+    if !pay.is_some_and(|scope| covers(scope, user, emp))
+        && let Some(obj) = row.as_object_mut()
+    {
+        for field in COMPENSATION_FIELDS {
+            obj.remove(*field);
+        }
+    }
+    Ok(row)
+}
+
+fn rows_response(rows: &[Employee], pay: Option<&Scope>, user: &User) -> Response {
+    match rows
+        .iter()
+        .map(|e| employee_json(e, pay, user))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn get_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
+    // Refused before the lookup, so a caller with no grant learns
+    // nothing — not even whether the id exists. Their own row is the
+    // one exception ([`crate::grants::shows`]).
+    let scope = match crate::grants::roster_scope(state.policy.as_ref(), &user).await {
+        Ok(scope) => Some(scope),
+        Err(refused) if id != user.id => return refused,
+        Err(_) => None,
+    };
     match state.people.employee_by_id(&id).await {
-        Ok(Some(emp)) => Json(emp).into_response(),
+        Ok(Some(emp)) if !shows(scope.as_ref(), &user, &emp) => outside_scope(),
+        Ok(Some(emp)) => {
+            let pay = compensation_scope(&state, &user).await;
+            match employee_json(&emp, pay.as_ref(), &user) {
+                Ok(row) => Json(row).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
         Ok(None) => (StatusCode::NOT_FOUND, format!("no employee with ID {id}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -142,10 +248,22 @@ async fn get_employee<R: PeopleRepository + 'static>(
 
 async fn get_reports<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
+    let scope = match crate::grants::roster_scope(state.policy.as_ref(), &user).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     match state.people.direct_reports(&id).await {
-        Ok(reports) => Json(reports).into_response(),
+        Ok(reports) => {
+            let shown: Vec<Employee> = reports
+                .into_iter()
+                .filter(|e| shows(Some(&scope), &user, e))
+                .collect();
+            let pay = compensation_scope(&state, &user).await;
+            rows_response(&shown, pay.as_ref(), &user)
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -163,8 +281,22 @@ const BOOTSTRAP_ROLE: &str = "platform-admin";
 
 async fn create_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Json(emp): Json<Employee>,
 ) -> Response {
+    // Hiring is Create on employee (backlog 69906ab9: after 8cdad84c
+    // gated the PUT, this route still took no caller). The seed writers
+    // sign as platform-admin, which the core default rules grant.
+    if let Err(refused) = crate::grants::require(
+        state.policy.as_ref(),
+        &user,
+        Action::Create,
+        Resource::employee(),
+    )
+    .await
+    {
+        return refused;
+    }
     if let Err(msg) = validate_email(emp.email.as_deref()) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -245,27 +377,41 @@ async fn update_employee<R: PeopleRepository + 'static>(
     Json(emp): Json<Employee>,
 ) -> Response {
     // Policy: editing an employee record requires Action::Update on
-    // Resource::employee(). Test path (policy: None) bypasses the gate.
-    if let Some(ref policy) = state.policy {
-        match policy
-            .check(&user, Action::Update, Resource::employee())
-            .await
-        {
-            Ok(Decision::Allow { .. }) => {}
-            Ok(Decision::Deny { reason }) => {
-                return (StatusCode::FORBIDDEN, reason).into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("policy check failed: {e}"),
-                )
-                    .into_response();
-            }
-        }
+    // Resource::employee(). Test path (policy: None) bypasses the gate;
+    // the binary wires a client — until 2026-09-23 it did not, and this
+    // gate never ran in production (backlog 8cdad84c).
+    if let Err(refused) = crate::grants::require(
+        state.policy.as_ref(),
+        &user,
+        Action::Update,
+        Resource::employee(),
+    )
+    .await
+    {
+        return refused;
     }
     if let Err(msg) = validate_email(emp.email.as_deref()) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    // A caller that could not see the stored pay cannot be clearing
+    // it: the tenant publish and both engines' prepare GET a row, set
+    // one field and PUT it back, and without a compensation grant that
+    // GET came back with no salary (backlog c7484d0e). So a PUT that
+    // carries none keeps the stored one unless the caller's grant
+    // covers the row — the only caller for whom an omitted salary can
+    // mean "clear it".
+    let mut emp = emp;
+    if emp.annual_salary_cents.is_none() {
+        let stored = match state.people.employee_by_id(&id).await {
+            Ok(stored) => stored,
+            Err(e) => return people_error_response(e),
+        };
+        if let Some(stored) = stored {
+            let pay = compensation_scope(&state, &user).await;
+            if !pay.is_some_and(|scope| covers(&scope, &user, &stored)) {
+                emp.annual_salary_cents = stored.annual_salary_cents;
+            }
+        }
     }
     let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
@@ -280,8 +426,20 @@ async fn update_employee<R: PeopleRepository + 'static>(
 
 async fn delete_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
+    // Deleting an employee is Delete on employee (backlog 69906ab9).
+    if let Err(refused) = crate::grants::require(
+        state.policy.as_ref(),
+        &user,
+        Action::Delete,
+        Resource::employee(),
+    )
+    .await
+    {
+        return refused;
+    }
     let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
         .people
@@ -646,5 +804,543 @@ mod tests {
             .unwrap();
         let reports: Vec<Employee> = serde_json::from_slice(&body).unwrap();
         assert_eq!(reports.len(), 2);
+    }
+
+    // ---- Compensation is read by grant, not by sign-in -------------
+    //
+    // Backlog c7484d0e (2026-09-23, the /ux/people page audit): every
+    // read of the roster returned `annual_salary_cents` to any
+    // signed-in viewer. The fix was the field, not the list — the
+    // dispatcher's notifier and auto-assign read the list by role. (The
+    // list became a grant of its own later: backlog cda177ef, below.)
+
+    const SALARY: i64 = 8_500_000;
+
+    fn paid_roster() -> Arc<InMemoryPeople> {
+        let mut boss = test_emp("emp-001", None);
+        boss.department = Some("finance".to_string());
+        let rows = [boss, test_emp("emp-002", Some("emp-001"))]
+            .into_iter()
+            .map(|mut e| {
+                e.annual_salary_cents = Some(SALARY);
+                e
+            })
+            .collect();
+        Arc::new(InMemoryPeople::new(rows))
+    }
+
+    fn app_with_policy(
+        people: Arc<InMemoryPeople>,
+        policy: Option<Arc<dyn PolicyClient>>,
+    ) -> Router {
+        router(PeopleApiState {
+            people,
+            publisher: None,
+            policy,
+            subject_kinds: None,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+        })
+    }
+
+    fn caller(id: &str, role: &str, reports: &[&str]) -> String {
+        serde_json::json!({
+            "id": id,
+            "role": role,
+            "direct_report_ids": reports,
+        })
+        .to_string()
+    }
+
+    async fn read_json(app: Router, uri: &str, user: &str) -> serde_json::Value {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-boss-user", user)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Every row a caller can be handed: the list, the single row and
+    /// the reports list, flattened.
+    async fn every_read(app: &Router, user: &str) -> Vec<serde_json::Value> {
+        let mut rows = Vec::new();
+        for uri in ["/api/people", "/api/people/emp-001/reports"] {
+            let v = read_json(app.clone(), uri, user).await;
+            rows.extend(v.as_array().cloned().unwrap_or_default());
+        }
+        rows.push(read_json(app.clone(), "/api/people/emp-001", user).await);
+        rows.push(read_json(app.clone(), "/api/people/emp-002", user).await);
+        rows
+    }
+
+    fn salary_of(row: &serde_json::Value) -> Option<&serde_json::Value> {
+        row.as_object()
+            .expect("an employee row is an object")
+            .get("annual_salary_cents")
+    }
+
+    /// A caller with no compensation grant still reads the whole
+    /// roster — role, status, email, the fields the dispatcher routes
+    /// on — and the salary KEY is gone, not zeroed and not null: a zero
+    /// is a claim about pay, and a null reads as "no salary" to a
+    /// caller that writes the row back.
+    #[tokio::test]
+    async fn a_caller_without_a_compensation_grant_reads_the_roster_without_salary() {
+        // Read on `employee` and nothing on `compensation`: since
+        // backlog cda177ef the roster itself is read by grant too.
+        let roster_only: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .allow(
+                    "service-tech",
+                    Action::Read,
+                    Resource::employee(),
+                    boss_policy::Scope::All,
+                )
+                .build(),
+        );
+        let app = app_with_policy(paid_roster(), Some(roster_only));
+        let rows = every_read(&app, &caller("emp-002", "service-tech", &[])).await;
+        assert_eq!(rows.len(), 5, "list 2 + reports 1 + two single rows");
+        for row in &rows {
+            assert_eq!(salary_of(row), None, "salary leaked: {row}");
+            assert_eq!(
+                row["role"], "service-tech",
+                "the roster itself stays readable"
+            );
+        }
+    }
+
+    /// Unwired policy is not a grant. The write gate's `None` = allow is
+    /// a test convenience, and the live people-api runs with `None`
+    /// (2026-09-23) — a private read must not fail open on that.
+    #[tokio::test]
+    async fn no_policy_wired_is_no_compensation_grant() {
+        let app = app_with_policy(paid_roster(), None);
+        for row in every_read(&app, &caller("emp-001", "platform-admin", &[])).await {
+            assert_eq!(salary_of(&row), None, "salary leaked: {row}");
+        }
+    }
+
+    /// Read on `compensation` with scope `all` shows every salary.
+    #[tokio::test]
+    async fn a_compensation_grant_shows_the_salary() {
+        let grant: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .allow(
+                    "head-of-people",
+                    Action::Read,
+                    Resource::employee(),
+                    boss_policy::Scope::All,
+                )
+                .allow(
+                    "head-of-people",
+                    Action::Read,
+                    Resource::compensation(),
+                    boss_policy::Scope::All,
+                )
+                .build(),
+        );
+        let app = app_with_policy(paid_roster(), Some(grant));
+        for row in every_read(&app, &caller("emp-hr", "head-of-people", &[])).await {
+            assert_eq!(salary_of(&row), Some(&serde_json::json!(SALARY)), "{row}");
+        }
+    }
+
+    /// The grant's scope is honoured row by row, in the vocabulary the
+    /// rest of policy uses: `self` is your own pay, `team` adds your
+    /// direct reports, `department:<d>` is that department's rows.
+    #[tokio::test]
+    async fn a_scoped_compensation_grant_shows_only_the_rows_it_covers() {
+        let seen = |scope: boss_policy::Scope, user: String| async move {
+            let grant: Arc<dyn PolicyClient> = Arc::new(
+                boss_policy_client::FakePolicyClient::builder()
+                    .allow(
+                        "staff",
+                        Action::Read,
+                        Resource::employee(),
+                        boss_policy::Scope::All,
+                    )
+                    .allow("staff", Action::Read, Resource::compensation(), scope)
+                    .build(),
+            );
+            let app = app_with_policy(paid_roster(), Some(grant));
+            let list = read_json(app, "/api/people", &user).await;
+            let mut ids: Vec<String> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| salary_of(r).is_some())
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            seen(boss_policy::Scope::Self_, caller("emp-002", "staff", &[])).await,
+            vec!["emp-002"]
+        );
+        assert_eq!(
+            seen(
+                boss_policy::Scope::Team,
+                caller("emp-001", "staff", &["emp-002"])
+            )
+            .await,
+            vec!["emp-001", "emp-002"]
+        );
+        assert_eq!(
+            seen(
+                boss_policy::Scope::Department("finance".into()),
+                caller("emp-x", "staff", &[])
+            )
+            .await,
+            vec!["emp-001"]
+        );
+    }
+
+    /// Four callers read a row and PUT it back to change one field —
+    /// the tenant publish's manager links and `--take`, both engines'
+    /// prepare. A redacted read written back must not wipe the pay it
+    /// never saw: without a grant, a PUT that carries no salary keeps
+    /// the stored one. Measured with no policy wired, which is how the
+    /// live people-api runs.
+    #[tokio::test]
+    async fn a_redacted_row_written_back_keeps_the_stored_salary() {
+        let people = paid_roster();
+        let app = app_with_policy(people.clone(), None);
+        let user = caller("emp-001", "platform-admin", &[]);
+        let mut row = read_json(app.clone(), "/api/people/emp-002", &user).await;
+        assert_eq!(salary_of(&row), None);
+        row["manager_id"] = serde_json::json!(null);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/people/emp-002")
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", &user)
+                    .body(Body::from(row.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let stored = people.employee_by_id("emp-002").await.unwrap().unwrap();
+        assert_eq!(stored.manager_id, None, "the edit landed");
+        assert_eq!(stored.annual_salary_cents, Some(SALARY), "the pay survived");
+    }
+
+    // ---- The Update gate, once policy is wired ----------------------
+    //
+    // Backlog 8cdad84c (2026-09-23): the binary built this state with
+    // `policy: None`, so the gate below never ran in production. It is
+    // wired now; these pin what it asks and what it refuses.
+
+    async fn put_status(app: Router, user: &str) -> StatusCode {
+        let body = serde_json::to_string(&test_emp("emp-002", None)).unwrap();
+        app.oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/people/emp-002")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// A caller whose role holds no Update on `employee` is refused,
+    /// and the row is untouched.
+    #[tokio::test]
+    async fn a_put_without_an_employee_update_grant_is_refused() {
+        let people = paid_roster();
+        let read_only: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .allow(
+                    "service-tech",
+                    Action::Read,
+                    Resource::employee(),
+                    boss_policy::Scope::All,
+                )
+                .build(),
+        );
+        let app = app_with_policy(people.clone(), Some(read_only));
+        let status = put_status(app, &caller("emp-002", "service-tech", &[])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let stored = people.employee_by_id("emp-002").await.unwrap().unwrap();
+        assert_eq!(stored.manager_id.as_deref(), Some("emp-001"), "unchanged");
+    }
+
+    /// The identity every seed writer signs as — platform-admin, the
+    /// tenant publish's and both engines' prepare — passes the gate on
+    /// the core default rules alone, so wiring policy breaks none of
+    /// them (the audit on 8cdad84c).
+    #[tokio::test]
+    async fn the_seed_writers_identity_passes_the_update_gate_on_the_default_rules() {
+        let defaults: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::defaults::default_rules()
+                .into_iter()
+                .fold(boss_policy_client::FakePolicyClient::builder(), |b, r| {
+                    b.allow(r.role, r.action, r.resource, r.scope)
+                })
+                .build(),
+        );
+        let app = app_with_policy(paid_roster(), Some(defaults));
+        let status = put_status(
+            app,
+            &caller("automation:tenant-seed", "platform-admin", &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// CREATE AND DELETE ASK THE POLICY TOO (backlog 69906ab9). After
+    /// 8cdad84c gated the PUT, POST /api/people and DELETE
+    /// /api/people/{id} still took no caller at all. A read grant alone
+    /// is refused, the roster is untouched, and the seed writers'
+    /// platform-admin identity passes both on the default rules.
+    #[tokio::test]
+    async fn create_and_delete_need_their_own_grants() {
+        let people = paid_roster();
+        let read_only = || -> Arc<dyn PolicyClient> {
+            Arc::new(
+                boss_policy_client::FakePolicyClient::builder()
+                    .allow(
+                        "hr",
+                        Action::Read,
+                        Resource::employee(),
+                        boss_policy::Scope::All,
+                    )
+                    .build(),
+            )
+        };
+        let mut hire = people.employee_by_id("emp-002").await.unwrap().unwrap();
+        hire.id = "emp-new".into();
+        hire.email = Some("new@example.test".into());
+        boss_testing::TestRequest::post("/api/people")
+            .as_user("emp-hr", "hr")
+            .json(&serde_json::to_value(&hire).unwrap())
+            .send(&app_with_policy(people.clone(), Some(read_only())))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+        assert!(people.employee_by_id("emp-new").await.unwrap().is_none());
+        boss_testing::TestRequest::delete("/api/people/emp-002")
+            .as_user("emp-hr", "hr")
+            .send(&app_with_policy(people.clone(), Some(read_only())))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+        assert!(people.employee_by_id("emp-002").await.unwrap().is_some());
+
+        let defaults = || -> Arc<dyn PolicyClient> {
+            Arc::new(
+                boss_policy_client::defaults::default_rules()
+                    .into_iter()
+                    .fold(boss_policy_client::FakePolicyClient::builder(), |b, r| {
+                        b.allow(r.role, r.action, r.resource, r.scope)
+                    })
+                    .build(),
+            )
+        };
+        let created = boss_testing::TestRequest::post("/api/people")
+            .as_user("automation:tenant-seed", "platform-admin")
+            .json(&serde_json::to_value(&hire).unwrap())
+            .send(&app_with_policy(people.clone(), Some(defaults())))
+            .await;
+        assert_ne!(
+            created.status,
+            StatusCode::FORBIDDEN,
+            "platform-admin may create"
+        );
+        let removed = boss_testing::TestRequest::delete("/api/people/emp-002")
+            .as_user("automation:tenant-seed", "platform-admin")
+            .send(&app_with_policy(people.clone(), Some(defaults())))
+            .await;
+        assert_ne!(
+            removed.status,
+            StatusCode::FORBIDDEN,
+            "platform-admin may delete"
+        );
+    }
+
+    // ---- The roster is read by grant (backlog cda177ef) -------------
+    //
+    // Review of guest cars 1+3 (design 2830b6b7), 2026-09-25: the OSS
+    // README says a Basic guest — the `visitor` role — reads only what
+    // policy grants it, and core grants it nothing on `employee`; yet
+    // the list, the single row and the reports list asked no one, so
+    // the guest read every name, email, role and department. These
+    // pin both halves of the fix: the guest is refused, and every
+    // reader the roster exists for still reads it on the core defaults.
+
+    fn default_rules() -> Arc<dyn PolicyClient> {
+        Arc::new(
+            boss_policy_client::defaults::default_rules()
+                .into_iter()
+                .fold(boss_policy_client::FakePolicyClient::builder(), |b, r| {
+                    b.allow(r.role, r.action, r.resource, r.scope)
+                })
+                .build(),
+        )
+    }
+
+    fn signed(id: &str, role: &str, tier: &str, reports: &[&str]) -> String {
+        serde_json::json!({
+            "id": id,
+            "role": role,
+            "access_tier": tier,
+            "direct_report_ids": reports,
+        })
+        .to_string()
+    }
+
+    async fn answer(app: Router, uri: &str, user: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().uri(uri);
+        if let Some(user) = user {
+            req = req.header("x-boss-user", user);
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn ids_of(body: &str) -> Vec<String> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(body).unwrap();
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    const ROSTER_READS: [&str; 4] = [
+        "/api/people",
+        "/api/people?role=service-tech&status=active",
+        "/api/people/emp-001",
+        "/api/people/emp-001/reports",
+    ];
+
+    /// THE DEFECT. A Basic guest session — the header the gateway's
+    /// `build_user_json` forwards for it — and a request carrying no
+    /// identity at all are both refused every roster read on the core
+    /// defaults, and no refusal carries a row.
+    #[tokio::test]
+    async fn a_basic_guest_is_refused_every_roster_read() {
+        let app = app_with_policy(paid_roster(), Some(default_rules()));
+        let visitor = signed(
+            boss_core::roles::GUEST_EMAIL,
+            boss_core::roles::VISITOR_ROLE,
+            "user",
+            &[],
+        );
+        for uri in ROSTER_READS {
+            for who in [Some(visitor.as_str()), None] {
+                let (status, body) = answer(app.clone(), uri, who).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} as {who:?}: {body}");
+                assert!(!body.contains("emp-00"), "a refusal carried a row: {body}");
+            }
+        }
+    }
+
+    /// Every reader the roster exists for still reads all of it on the
+    /// core defaults alone: a platform-admin session at either tier,
+    /// the recorded-probe reader (`audit-readonly` at the auditor
+    /// tier), the playground's audit guest (`audit-readonly` at user
+    /// tier, by decision on b3a1772d), and machinery at the operator
+    /// tier WHATEVER its role — the jobs API's owner resolution signs
+    /// as `system-jobs` with role `system`, which holds no policy row
+    /// at all (boss_jobs::owner_resolution::ReqwestRosterLookup), and
+    /// the platform-owner lookup signs as its own automation.
+    #[tokio::test]
+    async fn the_readers_the_roster_exists_for_still_read_it_on_the_default_rules() {
+        let app = app_with_policy(paid_roster(), Some(default_rules()));
+        let readers = [
+            signed("emp-david", "platform-admin", "user", &[]),
+            signed("automation:tenant-seed", "platform-admin", "operator", &[]),
+            signed(
+                "automation:run-car-probe-reader",
+                "audit-readonly",
+                "auditor",
+                &[],
+            ),
+            signed(boss_core::roles::GUEST_EMAIL, "audit-readonly", "user", &[]),
+            signed("system-jobs", "system", "operator", &[]),
+            boss_people_client::PLATFORM_OWNER_READER.to_string(),
+        ];
+        for who in &readers {
+            let (status, body) = answer(app.clone(), "/api/people", Some(who)).await;
+            assert_eq!(status, StatusCode::OK, "{who}: {body}");
+            assert_eq!(ids_of(&body), vec!["emp-001", "emp-002"], "{who}");
+            let (status, body) = answer(app.clone(), "/api/people/emp-002", Some(who)).await;
+            assert_eq!(status, StatusCode::OK, "{who}: {body}");
+            let (status, body) =
+                answer(app.clone(), "/api/people/emp-001/reports", Some(who)).await;
+            assert_eq!(status, StatusCode::OK, "{who}: {body}");
+            assert_eq!(ids_of(&body), vec!["emp-002"], "{who}");
+        }
+    }
+
+    /// A scoped grant reads the rows it covers, in the vocabulary the
+    /// compensation grant and the change log already use: `team` is
+    /// the caller's own row and their direct reports.
+    #[tokio::test]
+    async fn a_team_grant_reads_its_own_row_and_its_reports_only() {
+        let mut rows: Vec<Employee> = ["emp-001", "emp-002", "emp-003"]
+            .iter()
+            .map(|id| test_emp(id, None))
+            .collect();
+        rows[1].manager_id = Some("emp-001".into());
+        let people = Arc::new(InMemoryPeople::new(rows));
+        let team: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .allow(
+                    "warehouse-mgr",
+                    Action::Read,
+                    Resource::employee(),
+                    boss_policy::Scope::Team,
+                )
+                .build(),
+        );
+        let app = app_with_policy(people, Some(team));
+        let mgr = signed("emp-001", "warehouse-mgr", "user", &["emp-002"]);
+        let (status, body) = answer(app.clone(), "/api/people", Some(&mgr)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(ids_of(&body), vec!["emp-001", "emp-002"]);
+        let (status, _) = answer(app.clone(), "/api/people/emp-002", Some(&mgr)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = answer(app.clone(), "/api/people/emp-003", Some(&mgr)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "outside the team: {body}");
+        assert!(!body.contains("emp-003"), "{body}");
+    }
+
+    /// An employee reads their own row with no grant at all — the
+    /// schedules rule (a621d091): everyone reads their own. Nobody
+    /// else's row, and not the list.
+    #[tokio::test]
+    async fn an_employee_reads_their_own_row_without_a_grant() {
+        let deny: Arc<dyn PolicyClient> =
+            Arc::new(boss_policy_client::FakePolicyClient::deny_all());
+        let app = app_with_policy(paid_roster(), Some(deny));
+        let me = signed("emp-002", "service-tech", "user", &[]);
+        let (status, body) = answer(app.clone(), "/api/people/emp-002", Some(&me)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for uri in ["/api/people/emp-001", "/api/people"] {
+            let (status, _) = answer(app.clone(), uri, Some(&me)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
     }
 }

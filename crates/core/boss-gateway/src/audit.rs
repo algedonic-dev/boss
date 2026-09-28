@@ -17,10 +17,20 @@
 //! subject reference — no employee matched, and asserting one would
 //! both lie and trip the ref-check. IdP *transport* failures
 //! (discovery down, token exchange) are not auth decisions and stay
-//! plain warn lines in the handlers. `auth.login.succeeded` carries
-//! the method so the imminent passkey path lands as an enum value,
-//! not a schema change. `auth.session.guest` counts mints of the
-//! unauthenticated read-only capability.
+//! plain warn lines in the handlers. A Class registry that cannot
+//! confirm a verified employee's role IS one: the person proved who
+//! they are and is refused a session because of it, so that 503 is
+//! `reason: role_unconfirmed` (backlog 8f45e0b4). `auth.login.succeeded`
+//! carries the method so the imminent passkey path lands as an enum
+//! value, not a schema change, and a `downgrade: {from, to}` when the
+//! session carries less than the employee row asked for.
+//! `auth.session.guest` counts mints of the unauthenticated read-only
+//! capability.
+//!
+//! The auth-admin doors joined later (backlog 17ae5248, 2026-09-25):
+//! `auth.credential.written` (onboard: created or overwritten) and
+//! `auth.reset.issued` (issue-reset), each naming the target email and
+//! the acting session — never a password or a token.
 //!
 //! Failure posture (the LogTransport principle): emitting never
 //! blocks and never fails a login. The handler hands the event to a
@@ -72,6 +82,13 @@ pub enum DeniedReason {
     NoEmployeeRecord,
     /// The IdP itself refused the user (`error=access_denied`).
     IdpDenied,
+    /// The credential verified and an employee record matched, but the
+    /// Class registry could not say whether the row's tenant role is a
+    /// live `role` Class, so no session was minted (the 503). The
+    /// registry's silence is a transport failure; refusing the person
+    /// because of it is a decision about them, and until backlog
+    /// 8f45e0b4 (2026-09-27) it left only a warn line.
+    RoleUnconfirmed,
 }
 
 impl DeniedReason {
@@ -80,6 +97,44 @@ impl DeniedReason {
             Self::BadCredentials => "bad_credentials",
             Self::NoEmployeeRecord => "no_employee_record",
             Self::IdpDenied => "idp_denied",
+            Self::RoleUnconfirmed => "role_unconfirmed",
+        }
+    }
+}
+
+/// A session minted with less than its employee row asked for: the row
+/// held `from`, and the session carries `to` (the visitor). Rides the
+/// `auth.login.succeeded` event as `downgrade: {from, to}` — until
+/// backlog 8f45e0b4 (2026-09-27) a downgrade was a warn line only, so the
+/// log said an employee signed in and never that they signed in unable
+/// to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Downgrade<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+}
+
+/// Who performed an auth-administration act, read off the caller's
+/// verified session — never off the request body, which is not
+/// evidence of anything.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminActor<'a> {
+    /// The session's username (the admin's email).
+    pub email: &'a str,
+    pub employee_id: Option<&'a str>,
+    pub role: Option<&'a str>,
+}
+
+impl AdminActor<'_> {
+    /// `actor`, plus `actor_employee_id` / `actor_role` when the
+    /// session carries them — omitted rather than asserted as null.
+    fn stamp(self, payload: &mut serde_json::Value) {
+        payload["actor"] = json!(self.email);
+        if let Some(id) = self.employee_id {
+            payload["actor_employee_id"] = json!(id);
+        }
+        if let Some(role) = self.role {
+            payload["actor_role"] = json!(role);
         }
     }
 }
@@ -154,14 +209,25 @@ impl AuthAudit {
         self.emit("auth.login.denied", payload);
     }
 
-    /// A session was minted for an authenticated employee.
-    pub fn login_succeeded(&self, email: &str, employee_id: Option<&str>, method: AuthMethod) {
+    /// A session was minted for an authenticated employee. `downgrade`
+    /// is `Some` when the session carries less than the row's role; it
+    /// is omitted from the payload, not asserted as null, otherwise.
+    pub fn login_succeeded(
+        &self,
+        email: &str,
+        employee_id: Option<&str>,
+        method: AuthMethod,
+        downgrade: Option<Downgrade<'_>>,
+    ) {
         let mut payload = json!({
             "email": email,
             "method": method.as_str(),
         });
         if let Some(id) = employee_id {
             payload["employee_id"] = json!(id);
+        }
+        if let Some(d) = downgrade {
+            payload["downgrade"] = json!({ "from": d.from, "to": d.to });
         }
         self.emit("auth.login.succeeded", payload);
     }
@@ -184,6 +250,29 @@ impl AuthAudit {
                 "aaguid": aaguid,
             }),
         );
+    }
+
+    /// A local credential was written through the auth-admin door
+    /// (`POST /api/auth/onboard`). `created` is false when the write
+    /// replaced an existing credential — the upsert that used to leave
+    /// no trace either way (backlog 17ae5248). Never the password.
+    pub fn credential_written(&self, email: &str, created: bool, actor: AdminActor<'_>) {
+        let mut payload = json!({
+            "email": email,
+            "outcome": if created { "created" } else { "overwritten" },
+        });
+        actor.stamp(&mut payload);
+        self.emit("auth.credential.written", payload);
+    }
+
+    /// An administrator issued a password reset for `email`
+    /// (`POST /api/auth/issue-reset`). `mailed` is whether the link
+    /// left the building; a token issued but not sent is still a token
+    /// issued. Never the token (backlog 17ae5248).
+    pub fn reset_issued(&self, email: &str, mailed: bool, actor: AdminActor<'_>) {
+        let mut payload = json!({ "email": email, "mailed": mailed });
+        actor.stamp(&mut payload);
+        self.emit("auth.reset.issued", payload);
     }
 
     fn emit(&self, kind: &'static str, payload: serde_json::Value) {
@@ -289,12 +378,46 @@ mod tests {
     async fn succeeded_names_the_method_for_the_passkey_future() {
         let cap = Arc::new(Captured::default());
         let audit = AuthAudit::spawn(cap.clone());
-        audit.login_succeeded("op@example.com", Some("emp-1"), AuthMethod::Password);
+        audit.login_succeeded("op@example.com", Some("emp-1"), AuthMethod::Password, None);
         let events = drain(&cap, 1).await;
         let e = &events[0];
         assert_eq!(e.kind, "auth.login.succeeded");
         assert_eq!(e.payload["method"], "password");
         assert_eq!(e.payload["employee_id"], "emp-1");
+    }
+
+    /// Backlog 8f45e0b4 item (3): a downgraded mint says what the row
+    /// held and what the session carries, and a login the registry
+    /// could not confirm is a denial with its own closed reason.
+    #[tokio::test]
+    async fn a_downgrade_and_an_unconfirmed_role_are_on_the_record() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        audit.login_succeeded(
+            "op@example.com",
+            Some("emp-1"),
+            AuthMethod::Oidc,
+            Some(Downgrade {
+                from: "break-glass",
+                to: "visitor",
+            }),
+        );
+        audit.login_denied(
+            Some("op@example.com"),
+            AuthMethod::Password,
+            DeniedReason::RoleUnconfirmed,
+            None,
+        );
+        let events = drain(&cap, 2).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "auth.login.succeeded");
+        assert_eq!(
+            events[0].payload["downgrade"],
+            json!({ "from": "break-glass", "to": "visitor" })
+        );
+        assert_eq!(events[1].kind, "auth.login.denied");
+        assert_eq!(events[1].payload["reason"], "role_unconfirmed");
+        assert!(events[1].payload.get("employee_id").is_none());
     }
 
     #[tokio::test]
@@ -305,6 +428,91 @@ mod tests {
         let events = drain(&cap, 1).await;
         assert_eq!(events[0].kind, "auth.session.guest");
         assert_eq!(events[0].payload["email"], "guest@algedonic.dev");
+    }
+
+    /// Backlog 17ae5248: a credential written through the auth-admin
+    /// door names who wrote it, to which email, and whether it was
+    /// created or overwritten — and carries nothing that is itself a
+    /// credential. The key set is asserted whole so a later field
+    /// cannot ride in unread.
+    #[tokio::test]
+    async fn a_credential_write_names_actor_target_and_outcome_only() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        let actor = AdminActor {
+            email: "admin@example.com",
+            employee_id: Some("emp-admin"),
+            role: Some("platform-admin"),
+        };
+        audit.credential_written("new@example.com", true, actor);
+        audit.credential_written("new@example.com", false, actor);
+        let events = drain(&cap, 2).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "auth.credential.written");
+        assert_eq!(events[0].source, "gateway");
+        assert_eq!(events[0].payload["outcome"], "created");
+        assert_eq!(events[1].payload["outcome"], "overwritten");
+        let e = &events[0];
+        assert_eq!(e.payload["email"], "new@example.com");
+        assert_eq!(e.payload["actor"], "admin@example.com");
+        assert_eq!(e.payload["actor_employee_id"], "emp-admin");
+        assert_eq!(e.payload["actor_role"], "platform-admin");
+        let mut keys: Vec<&str> = e
+            .payload
+            .as_object()
+            .expect("object payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "actor",
+                "actor_employee_id",
+                "actor_role",
+                "email",
+                "outcome"
+            ]
+        );
+    }
+
+    /// Backlog 17ae5248: an admin-issued reset names who issued it and
+    /// for which email, never the token; `mailed` says whether the
+    /// link left the building.
+    #[tokio::test]
+    async fn a_reset_issue_names_actor_and_target_only() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        audit.reset_issued(
+            "user@example.com",
+            true,
+            AdminActor {
+                email: "glass@example.com",
+                employee_id: None,
+                role: Some("break-glass"),
+            },
+        );
+        let events = drain(&cap, 1).await;
+        let e = &events[0];
+        assert_eq!(e.kind, "auth.reset.issued");
+        assert_eq!(e.payload["email"], "user@example.com");
+        assert_eq!(e.payload["actor"], "glass@example.com");
+        assert_eq!(e.payload["actor_role"], "break-glass");
+        assert_eq!(e.payload["mailed"], true);
+        assert!(
+            e.payload.get("actor_employee_id").is_none(),
+            "an absent employee id is omitted, not asserted as null"
+        );
+        let mut keys: Vec<&str> = e
+            .payload
+            .as_object()
+            .expect("object payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["actor", "actor_role", "email", "mailed"]);
     }
 
     #[tokio::test]
@@ -319,7 +527,7 @@ mod tests {
             DeniedReason::BadCredentials,
             None,
         );
-        audit.login_succeeded("op@example.com", None, AuthMethod::Password);
+        audit.login_succeeded("op@example.com", None, AuthMethod::Password, None);
         audit.guest_session("guest@algedonic.dev");
     }
 
@@ -334,7 +542,7 @@ mod tests {
         }
         let audit = AuthAudit::spawn(Arc::new(Failing));
         // Emit must not error or panic; the drain task warns.
-        audit.login_succeeded("op@example.com", None, AuthMethod::Password);
+        audit.login_succeeded("op@example.com", None, AuthMethod::Password, None);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

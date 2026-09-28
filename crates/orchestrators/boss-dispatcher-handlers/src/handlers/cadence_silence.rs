@@ -50,7 +50,11 @@
 //!    fresh measurement, never twinned. When packets start
 //!    arriving again the alarm CLOSES ITSELF (`stale` — the claim no
 //!    longer holds), stamped so the settled-suppression below can tell
-//!    a machine clear from a human's answer.
+//!    a machine clear from a human's answer. It closes at the step the
+//!    packet is waiting on — `triage`, or the ready `build`/`measure` a
+//!    person routed it to — and where the machine may not complete that
+//!    step it says RECOVERED on the packet instead (backlog a2d8bad3,
+//!    `common::retraction`).
 //!
 //! WHERE THE DECLARATION LIVES, and why it is not the workflow row.
 //! CLAUDE.md §9 prefers registry data on the Workflow, and that was
@@ -138,8 +142,9 @@ use boss_dispatcher::rules::registry::RawRule;
 
 use super::cadence_roster::{ClockCadence, Guard, clock_cadences};
 use super::common::{
-    TRIAGE_SLUG, api_client, empty_roster_refusal, get_json, owner_for_filing, post_json,
-    triage_step, write_json,
+    Retraction, TRIAGE_SLUG, api_client, complete_step, empty_roster_refusal, get_json,
+    owner_for_filing, post_json, recovery_note, relapse_patch, retraction, rows_or_refuse,
+    write_json,
 };
 
 /// Arg-key prefix for one declared cadence. `interval_minutes.<kind>`
@@ -277,11 +282,11 @@ impl CadenceSilenceSweep {
             self.base()
         );
         let listing = get_json(&self.client, &url, rule_name).await?;
-        let rows: Vec<Value> = listing
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // No `data` array is no answer, not "nothing is holding it":
+        // read as zero rows it was a silent NO-BLOCK, and a suppressed
+        // cadence was reported dead with its remedy unnamed (d4698bc2).
+        let rows: Vec<Value> = rows_or_refuse(&listing, &format!("the guard read ({url})"))
+            .map_err(HandlerError::Downstream)?;
         Ok(oldest_open_block(&rows, guard))
     }
 }
@@ -1052,7 +1057,9 @@ pub fn alarm_body(
         json!(format!(
             "Raised by cadence.silence.sweep (backlog ecca2f43): {}. {} This alarm UPDATES \
              itself on each daily pass and CLOSES itself (`stale`) the moment a packet of \
-             `{label}` arrives again — so if it is still open, the cadence is still quiet. \
+             `{label}` arrives again — or, once a person has routed it somewhere the machine \
+             may not close, says RECOVERED on the packet — so if it is still open without \
+             that, the cadence is still quiet. \
              Precedent for why this exists: maintenance-ml-inference-batch died in \
              ExecStartPre for 23 nights (e109f57e) and the five-minute \
              maintenance-estate-observe-units observer was quiet for four days (408c81f6); \
@@ -1107,34 +1114,70 @@ fn alarm_title(label: &str, v: &Verdict) -> String {
 /// The metadata merge that refreshes a STANDING alarm instead of
 /// filing a twin. `PATCH /api/jobs/{id}/metadata` merges top-level
 /// keys, so this is exactly the fields that change between passes.
+///
+/// It also withdraws a standing recovery note ([`recovered_patch`]): a
+/// routed alarm the machine could not close is told RECOVERED, and if
+/// the cadence then goes quiet again that note is false (a2d8bad3).
 pub fn refresh_patch(w: &Watched, v: &Verdict, now: DateTime<Utc>) -> Value {
-    Value::Object(measurement(w, v, now))
+    let mut m = measurement(w, v, now);
+    if let Value::Object(relapse) = relapse_patch() {
+        m.extend(relapse);
+    }
+    Value::Object(m)
 }
 
-/// The triage completion that CLOSES a standing alarm when the kind
-/// starts arriving again. `disposition = "stale"` is the backlog-item
-/// terminal titled "Closed — the claim no longer holds", which is
-/// precisely true: the cadence is no longer silent.
+/// The merge onto a standing alarm whose cadence came back but which
+/// the machine may not close — routed to design, or to a step an
+/// executor holds ([`Retraction::Annotate`], backlog a2d8bad3). Today's
+/// measurement plus the recovery, so the packet stops showing the day
+/// it was raised: a6a4ae18's `last_measured_at` stayed at 2026-09-20
+/// for three days after its cadence returned.
+pub fn recovered_patch(w: &Watched, v: &Verdict, now: DateTime<Utc>, why_open: &str) -> Value {
+    let mut m = measurement(w, v, now);
+    m.extend(recovery_note(
+        &arriving_again(&w.label, v),
+        CLEARED_BY,
+        &now.to_rfc3339(),
+        why_open,
+    ));
+    Value::Object(m)
+}
+
+/// The sentence both a close and a recovery note state.
+fn arriving_again(label: &str, v: &Verdict) -> String {
+    format!(
+        "cadence.silence.sweep re-measured `{label}` and it is arriving again: {}.",
+        match v {
+            Verdict::Fresh => "its newest packet is inside the declared window".to_string(),
+            other => headline(label, other),
+        }
+    )
+}
+
+/// The fields that CLOSE a standing alarm when the kind starts
+/// arriving again — at `triage`, or at the `build`/`measure` a person
+/// routed it to (`common::retraction`, a2d8bad3). `disposition =
+/// "stale"` is the backlog-item terminal titled "Closed — the claim no
+/// longer holds", which is precisely true: the cadence is no longer
+/// silent.
 ///
-/// PUT on a step REPLACES top-level metadata, so the step's existing
-/// keys (`authority_role`) are carried through by the caller.
-pub fn clear_step_body(existing: &Map<String, Value>, label: &str, v: &Verdict) -> Value {
-    let mut metadata = existing.clone();
-    metadata.insert("disposition".into(), json!("stale"));
-    metadata.insert(
+/// ONLY these: they ride the step merge door, which keeps every key the
+/// step holds (`authority_role` among them) — the caller used to carry
+/// the step's own keys through for a PUT that replaced them wholesale
+/// (backlog e39a9d2a).
+pub fn clear_step_fields(label: &str, v: &Verdict) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("disposition".into(), json!("stale"));
+    fields.insert(
         "evidence".into(),
         json!(format!(
-            "cadence.silence.sweep re-measured `{label}` and it is arriving again: {}. \
-             The claim this alarm carried no longer holds; closed by machine, not by \
+            "{} The claim this alarm carried no longer holds; closed by machine, not by \
              judgement.",
-            match v {
-                Verdict::Fresh => "its newest packet is inside the declared window".to_string(),
-                other => headline(label, other),
-            }
+            arriving_again(label, v)
         )),
     );
-    metadata.insert("cleared_by".into(), json!(CLEARED_BY));
-    json!({"status": "completed", "metadata": metadata})
+    fields.insert("cleared_by".into(), json!(CLEARED_BY));
+    fields
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,14 +1232,24 @@ impl Handler for CadenceSilenceSweep {
                 findings.push((w, verdict(&w.declared, None, None, now)));
                 continue;
             }
-            let listing = match get_json(
+            // A listing with no `data` array fails like a failed read:
+            // read as zero rows it said "this kind never filed", which is
+            // a silence finding raised on the far side's bad answer
+            // (d4698bc2).
+            let rows: Vec<Value> = match get_json(
                 &self.client,
                 &format!("{}{}", self.base(), w.newest_packet_path()),
                 &ctx.rule_name,
             )
             .await
-            {
-                Ok(l) => l,
+            .and_then(|l| {
+                rows_or_refuse(
+                    &l,
+                    &format!("the newest-packet read ({})", w.newest_packet_path()),
+                )
+                .map_err(HandlerError::Downstream)
+            }) {
+                Ok(rows) => rows,
                 Err(e) => {
                     errors.push(format!(
                         "newest-packet read for {} failed; other cadences still swept: {e}",
@@ -1205,11 +1258,6 @@ impl Handler for CadenceSilenceSweep {
                     continue;
                 }
             };
-            let rows: Vec<Value> = listing
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
             let newest = newest_packet_at(&rows);
             // No packet ever gets ONE more read: when was the kind
             // declared? Silence starts there, not at the beginning of
@@ -1299,10 +1347,19 @@ impl Handler for CadenceSilenceSweep {
         // are open (update, don't twin), which were settled by a human
         // inside the window (stay quiet), and which standing alarms
         // belong to a kind that came back (close them).
+        //
+        // `metadata_has=cadence_silence` narrows it to the only packets
+        // all three questions read (backlog c5ac71de, the sibling of the
+        // estate alarm's dde64482). Without it every backlog-item of the
+        // week counted toward the page: on 2026-09-26 that was 1054 rows,
+        // 3 of them cadence alarms, so the HOLD below engaged on every
+        // pass and no CADENCE SILENT or SUPPRESSED alarm could be filed.
+        // The HOLD stays as the fail-safe; it now needs a thousand
+        // cadence alarms in a week to engage.
         let listing = get_json(
             &self.client,
             &format!(
-                "{}/api/jobs?kind=backlog-item&closed_within={SETTLED_DAYS}&limit={DEDUP_PAGE}",
+                "{}/api/jobs?kind=backlog-item&closed_within={SETTLED_DAYS}&metadata_has=cadence_silence&full=true&limit={DEDUP_PAGE}",
                 self.base()
             ),
             &ctx.rule_name,
@@ -1318,11 +1375,19 @@ impl Handler for CadenceSilenceSweep {
                 return finish(errors);
             }
         };
-        let rows: Vec<Value> = body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // No `data` array was held before only by accident of the
+        // truncation check below (a count with no rows looks short); it
+        // is refused now for what it is (d4698bc2).
+        let rows: Vec<Value> = match rows_or_refuse(&body, "the dedup read (GET /api/jobs)") {
+            Ok(rows) => rows,
+            Err(why) => {
+                errors.push(format!(
+                    "{why}; {} finding(s) held for retry to avoid duplicate alarms",
+                    findings.len()
+                ));
+                return finish(errors);
+            }
+        };
         // The list's own `total` is authoritative over the page length;
         // a missing `total` is treated as truncated (fail-safe).
         let complete = body
@@ -1402,25 +1467,52 @@ impl Handler for CadenceSilenceSweep {
                 errors.push(format!("open alarm for {label} has no id; not cleared"));
                 continue;
             };
-            let Some((step_id, step_meta)) = triage_step(existing) else {
-                errors.push(format!(
-                    "open alarm for {label} has no `{TRIAGE_SLUG}` step; cannot close itself"
-                ));
-                continue;
-            };
-            if let Err(e) = write_json(
-                &self.client,
-                reqwest::Method::PUT,
-                &format!("{}/api/jobs/{id}/steps/{step_id}", self.base()),
-                &clear_step_body(&step_meta, label, v),
-                &ctx.rule_name,
-            )
-            .await
-            {
-                errors.push(format!("auto-close of the alarm for {label} failed: {e}"));
-                continue;
+            // The step the packet is WAITING ON, not always triage: a
+            // person may already have routed it (a2d8bad3).
+            match retraction(existing) {
+                None => {
+                    errors.push(format!(
+                        "open alarm for {label} has no `{TRIAGE_SLUG}` step; cannot close itself"
+                    ));
+                }
+                // The fields through the step merge door, then the flip
+                // (e39a9d2a).
+                Some(Retraction::Complete { slug, step_id }) => {
+                    if let Err(e) = complete_step(
+                        &self.client,
+                        self.base(),
+                        id,
+                        &step_id,
+                        clear_step_fields(label, v),
+                        &ctx.rule_name,
+                    )
+                    .await
+                    {
+                        errors.push(format!(
+                            "auto-close of the alarm for {label} at its `{slug}` step failed: {e}"
+                        ));
+                        continue;
+                    }
+                    tracing::info!(cadence = %label, step = %slug, "cadence.silence.sweep closed its own alarm — the cadence is arriving again");
+                }
+                Some(Retraction::Annotate { why_open }) => {
+                    if let Err(e) = write_json(
+                        &self.client,
+                        reqwest::Method::PATCH,
+                        &format!("{}/api/jobs/{id}/metadata", self.base()),
+                        &recovered_patch(w, v, now, &why_open),
+                        &ctx.rule_name,
+                    )
+                    .await
+                    {
+                        errors.push(format!(
+                            "recovery note on the routed alarm for {label} failed: {e}"
+                        ));
+                        continue;
+                    }
+                    tracing::info!(cadence = %label, why_open = %why_open, "cadence.silence.sweep: the cadence is arriving again; told the routed alarm it has recovered");
+                }
             }
-            tracing::info!(cadence = %label, "cadence.silence.sweep closed its own alarm — the cadence is arriving again");
         }
 
         finish(errors)
@@ -1445,6 +1537,7 @@ fn finish(errors: Vec<String>) -> Result<(), HandlerError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::common::RECOVERED_AT;
     use super::*;
     use boss_dispatcher::rules::expr::Value as ExprValue;
 
@@ -1864,8 +1957,8 @@ mod tests {
     /// When the kind comes back, the alarm closes ITSELF: the
     /// `backlog-item` triage step completes with the `stale`
     /// disposition, whose terminal is titled "Closed — the claim no
-    /// longer holds". The step's existing metadata survives, because
-    /// a step PUT replaces top-level metadata wholesale.
+    /// longer holds". The step's existing metadata survives because the
+    /// fields ride the merge door and name none of it (e39a9d2a).
     #[test]
     fn a_returning_kind_closes_its_own_alarm_without_losing_step_metadata() {
         let open = json!({
@@ -1876,17 +1969,116 @@ mod tests {
                 {"id": "s-1", "spec_slug": "triage", "metadata": {"authority_role": "platform-admin"}}
             ],
         });
-        let (step_id, meta) = triage_step(&open).expect("the alarm has a triage step");
+        let Some(Retraction::Complete { step_id, .. }) = retraction(&open) else {
+            panic!("an untriaged alarm withdraws at its triage step");
+        };
         assert_eq!(step_id, "s-1");
-        let body = clear_step_body(&meta, "maintenance-views-catchup", &Verdict::Fresh);
-        assert_eq!(body["status"], json!("completed"));
-        assert_eq!(body["metadata"]["disposition"], json!("stale"));
+        let fields = clear_step_fields("maintenance-views-catchup", &Verdict::Fresh);
+        assert_eq!(fields["disposition"], json!("stale"));
+        assert_eq!(fields["cleared_by"], json!(CLEARED_BY));
+        let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
         assert_eq!(
-            body["metadata"]["authority_role"],
-            json!("platform-admin"),
-            "a PUT replaces step metadata wholesale, so existing keys must be carried"
+            keys,
+            ["cleared_by", "disposition", "evidence"],
+            "its own fields only — the merge door keeps `authority_role`"
         );
-        assert_eq!(body["metadata"]["cleared_by"], json!(CLEARED_BY));
+    }
+
+    /// Backlog a2d8bad3 — alarm a6a4ae18 as the jobs API held it: raised
+    /// 2026-09-20, triaged to `build` the same morning, its cadence back
+    /// from 2026-09-21. The sweep's only exit was the completed triage
+    /// step; now it withdraws at the ready build step, with the build's
+    /// own keys carried through and the machine's stamp on it.
+    #[test]
+    fn a_returning_kind_whose_alarm_was_routed_to_build_closes_at_the_build_step() {
+        let open = json!({
+            "id": "a6a4ae18-59ec-42c2-92d8-f6b9324fd533",
+            "status": "open",
+            "metadata": {"cadence_silence": silence_key("ops-request/github-mirror")},
+            "steps": [
+                {"id": "s-0", "spec_slug": "filed", "status": "completed", "metadata": {}},
+                {"id": "s-1", "spec_slug": "triage", "status": "completed",
+                 "metadata": {"authority_role": "platform-admin", "disposition": "build"}},
+                {"id": "s-5", "spec_slug": "build", "status": "ready",
+                 "metadata": {"authority_role": "platform-admin", "agent_profile": "builder"}}
+            ],
+        });
+        let Some(Retraction::Complete { slug, step_id }) = retraction(&open) else {
+            panic!("a ready build is where a routed alarm withdraws");
+        };
+        assert_eq!((slug.as_str(), step_id.as_str()), ("build", "s-5"));
+        let fields = clear_step_fields("ops-request/github-mirror", &Verdict::Fresh);
+        assert_eq!(
+            fields["disposition"],
+            json!("stale"),
+            "build's `stale` routes to the terminal \"Closed — the claim no longer holds\""
+        );
+        assert_eq!(fields["cleared_by"], json!(CLEARED_BY));
+
+        // And the machine's close on a HUMAN-routed packet is still a
+        // machine clear: the triage step a person completed carries no
+        // stamp, the build step does, and the stamp is what the settle
+        // window reads — a cadence that goes quiet again re-raises.
+        let mut closed = open.clone();
+        closed["status"] = json!("closed");
+        closed["closed_on"] = json!("2026-09-21");
+        // The build step as the merge door leaves it: its own keys,
+        // plus the fields.
+        for (k, v) in &fields {
+            closed["steps"][2]["metadata"][k] = v.clone();
+        }
+        let settled = settled_recently(&[closed], at("2026-09-22T00:00:00Z"));
+        assert!(
+            settled.is_empty(),
+            "a machine clear at the build step must not suppress the next silence"
+        );
+    }
+
+    /// The design route, or a build an executor holds, cannot be
+    /// completed by the machine — so the packet is TOLD: the recovery
+    /// and today's measurement, merged onto its metadata. a6a4ae18's
+    /// `last_measured_at` stayed at the raise for three days.
+    #[test]
+    fn a_returning_kind_whose_alarm_cannot_be_closed_says_so_on_the_packet() {
+        let now = at("2026-09-21T00:00:03Z");
+        let w = watched("ops-request/github-mirror");
+        let patch = recovered_patch(&w, &Verdict::Fresh, now, "triage routed it to `design`");
+        assert_eq!(patch["last_measured_at"], json!(now.to_rfc3339()));
+        assert_eq!(patch[RECOVERED_AT], json!(now.to_rfc3339()));
+        assert_eq!(patch["recovered_by"], json!(CLEARED_BY));
+        let text = patch["recovery"].as_str().expect("a sentence");
+        assert!(text.contains("arriving again"), "{text}");
+        assert!(text.contains("triage routed it to `design`"), "{text}");
+        assert_eq!(
+            patch["condition"],
+            json!("ops-request/github-mirror is arriving on cadence"),
+            "the condition line is today's, not the raise's"
+        );
+    }
+
+    /// A cadence that goes quiet AGAIN while its alarm is open refreshes
+    /// the alarm — and the refresh withdraws any recovery note, so the
+    /// packet does not say RECOVERED over a live silence.
+    #[test]
+    fn a_refresh_withdraws_a_standing_recovery_note() {
+        let v = Verdict::Silent {
+            interval_min: 1440,
+            age_min: 4000,
+            last: "2026-09-19T00:00:00+00:00".into(),
+        };
+        let patch = refresh_patch(&watched("k"), &v, at("2026-09-22T00:00:00Z"));
+        for key in [RECOVERED_AT, "recovered_by", "recovery"] {
+            assert_eq!(
+                patch[key],
+                Value::Null,
+                "{key} must be deleted by the merge"
+            );
+            assert!(
+                patch.as_object().expect("object").contains_key(key),
+                "{key} must be SENT as null — an absent key is left as it was"
+            );
+        }
     }
 
     /// A close THIS SWEEP made must not suppress the next raise: a
@@ -2230,6 +2422,228 @@ mod tests {
         assert_eq!(
             body["metadata"]["expected_interval_minutes"],
             json!("undetermined")
+        );
+    }
+
+    // ----- the reads and writes, end to end against a stub jobs API -----
+    //
+    // Until d4698bc2 nothing in this module spoke HTTP: every test above
+    // is of a pure decision, so no test could see a read that took an
+    // error body for an empty list, or a close the step API refuses.
+
+    /// The sweep at a fixed instant, against `base`.
+    fn sweep_at(base: &str, now: &str) -> CadenceSilenceSweep {
+        let snapshot: boss_clock_client::ClockNow =
+            serde_json::from_value(json!({ "now": now, "simulated": false })).expect("clock now");
+        CadenceSilenceSweep {
+            client: api_client(),
+            jobs_base: base.to_string(),
+            clock: Arc::new(boss_clock_client::FixedClockClient::new(snapshot)),
+            rules: Vec::new(),
+            owner: Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        }
+    }
+
+    const NOW: &str = "2026-09-23T12:00:00Z";
+
+    fn hourly(kind: &str) -> Vec<(String, ExprValue)> {
+        vec![(format!("{ARG_PREFIX}{kind}"), ExprValue::Int(60))]
+    }
+
+    fn sweep_ctx() -> InvocationContext {
+        InvocationContext {
+            rule_name: "cadence-silence-daily".into(),
+            triggering_event_id: "clock-2026-09-23".into(),
+            triggering_topic: "schedule".into(),
+            event_payload: json!({}),
+        }
+    }
+
+    /// Backlog d4698bc2: the guard's read with no `data` array read as
+    /// "nothing is holding it" — a silent NO-BLOCK, so a suppressed
+    /// cadence was reported as dead and its real remedy, the packet
+    /// holding it, was never named. It refuses by name now, and the
+    /// caller reports the silence unexplained and NAKs.
+    #[tokio::test]
+    async fn a_guard_read_with_no_data_array_refuses_rather_than_finding_no_block() {
+        use crate::handlers::listing_stub::{no_data_array, serve};
+        let stub = serve(vec![("/api/jobs", no_data_array())]).await;
+        let why = sweep_at(&stub.base, NOW)
+            .blocking_packet("ops-request", "github-mirror", "guard", "rule")
+            .await
+            .expect_err("no `data` array is no answer");
+        let HandlerError::Downstream(why) = why else {
+            panic!("a bad answer is retryable: {why:?}");
+        };
+        assert!(why.contains("no `data` array"), "{why}");
+        assert!(why.contains("the guard read"), "{why}");
+    }
+
+    /// The newest-packet read: no `data` array read as "this kind has
+    /// never filed", which is a silence finding — an alarm raised on
+    /// the far side's bad answer rather than on the cadence.
+    #[tokio::test]
+    async fn a_newest_packet_read_with_no_data_array_refuses_and_raises_nothing() {
+        use crate::handlers::listing_stub::{
+            assert_refused_by_name, empty_listing, no_data_array, serve,
+        };
+        let stub = serve(vec![
+            (
+                "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                empty_listing(),
+            ),
+            ("/api/jobs?kind=maintenance-k", no_data_array()),
+        ])
+        .await;
+        let res = sweep_at(&stub.base, NOW)
+            .invoke(&hourly("maintenance-k"), &sweep_ctx())
+            .await;
+        assert_eq!(stub.writes(), Vec::<String>::new(), "no alarm raised");
+        assert_refused_by_name(res, "the newest-packet read");
+    }
+
+    /// The dedup read was already held, but only by accident of its
+    /// truncation check (a count with no rows looked truncated). It
+    /// now refuses for what it is.
+    #[tokio::test]
+    async fn a_dedup_read_with_no_data_array_refuses_by_name() {
+        use crate::handlers::listing_stub::{assert_refused_by_name, no_data_array, serve};
+        let stub = serve(vec![
+            (
+                "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                no_data_array(),
+            ),
+            (
+                "/api/jobs?kind=maintenance-k",
+                json!({ "data": [packet("2026-09-23T11:30:00Z")], "total": 1 }),
+            ),
+        ])
+        .await;
+        let res = sweep_at(&stub.base, NOW)
+            .invoke(&hourly("maintenance-k"), &sweep_ctx())
+            .await;
+        assert_eq!(stub.writes(), Vec::<String>::new());
+        assert_refused_by_name(res, "the dedup read");
+    }
+
+    /// A returning kind whose alarm a person routed to `build` closes at
+    /// the build step — against a stub that refuses a write to the
+    /// answered triage with 409 as the step API does, so the a2d8bad3
+    /// regression (completing triage) fails here rather than live.
+    #[tokio::test]
+    async fn a_returning_kind_closes_its_routed_alarm_at_build_through_an_honest_step_api() {
+        use crate::handlers::listing_stub::serve;
+        let alarm = json!({
+            "id": "a6a4ae18",
+            "status": "open",
+            "metadata": {"cadence_silence": silence_key("maintenance-k")},
+            "steps": [
+                {"id": "a6a4ae18-triage", "spec_slug": "triage", "status": "completed",
+                 "metadata": {"authority_role": "platform-admin", "disposition": "build"}},
+                {"id": "a6a4ae18-build", "spec_slug": "build", "status": "ready",
+                 "metadata": {"authority_role": "platform-admin"}},
+            ],
+        });
+        let stub = serve(vec![
+            (
+                "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                json!({ "data": [alarm], "total": 1 }),
+            ),
+            (
+                "/api/jobs?kind=maintenance-k",
+                json!({ "data": [packet("2026-09-23T11:30:00Z")], "total": 1 }),
+            ),
+        ])
+        .await;
+        sweep_at(&stub.base, NOW)
+            .invoke(&hourly("maintenance-k"), &sweep_ctx())
+            .await
+            .expect("the close answered");
+        assert_eq!(
+            stub.writes(),
+            vec![
+                "PATCH /api/jobs/a6a4ae18/steps/a6a4ae18-build/metadata".to_string(),
+                "PUT /api/jobs/a6a4ae18/steps/a6a4ae18-build".to_string(),
+            ]
+        );
+        let sent = stub.sent();
+        assert_eq!(sent[0].1["disposition"], "stale");
+        assert_eq!(
+            sent[1].1,
+            json!({"status": "completed"}),
+            "the flip carries the status alone (e39a9d2a)"
+        );
+    }
+
+    /// THE DEDUP READS ONLY CADENCE ALARMS (backlog c5ac71de). Unfiltered,
+    /// the read counted every backlog-item open or closed this week; on
+    /// 2026-09-26 that was 1054 against a 1000-row page, so the
+    /// truncation HOLD engaged on every pass and no CADENCE SILENT or
+    /// SUPPRESSED alarm could be filed — the estate alarm's defect
+    /// (dde64482) in its sibling. The stub answers as the jobs API does:
+    /// the `metadata_has` read returns only the packets carrying the key,
+    /// the unfiltered one a truncated page of unrelated items. The sweep
+    /// must still see the alarm it holds, and raise the silence no packet
+    /// carries.
+    #[tokio::test]
+    async fn a_backlog_past_one_page_does_not_hold_a_new_cadence_alarm() {
+        use crate::handlers::listing_stub::{UNRELATED_BACKLOG, backlog_listing, serve};
+        const {
+            assert!(
+                UNRELATED_BACKLOG > DEDUP_PAGE,
+                "the fixture outgrows a page"
+            )
+        };
+        let standing = json!({
+            "id": "b7c1d2e3",
+            "status": "open",
+            "metadata": {"cadence_silence": silence_key("maintenance-other")},
+        });
+        let stub = serve(vec![
+            (
+                "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                json!({ "data": [standing], "total": 1 }),
+            ),
+            (
+                "/api/jobs?kind=backlog-item",
+                backlog_listing(&[], None, Some(DEDUP_PAGE)),
+            ),
+            (
+                "/api/jobs?kind=maintenance-k",
+                json!({ "data": [packet("2026-09-20T11:30:00Z")], "total": 1 }),
+            ),
+            (
+                "/api/jobs?kind=maintenance-other",
+                json!({ "data": [packet("2026-09-20T11:30:00Z")], "total": 1 }),
+            ),
+        ])
+        .await;
+        let mut args = hourly("maintenance-k");
+        args.extend(hourly("maintenance-other"));
+        let res = sweep_at(&stub.base, NOW).invoke(&args, &sweep_ctx()).await;
+        assert!(
+            res.is_ok(),
+            "a new silence must raise, not be held: {res:?}"
+        );
+        let posts: Vec<(String, Value)> = stub
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(
+            posts[0].1["metadata"]["cadence_silence"],
+            json!(silence_key("maintenance-k")),
+            "the standing alarm is refreshed; only the new silence files"
+        );
+        assert_eq!(
+            stub.writes()
+                .iter()
+                .filter(|w| w.as_str() == "PATCH /api/jobs/b7c1d2e3/metadata")
+                .count(),
+            1,
+            "{:?}",
+            stub.writes()
         );
     }
 }

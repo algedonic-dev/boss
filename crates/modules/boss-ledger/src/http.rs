@@ -28,6 +28,7 @@ use boss_policy::User;
 use sqlx::PgPool;
 
 mod accounts;
+mod author;
 mod bank_settlements;
 mod bills;
 mod entries;
@@ -91,10 +92,14 @@ pub struct LedgerApiState {
     /// clock-api. Services never inspect headers or env vars to
     /// learn whether time is sim or wall — the Clock decides.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
-    /// Policy engine for the read gate below. `None` leaves the
-    /// surface open, which is what tests want and what production
-    /// must never be — `boss-ledger-api` always wires one.
-    pub policy: Option<Arc<dyn boss_policy_client::PolicyClient>>,
+    /// Policy engine for the read gate below. Required: until backlog
+    /// 7048afa8 (2026-09-26) this was an `Option` and `None` let every
+    /// read through — fail-open by configuration, guarded only by a
+    /// comment. Now a surface cannot be built without a client, and a
+    /// test that wants the gate out of its way says so by wiring
+    /// `PermissivePolicyClient`. `boss-ledger-api` wires the real
+    /// engine, pinned by `tests/the_ledger_api_wires_policy.rs`.
+    pub policy: Arc<dyn boss_policy_client::PolicyClient>,
 }
 
 /// Router-wide gate on READING `/api/ledger/*`.
@@ -123,10 +128,8 @@ async fn require_ledger_read(
     if req.uri().path().ends_with("/health") {
         return next.run(req).await;
     }
-    let Some(policy) = state.policy.as_ref() else {
-        return next.run(req).await;
-    };
-    match policy
+    match state
+        .policy
         .check(
             &user,
             boss_policy_client::Action::Read,
@@ -142,9 +145,11 @@ async fn require_ledger_read(
             .into_response(),
         Err(e) => {
             // Fail closed. An unreachable policy engine must not open
-            // the company's books.
+            // the company's books — and the refusal is the one every
+            // door gives: 503 + Retry-After for an outage (backlog
+            // fe9d212c).
             tracing::warn!(error = %e, "ledger read gate: policy check failed");
-            (StatusCode::SERVICE_UNAVAILABLE, "policy engine unavailable").into_response()
+            e.into_response()
         }
     }
 }
@@ -155,14 +160,13 @@ async fn require_ledger_read(
 /// wired. Fact-write handlers record their `ledger.*` events in the
 /// DOMAIN TRANSACTION via this stamp (see
 /// `events::record_ledger_event_in_tx`); nothing publishes them
-/// post-commit anymore.
+/// post-commit anymore. The actor is [`author::signer`], the same one a
+/// write records as its author (backlog 7bf42e2b).
 pub(crate) async fn event_stamp(
     state: &LedgerApiState,
     user: &boss_policy_client::User,
 ) -> boss_core::publisher::EventStamp {
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let actor = author::signer(user);
     match &state.publisher {
         Some(p) => p.stamp_with_actor(actor).await,
         None => boss_core::publisher::EventStamp::new("ledger", actor),
@@ -365,4 +369,53 @@ fn ledger_err(e: crate::error::LedgerError) -> Response {
 
 fn storage_err(e: sqlx::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// Backlog fe9d212c: the read gate answered a policy outage as 503
+    /// "policy engine unavailable" with no Retry-After, so a caller
+    /// could not tell it apart from any other 503 or learn when to ask
+    /// again. It answers through `PolicyClientError`'s one rendering
+    /// now. The real adapter against a port nothing listens on; the
+    /// pool is lazy and never reached, because the gate refuses first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_read_gate_answers_a_policy_outage_as_503_with_retry_after() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dark = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let app = router(LedgerApiState {
+            pool: PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
+            publisher: None,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+            policy: Arc::new(boss_policy_client::ReqwestPolicyClient::new(dark)),
+        });
+        let resp = app
+            .oneshot(
+                Request::get("/api/ledger/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(
+                boss_policy_client::POLICY_OUTAGE_RETRY_AFTER_SECS
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8_lossy(&body), "policy-unreachable");
+    }
 }

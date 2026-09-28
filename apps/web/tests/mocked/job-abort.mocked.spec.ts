@@ -9,7 +9,8 @@
 //   3. a viewer without the terminal's authority_role sees the control
 //      disabled with the role named.
 
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route } from './_test';
+import { servePeopleRows } from './_smokeMocks';
 
 const JOB_ID = 'job-abort-1';
 
@@ -53,6 +54,7 @@ async function baseMocks(page: Page, steps: MockStep[], viewer = EMP) {
   };
   await page.route('**/api/**', (r) => json(r, []));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP, BREWER]));
+  await servePeopleRows(page, [EMP, BREWER]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: viewer.name.toLowerCase(), employee_id: viewer.id, role: viewer.role }));
   await page.route(/\/api\/jobs\/live$/, (r) =>

@@ -8,9 +8,9 @@
 //!
 //! A View is deliberately not a Cloudflare-OS gadget. It holds a query
 //! and a layout, never records — so it stays a pure function of the
-//! same projections everything else reads, and two people running the
-//! same View see the same numbers because there is only one set of
-//! numbers.
+//! same projections everything else reads. It is scoped to whoever
+//! runs it, not to its author: a narrower role sees its own rows, and
+//! each result says which (`ViewResults::scope`, backlog 5392cf23).
 //!
 //! Design + decision history:
 //! `docs/architecture-decisions.md §Step UX & frontend`.
@@ -40,7 +40,9 @@ pub use flow::{Flow, FlowJob, FlowRepo, FlowStep};
 pub use in_memory::InMemoryViewsRepo;
 pub use os_map::{OsMap, OsMapEdge, OsMapNode, OsMapRepo};
 pub use port::{ViewResolver, ViewsRepo};
-pub use types::{View, ViewInput, ViewLayout, ViewResults, ViewSource, Visibility};
+pub use types::{
+    ResultScope, View, ViewInput, ViewLayout, ViewResults, ViewSource, ViewSources, Visibility,
+};
 
 #[cfg(feature = "postgres")]
 pub use postgres::PgViewsRepo;

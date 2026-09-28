@@ -283,10 +283,17 @@ async fn handle_event(
     // (or any newly-unblocked) step lands here as `ready`. We assign
     // those to a role-matched Employee so the workforce, which only
     // drives ASSIGNED steps, has something to pull. `active` is kept
-    // only as a defensive net: a claimed step always carries an
-    // assignee, so the assignee_id-already-set check below
-    // short-circuits it; were some path ever to emit an unassigned
-    // active step we'd still route it. Idempotency is that assignee
+    // as a net: a claimed step always carries an assignee, so the
+    // assignee_id-already-set check below short-circuits it, and since
+    // backlog 0f42efa0 the jobs API refuses a PUT that clears the
+    // holder of an active step without releasing it. One path still
+    // makes an unheld active step, measured on the in-memory API
+    // 2026-09-25: `PUT {status: active}` with no assignee on an
+    // unassigned ready step answers 204 (a surface's Start button with
+    // the picker on "unassigned", the sim) — the PUT-as-claim path, a
+    // separate item. Until that path claims or refuses, dropping
+    // `active` here would strand such a step with nobody to pull it,
+    // so the net stays. Idempotency is that assignee
     // check — an assigned step never re-routes through the dispatcher,
     // no matter how many status flips fire (the assignment PUT itself
     // emits a `jobs.step.updated`).
@@ -1185,18 +1192,180 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
             continue;
         }
         let text = resp.text().await.unwrap_or_default();
+        if finished_before_assignment(status.as_u16(), &text) {
+            debug!(
+                job_id,
+                step_id, emp_id, "step finished before its assignment arrived; nothing to hold"
+            );
+            return Ok(());
+        }
+        if held_before_assignment(status.as_u16(), &text) {
+            debug!(
+                job_id,
+                step_id, emp_id, "step was claimed before its assignment arrived; nothing to hold"
+            );
+            return Ok(());
+        }
         anyhow::bail!("PUT {url} returned {status}: {text}");
     }
+}
+
+/// The jobs API's refusal of a holder change on a step that is already
+/// completed or skipped. Since backlog 42e7c6b9 a finished step's
+/// `assignee_id` is frozen and a PUT that would move it is refused 409
+/// by name — it used to be written onto the finished row in silence,
+/// re-attributing who held it. For this caller that refusal is the
+/// answer "nobody needs to hold it now": a redelivered `step.ready`, or
+/// one that loses the race with a fast completion, would otherwise NAK
+/// to the dead-letter stream over work that is already done.
+fn finished_before_assignment(status: u16, body: &str) -> bool {
+    if status != 409 {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let terminal = matches!(
+        v.get("step_status").and_then(|s| s.as_str()),
+        Some("completed" | "skipped")
+    );
+    let holder_refused = v
+        .get("refused_fields")
+        .and_then(|f| f.as_array())
+        .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("assignee_id")));
+    terminal && holder_refused
+}
+
+/// The jobs API's refusal of a holder change on an ACTIVE step someone
+/// already holds (backlog 650ebd0c). The nomination is judged off the
+/// event payload, which cannot know a claim landed after it was
+/// emitted: the first PUT then meets the row-version refusal, JetStream
+/// redelivers, and the redelivered PUT used to write this pick over the
+/// claimant. The jobs API now refuses that write, and for this caller
+/// the refusal is the answer "somebody holds it": ack, as for a step
+/// that finished first, rather than NAK the same refusal to the
+/// dead-letter stream.
+fn held_before_assignment(status: u16, body: &str) -> bool {
+    if status != 409 {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let active = v.get("step_status").and_then(|s| s.as_str()) == Some("active");
+    let holder_refused = v
+        .get("refused_fields")
+        .and_then(|f| f.as_array())
+        .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("assignee_id")));
+    active && holder_refused
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Partition, StepEventPayload, born_placed, capability_executor, eligible_candidates,
-        event_partition, executor_for, is_active_holder, left_for_role_queue, owner_assignee,
-        owner_id_from_job_body, partition_permits, pick_index, pick_index_for, roster_union,
-        stable_hash,
+        event_partition, executor_for, finished_before_assignment, held_before_assignment,
+        is_active_holder, left_for_role_queue, owner_assignee, owner_id_from_job_body,
+        partition_permits, pick_index, pick_index_for, roster_union, stable_hash,
     };
+
+    /// The jobs API's refusal body for a holder change on a finished step
+    /// (its shape is pinned on the jobs side by
+    /// `each_frozen_field_is_refused_by_name_on_a_completed_step`).
+    fn terminal_refusal(step_status: &str, fields: &[&str]) -> String {
+        serde_json::json!({
+            "error": "step is terminal — these fields are immutable",
+            "step_id": "00000000-0000-0000-0000-000000000001",
+            "step_status": step_status,
+            "refused_fields": fields,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_step_finished_before_its_assignment_is_nothing_to_hold() {
+        assert!(finished_before_assignment(
+            409,
+            &terminal_refusal("completed", &["assignee_id"])
+        ));
+        assert!(finished_before_assignment(
+            409,
+            &terminal_refusal("skipped", &["assignee_id"])
+        ));
+    }
+
+    #[test]
+    fn every_other_refusal_is_still_an_error() {
+        // A refusal that is not about the holder, or not of a finished
+        // step, or not a 409 at all, still NAKs as before.
+        assert!(!finished_before_assignment(
+            409,
+            &terminal_refusal("completed", &["metadata"])
+        ));
+        assert!(!finished_before_assignment(
+            409,
+            &terminal_refusal("ready", &["assignee_id"])
+        ));
+        assert!(!finished_before_assignment(
+            422,
+            &terminal_refusal("completed", &["assignee_id"])
+        ));
+        assert!(!finished_before_assignment(409, "step is completed"));
+    }
+
+    /// The jobs API's refusal of a holder change on an ACTIVE step
+    /// someone holds (backlog 650ebd0c). Built by the jobs API's own
+    /// builder, never a hand copy of its shape: the jobs side's tests
+    /// assert the wire body equals the same builder's output, so a
+    /// change to the shape reaches this reader's test the same day
+    /// (backlog 0f42efa0, CLAUDE.md §9a). The variants below mutate
+    /// that body, one field at a time.
+    fn held_refusal(step_status: &str, fields: &[&str]) -> String {
+        let mut body = boss_jobs::active_holder::refusal_body(
+            "00000000-0000-0000-0000-000000000001",
+            "emp-claimant",
+        );
+        body["step_status"] = serde_json::json!(step_status);
+        body["refused_fields"] = serde_json::json!(fields);
+        body.to_string()
+    }
+
+    /// The builder's body, untouched, is the one this reader acks.
+    #[test]
+    fn the_jobs_apis_own_held_refusal_is_read_as_held() {
+        let body = boss_jobs::active_holder::refusal_body("s", "emp-claimant");
+        assert!(held_before_assignment(409, &body.to_string()));
+    }
+
+    /// A redelivered nomination that finds the step claimed is done:
+    /// the claimant holds it, so there is nothing to assign and nothing
+    /// to redeliver — an ack, not a NAK towards the dead-letter stream.
+    #[test]
+    fn a_step_claimed_before_its_assignment_is_nothing_to_hold() {
+        assert!(held_before_assignment(
+            409,
+            &held_refusal("active", &["assignee_id"])
+        ));
+    }
+
+    #[test]
+    fn a_held_refusal_is_read_only_in_its_own_shape() {
+        // Not about the holder, not an active step, or not a 409: still
+        // an error, so a real failure keeps NAKing as before.
+        assert!(!held_before_assignment(
+            409,
+            &held_refusal("active", &["metadata"])
+        ));
+        assert!(!held_before_assignment(
+            409,
+            &held_refusal("ready", &["assignee_id"])
+        ));
+        assert!(!held_before_assignment(
+            422,
+            &held_refusal("active", &["assignee_id"])
+        ));
+        assert!(!held_before_assignment(409, "step changed"));
+    }
     use crate::config::AssignmentStrategy;
     use boss_jobs::step_registry::StepRegistry;
     use std::collections::HashMap;
@@ -1231,6 +1400,163 @@ mod tests {
             None
         );
         assert_eq!(left_for_role_queue(None), None);
+    }
+
+    /// AN OPS-REQUEST'S EXECUTE IS NOBODY'S UNTIL A RUNNER PASS CLAIMS IT
+    /// (backlog fd7090cc, the re-review of 2026-09-25). The ops-runner
+    /// takes an approved execute through the claim door, signed as a
+    /// claimant unique to its pass, because that door is a
+    /// compare-and-set admitting a READY step only to an unheld row or to
+    /// its holder — which is what makes a passkey approval single-use.
+    /// But this dispatcher nominated every ops-request execute to the
+    /// agent executor about 50ms after it went ready (299 of the last
+    /// 300 live requests carried `assignee_id = agent-claude`), so every
+    /// runner claim would have been refused 409 and no approved write
+    /// would ever run. The protocol now declares the step a role queue
+    /// (`claimable`), and this reads the step exactly as the event
+    /// carries it, materialised from the tree's own bundle.
+    ///
+    /// Why a queue and not a declared runner assignee: the claim door is
+    /// idempotent for its holder, so a step born placed with one fixed
+    /// runner id would let two passes that both read `ready` both
+    /// "claim" it. Single-use needs the row unheld and each pass a
+    /// different claimant.
+    ///
+    /// The same case pins the precondition the re-review named: the live
+    /// row was v2, whose approve step required no sign-off, so the tree's
+    /// row must carry `platform-admin` there and pass the viability lint
+    /// `boss workflow publish` runs, or the fix cannot go live.
+    #[test]
+    fn an_ops_request_execute_is_left_for_its_role_queue() {
+        use boss_core::job::{JobId, StepId, Subject};
+        let spec =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .find(|w| w.kind == "ops-request")
+                .expect("ops-request ships in the platform bundle");
+        let problems = boss_jobs::workflow_lint::validate_workflow(&spec, &StepRegistry::v1());
+        assert!(
+            problems.is_empty(),
+            "the tree's ops-request must be publishable: {problems:?}"
+        );
+        let approve = spec
+            .steps
+            .iter()
+            .find(|s| s.title == "approve")
+            .expect("ops-request has an approve step");
+        assert_eq!(
+            approve.sign_offs_required,
+            vec!["platform-admin".to_string()],
+            "the approve step names who must stamp it"
+        );
+        let steps = boss_jobs::registry::materialize_steps(
+            &spec,
+            &Subject::new("custom", "forge"),
+            JobId::new(),
+            &serde_json::json!({"host": "forge", "verb": "reap-terminated-pods", "requires_approval": true}),
+            StepId::new,
+        );
+        let execute = steps
+            .iter()
+            .find(|s| s.spec_slug.as_deref() == Some("execute"))
+            .expect("ops-request has an execute step");
+        let payload: StepEventPayload =
+            serde_json::from_value(boss_jobs::events::step_state_payload(execute))
+                .expect("a serialised Step is a StepEventPayload");
+        assert!(
+            !born_placed(&payload),
+            "execute is born unheld: {:?}",
+            payload.assignee_id
+        );
+        assert_eq!(
+            left_for_role_queue(payload.metadata.as_ref()),
+            Some("claimable"),
+            "the dispatcher must leave execute unassigned, or the runner's claim is refused"
+        );
+        assert_eq!(
+            payload
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("authority_role"))
+                .and_then(|v| v.as_str()),
+            Some("platform-admin"),
+            "a queue is still gated on its role"
+        );
+    }
+
+    /// ONLY AN APPROVAL OPENS AN OPS-REQUEST'S EXECUTE (adversarial
+    /// re-review of fd7090cc, 2026-09-25). Reject runs the same ceremony
+    /// as Approve on both surfaces — the decision saved, a presence stamp
+    /// over the shape carrying it, the approve step completed — and
+    /// execute was ready on `steps.approve.done` alone, so a rejected plan
+    /// opened the write. This drives the tree's own row through the
+    /// readiness engine: `approved` makes execute ready and leaves the
+    /// request open; any other decision, or none, leaves execute pending
+    /// (a predicate that reads job metadata is never engine-skipped) and
+    /// makes the `refused` terminal ready, whose completion closes the
+    /// request and skips the rest.
+    #[test]
+    fn an_ops_request_runs_only_on_an_approved_decision() {
+        use boss_core::job::{JobId, StepId, StepStatus, Subject};
+        let spec =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .find(|w| w.kind == "ops-request")
+                .expect("ops-request ships in the platform bundle");
+        let job_md = serde_json::json!({"host": "forge", "verb": "reap-terminated-pods", "requires_approval": true});
+        let subject = Subject::new("custom", "forge");
+        let after = |decision: Option<serde_json::Value>| {
+            let mut steps = boss_jobs::registry::materialize_steps(
+                &spec,
+                &subject,
+                JobId::new(),
+                &job_md,
+                StepId::new,
+            );
+            let at = |steps: &[boss_core::job::Step], slug: &str| {
+                steps
+                    .iter()
+                    .position(|s| s.spec_slug.as_deref() == Some(slug))
+                    .expect("ops-request carries the step")
+            };
+            let filed = at(&steps, "filed");
+            steps[filed].status = StepStatus::Completed;
+            boss_jobs::registry::reevaluate(&spec, &mut steps, &subject, &job_md);
+            let approve = at(&steps, "approve");
+            assert_eq!(
+                steps[approve].status,
+                StepStatus::Ready,
+                "the flag makes approve ready"
+            );
+            steps[approve].status = StepStatus::Completed;
+            if let Some(d) = decision {
+                steps[approve].metadata["decision"] = d;
+            }
+            boss_jobs::registry::reevaluate(&spec, &mut steps, &subject, &job_md);
+            (
+                steps[at(&steps, "execute")].status,
+                steps[at(&steps, "refused")].status,
+            )
+        };
+        assert_eq!(
+            after(Some(serde_json::json!("approved"))),
+            (StepStatus::Ready, StepStatus::Pending),
+            "an approved plan opens execute and leaves the request open"
+        );
+        for d in [
+            Some(serde_json::json!("rejected")),
+            Some(serde_json::json!("changes-requested")),
+            Some(serde_json::json!(true)),
+            None,
+        ] {
+            assert_eq!(
+                after(d.clone()),
+                (StepStatus::Pending, StepStatus::Ready),
+                "decision {d:?} must never open execute; it closes the request refused"
+            );
+        }
     }
 
     /// FNV-1a is a fixed function of the input bytes — the SAME bytes hash to

@@ -50,12 +50,26 @@ export function revenueCategoryLabel(code: RevenueCategory): string {
 }
 
 // Fallback humanizer: `event-package` → `Event package`,
-// `taproom` → `Taproom`. Used when neither the tenant manifest
-// nor any of the legacy device-shop defaults below match.
+// `taproom` → `Taproom`. Used when the tenant manifest carries no
+// label for the code.
 function humanizeCategoryCode(code: string): string {
   if (!code) return '—';
   const spaced = code.replace(/-/g, ' ');
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+// The statuses no longer owed: paid, and written off — the write-off
+// credits 1100 A/R, so the receivable is gone though no cash came in.
+// Every other status is still owed. The server's one definition is
+// `InvoiceStatus::NOT_OWED` in boss-commerce, which open-AR and the
+// summary's AR aging read; this is its copy on the far side of the
+// wire, held equal to it by boss-commerce's
+// `the_spa_not_owed_list_is_the_servers` test (backlog 926d64a3).
+export const NOT_OWED: ReadonlyArray<InvoiceStatus> = ['paid', 'written-off'];
+
+/** True while the invoice is still a receivable. */
+export function isOwed(status: InvoiceStatus): boolean {
+  return !NOT_OWED.includes(status);
 }
 
 export const INVOICE_STATUS_LABEL: Record<InvoiceStatus, string> = {

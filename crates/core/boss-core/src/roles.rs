@@ -67,14 +67,204 @@ pub fn has_global_read(role: &str) -> bool {
     role == PLATFORM_ADMIN_ROLE || role == AUDIT_READONLY_ROLE || is_executive(role)
 }
 
-/// True for roles allowed to administer the gateway's auth surface
-/// (onboard local credentials, issue resets). Global-read roles keep
-/// the authority they have always had; `break-glass` joins them
-/// because auth administration is one of its three named levers —
-/// without it, a lockout emergency could not repair the door it came
-/// in through.
+/// The roles allowed to administer the gateway's auth surface
+/// (onboard local credentials, issue resets) — named, never derived.
+///
+/// - `platform-admin`: the deploy superuser, who onboards the first
+///   users and holds every registry write in core's policy defaults.
+/// - `break-glass`: auth administration is one of its three named
+///   levers; without it a lockout emergency could not repair the door
+///   it came in through.
+///
+/// This set used to be `has_global_read` plus break-glass (backlog
+/// 34242f9a, 2026-09-25). Global read is a READ grant, and inheriting
+/// it handed a write to two members that were never meant to hold
+/// one: `audit-readonly`, the role `POST /api/auth/guest` mints for
+/// any anonymous visitor and whose own contract says it never writes;
+/// and every tenant-flagged executive, whose `is_executive` flag
+/// means "reads everything" and was never a grant to overwrite any
+/// credential — the platform-admin's included, which makes onboard a
+/// path from a tenant role to the deploy superuser.
+pub const AUTH_ADMINISTRATOR_ROLES: [&str; 2] = [PLATFORM_ADMIN_ROLE, BREAK_GLASS_ROLE];
+
+/// True for exactly the roles in [`AUTH_ADMINISTRATOR_ROLES`].
 pub fn can_administer_auth(role: &str) -> bool {
-    has_global_read(role) || role == BREAK_GLASS_ROLE
+    AUTH_ADMINISTRATOR_ROLES.contains(&role)
+}
+
+/// Visitor role — the anonymous guest on an install offering BASIC
+/// guest access, the OSS default (design 2830b6b7, decided 2026-09-25:
+/// "the default for the OSS repo be guest accounts with only basic
+/// access, whatever that means for that install"). It reads what the
+/// install grants the role as policy data and nothing else: it is not
+/// in [`has_global_read`], so the name-keyed gates on that (the events
+/// tail, the people scope routes) refuse it without an edit of their
+/// own.
+///
+/// Named `visitor` and NOT `guest`: `guest` is the role the policy
+/// extractor gives a request that arrived with no `x-boss-user` header
+/// — a loopback sibling or a test harness — and `boss-jobs` `trust.rs`
+/// and boss-messages admit that string for WRITES. A browser session
+/// carrying it would pass those doors.
+pub const VISITOR_ROLE: &str = "visitor";
+
+/// The roles that read and never write — the two a guest session can
+/// carry. `audit-readonly` is the system-audit read (the external
+/// auditor, and a guest on an instance that opts in to it);
+/// `visitor` is the basic guest. Every read-only guard asks
+/// [`is_read_only_floor`] rather than naming a role, because three such
+/// guards once keyed on the NAME `audit-readonly` and a new guest role
+/// added only to policy would have passed all three (sim-clock control,
+/// the simulator, surface opens).
+///
+/// `guest` is deliberately not here: it is the no-header trusted-
+/// internal sentinel, not a session, and the doors that refuse it keep
+/// their own check beside this one.
+pub const READ_ONLY_FLOOR_ROLES: [&str; 2] = [AUDIT_READONLY_ROLE, VISITOR_ROLE];
+
+/// True for exactly the roles in [`READ_ONLY_FLOOR_ROLES`] — the ONE
+/// predicate for "read-only role". The gateway refuses every method but
+/// GET/HEAD/OPTIONS from a session whose effective role answers true
+/// here, before any upstream sees the request, because about 110
+/// upstream write routes authorized no caller and a guest session
+/// carries one of these roles (backlog 07e797b4, 2026-09-25). That edge
+/// landed asking an `audit-readonly`-only predicate of its own the same
+/// day this list gained `visitor`; the two were merged into this one so
+/// a Basic guest is refused at the edge like an Audit guest, and a role
+/// joining the floor here is refused there with no edit.
+pub fn is_read_only_floor(role: &str) -> bool {
+    READ_ONLY_FLOOR_ROLES.contains(&role)
+}
+
+/// The role a session acts as when it carries none: [`VISITOR_ROLE`],
+/// the least access, where it used to be `audit-readonly` — the widest
+/// read. A session reaching a backend without a role is a defect
+/// somewhere upstream, and a defect should not widen what a stranger
+/// reads (design 2830b6b7).
+///
+/// A role that is present but blank is carried none, too. It used to
+/// come back as itself, and `""` is not on [`READ_ONLY_FLOOR_ROLES`], so
+/// an employee row with an empty role was a WRITER at the edge refusal
+/// (backlog e0996bca and 315edfab, 2026-09-25). Only blank is mapped:
+/// a padded or mis-cased name is not trimmed into a real role here,
+/// because normalising toward a writer is the wrong direction — the
+/// login's [`employee_session_role`] makes it a visitor instead.
+pub fn effective_role(role: Option<&str>) -> &str {
+    match role {
+        Some(r) if !r.trim().is_empty() => r,
+        _ => VISITOR_ROLE,
+    }
+}
+
+/// The roles core itself names, which mean the same on every install
+/// whether or not the tenant's Class registry lists them, and which an
+/// employee row may carry into a session: the deploy superuser and the
+/// two read-only floor roles. A row carrying one needs no registry
+/// answer, so the operator's login never waits on the registry being up.
+///
+/// Break-glass is NOT here, though core names it too: it was until
+/// backlog 8f45e0b4 (2026-09-27), and that let a row carrying it sign in
+/// as break-glass by password or OIDC. It is in
+/// [`ROLES_NO_ROW_CARRIES`] instead.
+pub const PLATFORM_ROLES: [&str; 3] = [PLATFORM_ADMIN_ROLE, AUDIT_READONLY_ROLE, VISITOR_ROLE];
+
+/// Roles an employee row may NAME but never carry into a session; a row
+/// naming one mints the visitor.
+///
+/// - [`GUEST_ROLE`] — the no-header sentinel the policy extractor mints,
+///   never an employee's role (backlog e0996bca item 3).
+/// - [`BREAK_GLASS_ROLE`] — minted by the gateway's hardware-key
+///   ceremony (`boss-gateway` `break_glass.rs`) and by nothing else.
+///   Its three levers (auth administration, merge approval, deploy
+///   rollback) are what the key in the room proves someone may pull; a
+///   row is text anyone with SQL can write, and a password or OIDC login
+///   proves nothing about a key (backlog 8f45e0b4, 2026-09-27).
+pub const ROLES_NO_ROW_CARRIES: [&str; 2] = [GUEST_ROLE, BREAK_GLASS_ROLE];
+
+/// The session role for an employee row's `role` when it can be
+/// answered WITHOUT the Class registry, else `None`.
+///
+/// - blank, or one of [`ROLES_NO_ROW_CARRIES`] — the visitor. `guest`
+///   is the no-header sentinel the policy extractor mints, never an
+///   employee's role (backlog e0996bca item 3: a row carrying it read as
+///   trusted-internal until e84de48e keyed trust on the access tier);
+///   break-glass is the hardware key's alone (backlog 8f45e0b4).
+///   Settled HERE, before the registry is asked, so no `role` Class of
+///   either name can vouch a row into one.
+/// - one of [`PLATFORM_ROLES`] — itself.
+/// - anything else — `None`: a tenant role is the registry's to answer.
+pub fn settled_session_role(role: &str) -> Option<&str> {
+    if role.trim().is_empty() || ROLES_NO_ROW_CARRIES.contains(&role) {
+        Some(VISITOR_ROLE)
+    } else if PLATFORM_ROLES.contains(&role) {
+        Some(role)
+    } else {
+        None
+    }
+}
+
+/// The role a session minted from an employee row carries: the row's
+/// role when it means something here — settled by
+/// [`settled_session_role`], or a live `role` Class (`registered`) —
+/// and otherwise the visitor, the least access, on the read-only floor.
+///
+/// Roles are Class data (docs/design/class-registry.md), and the
+/// people service validates a role against the registry on write; but
+/// a row seeded by SQL, a Class retired after the row was written, or
+/// an empty role reached the login unchecked and was minted as-is into
+/// a session that wrote past the edge (backlog e0996bca, 2026-09-25).
+/// A role nobody registered is a typo or a leftover, and the answer to
+/// either is the locked-down guest, never a writer.
+pub fn employee_session_role(role: &str, registered: bool) -> &str {
+    settled_session_role(role).unwrap_or(if registered { role } else { VISITOR_ROLE })
+}
+
+// ---------------------------------------------------------------------------
+// The identities minted for someone nobody can name
+// ---------------------------------------------------------------------------
+//
+// Spelled once, here, because two crates mint them and a third must
+// recognise them: the gateway mints the guest session, the policy
+// client's `CurrentUser` extractor mints the identity of a request that
+// carries none, and the policy service refuses both any policy authority
+// (backlog b8e75382, 2026-09-25: an override on `guest@algedonic.dev`
+// let a guest session write policy rules). `GUEST_EMAIL` lived in
+// `boss-gateway::local_auth` until then; a copy of it in the policy
+// service would have been a second list to drift.
+
+/// The guest session's fixed identity. It is a real address on the demo
+/// tenant's domain rather than something like `anonymous@local`
+/// because it shows up in the audit log as an actor, and an actor in
+/// the log should be a name you can look up.
+pub const GUEST_EMAIL: &str = "guest@algedonic.dev";
+
+/// The id `CurrentUser` gives a request that reached a service with no
+/// `x-boss-user` header at all.
+pub const ANONYMOUS_USER_ID: &str = "anonymous";
+
+/// The role `CurrentUser` gives that same identity-less request: every
+/// rule denies it except the unauth landing surface's workflow read.
+pub const GUEST_ROLE: &str = "guest";
+
+/// Every id an anonymous visitor can carry downstream: the guest
+/// session's, and the identity-less request's.
+pub const ANONYMOUS_VISITOR_IDS: [&str; 2] = [GUEST_EMAIL, ANONYMOUS_USER_ID];
+
+/// True when `role` is one an anonymous visitor can carry downstream:
+/// the identity-less request's `guest`, or any role in the read-only
+/// set — `audit-readonly` today, the role `POST /api/auth/guest` mints
+/// and the gateway falls back to for a session that names none. Built
+/// ON [`is_read_only_floor`] rather than beside it, so a role design
+/// 2830b6b7 adds to that set is refused policy authority too. The
+/// seeded `emp-audit` login shares `audit-readonly`, and its contract
+/// says it never writes either.
+pub fn is_anonymous_visitor_role(role: &str) -> bool {
+    role == GUEST_ROLE || is_read_only_floor(role)
+}
+
+/// True when `id` or `role` is one an anonymous visitor can carry.
+pub fn is_anonymous_visitor(id: &str, role: &str) -> bool {
+    ANONYMOUS_VISITOR_IDS.contains(&id) || is_anonymous_visitor_role(role)
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +376,212 @@ mod tests {
         seed_executive_set();
         assert!(can_administer_auth(BREAK_GLASS_ROLE));
         assert!(can_administer_auth(PLATFORM_ADMIN_ROLE));
-        assert!(can_administer_auth("ceo"));
         assert!(!can_administer_auth("service-tech"));
+    }
+
+    /// Backlog 34242f9a (2026-09-25). `audit-readonly` is the role
+    /// the guest endpoint mints for any anonymous visitor, and its own
+    /// contract above says it never writes. It held global read, and
+    /// auth administration used to inherit that set whole — so a
+    /// guest could overwrite any local credential. Global read is not
+    /// write authority; this pins the two apart.
+    #[test]
+    fn audit_readonly_cannot_administer_auth() {
+        seed_executive_set();
+        assert!(has_global_read(AUDIT_READONLY_ROLE), "the read half stays");
+        assert!(!can_administer_auth(AUDIT_READONLY_ROLE));
+    }
+
+    /// Same defect, second member: a tenant-flagged executive's
+    /// `is_executive` is a READ flag, and onboard overwrites ANY
+    /// credential — the platform-admin's included — so inheriting it
+    /// would let a tenant role make itself the deploy superuser.
+    #[test]
+    fn a_seeded_executive_cannot_administer_auth() {
+        seed_executive_set();
+        assert!(has_global_read("ceo"), "the read half stays");
+        for role in ["ceo", "coo", "cto", "cfo"] {
+            assert!(
+                !can_administer_auth(role),
+                "{role} must not administer auth"
+            );
+        }
+    }
+
+    /// Backlog b8e75382: the ids and roles the policy service refuses
+    /// policy authority to are the ones the gateway and the extractor
+    /// actually mint — a real employee and the deploy superuser are
+    /// not among them.
+    #[test]
+    fn anonymous_visitors_are_the_minted_identities_and_no_one_else() {
+        assert!(is_anonymous_visitor(GUEST_EMAIL, AUDIT_READONLY_ROLE));
+        assert!(is_anonymous_visitor(ANONYMOUS_USER_ID, GUEST_ROLE));
+        assert!(is_anonymous_visitor("emp-audit", AUDIT_READONLY_ROLE));
+        assert!(is_anonymous_visitor(GUEST_EMAIL, PLATFORM_ADMIN_ROLE));
+        assert!(!is_anonymous_visitor("emp-founder", PLATFORM_ADMIN_ROLE));
+        assert!(!is_anonymous_visitor("emp-oncall", BREAK_GLASS_ROLE));
+    }
+
+    /// The admitted set is named, not derived: exactly these two.
+    #[test]
+    fn auth_administrators_are_named_explicitly() {
+        seed_executive_set();
+        for role in ["", "guest", "admin", "smoke-tester", "owner"] {
+            assert!(
+                !can_administer_auth(role),
+                "{role:?} must not administer auth"
+            );
+        }
+        assert_eq!(
+            AUTH_ADMINISTRATOR_ROLES,
+            [PLATFORM_ADMIN_ROLE, BREAK_GLASS_ROLE]
+        );
+    }
+
+    /// Design 2830b6b7 (decided 2026-09-25): the read-only floor is
+    /// the two roles a guest can carry and nothing else. A role that
+    /// merely READS everything (platform-admin, a seeded executive) is
+    /// not on it, nor is break-glass, nor `guest` — that string is the
+    /// no-header trusted-internal sentinel, and every door that asks
+    /// this predicate keeps its own `guest` check beside it. The
+    /// gateway refuses every write from a role on the floor (07e797b4),
+    /// so a false positive here locks a writer out at the edge.
+    #[test]
+    fn the_read_only_floor_is_audit_readonly_and_visitor() {
+        seed_executive_set();
+        assert_eq!(READ_ONLY_FLOOR_ROLES, [AUDIT_READONLY_ROLE, VISITOR_ROLE]);
+        assert!(is_read_only_floor(AUDIT_READONLY_ROLE));
+        assert!(is_read_only_floor(VISITOR_ROLE));
+        for role in [
+            PLATFORM_ADMIN_ROLE,
+            BREAK_GLASS_ROLE,
+            "guest",
+            "ceo",
+            "service-tech",
+            "",
+            "Visitor",
+            "Audit-Readonly",
+        ] {
+            assert!(!is_read_only_floor(role), "{role:?} is not the floor");
+        }
+    }
+
+    /// `visitor` is a NEW name, not a second spelling of `guest` — the
+    /// no-header sentinel `trust.rs` and boss-messages admit for writes.
+    /// And it is outside global read: the OSS guest reads only what the
+    /// install grants it as policy rows, so the name-keyed gates on
+    /// `has_global_read` (the events tail, people `bootstrap_by_email`)
+    /// refuse it with no edit of their own.
+    #[test]
+    fn a_visitor_is_not_the_headerless_guest_and_has_no_global_read() {
+        seed_executive_set();
+        assert_eq!(VISITOR_ROLE, "visitor");
+        assert_ne!(VISITOR_ROLE, "guest");
+        assert!(!has_global_read(VISITOR_ROLE));
+        assert!(!has_broad_account_access(VISITOR_ROLE));
+        assert!(!can_administer_auth(VISITOR_ROLE));
+    }
+
+    /// A session that reaches a backend with no role acts as the LEAST
+    /// access, not the widest read: the fallback used to be
+    /// `audit-readonly`, Read on every shipped resource (design 2830b6b7).
+    #[test]
+    fn a_session_without_a_role_acts_as_a_visitor() {
+        assert_eq!(effective_role(None), VISITOR_ROLE);
+        assert_eq!(effective_role(Some("service-tech")), "service-tech");
+        assert_eq!(
+            effective_role(Some(AUDIT_READONLY_ROLE)),
+            AUDIT_READONLY_ROLE
+        );
+    }
+
+    /// Backlog e0996bca item (2) and 315edfab item (2), 2026-09-25: a
+    /// role that is present but blank is not a role. `Some("")` used to
+    /// come back as `""`, which is not on the read-only floor, so an
+    /// employee row with an empty role wrote past the edge refusal.
+    #[test]
+    fn a_blank_role_acts_as_a_visitor() {
+        for blank in ["", " ", "   ", "\t", "\n"] {
+            assert_eq!(effective_role(Some(blank)), VISITOR_ROLE, "{blank:?}");
+            assert!(is_read_only_floor(effective_role(Some(blank))));
+        }
+    }
+
+    /// The roles core names and a row may carry hold their meaning
+    /// without the tenant's Class registry — the operator's login must
+    /// not depend on a registry being up. A blank role, the headerless
+    /// sentinel `guest` and break-glass (the hardware key's alone,
+    /// backlog 8f45e0b4) are settled too, as the visitor. Every other
+    /// role is the registry's to answer.
+    #[test]
+    fn platform_roles_are_settled_and_tenant_roles_ask_the_registry() {
+        for role in PLATFORM_ROLES {
+            assert_eq!(settled_session_role(role), Some(role), "{role}");
+        }
+        assert_eq!(
+            PLATFORM_ROLES,
+            [PLATFORM_ADMIN_ROLE, AUDIT_READONLY_ROLE, VISITOR_ROLE]
+        );
+        assert_eq!(ROLES_NO_ROW_CARRIES, [GUEST_ROLE, BREAK_GLASS_ROLE]);
+        for sentinel in ["", "  ", GUEST_ROLE, BREAK_GLASS_ROLE] {
+            assert_eq!(settled_session_role(sentinel), Some(VISITOR_ROLE));
+        }
+        for tenant in [
+            "quartermaster",
+            "engineering-agent",
+            " platform-admin",
+            "Visitor",
+        ] {
+            assert_eq!(settled_session_role(tenant), None, "{tenant:?}");
+        }
+    }
+
+    /// A session minted from an employee row carries that row's role
+    /// only when the role means something here: a platform role, or a
+    /// live `role` Class. Anything else — blank, the `guest` sentinel,
+    /// a typo, a retired Class — is the visitor, on the read-only
+    /// floor, never a writer at the edge.
+    #[test]
+    fn an_unregistered_employee_role_mints_a_visitor() {
+        assert_eq!(
+            employee_session_role("quartermaster", true),
+            "quartermaster"
+        );
+        assert_eq!(employee_session_role("quartermaster", false), VISITOR_ROLE);
+        assert_eq!(employee_session_role(" quartermaster", false), VISITOR_ROLE);
+        assert_eq!(employee_session_role("", true), VISITOR_ROLE);
+        assert_eq!(employee_session_role("   ", true), VISITOR_ROLE);
+        assert_eq!(employee_session_role(GUEST_ROLE, true), VISITOR_ROLE);
+        for role in PLATFORM_ROLES {
+            assert_eq!(employee_session_role(role, false), role, "{role}");
+        }
+        assert!(is_read_only_floor(employee_session_role("typo", false)));
+    }
+
+    /// Backlog 8f45e0b4 (2026-09-27): break-glass is minted by the
+    /// hardware-key ceremony and by nothing else. An employee row that
+    /// NAMES it — people-api refuses to write one, so only SQL reaches
+    /// it — used to be settled as itself, and a password or OIDC login
+    /// then carried auth administration, merge approval and deploy
+    /// rollback with no key in the room. The row mints a visitor, and a
+    /// registry that answers "registered" (a `role` Class someone made
+    /// by that name) does not change that: the row is refused before
+    /// the registry is asked.
+    #[test]
+    fn a_break_glass_row_mints_a_visitor_never_break_glass() {
+        assert!(!PLATFORM_ROLES.contains(&BREAK_GLASS_ROLE));
+        assert!(ROLES_NO_ROW_CARRIES.contains(&BREAK_GLASS_ROLE));
+        assert_eq!(settled_session_role(BREAK_GLASS_ROLE), Some(VISITOR_ROLE));
+        for registered in [true, false] {
+            assert_eq!(
+                employee_session_role(BREAK_GLASS_ROLE, registered),
+                VISITOR_ROLE,
+                "registered={registered}"
+            );
+        }
+        assert!(!can_administer_auth(employee_session_role(
+            BREAK_GLASS_ROLE,
+            true
+        )));
     }
 }

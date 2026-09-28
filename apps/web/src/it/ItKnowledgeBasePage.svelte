@@ -28,18 +28,19 @@
   import primitivesSvg from './kb-assets/01-primitives.svg';
   import serviceMapSvg from './kb-assets/02-service-map.svg';
   import deploymentSvg from './kb-assets/03-deployment.svg';
+  import { safeLinkHref } from '@boss/web-kit/links';
 </script>
 
 {#snippet diagram(src: string, alt: string)}
   <div class="arch-diagram">
     <img
-      src={src}
+      src={safeLinkHref(src)}
       {alt}
       style="display:block; margin:0 auto; width:max(100%, 1600px); height:auto"
     />
   </div>
-  <div style="font-size:12px; color:#78716c; margin-top:6px; text-align:right">
-    <a href={src} target="_blank" rel="noopener noreferrer">Open at full size ↗</a>
+  <div style="font-size:12px; color:var(--static); margin-top:6px; text-align:right">
+    <a href={safeLinkHref(src)} target="_blank" rel="noopener noreferrer">Open at full size ↗</a>
   </div>
 {/snippet}
 
@@ -57,18 +58,18 @@
     display: flex;
     gap: 14px;
     align-items: flex-start;
-    border: 1px solid #e7e5e4;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
     padding: 14px 16px;
-    background: #fff;
+    background: var(--ink);
   }
   .layer p {
     margin: 4px 0 0;
     font-size: 14px;
     line-height: 1.55;
-    color: #44403c;
+    color: var(--static);
   }
-  .layer strong { font-size: 15px; color: #1c1917; }
+  .layer strong { font-size: 15px; color: var(--fog); }
   .layer-n {
     flex: 0 0 28px;
     height: 28px;
@@ -77,18 +78,18 @@
     place-items: center;
     font-size: 13px;
     font-weight: 600;
-    color: #1c1917;
+    color: var(--fog);
   }
-  .layer-actors   { border-left: 4px solid #a8a29e; }
-  .layer-actors   .layer-n { background: #f5f5f4; }
-  .layer-protocols { border-left: 4px solid #78716c; }
-  .layer-protocols .layer-n { background: #e7e5e4; }
-  .layer-network  { border-left: 4px solid #44403c; }
-  .layer-network  .layer-n { background: #d6d3d1; }
+  .layer-actors   { border-left: 4px solid var(--hairline); }
+  .layer-actors   .layer-n { background: var(--ink-raised); }
+  .layer-protocols { border-left: 4px solid var(--border-strong); }
+  .layer-protocols .layer-n { background: var(--ink-raised); }
+  .layer-network  { border-left: 4px solid var(--border-strong); }
+  .layer-network  .layer-n { background: var(--ink-raised); }
 
   .arch-diagram {
-    background: #fff;
-    border: 1px solid #e7e5e4;
+    background: var(--ink);
+    border: 1px solid var(--hairline);
     border-radius: 8px;
     padding: 16px;
     overflow: auto;
@@ -97,15 +98,19 @@
 </style>
 
 <div class="catalog theme-it">
-  <Breadcrumb to={href('/')}>← Home</Breadcrumb>
+  <!-- A breadcrumb names the page's parent, and this page's parent is
+       the IT department — the words MapPage's own crumb uses (846f0b51).
+       The eyebrow says IT for the same reason: /system became /it on
+       2026-08-31 (839a7f0f). -->
+  <Breadcrumb to={href('/it')}>← The IT world</Breadcrumb>
 
   <PageHeader
-    eyebrow="System Model · Knowledge Base"
+    eyebrow="IT · Knowledge Base"
     title="Knowledge Base"
     subtitle="The reading frame, then the four architecture diagrams — the reference for how BOSS is put together"
   />
 
-  <div style="background:#dbeafe; border:1px solid #bfdbfe; border-radius:8px; padding:14px 16px; margin-bottom:16px; font-size:14px; line-height:1.55; color:#1c1917">
+  <div style="background:var(--signal-wash); border:1px solid var(--signal); border-radius:8px; padding:14px 16px; margin-bottom:16px; font-size:14px; line-height:1.55; color:var(--fog)">
     <strong style="display:block; margin-bottom:4px">What lives here</strong>
     The reading frame (§0–1) followed by the four architecture diagrams, rendered from
     <code>docs/architecture/*.mmd</code> on every diagram-regen — a
@@ -120,20 +125,27 @@
 
   <nav
     aria-label="Knowledge Base jump nav"
-    style="display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px; margin-bottom:8px; background:#fafaf9; border:1px solid #e7e5e4; border-radius:8px; font-size:13px"
+    style="display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px; margin-bottom:8px; background:var(--ink-raised); border:1px solid var(--hairline); border-radius:8px; font-size:13px"
   >
-    <span style="color:#78716c; margin-right:4px">Jump to:</span>
-    <a href="#it-layers"      style="color:#1c1917">0 · The three layers</a>
-    <span style="color:#d6d3d1">·</span>
-    <a href="#it-framing"     style="color:#1c1917">1 · Execution lens</a>
-    <span style="color:#d6d3d1">·</span>
-    <a href="#it-primitives"  style="color:#1c1917">2 · Primitives</a>
-    <span style="color:#d6d3d1">·</span>
-    <a href="#it-service-map" style="color:#1c1917">3 · Service map</a>
-    <span style="color:#d6d3d1">·</span>
-    <a href="#it-deployment"  style="color:#1c1917">4 · Deployment</a>
-    <span style="color:#d6d3d1">·</span>
-    <a href={href('/it/registry')} style="color:#1c1917">Workflows ↗</a>
+    <span style="color:var(--static); margin-right:4px">Jump to:</span>
+    <a href="#it-layers"      style="color:var(--fog)">0 · The three layers</a>
+    <span style="color:var(--static)">·</span>
+    <a href="#it-framing"     style="color:var(--fog)">1 · Execution lens</a>
+    <span style="color:var(--static)">·</span>
+    <a href="#it-primitives"  style="color:var(--fog)">2 · Primitives</a>
+    <span style="color:var(--static)">·</span>
+    <a href="#it-service-map" style="color:var(--fog)">3 · Service map</a>
+    <span style="color:var(--static)">·</span>
+    <a href="#it-deployment"  style="color:var(--fog)">4 · Deployment</a>
+    <span style="color:var(--static)">·</span>
+    <!-- Each label promises what the catalog calls the page it lands on
+         (200d474c). /it/design is where the design-doc packets — the
+         decision record in the making — are read (d133ebf0); no repo
+         file is linked, because on any other deployer's instance it
+         would point at our LAN-only forge. -->
+    <a href={href('/it/registry')} style="color:var(--fog)">Registry ↗</a>
+    <span style="color:var(--static)">·</span>
+    <a href={href('/it/design')} style="color:var(--fog)">Design decisions ↗</a>
   </nav>
 
   <div class="tab-content" style="display:flex; flex-direction:column; gap:24px; padding:16px 0">
@@ -222,12 +234,14 @@
         of record) — cover every business entity worth modeling.
       </p>
       <p class="prose" style="margin-bottom:16px">
-        <strong>Class</strong>, <strong>Part</strong>, <strong>Composite</strong>,
-        Location and Reservation are <em>supporting</em> concepts that hang off those
-        four — load-bearing infrastructure, not foundational vocabulary. Class is the
-        data-driven taxonomy layer (roles, types, categories) so tenants extend without
-        forking core. Cross-cutting rails (policy, ledger, messages) are called through
-        typed client ports.
+        Three <em>supporting</em> concepts hang off those four — load-bearing
+        infrastructure, not foundational vocabulary. The <strong>Class registry</strong>
+        is the reference data each Subject kind owns: one table carries every taxonomy
+        (roles, account types, asset models), so a tenant extends one without forking
+        core. <strong>StepPlugins</strong> are UX extensions on Steps: a small JS bundle,
+        shipped as a registry row, that renders a custom surface for a step kind.
+        <strong>Policy</strong> is the privilege model: every write passes through
+        <code>boss-policy</code>, and its rules are rows.
       </p>
       {@render diagram(primitivesSvg, 'Primitives and abstractions')}
     </section>
@@ -235,10 +249,11 @@
     <section id="it-service-map" class="tab-section tab-section-wide" style="scroll-margin-top:16px">
       <h3 style="margin-top:0">3. Service map (domains)</h3>
       <p class="prose" style="margin-bottom:16px">
-        Every shipped service grouped by tier — core state-machine OS,
-        company-modeling modules, cross-tier orchestrators, sim bridges,
-        and the two example tenants. Services talk only through typed
-        cross-service client crates; no direct DB access between services.
+        Every service in the port registry (<code>boss-ports</code>), grouped by
+        crate tier — core state-machine OS, company-modeling modules, cross-tier
+        orchestrators, and the one example tenant. Services talk
+        only through typed cross-service client crates; no direct DB access between
+        services.
       </p>
       {@render diagram(serviceMapSvg, 'Service map')}
     </section>
@@ -246,12 +261,21 @@
     <section id="it-deployment" class="tab-section tab-section-wide" style="scroll-margin-top:16px">
       <h3 style="margin-top:0">4. Deployment topology</h3>
       <p class="prose" style="margin-bottom:16px">
-        The reference single-VM topology BOSS ships with: gateway +
-        primitive services + operational modules + cross-cutting rails
-        + tenant engines + periodic timers, all systemd-managed against
-        a single Postgres + NATS. Multi-VM splits, cloud-provider
-        provisioning, and edge-CDN choice are per-tenant deployment
-        questions, not core BOSS reference.
+        What a deployer runs: the open-source quickstart,
+        <code>infra/oss-quickstart/</code>. Docker compose brings up Postgres, NATS
+        and one <code>boss-services</code> container, whose launcher starts every
+        service in the port registry that the tenant's manifest asks for, the
+        gateway last. A one-shot <code>boss-init</code> converges the schema and
+        the platform Workflow bundle on every start. The gateway serves the SPA
+        and every <code>/api/*</code> route on port 4443 over plain HTTP; TLS is
+        the job of a reverse proxy you put in front of it.
+      </p>
+      <p class="prose" style="margin-bottom:16px">
+        <!-- Where THIS instance runs is data the estate registry holds and
+             /it/estate renders; drawing it here would be a second copy
+             that drifts (34717528). -->
+        How this instance runs is data, not a drawing:
+        <a href={href('/it/estate')}>This instance's estate, live ↗</a>
       </p>
       {@render diagram(deploymentSvg, 'Deployment topology')}
     </section>

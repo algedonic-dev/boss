@@ -13,7 +13,9 @@ target
 # infra/dev/wt-web links a worktree's node_modules to the operator's as
 # SYMLINKS, which are not directories to the ignore rules — so the
 # pattern that hid a bun install left three untracked paths in every
-# builder worktree (backlog ef4394e1, 2026-09-14). Pinned in wt_web_sh.rs.
+# builder worktree (backlog ef4394e1, 2026-09-14). wt-web installs real
+# directories since 2026-09-27 (backlog 44f1cd1e), which either form
+# matches; the slash stays off for any link left behind. Pinned in wt_web_sh.rs.
 node_modules
 dist/
 .next/

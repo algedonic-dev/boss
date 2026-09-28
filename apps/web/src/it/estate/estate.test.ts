@@ -1,19 +1,44 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
-  bastionOf,
-  bastionRoutes,
   comparisonVerdict,
-  DEV_SSH_DOOR,
-  DEV_SSH_LABEL,
-  DEV_SSH_URL,
+  DEV_DOOR_HOST,
+  devDoorSteps,
+  ESTATE_LOOPS,
   fetchEstate,
-  latestByScope,
+  HOST_COMPARISONS_READ,
+  hostCoverText,
+  hostLines,
+  hostPageIsWhole,
+  hostPlan,
+  hostSeriesRead,
+  CLUSTER_COMPARISON_READ,
+  CLUSTER_OBSERVATIONS_READ,
+  freshnessText,
   latestComparison,
+  latestPerHost,
+  loopAge,
+  loopHost,
+  loopPlan,
+  loopQueries,
+  LOOP_OK_OUTCOMES,
+  missingHostText,
+  OPS_REQUEST_KIND,
+  OPS_RUNNER_ROLE,
   parseComparisons,
+  parseHostComparisons,
+  parseLoopPackets,
   parseNodes,
   parseObservations,
+  parseSeriesPage,
+  seriesAbsentText,
+  seriesFreshness,
+  STALE_MIN_CADENCE_S,
+  STALE_MIN_OBSERVATIONS,
+  STALE_MULTIPLIER,
+  unitsVerdict,
   type Comparison,
+  type LoopRow,
 } from './estate';
 
 const realFetch = globalThis.fetch;
@@ -58,18 +83,171 @@ describe('parseNodes', () => {
   });
 });
 
-describe('observations and comparisons', () => {
-  test('latestByScope keeps the newest-first row per scope', () => {
-    const rows = parseObservations([
-      obsEvent('kubernetes-nodes', '2026-08-31T10:20:00Z', [{ id: 'a' }, { id: 'b' }]),
-      obsEvent('host', '2026-08-31T10:25:00Z'),
-      obsEvent('kubernetes-nodes', '2026-08-30T10:20:00Z'),
-    ]);
-    const byScope = latestByScope(rows);
-    expect(byScope.get('kubernetes-nodes')?.nodes).toHaveLength(2);
-    expect(byScope.get('host')?.observed_at).toBe('2026-08-31T10:25:00Z');
+// ONE SCOPED READ PER RENDERED SERIES (backlog 75027a93; page audit
+// 2cff1d6e, GAP 4). The page read one unscoped page of 20 observation
+// rows across every scope — measured 2026-09-27 17:14Z it held 11
+// host-units rows, 6 door, 2 host (both forge's) and 1 kubernetes-nodes,
+// of 6106, and boss-gcp's daily host reading at 10:25Z was not among
+// them, so boss-gcp had no host line at all. A limit is not a filter:
+// each series is its own read, and "never recorded" is said only when
+// that read's total is 0.
+describe('the series reads', () => {
+  test('the cluster series and each host\'s two series are read scoped, the host ones by host', () => {
+    expect(CLUSTER_OBSERVATIONS_READ).toBe('/api/estate/observations?scope=kubernetes-nodes&limit=10');
+    expect(CLUSTER_COMPARISON_READ).toBe('/api/estate/comparisons?scope=kubernetes-nodes&limit=1');
+    expect(hostSeriesRead('host', 'boss-gcp')).toBe('/api/estate/observations?scope=host&host=boss-gcp&limit=10');
+    expect(hostSeriesRead('host-units', 'a b')).toBe('/api/estate/observations?scope=host-units&host=a%20b&limit=10');
   });
 
+  test('a series page keeps only its own rows, and the total the server counted', () => {
+    // A jobs API that predates ?host= answers the whole scope to every
+    // host's read (the alarm's own guard, estate_alarm.rs); a neighbour's
+    // rows are not this host's series.
+    const page = parseSeriesPage({
+      data: [
+        obsEvent('host', '2026-09-27T17:05:45Z', [{ id: 'forge', disk_free_gb: 210 }]),
+        obsEvent('host', '2026-09-27T10:25:01Z', [{ id: 'boss-gcp', disk_free_gb: 13 }]),
+        obsEvent('host-units', '2026-09-27T10:24:00Z', [{ id: 'boss-gcp' }]),
+      ],
+      total: 999,
+    }, 'host', 'boss-gcp');
+    expect(page.rows.map((r) => [r.nodes[0]?.id, r.observed_at])).toEqual([['boss-gcp', '2026-09-27T10:25:01Z']]);
+    expect(page.total).toBe(999);
+    expect(page.returned).toBe(3);
+    // The cluster's series names no host: only the scope narrows it.
+    const cluster = parseSeriesPage([obsEvent('kubernetes-nodes', '2026-09-27T17:00:02Z', [{ id: 'cp-1' }])], 'kubernetes-nodes', null);
+    expect(cluster.rows).toHaveLength(1);
+    expect(cluster.total).toBeNull();
+  });
+
+  test('"never recorded" only when the series\' own read counted zero; otherwise the absence is the read\'s', () => {
+    expect(seriesAbsentText(parseSeriesPage({ data: [], total: 0 }, 'host', 'forge'))).toBe('no observation recorded yet');
+    expect(seriesAbsentText(parseSeriesPage({
+      data: [obsEvent('host', '2026-09-27T17:05:45Z', [{ id: 'forge' }])], total: 989,
+    }, 'host', 'boss-gcp'))).toBe('none of the 1 row this read returned is this series\' (the read counted 989)');
+    expect(seriesAbsentText(parseSeriesPage([], 'host', 'forge'))).toBe(
+      'none of the 0 rows this read returned is this series\', and the read did not say how many there are',
+    );
+  });
+
+  test('the hosts read are every live declared host outside the cluster plus every host that compared', () => {
+    const nodes = {
+      kind: 'ready' as const,
+      data: parseNodes([
+        node({ id: 'forge', role: 'forge' }),
+        node({ id: 'boss-gcp', role: 'bastion' }),
+        node({ id: 'w-1', role: 'talos-worker' }),
+        node({ id: 'old-host', role: 'forge', retired: true }),
+      ]),
+    };
+    const compared = { kind: 'ready' as const, data: parseHostComparisons({ data: [hostCmp('mystery-box', '2026-09-27T10:00:00Z')], total: 1 }) };
+    const failed = { kind: 'failed' as const, error: 'HTTP 503' };
+    expect(hostPlan(nodes, compared)).toEqual({ known: true, hosts: ['boss-gcp', 'forge', 'mystery-box'] });
+    expect(hostPlan(failed, compared)).toEqual({ known: true, hosts: ['mystery-box'] });
+    expect(hostPlan(nodes, failed)).toEqual({ known: true, hosts: ['boss-gcp', 'forge'] });
+    // Neither source answered: no host is known, which is not "no host".
+    expect(hostPlan(failed, failed)).toEqual({ known: false, hosts: [] });
+  });
+});
+
+// A SERIES IS JUDGED BY ITS OWN CADENCE (backlog e1eb34bc; page audit
+// 2cff1d6e, GAP 8). The age was grey relative text — "today" for a
+// three-minute-old row and a three-hour-old one alike — while the
+// estate alarm files `unobserved:*` when a series is quiet past 3x its
+// own measured cadence. boss-gcp's host observer is daily (10:25Z,
+// operator-measured 2026-09-23) and forge's every fifteen minutes, so
+// one global age would read boss-gcp stale every afternoon.
+describe('seriesFreshness', () => {
+  const now = new Date('2026-09-27T17:15:00Z');
+  const rows = (...stamps: string[]) => parseObservations(stamps.map((s) => obsEvent('host', s, [{ id: 'h' }])));
+
+  test('inside three of its cadences a series is fresh, and says its cadence', () => {
+    const f = seriesFreshness(rows('2026-09-27T17:05:00Z', '2026-09-27T16:50:00Z', '2026-09-27T16:35:00Z'), now);
+    expect(f).toEqual({ state: 'fresh', ageS: 600, cadenceS: 900 });
+    expect(freshnessText(f!)).toBe('10m ago · every 15m');
+  });
+
+  test('a daily series seven hours old is fresh — judged by ITS cadence, not the forge\'s', () => {
+    const f = seriesFreshness(rows('2026-09-27T10:25:00Z', '2026-09-26T10:25:00Z', '2026-09-25T10:25:00Z'), now);
+    expect(f?.state).toBe('fresh');
+    expect(freshnessText(f!)).toBe('6.8h ago · every 24h');
+  });
+
+  test('past three of its cadences a series is stale, and says so against the cadence', () => {
+    const f = seriesFreshness(rows('2026-09-27T16:15:00Z', '2026-09-27T16:10:00Z', '2026-09-27T16:05:00Z'), now);
+    expect(f).toEqual({ state: 'stale', ageS: 3600, cadenceS: 300 });
+    expect(freshnessText(f!)).toBe('1h ago — quiet past 3× its 5m cadence');
+  });
+
+  test('exactly three cadences is not yet stale — the alarm\'s strict greater-than', () => {
+    expect(seriesFreshness(rows('2026-09-27T17:00:00Z', '2026-09-27T16:55:00Z', '2026-09-27T16:50:00Z'), now)?.state).toBe('fresh');
+  });
+
+  test('the cadence is the median gap, so one missed firing does not stretch it', () => {
+    // Gaps 5, 5, 20 minutes: the median (upper, as the alarm takes it)
+    // is 5, not the mean.
+    const f = seriesFreshness(rows(
+      '2026-09-27T17:10:00Z', '2026-09-27T17:05:00Z', '2026-09-27T17:00:00Z', '2026-09-27T16:40:00Z',
+    ), now);
+    expect(f?.cadenceS).toBe(300);
+  });
+
+  test('fewer than three readings is no measured cadence, and no verdict is invented', () => {
+    const f = seriesFreshness(rows('2026-09-20T17:00:00Z', '2026-09-20T16:55:00Z'), now);
+    expect(f).toEqual({ state: 'unmeasured', ageS: 7 * 86400 + 900, cadenceS: null });
+    expect(freshnessText(f!)).toBe('168.3h ago · cadence not yet measured');
+    expect(seriesFreshness([], now)).toBeNull();
+  });
+
+  test('back-to-back manual posts cannot fake a fast cadence — the alarm\'s 60 s floor', () => {
+    const f = seriesFreshness(rows('2026-09-27T17:13:00Z', '2026-09-27T17:12:59Z', '2026-09-27T17:12:58Z'), now);
+    expect(f).toEqual({ state: 'fresh', ageS: 120, cadenceS: 60 });
+  });
+
+  // CLAUDE.md §9a: the threshold lives in the alarm AND here, so it is
+  // pinned — the page must call stale exactly what the alarm files.
+  test('the multiplier, the minimum readings and the cadence floor are the alarm\'s own', () => {
+    const alarm = readFileSync(
+      new URL('../../../../../crates/orchestrators/boss-dispatcher-handlers/src/handlers/estate_alarm.rs', import.meta.url),
+      'utf8',
+    );
+    expect(alarm).toContain(`const STALE_MULTIPLIER: i64 = ${STALE_MULTIPLIER};`);
+    expect(alarm).toContain(`const STALE_MIN_OBSERVATIONS: usize = ${STALE_MIN_OBSERVATIONS};`);
+    expect(alarm).toContain(`const STALE_MIN_CADENCE_S: i64 = ${STALE_MIN_CADENCE_S};`);
+  });
+});
+
+// UNIT HEALTH (backlog d5efb80d; page audit 2cff1d6e, GAP 3). host-units
+// was 12 of the 20 rows the page fetched and it drew none of them: at
+// 16:22Z on 2026-09-23 boss-gcp had 15 units watched, 0 unhealthy, and
+// a `units_unhealthy` finding would have been invisible here. The
+// observer's shape is observe-units.sh's: one node, carrying `units`.
+describe('unitsVerdict', () => {
+  const unit = (name: string, healthy: boolean) => ({ unit: name, healthy });
+
+  test('every unit healthy reads green, with how many were watched', () => {
+    expect(unitsVerdict({ id: 'boss-gcp', units: [unit('a.timer', true), unit('a.service', true)] }))
+      .toEqual({ ok: true, text: '2 units watched, all healthy' });
+  });
+
+  test('an unhealthy unit is counted AND named', () => {
+    expect(unitsVerdict({
+      id: 'forge',
+      units: [unit('boss-train.service', false), unit('boss-train.timer', true), unit('estate-observe-host.timer', false)],
+    })).toEqual({ ok: false, text: '3 units watched, 2 unhealthy: boss-train.service, estate-observe-host.timer' });
+  });
+
+  test('a unit whose health was not recorded is not counted healthy', () => {
+    expect(unitsVerdict({ id: 'forge', units: [{ unit: 'x.service' }] }))
+      .toEqual({ ok: false, text: '1 unit watched, 1 unhealthy: x.service' });
+  });
+
+  test('a reading with no units list says the units were unread, never "all healthy"', () => {
+    expect(unitsVerdict({ id: 'forge' })).toEqual({ ok: false, text: 'no units list on the reading' });
+  });
+});
+
+describe('observations and comparisons', () => {
   test('zero drift renders as the good state, with the counts said plainly', () => {
     const rows = parseComparisons([
       { payload: { scope: 'kubernetes-nodes', observed_at: '2026-08-31T10:20:01Z', counts: {
@@ -150,6 +328,227 @@ describe('observations and comparisons', () => {
     });
     expect(v.ok).toBe(true);
   });
+
+  // GAPS 5 AND 6 (ea5e0e8b, c2373cc4; page audit 2cff1d6e). The verdict
+  // read counts only, and the parser kept neither `not_ready` (a finding
+  // with no count until ea5e0e8b) nor the dispatcher's dead-letter pair,
+  // which estate.alarm raises as HARD findings. So a sick declared node
+  // and a dispatcher losing dead letters both read green "no drift".
+
+  /** A cluster comparison as compare() shapes it (estate_compare.rs). */
+  const clusterRow = (counts: Record<string, number>, findings: Record<string, unknown>): unknown => ({
+    payload: {
+      scope: 'kubernetes-nodes', observed_at: '2026-09-27T12:00:00Z',
+      counts: {
+        observed: 5, participating_declared: 5, observed_not_declared: 0,
+        declared_not_observed: 0, drift: 0, disk_tight: 0, disk_unmeasured: 0,
+        dead_letters_unrecorded: 0, ...counts,
+      },
+      findings: { not_ready: [], dead_letters_unrecorded: [], dispatcher_unread: null, ...findings },
+    },
+  });
+
+  test('a NotReady node is counted and named, not "no drift"', () => {
+    const [c] = parseComparisons([clusterRow({ not_ready: 1 }, { not_ready: ['w-1'] })]);
+    const v = comparisonVerdict(c as Comparison);
+    expect(v).toEqual({ ok: false, text: '1 not ready (w-1)' });
+  });
+
+  test('a row recorded before not_ready was counted still reads its finding', () => {
+    // Every cluster row before ea5e0e8b carries the finding and no
+    // count; the finding is the record, so the absent count is not a 0.
+    const [c] = parseComparisons([clusterRow({}, { not_ready: ['cp-2', 'w-1'] })]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({ ok: false, text: '2 not ready (cp-2, w-1)' });
+  });
+
+  test('a host that is not ready says so on its own line', () => {
+    const [c] = parseComparisons([{ payload: {
+      scope: 'host', observed_at: '2026-09-27T12:00:00Z', host: 'forge',
+      counts: { observed: 1, observed_not_declared: 0, drift: 0, disk_tight: 0, not_ready: 1 },
+      findings: { not_ready: ['forge'] },
+    } }]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({ ok: false, text: '1 not ready (forge)' });
+  });
+
+  test('unrecorded dead letters at the dispatcher are not "no drift"', () => {
+    const [c] = parseComparisons([clusterRow({ dead_letters_unrecorded: 1 }, {
+      dead_letters_unrecorded: [{ id: 'boss-dispatcher', dead_letters_unrecorded: 2, age_s: 600 }],
+    })]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({
+      ok: false, text: '1 dispatcher with unrecorded dead letters',
+    });
+  });
+
+  test('a dispatcher whose counters went unread says why, never "no drift"', () => {
+    // dead_letter_finding (estate_compare.rs) answers UNREAD, not zero,
+    // when the counters could not be read: the quiet answer is the one
+    // the estate alarm refuses, so the page refuses it too.
+    const [c] = parseComparisons([clusterRow({}, { dispatcher_unread: 'curl: (7) Failed to connect' })]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({
+      ok: false, text: 'dispatcher dead-letter counters unread: curl: (7) Failed to connect',
+    });
+  });
+
+  test('all three clear is still the good state', () => {
+    const [c] = parseComparisons([clusterRow({}, {})]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({ ok: true, text: '5 observed, 5 declared — no drift' });
+  });
+});
+
+// THE HOST COMPARISON (backlog 2d8d983b; page audit 2cff1d6e, GAP 1).
+// The page rendered the cluster's verdict only, so every host row's
+// drift (forge memory declared 30, observed 31) and boss-gcp's
+// disk_tight (13 G free against a 17 G floor) never reached it. A host
+// comparison is self-scoped — compare_host in estate_compare.rs stamps
+// `host` and counts observed / observed_not_declared / drift /
+// disk_tight, with no declared total.
+
+/** A host comparison as the reader serves it, shaped by compare_host. */
+function hostCmp(host: string | null, observed_at: string, counts: Record<string, number> = {}): unknown {
+  return {
+    payload: {
+      scope: 'host', observed_at, host,
+      counts: { observed: 1, observed_not_declared: 0, drift: 0, disk_tight: 0, ...counts },
+    },
+  };
+}
+
+describe('the host comparison', () => {
+  test('the parser keeps the host a self-scoped comparison names; a cluster row names none', () => {
+    const rows = parseComparisons([
+      hostCmp('forge', '2026-09-23T16:15:00Z', { drift: 1 }),
+      { payload: { scope: 'kubernetes-nodes', observed_at: '2026-09-23T16:16:00Z', counts: { observed: 5 } } },
+    ]);
+    expect(rows.map((r) => r.host)).toEqual(['forge', null]);
+  });
+
+  test('the newest row per host wins, one line per host, in host order', () => {
+    // Newest first, as the reader serves it: forge's older drift-free
+    // row is hidden by its newer one, and boss-gcp's daily row — older
+    // than both — still has a line of its own (the per-host collapse
+    // 3d1678ba names for the observation series).
+    const latest = latestPerHost(parseComparisons([
+      hostCmp('forge', '2026-09-23T16:15:00Z', { drift: 1 }),
+      hostCmp('forge', '2026-09-23T16:00:00Z'),
+      hostCmp('boss-gcp', '2026-09-23T10:25:00Z', { drift: 1, disk_tight: 1 }),
+    ]));
+    expect(latest.map((c) => [c.host, c.observed_at])).toEqual([
+      ['boss-gcp', '2026-09-23T10:25:00Z'],
+      ['forge', '2026-09-23T16:15:00Z'],
+    ]);
+  });
+
+  test('a host short of disk AND drifted names both, and is not clean', () => {
+    const [c] = parseComparisons([hostCmp('boss-gcp', '2026-09-23T10:25:00Z', { drift: 1, disk_tight: 1 })]);
+    const v = comparisonVerdict(c as Comparison);
+    expect(v.ok).toBe(false);
+    expect(v.text).toBe('1 drifted from declaration; 1 short of disk');
+  });
+
+  test('a clean host reads its observed count only — it carries no declared total to print as 0', () => {
+    const [c] = parseComparisons([hostCmp('forge', '2026-09-23T16:15:00Z')]);
+    expect(comparisonVerdict(c as Comparison)).toEqual({ ok: true, text: '1 observed — no drift' });
+  });
+
+  test('a host nobody declared is named as undeclared, not as "in the cluster"', () => {
+    const [c] = parseComparisons([hostCmp('mystery-box', '2026-09-23T16:15:00Z', { observed_not_declared: 1 })]);
+    const v = comparisonVerdict(c as Comparison);
+    expect(v.ok).toBe(false);
+    expect(v.text).toBe('1 observed but not declared');
+  });
+
+  test('the grouped read keeps host rows and its total, which counts hosts', () => {
+    const page = parseHostComparisons({
+      data: [
+        hostCmp('forge', '2026-09-23T16:15:00Z'),
+        // A server that ignored ?scope= would hand back other series;
+        // they are not host comparisons, whatever the page asked for.
+        { payload: { scope: 'host-units', observed_at: '2026-09-23T16:14:00Z', host: 'forge', counts: {} } },
+        hostCmp('boss-gcp', '2026-09-23T10:25:00Z'),
+      ],
+      total: 2,
+    });
+    expect(page.rows.map((r) => r.host)).toEqual(['forge', 'boss-gcp']);
+    expect(page.total).toBe(2);
+    expect(hostPageIsWhole(page)).toBe(true);
+  });
+
+  // Backlog 725532ab: the page used to take a scoped page of 50 rows
+  // and say how far back it reached, because boss-gcp's daily row fell
+  // off it about half of every day. The read now groups per host on
+  // the server, and the page owes a line to every DECLARED host.
+  test('every declared host outside the cluster gets a line — one with no comparison says so', () => {
+    const nodes = {
+      kind: 'ready' as const,
+      data: parseNodes([
+        node({ id: 'forge', role: 'forge' }),
+        node({ id: 'boss-gcp', role: 'bastion' }),
+        node({ id: 'lab-1', role: 'lab-host' }),
+        node({ id: 'w-1', role: 'talos-worker' }),
+        node({ id: 'old-host', role: 'forge', retired: true }),
+      ]),
+    };
+    const page = parseHostComparisons({
+      data: [hostCmp('forge', '2026-09-25T07:45:00Z', { drift: 1 }), hostCmp('boss-gcp', '2026-09-25T10:25:00Z')],
+      total: 2,
+    });
+    const lines = hostLines(nodes, page);
+    expect(lines.map((l) => [l.host, l.cmp?.observed_at ?? null])).toEqual([
+      ['boss-gcp', '2026-09-25T10:25:00Z'],
+      ['forge', '2026-09-25T07:45:00Z'],
+      // Declared, outside the cluster, live — and no comparison: a line.
+      ['lab-1', null],
+    ]);
+    expect(missingHostText(page)).toBe('no host comparison recorded');
+  });
+
+  test('a host that compared without being declared keeps its line; an unread registry leaves only the rows', () => {
+    const page = parseHostComparisons({ data: [hostCmp('mystery-box', '2026-09-25T10:00:00Z')], total: 1 });
+    const failed = { kind: 'failed' as const, error: 'HTTP 503' };
+    expect(hostLines(failed, page).map((l) => l.host)).toEqual(['mystery-box']);
+    const declared = { kind: 'ready' as const, data: parseNodes([node({ id: 'forge', role: 'forge' })]) };
+    expect(hostLines(declared, page).map((l) => l.host)).toEqual(['forge', 'mystery-box']);
+  });
+
+  test('a read that is not whole never tells a declared host it has no comparison', () => {
+    // More hosts than the page held (rows < total), or a server that
+    // did not count: the absence is of the READ, not of the host.
+    const truncated = parseHostComparisons({ data: [hostCmp('forge', '2026-09-25T07:45:00Z')], total: 3 });
+    expect(hostPageIsWhole(truncated)).toBe(false);
+    expect(missingHostText(truncated)).toBe('not among the 1 of 3 hosts this read returned');
+    expect(hostCoverText(truncated)).toBe('The host read returned 1 of 3 hosts: a host past it has no comparison shown here.');
+    const uncounted = parseHostComparisons([hostCmp('forge', '2026-09-25T07:45:00Z')]);
+    expect(hostPageIsWhole(uncounted)).toBe(false);
+    // An older reader that ignored latest_per answers a scoped page of
+    // one host's rows with the SERIES total: 1 host held, not whole.
+    const ungrouped = parseHostComparisons({
+      data: [hostCmp('forge', '2026-09-25T07:45:00Z'), hostCmp('forge', '2026-09-25T07:30:00Z')],
+      total: 768,
+    });
+    expect(hostCoverText(ungrouped)).toBe('The host read returned 1 of 768 hosts: a host past it has no comparison shown here.');
+    // Nothing at all is a whole answer, counted or not.
+    expect(hostPageIsWhole(parseHostComparisons([]))).toBe(true);
+    expect(hostCoverText(parseHostComparisons({ data: [hostCmp('forge', '2026-09-25T07:45:00Z')], total: 1 }))).toBeNull();
+  });
+
+  test('fetchEstate reads the host comparisons grouped per host, in a read of their own', async () => {
+    const asked: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      asked.push(u);
+      const body = u === HOST_COMPARISONS_READ
+        ? { data: [hostCmp('forge', '2026-09-23T16:15:00Z', { drift: 1 })], total: 1 }
+        : u.includes('/nodes') ? [node()] : [];
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    expect(HOST_COMPARISONS_READ).toBe('/api/estate/comparisons?scope=host&latest_per=host&limit=50');
+    expect(asked).toContain(HOST_COMPARISONS_READ);
+    expect(s.hostComparisons.kind).toBe('ready');
+    if (s.hostComparisons.kind === 'ready') {
+      expect(s.hostComparisons.data.rows.map((r) => [r.host, r.counts.drift])).toEqual([['forge', 1]]);
+    }
+  });
 });
 
 describe('fetchEstate', () => {
@@ -159,8 +558,12 @@ describe('fetchEstate', () => {
     }) as unknown as typeof fetch;
     const s = await fetchEstate();
     expect(s.nodes.kind).toBe('failed');
-    expect(s.observations.kind).toBe('failed');
+    expect(s.cluster.kind).toBe('failed');
     expect(s.comparisons.kind).toBe('failed');
+    expect(s.hostComparisons.kind).toBe('failed');
+    // With neither host source answering, no host series was planned —
+    // and the state says it does not know, rather than "no hosts".
+    expect(s.hosts).toEqual({ known: false, series: [] });
   });
 
   test('good reads land ready with parsed rows', async () => {
@@ -169,93 +572,320 @@ describe('fetchEstate', () => {
       const body = u.includes('/nodes')
         ? [node()]
         : u.includes('/observations')
-          ? [obsEvent('host', '2026-08-31T10:25:00Z')]
+          ? { data: [obsEvent('kubernetes-nodes', '2026-08-31T10:25:00Z')], total: 1 }
           : [];
       return new Response(JSON.stringify(body), { status: 200 });
     }) as unknown as typeof fetch;
     const s = await fetchEstate();
     expect(s.nodes.kind).toBe('ready');
     if (s.nodes.kind === 'ready') expect(s.nodes.data[0]?.id).toBe('w-1');
-    expect(s.observations.kind).toBe('ready');
+    expect(s.cluster.kind).toBe('ready');
+  });
+
+  // The pin the finding asked for: a slow series that falls off an
+  // unscoped page. The unscoped page here is the live one of 2026-09-27
+  // in miniature — spent by the five-minute series — and boss-gcp's
+  // daily host reading is nowhere on it. The page must never ask it.
+  test('a daily host reading that falls off an unscoped page is still read, from its own series', async () => {
+    const asked: string[] = [];
+    const unscoped = Array.from({ length: 20 }, (_, i) =>
+      obsEvent('host-units', `2026-09-27T17:${String(14 - (i % 10)).padStart(2, '0')}:00Z`, [{ id: i % 2 ? 'forge' : 'boss-gcp', units: [] }]));
+    const series: Record<string, unknown[]> = {
+      'kubernetes-nodes:': [obsEvent('kubernetes-nodes', '2026-09-27T17:00:02Z', [{ id: 'cp-1' }])],
+      'host:forge': [obsEvent('host', '2026-09-27T17:05:45Z', [{ id: 'forge', disk_free_gb: 210 }])],
+      'host:boss-gcp': [obsEvent('host', '2026-09-27T10:25:01Z', [{ id: 'boss-gcp', disk_free_gb: 13 }])],
+      'host-units:forge': [unscoped[1]!],
+      'host-units:boss-gcp': [unscoped[0]!],
+    };
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = new URL(String(url), 'http://page.test');
+      asked.push(`${u.pathname}${u.search}`);
+      if (u.pathname === '/api/estate/nodes') {
+        return new Response(JSON.stringify([node({ id: 'forge', role: 'forge' }), node({ id: 'boss-gcp', role: 'bastion' })]), { status: 200 });
+      }
+      if (u.pathname === '/api/estate/observations') {
+        const scope = u.searchParams.get('scope');
+        if (scope === null) return new Response(JSON.stringify({ data: unscoped, total: 6106 }), { status: 200 });
+        const rows = series[`${scope}:${u.searchParams.get('host') ?? ''}`] ?? [];
+        return new Response(JSON.stringify({ data: rows, total: rows.length }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const s = await fetchEstate();
+    expect(asked.filter((a) => a.startsWith('/api/estate/observations') && !a.includes('scope='))).toEqual([]);
+    expect(s.hosts.known).toBe(true);
+    const gcp = s.hosts.series.find((h) => h.host === 'boss-gcp');
+    expect(gcp?.readings.kind).toBe('ready');
+    if (gcp?.readings.kind === 'ready') {
+      expect(gcp.readings.data.rows.map((r) => [r.observed_at, r.nodes[0]?.disk_free_gb])).toEqual([['2026-09-27T10:25:01Z', 13]]);
+    }
+    expect(s.hosts.series.map((h) => h.host)).toEqual(['boss-gcp', 'forge']);
+    expect(s.hosts.series.every((h) => h.units.kind === 'ready')).toBe(true);
+  });
+
+  test('a host series whose read failed lands failed on that host alone', async () => {
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes('/nodes')) return new Response(JSON.stringify([node({ id: 'forge', role: 'forge' })]), { status: 200 });
+      if (u.includes('scope=host-units')) return new Response('', { status: 503 });
+      return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    const [forge] = s.hosts.series;
+    expect(forge?.units).toEqual({ kind: 'failed', error: '/api/estate/observations?scope=host-units&host=forge&limit=10: HTTP 503' });
+    expect(forge?.readings.kind).toBe('ready');
+  });
+});
+
+// THE LOOPS (backlog 0d9b2960; page audit 2cff1d6e, GAP 10). The page
+// showed none of the estate's own working or finished packets, so "did
+// the loop run" had no answer on it. Each loop's newest terminal is that
+// answer; an open packet is the run in flight (or stuck).
+
+/** A packet as GET /api/jobs lists it — only the keys the page reads. */
+function jobRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'aaaa1111-0000-0000-0000-000000000000',
+    kind: 'maintenance-cluster-watchdog',
+    status: 'closed',
+    opened_at: '2026-09-24T11:14:28Z',
+    metadata: { outcome: 'completed', closed_at: '2026-09-24T11:14:34Z', opened_at: '2026-09-24T11:14:28Z' },
+    steps: [{ spec_slug: 'run', metadata: { result: 'ok' } }],
+    ...over,
+  };
+}
+
+describe('parseLoopPackets', () => {
+  test('a terminal carries its outcome and the instant it closed', () => {
+    const [p] = parseLoopPackets({ data: [jobRow()], total: 1 });
+    expect(p).toEqual({
+      id: 'aaaa1111-0000-0000-0000-000000000000',
+      status: 'closed',
+      outcome: 'completed',
+      at: '2026-09-24T11:14:34Z',
+      host: null,
+    });
+  });
+
+  test('an open packet is dated from when it opened, and has no outcome yet', () => {
+    const [p] = parseLoopPackets([jobRow({ status: 'open', opened_at: '2026-09-24T11:20:00Z', metadata: {} })]);
+    expect(p?.status).toBe('open');
+    expect(p?.outcome).toBeNull();
+    expect(p?.at).toBe('2026-09-24T11:20:00Z');
+  });
+
+  test('the host is the one the packet names: an ops-request on its metadata, a converge on its run step', () => {
+    // Measured 2026-09-24: ops-request metadata.host = "forge"; the
+    // forge and boss-gcp converges stamp node_id on the run step; the
+    // watchdog and the observers name no host at all.
+    const [ops] = parseLoopPackets([jobRow({ kind: 'ops-request', metadata: { host: 'boss-gcp', outcome: 'answered' } })]);
+    expect(ops?.host).toBe('boss-gcp');
+    const [conv] = parseLoopPackets([jobRow({ steps: [{ spec_slug: 'run', metadata: { node_id: 'forge', result: 'ok' } }] })]);
+    expect(conv?.host).toBe('forge');
+    const [none] = parseLoopPackets([jobRow()]);
+    expect(none?.host).toBeNull();
+  });
+
+  test('a row with no id is refused, not rendered as a link to nowhere', () => {
+    expect(() => parseLoopPackets([{ status: 'closed' }])).toThrow();
+  });
+});
+
+describe('loopPlan', () => {
+  const nodes = [
+    parseNodes([node({ id: 'forge', role: 'forge', roles: ['cluster-operator', OPS_RUNNER_ROLE] })])[0]!,
+    parseNodes([node({ id: 'boss-gcp', role: 'bastion', roles: [OPS_RUNNER_ROLE] })])[0]!,
+    parseNodes([node({ id: 'old-box', role: 'forge', roles: [OPS_RUNNER_ROLE], retired: true })])[0]!,
+    parseNodes([node({ id: 'w-1' })])[0]!,
+  ];
+
+  test('every declared loop, then one ops-request row per live host that declares the runner role', () => {
+    const plan = loopPlan({ kind: 'ready', data: nodes });
+    expect(plan.map((p) => [p.kind, p.host])).toEqual([
+      ...ESTATE_LOOPS.map((l) => [l.kind, null]),
+      [OPS_REQUEST_KIND, 'forge'],
+      [OPS_REQUEST_KIND, 'boss-gcp'],
+    ]);
+  });
+
+  test('an unreadable registry still asks whether ANY runner answered, rather than dropping the row', () => {
+    const plan = loopPlan({ kind: 'failed', error: 'down' });
+    expect(plan.filter((p) => p.kind === OPS_REQUEST_KIND)).toEqual([
+      { kind: OPS_REQUEST_KIND, label: 'ops-request', host: null },
+    ]);
+  });
+});
+
+describe('loopQueries', () => {
+  test('the newest terminal is one closed row; the open read is every open packet of the kind', () => {
+    expect(loopQueries('maintenance-cluster-watchdog', null)).toEqual({
+      latest: '/api/jobs?kind=maintenance-cluster-watchdog&status=closed&limit=1&full=true',
+      open: '/api/jobs?kind=maintenance-cluster-watchdog&status=open&full=true',
+    });
+  });
+
+  test('a host row is narrowed by metadata containment, the filter the server applies', () => {
+    const q = loopQueries(OPS_REQUEST_KIND, 'forge');
+    const filter = `&metadata=${encodeURIComponent(JSON.stringify({ host: 'forge' }))}`;
+    expect(q.latest).toBe(`/api/jobs?kind=ops-request&status=closed&limit=1&full=true${filter}`);
+    expect(q.open).toBe(`/api/jobs?kind=ops-request&status=open&full=true${filter}`);
+  });
+});
+
+describe('loopHost', () => {
+  const row = (over: Partial<LoopRow>): LoopRow => ({
+    kind: 'k', label: 'k', host: null,
+    latest: { kind: 'ready', data: null }, open: { kind: 'ready', data: [] },
+    ...over,
+  });
+
+  test('a host row is its host; otherwise the host the newest packet names; otherwise it says so', () => {
+    expect(loopHost(row({ host: 'forge' }))).toBe('forge');
+    const packet = { id: 'x', status: 'closed', outcome: 'completed', at: null, host: 'boss-gcp' };
+    expect(loopHost(row({ latest: { kind: 'ready', data: packet } }))).toBe('boss-gcp');
+    expect(loopHost(row({}))).toBe('not named on the packet');
+  });
+});
+
+describe('loopAge', () => {
+  // A five-minute loop dated "today" answers nothing; the age is read
+  // to the minute (the board's sinceText), and a missing stamp says so.
+  const now = new Date('2026-09-24T12:00:00Z');
+  test('minutes, then hours, from the instant the packet names', () => {
+    expect(loopAge('2026-09-24T11:55:00Z', now)).toBe('5m ago');
+    expect(loopAge('2026-09-24T09:00:00Z', now)).toBe('3h ago');
+  });
+  test('no stamp is undated, never a zero age', () => {
+    expect(loopAge(null, now)).toBe('undated');
+  });
+});
+
+describe('fetchEstate reads the loops', () => {
+  test('an unreachable jobs API lands every loop row as failed — never as a loop that did not run', async () => {
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.startsWith('/api/jobs')) return new Response('', { status: 502 });
+      const body = u.includes('/nodes') ? [node({ id: 'forge', roles: [OPS_RUNNER_ROLE] })] : [];
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    expect(s.loops.length).toBe(ESTATE_LOOPS.length + 1);
+    expect(s.loops.every((l) => l.latest.kind === 'failed' && l.open.kind === 'failed')).toBe(true);
+  });
+
+  test('a kind with no closed packet reads ready-and-null, which the page renders as never finished', async () => {
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes('/nodes')) {
+        return new Response(JSON.stringify([node({ id: 'forge', roles: [OPS_RUNNER_ROLE] })]), { status: 200 });
+      }
+      if (u.includes('kind=maintenance-cluster-watchdog&status=closed')) {
+        return new Response(JSON.stringify({ data: [jobRow()], total: 1 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    const wd = s.loops.find((l) => l.kind === 'maintenance-cluster-watchdog');
+    expect(wd?.latest).toEqual({ kind: 'ready', data: parseLoopPackets([jobRow()])[0]! });
+    const other = s.loops.find((l) => l.kind === 'maintenance-forge-converge');
+    expect(other?.latest).toEqual({ kind: 'ready', data: null });
+    expect(s.loops.find((l) => l.kind === OPS_REQUEST_KIND)?.host).toBe('forge');
+  });
+});
+
+describe('the loops the page reads are in the registry', () => {
+  // A kind renamed in the registry would otherwise render "never
+  // finished" forever, a confident wrong answer (CLAUDE.md §9a: the
+  // list lives here AND in infra/platform/workflows, so it is pinned).
+  const workflow = (kind: string): string =>
+    readFileSync(new URL(`../../../../../infra/platform/workflows/${kind}.toml`, import.meta.url), 'utf8');
+  const kinds = [...ESTATE_LOOPS.map((l) => l.kind), OPS_REQUEST_KIND];
+
+  test('every kind the page reads is a workflow in the tree', () => {
+    for (const k of kinds) expect(workflow(k)).toContain(`kind = "${k}"`);
+  });
+
+  test('every terminal those workflows declare is one the page has decided the colour of', () => {
+    // The ok set is the success terminals; everything else these
+    // workflows can end in (failed, refused) must render as trouble. A
+    // new terminal outcome lands here as a red test, not as a silent ok.
+    const declared = new Set(
+      kinds.flatMap((k) => [...workflow(k).matchAll(/terminal = \{ outcome = "([^"]+)" \}/g)].map((m) => m[1]!)),
+    );
+    expect([...declared].sort()).toEqual(['answered', 'completed', 'failed', 'refused']);
+    expect([...LOOP_OK_OUTCOMES].sort()).toEqual(['answered', 'completed']);
   });
 });
 
 describe('the dev workspace door', () => {
-  test('the launch anchor target is the declared ssh door, exactly', () => {
-    // The href the page renders. Hardcoded until a service-instances
-    // read endpoint exists (see the constant's comment); this pin
-    // means a silent change to the door's address fails a test rather
-    // than shipping a dead link. The literal is the `boss-dev-ssh`
-    // service_instances row of migration 202608310030: LoadBalancer
-    // 10.20.0.35, port 22, root. Change that row and this must go red.
-    expect(DEV_SSH_URL).toBe('ssh://root@10.20.0.35');
-    expect(DEV_SSH_LABEL).toBe('root@10.20.0.35');
-    expect(DEV_SSH_DOOR).toEqual({ user: 'root', host: '10.20.0.35' });
+  // The door moved from a LAN VIP behind a WireGuard bastion to one
+  // public hostname behind a Cloudflare Access SSH application (design
+  // 5fc71f03; backlog e4cedb46). The hostname is pinned to the tunnel
+  // route that serves it by the Rust test
+  // the_dev_door_is_an_access_ssh_application.rs — this file pins the
+  // WORDS an operator pastes, which nothing else reads.
+  test('the hostname is the declared one', () => {
+    expect(DEV_DOOR_HOST).toBe('dev.algedonic.dev');
+  });
+
+  test('the block is the three-line setup, in order, each with its reason', () => {
+    const steps = devDoorSteps();
+    expect(steps.map((s) => s.command)).toEqual([
+      'cloudflared --version',
+      "grep -qsF 'Match host dev.algedonic.dev ' ~/.ssh/config || cloudflared access ssh-config --hostname dev.algedonic.dev --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config",
+      'ssh root@dev.algedonic.dev',
+    ]);
+    // A command pasted blind is a command nobody can judge.
+    expect(steps.every((s) => s.why.length > 0 && s.what.length > 0)).toBe(true);
+  });
+
+  test('the route step appends only the stanza, and only once', () => {
+    // cloudflared prints "Add to your <home>/.ssh/config:" above the
+    // stanza. It is not a # comment, so appending it raw leaves a line
+    // ssh refuses to parse, and the operator deleted it by hand every
+    // time. A second run appended a second stanza, so the step is
+    // guarded on the one it writes.
+    const route = devDoorSteps()[1]?.command ?? '';
+    expect(route).toContain("sed '/^Add to your/d'");
+    expect(route.startsWith("grep -qsF 'Match host dev.algedonic.dev ' ~/.ssh/config || ")).toBe(true);
+  });
+
+  test('every step names the host it was given, so one constant moves them all', () => {
+    const steps = devDoorSteps('dev.example.test');
+    expect(steps[1]?.command).toContain('dev.example.test');
+    expect(steps[2]?.command).toBe('ssh root@dev.example.test');
+    // The root login is what the certificate's principal must match:
+    // sshd with no AuthorizedPrincipalsFile requires cert principal ==
+    // login name (infra/cluster/manifests/boss-dev.yaml).
+    expect(steps[2]?.command.startsWith('ssh root@')).toBe(true);
   });
 });
 
-describe('the bastion route', () => {
-  // 10.20.0.35 is a LAN address: the primary link works on the VPN and
-  // is dead from outside, where the only way in is THROUGH the bastion
-  // (boss-gcp, the WireGuard hub). ssh:// cannot carry a ProxyJump, so
-  // the page offers the jump explicitly — sourced from the registry
-  // node with role=bastion, never from a second hardcoded address.
-  const bastion = node({ id: 'boss-gcp', label: 'boss-gcp', address: '34.45.110.40', role: 'bastion', cpu: 4, memory_gb: 15, disk_gb: 48 });
-
-  test('bastionOf picks the live node declared as the bastion', () => {
-    const b = bastionOf(parseNodes([node(), bastion]));
-    expect(b?.id).toBe('boss-gcp');
-    expect(b?.address).toBe('34.45.110.40');
-  });
-
-  test('bastionOf is null when no bastion is declared, when it is retired, or when it has no address', () => {
-    // A missing route renders as nothing, never as ssh://null.
-    expect(bastionOf(parseNodes([node()]))).toBeNull();
-    expect(bastionOf(parseNodes([node(), { ...bastion, retired: true }]))).toBeNull();
-    expect(bastionOf(parseNodes([node(), { ...bastion, address: null }]))).toBeNull();
-    expect(bastionOf([])).toBeNull();
-  });
-
-  test('bastionRoutes spells the three ways through, verbatim', () => {
-    const r = bastionRoutes('34.45.110.40', { user: 'root', host: '10.20.0.35' });
-    // No username baked in: the viewer's ssh config supplies it.
-    expect(r.shellUrl).toBe('ssh://34.45.110.40');
-    expect(r.hopCommand).toBe('ssh root@10.20.0.35');
-    expect(r.jumpCommand).toBe('ssh -J <you>@34.45.110.40 root@10.20.0.35');
-    expect(r.sshConfig).toBe('Host 10.20.0.35\n  ProxyJump <you>@34.45.110.40');
-  });
-
-  test('bastionRoutes defaults to the pinned dev door', () => {
-    expect(bastionRoutes('34.45.110.40')).toEqual(bastionRoutes('34.45.110.40', DEV_SSH_DOOR));
-  });
-});
-
-describe('EstatePage renders the bastion route from the registry', () => {
+describe('EstatePage renders the door from the module', () => {
   // Source-level pin, the TriageBoard posture: bun test has no Svelte
-  // pass, and the coupling this guards against — a third address typed
-  // into the page — would appear in the source, not in a render.
+  // pass, and the coupling this guards against — an address or a
+  // command typed into the page — would appear in the source, not in a
+  // render.
   const source = readFileSync(new URL('./EstatePage.svelte', import.meta.url), 'utf8');
   const code = source
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
-  test('carries no address of its own — every IP comes from the registry node or the pinned door', () => {
+  test('carries no address of its own — every IP came from the registry node, and none is left', () => {
     expect(code).not.toMatch(/\b\d{1,3}(?:\.\d{1,3}){3}\b/);
   });
 
-  test('selects the bastion from the nodes read and gates the block on it', () => {
-    expect(code).toMatch(/bastionOf\(/);
-    expect(code).toMatch(/bastionRoutes\(/);
-    // The block exists only inside an {#if} on the derived bastion —
-    // absent bastion, no link, so never a broken one.
-    expect(code).toMatch(/\{#if\s+bastion\b[^}]*\}[\s\S]*?bastion\.address[\s\S]*?\{\/if\}/);
+  test('the setup block is rendered from devDoorSteps, not retyped', () => {
+    expect(code).toMatch(/devDoorSteps\(\)/);
+    expect(code).toMatch(/\{#each\s+doorSteps\b/);
+    expect(code).toMatch(/\{step\.command\}/);
+    expect(code).not.toMatch(/cloudflared access ssh-config/);
   });
 
-  test('the primary door is unchanged and the jump link carries no username', () => {
-    expect(code).toMatch(/href=\{DEV_SSH_URL\}/);
-    expect(code).toMatch(/href=\{routes\.shellUrl\}/);
-    expect(code).toMatch(/routes\.jumpCommand/);
-    expect(code).toMatch(/routes\.sshConfig/);
+  test('the bastion route is gone with the door it served', () => {
+    expect(code).not.toMatch(/bastion/i);
+    expect(code).not.toMatch(/ProxyJump/);
   });
 });

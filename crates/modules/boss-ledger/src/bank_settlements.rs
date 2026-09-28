@@ -10,9 +10,9 @@
 //! 2. `list_due_pending` — called by the bank-clearing sim generator on
 //!    each tick. Returns every pending row whose `expected_settle_on`
 //!    is at or before today.
-//! 3. `mark_settled` — called by the generator once it's posted
-//!    `finance.payment.settled` for a row. Flips the row to `settled`
-//!    and stamps `settled_on`.
+//! 3. `mark_settled_in_tx` — called by the settle handler inside the
+//!    transaction that posts `finance.payment.settled` for a row. Flips
+//!    the row to `settled` and stamps `settled_on`.
 //!
 //! A small share of payments (NSF, wire recall) flip to `returned`
 //! instead of `settled`; that path is reserved for the generator's
@@ -193,14 +193,23 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<BankSettlement>, Ledg
     Ok(row.as_ref().map(row_to_settlement))
 }
 
-/// Flip a pending row to settled; the caller has posted the
-/// `finance.payment.settled` journal entry separately. No-op (returns
-/// the current row) if the row is already settled.
-pub async fn mark_settled(
-    pool: &PgPool,
+/// Flip a pending row to settled, inside the caller's transaction so
+/// `finance.payment.settled`, its journal entry and the
+/// `ledger.payment.settled` event commit with the flip or not at all.
+/// `Some` is the row THIS call flipped; `None` means nothing was pending
+/// under `id` (absent, or already settled / returned — possibly by a
+/// concurrent settle), and the caller must record nothing.
+///
+/// Until 2026-09-27 this ran on the pool and committed before the
+/// caller opened the transaction that records the fact (backlog
+/// 016a2763): a refused or crashed fact write left a `settled` row with
+/// no fact and no event — dropped by the next log-rooted rebuild, and
+/// never retried, because the sweep reads only `pending` rows.
+pub async fn mark_settled_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
     settled_on: NaiveDate,
-) -> Result<BankSettlement, LedgerError> {
+) -> Result<Option<BankSettlement>, LedgerError> {
     let row = sqlx::query(
         "UPDATE bank_settlements \
          SET status = 'settled', settled_on = $2, updated_at = NOW() \
@@ -210,20 +219,10 @@ pub async fn mark_settled(
     )
     .bind(id)
     .bind(settled_on)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
-
-    match row {
-        Some(r) => Ok(row_to_settlement(&r)),
-        None => {
-            // Either the row doesn't exist or it's already settled / returned.
-            // Fall through to a lookup so the caller sees the current state.
-            get(pool, id)
-                .await?
-                .ok_or_else(|| LedgerError::Storage(format!("bank_settlement {id} not found")))
-        }
-    }
+    Ok(row.as_ref().map(row_to_settlement))
 }
 
 fn row_to_settlement(row: &sqlx::postgres::PgRow) -> BankSettlement {
