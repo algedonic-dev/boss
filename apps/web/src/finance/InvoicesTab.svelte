@@ -12,11 +12,13 @@
   import InvoiceStatusChip from './InvoiceStatusChip.svelte';
   import {
     PAYMENT_METHOD_LABEL,
+    isOwed,
     type Invoice,
     type InvoiceStatus,
     type PaymentMethod,
   } from './types';
   import type { Account } from '../accounts/types';
+  import { fetchAccountsPage } from '../accounts/api';
   import { formatMoney } from '@boss/web-kit/ui/money';
 
   type Props = {
@@ -43,12 +45,8 @@
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch('/api/people/accounts');
-        if (!r.ok) return;
-        const body = await r.json();
-        if (!cancelled) {
-          accounts = Array.isArray(body) ? body : (body.data ?? []);
-        }
+        const r = await fetchAccountsPage();
+        if (r.kind === 'ready' && !cancelled) accounts = [...r.page.data];
       } catch {
         // Ignore — invoices still render without friendly account names.
       }
@@ -68,9 +66,8 @@
   // "Unpaid" = genuinely awaiting collection (outstanding + past-due).
   // Written-off invoices are uncollectable, not unpaid — they get their own
   // bucket so the operator sees real receivables vs historical write-offs.
-  let unpaid = $derived(
-    invoices.filter((i) => i.status !== 'paid' && i.status !== 'written-off'),
-  );
+  // `isOwed` is the server's one definition of owed (backlog 926d64a3).
+  let unpaid = $derived(invoices.filter((i) => isOwed(i.status)));
   let pastDue = $derived(invoices.filter((i) => i.status === 'past-due'));
   let writtenOff = $derived(invoices.filter((i) => i.status === 'written-off'));
 
@@ -90,11 +87,7 @@
 
   let visible = $derived(
     invoices.filter((i) => {
-      if (
-        statusFilter === 'unpaid' &&
-        (i.status === 'paid' || i.status === 'written-off')
-      )
-        return false;
+      if (statusFilter === 'unpaid' && !isOwed(i.status)) return false;
       if (
         statusFilter !== 'all' &&
         statusFilter !== 'unpaid' &&
@@ -153,7 +146,7 @@
 <div class="catalog-layout">
   <aside class="catalog-filters">
     <FilterGroup label="Search">
-        <SearchInput bind:value={query} placeholder="Invoice, account…" />
+        <SearchInput bind:value={query} placeholder="Invoice, account…" label="Search invoices" />
     </FilterGroup>
     <FilterGroup label="Status">
         <FilterButton active={statusFilter === 'all'} onclick={() => (statusFilter = 'all')}>
@@ -234,11 +227,11 @@
               </td>
               <td class="num">{i.line_items.length}</td>
               <td class="num">{formatMoney({ amount_cents: i.amount_cents, currency: i.currency })}</td>
-              <td class="num" style={taxCents > 0 ? '' : 'color:#a8a29e'}>
+              <td class="num" style={taxCents > 0 ? '' : 'color:var(--static)'}>
                 {#if taxCents > 0}
                   {formatMoney({ amount_cents: taxCents, currency: i.currency })}
                   {#if i.tax_jurisdiction}
-                    <span class="mono" style="margin-left:4px; font-size:10px; color:#78716c">
+                    <span class="mono" style="margin-left:4px; font-size:10px; color:var(--static)">
                       {i.tax_jurisdiction.replace(/^US-/, '')}
                     </span>
                   {/if}
@@ -250,7 +243,7 @@
                 {#if i.payment_method}
                   {PAYMENT_METHOD_LABEL[i.payment_method]}
                 {:else}
-                  <span style="color:#a8a29e">—</span>
+                  <span style="color:var(--static)">—</span>
                 {/if}
               </td>
               <td>{i.issued_on}</td>

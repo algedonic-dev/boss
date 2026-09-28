@@ -1,32 +1,47 @@
 <script lang="ts">
-  // /it/subjects — Subjects & Classes: the model's vocabulary, read-only.
-  // Left: the SubjectKind taxonomy (boss-subject-kinds). Right: the
-  // selected kind's Class registry (boss-classes), grouped by the Subject
-  // attribute each class set keys (role / department / type / …). Authoring
-  // is deliberately out of scope for v1 — this is the "what vocabulary does
-  // the running model speak?" surface that pairs with /it/dispatcher and
-  // /it/monitoring.
+  // /it/registry/subjects — Subjects & Classes: the model's vocabulary,
+  // read-only. Left: the SubjectKind taxonomy (boss-subject-kinds). Right:
+  // the selected kind's Class registry (boss-classes), grouped by the
+  // Subject attribute each class set keys (role / department / type / …),
+  // under a line naming the kind's module and how many active workflows
+  // name it. Authoring is deliberately out of scope — this is the "what
+  // vocabulary does the running model speak?" surface beside
+  // /it/registry/dispatcher and /it/operate/audit.
+  //
+  // Each of the three reads owns its failure line (page audit 9f7ba57d):
+  // the kinds read the page-wide alert, the classes read a line in the
+  // detail pane naming the kind it failed for, the workflows read a line
+  // saying the count is unknown. A failed read is never an empty one —
+  // the classes read used to paint "No classes registered" under the
+  // alert (backlog d145e41d).
 
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
+  import type { Remote } from '../../data/remote';
   import {
     listSubjectKinds,
     listClasses,
+    listWorkflows,
     buildKindTree,
     groupClassesByAttribute,
+    kindModule,
+    workflowCountsByKind,
     type SubjectKind,
     type ClassRow,
     type KindTreeNode,
   } from './subjects';
 
+  const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
   let tree = $state<ReadonlyArray<KindTreeNode>>([]);
   let kindsByCode = $state<Map<string, SubjectKind>>(new Map());
   let selected = $state<string | null>(null);
-  let classes = $state<ReadonlyArray<ClassRow>>([]);
+  let classes = $state<Remote<ReadonlyArray<ClassRow>>>({ kind: 'loading' });
+  let workflowCounts = $state<Remote<ReadonlyMap<string, number>>>({ kind: 'loading' });
   let loadingKinds = $state(true);
-  let loadingClasses = $state(false);
-  let error = $state<string | null>(null);
+  let kindsError = $state<string | null>(null);
 
   async function loadKinds(): Promise<void> {
     loadingKinds = true;
@@ -34,37 +49,52 @@
       const all = await listSubjectKinds();
       tree = buildKindTree(all);
       kindsByCode = new Map(all.map((k) => [k.kind, k]));
-      error = null;
+      kindsError = null;
       const first = tree[0];
       if (first) await select(first.kind.kind);
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      kindsError = message(e);
     } finally {
       loadingKinds = false;
     }
   }
 
+  async function loadWorkflowCounts(): Promise<void> {
+    try {
+      workflowCounts = { kind: 'ready', data: workflowCountsByKind(await listWorkflows()) };
+    } catch (e) {
+      workflowCounts = { kind: 'failed', error: message(e) };
+    }
+  }
+
   async function select(kind: string): Promise<void> {
     selected = kind;
-    loadingClasses = true;
+    classes = { kind: 'loading' };
+    let next: Remote<ReadonlyArray<ClassRow>>;
     try {
-      classes = await listClasses(kind);
-      error = null;
+      next = { kind: 'ready', data: await listClasses(kind) };
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      classes = [];
-    } finally {
-      loadingClasses = false;
+      next = { kind: 'failed', error: message(e) };
     }
+    // A slower answer for a kind the operator has since clicked away from
+    // must not paint over the kind now selected.
+    if (selected === kind) classes = next;
   }
 
   onMount(() => {
     void loadKinds();
+    void loadWorkflowCounts();
   });
 
   let selectedKind = $derived(selected ? (kindsByCode.get(selected) ?? null) : null);
-  let grouped = $derived(groupClassesByAttribute(classes));
+  let grouped = $derived(classes.kind === 'ready' ? groupClassesByAttribute(classes.data) : []);
   let kindCount = $derived(kindsByCode.size);
+  let selectedModule = $derived(selectedKind ? kindModule(selectedKind) : null);
+
+  /** "module off on this instance" is the manifest's word, not the row's
+   *  (backlog 92ea2e00): the row says which module, the tenant manifest
+   *  says whether this instance runs it. */
+  const moduleOff = (m: string): boolean => !moduleEnabled(m);
 
   function fmtVal(v: unknown): string {
     if (v === null || v === undefined) return '';
@@ -72,6 +102,17 @@
     return JSON.stringify(v);
   }
 </script>
+
+{#snippet kindCode(k: SubjectKind)}
+  <!-- The module rides on the tree row too, so dormant vocabulary reads
+       as dormant at a glance rather than one click at a time (92ea2e00). -->
+  {@const m = kindModule(k)}
+  <span class="sc-kind-code mono"
+    >{k.kind}{#if m}<span class="sc-kind-module" class:off={moduleOff(m)}
+        > · {m}{moduleOff(m) ? ' (off)' : ''}</span
+      >{/if}</span
+  >
+{/snippet}
 
 {#snippet metaCell(meta: Readonly<Record<string, unknown>>)}
   {@const entries = Object.entries(meta)}
@@ -92,11 +133,17 @@
     title="Subjects & Classes"
     subtitle={loadingKinds
       ? 'Loading…'
-      : `${kindCount} subject kind${kindCount === 1 ? '' : 's'} · the Class registry`}
+      : kindsError && kindCount === 0
+        ? // A failed kinds read leaves the map empty, and "0 subject
+          // kinds" read as an empty registry (sweep c3e4edcc).
+          'Subject-kind count unknown — the registry read failed'
+        : `${kindCount} subject kind${kindCount === 1 ? '' : 's'} · the Class registry`}
   />
 
-  {#if error}
-    <p class="empty" style="color:#dc2626; padding:0 24px">Failed to load: {error}</p>
+  {#if kindsError}
+    <!-- The shared failure marker (sweep c3e4edcc); no inline colour or
+         padding, which would outrank its troubled ink and rail card. -->
+    <p class="empty load-failed" role="alert" style="margin:0 24px">Failed to load: {kindsError}</p>
   {/if}
 
   <div class="sc-body">
@@ -109,7 +156,7 @@
           onclick={() => select(node.kind.kind)}
         >
           <span class="sc-kind-label">{node.kind.label}</span>
-          <span class="sc-kind-code mono">{node.kind.kind}</span>
+          {@render kindCode(node.kind)}
         </button>
         {#each node.children as child (child.kind)}
           <button
@@ -118,7 +165,7 @@
             onclick={() => select(child.kind)}
           >
             <span class="sc-kind-label">{child.label}</span>
-            <span class="sc-kind-code mono">{child.kind}</span>
+            {@render kindCode(child)}
           </button>
         {/each}
       {/each}
@@ -138,12 +185,41 @@
             {#if selectedKind.parent_kind}
               <span>parent <span class="mono">{selectedKind.parent_kind}</span></span>
             {/if}
-            <span>owner {selectedKind.owning_team}</span>
+            <!-- Was `owner {owning_team}`, which read `platform` on 24 of 24
+                 kinds and so distinguished nothing (backlog 92ea2e00). The
+                 row names its module; the manifest says whether this
+                 instance runs it. -->
+            {#if selectedModule}
+              <span
+                >module <span class="mono">{selectedModule}</span
+                >{#if moduleOff(selectedModule)}<span class="sc-off"> · off on this instance</span
+                  >{/if}</span
+              >
+            {:else}
+              <span>platform kind</span>
+            {/if}
+            {#if workflowCounts.kind === 'ready'}
+              {@const n = workflowCounts.data.get(selectedKind.kind) ?? 0}
+              <span
+                >{n === 0
+                  ? 'no active workflow names this kind'
+                  : `${n} active workflow${n === 1 ? ' names' : 's name'} this kind`}</span
+              >
+            {/if}
           </div>
+          {#if workflowCounts.kind === 'failed'}
+            <p class="empty load-failed sc-read-failed">
+              Couldn't count the workflows naming {selectedKind.kind} — {workflowCounts.error}
+            </p>
+          {/if}
         </div>
 
-        {#if loadingClasses}
+        {#if classes.kind === 'loading'}
           <p class="empty">Loading classes…</p>
+        {:else if classes.kind === 'failed'}
+          <p class="empty load-failed" role="alert">
+            Couldn't load the classes of {selectedKind.kind} — {classes.error}
+          </p>
         {:else if grouped.length === 0}
           <p class="empty">
             No classes registered for <span class="mono">{selectedKind.kind}</span>. Classes are
@@ -182,7 +258,9 @@
             </Section>
           {/each}
         {/if}
-      {:else if !loadingKinds}
+      {:else if !loadingKinds && !kindsError}
+        <!-- A failed kinds read has nothing to select: the alert above
+             is the whole of what this page knows (backlog d145e41d). -->
         <p class="empty">Select a subject kind to see its classes.</p>
       {/if}
     </div>
@@ -203,19 +281,19 @@
   .sc-tree {
     position: sticky;
     top: 16px;
-    border: 1px solid #e5e7eb;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
     overflow: hidden;
-    background: #fff;
+    background: var(--ink);
   }
   .sc-tree-head {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: #6b7280;
+    color: var(--static);
     padding: 10px 12px;
-    background: #f9fafb;
-    border-bottom: 1px solid #e5e7eb;
+    background: var(--ink-raised);
+    border-bottom: 1px solid var(--hairline);
   }
   .sc-kind {
     display: flex;
@@ -226,15 +304,15 @@
     padding: 8px 12px;
     background: none;
     border: none;
-    border-bottom: 1px solid #f3f4f6;
+    border-bottom: 1px solid var(--hairline);
     cursor: pointer;
   }
   .sc-kind:hover {
-    background: #f9fafb;
+    background: var(--ink-raised);
   }
   .sc-kind.active {
-    background: #eef2ff;
-    box-shadow: inset 3px 0 0 #6366f1;
+    background: var(--signal-wash);
+    box-shadow: inset 3px 0 0 var(--signal);
   }
   .sc-root .sc-kind-label {
     font-weight: 600;
@@ -244,11 +322,11 @@
   }
   .sc-kind-label {
     font-size: 13px;
-    color: #111827;
+    color: var(--fog);
   }
   .sc-kind-code {
     font-size: 11px;
-    color: #9ca3af;
+    color: var(--static);
   }
   .sc-detail-head {
     padding: 4px 0 12px;
@@ -259,12 +337,12 @@
   }
   .sc-detail-code {
     font-size: 13px;
-    color: #9ca3af;
+    color: var(--static);
     font-weight: 400;
   }
   .sc-detail-desc {
     margin: 6px 0 0;
-    color: #4b5563;
+    color: var(--static);
     font-size: 13px;
     max-width: 60ch;
   }
@@ -273,10 +351,20 @@
     gap: 16px;
     margin-top: 6px;
     font-size: 12px;
-    color: #6b7280;
+    color: var(--static);
   }
   .sc-dim {
-    color: #d1d5db;
+    color: var(--text-faint);
+  }
+  .sc-kind-module.off,
+  .sc-off {
+    color: var(--text-faint);
+    font-style: italic;
+  }
+  /* Layout only: .load-failed draws the card, rail and ink. */
+  .sc-read-failed {
+    margin: 8px 0 0;
+    font-size: 12px;
   }
   .sc-chips {
     display: flex;
@@ -285,13 +373,13 @@
   }
   .sc-chip {
     font-size: 11px;
-    background: #f3f4f6;
+    background: var(--ink-raised);
     border-radius: 4px;
     padding: 1px 6px;
-    color: #374151;
+    color: var(--static);
   }
   .sc-chip-k {
-    color: #9ca3af;
+    color: var(--static);
     margin-right: 4px;
   }
 </style>

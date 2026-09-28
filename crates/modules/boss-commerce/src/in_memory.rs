@@ -3,16 +3,26 @@
 use async_trait::async_trait;
 use boss_core::publisher::EventStamp;
 
-use crate::port::{CommerceError, CommerceRepository};
-use crate::types::{Invoice, InvoiceSummary, RevenueLine};
+use crate::port::{CommerceError, CommerceRepository, InvoiceCreate};
+use crate::types::{
+    AccountOpenAr, ArAgingBucket, Invoice, InvoiceStatus, InvoiceSummary, InvoiceTransition,
+    RevenueLine,
+};
 
 pub struct InMemoryCommerce {
     invoices: Vec<Invoice>,
     revenue: Vec<RevenueLine>,
-    /// Ids flipped by `mark_invoice_written_off` — enough state for
-    /// HTTP tests to exercise the converge-on-double-delivery
-    /// contract (the transactional flip itself is pg-pinned).
-    written_off: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Invoices a status verb moved, by id, overlaid on `invoices` by
+    /// every read. It held only the write-off ids until backlog
+    /// 203ef806, so mark-paid and mark-past-due moved nothing here and
+    /// recorded the pre-move row — and this adapter could not be held
+    /// to the transition table the Pg adapter enforces.
+    moved: std::sync::Mutex<std::collections::HashMap<String, Invoice>>,
+    /// Invoices `create_invoice_at` wrote, after the seed. Until backlog
+    /// 9d2af748 a create stored nothing — it recorded its event and
+    /// returned — so this adapter could not tell a repeat create from a
+    /// first one, and could not be held to creating once per id.
+    created: std::sync::Mutex<Vec<Invoice>>,
     /// Events the outbox-migrated paths would have recorded in-tx —
     /// the in-memory analogue of `event_outbox`, collected for test
     /// assertions (no relay here; the pg path is the real contract).
@@ -24,7 +34,8 @@ impl InMemoryCommerce {
         Self {
             invoices,
             revenue: Vec::new(),
-            written_off: std::sync::Mutex::new(std::collections::HashSet::new()),
+            moved: std::sync::Mutex::new(std::collections::HashMap::new()),
+            created: std::sync::Mutex::new(Vec::new()),
             recorded: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -44,6 +55,87 @@ impl InMemoryCommerce {
         self.revenue = revenue;
         self
     }
+
+    fn moved(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, std::collections::HashMap<String, Invoice>>, CommerceError>
+    {
+        self.moved
+            .lock()
+            .map_err(|e| CommerceError::Storage(format!("moved lock: {e}")))
+    }
+
+    fn created(&self) -> Result<std::sync::MutexGuard<'_, Vec<Invoice>>, CommerceError> {
+        self.created
+            .lock()
+            .map_err(|e| CommerceError::Storage(format!("created lock: {e}")))
+    }
+
+    /// Every invoice as issued — the seed, then what was created — with
+    /// no move applied. Takes the `created` lock and releases it, so no
+    /// caller ever holds it and `moved` together.
+    fn issued(&self) -> Result<Vec<Invoice>, CommerceError> {
+        let created = self.created()?.clone();
+        Ok(self.invoices.iter().cloned().chain(created).collect())
+    }
+
+    /// Every invoice as it stands now — the seed and the created, with
+    /// the moves applied.
+    fn current(&self) -> Result<Vec<Invoice>, CommerceError> {
+        let issued = self.issued()?;
+        let moved = self.moved()?;
+        Ok(issued
+            .into_iter()
+            .map(|i| moved.get(&i.id).cloned().unwrap_or(i))
+            .collect())
+    }
+
+    /// The invoices still owed — `InvoiceStatus::is_owed` on the
+    /// current status. The one filter `open_ar_by_account` and the
+    /// summary's AR aging both read (backlog 926d64a3).
+    fn owed_invoices(&self) -> Result<Vec<Invoice>, CommerceError> {
+        Ok(self
+            .current()?
+            .into_iter()
+            .filter(|i| i.status.is_owed())
+            .collect())
+    }
+
+    /// The status write all three verbs run, deciding by
+    /// `InvoiceStatus::transition_to` under one lock, as Pg decides in
+    /// its UPDATE's WHERE (backlog 203ef806). `Some(moved row)` when
+    /// THIS call moved the invoice — the caller records it as the
+    /// event; `None` when it was already at `to`; a terminal source is
+    /// refused by name and nothing changes.
+    fn transition(
+        &self,
+        id: &str,
+        to: &str,
+        paid_on: Option<chrono::NaiveDate>,
+    ) -> Result<Option<Invoice>, CommerceError> {
+        let issued = self.issued()?.into_iter().find(|i| i.id == id);
+        let mut moved = self.moved()?;
+        let Some(inv) = moved.get(id).cloned().or(issued) else {
+            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        };
+        match inv.status.transition_to(to) {
+            InvoiceTransition::Already => Ok(None),
+            InvoiceTransition::Refused => Err(CommerceError::refused_transition(
+                id,
+                inv.status.as_str(),
+                to,
+            )),
+            InvoiceTransition::Flip => {
+                let next = Invoice {
+                    status: InvoiceStatus::new(to),
+                    paid_on: paid_on.or(inv.paid_on),
+                    ..inv
+                };
+                moved.insert(id.to_string(), next.clone());
+                Ok(Some(next))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -53,7 +145,7 @@ impl CommerceRepository for InMemoryCommerce {
     }
 
     async fn all_invoices(&self) -> Result<Vec<Invoice>, CommerceError> {
-        Ok(self.invoices.clone())
+        self.current()
     }
 
     async fn list_invoices(
@@ -62,37 +154,39 @@ impl CommerceRepository for InMemoryCommerce {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<Invoice>, i64), CommerceError> {
-        let filtered: Vec<&Invoice> = match account_id {
-            Some(cid) => self
-                .invoices
-                .iter()
-                .filter(|i| i.account_id == cid)
-                .collect(),
-            None => self.invoices.iter().collect(),
-        };
+        let filtered: Vec<Invoice> = self
+            .current()?
+            .into_iter()
+            .filter(|i| account_id.is_none_or(|cid| i.account_id == cid))
+            .collect();
         let total = filtered.len() as i64;
         let start = (offset as usize).min(filtered.len());
         let end = (start + limit as usize).min(filtered.len());
-        Ok((
-            filtered[start..end].iter().map(|&i| i.clone()).collect(),
-            total,
-        ))
+        Ok((filtered[start..end].to_vec(), total))
+    }
+
+    async fn open_ar_by_account(&self) -> Result<Vec<AccountOpenAr>, CommerceError> {
+        let owed = self.owed_invoices()?;
+        let by_account = owed.iter().fold(
+            std::collections::BTreeMap::<&str, (i64, i64)>::new(),
+            |mut acc, i| {
+                let e = acc.entry(i.account_id.as_str()).or_default();
+                *e = (e.0 + i.amount_cents, e.1 + 1);
+                acc
+            },
+        );
+        Ok(by_account
+            .into_iter()
+            .map(|(account_id, (open_ar_cents, open_count))| AccountOpenAr {
+                account_id: account_id.to_string(),
+                open_ar_cents,
+                open_count,
+            })
+            .collect())
     }
 
     async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError> {
-        let mut inv = self.invoices.iter().find(|i| i.id == id).cloned();
-        // Overlay the write-off flip so post-flip reads (the event
-        // emit path) see the terminal status, matching pg.
-        if let Some(inv) = inv.as_mut()
-            && self
-                .written_off
-                .lock()
-                .map_err(|e| CommerceError::Storage(format!("written_off lock: {e}")))?
-                .contains(id)
-        {
-            inv.status = crate::types::InvoiceStatus::WRITTEN_OFF.into();
-        }
-        Ok(inv)
+        Ok(self.current()?.into_iter().find(|i| i.id == id))
     }
 
     async fn create_invoice_at(
@@ -100,7 +194,7 @@ impl CommerceRepository for InMemoryCommerce {
         invoice: &Invoice,
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &EventStamp,
-    ) -> Result<Invoice, CommerceError> {
+    ) -> Result<InvoiceCreate, CommerceError> {
         if invoice.line_items.is_empty() {
             return Err(CommerceError::Storage(format!(
                 "invoice {} has no line items",
@@ -124,29 +218,55 @@ impl CommerceRepository for InMemoryCommerce {
                 invoice.id, invoice.currency
             )));
         }
-        // In-memory impl has no FG inventory to draw down — return
-        // the invoice unchanged. Tests that depend on enrichment
-        // use the postgres impl.
+        // Once per id, as the Pg adapter's `ON CONFLICT (id) DO NOTHING`
+        // decides it (backlog 9d2af748): the `created` lock is held
+        // across the check and the write, so two creates cannot both
+        // find the id free. An existing id writes and records nothing.
+        let exists = {
+            let mut created = self.created()?;
+            let exists = self.invoices.iter().any(|i| i.id == invoice.id)
+                || created.iter().any(|i| i.id == invoice.id);
+            if !exists {
+                created.push(invoice.clone());
+            }
+            exists
+        };
+        if exists {
+            let stored = self
+                .invoice_by_id(&invoice.id)
+                .await?
+                .ok_or_else(|| CommerceError::NotFound(format!("invoice {}", invoice.id)))?;
+            let differing = invoice.issuance_differences(&stored);
+            return if differing.is_empty() {
+                Ok(InvoiceCreate::AlreadyCreated(stored))
+            } else {
+                Err(CommerceError::another_invoice_under_this_id(
+                    &invoice.id,
+                    &differing,
+                ))
+            };
+        }
         self.record(stamp.event(
             crate::events::INVOICE_CREATED,
             crate::events::invoice_created_payload(invoice),
         ));
-        Ok(invoice.clone())
+        Ok(InvoiceCreate::Created(invoice.clone()))
     }
 
     async fn mark_invoice_paid_at(
         &self,
         id: &str,
-        _paid_on: chrono::NaiveDate,
+        paid_on: chrono::NaiveDate,
         stamp: &EventStamp,
     ) -> Result<(), CommerceError> {
-        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
-        };
-        self.record(stamp.event(
-            crate::events::INVOICE_PAID,
-            serde_json::to_value(inv).unwrap_or_default(),
-        ));
+        // Emit-once is structural: only the move records, and it records
+        // the post-move row, as Pg does.
+        if let Some(paid) = self.transition(id, InvoiceStatus::PAID, Some(paid_on))? {
+            self.record(stamp.event(
+                crate::events::INVOICE_PAID,
+                serde_json::to_value(&paid).unwrap_or_default(),
+            ));
+        }
         Ok(())
     }
 
@@ -155,13 +275,12 @@ impl CommerceRepository for InMemoryCommerce {
         id: &str,
         stamp: &EventStamp,
     ) -> Result<(), CommerceError> {
-        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
-        };
-        self.record(stamp.event(
-            crate::events::INVOICE_PAST_DUE,
-            serde_json::to_value(inv).unwrap_or_default(),
-        ));
+        if let Some(past_due) = self.transition(id, InvoiceStatus::PAST_DUE, None)? {
+            self.record(stamp.event(
+                crate::events::INVOICE_PAST_DUE,
+                serde_json::to_value(&past_due).unwrap_or_default(),
+            ));
+        }
         Ok(())
     }
 
@@ -170,27 +289,9 @@ impl CommerceRepository for InMemoryCommerce {
         id: &str,
         stamp: &EventStamp,
     ) -> Result<bool, CommerceError> {
-        use crate::types::InvoiceStatus;
-        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
-        };
-        if inv.status.as_str() == InvoiceStatus::PAID {
-            return Err(CommerceError::Conflict(format!(
-                "invoice {id} is 'paid': only outstanding or past-due \
-                 invoices write off"
-            )));
-        }
-        let mut flipped = self
-            .written_off
-            .lock()
-            .map_err(|e| CommerceError::Storage(format!("written_off lock: {e}")))?;
-        if inv.status.as_str() == InvoiceStatus::WRITTEN_OFF || flipped.contains(id) {
+        let Some(written) = self.transition(id, InvoiceStatus::WRITTEN_OFF, None)? else {
             return Ok(false);
-        }
-        flipped.insert(id.to_string());
-        // Emit-once is structural: only the flip-winning call records.
-        let mut written = inv.clone();
-        written.status = InvoiceStatus::WRITTEN_OFF.into();
+        };
         self.record(stamp.event(
             crate::events::INVOICE_WRITTEN_OFF,
             serde_json::to_value(&written).unwrap_or_default(),
@@ -200,15 +301,24 @@ impl CommerceRepository for InMemoryCommerce {
 
     async fn invoice_summary(
         &self,
-        _today: chrono::NaiveDate,
+        today: chrono::NaiveDate,
     ) -> Result<InvoiceSummary, CommerceError> {
+        // Revenue here is GL-sourced on Pg and has no in-memory
+        // analogue; the AR aging is invoices alone, so it is computed
+        // with the same owed filter and bucketing rule as Pg.
+        let ar_aging = ArAgingBucket::age(
+            self.owed_invoices()?
+                .into_iter()
+                .map(|i| ((today - i.due_on).num_days(), 1, i.amount_cents)),
+        );
+        let total_outstanding_cents = ar_aging.iter().map(|b| b.total_cents).sum();
         Ok(InvoiceSummary {
             revenue_ttm: Vec::new(),
             total_revenue_ttm_cents: 0,
             total_cogs_ttm_cents: 0,
             total_gross_margin_ttm_cents: 0,
-            ar_aging: Vec::new(),
-            total_outstanding_cents: 0,
+            ar_aging,
+            total_outstanding_cents,
             total_invoice_count: self.invoices.len() as i64,
             revenue_by_month: Vec::new(),
             currency: "USD".to_string(),
@@ -237,7 +347,7 @@ mod tests {
             line_items: vec![InvoiceLineItem {
                 id: format!("{id}-l1"),
                 invoice_id: id.to_string(),
-                revenue_category: RevenueCategory::from("new-sales"),
+                revenue_category: RevenueCategory::from("wholesale"),
                 amount_cents: 1_200_000,
                 currency: "USD".to_string(),
                 description: "Test line".to_string(),
@@ -276,5 +386,65 @@ mod tests {
     async fn invoice_by_id_not_found() {
         let repo = test_repo();
         assert!(repo.invoice_by_id("inv-999").await.unwrap().is_none());
+    }
+
+    /// The summary's AR aging is the owed invoices and nothing else
+    /// (backlog 926d64a3): paid is out, and so is written-off — both a
+    /// row that arrives written off and one flipped by
+    /// `mark_invoice_written_off`, which this adapter keeps as an
+    /// overlay. Same definition, same answer as the Pg adapter's
+    /// `summary_ar_aging_excludes_written_off_invoices`.
+    #[tokio::test]
+    async fn summary_ar_aging_counts_only_owed_invoices() {
+        let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let inv = |id: &str, cents: i64, status: &str, due_on: chrono::NaiveDate| {
+            let mut i = test_invoice(id);
+            i.amount_cents = cents;
+            i.line_items[0].amount_cents = cents;
+            i.status = status.into();
+            i.due_on = due_on;
+            i
+        };
+        let repo = InMemoryCommerce::new(vec![
+            inv(
+                "inv-1",
+                125_000,
+                InvoiceStatus::OUTSTANDING,
+                day(2025, 6, 10),
+            ),
+            inv("inv-2", 2_550, InvoiceStatus::PAST_DUE, day(2025, 4, 1)),
+            inv("inv-3", 5_000, InvoiceStatus::PAID, day(2025, 4, 1)),
+            inv("inv-4", 9_900, InvoiceStatus::WRITTEN_OFF, day(2025, 4, 1)),
+            inv("inv-5", 800, InvoiceStatus::PAST_DUE, day(2025, 1, 1)),
+        ]);
+        let stamp = EventStamp::new(
+            "commerce",
+            boss_core::actor::ActorId::Automation("test".into()),
+        );
+        assert!(
+            repo.mark_invoice_written_off("inv-5", &stamp)
+                .await
+                .unwrap()
+        );
+
+        let summary = repo.invoice_summary(day(2025, 6, 1)).await.unwrap();
+        let bucket = |label: &str, count, total_cents| ArAgingBucket {
+            label: label.into(),
+            count,
+            total_cents,
+        };
+        assert_eq!(
+            summary.ar_aging,
+            vec![
+                bucket("current", 1, 125_000),
+                bucket("1-30", 0, 0),
+                bucket("31-60", 0, 0),
+                bucket("61-90", 1, 2_550),
+                bucket("90+", 0, 0),
+            ],
+            "paid and written-off are not owed, so neither ages"
+        );
+        assert_eq!(summary.total_outstanding_cents, 127_550);
+        assert_eq!(summary.total_invoice_count, 5, "the count is every status");
     }
 }

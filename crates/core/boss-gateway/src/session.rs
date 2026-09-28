@@ -89,6 +89,19 @@ impl Session {
         }
     }
 
+    /// The role this session acts as. A session with no role acts as a
+    /// `visitor` — the least access, and on the read-only floor —
+    /// through `boss_core::roles::effective_role`, the one fallback,
+    /// because two readers here must agree on it: the role-header layer
+    /// that tells every service who is calling, and the proxy that
+    /// refuses a read-only session's writes before any service is
+    /// called (backlog 07e797b4). Were they to disagree, a roleless
+    /// session would be read-only downstream and a writer at the edge.
+    /// It was `audit-readonly`, the widest read, until design 2830b6b7.
+    pub fn effective_role(&self) -> &str {
+        boss_core::roles::effective_role(self.role.as_deref())
+    }
+
     /// Encode and sign into a cookie value.
     pub fn encode(&self, key: &[u8]) -> String {
         let payload = serde_json::to_vec(self).expect("serialize Session");

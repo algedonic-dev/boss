@@ -8,9 +8,11 @@
   // The user picks "I'm the sender, confirm" or "I'm the
   // receiver, confirm." Both ack lights up → step done.
 
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { claimedFor, startable } from './holder';
+  import { loadPersonOrTeamNames, personIdsOf } from '../data/ownerNames';
+  import { okRead, type ReadState } from '../data/readState';
+  import { putStep, startStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -55,39 +57,50 @@
   });
   let terminal = $derived(_isTerminal(step.status));
 
-  let employees = $state<Employee[]>([]);
-
+  // Names the two ends, one row each, and says so when a name cannot
+  // load. Until backlog 1e73bd93 this read the WHOLE roster, a refusal
+  // became `[]` and a network error was caught and dropped, so a person
+  // silently became an id. Either end may be a TEAM or a role rather
+  // than a person (the StepType's own "Person or team"), and the people
+  // service answers one 404 — "not a person", which is an answer, so
+  // loadPersonOrTeamNames keeps its id as the label and paints nothing.
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
+  let endsKey = $derived(personIdsOf([fromId, toId]).join('\n'));
   $effect(() => {
+    const ids = endsKey ? endsKey.split('\n') : [];
     let cancelled = false;
-    fetch('/api/people')
-      .then((r) => (r.ok ? r.json() : []))
-      .then((roster: Employee[]) => {
-        if (!cancelled) employees = roster;
-      })
-      .catch(() => {});
+    (async () => {
+      const out = await loadPersonOrTeamNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
+      }
+    })();
     return () => {
       cancelled = true;
     };
   });
 
-  let empNames = $derived.by(() => {
-    const m = new Map<string, string>();
-    for (const e of employees) m.set(e.id, e.name ?? "");
-    return m;
-  });
-
 
   let bothConfirmed = $derived(fromConfirmed && toConfirmed);
 
-  async function persist(status?: string): Promise<void> {
+  /// A Save on a ready step also starts it — it always did — and a
+  /// Start is a claim (design 611fbffd, clause b): the save, then the
+  /// claim door, for the stored nominee. The body carries `status` only
+  /// when the gesture moves it, and never the snapshot's holder: both
+  /// are how a stale page released a claim made after it was drawn
+  /// (backlog 6ef4a36b).
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
       const body = {
-        ...step,
+        ...drawn,
         job_id: jobId,
         notes: notes || undefined,
-        status: status ?? step.status,
+        ...(status ? { status } : {}),
         metadata: {
           ...step.metadata,
           from_id: fromId,
@@ -107,6 +120,15 @@
         toConfirmed = pickBool('to_confirmed');
         return;
       }
+      if (start) {
+        // The save landed, so its checkmarks stand; a refused claim
+        // leaves the step ready and says why.
+        const claimed = await startStep(jobId, step.id, claimedFor(step.assignee_id));
+        if (claimed.kind === 'failed') {
+          writeError = claimed.error;
+          return;
+        }
+      }
       onUpdate();
     } finally {
       saving = false;
@@ -120,6 +142,12 @@
     <span class="step-kind-label">{step.kind}</span>
     <span class="step-status step-status-{step.status}">{step.status}</span>
   </div>
+
+  {#if namesRead.kind === 'failed'}
+    <p class="load-failed" role="alert">
+      Couldn't load the names on this handoff — {namesRead.error}. People show as ids.
+    </p>
+  {/if}
 
   <div class="step-handoff-pair">
     <div class="step-handoff-side">
@@ -183,14 +211,14 @@
   <div class="step-actions">
     {#if !terminal}
       <button
-        class="step-btn"
-        onclick={() => persist(isPending(step.status) ? 'active' : undefined)}
+        class="btn"
+        onclick={() => persist(undefined, startable(step))}
         disabled={saving}
       >
-        {saving ? 'Saving…' : 'Save'}
+        {saving ? 'Saving…' : startable(step) ? 'Save and start' : 'Save'}
       </button>
       <button
-        class="step-btn step-btn-primary"
+        class="btn btn-primary"
         onclick={() => persist('completed')}
         disabled={saving || !bothConfirmed}
         title={!bothConfirmed
@@ -213,13 +241,13 @@
   .step-handoff-side {
     flex: 1;
     padding: 10px 12px;
-    background: var(--bg-soft, #f9fafb);
-    border: 1px solid var(--border-soft, #f3f4f6);
+    background: var(--ink-raised);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
   }
   .step-handoff-arrow {
     align-self: center;
-    color: var(--text-muted, #9ca3af);
+    color: var(--static);
     font-size: 24px;
     font-weight: 300;
   }
@@ -227,7 +255,7 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--text-muted, #6b7280);
+    color: var(--static);
     margin-bottom: 2px;
   }
   .step-handoff-name {

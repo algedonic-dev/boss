@@ -532,7 +532,7 @@ async fn main() -> Result<()> {
     // Long-lived live-API output. CRITICAL: must be held across
     // every tick of a sim-day so the per-day batch buffers
     // (`day_job_creates`, `day_invoices`, `day_shipments`,
-    // `day_step_creates`, `day_step_updates`, etc) accumulate
+    // `day_step_creates`, etc) accumulate
     // across the day's ticks before flushing. A per-tick
     // LiveApiOutput would scope-die at the close of each
     // spawn_blocking closure, so the end_of_day flush would run
@@ -1398,8 +1398,7 @@ mod day_cursor_tests {
 
     #[test]
     fn epoch_rewind_cleanup_removes_checkpoint() {
-        let dir = std::env::temp_dir().join(format!("rewind-cleanup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = boss_testing::scratch_dir("rewind-cleanup");
         let path = dir.join("counterparty-queue.json");
         std::fs::write(&path, "{}").unwrap();
         cleanup_for_epoch_rewind(&path).unwrap();
@@ -1760,24 +1759,13 @@ fn run_regen(
     hard_fail: bool,
     drain_pause_ms: u64,
 ) -> Result<()> {
-    // Duration-based completion timing: pass each StepType's
-    // typical_duration_hours so end_of_day computes completion
-    // sim_time = LA 08:00 + duration per step instead of a uniform
-    // spread — the day's audit_log reads as a realistic ops cadence.
-    let step_registry = boss_jobs::step_registry::StepRegistry::v1();
-    let step_durations: HashMap<String, (f64, f64)> = step_registry
-        .all()
-        .into_iter()
-        .filter_map(|t| {
-            t.typical_duration_hours
-                .map(|h| (t.kind.to_string(), (h, t.typical_duration_jitter)))
-        })
-        .collect();
-
+    // (No step durations: they timed LiveApiOutput's end-of-day step
+    // update flush, which nothing fed and was deleted, e39a9d2a. The
+    // workforce, which does complete steps, takes its own durations
+    // in `Workforce::new`.)
     let mut output = LiveApiOutput::new(api_base)
         .with_hard_fail(hard_fail)
-        .with_drain_pause_ms(drain_pause_ms)
-        .with_step_durations(step_durations);
+        .with_drain_pause_ms(drain_pause_ms);
     register_default_event_routes(&mut output);
 
     // Every domain-write side effect flows engine → jobs-api PUT step →

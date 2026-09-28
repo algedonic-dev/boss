@@ -58,7 +58,8 @@
 //! every reading it left null — and not asked again until the next
 //! poll. The two standings are separate: a key with one scope and not
 //! the other still reads everything the scope it has allows. Any
-//! other non-2xx or transport failure is weather on that one charge:
+//! other non-2xx, transport failure, or a 2xx body in a shape the
+//! adapter does not know (f2eac973) is weather on that one charge:
 //! the reading carries null and a note naming the status, and the
 //! next charge is asked.
 //!
@@ -166,24 +167,76 @@ pub fn fee_and_net(txn: &Json) -> Option<(i64, i64)> {
     Some((txn.get("fee")?.as_i64()?, txn.get("net")?.as_i64()?))
 }
 
+/// A Checkout Session, as far as the consent read needs it: the
+/// `custom_fields` list Stripe always sends (empty when the Checkout
+/// page declares none). Required, so a session without it is a shape
+/// this adapter does not know rather than a sponsor who gave nothing.
+#[derive(Debug, Deserialize)]
+struct Session {
+    custom_fields: Vec<CustomField>,
+}
+
+/// One `custom_fields[]` entry: its `key`, and the `text` hash Stripe
+/// fills only for a field of type `text` (null for a dropdown or a
+/// numeric field).
+#[derive(Debug, Deserialize)]
+struct CustomField {
+    key: String,
+    #[serde(default)]
+    text: Option<TextField>,
+}
+
+/// `text.value` is what the sponsor typed, or null when they left the
+/// optional field empty.
+#[derive(Debug, Deserialize)]
+struct TextField {
+    #[serde(default)]
+    value: Option<String>,
+}
+
 /// The trimmed `text.value` of the custom field keyed
-/// [`SPONSOR_ROLL_FIELD`] on the first session of a listing — `None`
+/// [`SPONSOR_ROLL_FIELD`] on the first session of a listing — `Ok(None)`
 /// when the listing is empty, the field is absent, or its value is
-/// blank. Reads nothing else. The shape is Stripe's Checkout Session
-/// object (https://docs.stripe.com/api/checkout/sessions/object,
+/// blank or null. Reads nothing else. The shape is Stripe's Checkout
+/// Session object (https://docs.stripe.com/api/checkout/sessions/object,
 /// `custom_fields[]`: `{key, label, optional, type, text: {value, ..}}`),
 /// pinned by the `session` fixture in the tests below.
-pub fn sponsor_roll_name(sessions: &Json) -> Option<String> {
-    sessions
-        .pointer("/data/0/custom_fields")?
-        .as_array()?
-        .iter()
-        .find(|f| f.get("key").and_then(Json::as_str) == Some(SPONSOR_ROLL_FIELD))?
-        .pointer("/text/value")?
-        .as_str()
+///
+/// A SHAPE IT DOES NOT KNOW IS AN `Err`, NOT A `None` (backlog
+/// f2eac973). This was an untyped `pointer("/data/0/custom_fields")`,
+/// so a listing with no `data`, a session whose `custom_fields` is not a
+/// list, or our field arriving without its `text` hash all read exactly
+/// like a sponsor who left the roll blank — an opted-in name dropped to
+/// null with nothing on the reading to say so. The listing is now parsed
+/// through the same typed [`ChargePage`] the charges read uses (serde
+/// requires `data`), the session through [`Session`], and a failure is
+/// the caller's to note. It is judged here rather than through the jobs
+/// API's `rows_or_refuse`: Stripe is an external API whose failure has
+/// its own shape and its own note.
+pub fn sponsor_roll_name(sessions: &Json) -> Result<Option<String>, String> {
+    let listing: ChargePage = serde_json::from_value(sessions.clone())
+        .map_err(|e| format!("not a session listing: {e}"))?;
+    let Some(first) = listing.data.into_iter().next() else {
+        return Ok(None);
+    };
+    let session: Session =
+        serde_json::from_value(first).map_err(|e| format!("not a checkout session: {e}"))?;
+    let Some(field) = session
+        .custom_fields
+        .into_iter()
+        .find(|f| f.key == SPONSOR_ROLL_FIELD)
+    else {
+        return Ok(None);
+    };
+    let text = field.text.ok_or_else(|| {
+        format!("the {SPONSOR_ROLL_FIELD} custom field carries no text hash (not a text field?)")
+    })?;
+    Ok(text
+        .value
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
 /// Put one secondary read's result onto a reading's payload: the
@@ -312,7 +365,9 @@ impl StripeCharges {
                 "the sponsor's consent",
             )
             .await?;
-        Ok(sponsor_roll_name(&listing))
+        // A shape this adapter does not know is this charge's weather,
+        // named on the reading — never a silent "no consent" (f2eac973).
+        sponsor_roll_name(&listing).map_err(|e| Miss::Failed(format!("GET {path}: {e}")))
     }
 
     /// The fee and net on the charge's balance transaction (Stripe API
@@ -648,7 +703,10 @@ mod tests {
                 text_field(SPONSOR_ROLL_FIELD, json!("  Ada Lovelace  "))
             ]),
         )]);
-        assert_eq!(sponsor_roll_name(&s).as_deref(), Some("Ada Lovelace"));
+        assert_eq!(
+            sponsor_roll_name(&s).unwrap().as_deref(),
+            Some("Ada Lovelace")
+        );
         // Blank, null, and a field of another key are no consent.
         for fields in [
             json!([text_field(SPONSOR_ROLL_FIELD, json!("   "))]),
@@ -658,10 +716,38 @@ mod tests {
         ] {
             assert_eq!(
                 sponsor_roll_name(&list(vec![session("pi_1", fields)])),
-                None
+                Ok(None)
             );
         }
-        assert_eq!(sponsor_roll_name(&list(vec![])), None, "no session");
+        assert_eq!(sponsor_roll_name(&list(vec![])), Ok(None), "no session");
+    }
+
+    /// Backlog f2eac973: a shape the adapter does not know refuses, so
+    /// the caller can note it, rather than reading as no consent.
+    #[test]
+    fn a_session_listing_in_an_unknown_shape_is_an_error_not_no_consent() {
+        for (body, says) in [
+            (json!({"object": "list"}), "not a session listing"),
+            (json!({"error": {"message": "x"}}), "not a session listing"),
+            (
+                list(vec![json!({"id": "cs_1", "object": "checkout.session"})]),
+                "not a checkout session",
+            ),
+            (
+                list(vec![session("pi_1", json!("sponsor_roll_name=Ada"))]),
+                "not a checkout session",
+            ),
+            (
+                list(vec![session(
+                    "pi_1",
+                    json!([{"key": SPONSOR_ROLL_FIELD, "type": "dropdown", "text": null}]),
+                )]),
+                "carries no text",
+            ),
+        ] {
+            let why = sponsor_roll_name(&body).expect_err("an unknown shape");
+            assert!(why.contains(says), "{body}: {why}");
+        }
     }
 
     #[test]
@@ -1171,6 +1257,78 @@ mod tests {
             2,
             "weather is not a refusal: the next charge is asked"
         );
+    }
+
+    /// A SHAPE WE DO NOT KNOW IS NOT AN ABSENT CONSENT (backlog
+    /// f2eac973). The consent was read with an untyped
+    /// `pointer("/data/0/custom_fields")`, so any change in Stripe's
+    /// shape — no `data`, `custom_fields` not a list, our field without
+    /// its `text` — read exactly like a sponsor who left the roll blank:
+    /// null, no note, an opted-in name gone without a word. Each is now
+    /// this charge's weather: null WITH a note naming the listing, and
+    /// the next charge is still asked.
+    #[tokio::test]
+    async fn a_session_listing_in_an_unknown_shape_notes_it_rather_than_reading_no_consent() {
+        let listing = [
+            ("pi_1", json!({"object": "list", "has_more": false})),
+            (
+                "pi_2",
+                list(vec![session("pi_2", json!("sponsor_roll_name=Ada"))]),
+            ),
+            (
+                "pi_3",
+                list(vec![session(
+                    "pi_3",
+                    json!([{"key": SPONSOR_ROLL_FIELD, "type": "dropdown",
+                            "dropdown": {"value": "ada"}}]),
+                )]),
+            ),
+            (
+                "pi_4",
+                list(vec![session(
+                    "pi_4",
+                    json!([text_field(SPONSOR_ROLL_FIELD, json!("Ada Lovelace"))]),
+                )]),
+            ),
+        ];
+        let sessions = listing
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let charges = vec![
+            paid_charge("ch_1", 1_700_000_100, "pi_1"),
+            paid_charge("ch_2", 1_700_000_200, "pi_2"),
+            paid_charge("ch_3", 1_700_000_300, "pi_3"),
+            paid_charge("ch_4", 1_700_000_400, "pi_4"),
+        ];
+        let (base, _, seen, _) = stub_stripe_with(
+            200,
+            Some(charges),
+            Sessions::Listing(sessions),
+            Txns::Listing(Default::default()),
+        )
+        .await;
+        let obs = StripeCharges::new(base)
+            .read("rk_test_good", None)
+            .await
+            .expect("consent is optional; the payment is not");
+        assert_eq!(obs.len(), 4);
+        for id in ["ch_1", "ch_2", "ch_3"] {
+            let (name, note) = roll(&obs, id);
+            assert_eq!(name, Json::Null, "{id}");
+            let note = note.unwrap_or_else(|| panic!("{id}: an unknown shape carries a note"));
+            let note = note.as_str().unwrap_or_default();
+            assert!(
+                note.contains("/v1/checkout/sessions") && !note.contains("rk_test_good"),
+                "{id}: {note}"
+            );
+        }
+        assert_eq!(
+            roll(&obs, "ch_4"),
+            (json!("Ada Lovelace"), None),
+            "a shape error is one charge's weather, not a standing refusal"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4, "every charge was asked");
     }
 
     #[tokio::test]

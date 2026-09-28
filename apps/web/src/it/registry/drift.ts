@@ -21,6 +21,7 @@
 // refused, exit 3) is COUNTED and named, never read as "0 adrift". A
 // failed read is a failure, never an empty table.
 
+import { ageText } from '../../dispatcher/ruleFirings';
 import { fetchRemote, type Remote } from '../../data/remote';
 
 // ---------------------------------------------------------------------
@@ -44,6 +45,11 @@ export type Measured = Readonly<{
   fields_parsed: number;
   fields_compared: number;
   exempt: ReadonlyArray<string>;
+  /** `method.fields` — the script's own statement of which fields it
+   *  compares. The page draws this rather than a list of its own, which
+   *  had fallen behind the script's four step facets (fb5f1c2f); null
+   *  when the packet does not say. */
+  method_fields: string | null;
 }>;
 
 /** One compared field that disagrees: the file in the tree at `head`
@@ -120,6 +126,7 @@ function parseMeasured(v: unknown): Measured | null {
     fields_parsed: int(r.fields_parsed),
     fields_compared: int(r.fields_compared),
     exempt: strs(r.exempt),
+    method_fields: str(rec(r.method)?.fields),
   };
 }
 
@@ -207,4 +214,21 @@ export function loadDriftPackets(limit: number): Promise<Exclude<Remote<DriftPag
 /** The packet measured last — by `measured.at`, not by API order. */
 export function newestMeasured(packets: ReadonlyArray<DriftPacket>): DriftPacket | null {
   return packets.reduce<DriftPacket | null>((best, p) => (best === null || p.measured.at > best.measured.at ? p : best), null);
+}
+
+/** The measurement runs daily at 05:20Z; past the period plus two hours'
+ *  slack a run was missed (d83886c6). A clean streak — "every compared
+ *  field agrees" — is exactly what a stopped cadence would keep drawing,
+ *  so the age is drawn always and marked past this. */
+export const STALE_AFTER_HOURS = 26;
+
+export type MeasurementAge = Readonly<{ text: string; stale: boolean }>;
+
+/** How old `at` is at `now` (`14h`, `3d`), and whether that is past
+ *  STALE_AFTER_HOURS. Null when either instant cannot be read, so the
+ *  page never prints an invented age. */
+export function measurementAge(at: string, now: string): MeasurementAge | null {
+  const ms = Date.parse(now) - Date.parse(at);
+  if (!Number.isFinite(ms)) return null;
+  return { text: ageText(at, now), stale: ms > STALE_AFTER_HOURS * 3_600_000 };
 }

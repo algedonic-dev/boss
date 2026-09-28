@@ -201,8 +201,10 @@ if command -v jq >/dev/null 2>&1; then
     printf '#!/bin/sh\nexit 0\n' > "$tmp/rbin/gh"; chmod +x "$tmp/rbin/gh"
     cat > "$tmp/rbin/curl" <<'EOF'
 #!/bin/sh
-# The system of record, stubbed: a PUT records its payload; a GET serves the fixture.
-for a in "$@"; do case "$a" in @*) cp "${a#@}" "$STUB_PUT"; exit 0;; esac; done
+# The system of record, stubbed: every write answers 200 (the runner reads the status, 3c3b202c) and the step merge door's body - the keys the runner records on the step, sent before a status-only PUT (2aa2b19e) - is kept; a GET serves the fixture.
+for a in "$@"; do case "$a" in @*)
+    for u in "$@"; do case "$u" in */steps/*/metadata) cp "${a#@}" "$STUB_STEP_METADATA";; esac; done
+    printf 200; exit 0;; esac; done
 cat "$STUB_JOBS"
 EOF
     chmod +x "$tmp/rbin/curl"
@@ -215,23 +217,23 @@ EOF
     }
     run_runner() {
         env -i PATH="$tmp/rbin:$PATH" HOST_ID=forge BOSS_JOBS_URL=http://sor.invalid \
-            OPS_VERBS_DIR="$tmp/verbs" STUB_JOBS="$tmp/jobs.json" STUB_PUT="$tmp/put.json" \
+            OPS_VERBS_DIR="$tmp/verbs" STUB_JOBS="$tmp/jobs.json" STUB_STEP_METADATA="$tmp/step-md.json" \
             BOSS_PUBLISH_STATE_DIR="$tmp/rstate" BOSS_FORGE_REPO_PATH="$tmp/forge.git" \
             BOSS_GITHUB_TOKEN_FILE="$tmp/etc/github.token" BOSS_SOR_ENV="$tmp/sor.env" \
             sh "$repo/infra/ops/ops-runner.sh" 2>&1
     }
-    rm -f "$tmp/put.json"; packet '["--check"]'
+    rm -f "$tmp/step-md.json"; packet '["--check"]'
     out=$(run_runner) || fail "the runner failed on publish-github-pr --check: $out"
-    [[ -f "$tmp/put.json" ]] || fail "the runner completed no step for --check: $out"
-    [[ "$(jq -r .metadata.disposition "$tmp/put.json")" == answered ]] || fail "--check was not answered through the runner: $(cat "$tmp/put.json") / $out"
-    grep -q -- '--check ok' <<<"$(jq -r .metadata.output "$tmp/put.json")" || fail "--check through the runner did not report ok: $(cat "$tmp/put.json")"
-    rm -f "$tmp/put.json"; packet '["--force"]'
+    [[ -f "$tmp/step-md.json" ]] || fail "the runner completed no step for --check: $out"
+    [[ "$(jq -r .disposition "$tmp/step-md.json")" == answered ]] || fail "--check was not answered through the runner: $(cat "$tmp/step-md.json") / $out"
+    grep -q -- '--check ok' <<<"$(jq -r .output "$tmp/step-md.json")" || fail "--check through the runner did not report ok: $(cat "$tmp/step-md.json")"
+    rm -f "$tmp/step-md.json"; packet '["--force"]'
     out=$(run_runner) || fail "the runner failed refusing --force: $out"
-    [[ "$(jq -r .metadata.disposition "$tmp/put.json")" == refused ]] || fail "--force was not refused: $(cat "$tmp/put.json")"
-    reason=$(jq -r '.metadata.reason // empty' "$tmp/put.json")
-    [[ -n "$reason" ]] || fail "the refusal wrote no reason on the step: $(cat "$tmp/put.json")"
+    [[ "$(jq -r .disposition "$tmp/step-md.json")" == refused ]] || fail "--force was not refused: $(cat "$tmp/step-md.json")"
+    reason=$(jq -r '.reason // empty' "$tmp/step-md.json")
+    [[ -n "$reason" ]] || fail "the refusal wrote no reason on the step: $(cat "$tmp/step-md.json")"
     [[ "$reason" == *"not one of --check"* ]] || fail "the reason does not name the literal list: $reason"
-    [[ "$reason" == "$(jq -r .metadata.output "$tmp/put.json")" ]] || fail "reason and output differ on a refusal"
+    [[ "$reason" == "$(jq -r .output "$tmp/step-md.json")" ]] || fail "reason and output differ on a refusal"
     grep -qF -- "refused aaaaaaaa — $reason" <<<"$out" || fail "the journal line does not carry the same reason: $out"
     runner_line="through the runner, publish-github-pr --check is answered and --force is refused with the reason on the step"
 fi

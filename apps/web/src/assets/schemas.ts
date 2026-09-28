@@ -1,12 +1,9 @@
 // Runtime schemas for the assets API surfaces consumed by
 // AssetPage. Mirrors `apps/web/src/assets/types.ts`.
 //
-// `phase` is modeled as an open string here even though `types.ts`
-// uses a closed union — the DB CHECK constraint can drift ahead of
-// the SPA, and we'd rather render an unfamiliar phase than refuse
-// the whole bundle. The TS type stays closed so new phases produce a
-// compile error in switch-style consumers, which is the right
-// granularity for catching that drift.
+// `phase` is an open string, here and in `types.ts`: the vocabulary is
+// the Class registry's `(asset, phase)` rows, not a list in the SPA
+// (backlog 53fecfc9), so an unfamiliar phase renders by its code.
 
 import { z } from '../data/parseResponse';
 
@@ -23,6 +20,18 @@ export const AssetSchema = z.object({
   first_seen: z.string(),
   last_event_at: z.string(),
   oem_serial: z.string().nullable(),
+});
+
+/// `GET /api/assets/summary` (boss-assets' AssetsSummary). The page used
+/// to cast it, so a 200 of any other shape — the smoke floor's `[]` —
+/// painted every count as 0 with no failure line (backlog e1cb1ef3).
+export const AssetsSummarySchema = z.object({
+  phase_counts: z.array(z.object({ phase: z.string(), count: z.number() })),
+  total_systems: z.number(),
+  in_field_count: z.number(),
+  open_tickets_total: z.number(),
+  warranty_expiring_30d: z.number(),
+  sku_counts: z.array(z.object({ sku: z.string(), count: z.number() })).optional(),
 });
 
 /// Asset events have a stable header (id/ts/actor_id/kind) plus

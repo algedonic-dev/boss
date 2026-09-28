@@ -53,6 +53,41 @@ pub(crate) fn blocking_draft(versions: &[Value], ours: Option<i32>) -> Option<i3
 /// Compares the version AND the step titles, because a version number
 /// alone would not have caught the v16 regression — v16 is a perfectly
 /// valid version, just the wrong protocol.
+/// The workflow row a `GET` or `PUT /api/workflows/{kind}` answered, or
+/// a refusal naming the read and what the body carried instead.
+///
+/// Backlog f2eac973. Both answer a BARE `WorkflowSpec` (boss-jobs
+/// `get_kind` / `update_kind`: `Json(spec)`) — never an envelope, never
+/// a list. The three reads in `publish` spelled
+/// `.get("data").cloned().unwrap_or(v)` and then took the LAST element
+/// of any array, so every 200 body was "the row": an error body went on
+/// to fail as "carries no version", three steps from the read that
+/// caused it. The row is read bare and must carry what every
+/// `WorkflowSpec` does, a non-empty `kind` and an integer `version`.
+pub(crate) fn workflow_row(body: Value, what: &str) -> Result<Value> {
+    let is_row = body
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| !k.is_empty())
+        && body.get("version").and_then(Value::as_i64).is_some();
+    if is_row {
+        return Ok(body);
+    }
+    let carried = match &body {
+        Value::Object(m) => format!(
+            "keys [{}]",
+            m.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Array(_) => "a list".to_string(),
+        Value::Null => "null".to_string(),
+        _ => "a scalar".to_string(),
+    };
+    bail!(
+        "{what} answered no workflow row (no string `kind` and integer `version`; the body \
+         carried {carried})"
+    )
+}
+
 pub(crate) fn confirm(active: &Value, want_version: i32, want_titles: &[String]) -> Result<()> {
     let got_version = active
         .get("version")
@@ -130,7 +165,7 @@ pub async fn discard(kind: &str, version: i32) -> Result<()> {
         None,
     )
     .await?;
-    let versions = crate::gate::rows(
+    let versions = crate::train::rows(
         crate::gate::api(
             &http,
             reqwest::Method::GET,
@@ -138,7 +173,7 @@ pub async fn discard(kind: &str, version: i32) -> Result<()> {
             None,
         )
         .await?,
-    );
+    )?;
     let still_there = versions
         .iter()
         .any(|v| v.get("version").and_then(serde_json::Value::as_i64) == Some(i64::from(version)));
@@ -197,7 +232,8 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
     let mut spec = load_spec(kind, path)?;
 
     // The active row, for the fields a draft needs and for the
-    // before/after comparison.
+    // before/after comparison. A failed read is still "no active row"
+    // (a new kind answers 404), but a 200 that is not a row refuses.
     let active = crate::gate::api(
         &http,
         reqwest::Method::GET,
@@ -207,14 +243,8 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
     .await
     .ok()
     .flatten()
-    .map(|v| v.get("data").cloned().unwrap_or(v));
-    let active = active.map(|a| {
-        if a.is_array() {
-            a[a.as_array().map_or(0, |x| x.len() - 1)].clone()
-        } else {
-            a
-        }
-    });
+    .map(|v| workflow_row(v, &format!("GET /api/workflows/{kind}")))
+    .transpose()?;
     carry_forward(&mut spec, active.as_ref());
     let want_titles = titles(&spec);
     if want_titles.is_empty() {
@@ -222,7 +252,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
     }
 
     // REFUSE INTO A DIRTY REGISTRY, before writing anything.
-    let versions = crate::gate::rows(
+    let versions = crate::train::rows(
         crate::gate::api(
             &http,
             reqwest::Method::GET,
@@ -230,7 +260,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
             None,
         )
         .await?,
-    );
+    )?;
     if let Some(stale) = blocking_draft(&versions, None) {
         bail!(
             "a draft of {kind} v{stale} is already sitting in the registry, and publish \
@@ -277,7 +307,8 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
         Some(spec.clone()),
     )
     .await?
-    .map(|v| v.get("data").cloned().unwrap_or(v))
+    .map(|v| workflow_row(v, &format!("PUT /api/workflows/{kind}")))
+    .transpose()?
     .context("the draft create returned no body — refusing to publish on that")?;
     let draft_version = created
         .get("version")
@@ -302,13 +333,9 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
         None,
     )
     .await?
-    .map(|v| v.get("data").cloned().unwrap_or(v))
+    .map(|v| workflow_row(v, &format!("GET /api/workflows/{kind}")))
+    .transpose()?
     .context("could not read the active row back")?;
-    let now_active = if now_active.is_array() {
-        now_active[now_active.as_array().map_or(0, |x| x.len() - 1)].clone()
-    } else {
-        now_active
-    };
     confirm(&now_active, draft_version, &want_titles)?;
     println!(
         "boss workflow: {kind} v{draft_version} is live, with the {} steps sent — confirmed by \
@@ -322,6 +349,40 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Backlog f2eac973, the CLI neighbour. `GET` and `PUT
+    /// /api/workflows/{kind}` answer a BARE `WorkflowSpec` (boss-jobs
+    /// `get_kind` / `update_kind`: `Json(spec)`), never an envelope and
+    /// never a list. The reads here spelled `.get("data").cloned()
+    /// .unwrap_or(v)` and then took the last element of an array, so
+    /// ANY 200 body was "the row": an envelope was unwrapped, a list
+    /// was indexed, and an error body went on to a confusing "carries
+    /// no version". The row is now read bare and must be one, and the
+    /// refusal names what the body carried instead.
+    #[test]
+    fn a_workflow_read_takes_the_bare_row_or_refuses_naming_the_body() {
+        let row = json!({"kind": "ship-a-change", "version": 22, "steps": []});
+        assert_eq!(
+            workflow_row(row.clone(), "GET /api/workflows/ship-a-change").unwrap(),
+            row
+        );
+        for (body, carried) in [
+            (json!({"data": row.clone()}), "keys [data]"),
+            (json!({"error": "forbidden"}), "keys [error]"),
+            (json!([row.clone()]), "a list"),
+            (Value::Null, "null"),
+            (json!({"kind": "ship-a-change"}), "keys [kind]"),
+            (json!({"kind": "", "version": 3}), "keys [kind, version]"),
+        ] {
+            let why = workflow_row(body.clone(), "GET /api/workflows/ship-a-change")
+                .expect_err("not a workflow row")
+                .to_string();
+            assert!(
+                why.contains("GET /api/workflows/ship-a-change") && why.contains(carried),
+                "{body}: {why}"
+            );
+        }
+    }
 
     /// THE v16 REGRESSION, as a rule. A stale draft left by an earlier
     /// failed attempt is exactly what `publish` promotes, because it

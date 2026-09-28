@@ -73,6 +73,8 @@ fn build_app(pool: PgPool) -> Router {
         repo: Arc::new(PgScheduling::new(pool)),
         publisher: Some(publisher),
         clock: Arc::new(boss_clock_client::WallClockClient),
+        // The reads' gate is not under test here; the writes ask none.
+        policy: Arc::new(boss_policy_client::PermissivePolicyClient),
     })
 }
 
@@ -128,6 +130,7 @@ async fn scheduling_writes_survive_rebuild() {
 
     // 4. Calendar token rotation.
     TestRequest::post("/api/scheduling/techs/emp-tech-001/calendar-token")
+        .as_user("emp-tech-001", "service-tech")
         .json(&json!({}))
         .send(&app)
         .await
@@ -214,10 +217,12 @@ struct AssignmentRow {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The token table holds a digest, never the token (backlog 4aaff4dc).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 struct TokenRow {
     employee_id: String,
-    token: String,
+    token_sha256: String,
+    logged_raw: bool,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -234,7 +239,8 @@ async fn snapshot_assignments(pool: &PgPool) -> Vec<AssignmentRow> {
 
 async fn snapshot_tokens(pool: &PgPool) -> Vec<TokenRow> {
     sqlx::query_as(
-        "SELECT employee_id, token, created_at FROM tech_calendar_tokens ORDER BY employee_id",
+        "SELECT employee_id, token_sha256, logged_raw, created_at \
+         FROM tech_calendar_tokens ORDER BY employee_id",
     )
     .fetch_all(pool)
     .await
@@ -282,6 +288,7 @@ async fn scheduling_rebuild_is_byte_identical() {
     // Calendar token minted (the mint used to stamp NOW() into
     // created_at on both the live insert and the replay).
     TestRequest::post("/api/scheduling/techs/emp-tech-002/calendar-token")
+        .as_user("emp-tech-002", "service-tech")
         .json(&json!({}))
         .send(&app)
         .await

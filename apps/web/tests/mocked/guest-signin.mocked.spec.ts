@@ -11,7 +11,7 @@
 // ever appears because somebody asked for it, and that a deployment
 // which does not offer it never shows the control.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './_test';
 import { mountPage } from './_helpers';
 import { installApiFloor } from './_smokeMocks';
 
@@ -92,7 +92,7 @@ test.describe('guest sign-in', () => {
     expect(mintCalls).toBe(0);
 
     await guestButton(page).click();
-    await page.waitForURL(/\/ux\/jobs/, { timeout: 10_000 });
+    await page.waitForURL(/\/ux\/jobs/);
     expect(mintCalls).toBe(1);
   });
 });

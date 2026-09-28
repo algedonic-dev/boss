@@ -6,7 +6,7 @@ holding our actual software implementation to the ideals of our
 design."*
 **Related**: [the-three-layers.md](./the-three-layers.md) ·
 [correctness-protocol.md](./correctness-protocol.md) ·
-[packet-loss.md](./packet-loss.md)
+[packet-loss, folded into the decision record](../architecture-decisions.md)
 
 ---
 

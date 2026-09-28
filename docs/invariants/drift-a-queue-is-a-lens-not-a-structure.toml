@@ -1,7 +1,7 @@
 [[invariant]]
 id = "drift-a-queue-is-a-lens-not-a-structure"
 claim = "A queue is a lens … never a reified structure."
-source = "docs/design/queue-visibility.md; docs/design/views-as-queue-lenses.md"
+source = "docs/design/queue-visibility.md; the views-as-queue-lenses decision in docs/architecture-decisions.md"
 enforcement = "unenforced"
 mechanism = ""
 last_verified = ""

@@ -8,6 +8,7 @@
   import { navigate, href } from '../router';
   import { shortId } from '../data/ids';
   import {
+    parseJob,
     subjectLabel,
     subjectPath,
     type Job,
@@ -25,6 +26,10 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import AbortModal from './AbortModal.svelte';
   import { abortAuthority, abortTerminals } from './abort';
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import { idSegments, jobAnnotations } from './annotations';
 
   let { jobId } = $props<{ jobId: string }>();
 
@@ -82,6 +87,24 @@
     return out;
   });
 
+  // Every other job-level metadata key — the operator annotations
+  // written through PATCH /api/jobs/{id}/metadata (plan_of_action,
+  // eta_utc, needs_david, decided_*, …). They were readable only
+  // through the API until backlog 1abb9928 (2026-09-27); annotations.ts
+  // decides the order and the shape. The link fields are skipped only
+  // when the registry read landed, because only then does Linked Jobs
+  // draw them — a failed read leaves them here rather than nowhere.
+  let annotations = $derived.by(() => {
+    const j = job;
+    if (!j) return [];
+    const linkFields = new Set(
+      (edges?.kind === 'ready' ? edges.data : [])
+        .filter((e) => e.source_kind === j.kind)
+        .map((e) => e.field_path),
+    );
+    return jobAnnotations(j.metadata, linkFields);
+  });
+
   // Two paths:
   // 1. /api/jobs/{id}/stream — SSE that pushes a JobDetail frame
   //    on every observable change (job status / priority / closed_on,
@@ -117,9 +140,13 @@
       loading = true;
     }
     try {
-      const resp = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+      const url = `/api/jobs/${encodeURIComponent(id)}`;
+      const resp = await fetch(url);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const detail = (await resp.json()) as Job;
+      // A body that is not a Job throws here, naming what it lacks, and
+      // lands on the failure line below — never in the Subject section
+      // as a render throw (backlog c2e18fdd).
+      const detail = parseJob(url, await resp.json());
       // The ticket check: a newer question has been asked, or the
       // page has moved to a different packet. Either way this answer
       // is history — drop it entirely.
@@ -155,18 +182,24 @@
     refreshing = false;
 
     try {
-      es = new EventSource(`/api/jobs/${encodeURIComponent(id)}/stream`);
+      const streamUrl = `/api/jobs/${encodeURIComponent(id)}/stream`;
+      es = new EventSource(streamUrl);
       es.onmessage = (ev) => {
         if (cancelled) return;
         try {
-          const detail = JSON.parse(ev.data) as Job;
+          const detail = parseJob(streamUrl, JSON.parse(ev.data));
           job = detail;
           firstAnswered = true;
           loading = false;
           refreshing = false;
           error = null;
-        } catch {
-          // Drop malformed frame; next push will fix it.
+        } catch (e) {
+          // A frame that is not a Job never replaces the one rendered;
+          // the next push corrects it. But it is said, not dropped: with
+          // nothing rendered yet the failure line names it, where a
+          // silent drop left "Loading…" up (backlog c2e18fdd).
+          error = e instanceof Error ? e.message : String(e);
+          loading = false;
         }
       };
       es.addEventListener('error', () => {
@@ -227,6 +260,11 @@
   let abortOpen = $state(false);
 </script>
 
+<!-- A string with every uuid in it drawn as a link to that packet. One
+     line on purpose: prose renders with its whitespace preserved, so a
+     newline inside this snippet would print. -->
+{#snippet linked(text: string)}{#each idSegments(text) as seg, i (i)}{#if seg.kind === 'id'}<Link to={entityHref('job', seg.id)} className="jd-mono">{seg.id}</Link>{:else}{seg.text}{/if}{/each}{/snippet}
+
 {#if loading && !job}
   <!-- Only the FIRST wait for a packet blanks the page. Refreshes
        (the 30s fallback poll, post-action refetches) keep the content
@@ -239,7 +277,8 @@
        packet for an error on one blip is the modal's poisoning bug at
        page scale. -->
   <div class="catalog theme-exec">
-    <p class="empty">Couldn't load job: {error ?? 'not found'}</p>
+    <!-- The shared failure marker (sweep c3e4edcc). -->
+    <p class="empty load-failed" role="alert">Couldn't load job: {error ?? 'not found'}</p>
   </div>
 {:else}
   {@const j = job}
@@ -281,6 +320,35 @@
 
     <div class="tab-grid">
       <ArrivalReport job={j} />
+      {#if annotations.length > 0}
+        <!-- The packet's own annotations, first after an arrival report:
+             an alarm plan (owner, plan, ETA, what needs David) is the
+             first thing a troubled packet owes its reader. -->
+        <Section title="Annotations" wide>
+          <dl class="jd-annotations">
+            {#each annotations as a (a.key)}
+              <div class="jd-ann jd-ann-{a.value.kind}" data-key={a.key}>
+                <dt>{a.key}</dt>
+                <dd>
+                  {#if a.value.kind === 'prose'}
+                    <p class="jd-ann-prose">{@render linked(a.value.text)}</p>
+                  {:else if a.value.kind === 'text'}
+                    {@render linked(a.value.text)}
+                  {:else if a.value.kind === 'list'}
+                    <ul class="jd-ann-list">
+                      {#each a.value.items as item, i (i)}
+                        <li>{@render linked(item)}</li>
+                      {/each}
+                    </ul>
+                  {:else}
+                    <pre class="jd-ann-json">{a.value.json}</pre>
+                  {/if}
+                </dd>
+              </div>
+            {/each}
+          </dl>
+        </Section>
+      {/if}
       {#if edges?.kind === 'failed'}
         <!-- Saying nothing here would be saying "no linked Jobs", which
              the failed read has no standing to claim. -->
@@ -320,7 +388,7 @@
             <span class="jd-info-label">ID</span>
             <span class="jd-info-value jd-mono">
               <a
-                href={href(subjectPath(j.subject))}
+                href={safeLinkHref(href(subjectPath(j.subject)))}
                 onclick={(e) => {
                   e.preventDefault();
                   navigate(href(subjectPath(j.subject)));
@@ -363,4 +431,15 @@
     margin: -8px 0 20px;
   }
   .jd-abort-why { font-size: 12px; color: var(--text-dim); }
+  /* Short values sit beside their key, as the Subject rows do; prose,
+     lists and JSON take the full width under it. */
+  .jd-annotations { margin: 0; display: grid; gap: 8px; font-size: 13px; }
+  .jd-ann { display: grid; grid-template-columns: minmax(8rem, 14rem) 1fr; gap: 12px; }
+  .jd-ann:not(.jd-ann-text) { grid-template-columns: 1fr; gap: 2px; }
+  .jd-ann dt { color: var(--text-dim); font-family: monospace; font-size: 12px; overflow-wrap: anywhere; }
+  .jd-ann dd { margin: 0; overflow-wrap: anywhere; }
+  .jd-ann-prose { margin: 0; white-space: pre-wrap; line-height: 1.45; }
+  .jd-ann-list { margin: 0; padding-left: 1.2em; }
+  .jd-ann-list li { white-space: pre-wrap; }
+  .jd-ann-json { margin: 0; font-size: 12px; white-space: pre-wrap; max-height: 24rem; overflow: auto; }
 </style>

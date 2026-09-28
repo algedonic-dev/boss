@@ -38,6 +38,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use boss_policy::{AccessTier, User};
 use boss_policy_client::CurrentUser;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -47,10 +48,168 @@ use sqlx::PgPool;
 /// `boss-ml::bootstrap::seed_phase_two_candidates`.
 const CHURN_RISK_MODEL_ID: &str = "mdl-account-churn-risk-v1";
 
+/// How often the batch that writes these predictions runs: daily, per
+/// `infra/ml/boss-ml-inference-batch.timer` (`OnCalendar=*-*-* 02:30:00`).
+/// Held to that file by `the_stale_window_is_one_timer_cadence_plus_the_grace`.
+const BATCH_CADENCE_HOURS: i64 = 24;
+/// Slack for a run that starts late or takes a while, so last night's
+/// score is not called stale in the minutes before tonight's lands.
+const GRACE_HOURS: i64 = 2;
+/// A score older than this was not rewritten by the last run the batch
+/// should have made — the batch stopped, or stopped reaching this
+/// account (backlog 8ddaefcd; page audit 08b0c4f8 GAP 12).
+pub const STALE_AFTER_HOURS: i64 = BATCH_CADENCE_HOURS + GRACE_HOURS;
+
+/// Operator tier, or a role with broad account access. NOT a request
+/// with no `x-boss-user`: that arrives as `role=guest` and was admitted
+/// by name here — the full watchlist for nobody, while a signed-in
+/// service tech was refused (backlog 2f4be936; decided under e84de48e,
+/// David 2026-09-25: a request without the identity header is not
+/// trusted).
 fn is_trusted_or_broad(user: &User) -> bool {
-    user.role == "guest"
-        || user.access_tier == AccessTier::Operator
+    user.access_tier == AccessTier::Operator
         || boss_core::roles::has_broad_account_access(&user.role)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_without_the_identity_header_is_refused() {
+        assert!(!is_trusted_or_broad(&User::anonymous()));
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn scored_at(id: &str, score: i32, at: DateTime<Utc>) -> Prediction {
+        Prediction {
+            account_id: id.to_string(),
+            account_name: id.to_string(),
+            score,
+            top_factor: "healthy".to_string(),
+            factors: RiskFactors {
+                days_since_last_invoice: None,
+                open_ticket_count: 0,
+                has_active_contract: false,
+                days_since_last_note: None,
+            },
+            scored_at: at,
+        }
+    }
+
+    fn scored(id: &str, score: i32) -> Prediction {
+        scored_at(id, score, now())
+    }
+
+    /// Backlog 9269d612 (page audit 08b0c4f8 GAP 8): `total_scored` was
+    /// `filtered.len()` AFTER `.take(limit)`, so it was the page size
+    /// under another name and /watchlist could not tell 200 scored from
+    /// 200 of 350. It counts every score past the cutoff, before the page.
+    #[test]
+    fn total_scored_counts_past_the_limit() {
+        let scores = (0..5).map(|i| scored(&format!("a{i}"), i * 10)).collect();
+        let list = rank(scores, 0, 2, now());
+        assert_eq!(list.total_scored, 5);
+        let top: Vec<i32> = list.accounts.iter().map(|s| s.score).collect();
+        assert_eq!(top, vec![40, 30], "the page is the highest scores");
+    }
+
+    #[test]
+    fn total_scored_honours_the_cutoff() {
+        let scores = (0..5).map(|i| scored(&format!("a{i}"), i * 10)).collect();
+        let list = rank(scores, 20, 200, now());
+        assert_eq!(list.total_scored, 3);
+        assert_eq!(list.accounts.len(), 3);
+    }
+
+    /// Backlog 8ddaefcd (page audit 08b0c4f8 GAP 12): the read carried no
+    /// time at all, so a batch that stopped weeks ago painted exactly
+    /// like one that ran last night. Each score carries the prediction's
+    /// own `created_at`, and the list the newest of them — taken over
+    /// EVERY prediction read, past the cutoff and the limit, because it
+    /// answers "when did the model last write", not "when was this page's
+    /// top row written".
+    #[test]
+    fn each_score_carries_its_time_and_the_list_its_newest() {
+        let old = now() - chrono::Duration::days(20);
+        let newest = now() - chrono::Duration::hours(3);
+        let scores = vec![
+            scored_at("high-old", 90, old),
+            scored_at("low-new", 0, newest),
+        ];
+        let list = rank(scores, 50, 1, now());
+        assert_eq!(list.accounts.len(), 1);
+        assert_eq!(list.accounts[0].scored_at, old);
+        assert_eq!(
+            list.scored_as_of,
+            Some(newest),
+            "the newest prediction counts though the cutoff hides its row"
+        );
+    }
+
+    #[test]
+    fn nothing_scored_has_no_as_of_time() {
+        let list = rank(Vec::new(), 0, 200, now());
+        assert_eq!(list.scored_as_of, None);
+        assert_eq!(list.stale_after_hours, STALE_AFTER_HOURS);
+    }
+
+    /// A score is stale once it is older than one batch cadence plus
+    /// the grace — not before: the score written at 02:30 is still the
+    /// current one at 02:29 the next day.
+    #[test]
+    fn a_score_older_than_the_batch_cadence_is_stale() {
+        let window = chrono::Duration::hours(STALE_AFTER_HOURS);
+        let scores = vec![
+            scored_at("fresh", 30, now() - chrono::Duration::hours(1)),
+            scored_at("edge", 20, now() - window),
+            scored_at("stale", 10, now() - window - chrono::Duration::minutes(1)),
+        ];
+        let list = rank(scores, 0, 200, now());
+        let stale: Vec<(&str, bool)> = list
+            .accounts
+            .iter()
+            .map(|s| (s.account_id.as_str(), s.stale))
+            .collect();
+        assert_eq!(
+            stale,
+            vec![("fresh", false), ("edge", false), ("stale", true)]
+        );
+    }
+
+    /// A fact that lives twice gets an equality test (CLAUDE.md §9a):
+    /// the stale window is derived from the batch timer's cadence, and
+    /// the timer lives in infra/ml. If the timer stops being daily, this
+    /// names the pair rather than letting every score read stale — or a
+    /// week-old batch read fresh.
+    #[test]
+    fn the_stale_window_is_one_timer_cadence_plus_the_grace() {
+        let path = boss_testing::repo_root().join("infra/ml/boss-ml-inference-batch.timer");
+        let timer = std::fs::read_to_string(&path).unwrap();
+        let on_calendar: Vec<&str> = timer
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("OnCalendar="))
+            .collect();
+        assert_eq!(
+            on_calendar.len(),
+            1,
+            "{} should fire on exactly one OnCalendar",
+            path.display()
+        );
+        assert!(
+            on_calendar[0].starts_with("*-*-* "),
+            "{} fires on {:?}, not daily; BATCH_CADENCE_HOURS says 24",
+            path.display(),
+            on_calendar[0]
+        );
+        assert_eq!(BATCH_CADENCE_HOURS, 24);
+        assert_eq!(STALE_AFTER_HOURS, BATCH_CADENCE_HOURS + GRACE_HOURS);
+    }
 }
 
 #[derive(Clone)]
@@ -75,6 +234,18 @@ pub struct RiskFactors {
     pub days_since_last_note: Option<i64>,
 }
 
+/// One account's newest prediction as read from `ml_predictions`,
+/// before it is judged against the clock.
+#[derive(Debug, Clone)]
+struct Prediction {
+    account_id: String,
+    account_name: String,
+    score: i32,
+    top_factor: String,
+    factors: RiskFactors,
+    scored_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RiskScore {
     pub account_id: String,
@@ -82,12 +253,27 @@ pub struct RiskScore {
     pub score: i32,
     pub top_factor: String,
     pub factors: RiskFactors,
+    /// The prediction's own `created_at`. The read carried no time, so a
+    /// score from a batch that stopped weeks ago looked exactly like
+    /// last night's (backlog 8ddaefcd; page audit 08b0c4f8 GAP 12).
+    pub scored_at: DateTime<Utc>,
+    /// Older than `STALE_AFTER_HOURS`: the last run the batch should
+    /// have made did not rewrite it.
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RiskScoreList {
     pub accounts: Vec<RiskScore>,
     pub total_scored: usize,
+    /// The newest prediction across EVERY account read — past the
+    /// cutoff and the limit — so it says when the model last wrote, not
+    /// when this page's top row was written. `null` when nothing is
+    /// scored.
+    pub scored_as_of: Option<DateTime<Utc>>,
+    /// The window `stale` is judged against, so a reader can say it in
+    /// words without keeping its own copy of the cadence.
+    pub stale_after_hours: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,33 +304,72 @@ async fn list_risk_scores(
 ) -> Response {
     // Security gate: account risk scores include financial + churn
     // signals. Only roles with broad account access (exec / VP /
-    // manager) see the cross-account watchlist; everyone else gets an
-    // empty list so the panel
-    // degrades cleanly rather than 403-ing.
+    // manager) see the cross-account watchlist; everyone else is
+    // REFUSED. This used to answer `200 {accounts: []}` "so the panel
+    // degrades cleanly", and /watchlist painted it as "No accounts
+    // match those filters." — a denial read as nothing at risk, the
+    // false-empty class (backlog 3f0cdca8; page audit 08b0c4f8 GAP 5,
+    // 2026-09-23). A refusal the page can name is the clean degrade.
     if !is_trusted_or_broad(&user) {
-        return Json(RiskScoreList {
-            accounts: Vec::new(),
-            total_scored: 0,
-        })
-        .into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "account risk scores are shown only to roles with broad account access",
+        )
+            .into_response();
     }
     let limit = params.limit.clamp(1, 200);
+    // WALL time, not the clock port: a score's age is judged against its
+    // `created_at`, a record stamp the database wrote on the wall clock,
+    // by a batch a wall-clock systemd timer runs. The business clock
+    // answers "what day is it in the company's timeline"; in sim mode it
+    // drifts from both, and would call every score stale (or none).
+    let now = boss_clock_client::wall_now();
     match read_latest_predictions(&state.pool).await {
-        Ok(mut scores) => {
-            scores.sort_by_key(|s| std::cmp::Reverse(s.score));
-            let filtered: Vec<RiskScore> = scores
-                .into_iter()
-                .filter(|s| s.score >= params.min_score)
-                .take(limit)
-                .collect();
-            let total_scored = filtered.len();
-            Json(RiskScoreList {
-                accounts: filtered,
-                total_scored,
-            })
-            .into_response()
-        }
+        Ok(scores) => Json(rank(scores, params.min_score, limit, now)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// The highest `limit` scores at or above `min_score`, and how many
+/// there are in all. `total_scored` is counted BEFORE the limit: it was
+/// counted after, so a 200-row page reported 200 scored whatever the
+/// true number (backlog 9269d612; page audit 08b0c4f8 GAP 8), and a cap
+/// read as a count.
+///
+/// `now` is the instant each score's age is judged against; the handler
+/// passes the wall clock, because `created_at` is the database's
+/// `NOW()` at write time.
+fn rank(
+    mut scores: Vec<Prediction>,
+    min_score: i32,
+    limit: usize,
+    now: DateTime<Utc>,
+) -> RiskScoreList {
+    let scored_as_of = scores.iter().map(|s| s.scored_at).max();
+    let stale_before = now - chrono::Duration::hours(STALE_AFTER_HOURS);
+    scores.sort_by_key(|s| std::cmp::Reverse(s.score));
+    let eligible: Vec<Prediction> = scores
+        .into_iter()
+        .filter(|s| s.score >= min_score)
+        .collect();
+    let total_scored = eligible.len();
+    RiskScoreList {
+        accounts: eligible
+            .into_iter()
+            .take(limit)
+            .map(|p| RiskScore {
+                stale: p.scored_at < stale_before,
+                account_id: p.account_id,
+                account_name: p.account_name,
+                score: p.score,
+                top_factor: p.top_factor,
+                factors: p.factors,
+                scored_at: p.scored_at,
+            })
+            .collect(),
+        total_scored,
+        scored_as_of,
+        stale_after_hours: STALE_AFTER_HOURS,
     }
 }
 
@@ -153,11 +378,11 @@ async fn list_risk_scores(
 /// account name. Empty result means the dispatcher hasn't run
 /// yet — the watchlist degrades to an empty list rather than
 /// running an on-demand recompute.
-async fn read_latest_predictions(pool: &PgPool) -> Result<Vec<RiskScore>, String> {
-    let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT a.id, a.name, p.payload \
+async fn read_latest_predictions(pool: &PgPool) -> Result<Vec<Prediction>, String> {
+    let rows: Vec<(String, String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT a.id, a.name, p.payload, p.created_at \
          FROM ( \
-             SELECT DISTINCT ON (entity_id) entity_id, payload \
+             SELECT DISTINCT ON (entity_id) entity_id, payload, created_at \
              FROM ml_predictions \
              WHERE model_id = $1 AND entity_type = 'account' \
              ORDER BY entity_id, created_at DESC \
@@ -171,7 +396,7 @@ async fn read_latest_predictions(pool: &PgPool) -> Result<Vec<RiskScore>, String
     .map_err(|e| format!("ml_predictions read: {e}"))?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, name, payload) in rows {
+    for (id, name, payload, scored_at) in rows {
         let factors = parse_factors(&payload).ok_or_else(|| {
             format!("malformed factors payload on prediction for {id}: {payload}")
         })?;
@@ -185,12 +410,13 @@ async fn read_latest_predictions(pool: &PgPool) -> Result<Vec<RiskScore>, String
             .and_then(|v| v.as_str())
             .unwrap_or("healthy")
             .to_string();
-        out.push(RiskScore {
+        out.push(Prediction {
             account_id: id,
             account_name: name,
             score,
             top_factor,
             factors,
+            scored_at,
         });
     }
     Ok(out)

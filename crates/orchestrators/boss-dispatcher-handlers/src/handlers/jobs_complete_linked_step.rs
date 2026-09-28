@@ -125,7 +125,11 @@
 //!   `failed_source` = the request, and `alert`), and an URGENT
 //!   backlog-item naming the verb, the request and the line is filed
 //!   to the platform owner through the door every alarm handler uses.
-//!   One alert per failed request (`for_request` dedups while open).
+//!   One alert per failed request (`for_request` dedups while open),
+//!   and since fd808d90 one per troubled STEP: an open alert the same
+//!   verb filed for the same step of the same packet is reused, so a
+//!   verb re-filed on a clock that keeps failing is one alert, not one
+//!   per firing.
 //!
 //! ## The mode is the DEFAULT (v7, f47861a5)
 //!
@@ -176,6 +180,16 @@
 //! the same note on both ends. The evidence gains one field, the
 //! completing `step`, for the same reason the edge cannot be
 //! job-level.
+//!
+//! ## Every item the close answers (v8, a994f533)
+//!
+//! - `also_link = "<key>"` — a `job_id_list` edge on the closing
+//!   packet naming every OTHER item it answers. Each gets the same
+//!   guards, route and completion the primary `link` gets, in order,
+//!   after it. A car's `backlog_item` holds one id, so a change that
+//!   answered two left the second open, and `boss dispatch` handed that
+//!   landed-but-unclosed item to a builder twice on 2026-09-23. Absent,
+//!   nothing is read: every rule before v8 is untouched.
 //!
 //! ## Idempotence
 //!
@@ -505,6 +519,31 @@ fn link_on_completing_step<'a>(payload: &'a serde_json::Value, link: &str) -> Op
         .filter(|s| !s.is_empty())
 }
 
+/// PURE over the closing packet's metadata: the usable ids of the
+/// `job_id_list` edge under `key`, in order, trimmed. An element that
+/// cannot name a Job is skipped the way an unusable single edge is. A
+/// value that is not an array is said and read as empty — the write
+/// path's trigger skips a non-array `job_id_list` without ref-checking
+/// it, so nothing vouches for what it holds.
+fn listed_links(meta: &serde_json::Value, key: &str, rule: &str) -> Vec<String> {
+    match meta.get(key) {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(ids)) => ids
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|id| usable_link(id, key, rule))
+            .map(str::to_string)
+            .collect(),
+        Some(other) => {
+            tracing::warn!(rule = %rule, link = %key,
+                "list edge is not an array ({other}) — reading no items from it");
+            Vec::new()
+        }
+    }
+}
+
 /// `unusable_link` as a filter: the id when it can name a Job, `None`
 /// with the warning already said when it cannot. One definition, used
 /// by both edge sources — a link that cannot name a Job is a skip, not
@@ -635,21 +674,90 @@ impl Handler for JobsCompleteLinkedStep {
         // free-text case: a car whose motivating item is named only in
         // `backlog_text` prose, or one filed against nothing at all.
         // Both ship exactly as before.
-        let target_id = match step_link {
-            Some(id) => id,
-            None => {
-                let Some(id) = closing_meta
-                    .get(link)
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|id| usable_link(id, link, &ctx.rule_name))
-                else {
-                    return Ok(());
-                };
-                id
-            }
+        let primary: Option<String> = match step_link {
+            Some(id) => Some(id.to_string()),
+            None => closing_meta
+                .get(link)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|id| usable_link(id, link, &ctx.rule_name))
+                .map(str::to_string),
         };
+        // The list edge (v8, a994f533): every OTHER item the close
+        // answers, read only when the rule row names its key. A car's
+        // `backlog_item` holds one id, so a change that answered two
+        // items left the second open as landed-but-unclosed residue —
+        // and `boss dispatch` handed it to a builder, twice on
+        // 2026-09-23 (5994de6d, cab50f4c), each run spent rediscovering
+        // a landing. Ids repeated, or equal to the primary, are read once.
+        let items: Vec<String> = match arg(args, "also_link") {
+            Some(Value::String(key)) if !key.is_empty() => {
+                listed_links(&closing_meta, key, &ctx.rule_name)
+                    .into_iter()
+                    .fold(primary.into_iter().collect(), |mut seen, id| {
+                        if !seen.contains(&id) {
+                            seen.push(id);
+                        }
+                        seen
+                    })
+            }
+            _ => primary.into_iter().collect(),
+        };
+
+        let close = Close {
+            id: closing_id,
+            job: closing,
+            meta: closing_meta,
+            allowed,
+            evidence_key,
+            answer,
+            args,
+        };
+        // EVERY ITEM THE CLOSE ANSWERS (v8, a994f533). The primary
+        // edge first, then each id on the list the rule names in
+        // `also_link`, and each gets exactly the obligation the primary
+        // gets. A failure on one returns the error and the event
+        // redelivers; the items already answered fall out at their own
+        // guards, so the retry costs the list nothing but reads.
+        for target_id in &items {
+            self.answer_item(&close, target_id, ctx).await?;
+        }
+        Ok(())
+    }
+}
+
+/// What the close carries into every item it answers — read once off
+/// the closing packet and the rule row, shared across the list (v8,
+/// a994f533).
+struct Close<'a> {
+    id: &'a str,
+    job: serde_json::Value,
+    meta: serde_json::Value,
+    allowed: Vec<&'a str>,
+    evidence_key: &'a str,
+    answer: AnswerSpec,
+    args: &'a [(String, Value)],
+}
+
+impl JobsCompleteLinkedStep {
+    /// The obligation, discharged against ONE item: every guard, the
+    /// route, the completion, the note on both ends — unchanged from
+    /// the single-item handler it was cut out of, so an item named on
+    /// the list is answered exactly as the primary is.
+    async fn answer_item(
+        &self,
+        close: &Close<'_>,
+        target_id: &str,
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let closing_id: &str = close.id;
+        let closing = &close.job;
+        let closing_meta = &close.meta;
+        let allowed: &[&str] = &close.allowed;
+        let evidence_key: &str = close.evidence_key;
+        let answer = &close.answer;
+        let args = close.args;
 
         let target = self.get_job(target_id, &ctx.rule_name).await?;
 
@@ -669,15 +777,15 @@ impl Handler for JobsCompleteLinkedStep {
         // line matched" note on both ends is what left the publish step
         // ready and silent for five hours.
         if let (Some(OnFailure::AnnotateAndAlert), Some(failure)) =
-            (answer.on_failure, verb_failure(&closing))
+            (answer.on_failure, verb_failure(closing))
         {
             return self
                 .annotate_and_alert(
                     closing_id,
-                    &closing_meta,
+                    closing_meta,
                     target_id,
                     &target,
-                    &allowed,
+                    allowed,
                     &failure,
                     ctx,
                 )
@@ -690,7 +798,7 @@ impl Handler for JobsCompleteLinkedStep {
         // or was killed before its last line — and the step it would
         // have completed stays with its person. Said on both ends, like
         // a dead link; idempotent under redelivery like it too.
-        let answer_groups = match answer.groups(&closing) {
+        let answer_groups = match answer.groups(closing) {
             Ok(groups) => groups,
             Err(why) => {
                 tracing::warn!(
@@ -735,7 +843,7 @@ impl Handler for JobsCompleteLinkedStep {
         // different disposition value). A re-delivery finds the branch
         // already `completed` and falls out here.
         let mut shipped: Option<Shipped> = None;
-        let step = match open_step(&target, &allowed).cloned() {
+        let step = match open_step(&target, allowed).cloned() {
             Some(step) => step,
             None => {
                 // THE ROUTE (v3, dda0713c). No branch is open because
@@ -760,7 +868,7 @@ impl Handler for JobsCompleteLinkedStep {
                     // Silent on a redelivery; loud when the link
                     // pointed at a packet this obligation cannot act
                     // on. See `noop_reason`.
-                    if let Some(why) = noop_reason(&target, &allowed) {
+                    if let Some(why) = noop_reason(&target, allowed) {
                         tracing::warn!(
                             rule = %ctx.rule_name,
                             car = %closing_id,
@@ -797,7 +905,7 @@ impl Handler for JobsCompleteLinkedStep {
                     return Ok(());
                 };
                 let facts = self
-                    .shipped(closing_id, &closing, &closing_meta, &answer_groups, ctx)
+                    .shipped(closing_id, closing, closing_meta, &answer_groups, ctx)
                     .await;
                 self.complete_step(
                     target_id,
@@ -810,7 +918,7 @@ impl Handler for JobsCompleteLinkedStep {
                 .await?;
                 shipped = Some(facts);
                 let routed = self.get_job(target_id, &ctx.rule_name).await?;
-                match open_step(&routed, &allowed).cloned() {
+                match open_step(&routed, allowed).cloned() {
                     Some(step) => step,
                     // The route wrote a disposition none of `steps`
                     // answers to — rule authoring, pinned by
@@ -842,7 +950,7 @@ impl Handler for JobsCompleteLinkedStep {
         let facts = match shipped {
             Some(f) => f,
             None => {
-                self.shipped(closing_id, &closing, &closing_meta, &answer_groups, ctx)
+                self.shipped(closing_id, closing, closing_meta, &answer_groups, ctx)
                     .await
             }
         };
@@ -1095,16 +1203,19 @@ pub(crate) fn is_unset(v: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// Fill `merged` from a template: unset keys only — metadata a
-/// person already wrote is their record, not this obligation's to
-/// overwrite — with string values substituting the car's facts.
+/// The template's keys the step as read (`existing`) holds unset —
+/// metadata a person already wrote is their record, not this
+/// obligation's to overwrite — with string values substituting the
+/// car's facts. Only those keys: they ride the step merge door, which
+/// keeps the rest (backlog e39a9d2a).
 fn fill(
-    merged: &mut serde_json::Map<String, serde_json::Value>,
+    existing: &serde_json::Map<String, serde_json::Value>,
     template: &serde_json::Map<String, serde_json::Value>,
     shipped: &Shipped,
-) {
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
     for (k, v) in template {
-        if !is_unset(merged.get(k)) {
+        if !is_unset(existing.get(k)) {
             continue;
         }
         let v = match v {
@@ -1125,8 +1236,9 @@ fn fill(
             }
             other => other.clone(),
         };
-        merged.insert(k.clone(), v);
+        fields.insert(k.clone(), v);
     }
+    fields
 }
 
 /// What a verb that ran and failed left behind (v6): its exit, and the
@@ -1376,17 +1488,48 @@ impl JobsCompleteLinkedStep {
 
         let open =
             super::common::open_jobs_of_kind(&self.client, base, "backlog-item", rule).await?;
+        let meta_is = |j: &serde_json::Value, key: &str, want: &str| {
+            j.get("metadata")
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                == Some(want)
+        };
+        // ONE ALERT PER TROUBLED STEP (backlog fd808d90). This request's
+        // own alert first — a redelivery — and then any open alert the
+        // same verb filed for the same step of the same packet. A verb
+        // re-filed on a clock (reread-publish-pr-every-15-minutes) that
+        // keeps failing on one packet is one fact while it stands: the
+        // alert per REQUEST this used to file would have been ninety-six
+        // urgent items a day for publish 8d7a3507, the silence traded
+        // for noise. Once that alert is closed, the next failure files
+        // afresh.
         let alert_id = match open
             .iter()
-            .find(|j| {
-                j.get("metadata")
-                    .and_then(|m| m.get(FOR_REQUEST))
-                    .and_then(|v| v.as_str())
-                    == Some(closing_id)
+            .find(|j| meta_is(j, FOR_REQUEST, closing_id))
+            .or_else(|| {
+                open.iter().find(|j| {
+                    meta_is(j, "for_packet", target_id)
+                        && meta_is(j, "step", slug)
+                        && meta_is(j, "verb", verb)
+                })
             })
             .and_then(|j| j.get("id").and_then(|v| v.as_str()))
         {
-            Some(existing) => existing.to_string(),
+            Some(existing) => {
+                // The step already says this, under this alert: the
+                // failure repeated, and the request that repeated it is
+                // its own record. Nothing new to write.
+                let said = |key: &str, want: &str| {
+                    step.get("metadata")
+                        .and_then(|m| m.get(key))
+                        .and_then(|v| v.as_str())
+                        == Some(want)
+                };
+                if said("failed", &failure.line) && said("alert", existing) {
+                    return Ok(());
+                }
+                existing.to_string()
+            }
             None => {
                 let owner = super::common::owner_for_filing(self.owner.as_ref(), rule).await;
                 let body = failure_alert_body(
@@ -1497,6 +1640,21 @@ impl JobsCompleteLinkedStep {
         if let Some(step_id) = ctx.event_payload.get("step_id").and_then(|v| v.as_str()) {
             evidence["step"] = json!(step_id);
         }
+        // WHERE IT WAS BUILT (backlog a3355e14). `boss gate` stamps the
+        // worktree it was launched from beside a run's `agent_run` edge,
+        // because the gate is the only party that knows it: the run
+        // packet used to record the DISPATCHER's cwd, a property of a
+        // different session. Written only when the closing packet
+        // carries one, like `step` above — an absent stamp is absent
+        // here too, never a guessed path.
+        if let Some(wt) = closing_meta
+            .get("worktree")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            evidence["worktree"] = json!(wt);
+        }
         Shipped {
             car: closing_id.to_string(),
             branch: branch.unwrap_or("(no branch recorded)").to_string(),
@@ -1507,10 +1665,14 @@ impl JobsCompleteLinkedStep {
     }
 
     /// Complete `step` on `target_id`: the template's vocabulary
-    /// (absent keys only) plus the evidence under `evidence_key`,
-    /// merged into the step's existing metadata — PATCH-on-PUT
-    /// replaces top-level `metadata` wholesale, and `authority_role`
-    /// living there is what keeps the step gated.
+    /// (keys the step as read holds unset, only) plus the evidence
+    /// under `evidence_key` — through the step merge door, then the
+    /// status alone (`common::complete_step`, backlog e39a9d2a). This
+    /// was one PUT of the step's metadata AS READ plus those keys; the
+    /// PUT replaces metadata wholesale, so a key written to the step
+    /// between the read and the PUT was refused 409 under stage 1 and
+    /// is refused under the decided end state however the body is
+    /// built. The merge door keeps what it is not sent.
     async fn complete_step(
         &self,
         target_id: &str,
@@ -1523,49 +1685,30 @@ impl JobsCompleteLinkedStep {
         let Some(step_id) = step.get("id").and_then(|v| v.as_str()) else {
             return Ok(());
         };
-        let mut merged = match step.get("metadata").cloned() {
-            Some(serde_json::Value::Object(m)) => m,
+        let existing = match step.get("metadata") {
+            Some(serde_json::Value::Object(m)) => m.clone(),
             _ => serde_json::Map::new(),
         };
-        if let Some(template) = template {
-            fill(&mut merged, template, shipped);
-        }
-        merged.insert(evidence_key.to_string(), shipped.evidence.clone());
-
-        let step_url = format!(
-            "{}/api/jobs/{}/steps/{}",
+        let mut fields = template
+            .map(|t| fill(&existing, t, shipped))
+            .unwrap_or_default();
+        fields.insert(evidence_key.to_string(), shipped.evidence.clone());
+        super::common::complete_step(
+            &self.client,
             self.jobs_base.trim_end_matches('/'),
             target_id,
             step_id,
-        );
-        let body = json!({
-            "status": "completed",
-            "metadata": serde_json::Value::Object(merged),
-        });
-        let resp = self
-            .client
-            .put(&step_url)
-            .header("content-type", "application/json")
-            .header("x-boss-user", dispatcher_actor_header(rule))
-            .header("x-sim-origin", sim_origin_value())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("PUT {step_url}: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "PUT {step_url} returned {status}: {text}"
-            )));
-        }
-        Ok(())
+            fields,
+            rule,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use axum::{Json, Router, extract::Path, routing::get};
     use std::sync::Mutex;
 
@@ -1700,9 +1843,21 @@ mod tests {
     /// completes with `disposition = "build"` — standing in for
     /// jobs-api's own re-evaluation on the write. The handler routes,
     /// re-reads, and must find the branch it opened.
+    ///
+    /// THE STEP DOORS AS THE DECIDED END STATE HAS THEM (e39a9d2a): a
+    /// step PUT carrying metadata is refused 409; the fields go through
+    /// the step merge door first. `puts` records each COMPLETION as
+    /// `(step_id, {status, metadata})`, where `metadata` is exactly what
+    /// the merge door received for that step since its last flip — what
+    /// the completion wrote, never the step's stored keys. A flip with no
+    /// merge before it records empty metadata, so the order is pinned.
     pub(super) async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Puts, Puts) {
         let patches: Puts = Arc::new(Mutex::new(Vec::new()));
         let puts: Puts = Arc::new(Mutex::new(Vec::new()));
+        let merged: Arc<
+            Mutex<std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>>,
+        > = Arc::default();
+        let (put_merged, merge_merged) = (merged.clone(), merged.clone());
         let by_id: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>> =
             Arc::new(Mutex::new(
                 jobs.into_iter()
@@ -1713,6 +1868,7 @@ mod tests {
         let get_puts = puts.clone();
         let get_jobs = by_id.clone();
         let put_jobs = by_id.clone();
+        let merge_jobs = by_id.clone();
         let app = Router::new()
             .route(
                 "/api/jobs/{id}",
@@ -1736,10 +1892,46 @@ mod tests {
                           Json(body): Json<serde_json::Value>| {
                         let puts = get_puts.clone();
                         let by_id = put_jobs.clone();
+                        let merged = put_merged.clone();
                         async move {
-                            puts.lock().unwrap().push((step_id.clone(), body.clone()));
+                            // The decided end state (e39a9d2a).
+                            if let Some(refused) =
+                                super::super::listing_stub::end_state_step_put(&id, &step_id, &body)
+                            {
+                                return refused;
+                            }
+                            let wrote = merged.lock().unwrap().remove(&step_id).unwrap_or_default();
+                            let mut completion = body.clone();
+                            completion["metadata"] = serde_json::Value::Object(wrote);
+                            puts.lock().unwrap().push((step_id.clone(), completion));
                             if let Some(job) = by_id.lock().unwrap().get_mut(&id) {
                                 apply_step_put(job, &step_id, &body);
+                            }
+                            Json(json!({ "ok": true })).into_response()
+                        }
+                    },
+                ),
+            )
+            // The step merge door: merged into the stored step, and held
+            // as what this step's next completion wrote.
+            .route(
+                "/api/jobs/{id}/steps/{step_id}/metadata",
+                axum::routing::patch(
+                    move |Path((id, step_id)): Path<(String, String)>,
+                          Json(body): Json<serde_json::Value>| {
+                        let merged = merge_merged.clone();
+                        let by_id = merge_jobs.clone();
+                        async move {
+                            if let Some(sent) = body.as_object() {
+                                merged
+                                    .lock()
+                                    .unwrap()
+                                    .entry(step_id.clone())
+                                    .or_default()
+                                    .extend(sent.clone());
+                            }
+                            if let Some(job) = by_id.lock().unwrap().get_mut(&id) {
+                                merge_step_metadata(job, &step_id, &body);
                             }
                             Json(json!({ "ok": true }))
                         }
@@ -1764,20 +1956,38 @@ mod tests {
         (format!("http://{addr}"), puts, patches)
     }
 
-    /// The mock's PUT: overlay status + metadata on the stored step,
-    /// then re-evaluate the single predicate the route tests rely on.
+    /// The mock's merge door: the sent keys merged into the stored
+    /// step's metadata, every other key kept.
+    fn merge_step_metadata(job: &mut serde_json::Value, step_id: &str, sent: &serde_json::Value) {
+        let Some(steps) = job.get_mut("steps").and_then(|s| s.as_array_mut()) else {
+            return;
+        };
+        for step in steps.iter_mut() {
+            if step.get("id").and_then(|v| v.as_str()) == Some(step_id)
+                && let (Some(stored), Some(sent)) = (
+                    step.get_mut("metadata").and_then(|m| m.as_object_mut()),
+                    sent.as_object(),
+                )
+            {
+                for (k, v) in sent {
+                    stored.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// The mock's PUT: overlay the status on the stored step (a body
+    /// carrying metadata never reaches here — it is refused), then
+    /// re-evaluate the single predicate the route tests rely on.
     fn apply_step_put(job: &mut serde_json::Value, step_id: &str, body: &serde_json::Value) {
         let Some(steps) = job.get_mut("steps").and_then(|s| s.as_array_mut()) else {
             return;
         };
         for step in steps.iter_mut() {
-            if step.get("id").and_then(|v| v.as_str()) == Some(step_id) {
-                if let Some(status) = body.get("status") {
-                    step["status"] = status.clone();
-                }
-                if let Some(metadata) = body.get("metadata") {
-                    step["metadata"] = metadata.clone();
-                }
+            if step.get("id").and_then(|v| v.as_str()) == Some(step_id)
+                && let Some(status) = body.get("status")
+            {
+                step["status"] = status.clone();
             }
         }
         let routed_to_build = steps.iter().any(|s| {
@@ -2233,6 +2443,148 @@ mod tests {
         );
     }
 
+    const SECOND_PACKET: &str = "55555555-5555-5555-5555-555555555555";
+
+    /// A second untriaged backlog item, its step ids distinct from the
+    /// first's so a recorded PUT says which item it landed on.
+    fn second_untriaged_packet() -> serde_json::Value {
+        json!({
+            "id": SECOND_PACKET,
+            "kind": "backlog-item",
+            "title": "The same defect, filed a second time from another angle",
+            "status": "open",
+            "metadata": {},
+            "steps": [
+                { "id": "s2-triage", "spec_slug": "triage", "status": "ready", "metadata": {} },
+                { "id": "s2-investigate", "spec_slug": "investigate", "status": "pending",
+                  "metadata": {} },
+                { "id": "s2-build", "spec_slug": "build", "status": "pending", "metadata": {} },
+            ],
+        })
+    }
+
+    /// The live rule's args (v5, a994f533): v4's, plus the list key.
+    fn args_with_also() -> Vec<(String, Value)> {
+        let mut a = args_with_routes();
+        a.push((
+            "also_link".to_string(),
+            Value::String("also_answers".into()),
+        ));
+        a
+    }
+
+    /// A CAR THAT ANSWERS TWO ITEMS CLOSES BOTH (a994f533).
+    ///
+    /// Measured twice on 2026-09-23: 5994de6d's fix landed in #572/#574
+    /// on cars filed under other items, and cab50f4c's in #527 on car
+    /// c842f18b, which named only 3ec04168. `backlog_item` holds ONE id,
+    /// so the second item stayed open as landed-but-unclosed residue and
+    /// `boss dispatch` handed it to a builder, who spent a run
+    /// rediscovering the landing. The list edge lets the car name every
+    /// item it answers, and each gets the same route and the same build
+    /// completion the primary gets.
+    #[tokio::test]
+    async fn a_car_closes_every_item_it_also_answers() {
+        let (base, puts, patches) = mock_jobs(vec![
+            car(json!({
+                "backlog_item": PACKET,
+                "also_answers": [SECOND_PACKET],
+                "train": TRAIN,
+                "branch": "fix/x",
+            })),
+            untriaged_packet(),
+            second_untriaged_packet(),
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_also(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let steps: Vec<String> = puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect();
+        assert_eq!(
+            steps,
+            vec!["s-triage", BRANCH_STEP, "s2-triage", "s2-build"],
+            "the primary item first, then every listed one, each routed then built"
+        );
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls[3].1["metadata"]["arrived_from"]["car"], CAR);
+        assert!(patches.lock().unwrap().is_empty(), "{:?}", patches.lock());
+    }
+
+    /// Redelivery is as idempotent across the list as for one item: the
+    /// second delivery finds every branch completed and writes nothing.
+    #[tokio::test]
+    async fn a_redelivered_close_writes_nothing_more_across_the_list() {
+        let (base, puts, _) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "also_answers": [SECOND_PACKET] })),
+            untriaged_packet(),
+            second_untriaged_packet(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        for _ in 0..2 {
+            h.invoke(&args_with_also(), &ctx(close_marker()))
+                .await
+                .expect("runs");
+        }
+        assert_eq!(puts.lock().unwrap().len(), 4, "{:?}", puts.lock());
+    }
+
+    /// An element that cannot name a Job is skipped the way an unusable
+    /// `backlog_item` is — said, not retried — and costs the rest of the
+    /// list nothing. The list stands alone, too: a car may name its
+    /// items only there.
+    #[tokio::test]
+    async fn an_unusable_listed_item_is_skipped_and_the_rest_still_close() {
+        let (base, puts, _) = mock_jobs(vec![
+            car(json!({ "also_answers": ["bb86d687", SECOND_PACKET] })),
+            second_untriaged_packet(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_also(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+        let steps: Vec<String> = puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect();
+        assert_eq!(steps, vec!["s2-triage", "s2-build"]);
+    }
+
+    /// The list is read only when the rule names it — the key is the
+    /// rule row's to choose, like `link` — so a rule without
+    /// `also_link` closes exactly what it closed before.
+    #[tokio::test]
+    async fn a_rule_that_names_no_list_reads_none() {
+        let (base, puts, _) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "also_answers": [SECOND_PACKET] })),
+            untriaged_packet(),
+            second_untriaged_packet(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&args_with_routes(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+        let steps: Vec<String> = puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect();
+        assert_eq!(steps, vec!["s-triage", BRANCH_STEP]);
+    }
+
     /// The obligation itself: a merged car completes the branch its
     /// packet's triage opened, carrying evidence that names the car.
     #[tokio::test]
@@ -2268,10 +2620,13 @@ mod tests {
             evidence["generation"], "abc1234",
             "the generation the train carried is reachable: {evidence:#}"
         );
-        // The step's own metadata survives the write — PATCH-on-PUT
-        // replaces `metadata` wholesale, and `authority_role` living
-        // there is what keeps the step gated.
-        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+        // The step's own metadata survives the write because the write
+        // does not carry it: the fields ride the step merge door, which
+        // keeps `authority_role` — what keeps the step gated — on the row.
+        assert!(
+            body["metadata"].get("authority_role").is_none(),
+            "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
+        );
     }
 
     /// v2's `done_metadata` (0ab5fa3a): the completion carries the
@@ -2330,9 +2685,9 @@ mod tests {
         let calls = puts.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         let (_, body) = &calls[0];
-        assert_eq!(
-            body["metadata"]["verdict"], "declined",
-            "the person's verdict survives the obligation"
+        assert!(
+            body["metadata"].get("verdict").is_none(),
+            "the person's verdict survives the obligation: it is neither overwritten nor re-sent"
         );
         assert_eq!(
             body["metadata"]["answer"], "shipped: feat/x — Close the feedback loop",
@@ -2642,13 +2997,12 @@ mod tests {
             body["metadata"]["decided_by"]["branch"].is_null(),
             "a design has no branch; the evidence says null rather than inventing one"
         );
-        // The step's own keys survive the wholesale metadata replace.
-        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+        // The step's own keys survive because the write does not carry
+        // them: the merge door keeps what it is not sent (e39a9d2a).
         assert!(
-            body["metadata"]["question"]
-                .as_str()
-                .is_some_and(|q| q.contains("c6bd173e")),
-            "the question the verb wrote is still on the completed step"
+            body["metadata"].get("authority_role").is_none()
+                && body["metadata"].get("question").is_none(),
+            "the question the verb wrote stays on the step, not re-sent: {body}"
         );
         assert!(
             patches.lock().unwrap().is_empty(),
@@ -2986,9 +3340,9 @@ mod tests {
             body["metadata"]["result"], "delivered",
             "the analyst ending the vocabulary admits (a9c6ed5b)"
         );
-        assert_eq!(
-            body["metadata"]["authority_role"], "platform-admin",
-            "the step's own metadata is merged, never replaced"
+        assert!(
+            body["metadata"].get("authority_role").is_none(),
+            "the step's own metadata is merged, never replaced — nor re-sent"
         );
         assert_eq!(
             body["metadata"]["delivered"]["step"], MEASURE_STEP,
@@ -3082,6 +3436,79 @@ mod tests {
         assert!(matches!(err, HandlerError::Permanent(_)), "{err:?}");
         let why = format!("{err:?}");
         assert!(why.contains("step") && why.contains("job"), "{why}");
+    }
+
+    const GATE: &str = "77777777-7777-7777-7777-777777777777";
+
+    /// A gate-run closed green, carrying what `boss gate` stamps at
+    /// launch: the run's edge, the branch, and — when it has one —
+    /// the worktree it was launched from.
+    fn green_gate(metadata: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": GATE,
+            "kind": "gate-run",
+            "title": "gate: fix/x",
+            "status": "closed",
+            "subject": { "subject_kind": "custom", "id": "bosspipeline" },
+            "metadata": metadata,
+            "steps": [],
+        })
+    }
+
+    fn landing_args() -> Vec<(String, Value)> {
+        vec![
+            ("link".to_string(), Value::String("agent_run".into())),
+            ("steps".to_string(), Value::String("building".into())),
+            ("evidence_key".to_string(), Value::String("gate_run".into())),
+            (
+                "done_metadata".to_string(),
+                Value::String(r#"{"result": "gated"}"#.into()),
+            ),
+        ]
+    }
+
+    /// THE BUILDER'S WORKTREE RIDES THE GREEN (backlog a3355e14). The
+    /// run packet used to record the DISPATCHER's cwd as its worktree;
+    /// the only party that knows the builder's is the gate it
+    /// launched, which stamps it. The landing carries that stamp onto
+    /// the run's `building` evidence, so the run finally says where it
+    /// was built — and a gate that stamped none says nothing, not an
+    /// invented path.
+    #[tokio::test]
+    async fn the_green_carries_the_gates_worktree_stamp_onto_the_run() {
+        let wt = "/work/boss/.claude/worktrees/agent-a9";
+        let (base, puts, _patches) = mock_jobs(vec![
+            green_gate(json!({ "agent_run": RUN, "branch": "fix/x", "worktree": wt })),
+            run("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let marker = json!({ "id": GATE, "kind": "gate-run", "outcome": "completed",
+                             "closed_on": "2026-09-24", "parent_step_id": null });
+        h.invoke(&landing_args(), &ctx(marker.clone()))
+            .await
+            .expect("runs");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        let (step_id, body) = &puts[0];
+        assert_eq!(step_id, "r-building");
+        assert_eq!(body["metadata"]["result"], "gated");
+        assert_eq!(body["metadata"]["gate_run"]["branch"], "fix/x");
+        assert_eq!(body["metadata"]["gate_run"]["worktree"], wt);
+
+        let (base, puts, _patches) = mock_jobs(vec![
+            green_gate(json!({ "agent_run": RUN, "branch": "fix/x" })),
+            run("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        h.invoke(&landing_args(), &ctx(marker)).await.expect("runs");
+        let puts = puts.lock().unwrap().clone();
+        let gate_run = &puts[0].1["metadata"]["gate_run"];
+        assert!(
+            gate_run.get("worktree").is_none(),
+            "no stamp, no key: {gate_run}"
+        );
     }
 
     /// The default is the JOB metadata — every rule authored before v7
@@ -3316,7 +3743,10 @@ mod answer_tests {
         // The evidence names the request, under the rule's own key.
         assert_eq!(body["metadata"]["tagged_by"]["car"], REQUEST);
         assert_eq!(body["metadata"]["tagged_by"]["outcome"], "answered");
-        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+        assert!(
+            body["metadata"].get("authority_role").is_none(),
+            "the step's own keys are not re-sent: the merge door keeps them (e39a9d2a)"
+        );
         assert!(patches.lock().unwrap().is_empty(), "nothing to note");
     }
 
@@ -3428,11 +3858,10 @@ mod answer_tests {
             evidence: json!({}),
             answer: groups.as_object().cloned().unwrap_or_default(),
         };
-        let mut merged = serde_json::Map::new();
         let template: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": "{tag}", "count": "{n} cars", "who": "{car}"}"#)
                 .unwrap();
-        fill(&mut merged, &template, &shipped);
+        let merged = fill(&serde_json::Map::new(), &template, &shipped);
         assert_eq!(merged["tag"], "v1.2.3");
         assert_eq!(
             merged["count"], "7 cars",

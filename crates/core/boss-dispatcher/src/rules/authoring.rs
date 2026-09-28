@@ -61,6 +61,15 @@ pub struct RuleVersion {
     /// only `None`-sourced rules no file names; see `seed.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The SIGNED caller of each authoring act (backlog 847af5c7): who
+    /// drafted this row, who made it live, who took it out of service —
+    /// read by the door from `x-boss-user`, never from the body. `None`
+    /// is a row no door wrote that column of: the boot seed, a
+    /// migration, a row older than the column. Served as `null` rather
+    /// than omitted, so "unrecorded" is visible to the reader.
+    pub created_by: Option<String>,
+    pub published_by: Option<String>,
+    pub retired_by: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -113,7 +122,8 @@ fn store<E: std::fmt::Display>(e: E) -> AuthoringError {
 }
 
 const SELECT_COLS: &str = "name, version, status, on_event, when_expr, do_steps, delay, \
-     schedule_cadence, schedule_anchor, schedule_calendar, source, created_at";
+     schedule_cadence, schedule_anchor, schedule_calendar, source, created_by, published_by, \
+     retired_by, created_at";
 
 /// Parse a draft through the SAME `Rule::from_raw` the runtime uses, so an
 /// authoring error (bad topic / `when` / arg expr) surfaces before persist.
@@ -158,6 +168,9 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<RuleVersion, AuthoringE
         do_steps,
         delay: row.try_get("delay").map_err(store)?,
         source: row.try_get("source").map_err(store)?,
+        created_by: row.try_get("created_by").map_err(store)?,
+        published_by: row.try_get("published_by").map_err(store)?,
+        retired_by: row.try_get("retired_by").map_err(store)?,
         created_at: row.try_get("created_at").map_err(store)?,
     })
 }
@@ -266,10 +279,15 @@ pub fn source_label(source: Option<&str>) -> &str {
 /// `max(declared, MAX + 1)` as always — above the retired history,
 /// never reusing a version — and the retired rows of the old source
 /// stay as history under the name, so `list_versions` shows both.
+///
+/// `author` is the caller the request was SIGNED as (backlog 847af5c7),
+/// stored as `created_by`; the HTTP door reads it from `x-boss-user`
+/// after policy admits it, never from the body.
 pub async fn create_draft(
     pool: &PgPool,
     raw: &RawRule,
     source: Option<&str>,
+    author: &str,
 ) -> Result<RuleVersion, AuthoringError> {
     validate(raw).map_err(|e| AuthoringError::Invalid(e.to_string()))?;
     let do_json = serde_json::to_value(&raw.do_steps).map_err(store)?;
@@ -308,8 +326,8 @@ pub async fn create_draft(
     sqlx::query(
         "INSERT INTO dispatcher_rules \
             (name, version, status, on_event, when_expr, do_steps, delay, \
-             schedule_cadence, schedule_anchor, schedule_calendar, source) \
-         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10)",
+             schedule_cadence, schedule_anchor, schedule_calendar, source, created_by) \
+         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&raw.name)
     .bind(next)
@@ -321,6 +339,7 @@ pub async fn create_draft(
     .bind(sched_anchor)
     .bind(sched_calendar)
     .bind(source)
+    .bind(author)
     .execute(&mut *tx)
     .await
     .map_err(store)?;
@@ -330,7 +349,14 @@ pub async fn create_draft(
 
 /// Activate the latest draft of `name`, retiring the prior active in the
 /// same tx (so the one-active-per-name index never trips mid-flight).
-pub async fn publish(pool: &PgPool, name: &str) -> Result<RuleVersion, AuthoringError> {
+/// `publisher` — the signed caller — is stamped as the promoted row's
+/// `published_by` and as the superseded row's `retired_by`, because this
+/// act is what retired it.
+pub async fn publish(
+    pool: &PgPool,
+    name: &str,
+    publisher: &str,
+) -> Result<RuleVersion, AuthoringError> {
     let mut tx = pool.begin().await.map_err(store)?;
     // Read the WHOLE draft row, not just its version: the gate below has to
     // see the rule content, and it has to see the content of the row this
@@ -365,28 +391,37 @@ pub async fn publish(pool: &PgPool, name: &str) -> Result<RuleVersion, Authoring
     validate(&promoted.to_raw()).map_err(|e| AuthoringError::Unviable(e.to_string()))?;
 
     sqlx::query(
-        "UPDATE dispatcher_rules SET status = 'retired' WHERE name = $1 AND status = 'active'",
+        "UPDATE dispatcher_rules SET status = 'retired', retired_by = $2 \
+         WHERE name = $1 AND status = 'active'",
     )
     .bind(name)
+    .bind(publisher)
     .execute(&mut *tx)
     .await
     .map_err(store)?;
-    sqlx::query("UPDATE dispatcher_rules SET status = 'active' WHERE name = $1 AND version = $2")
-        .bind(name)
-        .bind(v)
-        .execute(&mut *tx)
-        .await
-        .map_err(store)?;
+    sqlx::query(
+        "UPDATE dispatcher_rules SET status = 'active', published_by = $3 \
+         WHERE name = $1 AND version = $2",
+    )
+    .bind(name)
+    .bind(v)
+    .bind(publisher)
+    .execute(&mut *tx)
+    .await
+    .map_err(store)?;
     tx.commit().await.map_err(store)?;
     get_version(pool, name, v).await
 }
 
-/// Retire the active version of `name` (idempotent — no-op if none active).
-pub async fn retire(pool: &PgPool, name: &str) -> Result<(), AuthoringError> {
+/// Retire the active version of `name` (idempotent — no-op if none
+/// active), stamping the signed caller as its `retired_by`.
+pub async fn retire(pool: &PgPool, name: &str, retirer: &str) -> Result<(), AuthoringError> {
     sqlx::query(
-        "UPDATE dispatcher_rules SET status = 'retired' WHERE name = $1 AND status = 'active'",
+        "UPDATE dispatcher_rules SET status = 'retired', retired_by = $2 \
+         WHERE name = $1 AND status = 'active'",
     )
     .bind(name)
+    .bind(retirer)
     .execute(pool)
     .await
     .map_err(store)?;
@@ -412,6 +447,9 @@ mod tests {
             }],
             delay: None,
             source: None,
+            created_by: None,
+            published_by: None,
+            retired_by: None,
             created_at: chrono::Utc.with_ymd_and_hms(2026, 8, 13, 0, 0, 0).unwrap(),
         }
     }

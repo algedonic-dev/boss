@@ -60,7 +60,12 @@ fn draft_spec(kind: &str) -> WorkflowSpec {
 }
 
 fn build_app(registry: Arc<dyn WorkflowRegistry>) -> Router {
-    let jobs = Arc::new(InMemoryJobs::new());
+    build_app_over(registry, Arc::new(InMemoryJobs::new()))
+}
+
+/// `build_app` over a jobs store the test can also write — the discard
+/// route reads which packets are pinned to a version.
+fn build_app_over(registry: Arc<dyn WorkflowRegistry>, jobs: Arc<InMemoryJobs>) -> Router {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
@@ -72,6 +77,9 @@ fn build_app(registry: Arc<dyn WorkflowRegistry>) -> Router {
             .allow("cto", Action::Update, Resource::workflow(), Scope::All)
             .allow("cto", Action::Publish, Resource::workflow(), Scope::All)
             .allow("cto", Action::Retire, Resource::workflow(), Scope::All)
+            // The basic guest's shipped grant: Read on the operating
+            // model, and no authoring verb (backlog 1a4a4d03).
+            .allow("visitor", Action::Read, Resource::workflow(), Scope::All)
             .build(),
     );
     let state = JobsApiState {
@@ -448,4 +456,240 @@ async fn list_kinds_filters_by_category() {
     let kinds: Vec<WorkflowSpec> = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(kinds.len(), 1);
     assert_eq!(kinds[0].kind, "sale-test");
+}
+
+/// Backlog ce8b7d66: a draft a packet is pinned to is not "pre-history"
+/// — an experiment admitted to it, or `boss job convert --to vN` moved
+/// one onto it, and that packet runs the draft's text. Discarding it
+/// would leave the packet pinned to a number with no protocol (and,
+/// before the allocator stopped reusing numbers, to the NEXT draft's
+/// protocol). The route refuses 409, naming how many and one of them;
+/// an unpinned draft still discards 204.
+#[tokio::test]
+async fn discarding_a_draft_a_packet_is_pinned_to_is_refused() {
+    use boss_core::job::{Job, Priority, Subject};
+    use boss_jobs::port::JobsRepository;
+
+    let registry = Arc::new(InMemoryWorkflows::new());
+    let jobs = Arc::new(InMemoryJobs::new());
+    let now = chrono::Utc::now();
+    let actor = boss_core::actor::ActorId::Human("emp-cto".into());
+    let pinned_draft = registry
+        .create_draft(draft_spec("intake-review"), &actor, now)
+        .await
+        .unwrap();
+    let packet = Job::new(
+        "intake-review",
+        Subject::new("system", "sys-1"),
+        "admitted to the candidate",
+        "emp-1",
+        Priority::Standard,
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap(),
+    )
+    .with_workflow_version(pinned_draft.version);
+    jobs.create_job(&packet).await.unwrap();
+
+    let registry_dyn: Arc<dyn WorkflowRegistry> = registry.clone();
+    let app = build_app_over(registry_dyn, jobs);
+
+    let uri = format!(
+        "/api/workflows/intake-review/versions/{}",
+        pinned_draft.version
+    );
+    let resp = send_json(app.clone(), "DELETE", &uri, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("1 packet"), "names the count: {body}");
+    assert!(
+        body.contains(&packet.id.to_string()),
+        "names a packet: {body}"
+    );
+    // Refused means untouched: the draft is still served.
+    assert!(
+        registry
+            .get_version("intake-review", pinned_draft.version)
+            .await
+            .is_ok(),
+        "a refused discard removes nothing"
+    );
+
+    // Nothing pinned to the next draft, so it still discards.
+    let free = registry
+        .create_draft(draft_spec("intake-review"), &actor, now)
+        .await
+        .unwrap();
+    let uri = format!("/api/workflows/intake-review/versions/{}", free.version);
+    let resp = send_json(app, "DELETE", &uri, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+fn visitor() -> User {
+    User {
+        id: "guest@algedonic.dev".into(),
+        role: "visitor".into(),
+        ..cto()
+    }
+}
+
+async fn versions_of(app: Router, kind: &str, user: &User) -> Vec<(i32, WorkflowStatus)> {
+    let uri = format!("/api/workflows/{kind}/versions");
+    let resp = send_json(app, "GET", &uri, user, None).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice::<Vec<WorkflowSpec>>(&bytes)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.version, s.status))
+        .collect()
+}
+
+/// A DRAFT IS ITS AUTHORS' (backlog 1a4a4d03, second finding). Workflow
+/// Read — which the basic guest holds by shipped default — opened every
+/// version of a protocol, drafts included: an install's unpublished
+/// metadata, entitlements and agent blocks, which no repo publishes.
+/// A version that RAN is the record — in-flight packets are pinned to
+/// retired ones, and a step surface reads the version its packet runs
+/// under — so active and retired rows stay readable to Read, while a
+/// draft needs an authoring verb on `workflow` (Create, Update or
+/// Publish). The list omits a draft for a reader, and a GET of one is
+/// refused; the author sees every row.
+#[tokio::test]
+async fn a_draft_is_read_only_by_who_may_author_it() {
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let app = build_app(registry);
+    let kind = "intake-review";
+    let body = |label: &str| {
+        let mut s = draft_spec(kind);
+        s.label = label.into();
+        Some(serde_json::to_value(s).unwrap())
+    };
+    let publish = format!("/api/workflows/{kind}/publish");
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), body("v1")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let put = format!("/api/workflows/{kind}");
+    let resp = send_json(app.clone(), "PUT", &put, &cto(), body("v2")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // v3 is staged and never published.
+    let resp = send_json(app.clone(), "PUT", &put, &cto(), body("v3 staged")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    assert_eq!(
+        versions_of(app.clone(), kind, &cto()).await,
+        vec![
+            (1, WorkflowStatus::Retired),
+            (2, WorkflowStatus::Active),
+            (3, WorkflowStatus::Draft),
+        ],
+        "the author reads every row"
+    );
+    assert_eq!(
+        versions_of(app.clone(), kind, &visitor()).await,
+        vec![(1, WorkflowStatus::Retired), (2, WorkflowStatus::Active)],
+        "a reader reads what ran, and no draft"
+    );
+
+    for (version, want) in [
+        (1, StatusCode::OK),
+        (2, StatusCode::OK),
+        (3, StatusCode::FORBIDDEN),
+    ] {
+        let uri = format!("/api/workflows/{kind}/versions/{version}");
+        let resp = send_json(app.clone(), "GET", &uri, &visitor(), None).await;
+        assert_eq!(resp.status(), want, "visitor GET {uri}");
+        let text = resp.into_body().collect().await.unwrap().to_bytes();
+        if want == StatusCode::FORBIDDEN {
+            assert!(
+                !String::from_utf8_lossy(&text).contains("v3 staged"),
+                "the refusal carries none of the draft"
+            );
+        }
+    }
+    let resp = send_json(
+        app,
+        "GET",
+        &format!("/api/workflows/{kind}/versions/3"),
+        &cto(),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the author reads its draft");
+}
+
+/// THE ACTIVE READ REFUSES A PARAMETER IT DOES NOT READ (backlog
+/// d57f6129). `GET /api/workflows/{kind}` reads no query at all, and
+/// until 2026-09-27 it answered `?version=2` with the ACTIVE row, HTTP
+/// 200 — measured live: department-retro `?version=2`, `?version=999`
+/// and `?no_such_param=1` each answered v5. A reader checking the
+/// version its packets are pinned to was handed a different one without
+/// a word. Now each is a 400 that names the parameter and the route
+/// that does answer one version; the bare read still answers the active
+/// row, and the versioned route still answers v1.
+#[tokio::test]
+async fn the_active_read_refuses_a_parameter_it_does_not_read() {
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let app = build_app(registry);
+    let kind = "intake-review";
+    let body = |label: &str| {
+        let mut s = draft_spec(kind);
+        s.label = label.into();
+        Some(serde_json::to_value(s).unwrap())
+    };
+    let publish = format!("/api/workflows/{kind}/publish");
+    let put = format!("/api/workflows/{kind}");
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), body("v1")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send_json(app.clone(), "PUT", &put, &cto(), body("v2")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for (query, param) in [
+        ("version=1", "version"),
+        ("version=999", "version"),
+        ("no_such_param=1", "no_such_param"),
+    ] {
+        let uri = format!("/api/workflows/{kind}?{query}");
+        let resp = send_json(app.clone(), "GET", &uri, &visitor(), None).await;
+        let status = resp.status();
+        let text = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .into_owned();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "GET {uri}: {text}");
+        // Backticked, as serde names an unknown field — a bare
+        // `version` would be matched by the pointer's `/versions/`.
+        assert!(
+            text.contains(&format!("unknown field `{param}`")),
+            "the 400 names `{param}`: {text}"
+        );
+        assert!(
+            text.contains(&format!("/api/workflows/{kind}/versions/")),
+            "the 400 names the route that reads one version: {text}"
+        );
+    }
+
+    // Controls: the bare read answers the active row, the versioned
+    // route answers the version asked for.
+    for (uri, want) in [
+        (format!("/api/workflows/{kind}"), 2),
+        (format!("/api/workflows/{kind}/versions/1"), 1),
+    ] {
+        let resp = send_json(app.clone(), "GET", &uri, &visitor(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let spec: WorkflowSpec = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(spec.version, want, "GET {uri}");
+    }
 }

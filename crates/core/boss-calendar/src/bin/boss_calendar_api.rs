@@ -82,10 +82,20 @@ async fn main() -> Result<()> {
         )))
     });
 
+    // Every reservation write asks it (backlog 11721a25). Wrapped like
+    // every service's: the sim-origin bypass exists only on a sim
+    // instance.
+    let policy_url = std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"));
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new(policy_url.clone()),
+    ));
+    info!(%policy_url, "policy client wired");
+
     let state = CalendarApiState {
         calendar,
         publisher,
         clock,
+        policy,
     };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
@@ -104,6 +114,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "calendar HTTP API listening");
+    let app = boss_core::machine_gate::mount(app, "calendar", &["/api/calendar/health"]);
     axum::serve(listener, app).await?;
     Ok(())
 }

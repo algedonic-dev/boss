@@ -2,7 +2,7 @@
 // (design 0524fc95, decided 2026-09-19; car 1 is the server read, this
 // is car 2, the map page). Eight regions in map order — dock, gates,
 // track, shed, arrivals, garage, receiving, marshalling — each a card
-// with a count, a clear / busy / troubled state, one sentence of why,
+// with a count, a clear / attention / troubled state, one sentence of why,
 // and a trend (this window against the previous). Every number on a
 // card is the server's: this module parses the payload ONCE and turns
 // it into words, and nothing here derives a count or a state of its
@@ -21,7 +21,7 @@ import { fetchRemote, type Remote } from '../../data/remote';
 // Wire types — the shape of GET /api/yard/regions. Parsed once, below.
 // ---------------------------------------------------------------------
 
-/** The nine regions, in map order. The server's
+/** The ten regions, in map order. The server's
  *  `boss_jobs::regions::REGIONS` is the decision (0524fc95 Q2); this
  *  is the client's copy, pinned equal by regions.test.ts. */
 export const REGION_NAMES = [
@@ -34,15 +34,52 @@ export const REGION_NAMES = [
   'receiving',
   'marshalling',
   'shop-floor',
+  'publish',
 ] as const;
 export type RegionName = (typeof REGION_NAMES)[number];
 
-/** Clear: room to spare and nothing wrong. Busy: at a bound or holding
- *  work that waits on the machine. Troubled: a threshold the yard or an
- *  alarm already enforces, crossed — or a reading that could not be
- *  taken, refused like a failure rather than drawn as clear. */
-export type RegionState = 'clear' | 'busy' | 'troubled';
-const STATES: ReadonlyArray<RegionState> = ['clear', 'busy', 'troubled'];
+/** ONE VOCABULARY, regions and borders alike (design 62de32ae,
+ *  decision 1; the server's `boss_jobs::region_states` is the
+ *  definition). Clear: flowing within its declared bounds — busy and
+ *  healthy included, so a dock with a train due is clear. Attention: a
+ *  declared band crossed. Troubled: ours and not moving, or a reading
+ *  that could not be taken, refused like a failure rather than drawn as
+ *  clear. `busy` is gone rather than aliased: it meant three things on
+ *  six of ten regions, and a server still sending it fails this parse
+ *  loudly instead of drawing a new meaning under an old word.
+ *
+ *  Full (design e765b3fc §4a, car F1): a CAPACITY region at its bound
+ *  while its out-route keeps moving — the gates 3/3 with verdicts
+ *  landing. A GOOD state, drawn as a solid disk and never as an alarm;
+ *  it replaced the amber the gates wore for being used. No border is
+ *  ever full (borders.ts keeps the other three). */
+export type RegionState = 'clear' | 'full' | 'attention' | 'troubled';
+const STATES: ReadonlyArray<RegionState> = ['clear', 'full', 'attention', 'troubled'];
+
+/** What a bound IS (decision 5): the most a place holds, or the depth at
+ *  which something is due. "DOCK 6 / 1" read as six cars in a space for
+ *  one; it was six cars against a boarding threshold of one. */
+export type BoundKind = 'capacity' | 'threshold';
+const BOUND_KINDS: ReadonlyArray<BoundKind> = ['capacity', 'threshold'];
+
+/** One number of a region's KPI, with its unit (decisions 5 and 9).
+ *  `text` is the server's sentence — the map prints it, never builds
+ *  one; `value` is null where nothing could be measured. */
+export type Measure = Readonly<{ name: string; value: number | null; unit: string; text: string }>;
+
+/** THE BAND THAT DECIDED A NON-CLEAR STATE (decisions 1 and 2): the
+ *  reading against the declared line ("oldest 5d > the 3-day triage
+ *  band"), the period its condition had to hold, and how long the
+ *  record says it has held — `held` is the server's own "16m", so the
+ *  map and `boss orient` say "troubled for 16m" in one voice. */
+export type Decided = Readonly<{
+  id: string;
+  reads: string;
+  hold_minutes: number;
+  since: string | null;
+  held_minutes: number | null;
+  held: string | null;
+}>;
 
 /** This window against the previous one. A half nobody measured is
  *  `null` — a rate nobody measured is not zero. */
@@ -84,19 +121,150 @@ export type Region = Readonly<{
   count: number | null;
   /** The bound the count is read against, where the region has one. */
   bound: number | null;
+  /** What the bound is; null with the bound, and on an older server —
+   *  which `countText` then reads as the capacity it always meant. */
+  bound_kind: BoundKind | null;
+  /** What the count counts: `cars parked`. Empty on an older server. */
+  unit: string;
   state: RegionState;
   why: string;
+  /** The band that decided a non-clear state; null when clear. */
+  band: Decided | null;
   trend: Trend;
+  /** The region's KPI, primary first. Empty on an older server. */
+  kpi: ReadonlyArray<Measure>;
   /** The machinery standing in this region. Empty for a region no
    *  machine of ours works in, and empty on an older server — which
    *  draws no glyphs rather than inventing idle ones. */
   machines: ReadonlyArray<Machine>;
+  /** How many of the region's OWN members stand at each of its places
+   *  — marshalling's stations, the shed's three places (design
+   *  62de32ae, the rest of decision 5). The partition is the server's,
+   *  so an interior draws the head's count from these rather than a
+   *  count of its own. Empty for a region with no places, and on an
+   *  older server. */
+  places: ReadonlyArray<Place>;
 }>;
 
+export type Place = Readonly<{ name: string; count: number }>;
+
+/** A third's STUCK reading (design cf820810), exactly as the server
+ *  gives it: stuck and waiting side by side and never summed; a
+ *  non-empty `unknown` makes `stuck` a FLOOR. */
+export type ThirdStuck = Readonly<{
+  stuck: number | null;
+  waiting: number | null;
+  unknown: ReadonlyArray<string>;
+  oldest_hours: number | null;
+  regions: ReadonlyArray<string>;
+}>;
+
+/** IS THE THIRD TAKING WORK IN FASTER THAN IT LETS WORK OUT? (design
+ *  00774ca8, decision 2) — per day, in ONE unit per third, each packet
+ *  counted once, the net written by the server. A half whose read
+ *  failed is null with the failed read in `why`. */
+export type Balance = Readonly<{
+  unit: string;
+  in_means: string;
+  out_means: string;
+  in: number | null;
+  out: number | null;
+  net: number | null;
+  in_count: number | null;
+  out_count: number | null;
+  why: string | null;
+}>;
+
+/** One HUD row: a third, its regions (the row's membership), its
+ *  balance and its stuck reading — `boss_jobs::thirds::Third`. */
+export type Third = Readonly<{
+  third: string;
+  regions: ReadonlyArray<string>;
+  balance: Balance;
+  stuck: ThirdStuck;
+}>;
+
+/** A failed or unjudged machine with the region whose map draws it. */
+export type MachineAt = Readonly<{ region: string; id: string; name: string; state: MachineState; why: string }>;
+
+/** The whole system's machines, counted once by state (decision 3). */
+export type MachineSummary = Readonly<{
+  running: number;
+  idle: number;
+  failed: number;
+  unknown: number;
+  total: number;
+  failed_or_unknown: ReadonlyArray<MachineAt>;
+}>;
+
+/** One packet that outranks regular order — `boss_jobs::outranks::Outrank`
+ *  (backlog 74569e94, design ea906603 car 1): open, real, of a priority
+ *  that drains before `standard`, with where it stands. */
+export type Outrank = Readonly<{
+  id: string;
+  kind: string;
+  title: string;
+  priority: string;
+  opened_at: string;
+  /** Whole minutes from `opened_at` to the server's `now` — one age for
+   *  every reader, not each clock its own. */
+  age_minutes: number | null;
+  /** Its first ready-or-active step, or null when none is workable. */
+  at: Readonly<{ slug: string | null; title: string; status: string; assignee_id: string | null }> | null;
+  /** The stations it stands at; null when they could not be read —
+   *  never "stands nowhere". */
+  stations: ReadonlyArray<string> | null;
+}>;
+
+/** One upcoming event of the IT department — the `next_up` field,
+ *  `boss_jobs::next_up::NextEvent` (design ea906603 Q3, car 3). Timed
+ *  rows come soonest first, capped at six; rows with no time (`basis`
+ *  says why) and unread sources (`unread` says why) follow. */
+export type NextEvent = Readonly<{
+  /** kebab-case: train-board, train-window, in-transit, gates, scheduled, rotation-due. */
+  kind: string;
+  title: string;
+  /** UTC; the surface converts it to the viewer's zone. */
+  at: string | null;
+  /** The time is an estimate (a median, a cooldown on a tick) — drawn "~". */
+  estimate: boolean;
+  /** What the time rests on, or why there is none — the row's small print. */
+  basis: string;
+  /** The read the row came from. */
+  source: string;
+  /** The source could not be read, and why. */
+  unread: string | null;
+}>;
+
+/** A board field as the payload carried it: its rows (possibly none —
+ *  an answer), or unread with the reason. A field the payload does not
+ *  carry at all is an older server's silence, and is unread too. */
+export type Answer<T> =
+  | Readonly<{ kind: 'rows'; rows: ReadonlyArray<T> }>
+  | Readonly<{ kind: 'unread'; why: string }>;
+
 export type Regions = Readonly<{
+  /** WHAT OUTRANKS REGULAR ORDER (design ea906603 Q1) — the top board's
+   *  first row. */
+  outranks: Answer<Outrank>;
+  /** NEXT UP (design ea906603 Q3) — the top board's departures. */
+  next_up: Answer<NextEvent>;
   window_hours: number;
   regions: ReadonlyArray<Region>;
   now: string;
+  /** The HUD's rows, in the server's order. Empty on a server older
+   *  than the block — which the HUD draws as unanswered, never as a
+   *  balanced system. */
+  thirds: ReadonlyArray<Third>;
+  /** The machine cell. Null on an older server: not answered, never
+   *  "no machines". */
+  machines: MachineSummary | null;
+  /** THE PLANT (decision 11): machinery that serves every region — the
+   *  host runners — drawn as a strip along the map's edge rather than
+   *  filed under one region. Empty on an older server, which draws no
+   *  strip rather than inventing idle machines. The HUD's machine cell
+   *  counts these too, under the region `plant`. */
+  plant: ReadonlyArray<Machine>;
 }>;
 
 function asObject(raw: unknown, where: string): Record<string, unknown> {
@@ -134,21 +302,183 @@ function parseMachine(raw: unknown): Machine {
   };
 }
 
+function parseMeasure(raw: unknown): Measure {
+  const o = asObject(raw, 'measure');
+  return {
+    name: String(o.name ?? ''),
+    value: numberOrNull(o.value),
+    unit: String(o.unit ?? ''),
+    text: String(o.text ?? ''),
+  };
+}
+
+function parseDecided(raw: unknown): Decided | null {
+  if (raw === null || raw === undefined) return null;
+  const o = asObject(raw, 'band');
+  return {
+    id: String(o.id ?? ''),
+    reads: String(o.reads ?? ''),
+    hold_minutes: numberOrNull(o.hold_minutes) ?? 0,
+    since: typeof o.since === 'string' ? o.since : null,
+    held_minutes: numberOrNull(o.held_minutes),
+    held: typeof o.held === 'string' ? o.held : null,
+  };
+}
+
 function parseRegion(raw: unknown): Region {
   const o = asObject(raw, 'region');
+  const name = String(o.name ?? '?');
   const state = String(o.state ?? '');
   if (!(STATES as ReadonlyArray<string>).includes(state)) {
-    throw new Error(`region ${String(o.name ?? '?')}: unknown state ${JSON.stringify(state)}`);
+    throw new Error(`region ${name}: unknown state ${JSON.stringify(state)}`);
+  }
+  // Absent is an older server; present and unknown is a newer one whose
+  // bound this client cannot read — refused, like an unknown state.
+  const kind = o.bound_kind;
+  if (kind !== undefined && kind !== null && !(BOUND_KINDS as ReadonlyArray<unknown>).includes(kind)) {
+    throw new Error(`region ${name}: unknown bound kind ${JSON.stringify(kind)}`);
   }
   return {
     name: String(o.name ?? ''),
     count: numberOrNull(o.count),
     bound: numberOrNull(o.bound),
+    bound_kind: (kind ?? null) as BoundKind | null,
+    unit: String(o.unit ?? ''),
     state: state as RegionState,
     why: String(o.why ?? ''),
+    band: parseDecided(o.band),
     trend: parseTrend(o.trend),
+    kpi: Array.isArray(o.kpi) ? o.kpi.map(parseMeasure) : [],
     machines: Array.isArray(o.machines) ? o.machines.map(parseMachine) : [],
+    places: Array.isArray(o.places) ? o.places.map(parsePlace) : [],
   };
+}
+
+function parsePlace(raw: unknown): Place {
+  const o = asObject(raw, 'place');
+  return { name: String(o.name ?? ''), count: numberOrNull(o.count) ?? 0 };
+}
+
+const strings =(v: unknown): ReadonlyArray<string> => (Array.isArray(v) ? v.map(String) : []);
+
+function parseThird(raw: unknown): Third {
+  const o = asObject(raw, 'third');
+  const b = asObject(o.balance, `third ${String(o.third ?? '?')} balance`);
+  const s = asObject(o.stuck, `third ${String(o.third ?? '?')} stuck`);
+  return {
+    third: String(o.third ?? ''),
+    regions: strings(o.regions),
+    balance: {
+      unit: String(b.unit ?? ''),
+      in_means: String(b.in_means ?? ''),
+      out_means: String(b.out_means ?? ''),
+      in: numberOrNull(b.in),
+      out: numberOrNull(b.out),
+      net: numberOrNull(b.net),
+      in_count: numberOrNull(b.in_count),
+      out_count: numberOrNull(b.out_count),
+      why: typeof b.why === 'string' ? b.why : null,
+    },
+    stuck: {
+      // A count the payload does not carry is null — unanswered — never 0.
+      stuck: numberOrNull(s.stuck),
+      waiting: numberOrNull(s.waiting),
+      unknown: strings(s.unknown),
+      oldest_hours: numberOrNull(s.oldest_hours),
+      regions: strings(s.regions),
+    },
+  };
+}
+
+function parseMachineSummary(raw: unknown): MachineSummary | null {
+  if (raw === null || raw === undefined) return null;
+  const o = asObject(raw, 'machines');
+  const count = (k: string): number => {
+    const n = numberOrNull(o[k]);
+    if (n === null) throw new Error(`machines: expected a count for ${k}`);
+    return n;
+  };
+  return {
+    running: count('running'),
+    idle: count('idle'),
+    failed: count('failed'),
+    unknown: count('unknown'),
+    total: count('total'),
+    failed_or_unknown: Array.isArray(o.failed_or_unknown)
+      ? o.failed_or_unknown.map((m) => {
+          const x = asObject(m, 'machine');
+          return { ...parseMachine(x), region: String(x.region ?? '') };
+        })
+      : [],
+  };
+}
+
+const stringOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+function parseOutrank(raw: unknown): Outrank {
+  const o = asObject(raw, 'outrank');
+  if (typeof o.id !== 'string' || typeof o.title !== 'string') {
+    throw new Error('an outranking packet came without its id and title');
+  }
+  const at = o.at === null || o.at === undefined ? null : asObject(o.at, 'outrank at');
+  return {
+    id: o.id,
+    kind: String(o.kind ?? ''),
+    title: o.title,
+    priority: String(o.priority ?? ''),
+    opened_at: String(o.opened_at ?? ''),
+    age_minutes: numberOrNull(o.age_minutes),
+    at:
+      at === null
+        ? null
+        : {
+            slug: stringOrNull(at.slug),
+            title: String(at.title ?? ''),
+            status: String(at.status ?? ''),
+            assignee_id: stringOrNull(at.assignee_id),
+          },
+    stations: Array.isArray(o.stations) ? o.stations.map(String) : null,
+  };
+}
+
+function parseNextEvent(raw: unknown): NextEvent {
+  const o = asObject(raw, 'next event');
+  if (typeof o.kind !== 'string' || typeof o.title !== 'string') {
+    throw new Error('an upcoming event came without its kind and title');
+  }
+  return {
+    kind: o.kind,
+    title: o.title,
+    at: stringOrNull(o.at),
+    estimate: o.estimate === true,
+    basis: String(o.basis ?? ''),
+    source: String(o.source ?? ''),
+    unread: stringOrNull(o.unread),
+  };
+}
+
+/** One board field, parsed ON ITS OWN (design ea906603, with 8c7c2f4b's
+ *  intent): a field that is absent, null or malformed makes that one
+ *  row unread with the reason, and never fails the regions read — the
+ *  map and the other rows stand. */
+function answer<T>(
+  o: Record<string, unknown>,
+  key: string,
+  what: string,
+  nullWhy: string,
+  parse: (raw: unknown) => T,
+): Answer<T> {
+  if (!(key in o)) {
+    return { kind: 'unread', why: `this server does not send ${what} (it predates design ea906603)` };
+  }
+  const v = o[key];
+  if (v === null) return { kind: 'unread', why: nullWhy };
+  if (!Array.isArray(v)) return { kind: 'unread', why: `${key}: expected a list` };
+  try {
+    return { kind: 'rows', rows: v.map(parse) };
+  } catch (e) {
+    return { kind: 'unread', why: `${key}: ${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 /** The whole map, or a throw — a payload without `regions` is a wrong
@@ -157,9 +487,18 @@ export function parseRegions(raw: unknown): Regions {
   const o = asObject(raw, 'yard regions');
   if (!Array.isArray(o.regions)) throw new Error('yard regions: expected a regions list');
   return {
+    // Null means different things on the two fields, each as its server
+    // defines it: car 1 sends null when its narrowed read failed; car 3
+    // leaves None only on a payload its handler did not fill.
+    outranks: answer(o, 'outranks', 'what outranks regular order',
+      'the server could not read what outranks regular order', parseOutrank),
+    next_up: answer(o, 'next_up', 'what is next up', 'the server did not fill what is next up', parseNextEvent),
     window_hours: numberOrNull(o.window_hours) ?? 0,
     regions: o.regions.map(parseRegion),
     now: String(o.now ?? ''),
+    thirds: Array.isArray(o.thirds) ? o.thirds.map(parseThird) : [],
+    machines: parseMachineSummary(o.machines),
+    plant: Array.isArray(o.plant) ? o.plant.map(parseMachine) : [],
   };
 }
 
@@ -184,24 +523,39 @@ const YARD_SELECTION: Readonly<Record<string, string>> = {
   garage: 'garage',
 };
 
-/** The regions whose floor is a BOARD rather than the yard's own
- *  rolling stock. Since car 4 of design d2154293 they are zooms like
- *  every other territory: the board mounts UNDER the zoomed world, and
- *  /it/operate/receiving and /it/operate/marshalling — the pages they
- *  used to be — resolve to the same route. The shop floor joined them
- *  on backlog 94c6ffd0: its board is the crew board, which was the
- *  floor before the region existed. */
-const BOARD_FLOORS: ReadonlyArray<string> = ['receiving', 'marshalling', 'shop-floor'];
+const isRegion = (name: string): boolean => (REGION_NAMES as ReadonlyArray<string>).includes(name);
 
-/** Where a card leads. A name this client does not know opens the
- *  yard itself — a door that opens somewhere, never a dead link. */
-export function floorHref(name: string): string {
-  if (BOARD_FLOORS.includes(name)) return `/it/yard/${name}`;
-  return name in YARD_SELECTION ? `/it/yard/${name}` : '/it/yard';
+/** Where a link to a region leads — its SELECTION on the Department
+ *  Map, `/it?at=<name>`, for every region the server serves: the map
+ *  stays on top and the station's detail opens below it (design
+ *  e765b3fc, car N1). Until that car it opened the region's own page,
+ *  which swapped the map away.
+ *  THE ONE DOOR (backlog 594ffe96, 2026-09-25): the world map's old
+ *  floor link listed the six yard regions and the three boards and
+ *  sent anything else to /it/yard, which the router reads as the
+ *  TRACK — so the publish territory opened the track's page — while
+ *  the transit map's `regionHref` and the HUD's `machineHref` each
+ *  built the path themselves. A name that is not a region (the plant,
+ *  or a newer server's eleventh) opens the map with nothing selected:
+ *  somewhere, and never another region. */
+export function regionHref(name: string): string {
+  return isRegion(name) ? `/it?at=${encodeURIComponent(name)}` : '/it';
 }
 
-/** The selection a `/it/yard/<region>` floor opens the yard on; the
- *  track for anything else, as parseSelection falls back. */
+/** The link a SECTION selects itself by (design e765b3fc, car N2) — the
+ *  Department Map with the border in the query, `/it?at=dock->track`,
+ *  built here beside `regionHref` so the map's links are built in one
+ *  place. selection.ts reads it back. */
+export function sectionHref(from: string, to: string): string {
+  return `/it?at=${encodeURIComponent(`${from}->${to}`)}`;
+}
+
+// `floorHref` — a region's floor page, `/it/yard/<name>` — retired with
+// the page (design e765b3fc, car N3): the station's panel carries the
+// floor itself.
+
+/** The selection a station's floor deck opens on; the track for
+ *  anything else, as parseSelection falls back. */
 export function floorSelection(region: string): string {
   return YARD_SELECTION[region] ?? 'track';
 }
@@ -210,17 +564,48 @@ export function floorSelection(region: string): string {
 // Words — pure, testable without a DOM.
 // ---------------------------------------------------------------------
 
-/** The yard's lamp for a state (`.yard-lamp-dot.<lamp>`). */
+/** The yard's lamp for a state (`.yard-lamp-dot.<lamp>`). Full is a good
+ *  state, so it lights the same lamp as clear. */
 export function lampOf(state: RegionState): 'ok' | 'warn' | 'err' {
-  return state === 'clear' ? 'ok' : state === 'busy' ? 'warn' : 'err';
+  return state === 'clear' || state === 'full' ? 'ok' : state === 'attention' ? 'warn' : 'err';
 }
 
-/** What is here, over its bound when it has one; "no reading" for a
- *  count the server could not take — never 0. */
+/** What is here, in its unit, against its bound — "3 / 3 bays in use"
+ *  for a capacity, "6 cars parked · threshold 1" for a threshold, so a
+ *  trigger never reads as room (decision 5). "no reading" for a count
+ *  the server could not take — never 0. */
 export function countText(r: Region): string {
   if (r.count === null) return 'no reading';
-  return r.bound === null ? String(r.count) : `${r.count} / ${r.bound}`;
+  const unit = r.unit === '' ? '' : ` ${r.unit}`;
+  if (r.bound === null) return `${r.count}${unit}`;
+  return r.bound_kind === 'threshold'
+    ? `${r.count}${unit} · threshold ${r.bound}`
+    : `${r.count} / ${r.bound}${unit}`;
 }
+
+/** The count as a territory has room for it: the number against its
+ *  bound, with the threshold still named — the unit rides the KPI line
+ *  and the title. */
+export function compactCountText(r: Region): string {
+  if (r.count === null) return 'no reading';
+  if (r.bound === null) return String(r.count);
+  return r.bound_kind === 'threshold' ? `${r.count} · threshold ${r.bound}` : `${r.count} / ${r.bound}`;
+}
+
+/** The state with how long the record says it has held — "troubled
+ *  for 16m" (decision 2). A clear state, or one whose onset the record
+ *  does not hold, is the bare word. */
+export function stateText(r: Region | undefined): string {
+  if (r === undefined) return 'troubled';
+  return r.band?.held ? `${r.state} for ${r.band.held}` : r.state;
+}
+
+/** The band that decided a non-clear state, read against its number —
+ *  "oldest 5d > the 3-day triage band"; null when clear. */
+export const bandText = (r: Region | undefined): string | null => r?.band?.reads ?? null;
+
+/** The region's KPI as one line, each measure in the server's words. */
+export const kpiText = (r: Region): string => r.kpi.map((m) => m.text).join(' · ');
 
 /** A number as the card prints it: one decimal at most, and no
  *  trailing `.0`. */

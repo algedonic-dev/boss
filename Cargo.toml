@@ -9,14 +9,11 @@ members = [
     "crates/core/boss-expr",
     "crates/core/boss-gateway",
     "crates/orchestrators/boss-cli",
-    "crates/core/boss-cybernetics",
     "crates/core/boss-nats",
-    "crates/core/boss-observability",
     "crates/modules/boss-catalog",
     "crates/modules/boss-assets",
     "crates/modules/boss-assets-client",
     "crates/tenants/boss-brewery-engine",
-    "crates/tenants/boss-used-device-shop-engine",
     "crates/modules/boss-accounts",
     "crates/modules/boss-people",
     "crates/modules/boss-people-client",
@@ -26,7 +23,6 @@ members = [
     "crates/modules/boss-catalog-client",
     "crates/modules/boss-messages",
     "crates/core/boss-jobs",
-    "crates/core/boss-jobs-client",
     "crates/modules/boss-shipping",
     "crates/modules/boss-shipping-client",
     "crates/orchestrators/boss-sim",
@@ -67,7 +63,7 @@ authors = ["Algedonic, LLC"]
 # in each crate's Cargo.toml. As of 2026-05-05 every crate is at 0
 # clippy warnings under `cargo clippy --workspace --all-features`.
 # CI gates regressions via the clippy step in infra/gate.sh
-# (`cargo clippy --workspace --all-features --tests -- -D warnings`);
+# (`cargo clippy --workspace --all-features --all-targets -- -D warnings`);
 # this section is reserved as the single config point for future
 # ratchets without forcing local-dev shells to deny mid-refactor
 # state. Today it intentionally re-states the cargo defaults so the

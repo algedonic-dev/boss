@@ -48,10 +48,19 @@
     title="Step UX plugins"
     subtitle={loading
       ? 'Loading…'
-      : `${plugins.length} active plugin${plugins.length === 1 ? '' : 's'} across ${categoryKeys.length} categor${categoryKeys.length === 1 ? 'y' : 'ies'}`}
+      : error
+        ? // A failed read leaves `plugins` at [] — counting that would
+          // paint the empty registry's "0 active plugins" beside the
+          // failure line (backlog 044f55e4). The count is unknown, so say so.
+          'Plugin count unknown — the registry read failed'
+        : `${plugins.length} active plugin${plugins.length === 1 ? '' : 's'} across ${categoryKeys.length} categor${categoryKeys.length === 1 ? 'y' : 'ies'}`}
   />
   {#if error}
-    <p class="empty" style="color:#dc2626">Failed to load: {error}</p>
+    <!-- load-failed + role=alert: the shared failure marker the outage
+         crawl asserts (tests/mocked/_routes.ts FAILURE_MARKER; backlog 7267f9ce).
+         No inline colour: the marker's own rule sets the words in troubled
+         ink, and an inline --err outranked it (sweep c3e4edcc). -->
+    <p class="empty load-failed" role="alert" style="margin:0 24px">Failed to load: {error}</p>
   {/if}
 
   {#if plugins.length === 0 && !loading && !error}
@@ -86,7 +95,7 @@
                   <td>{p.label}</td>
                   <td>
                     {#if p.owning_team === 'platform'}
-                      <span style="color:#888; font-size:12px">system</span>
+                      <span style="color:var(--static); font-size:12px">system</span>
                     {:else}
                       <span class="mono">{p.owning_team}</span>
                     {/if}

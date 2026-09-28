@@ -20,10 +20,13 @@
 //! - `GET  /api/assets/assets/{id}/accessories` — installed accessories
 //! - `POST /api/assets/assets/{id}/accessories` — append (sim)
 //!
-//! The POST endpoints are how `boss-sim`'s `intake` generator populates
-//! these during a 12-month replay. No auth on writes in this wave —
-//! a follow-up can gate them behind CurrentUser + policy once the UI
-//! edit flows exist.
+//! The POST endpoints were written for `boss-sim`'s `intake` generator.
+//! Both writes ask Update on `asset` — the question the asset event
+//! doors ask — and stage their fact on the outbox in the write's own
+//! transaction (backlog d2bea664, 2026-09-27). Until then they took no
+//! caller, asked no policy and recorded nothing: "No auth on writes in
+//! this wave", this header said, and the log could not say who changed
+//! an asset's firmware or attached an accessory, or that anyone had.
 
 use std::sync::Arc;
 
@@ -33,18 +36,39 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use boss_core::primitives::Part;
+use boss_core::publisher::DomainPublisher;
+use boss_policy_client::{CurrentUser, PolicyClient};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::http::require_asset_update_on;
+
+/// An asset's software config was set: the full row as written.
+pub const SOFTWARE_CONFIG_UPSERTED: &str = "assets.software_config.upserted";
+/// An accessory was attached to an asset: the full row as written.
+pub const ACCESSORY_ATTACHED: &str = "assets.accessory.attached";
+
 #[derive(Clone)]
 pub struct SystemPartsState {
     pub pool: Arc<PgPool>,
+    /// Stamps each staged fact: the caller's actor, wall time and the
+    /// sim-origin probe the event doors' publisher carries.
+    pub publisher: DomainPublisher,
+    /// The policy client both writes ask. Required: the router cannot
+    /// be built without one (backlog 2b49ab60).
+    pub policy: Arc<dyn PolicyClient>,
 }
 
-pub fn asset_parts_router(pool: PgPool) -> Router {
+pub fn asset_parts_router(
+    pool: PgPool,
+    publisher: DomainPublisher,
+    policy: Arc<dyn PolicyClient>,
+) -> Router {
     let state = SystemPartsState {
         pool: Arc::new(pool),
+        publisher,
+        policy,
     };
     Router::new()
         .route("/api/assets/assets/{asset_id}/parts", get(list_parts))
@@ -154,13 +178,41 @@ async fn get_software_config(
     }
 }
 
+/// The stamp for a fact this caller's write stages: their actor, or the
+/// platform automation for a request that carried no identity (which
+/// policy has already refused unless a rule grants the guest role).
+async fn stamp_for(
+    state: &SystemPartsState,
+    user: &boss_policy_client::User,
+) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    state.publisher.stamp_with_actor(actor).await
+}
+
+fn storage_error(e: impl std::fmt::Display) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+}
+
 async fn upsert_software_config(
     State(state): State<SystemPartsState>,
     Path(asset_id): Path<String>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<UpsertSoftwareConfigRequest>,
 ) -> Response {
+    if let Err(refused) = require_asset_update_on(state.policy.as_ref(), &user).await {
+        return refused;
+    }
     let modules = serde_json::to_value(&req.modules).unwrap_or(serde_json::json!([]));
-    let result = sqlx::query(
+    let stamp = stamp_for(&state, &user).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return storage_error(e),
+    };
+    // The row as written is the fact: RETURNING reads back what the
+    // upsert left, so the payload is value-primary for a rebuilder.
+    let row = sqlx::query_as::<_, SoftwareConfig>(
         "INSERT INTO asset_software_configs
              (asset_id, firmware_version, modules, license_tier, last_updated_on, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
@@ -169,19 +221,32 @@ async fn upsert_software_config(
              modules = EXCLUDED.modules,
              license_tier = EXCLUDED.license_tier,
              last_updated_on = EXCLUDED.last_updated_on,
-             updated_at = NOW()",
+             updated_at = NOW()
+         RETURNING asset_id, firmware_version, modules, license_tier, last_updated_on, updated_at",
     )
     .bind(&asset_id)
     .bind(&req.firmware_version)
     .bind(&modules)
     .bind(&req.license_tier)
     .bind(req.last_updated_on)
-    .execute(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await;
-
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => return storage_error(e),
+    };
+    let payload = serde_json::to_value(&row).unwrap_or_default();
+    if let Err(e) = boss_events::outbox::record_event_in_tx(
+        &mut tx,
+        &stamp.event(SOFTWARE_CONFIG_UPSERTED, payload),
+    )
+    .await
+    {
+        return storage_error(e);
+    }
+    match tx.commit().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => storage_error(e),
     }
 }
 
@@ -198,24 +263,44 @@ async fn list_accessories(
 async fn append_accessory(
     State(state): State<SystemPartsState>,
     Path(asset_id): Path<String>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<AppendAccessoryRequest>,
 ) -> Response {
-    let result = sqlx::query(
+    if let Err(refused) = require_asset_update_on(state.policy.as_ref(), &user).await {
+        return refused;
+    }
+    let stamp = stamp_for(&state, &user).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return storage_error(e),
+    };
+    let row = sqlx::query_as::<_, Accessory>(
         "INSERT INTO asset_accessories
              (asset_id, accessory_kind, serial, installed_on, notes)
-         VALUES ($1, $2, $3, $4, $5)",
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, asset_id, accessory_kind, serial, installed_on, removed_on, notes",
     )
     .bind(&asset_id)
     .bind(&req.accessory_kind)
     .bind(&req.serial)
     .bind(req.installed_on)
     .bind(&req.notes)
-    .execute(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await;
-
-    match result {
-        Ok(_) => StatusCode::CREATED.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => return storage_error(e),
+    };
+    let payload = serde_json::to_value(&row).unwrap_or_default();
+    if let Err(e) =
+        boss_events::outbox::record_event_in_tx(&mut tx, &stamp.event(ACCESSORY_ATTACHED, payload))
+            .await
+    {
+        return storage_error(e);
+    }
+    match tx.commit().await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => storage_error(e),
     }
 }
 

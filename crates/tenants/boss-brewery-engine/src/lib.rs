@@ -468,8 +468,18 @@ pub fn fetch_employees(api_base: &str) -> std::collections::HashMap<String, Stri
         }
     };
     // x-sim-origin marks this as simulator traffic, consistent with the
-    // daemon's writes; the GET itself is an ungated read.
-    match client.get(&url).header("x-sim-origin", "true").send() {
+    // daemon's writes. The read signs as the sim's own automation: the
+    // roster answers a caller by grant, and one with no identity is
+    // refused (backlog cda177ef).
+    match client
+        .get(&url)
+        .header("x-sim-origin", "true")
+        .header(
+            "x-boss-user",
+            r#"{"id":"automation:brewery-sim","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#,
+        )
+        .send()
+    {
         Ok(resp) if resp.status().is_success() => match resp.json::<Vec<Row>>() {
             Ok(rows) => {
                 for r in rows {

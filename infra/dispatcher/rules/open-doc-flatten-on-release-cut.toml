@@ -1,0 +1,55 @@
+# A release that is cut opens the documentation flatten it owes
+# (backlog 04c6e143, decided 2026-09-25).
+#
+# `doc-flatten` (infra/platform/workflows/doc-flatten.toml) is the
+# protocol that folds settled decisions into
+# docs/architecture-decisions.md and retires what they supersede —
+# CLAUDE.md §Design docs: "Each release, settled material folds into
+# docs/architecture-decisions.md". Measured 2026-09-25 and again
+# 2026-09-27 on 94c6bfd9: 0 doc-flatten packets ever, while 72
+# design-docs closed in the same period, and no file in this directory
+# named the kind. The protocol said "each release" and nothing opened
+# it when one was cut, so it depended on a person remembering.
+#
+# WHICH EVENT. The live `cut-a-release` v1 row (the tenant's protocol,
+# design 3613f0af — registry data, not a file in this tree) runs
+# decided -> changelog -> approve -> tag -> mirror -> announce and ends
+# at `released` (after announce) or `withdrawn` (approve said anything
+# but approved). A release is CUT only at `released`, so this keys on
+# the packet's close with that outcome: a withdrawn release changed no
+# baseline and owes no flatten. The close payload carries id, kind,
+# outcome and title, which is all the spawn needs.
+#
+# THE DEDUP IS PER RELEASE. The flatten is opened ABOUT the release
+# that earned it (`subject = id`, and `metadata.for_release` names it),
+# and the guard asks whether a flatten for THAT release is open, so a
+# redelivered close opens no twin. A guard on the kind alone would be
+# the dedup that silently retires a cadence: one flatten left open
+# would swallow every later release's.
+#
+# The title is a literal because the arg language has no
+# concatenation; the release's own title rides as
+# `metadata.release_title`. Pinned by
+# crates/core/boss-dispatcher/tests/doc_flatten_on_release_rule.rs.
+[[rule]]
+name = "open-doc-flatten-on-release-cut"
+why = """
+A CROSS-PROTOCOL REACTOR: the close of a `cut-a-release` packet with
+outcome `released` opens a `doc-flatten` packet about that release —
+two protocols, and the release's protocol (the tenant's) cannot open a
+platform chore, so no single Workflow consequence can declare it.
+Measured 2026-09-25 (backlog 04c6e143): doc-flatten, the protocol that
+keeps docs/architecture-decisions.md current "each release", had 0
+packets ever while 72 design-docs closed, because nothing opened it —
+opening a periodic chore is mechanical and belongs to the machine
+(CLAUDE.md, "Mechanical operations belong to the machine"). It adds no
+routing inside either protocol: the flatten's own row owns survey ->
+fold -> curate -> verify -> review. Redelivery-safe: a flatten already
+open for the same release suppresses a twin.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = 'kind = "cut-a-release" AND outcome = "released" AND NOT open_job_exists("doc-flatten", id)'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = '"doc-flatten"', subject_kind = '"custom"', subject = "id", title = '"Documentation flatten — a release was cut"', "metadata.for_release" = "id", "metadata.release_title" = "title" }

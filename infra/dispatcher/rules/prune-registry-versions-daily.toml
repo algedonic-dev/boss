@@ -1,0 +1,86 @@
+# Prune the forge registry's image versions, every day, unattended.
+#
+# THE DEFECT (backlog 8d77d670, design 97add747). Every train pushes a
+# boss:<sha> and a boss-ci:<sha> image to the forge's registry, and the
+# only thing that removes one is the MUTATING verb
+# `prune-registry-versions` — which ran only when someone filed it. The
+# registry was 17 GB after the 2026-09-18 prune and 92 GB on
+# 2026-09-26, about 9 GB a day, and disk-floor-sweep ended FLOOR UNMET
+# every hour from 2026-09-24 12:01Z (estate alarm c4da71b0). Room (the
+# forge's second NVMe, b2d5b546) is not a bound; a cadence is.
+#
+# THE AUTHORITY. A rule filing a `--for-real` delete is exactly the
+# widening infra/ops/verbs/README.md says a rule must not make on its
+# own: no human files the packet. David authorised it on 2026-09-27,
+# answering Q1 of design 97add747, and the verb's `about` carries that
+# as its precedent. Nothing else is widened by it.
+#
+# THE VERB IS ITS OWN FILE, NOT A MODE THIS RULE SELECTS. The hand verb
+# declares its mode with no default. Since 4d53fae2 (2026-09-22) a
+# `jobs.spawn` CAN carry an args list, so this rule could name the hand
+# verb with `--for-real`; it does not, so that the delete nobody files
+# is its own reviewed verb carrying its own authorisation, and the
+# silence sweep and the watch key on a name that can only be this run.
+# `prune-registry-versions-daily`
+# (infra/ops/verbs/prune-registry-versions-daily.json) runs the SAME
+# script with `--for-real` fixed in its argv and no second argument, so
+# the keep set is the one the hand verb derives — the live images, the
+# named rollback target, the last 10 landed trains (the script's own
+# default) plus every sha an open train carries, latest, anything under
+# 24 h, anything unclassifiable — and an underivable half is still a
+# refusal that deletes nothing. The `mirror-drift` /
+# `refresh-publish-drift-daily` pair is the precedent.
+#
+# A RUN THAT DOES NOT DO ITS JOB IS AN ALARM. The request closes
+# `answered` whenever the verb ran — a refusal (exit 2) and a part-way
+# failure (exit 1) included — so `watch-prune-registry-versions-daily`
+# reads every close and files an urgent alarm for any run that did not
+# delete what it planned (backlog 8d77d670, review H1).
+#
+# THIS RULE CARRIES NO GUARD. The idempotence is in the script: a second
+# run the same day finds nothing outside the keep set to delete. A
+# `NOT open_*` guard would let one unfinished ops-request retire the
+# cadence — `a-dedup-guard-silently-retires-a-cadence`, the defect that
+# silenced publish-to-github-daily for nineteen days.
+# `the_prune_carries_no_dedup_guard`
+# (crates/core/boss-dispatcher/tests/prune_registry_versions_daily_rule.rs)
+# refuses one.
+#
+# NO TIME-OF-DAY ANCHOR beyond the daily cadence (design 97add747,
+# decision 3). The bytes are freed by Forgejo's [cron.cleanup_packages],
+# unset in app.ini so its @midnight / older_than 24h default applies:
+# whatever hour this fires, a deleted version's blobs go at the next
+# midnight, a lag of at most a day against ~9 GB of daily growth. The
+# review asked (L4) for a fire near 23:00Z instead; a schedule here has
+# no time of day (RawSchedule is cadence + anchor_date, and a daily
+# rule fires on clock.day at 00:00Z), and the nearest spelling,
+# every-1380-minutes, fires at 00:00 AND 23:00 — two runs a day and a
+# second cadence for the silence sweep. Pinning the cron in app.ini is
+# the later car the design names if the day's lag matters.
+#
+# The packet's subject is the REGISTRY, not the host that runs the verb
+# (`metadata.host` is what the ops-runner routes on): one identity this
+# rule alone files, so `cadence_roster::clock_cadences` derives a daily
+# `ops-request/forge-registry` the silence sweep can measure, rather than
+# one hidden inside the forge's ordinary ops traffic.
+[[rule]]
+name = "prune-registry-versions-daily"
+why = """
+A TIMER, the standing exemption: no packet causes "a day passed", and
+the growth this bounds is the steady side effect of every train, not
+an event a Workflow `on` consequence could hang the prune from.
+Decided in design 97add747 (Q1 authorised by David, 2026-09-27),
+measured on backlog 8d77d670: the forge registry regrew 17 GB -> 92 GB
+in the eight days between two hand-filed prunes, and disk-floor-sweep
+has ended FLOOR UNMET every hour since 2026-09-24. It files the
+fixed-argv `prune-registry-versions-daily` verb, which runs the hand
+verb's own script with `--for-real` and its derived keep set, so the
+bound holds with nobody present; watch-prune-registry-versions-daily
+turns a run that does not hold it into an alarm. It adds no routing:
+one firing spawns one ops-request, and what happens next is that
+protocol's row.
+"""
+schedule = { cadence = "daily", anchor_date = "2026-09-27" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"forge-registry\"", title = "\"prune the forge registry's image versions outside the derived keep set\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"prune-registry-versions-daily\"", "metadata.area" = "\"platform\"" }

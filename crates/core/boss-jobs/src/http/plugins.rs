@@ -4,6 +4,7 @@
 use super::*;
 
 use axum::extract::{Path, Query};
+use boss_policy_client::Scope;
 
 #[allow(
     clippy::result_large_err,
@@ -42,11 +43,7 @@ async fn plugin_policy_check<R: JobsRepository, B: EventBus>(
     {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("policy check failed: {e}"),
-        )
-            .into_response()),
+        Err(e) => Err(e.into_response()),
     }
 }
 
@@ -209,16 +206,116 @@ pub(super) async fn retire_plugin<R: JobsRepository + 'static, B: EventBus + 'st
 /// admin UI calls this before a retire confirm so the operator sees
 /// the blast radius — in-flight Steps keep rendering their current
 /// bundle; only brand-new Steps of this kind are blocked by retire.
+///
+/// A COUNT OF STEPS IS A READ OF STEPS (backlog 1a4a4d03). It asked only
+/// for Read on `step-plugin` — the basic guest's shipped grant — and
+/// counted any `{kind}` at all, so a stranger could read how much work
+/// of every kind was in flight. It now takes Read on `step` at scope
+/// all, because the count spans every packet and a narrower scope would
+/// be told about steps it may not see, and it answers only for a kind
+/// the plugin registry holds: this is the plugin page's door, not a
+/// general census. Both refusals come before the registry is read, so
+/// they do not say which kinds exist either. Its one caller, the retire
+/// confirm on the plugin page, is the operator's.
 pub(super) async fn in_flight_plugin_count<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
     Path(kind): Path<String>,
 ) -> Response {
+    let reg = match plugin_registry_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
     if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
         return r;
     }
+    match state
+        .policy
+        .check(&user, Action::Read, Resource::step())
+        .await
+    {
+        Ok(Decision::Allow { scope: Scope::All }) => {}
+        Ok(Decision::Allow { scope }) => {
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "the in-flight count spans every packet's steps; {} (role {}) reads steps \
+                     only at scope {}",
+                    user.id,
+                    user.role,
+                    scope.to_db_string()
+                ),
+            )
+                .into_response();
+        }
+        Ok(Decision::Deny { reason }) => return (StatusCode::FORBIDDEN, reason).into_response(),
+        Err(e) => return e.into_response(),
+    }
+    match reg.list_versions(&kind).await {
+        Ok(versions) if !versions.is_empty() => {}
+        Ok(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no step plugin `{kind}` in the plugin registry"),
+            )
+                .into_response();
+        }
+        Err(e) => return plugin_err_response(e),
+    }
     match state.jobs.count_in_flight_steps_by_kind(&kind).await {
         Ok(n) => Json(serde_json::json!({ "kind": kind, "in_flight": n })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/jobs/repairs/step-plugin-version` — the dry run of the
+/// one-time repair (backlog 5a670a71): every step whose log-derived
+/// plugin version differs from its row, and what the write would do
+/// with each, with nothing written. `POST` below is the write.
+///
+/// Both halves take `publish` on `step_plugin`, the authority that
+/// decides which plugin version a step is stamped with
+/// (`platform-admin` in the core defaults): the dry run lists every
+/// packet's divergent steps, so it is the repair's reader, not a
+/// general one. The contract is `crate::plugin_version_repair`.
+pub(super) async fn preview_plugin_version_repair<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    plugin_version_repair(&state, &user, false).await
+}
+
+/// `POST /api/jobs/repairs/step-plugin-version` — append ONE correcting
+/// STEP_UPDATED, built from the stored row and signed as the caller,
+/// for each step whose divergence is exactly the version-0 STEP_CREATED
+/// defect; refuse and list the rest. A second call writes nothing.
+pub(super) async fn run_plugin_version_repair<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    plugin_version_repair(&state, &user, true).await
+}
+
+async fn plugin_version_repair<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    write: bool,
+) -> Response {
+    if let Err(r) = plugin_policy_check(state, user, Action::Publish).await {
+        return r;
+    }
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let stamp = state.publisher.stamp_with_actor(actor).await;
+    match state.jobs.repair_step_plugin_versions(write, &stamp).await {
+        Ok(report) => Json(report).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

@@ -104,35 +104,14 @@ pub trait SimOutput {
         Ok(())
     }
 
-    /// Update a Step's status and optionally its metadata via the Jobs API.
-    /// Maps to PUT /api/jobs/{job_id}/steps/{step_id}. Default no-op.
-    ///
-    /// `completed_by` (if `Some`) names the Employee that performed
-    /// the transition — the sim's role-aware actor stamping (see
-    /// `ShapeDrivenState::pick_employee_for_role`). The boss-jobs-
-    /// api handler honours this field as the audit_log `_actor`
-    /// when present and the calling user is a system / automation
-    /// identity. None = the API stamps whoever's session is on the
-    /// PUT (the brewery-sim's slug for the live tick path).
-    ///
-    /// `signed_off_by` — when the step is `needs_sign_off=true`
-    /// AND the sim is completing it in the same tick (no separate
-    /// sign-off ceremony), this names the Employee who signed off.
-    /// The LiveApi impl writes `signed_off_by` + `signed_off_on` into
-    /// the PUT body so the API's PATCH semantics flip both at once;
-    /// without this the Job projection stays
-    /// `pending-sign-off` forever even though every step is done.
-    fn emit_step_update(
-        &mut self,
-        _job_id: &str,
-        _step_id: &str,
-        _new_status: &str,
-        _metadata_update: Option<serde_json::Value>,
-        _completed_by: Option<&str>,
-        _signed_off_by: Option<&str>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
+    // (No step-update emitter. `emit_step_update` buffered a step
+    // PUT of {status, metadata} for the end-of-day flush, and nothing
+    // in the tree has called it since the initial commit: the
+    // simulated workforce claims, merges and completes each step
+    // itself, through the step merge door (workforce.rs). The dead
+    // flush was the last step writer that sent metadata without
+    // reading the step first, so it was deleted rather than moved
+    // (backlog e39a9d2a, design 93d2bddb, 2026-09-26).)
 
     /// Emit a KB fact (account, vendor, or system fact).
     /// Body matches the Fact schema. Default no-op.
@@ -244,10 +223,6 @@ pub struct InMemoryOutput {
     pub job_creates: Vec<serde_json::Value>,
     /// Steps created via emit_step_json: (job_id, step_body).
     pub step_creates: Vec<(String, serde_json::Value)>,
-    /// Step updates: (job_id, step_id, new_status, metadata_update).
-    /// Populated by the shape-driven engine when a Step transitions
-    /// to `done`; tests assert on this to verify the emit path.
-    pub step_updates: Vec<(String, String, String, Option<serde_json::Value>)>,
     /// KB facts: (entity_kind, fact_body).
     pub facts: Vec<(String, serde_json::Value)>,
     /// Scheduled tech assignments (scheduled_assignments table).
@@ -471,54 +446,6 @@ impl SimOutput for InMemoryOutput {
         Ok(())
     }
 
-    fn emit_step_update(
-        &mut self,
-        job_id: &str,
-        step_id: &str,
-        new_status: &str,
-        metadata_update: Option<serde_json::Value>,
-        completed_by: Option<&str>,
-        signed_off_by: Option<&str>,
-    ) -> anyhow::Result<()> {
-        // InMemoryOutput captures the body for inspection in
-        // tests; bake completed_by + signed_off_by into the
-        // metadata snapshot so tests can assert the actor stamps
-        // without changing the tuple shape.
-        let mut snapshot: serde_json::Map<String, serde_json::Value> = match metadata_update {
-            Some(serde_json::Value::Object(m)) => m,
-            Some(v) => {
-                let mut m = serde_json::Map::new();
-                m.insert("_metadata".to_string(), v);
-                m
-            }
-            None => serde_json::Map::new(),
-        };
-        if let Some(by) = completed_by {
-            snapshot.insert(
-                "completed_by".to_string(),
-                serde_json::Value::String(by.to_string()),
-            );
-        }
-        if let Some(by) = signed_off_by {
-            snapshot.insert(
-                "signed_off_by".to_string(),
-                serde_json::Value::String(by.to_string()),
-            );
-        }
-        let metadata_with_actor = if snapshot.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(snapshot))
-        };
-        self.step_updates.push((
-            job_id.to_string(),
-            step_id.to_string(),
-            new_status.to_string(),
-            metadata_with_actor,
-        ));
-        Ok(())
-    }
-
     fn emit_fact(&mut self, entity_kind: &str, body: &serde_json::Value) -> anyhow::Result<()> {
         self.facts.push((entity_kind.to_string(), body.clone()));
         Ok(())
@@ -737,35 +664,7 @@ pub mod live {
         // streams above. Keyed by (asset_id, body).
         day_software_configs: Vec<(String, serde_json::Value)>,
         day_accessories: Vec<(String, serde_json::Value)>,
-        day_job_creates: Vec<serde_json::Value>,
         day_step_creates: Vec<(String, serde_json::Value)>, // (job_id, step_body)
-        // (step_id → step kind) cache for duration-based completion
-        // timing. Populated from emit_step_json so end_of_day's
-        // step_updates loop can look up each step's
-        // StepType.typical_duration_hours and compute completion
-        // sim_time = day-start + start_anchor + duration. Without
-        // the cache the loop falls back to uniform spread across
-        // the LA 06:00–22:00 business-day window. The cache survives
-        // across days because a step created on day N can complete
-        // on day N+M (rare in brewery but supported by the model).
-        step_kind_cache: std::collections::HashMap<String, String>,
-        // (step kind → (typical duration in hours, jitter factor))
-        // injected at LiveApiOutput construction via
-        // `with_step_durations` from the caller's StepRegistry.
-        // `jitter` is StepType.typical_duration_jitter (multi-
-        // plicative spread; 0.3 means ±30%). None = duration-based
-        // timing disabled, fall back to uniform spread.
-        step_durations: Option<std::collections::HashMap<String, (f64, f64)>>,
-        #[allow(clippy::type_complexity)]
-        // (job_id, step_id, status, metadata, completed_by, signed_off_by)
-        day_step_updates: Vec<(
-            String,
-            String,
-            String,
-            Option<serde_json::Value>,
-            Option<String>,
-            Option<String>,
-        )>,
         day_scheduled_assignments: Vec<ScheduledAssignmentSnapshot>,
         day_revenue_schedules: Vec<serde_json::Value>,
 
@@ -871,11 +770,7 @@ pub mod live {
                 day_account_contact_updates: Vec::new(),
                 day_software_configs: Vec::new(),
                 day_accessories: Vec::new(),
-                day_job_creates: Vec::new(),
                 day_step_creates: Vec::new(),
-                day_step_updates: Vec::new(),
-                step_kind_cache: std::collections::HashMap::new(),
-                step_durations: None,
                 day_scheduled_assignments: Vec::new(),
                 day_revenue_schedules: Vec::new(),
                 stats: LiveApiStats {
@@ -937,20 +832,6 @@ pub mod live {
             // chains (single processes, no per-Subject id), which then
             // contribute nothing to the distinct-actor count.
             api_activity::record(&self.api_activity, *kind, label, &endpoint, ok, actor_id);
-        }
-
-        /// Inject step durations (kind → hours) so end_of_day can
-        /// compute deterministic completion sim_times for each
-        /// step_update instead of falling back to uniform spread.
-        /// Sourced from the caller's StepRegistry. When unset,
-        /// step_updates fan out uniformly across the LA 06:00–22:00
-        /// business-day window.
-        pub fn with_step_durations(
-            mut self,
-            durations: std::collections::HashMap<String, (f64, f64)>,
-        ) -> Self {
-            self.step_durations = Some(durations);
-            self
         }
 
         /// Register a topic→endpoint route. Topics are matched by exact
@@ -1110,49 +991,13 @@ pub mod live {
             ok
         }
 
+        /// PUT signed as this output's own identity (`automation:sim`).
+        /// The per-employee `put_as` override went with the dead step
+        /// update flush, its only employee-signed caller (e39a9d2a);
+        /// the workforce signs its own calls as the employee.
         fn put(&mut self, path: &str, body: &serde_json::Value) -> bool {
-            self.put_as(path, body, None)
-        }
-        /// PUT with an optional per-call x-boss-user override. When
-        /// `as_employee_id` is Some, we synthesize a header for that
-        /// employee so the receiving service's policy gate fires
-        /// against THAT employee's role — not platform-admin. The
-        /// sim acts AS the simulated worker; bugs in policy
-        /// enforcement surface as 403s the sim would otherwise miss.
-        ///
-        /// The synthesized header carries id + role + department.
-        /// Receiving services that need the full ScopedActor (with
-        /// territory_account_ids etc.) fall back to the default
-        /// header path; for the step PUT path the id is what matters
-        /// for the is_automation check + body.completed_by override.
-        fn put_as(
-            &mut self,
-            path: &str,
-            body: &serde_json::Value,
-            as_employee_id: Option<&str>,
-        ) -> bool {
             let url = service_url(&self.api_base, path);
-            let mut req = self.client.put(&url).json(body);
-            if let Some(emp_id) = as_employee_id {
-                // The simulator masquerades as the employee whose work
-                // this step represents: `id = emp_id` so the server
-                // attributes the audit_log row to that person, `role =
-                // system-sim` to mark the actor as automation. Policy is
-                // not gated on this role — sim traffic is authorized by
-                // the sim-origin bypass (SimBypassPolicyClient) — so no
-                // per-role grant or superuser claim is needed here.
-                let actor = serde_json::json!({
-                    "id": emp_id,
-                    "role": "system-sim",
-                    "access_tier": "operator",
-                    "territory_account_ids": [],
-                    "direct_report_ids": [],
-                    "department": "platform",
-                })
-                .to_string();
-                req = req.header("x-boss-user", actor);
-                req = req.header("x-sim-origin", "true");
-            }
+            let req = self.client.put(&url).json(body);
             let ok = match req.send() {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
@@ -1334,37 +1179,8 @@ pub mod live {
         }
 
         fn emit_step_json(&mut self, job_id: &str, body: &serde_json::Value) -> anyhow::Result<()> {
-            // Cache (step_id → kind) so end_of_day can look up
-            // typical_duration_hours per step for completion timing.
-            if let (Some(id), Some(kind)) = (
-                body.get("id").and_then(|v| v.as_str()),
-                body.get("kind").and_then(|v| v.as_str()),
-            ) {
-                self.step_kind_cache
-                    .insert(id.to_string(), kind.to_string());
-            }
             self.day_step_creates
                 .push((job_id.to_string(), body.clone()));
-            Ok(())
-        }
-
-        fn emit_step_update(
-            &mut self,
-            job_id: &str,
-            step_id: &str,
-            new_status: &str,
-            metadata_update: Option<serde_json::Value>,
-            completed_by: Option<&str>,
-            signed_off_by: Option<&str>,
-        ) -> anyhow::Result<()> {
-            self.day_step_updates.push((
-                job_id.to_string(),
-                step_id.to_string(),
-                new_status.to_string(),
-                metadata_update,
-                completed_by.map(str::to_string),
-                signed_off_by.map(str::to_string),
-            ));
             Ok(())
         }
 
@@ -1673,39 +1489,11 @@ pub mod live {
                 }
             }
 
-            // --- Job creates (new Job-centric path) ---
-            //
-            // ?materialize_steps=false opts out of the API's
-            // auto-materialization. The engine then takes
-            // exclusive responsibility for step rows via its
-            // emit_step_create → POST /api/jobs/{id}/steps loop
-            // below. Without the opt-out every Job lands with 2×
-            // the spec's step count (auto-mat fresh UUIDs +
-            // engine deterministic UUIDs = duplicate sets).
-            // Spread job.created across LA 08:00–10:00 so ~700 jobs
-            // / day don't cluster at a single 08:00 anchor. Same
-            // insertion-ordered linear walk as step.creates above.
-            let job_creates: Vec<_> = self.day_job_creates.drain(..).collect();
-            let jobs_count = job_creates.len() as i64;
-            if jobs_count > 0 {
-                const JOB_START_SEC: i64 = 15 * 3600; // LA 08:00
-                const JOB_RANGE_SEC: i64 = 2 * 3600; // 2h window
-                let mut prev_sim_time = day_start + chrono::Duration::seconds(JOB_START_SEC);
-                for (i, body) in job_creates.iter().enumerate() {
-                    let offset = JOB_START_SEC + (i as i64) * JOB_RANGE_SEC / jobs_count;
-                    let target = day_start + chrono::Duration::seconds(offset);
-                    let sim_time = if target > prev_sim_time {
-                        target
-                    } else {
-                        prev_sim_time + chrono::Duration::microseconds(1)
-                    };
-                    prev_sim_time = sim_time;
-                    self.advance_clock_to_instant(sim_time);
-                    if self.post_individual("/api/jobs?materialize_steps=false", body) {
-                        self.stats.jobs += 1;
-                    }
-                }
-            }
+            // (No batched job creates: `emit_job_json` POSTs each Job
+            // synchronously, and the server materializes its steps. The
+            // batch flush that used `?materialize_steps=false` had no
+            // feed and was deleted when the API began refusing that
+            // parameter — afbf4f73.)
 
             // --- Step creates ---
             // Spread step.created across LA 08:00–10:00 (2-hour
@@ -1734,168 +1522,6 @@ pub mod live {
                     let path = format!("/api/jobs/{job_id}/steps");
                     self.post_individual(&path, body);
                 }
-            }
-
-            // --- Step updates ---
-            // Done-transitions stamp completed_on with the sim-day
-            // (`day` argument). Without this the API handler's
-            // PATCH semantics leave completed_on NULL, downstream
-            // dispatcher rule handlers read NULL → fall back to
-            // wall-clock NOW(), and every
-            // dependent projection (invoices.issued_on,
-            // gl_journal_entries.posted_on, shipments.created_on)
-            // collapses its date axis to the install date. Set
-            // signed_off_on too when the engine implies the
-            // completion is signed off — the runner uses it for
-            // ledger-period cutoffs.
-            //
-            // step_updates come out of the day's batch in insertion
-            // order (parent-tier before child-tier). We compute a
-            // monotonically-increasing sim_time per update, advance
-            // the clock to each target, then issue the PUT.
-            // boss-jobs-api stamps audit_log via its ClockClient —
-            // pulling the new instant within the 100ms TTL window —
-            // so each step.* audit row lands at a distinct
-            // time-of-day rather than all clustering at one instant.
-            //
-            // Insertion order preserved so parent step.completed
-            // always lands at an earlier sim_time than child
-            // step.in_progress (causal ordering matters for the
-            // rebuild path's prereq checks). The per-step duration
-            // distribution is computed below (duration-based mode).
-            let step_updates: Vec<_> = self.day_step_updates.drain(..).collect();
-            let count = step_updates.len() as i64;
-            // Two ordering modes, picked at construction:
-            //
-            // **Duration-based** — when `step_durations` is wired
-            // (caller passed a StepRegistry-derived map via
-            // with_step_durations),
-            // each step's completion sim_time = LA 08:00 +
-            // typical_duration_hours. A 30-min step finishes at
-            // 08:30; a 2h step at 10:00; an 8h step at 16:00.
-            // Reads as "short steps clear quickly in the
-            // morning, long steps land late afternoon." Falls
-            // back to uniform spread for step kinds not in the
-            // cache (Job opened before this output's step_kind
-            // cache was populated — rare, happens on cross-day
-            // step lifecycle).
-            //
-            // **Uniform-spread fallback** — N updates across
-            // LA 06:00–22:00 (16-hour business day). With ~300
-            // updates/day that's ~3 minutes between emits.
-            const FALLBACK_START_SEC: i64 = 13 * 3600; // LA 06:00
-            const FALLBACK_RANGE_SEC: i64 = 16 * 3600; // 16h business day
-            // LA 08:00 = UTC 15:00 in PDT — start-of-work anchor
-            // for duration-based completions. Durations are NOT
-            // capped: with spec-authored step durations a
-            // fermentation genuinely runs for days (up to 336h for
-            // a lager), and clamping it to end-of-business-day
-            // would re-manufacture the fermentation-in-one-workday
-            // fiction the spec durations exist to kill.
-            const DURATION_START_SEC: i64 = 15 * 3600;
-
-            // Walk step_updates in INSERTION order — the engine
-            // emits parent-tier transitions before child-tier and
-            // a step's lifecycle (completed → signed_off) in
-            // strict sequence. Sorting by duration broke
-            // causality (signing-off before completing → 409 on
-            // the API). We instead compute a duration-based
-            // sim_time per step and clamp it monotonically so the
-            // clock walks forward only. When a long-duration
-            // step is followed in insertion order by a short one,
-            // both share the long step's completion time + a
-            // microsecond bump — imperfect but causally correct.
-            // (The parked heap scheduler in `boss-sim/scheduler.rs` is
-            // the heap-with-causal-graph dispatch this clamp stands in
-            // for; see architecture-decisions.md §Simulator.)
-            let mut prev_sim_time = day_start + chrono::Duration::seconds(FALLBACK_START_SEC);
-            for (i, (job_id, step_id, status, metadata, completed_by, signed_off_by)) in
-                step_updates.iter().enumerate()
-            {
-                let target_offset_sec = match (
-                    self.step_durations.as_ref(),
-                    self.step_kind_cache.get(step_id),
-                ) {
-                    (Some(durations), Some(kind)) => match durations.get(kind) {
-                        Some(&(hours, jitter)) => {
-                            // Apply deterministic per-step jitter so
-                            // many steps of the same kind don't all
-                            // land at the exact same second. Hash
-                            // step_id (a UUID string, stable across
-                            // replays) into [0, 1), map to
-                            // [-jitter, +jitter], multiply hours.
-                            // Replays reproduce identical timestamps.
-                            let jittered_hours = if jitter > 0.0 {
-                                use std::collections::hash_map::DefaultHasher;
-                                use std::hash::{Hash, Hasher};
-                                let mut h = DefaultHasher::new();
-                                step_id.hash(&mut h);
-                                let unit = (h.finish() as f64) / (u64::MAX as f64);
-                                let factor = 1.0 + jitter * (unit * 2.0 - 1.0);
-                                hours * factor.max(0.05)
-                            } else {
-                                hours
-                            };
-                            DURATION_START_SEC + (jittered_hours * 3600.0) as i64
-                        }
-                        None => {
-                            if count > 0 {
-                                FALLBACK_START_SEC + (i as i64) * FALLBACK_RANGE_SEC / count
-                            } else {
-                                FALLBACK_START_SEC
-                            }
-                        }
-                    },
-                    _ => {
-                        if count > 0 {
-                            FALLBACK_START_SEC + (i as i64) * FALLBACK_RANGE_SEC / count
-                        } else {
-                            FALLBACK_START_SEC
-                        }
-                    }
-                };
-                let target = day_start + chrono::Duration::seconds(target_offset_sec);
-                // Monotonic clamp: never rewind the clock mid-flush.
-                let sim_time = if target > prev_sim_time {
-                    target
-                } else {
-                    prev_sim_time + chrono::Duration::microseconds(1)
-                };
-                prev_sim_time = sim_time;
-                self.advance_clock_to_instant(sim_time);
-
-                let path = format!("/api/jobs/{job_id}/steps/{step_id}");
-                let mut body = serde_json::json!({"status": status});
-                if let Some(meta) = metadata {
-                    body["metadata"] = meta.clone();
-                }
-                if status == "completed" {
-                    body["completed_on"] =
-                        serde_json::Value::String(day.format("%Y-%m-%d").to_string());
-                }
-                // Real-Employee actor stamp — boss-jobs-api's
-                // update_step honors `completed_by` as the
-                // audit_log _actor when the calling user is a
-                // system / automation identity (the brewery-sim).
-                if let Some(by) = completed_by {
-                    body["completed_by"] = serde_json::Value::String(by.clone());
-                }
-                // If the engine signed off this completion, include
-                // signed_off_by + signed_off_on so the API's
-                // PATCH-on-PUT flips both at once. Without this the
-                // Job projection sees status=completed with
-                // signed_off_by=NULL on a needs_sign_off step and
-                // keeps the Job in `pending-sign-off` forever.
-                if let Some(by) = signed_off_by {
-                    body["signed_off_by"] = serde_json::Value::String(by.clone());
-                    body["signed_off_on"] =
-                        serde_json::Value::String(day.format("%Y-%m-%d").to_string());
-                }
-                // Act AS the assigned employee. Policy fires
-                // against the employee's role, not platform-admin —
-                // bugs in policy enforcement surface as 403s here
-                // instead of silently passing in production.
-                self.put_as(&path, &body, completed_by.as_deref());
             }
 
             // --- Purchase orders (batch) ---
@@ -2138,10 +1764,10 @@ pub mod live {
             }
 
             // --- Scheduled assignments (individual POST per row) ---
-            // MUST run after `day_job_creates` above: the assignment
-            // carries a `target_job_id` that the scheduling service
-            // verifies via FK. Flushing Jobs first lets the Jobs row
-            // land before the assignment tries to reference it.
+            // The assignment carries a `target_job_id` that the
+            // scheduling service verifies via FK; the Jobs it names
+            // were POSTed synchronously by `emit_job_json`, so the row
+            // has landed before the assignment tries to reference it.
             let drained_assigns: Vec<_> = self.day_scheduled_assignments.drain(..).collect();
             for s in &drained_assigns {
                 let body = serde_json::json!({

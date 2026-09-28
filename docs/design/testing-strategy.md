@@ -35,7 +35,7 @@ formatting drift, syntax-level mistakes.
 
 **Mechanism:**
 - `cargo build --workspace` — every member compiles.
-- `cargo clippy --workspace --all-features --tests -- -D warnings`
+- `cargo clippy --workspace --all-features --all-targets -- -D warnings`
   — workspace clippy gate, denied warnings, includes test code.
   Workspace lint floor in `Cargo.toml` (`[workspace.lints]`)
   pins clippy::correctness + clippy::suspicious to deny so any
@@ -235,12 +235,13 @@ answer "yes" stops the search:
 
 ## What CI actually runs today
 
-`.forgejo/workflows/ci.yml` (the forge; the GitHub mirror is a backup
-of source and runs no CI of ours):
+`.forgejo/workflows/ci.yml` (the forge; the GitHub mirror runs
+`infra/gate.sh` in full on each publish PR via `.github/workflows/ci.yml`,
+backlog 2328c95e, and gates nothing):
 
 ```yaml
 - Apply schema (infra/postgres/migrate.sh — the schema/ manifest as an ordered migration list)
-- Clippy: cargo clippy --workspace --all-features --tests -- -D warnings
+- Clippy: cargo clippy --workspace --all-features --all-targets -- -D warnings
 - Test:   cargo test --all-features
 - Format: cargo fmt -- --check
 - Lint:   infra/lint/seed-bypass-smell.sh

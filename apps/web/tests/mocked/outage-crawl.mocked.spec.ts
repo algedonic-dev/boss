@@ -35,9 +35,10 @@
 // the list is the work. It is pinned in BOTH directions (see the two
 // tests at the bottom) so it can only shrink.
 
-import { test, expect, type Page, type Request } from '@playwright/test';
-import { SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
-import { FAILURE_MARKER, LANDING_FALLBACK, ROUTES } from './_routes';
+import { test, expect, type Page, type Request } from './_test';
+import { EMPLOYEE_DETAIL, SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
+import { FAILURE_MARKER, ROUTES } from './_routes';
+import { nextFrame } from './_helpers';
 
 /// The endpoints that stay up — SHELL_ENDPOINTS, defined beside the
 /// fixtures in _smokeMocks.ts since the interaction crawl's empty leg
@@ -62,47 +63,136 @@ const HEALTHY = SHELL_ENDPOINTS;
 /// surfaces that no longer need it. That is the half the packet's
 /// "ROUTES-style drift pin" was asking for: a roster that rots in either
 /// direction reds the gate.
+///
+/// 2026-09-24, sweep c3e4edcc: 28 entries → 12. Sixteen routes painted
+/// their failure in words without the marker (or, on /it/operate/audit,
+/// four such lines); each line now wears it, and the header above it
+/// states no count it does not have. What is left is either a read that
+/// never fires under the crawl's empty session or behind a click, or a
+/// page with no failure line at all (/ux/shop, /it/registry/new) — a
+/// different defect from a line without the marker.
+///
+/// 2026-09-26, backlog aaeb02d6: those two now name their failed reads,
+/// so no entry left is a page that swallows a read the crawl breaks —
+/// each is a read that never fires here, one HEALTHY keeps up, or no
+/// read at all.
 const SILENT: ReadonlyMap<string, string> = new Map([
-  ['/', 'home: /api/jobs/live + the sim-clock stream'],
-  ['/ux/me', 'My Day: /api/jobs/live; identity-keyed reads never fire under the empty mocked session'],
+  ['/', 'My Day (the bare alias): same as /ux/me'],
+  ['/ux/me', 'My Day: identity-keyed reads never fire under the empty mocked session (its two failure lines wear the marker)'],
   ['/ux/inbox', 'inbox: /api/messages/inbox/{id} never fires under the empty mocked session'],
-  ['/ux/views', 'views composer: /api/views'],
-  ['/ux/jobs', 'jobs list: /api/jobs + /api/workflows'],
-  ['/ux/accounts', 'accounts: /api/people/accounts, /api/assets, /api/commerce/invoices'],
-  ['/ux/vendors', 'vendors: /api/inventory/vendors, /orders, /vendor-invoices'],
-  ['/ux/people', 'people: roster reads /api/people, which HEALTHY keeps up — needs a per-read outage'],
-  ['/ux/assets', 'assets: /api/assets + /api/assets/summary'],
   ['/ux/calendar/me', 'my calendar: identity-keyed reads never fire under the empty mocked session'],
-  ['/ux/service', 'service: /api/jobs + /api/workflows'],
-  [LANDING_FALLBACK, 'the landing page (router catch-all): /api/workflows + /api/jobs/live'],
-  ['/ux/hr', 'HR: the workflow + step reads fire on the Workflows tab, not on load (see false-empty.mocked.spec.ts, which pins them)'],
-  ['/ux/sales', 'sales: /api/jobs + /api/workflows'],
-  ['/ux/shop', 'shop: /api/inventory/items + /api/workflows'],
-  ['/it/registry/subjects', 'subjects+classes: reads /api/subject-kinds + /api/classes, which HEALTHY keeps up'],
-  ['/it/registry/dispatcher', 'dispatcher cascade: /api/dispatcher/rules'],
-  ['/it/registry/rules', 'rules: /api/dispatcher/rules'],
-  ['/it/operate/perf', 'gateway perf: /api/gateway/perf'],
-  ['/it/operate/atlas', 'atlas: /api/views/stage-runs, /stage-durations, /api/stations'],
-  ['/it/registry/step-plugins', 'step plugins: /api/jobs/step-plugins'],
+  ['/ux/hr', 'HR: its one load-time read, /api/people, is a shell read HEALTHY keeps up (its /hr alias breaks it, in ALSO_BROKEN); the workflow + step reads fire on the Workflows tab (false-empty.mocked.spec.ts fails each one)'],
   ['/it/kb', 'KB: its search reads fire on a query, not on load'],
-  ['/it/design', 'design queue: /api/stations/design-review/queue'],
-  ['/it/registry', 'workflow registry: /api/workflows'],
-  ['/it/registry/new', 'new-workflow form: /api/workflows (a form, but it reads the registry to validate)'],
-  ['/it/registry/seasonal-release', 'workflow detail: /api/workflows/{kind} + /versions'],
-  ['/it/registry/policy', 'policy rules: /api/policy/rules'],
   ['/it/auth-admin', 'auth admin: its reads fire behind a tab'],
-  ['/it/operate/bottlenecks', 'bottlenecks: /api/workflows'],
-  ['/watchlist', 'watchlist: /api/people/accounts/risk-scores'],
-  ['/hr', 'HR (bare alias): same as /ux/hr'],
+  ['/ux/accounts/agreements/x', 'the not-found page (design ee3a3a2f): it names the unmatched path and makes no read of its own'],
 ]);
 
+/// PER-READ OUTAGES: a shell read that is also a route's OWN data, broken
+/// on that route alone (backlog 25ad5042). HEALTHY keeps /api/people up
+/// on every route, so /ux/people, whose one read IS /api/people, was
+/// crawled with its roster loaded and sat on SILENT, and nothing failed
+/// the read and asserted the page's roster-failure line. A regression
+/// to "No employees match those filters." would have passed every spec.
+/// Breaking it on the one route that owns it keeps the other 50 crawled
+/// with the shell they need. The shell no longer reads the roster at
+/// all — it reads the viewer's own row (backlog b4f68a65) — and the
+/// crawl's mocked session is unauthenticated anyway, so the shell still
+/// paints.
+///
+/// /ux/people/emp-001 (backlog 1a83fe98) reads its own record AND the
+/// roster, which feeds its reporting chain and team; both are its own
+/// data, so both fail there. It was crawled by nothing before, and only
+/// employee-page-roster-read.mocked.spec.ts said what it shows when a
+/// read fails.
+///
+/// /hr (page audit b959394e, c69e7455) reads /api/people on load — R1,
+/// its roster — and sat on SILENT with the reason "the workflow + step
+/// reads fire on the Workflows tab, not on load", which was untrue of
+/// R1: HEALTHY kept it up, so its "Couldn't load the roster" line was
+/// exercised by nothing. Broken here on the bare alias, and /ux/hr, the
+/// same page, stays on SILENT crawled with its roster up.
+///
+/// /it/registry/subjects (page audit 9f7ba57d, backlog d145e41d) reads
+/// /api/subject-kinds and then /api/classes for the kind it selects —
+/// both shell reads HEALTHY keeps up, so it sat on SILENT and neither
+/// failure line was asserted by anything. Its kinds read fails here, and
+/// the page must show its alert. Its classes read is not listed: it is
+/// only ever asked for once the kinds read has answered, so under this
+/// entry it never fires, and with the kinds read up the page's workflow
+/// count (a non-shell read, broken on every route) draws a marker of its
+/// own — a marker count here cannot tell a classes line from its absence.
+/// subjects-classes-page.mocked.spec.ts fails each of the three reads
+/// alone and pins each failure line by its words.
+const ALSO_BROKEN: ReadonlyMap<string, ReadonlyArray<RegExp>> = new Map([
+  ['/ux/people', [/\/api\/people$/]],
+  ['/ux/people/emp-001', [/\/api\/people$/]],
+  ['/hr', [/\/api\/people$/]],
+  ['/it/registry/subjects', [/\/api\/subject-kinds$/]],
+]);
+
+/// ROUTES CRAWLED SIGNED IN (backlog daba5702, page audit d2e86594). The
+/// crawl's session probe answers `{}` — nobody — so a page whose reads
+/// wait for a viewer issues none of them here, and sat on SILENT for that
+/// reason alone. On these routes the probe names the fixture operator and
+/// that operator's people row stays up, so the session resolves and the
+/// page's own reads fire into the outage like any other route's.
+/// /ux/views was the first: its list read waits for a viewer.
+const SIGNED_IN: ReadonlySet<string> = new Set(['/ux/views']);
+const SIGNED_IN_PROBE = { username: 'ceo', employee_id: 'emp-001', role: 'ceo' };
+
+/// How late a route's OWN read is issued — the manual-page fix's figure
+/// (0eda772f), three times the quiet window the crawl used to settle on.
+const LATE_READ_MS = 750;
+
+/// A ROUTE'S OWN READ, ISSUED LATE on purpose (backlog 6592caf7). The
+/// crawl redded gate 59ed3414 on /ux/people with no marker, and passed on
+/// a re-gate of the same sha: the page asks for /api/people from an
+/// $effect after mount, and under load the shell's reads can all answer
+/// and sit quiet for longer than the old 250 ms window before that
+/// request is even made — so the crawl counted a page whose read had not
+/// been asked for yet. Holding each ALSO_BROKEN read back before it
+/// leaves the page makes that the ordinary case, so a crawl that counts
+/// before the route's own read fails every run, not one in a busy hour.
+async function issueOwnReadsLate(page: Page): Promise<void> {
+  const late = [...ALSO_BROKEN].map(([path, reads]) => ({
+    path,
+    reads: reads.map((re) => re.source),
+  }));
+  await page.addInitScript(
+    ({ late, ms }) => {
+      const mine = late.find((l) => l.path === location.pathname);
+      if (!mine) return;
+      const reads = mine.reads.map((s) => new RegExp(s));
+      const real = window.fetch.bind(window);
+      window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        const path = new URL(url, location.href).pathname;
+        if (reads.some((re) => re.test(path))) await new Promise((ok) => setTimeout(ok, ms));
+        return real(input, init);
+      }) as typeof fetch; // bun-types adds `preconnect` to fetch; the browser this runs in has none.
+    },
+    { late, ms: LATE_READ_MS },
+  );
+}
+
 /// Force the outage. Runs AFTER installSmokeMocks, so it takes
-/// precedence, and falls back to the healthy fixtures for HEALTHY.
-async function installOutage(page: Page): Promise<void> {
+/// precedence, and falls back to the healthy fixtures for HEALTHY —
+/// except the reads ALSO_BROKEN names for the route being crawled, which
+/// `current` answers at the moment each request is made.
+async function installOutage(page: Page, current: () => string): Promise<void> {
   await installSmokeMocks(page);
+  await issueOwnReadsLate(page);
   await page.route('**/api/**', async (route) => {
     const url = route.request().url();
-    if (HEALTHY.some((re) => re.test(url))) return route.fallback();
+    if (SIGNED_IN.has(current())) {
+      if (/\/api\/session$/.test(url)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(SIGNED_IN_PROBE) });
+      }
+      if (EMPLOYEE_DETAIL.test(url)) return route.fallback();
+    }
+    const broken = ALSO_BROKEN.get(current()) ?? [];
+    const healthy = HEALTHY.some((re) => re.test(url)) && !broken.some((re) => re.test(url));
+    if (healthy) return route.fallback();
     return route.fulfill({
       status: 500,
       contentType: 'application/json',
@@ -111,7 +201,14 @@ async function installOutage(page: Page): Promise<void> {
   });
 }
 
-type Seen = { route: string; markers: number; shell: boolean };
+/// `bare` is every marker on the route NOT drawn as the failed read's red
+/// rail (backlog 6f471ff6, car 3), as its computed left edge — so a page
+/// whose own class takes the rail back is named here, by route.
+type Seen = { route: string; markers: number; shell: boolean; bare: string[] };
+
+/// The rail as a browser computes it: 8px of the troubled plate's red
+/// (#C8283D, --troubled).
+const RAIL = '8px solid rgb(200, 40, 61)';
 
 /// THE READS A ROUTE FIRES, OBSERVED (backlog e6bc776b). The crawl used
 /// to give a painted shell a flat 700 ms for "onMount effects and the
@@ -153,9 +250,6 @@ const QUIET_MS = 250;
 /// has not run. Bounded so a genuinely read-free route costs this much
 /// and not the whole budget.
 const FIRST_READ_MS = 2_000;
-/// The last answer lands in JS; the render it causes is the next frame.
-const PAINT_MS = 100;
-
 async function settle(page: Page, reads: Reads): Promise<void> {
   const start = Date.now();
   const deadline = start + SETTLE_BUDGET_MS;
@@ -165,35 +259,73 @@ async function settle(page: Page, reads: Reads): Promise<void> {
     if (reads.inFlight.size > 0 || !started) quietSince = 0;
     else if (quietSince === 0) quietSince = Date.now();
     else if (Date.now() - quietSince >= QUIET_MS) break;
+    // short on purpose: the loop's poll interval — QUIET_MS above is the window, this only paces the reads of it
     await page.waitForTimeout(25);
   }
-  await page.waitForTimeout(PAINT_MS);
+  // The last answer lands in JS; the render it causes is the next frame —
+  // waited for as a frame, not as the 100 ms it was until backlog 840c5a76.
+  await nextFrame(page);
 }
+
+/// WHAT A QUIET WINDOW CANNOT SEE (backlog 6592caf7). settle() leaves
+/// once the reads ISSUED so far have answered and nothing new has left
+/// for QUIET_MS. A read the page has not asked for yet is invisible to
+/// it: /ux/people asks for its roster from an $effect after mount, and on
+/// gate 59ed3414 the shell's own reads answered and sat quiet for longer
+/// than the window before that request was made, so the crawl counted a
+/// page mid-mount and named it mute. So the crawl that ASSERTS a marker
+/// waits for one first — the page's rendered answer, under the same
+/// budget — and only then settles for the rest. A page that never draws
+/// one still counts zero and is still named, one budget later; only the
+/// page that had not drawn it YET stops being reported as a falsehood.
+/// The SILENT crawl cannot wait on a marker it expects not to see, and
+/// its miss is the opposite direction — a fixed page counted before its
+/// marker renders stays on the list one more run, which reds nothing.
+type Await = 'marker' | 'quiet';
 
 /// One shared page, one navigation per route — same rationale as
 /// route-smoke: the browser keeps the on-the-fly bundle warm, and a full
 /// goto wipes the previous route's JS state, so there is no effect bleed.
-async function crawl(page: Page, routes: ReadonlyArray<string>): Promise<Seen[]> {
-  await installOutage(page);
+async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): Promise<Seen[]> {
+  let current = '';
+  await installOutage(page, () => current);
   const reads = watchReads(page);
   const seen: Seen[] = [];
   for (const route of routes) {
+    current = route;
     let shell = false;
     for (let attempt = 1; attempt <= 2 && !shell; attempt++) {
       try {
         reads.inFlight.clear();
         reads.issued = 0;
-        await page.goto(route, { waitUntil: 'commit', timeout: 20_000 });
+        await page.goto(route, { waitUntil: 'commit' });
         await expect(page.locator('.app-shell')).toBeVisible({ timeout: 20_000 });
         shell = true;
       } catch {
         // Recorded as shell:false below if the retry also misses.
       }
     }
+    // The asserted crawl waits for the page's own answer first; a miss is
+    // not thrown here but counted below, so the failure names the route.
+    if (shell && until === 'marker') {
+      await page
+        .locator(FAILURE_MARKER)
+        .first()
+        .waitFor({ state: 'attached', timeout: SETTLE_BUDGET_MS })
+        .catch(() => undefined);
+    }
     // Let onMount's reads be ANSWERED and the failure branch render.
     if (shell) await settle(page, reads);
     const markers = shell ? await page.locator(FAILURE_MARKER).count() : 0;
-    seen.push({ route, markers, shell });
+    const edges = shell
+      ? await page.locator(FAILURE_MARKER).evaluateAll((els) =>
+          els.map((e) => {
+            const s = getComputedStyle(e);
+            return `${s.borderLeftWidth} ${s.borderLeftStyle} ${s.borderLeftColor}`;
+          }),
+        )
+      : [];
+    seen.push({ route, markers, shell, bare: edges.filter((e) => e !== RAIL) });
   }
   return seen;
 }
@@ -202,7 +334,7 @@ test.describe('the outage crawl — a surface cannot render a falsehood', () => 
   test('every asserted surface says a read failed when every read fails', async ({ page }) => {
     test.setTimeout(600_000);
     const asserted = ROUTES.filter((r) => !SILENT.has(r));
-    const seen = await crawl(page, asserted);
+    const seen = await crawl(page, asserted, 'marker');
 
     const mute = seen.filter((s) => s.markers === 0);
     expect(
@@ -212,12 +344,22 @@ test.describe('the outage crawl — a surface cannot render a falsehood', () => 
         `they do not know. Render the failure (the branch, not a lint: see ` +
         `src/data/remote.ts), or move the route to SILENT with what it reads.`,
     ).toEqual([]);
+
+    // What it SAYS it in: the failed read is a red rail on every page that
+    // names the marker, because the marker's own rule draws it — a failure
+    // set as red words on an empty's line reads as an empty.
+    const bare = seen.filter((s) => s.bare.length > 0);
+    expect(
+      bare.map((s) => `${s.route}: ${s.bare.join(', ')}`).sort(),
+      `These surfaces show ${FAILURE_MARKER} without the ${RAIL} rail — ` +
+        `a page rule outranks the marker's (styles.css, the failed read).`,
+    ).toEqual([]);
   });
 
   test('no surface on the SILENT list has quietly started reporting its failures', async ({ page }) => {
     test.setTimeout(600_000);
     const silent = ROUTES.filter((r) => SILENT.has(r));
-    const seen = await crawl(page, silent);
+    const seen = await crawl(page, silent, 'quiet');
 
     const fixed = seen.filter((s) => s.markers > 0);
     expect(
@@ -237,6 +379,28 @@ test.describe('the outage crawl — a surface cannot render a falsehood', () => 
       ghosts,
       'an excuse for a route no crawl visits reads as "known debt" while ' +
         'covering nothing — drop it, or fix the path',
+    ).toEqual([]);
+  });
+
+  test('every signed-in route is a crawled, asserted route', async () => {
+    const crawled = new Set(ROUTES);
+    const idle = [...SIGNED_IN].filter((r) => !crawled.has(r) || SILENT.has(r)).sort();
+    expect(
+      idle,
+      'a signed-in session on a route no crawl visits, or on a SILENT one the ' +
+        'first test never asserts, signs in for nothing — drop it, fix the ' +
+        'path, or take the route off SILENT',
+    ).toEqual([]);
+  });
+
+  test('every per-read outage breaks a crawled, asserted route', async () => {
+    const crawled = new Set(ROUTES);
+    const idle = [...ALSO_BROKEN.keys()].filter((r) => !crawled.has(r) || SILENT.has(r)).sort();
+    expect(
+      idle,
+      'a per-read outage on a route no crawl visits, or on a SILENT one the ' +
+        'first test never asserts, breaks a read and checks nothing — drop ' +
+        'it, fix the path, or take the route off SILENT',
     ).toEqual([]);
   });
 });

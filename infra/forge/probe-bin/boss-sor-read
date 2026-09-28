@@ -131,6 +131,28 @@ esac
 
 base="${BOSS_JOBS_URL%/}"
 
+# A LIST READ ASKS FOR THE WHOLE STEP (backlog 9b473d4a). The job list
+# serves each step without its `metadata` and `fields` when the read
+# says `full=false`, and by default once that flips — 200 rows were
+# 3.6 MB, most of it step metadata, and
+# truncated a reader twice. A probe is program text frozen on its car,
+# and probes recorded before that change read a listed step's metadata
+# (`[.steps[] | select(.spec_slug == "execute") | .metadata.exit_code]`
+# on cars f3b1b9a2, bf800cc1, b8c4267f, measured 2026-09-27): read slim,
+# each would judge an absent key — not yet forever, or a false FAILED.
+# So this door asks for the shape they were written against, unless the
+# probe names `full` itself. Only the collection read: `/api/jobs/…` is
+# one packet, already whole.
+case "$path" in
+    /api/jobs) path="/api/jobs?full=true" ;;
+    /api/jobs\?*)
+        case "$path" in
+            *'?full='* | *'&full='*) ;;
+            *) path="${path}&full=true" ;;
+        esac
+        ;;
+esac
+
 # The service a path belongs to, by the one route table both doors
 # share. readlink -f: the runner puts this DIRECTORY on the probe's
 # PATH, and the table sits beside the file.

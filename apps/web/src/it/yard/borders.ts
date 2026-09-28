@@ -8,11 +8,12 @@
 // half of the read that answers all three.
 //
 // NOTHING HERE DERIVES A JUDGEMENT. The rate, the queue, each hold's
-// reason, the machine's silence and the border's clear/busy/troubled
+// reason, the machine's silence and the border's clear/attention/troubled
 // state are all the server's (boss_jobs::borders); this module parses
 // them ONCE and turns them into words. The only thing it decides is how
-// THICK to draw a rail (`densityOf`), which is presentation — the
-// number itself is always printed beside it.
+// to DRAW a rail — how wide (`railWidth`) and at what pace its traffic
+// runs (`densityOf`) — which is presentation: the number itself is
+// always printed beside it.
 //
 // AND THE RULE UNDER ALL OF IT: a border whose flow the server could
 // not compute renders as UNKNOWN, never as zero. `waiting: null` prints
@@ -53,10 +54,27 @@ export type Border = Readonly<{
   /** `null` when the read that would answer it failed — never 0. */
   waiting: number | null;
   holds: ReadonlyArray<Hold>;
+  /** Every waiting packet, by whom it waits on — summing to `waiting`,
+   *  `null` exactly when `waiting` is (car M1, design 31bade8f decision
+   *  8). The pile on the moving map is shaded off this, never off the
+   *  holds' words. */
+  holds_by_class: HoldsByClass | null;
+  /** Is work crossing this rail — the SERVER's judgement from the
+   *  rail's own mean gap. `null` is "cannot tell", never either answer. */
+  flowing: boolean | null;
+  /** RFC3339: the record's last crossing when `flowing` is false — what
+   *  a "held for" clock counts from. `null` while flowing, and when
+   *  nothing crossed in the whole read. */
+  held_since: string | null;
+  /** The rule `flowing` was judged by, in words. */
+  flowing_why: string;
   machine: Machine;
   state: RegionState;
   why: string;
 }>;
+
+/** Whom a border's waiting packets wait on (`boss_jobs::borders::HoldsByClass`). */
+export type HoldsByClass = Readonly<{ machine: number; person: number; unknown: number; stuck: number }>;
 
 export type Borders = Readonly<{
   window_hours: number;
@@ -64,7 +82,7 @@ export type Borders = Readonly<{
   now: string;
 }>;
 
-const STATES: ReadonlyArray<RegionState> = ['clear', 'busy', 'troubled'];
+const STATES: ReadonlyArray<RegionState> = ['clear', 'attention', 'troubled'];
 
 function asObject(raw: unknown, where: string): Record<string, unknown> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -103,6 +121,16 @@ function parseMachine(raw: unknown): Machine {
   };
 }
 
+/** The classes, or null — for a missing block, and for one with any
+ *  class that is not a count: a half-read pile is not shaded. */
+function parseClasses(raw: unknown): HoldsByClass | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const [machine, person, unknown, stuck] = [o.machine, o.person, o.unknown, o.stuck].map(numberOrNull);
+  if (machine == null || person == null || unknown == null || stuck == null) return null;
+  return { machine, person, unknown, stuck };
+}
+
 function parseBorder(raw: unknown): Border {
   const o = asObject(raw, 'border');
   const state = String(o.state ?? '');
@@ -121,6 +149,10 @@ function parseBorder(raw: unknown): Border {
       const held = asObject(h, 'hold');
       return { what: String(held.what ?? ''), why: String(held.why ?? '') };
     }),
+    holds_by_class: parseClasses(o.holds_by_class),
+    flowing: boolOrNull(o.flowing),
+    held_since: stringOrNull(o.held_since),
+    flowing_why: String(o.flowing_why ?? ''),
     machine: parseMachine(o.machine),
     state: state as RegionState,
     why: String(o.why ?? ''),
@@ -184,10 +216,59 @@ export function waitingText(b: Border): string {
  *  and `boss orient` branch on the same fact rather than on a phrase
  *  copied between them. */
 export function machineText(m: Machine): string {
-  if (m.kind === 'actors') return `${m.name} · worked by actors`;
-  if (m.silent === true) return `${m.name} · SILENT ${m.silent_for_minutes ?? '?'}m`;
-  if (m.silent_for_minutes !== null) return `${m.name} · fired ${m.silent_for_minutes}m ago`;
-  return `${m.name} · no firing recorded`;
+  return `${m.name} · ${machineStatus(m)}`;
+}
+
+/** The status half of `machineText`, alone — the line the rail writes
+ *  under the machine's name, beside its lamp (design 62de32ae decision
+ *  6: the machine's name and lamp written ON the rail). */
+export function machineStatus(m: Machine): string {
+  if (m.kind === 'actors') return 'worked by actors';
+  if (m.silent === true) return `SILENT ${m.silent_for_minutes ?? '?'}m`;
+  if (m.silent_for_minutes !== null) return `fired ${m.silent_for_minutes}m ago`;
+  return 'no firing recorded';
+}
+
+/** The widest a rail draws, in world units. */
+export const RAIL_MAX_WIDTH = 8;
+
+/** How WIDE the rail draws (design 62de32ae decision 6: rail width
+ *  follows rate). PRESENTATION ONLY — the rate is printed beside it.
+ *  Logarithmic, because the live rates span three orders (a few
+ *  arrivals a day beside hundreds of intakes) and a linear width would
+ *  draw every rail but one as a hairline. An empty rail is a hairline;
+ *  an UNMEASURED one is drawn at a thin measured width in the dotted
+ *  `unknown` band, so it can never read as the empty one. */
+export function railWidth(perDay: number | null): number {
+  if (perDay === null) return 2;
+  if (perDay <= 0) return 1.5;
+  return Math.min(RAIL_MAX_WIDTH, 2 + 2 * Math.log10(1 + perDay));
+}
+
+/** When the rail last crossed, in the stack's own clock (UTC — the
+ *  whole estate runs on it, so the panel says so rather than guessing
+ *  a reader's zone), and how long before the read that was. A read
+ *  that carried no `now` gets the stamp alone: an age measured against
+ *  a clock nobody sent is not an age. */
+export function crossedText(b: Border, now: string): string {
+  if (b.last_crossed === null) return 'nothing crossed in the two windows read';
+  const at = new Date(b.last_crossed);
+  if (Number.isNaN(at.getTime())) return b.last_crossed;
+  const stamp = `${at.toISOString().slice(0, 10)} ${at.toISOString().slice(11, 16)} UTC`;
+  const read = new Date(now);
+  if (now === '' || Number.isNaN(read.getTime())) return stamp;
+  const minutes = Math.max(0, Math.floor((read.getTime() - at.getTime()) / 60_000));
+  const ago = minutes < 60 ? `${minutes}m` : minutes < 48 * 60 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 1440)}d`;
+  return `${stamp} · ${ago} ago`;
+}
+
+/** What waits that the holds list does not name: the server bounds the
+ *  LIST (`MAX_HOLDS`), never the count, so a panel that showed only the
+ *  list would under-report the queue. */
+export function unlistedText(b: Border): string {
+  if (b.waiting === null) return '';
+  const more = b.waiting - b.holds.length;
+  return more > 0 ? `+${more} more waiting, not listed` : '';
 }
 
 /** How thick the rail draws. PRESENTATION ONLY — the rate itself is
@@ -202,27 +283,4 @@ export function densityOf(perDay: number | null): Density {
   if (perDay < 4) return 'light';
   if (perDay < 20) return 'steady';
   return 'heavy';
-}
-
-/** The whole map's activity in one line — the summary the high-level
- *  view bubbles up: how much crossed the world this window, what is
- *  standing, and which rails are troubled (named, because a verdict
- *  must name what it is about). A border the server could not read is
- *  COUNTED AS UNREAD rather than left out of the total, so the line
- *  cannot quietly under-report. */
-export function summaryLine(borders: Borders): string {
-  const rows = borders.borders;
-  const unread = rows.filter((b) => b.rate.current === null || b.waiting === null);
-  const crossings = rows.reduce((n, b) => n + b.rate.samples, 0);
-  const waiting = rows.reduce((n, b) => n + (b.waiting ?? 0), 0);
-  const troubled = rows.filter((b) => b.state === 'troubled').map((b) => `${b.from} → ${b.to}`);
-  const parts = [
-    `${crossings} ${crossings === 1 ? 'crossing' : 'crossings'} in ${borders.window_hours}h`,
-    `${waiting} waiting at the borders`,
-  ];
-  if (unread.length > 0) {
-    parts.push(`${unread.length} ${unread.length === 1 ? 'border unread' : 'borders unread'}`);
-  }
-  if (troubled.length > 0) parts.push(`troubled: ${troubled.join(', ')}`);
-  return parts.join(' · ');
 }

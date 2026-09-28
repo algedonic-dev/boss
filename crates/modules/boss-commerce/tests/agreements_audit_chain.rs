@@ -38,7 +38,12 @@ fn build_app(pool: PgPool) -> Router {
     // and the event records on the outbox — deliberately NO direct
     // audit writer, so this test only passes through the real
     // outbox → relay → audit_log path.
-    agreements_router(pool, None, Arc::new(boss_clock_client::WallClockClient))
+    agreements_router(
+        pool,
+        None,
+        Arc::new(boss_clock_client::WallClockClient),
+        Arc::new(boss_policy_client::PermissivePolicyClient),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]

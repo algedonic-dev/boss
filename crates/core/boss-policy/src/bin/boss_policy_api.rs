@@ -1,6 +1,6 @@
 //! boss-policy-api — row-level authorization service.
 //!
-//! Serves check / my-scope / admin endpoints over the PolicyRepository.
+//! Serves check / admin endpoints over the PolicyRepository.
 //! On startup, seeds DEFAULT_RULES (per D8) — idempotent, operator
 //! edits survive restarts.
 //!
@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         }
     };
     info!(%bind, "boss-policy-api listening (postgres-backed)");
+    let app = boss_core::machine_gate::mount(app, "policy", &["/api/policy/health"]);
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -15,7 +15,8 @@
 // button — in that order; every option naming the step it opens; the
 // button naming the route; the missing field named in the row.
 
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route } from './_test';
+import { servePeopleRows } from './_smokeMocks';
 
 const JOB_ID = '6f58e9a1-0000-4000-8000-000000000001';
 const STEP_ID = '19b29853-0000-4000-8000-000000000002';
@@ -81,8 +82,11 @@ const JOB = {
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
 
-async function mocks(page: Page): Promise<Record<string, unknown>[]> {
+async function mocks(
+  page: Page,
+): Promise<{ puts: Record<string, unknown>[]; merges: Record<string, unknown>[] }> {
   const puts: Record<string, unknown>[] = [];
+  const merges: Record<string, unknown>[] = [];
   await page.addInitScript(() => {
     setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
   });
@@ -90,6 +94,7 @@ async function mocks(page: Page): Promise<Record<string, unknown>[]> {
   // order, so later, more specific routes win over this one.
   await page.route('**/api/**', (r) => json(r, { data: [], total: 0 }));
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: EMP.role }));
   await page.route(/\/api\/jobs\/step-types$/, (r) =>
@@ -104,7 +109,13 @@ async function mocks(page: Page): Promise<Record<string, unknown>[]> {
     }
     return json(r, STEP);
   });
-  return puts;
+  // The step merge door — the answered fields land here, before the
+  // status-only PUT (backlog e39a9d2a).
+  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/${STEP_ID}/metadata$`), (r) => {
+    merges.push(JSON.parse(r.request().postData() ?? '{}') as Record<string, unknown>);
+    return json(r, STEP);
+  });
+  return { puts, merges };
 }
 
 test('title, brief, form, button — in that order, with nothing between', async ({ page }) => {
@@ -140,7 +151,7 @@ test('every option names the step it opens, read off the Workflow graph', async 
 });
 
 test('the button names the route and the missing field, and completes from ready', async ({ page }) => {
-  const puts = await mocks(page);
+  const { puts, merges } = await mocks(page);
   await page.goto(`/ux/jobs/${JOB_ID}`);
   const ask = page.locator('.step-ask');
   const complete = ask.getByRole('button', { name: /^Complete/ });
@@ -161,10 +172,17 @@ test('the button names the route and the missing field, and completes from ready
   await complete.click();
 
   await expect.poll(() => puts.length).toBe(1);
-  const sent = puts[0] as { status: string; metadata: Record<string, unknown> };
+  const sent = puts[0] as { status: string; metadata?: unknown };
   expect(sent.status).toBe('completed');
-  expect(sent.metadata['disposition']).toBe('build');
-  expect(sent.metadata['evidence']).toBe('option b');
-  expect(sent.metadata['authority_role']).toBe('platform-admin');
-  expect(sent.metadata['context_md']).toBe(BRIEF);
+  expect(sent.metadata).toBeUndefined();
+  expect(merges.length).toBe(1);
+  const merged = merges[0]!;
+  expect(merged['disposition']).toBe('build');
+  expect(merged['evidence']).toBe('option b');
+  // A key the surface does not own is not re-sent: the merge leaves it
+  // on the row as stored, where a wholesale PUT had to carry it back.
+  // (`context_md` IS a declared field, so the form owns it and sends
+  // its value, unchanged.)
+  expect('authority_role' in merged).toBe(false);
+  expect(merged['context_md']).toBe(BRIEF);
 });

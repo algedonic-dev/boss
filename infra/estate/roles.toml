@@ -79,14 +79,12 @@ units = []
 # alone forgetting it.
 units = []
 
-[roles.legacy-stack]
-# The chores that maintained the second, older stack's data — retired
-# with it on 2026-09-15 (ops-request 7912c9ae) and uninstalled from
-# boss-gcp by the uninstall-not-in-role verb. The host backup and the
-# deploy-confirm dead-man left this list with the bare-metal deploy path
-# (2026-09-18): the cluster's boss-pg-backup CronJob is the backup, and
-# the conservation sweep's units were deleted the same day once its
-# CronJob existed (H12, backlog 236529aa). Each chore here has a cluster
-# CronJob twin that is the one that runs.
-# This role exists to be removed.
-units = ["boss-messages-events-purge", "boss-audit-integrity-check", "boss-ledger-recognize", "boss-ledger-replay-check", "boss-files-gc", "boss-views-catchup", "boss-search-reindex"]
+# No [roles.legacy-stack]. It named the seven chores that maintained the
+# second, older stack's data; the stack was retired on 2026-09-15
+# (ops-request 7912c9ae), the chores were uninstalled from boss-gcp by
+# the uninstall-not-in-role verb, each has a cluster CronJob twin that
+# is the one that runs, and 0 of 7 nodes held the role on 2026-09-27.
+# The section and the `node`/`legacy-stack` Class were retired together
+# (backlog 0f9a7a47) — the Class through the registry's evented door,
+# not a migration. infra/gcp/second-stack-units.txt remains the record of
+# what the retire verb stopped.

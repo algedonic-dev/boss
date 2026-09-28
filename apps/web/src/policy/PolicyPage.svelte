@@ -31,7 +31,10 @@
     loading = true;
     try {
       const r = await fetch('/api/policy/rules');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      // The service's reason rides the refusal (F5 of the review behind
+      // backlog 5763e52e): a bare status sent the reader to re-derive
+      // what the policy service had already said.
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
       rules = (await r.json()) as PolicyRule[];
       error = null;
     } catch (e) {
@@ -71,11 +74,16 @@
   <PageHeader
     eyebrow="Platform · Policy"
     title="Policy rules"
-    subtitle={`${rules.length} active rules · ${roles.length} roles`}
+    subtitle={error
+      ? // "0 active rules · 0 roles" above the failure line read as an
+        // empty policy (sweep c3e4edcc). The counts are unknown.
+        'Rule count unknown — the policy read failed'
+      : `${rules.length} active rules · ${roles.length} roles`}
   />
 
   {#if error}
-    <p class="empty" style="color:#dc2626">Failed to load rules: {error}</p>
+    <!-- The shared failure marker (sweep c3e4edcc). -->
+    <p class="empty load-failed" role="alert" style="margin:0 24px">Failed to load rules: {error}</p>
   {/if}
 
   <div style="padding:0 24px 16px; display:flex; gap:12px; align-items:center">
@@ -87,7 +95,7 @@
         {/each}
       </select>
     </label>
-    <button type="button" class="wb-btn" onclick={load} disabled={loading}>
+    <button type="button" class="btn" onclick={load} disabled={loading}>
       {loading ? 'Loading…' : 'Refresh'}
     </button>
   </div>
@@ -112,14 +120,14 @@
                   {#if rule}
                     <button
                       type="button"
-                      class="wb-btn"
+                      class="btn"
                       style="padding:2px 8px; font-size:12px"
                       onclick={() => (editing = rule)}
                     >
                       {scopeForDisplay(rule.scope)}
                     </button>
                   {:else}
-                    <span style="color:#888; font-size:12px">—</span>
+                    <span style="color:var(--static); font-size:12px">—</span>
                   {/if}
                 </td>
               {/each}

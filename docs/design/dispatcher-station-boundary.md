@@ -1,6 +1,9 @@
 # The dispatcher/station boundary
 
-**Status**: living
+**Status**: living — the rule is also recorded in
+`docs/architecture-decisions.md` §Dispatcher (folded 2026-09-27,
+`doc-flatten` packet c98e5183), with the two violations re-measured
+there; this page stays as the one to cite in review.
 
 Decided by David on packet 194db591 (*Review how the dispatcher and
 the queue layer divide matchmaking*), accepted 2026-08-19. This page

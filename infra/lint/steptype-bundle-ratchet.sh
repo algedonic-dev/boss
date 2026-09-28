@@ -50,7 +50,11 @@
 #   - an existing field may not be REMOVED (the UNION validator stops
 #     requiring it, other consumers — sim faker, surfaces — stop
 #     seeing it; removal is a contract change that belongs behind the
-#     versioned path, not a restart).
+#     versioned path, not a restart);
+#   - a kind may leave ONLY with a row in steptype-retired-kinds.txt
+#     naming it, the car that retires it, and an in-flight count
+#     measured at 0 (backlog adaecf05) — and never while it declares a
+#     required field (loosen it first, which is legal, then retire it).
 # A brand-new kind may declare anything: nothing in flight carries it.
 # required -> optional stays legal — loosening strands nobody.
 #
@@ -175,24 +179,66 @@ enum_widens() {
     return 0
 }
 
+# A KIND LEAVES THE BUNDLE ONLY AS A RECORDED ACT (backlog adaecf05).
+# Car 5 of a8991c86 (2026-09-24, the `marketing-launch` retirement,
+# design 2ea444f5) let any kind that declared no required field leave,
+# on the reasoning that an unknown kind validates permissively — and
+# left "is anything still in flight?" to the car, which nothing asked
+# it to record. 17 kinds on the 2026-09-26 bundle require nothing,
+# `task`, `outcome`, `trigger` and `sign-off` among them (1670 `outcome`,
+# 1246 `task`, 37 `sign-off` steps in flight that day), and the
+# dispatcher reads an unknown kind as decision-shaped: one deleted block
+# would have routed every one of those steps to a person, green.
+#
+# So a kind on the trunk and absent here needs a row in RETIRED, read at
+# HEAD: `kind car in_flight measured_at`, whitespace-separated, with
+# in_flight exactly 0. The tree cannot see the live registry, so the
+# measurement is the car's — but it is now WRITTEN, beside the car that
+# made it, where the next reader of the removal can check it. A kind
+# that declared a required field is refused with or without a row
+# (below): a rule or surface reading its done metadata was promised that
+# field. Loosening it to optional is legal on its own; retire it in a
+# later car. An absent RETIRED file is no rows, which refuses every
+# removal — the safe direction for a record that could not be read.
+RETIRED="infra/lint/steptype-retired-kinds.txt"
+retired_rows=""
+[ -f "$RETIRED" ] && retired_rows=$(grep -v '^[[:space:]]*\(#\|$\)' "$RETIRED" || true)
+retired_row() { awk -v k="$1" '$1 == k { print; exit }' <<< "$retired_rows"; }
+required_kinds=$(awk -F'\t' '$3 != "KIND" && $4 == "true" { print $1 }' <<< "$base_rows" | sort -u)
+
 while IFS=$'\t' read -r kind field ftype freq; do
     [ -n "$kind" ] || continue
     if [ "$ftype" = "KIND" ]; then
-        # A kind existing on trunk must still exist: removal changes
-        # the contract of every in-flight step of that kind (unknown
-        # kinds validate permissively) through the unversioned door.
         # Here-strings, not `printf | grep -q`: under pipefail a `grep -q`
         # that exits at its match SIGPIPEs the multi-line writer and the
         # pipeline reports 141 for a row that IS present — here a false
         # "kind removed"; below, a real tightening waved through as a
         # new kind (measured in a-kind-bundle-does-not-tighten, 28af807c).
-        if ! grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" <<< "$head_rows"; then
+        grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" <<< "$head_rows" && continue
+        if grep -qxF "$kind" <<< "$required_kinds"; then
             say "steptype-bundle-ratchet: kind \`$kind\` exists on the trunk and is removed here." \
-                " In-flight steps of that kind lose their contract at the next restart;" \
-                " retire behaviour through the versioned workflow path instead (cdc23602)."
+                " It declares a required field, which every reader of its done metadata was promised;" \
+                " make every field optional first (legal on its own), or retire behaviour through the versioned workflow path (cdc23602)."
+            continue
         fi
+        row=$(retired_row "$kind")
+        if [ -z "$row" ]; then
+            say "steptype-bundle-ratchet: kind \`$kind\` exists on the trunk and is removed here with no row in $RETIRED." \
+                " An in-flight step of an unknown kind is routed to a person; measure the live in-flight count," \
+                " and add \`$kind <car> 0 <measured_at>\` only if it is 0 (adaecf05)."
+            continue
+        fi
+        read -r _ r_car r_count r_at _ <<< "$row"
+        if [ "$r_count" != "0" ] || [ -z "$r_car" ] || [ -z "$r_at" ]; then
+            say "steptype-bundle-ratchet: kind \`$kind\` is removed here, but its row in $RETIRED reads \`$row\`:" \
+                " a kind leaves only with its car, a measured_at, and 0 steps in flight (found \`${r_count:-nothing}\` in flight)."
+            continue
+        fi
+        echo "steptype-bundle-ratchet: kind \`$kind\` leaves the bundle — retired by $r_car, 0 in flight as measured $r_at"
         continue
     fi
+    # The fields of a kind that is leaving were judged with the kind.
+    grep -qxF "$(printf '%s\t-\tKIND\t-' "$kind")" <<< "$head_rows" || continue
     head_row=$(awk -F'\t' -v k="$kind" -v f="$field" '$1==k && $2==f { print; exit }' <<<"$head_rows")
     if [ -z "$head_row" ]; then
         say "steptype-bundle-ratchet: field \`$field\` on kind \`$kind\` exists on the trunk and is removed here — a bundle contract change with no version to pin against."

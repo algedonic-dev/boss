@@ -2,18 +2,17 @@
 //!
 //! Backs `/api/inventory/warehouse-status` and the `/warehouse`
 //! dashboard + B5 embedded slice plugin (operations-needs session 3,
-//! E1). The projection aggregates five views of physical inventory:
+//! E1). The projection aggregates three views of physical inventory:
 //!
 //! - Parts stock (on-hand / allocated / available / below-reorder)
 //! - Inbound POs (draft / submitted / in-transit / late / arriving-soon)
 //! - Outbound shipments (status counts + recent rows)
-//! - Refurb WIP counts per stage (intake / triage / refurb / qa / ready)
-//! - Ready-for-sale device count
 //!
-//! Stage mapping and outbound summary are computed by the cross-service
-//! client adapters (`boss-jobs-client`, `boss-shipping-client`); this
-//! module combines their summaries with inventory's own items + POs
-//! into the wire shape the frontend consumes.
+//! The outbound summary is computed by the shipping client adapter
+//! (`boss-shipping-client`); this module combines it with inventory's
+//! own items + POs into the wire shape the frontend consumes. The
+//! shipping leg can be unavailable on its own (`OutboundShipmentsRead`)
+//! without taking inventory's own two summaries down with it.
 //!
 //! Recent receive/put-away activity is a v1.1 follow-up (needs an assets
 //! events feed the warehouse dashboard can subscribe to).
@@ -25,7 +24,6 @@ use crate::types::{InventoryItem, PoStatus, PurchaseOrder};
 
 // Re-exported so callers can import everything they need from one place
 // and so the frontend TS types have a single Rust-side anchor.
-pub use crate::refurb_wip::{RefurbStageCount, RefurbWipSummary};
 pub use boss_shipping_client::{OutboundShipmentRow, OutboundShipmentSummary};
 
 /// Top-of-wire response shape for `/api/inventory/warehouse-status`.
@@ -33,12 +31,24 @@ pub use boss_shipping_client::{OutboundShipmentRow, OutboundShipmentSummary};
 pub struct WarehouseStatus {
     pub parts_stock: PartsStockSummary,
     pub inbound_pos: InboundPoSummary,
-    pub outbound_shipments: OutboundShipmentSummary,
-    pub refurb_wip: RefurbWipSummary,
-    pub ready_for_sale_count: u64,
+    pub outbound_shipments: OutboundShipmentsRead,
     /// Snapshot time — clients can display "updated X ago" without
     /// threading a second timestamp through.
     pub as_of: DateTime<Utc>,
+}
+
+/// The one leg this projection reads from another department's service,
+/// as that read turned out. Backlog 89cf07d8: a shipping outage used to
+/// answer 502 for the WHOLE read, so parts stock and inbound POs —
+/// inventory's own data — vanished with it, and distribution's service
+/// is off on the live instance. The leg now fails alone and names why;
+/// one enum rather than an Option beside a reason, so the wire cannot
+/// carry a summary and a failure at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutboundShipmentsRead {
+    Ok { summary: OutboundShipmentSummary },
+    Unavailable { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -213,30 +223,26 @@ fn inbound_pos_summary(pos: &[PurchaseOrder], today: NaiveDate) -> InboundPoSumm
 }
 
 // Outbound shipments (`OutboundShipmentSummary` / `OutboundShipmentRow`)
-// and refurb WIP (`RefurbWipSummary` / `RefurbStageCount`) are re-exported
-// from the cross-service client crates above — one type per wire shape.
+// are re-exported from the shipping client crate above — one type per
+// wire shape.
 
 // ---------------------------------------------------------------------------
 // Aggregator
 // ---------------------------------------------------------------------------
 
 /// Combine inventory's own data (items + POs) with the pre-fetched
-/// cross-service summaries into the wire shape. Pure function — no
+/// outbound shipment read into the wire shape. Pure function — no
 /// I/O, so tests can pin every branch deterministically.
 pub fn build_warehouse_status(
     items: &[InventoryItem],
     purchase_orders: &[PurchaseOrder],
-    refurb_wip: RefurbWipSummary,
-    ready_for_sale_count: u64,
-    outbound_shipments: OutboundShipmentSummary,
+    outbound_shipments: OutboundShipmentsRead,
     as_of: DateTime<Utc>,
 ) -> WarehouseStatus {
     WarehouseStatus {
         parts_stock: parts_stock_summary(items),
         inbound_pos: inbound_pos_summary(purchase_orders, as_of.date_naive()),
         outbound_shipments,
-        refurb_wip,
-        ready_for_sale_count,
         as_of,
     }
 }
@@ -451,31 +457,6 @@ mod tests {
             PoStatus::new(PoStatus::SUBMITTED),
             d(2026, 4, 25),
         )];
-        let refurb = RefurbWipSummary {
-            total_in_flight: 12,
-            by_stage: vec![
-                RefurbStageCount {
-                    stage: "intake".into(),
-                    count: 3,
-                },
-                RefurbStageCount {
-                    stage: "triage".into(),
-                    count: 4,
-                },
-                RefurbStageCount {
-                    stage: "refurb".into(),
-                    count: 2,
-                },
-                RefurbStageCount {
-                    stage: "qa".into(),
-                    count: 2,
-                },
-                RefurbStageCount {
-                    stage: "ready".into(),
-                    count: 1,
-                },
-            ],
-        };
         let outbound = OutboundShipmentSummary {
             label_created: 2,
             picked_up: 1,
@@ -485,21 +466,41 @@ mod tests {
             recent: vec![],
         };
 
-        let status = build_warehouse_status(
-            &items,
-            &pos,
-            refurb.clone(),
-            42,
-            outbound.clone(),
-            ts(2026, 4, 22),
-        );
+        let read = OutboundShipmentsRead::Ok { summary: outbound };
+        let status = build_warehouse_status(&items, &pos, read.clone(), ts(2026, 4, 22));
 
         assert_eq!(status.parts_stock.total_skus, 1);
         assert_eq!(status.inbound_pos.total_open, 1);
-        assert_eq!(status.refurb_wip, refurb);
-        assert_eq!(status.outbound_shipments, outbound);
-        assert_eq!(status.ready_for_sale_count, 42);
+        assert_eq!(status.outbound_shipments, read);
         assert_eq!(status.as_of, ts(2026, 4, 22));
+    }
+
+    // Backlog a8991c86: two summaries filled only by a retired example
+    // tenant's Workflows rode this wire, drawn by an SPA block that
+    // hid itself for every other tenant. The wire carries what the
+    // warehouse page reads, and one key more is a key nobody reads.
+    #[test]
+    fn the_wire_carries_only_what_the_warehouse_page_reads() {
+        let status = build_warehouse_status(
+            &[],
+            &[],
+            OutboundShipmentsRead::Ok {
+                summary: OutboundShipmentSummary::default(),
+            },
+            ts(2026, 4, 22),
+        );
+        let wire = serde_json::to_value(&status).unwrap();
+        let mut keys: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["as_of", "inbound_pos", "outbound_shipments", "parts_stock"]
+        );
     }
 
     #[test]
@@ -507,16 +508,14 @@ mod tests {
         let status = build_warehouse_status(
             &[],
             &[],
-            RefurbWipSummary::default(),
-            0,
-            OutboundShipmentSummary::default(),
+            OutboundShipmentsRead::Ok {
+                summary: OutboundShipmentSummary::default(),
+            },
             ts(2026, 4, 22),
         );
         assert_eq!(status.parts_stock.total_skus, 0);
         assert_eq!(status.parts_stock.below_reorder_count, 0);
         assert_eq!(status.inbound_pos.total_open, 0);
-        assert_eq!(status.refurb_wip.total_in_flight, 0);
-        assert_eq!(status.ready_for_sale_count, 0);
     }
 
     // ---------------------------------------------------------------------
@@ -696,23 +695,11 @@ mod tests {
         fn prop_build_passes_through_cross_service_inputs(
             items in vec(arb_item(), 0..10),
             pos in vec(arb_po(), 0..10),
-            ready in 0u64..10_000,
-            total_in_flight in 0i64..500,
         ) {
-            let refurb = RefurbWipSummary { total_in_flight, by_stage: vec![] };
-            let outbound = OutboundShipmentSummary::default();
+            let outbound = OutboundShipmentsRead::Ok { summary: OutboundShipmentSummary::default() };
             let as_of = ts(2026, 4, 22);
-            let status = build_warehouse_status(
-                &items,
-                &pos,
-                refurb.clone(),
-                ready,
-                outbound.clone(),
-                as_of,
-            );
-            prop_assert_eq!(&status.refurb_wip, &refurb);
+            let status = build_warehouse_status(&items, &pos, outbound.clone(), as_of);
             prop_assert_eq!(&status.outbound_shipments, &outbound);
-            prop_assert_eq!(status.ready_for_sale_count, ready);
             prop_assert_eq!(status.as_of, as_of);
         }
     }

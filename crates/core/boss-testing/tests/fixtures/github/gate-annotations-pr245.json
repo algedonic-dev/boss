@@ -1,0 +1,86 @@
+[
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/.github",
+    "start_line": 13834,
+    "start_column": null,
+    "end_line": 13834,
+    "end_column": null,
+    "annotation_level": "failure",
+    "title": "",
+    "message": "Process completed with exit code 1.",
+    "raw_details": ""
+  },
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/.github",
+    "start_line": 13063,
+    "start_column": null,
+    "end_line": 13063,
+    "end_column": null,
+    "annotation_level": "warning",
+    "title": "LIVE HALF NOT RUN",
+    "message": "the-live-rules-are-the-authored-rules did not read the estate — BOSS_ESTATE=none, so its live comparison was not made",
+    "raw_details": ""
+  },
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/.github",
+    "start_line": 13056,
+    "start_column": null,
+    "end_line": 13056,
+    "end_column": null,
+    "annotation_level": "warning",
+    "title": "LIVE HALF NOT RUN",
+    "message": "the-live-protocols-are-the-authored-protocols did not read the estate — BOSS_ESTATE=none, so its live comparison was not made",
+    "raw_details": ""
+  },
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/.github",
+    "start_line": 12674,
+    "start_column": null,
+    "end_line": 12674,
+    "end_column": null,
+    "annotation_level": "warning",
+    "title": "LIVE HALF NOT RUN",
+    "message": "a-car-stays-under-the-edit-level did not read the estate — BOSS_ESTATE=none, so its live comparison was not made",
+    "raw_details": ""
+  },
+  {
+    "path": "http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js",
+    "start_line": 6240,
+    "start_column": 23,
+    "end_line": 6240,
+    "end_column": 23,
+    "annotation_level": "failure",
+    "title": "Svelte error: each_key_duplicate",
+    "message": "https://svelte.dev/e/each_key_duplicate\n\nin <unknown>\nin WorldMap.svelte\nin MapPage.svelte\nin AppShell.svelte\nin App.svelte\nin undefined\n\n      at Object.each_key_duplicate (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:6240:23)\n      at validate_each_keys (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:14196:15)\n      at unknown (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:13936:13)\n      at update_reaction (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:2988:22)\n      at Object.update_effect2 [as update_effect] (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:3115:24)\n      at create_effect (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:5506:28)\n      at Object.block3 [as block] (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:5650:20)\n      at Object.each2 [as each] (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:13878:37)\n      at unknown (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:83074:47)\n      at Object.add_svelte_meta2 [as add_svelte_meta] (http://127.0.0.1:5174/_bun/client/index-00000000b32f1b73.js:5914:16)",
+    "raw_details": ""
+  },
+  {
+    "path": "http://127.0.0.1:5174/plugins/plugins/incident-review.js",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/http://127.0.0.1:5174/plugins/plugins/incident-review.js",
+    "start_line": 12,
+    "start_column": 36,
+    "end_line": 12,
+    "end_column": 36,
+    "annotation_level": "failure",
+    "title": "error: late plugin throw",
+    "message": "\n      at unknown (http://127.0.0.1:5174/plugins/plugins/incident-review.js:12:36)",
+    "raw_details": ""
+  },
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/algedonic-dev/boss/blob/28554177812cc9645ab0eff2158574c25286f34a/.github",
+    "start_line": 1,
+    "start_column": null,
+    "end_line": 1,
+    "end_column": null,
+    "annotation_level": "notice",
+    "title": "",
+    "message": "\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\"",
+    "raw_details": ""
+  }
+]

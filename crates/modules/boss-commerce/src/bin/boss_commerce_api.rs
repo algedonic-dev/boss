@@ -103,11 +103,27 @@ async fn main() -> Result<()> {
         )))
     });
 
+    // The one policy client every commerce write asks: the invoice
+    // doors and the agreements upsert. Until 2026-09-26 the state was
+    // built with `policy: None`, so the gate in http.rs skipped and any
+    // caller reaching the port could create an invoice (backlog
+    // 54bf2e1e); until 2026-09-27 the field stayed an `Option` and the
+    // agreements router took no client at all (2b49ab60, d2bea664) —
+    // now both take one by type, so this binary cannot build either
+    // surface without it. Same wrapping as people and ledger: on a sim
+    // instance a sim caller is authorized at the boundary; everything
+    // else is enforced per-role (backlog 85e7f10f).
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new(
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        ),
+    ));
+
     let state = CommerceApiState {
         commerce,
         publisher,
         people_client,
-        policy: None,
+        policy: policy.clone(),
         clock,
         classes_client,
     };
@@ -116,6 +132,7 @@ async fn main() -> Result<()> {
         pool.clone(),
         agreements_publisher,
         state.clock.clone(),
+        policy,
     );
 
     let app = router(state).merge(agreements_app);
@@ -136,6 +153,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "commerce HTTP API listening");
 
+    let app = boss_core::machine_gate::mount(app, "commerce", &["/api/commerce/health"]);
     axum::serve(listener, app).await?;
     Ok(())
 }

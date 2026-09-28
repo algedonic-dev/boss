@@ -402,13 +402,17 @@ END {
 # line arithmetic this script is otherwise made of; it cannot do this.
 #
 # WHERE IT IS LOOKED FOR, in order, and WHY THE ABSENCE IS A SENTENCE
-# RATHER THAN A ZERO. boss-gcp's converge deliberately does not build
-# (`infra/gcp/boss-gcp-converge.sh`: "This does not build, stage binaries,
-# converge the schema, or restart a service"), so the counter is present
-# on a box only once somebody built it there. A machine without it must
+# RATHER THAN A ZERO. boss-gcp's converge does not build; it takes the
+# counter out of the cluster image beside the CLI
+# (infra/estate/install-cli-from-image.sh), and the unit names it with
+# BOSS_LEAKED_POLICY_BIN (backlog c4d60110 — until 2026-09-27 nothing put
+# it there, and 11 of 11 packets filed null). A machine without it must
 # say "not measured here", because reporting 0 leaked branches from a box
 # with no Rust toolchain is the same defect as a query against the wrong
 # deployment answering `total: 0` — well-formed, confident and wrong.
+# Every null carries a VERDICT first — `unrunnable:` when there was no
+# counter to run, `refused:` when it ran and would not count — so a
+# reader or a probe tells the two apart without parsing prose.
 leaked_policy_bin() {
     if [ -n "${BOSS_LEAKED_POLICY_BIN:-}" ]; then
         # Explicitly named and not runnable is a CONFIGURATION error, and
@@ -463,9 +467,9 @@ leaked_policy_measure() { # <extracted tree> <scratch dir>
     : >"$scratch/leaked.why"
     if ! bin=$(leaked_policy_bin); then
         if [ -n "${BOSS_LEAKED_POLICY_BIN:-}" ]; then
-            printf '%s' "BOSS_LEAKED_POLICY_BIN=$BOSS_LEAKED_POLICY_BIN is not an executable, so the code-branch half was not counted. Named explicitly and not runnable is a configuration error, not a reason to silently count with something else." >"$scratch/leaked.why"
+            printf '%s' "unrunnable: BOSS_LEAKED_POLICY_BIN=$BOSS_LEAKED_POLICY_BIN is not an executable, so the code-branch half was not counted. Named explicitly and not runnable is a configuration error, not a reason to silently count with something else. On a converged host the counter is taken out of the cluster image beside the CLI by infra/estate/install-cli-from-image.sh; \`cli_leaked_policy\` on the host's converge packet says whether it was." >"$scratch/leaked.why"
         else
-            printf '%s' "No boss-leaked-policy on this machine (tried \$BOSS_LEAKED_POLICY_BIN, \$CARGO_TARGET_DIR, $REPO/target/release, $REPO/target/debug, \$PATH), so the code-branch half of CLAUDE.md §9 was NOT counted on this run. This is a fact about the machine, not about the codebase: the count is unmeasured here, which is not the same as zero. Build it with \`cargo build --release -p boss-testing --bin boss-leaked-policy\`." >"$scratch/leaked.why"
+            printf '%s' "unrunnable: No boss-leaked-policy on this machine (tried \$BOSS_LEAKED_POLICY_BIN, \$CARGO_TARGET_DIR, $REPO/target/release, $REPO/target/debug, \$PATH), so the code-branch half of CLAUDE.md §9 was NOT counted on this run. This is a fact about the machine, not about the codebase: the count is unmeasured here, which is not the same as zero. Build it with \`cargo build --release -p boss-testing --bin boss-leaked-policy\`." >"$scratch/leaked.why"
         fi
         return 0
     fi
@@ -478,7 +482,7 @@ leaked_policy_measure() { # <extracted tree> <scratch dir>
     # file's own `unreadable_files` path makes the same argument.
     : >"$scratch/leaked.json"
     sed 's/^/    /' "$scratch/leaked.err" >&2
-    printf '%s' "$bin refused rather than counting: $(tr '\n' ' ' <"$scratch/leaked.err"). Its full output is in this run's stderr." >"$scratch/leaked.why"
+    printf '%s' "refused: $bin refused rather than counting: $(tr '\n' ' ' <"$scratch/leaked.err"). Its full output is in this run's stderr." >"$scratch/leaked.why"
     return 0
 }
 
@@ -592,7 +596,7 @@ snapshot_json() {
           code_branches_not_counted_why:
             (if $leaked_why != "" then $leaked_why
              elif $leaked == null then
-               "The counter produced neither a measurement nor a reason — a bug in codebase-metrics.sh itself, not a fact about the codebase. Re-run `codebase-metrics.sh snapshot` and read this run'"'"'s stderr."
+               "unrunnable: The counter produced neither a measurement nor a reason — a bug in codebase-metrics.sh itself, not a fact about the codebase. Re-run `codebase-metrics.sh snapshot` and read this run'"'"'s stderr."
              else null end)}')
 
     printf '%s' "$totals" | jq \

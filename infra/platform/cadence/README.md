@@ -7,9 +7,13 @@ whose `name` is the file name, carrying every column of the
 `verb`, `basis`, and the basis's own columns — `every_minutes` (wall),
 `at_times` (clock, calendar), `min_dock_depth` + `cooldown_minutes`
 (queue-depth), `cadence` + `anchor_date` + `business_calendar`
-(calendar). A column the basis does not use is simply absent — TOML has
-no null. **Adding a rule is dropping a file in.** Changing one is
-bumping its `version`.
+(calendar), and `regate_hold_minutes` on a rule that departs a train
+(`board`, `run`: how long a departure waits for the dock's re-gate
+round, `20260925200737`). A column the basis does not use is simply
+absent — TOML has no null. **Adding a rule is dropping a file in.**
+Changing one is bumping its `version`. `train-dock-refresh` (design
+42279fb2, 2026-09-25) was the first rule born here rather than in a
+migration; the equality pin counts such rules as born in the bundle.
 
 Since 2026-09-18 (backlog 393d3234, consolidation H4, car 3) this
 directory is where a cadence rule is DECLARED. Before it, nine
@@ -39,12 +43,21 @@ directory to the migrations' active rows MINUS that list, and refuses a
 name that leaves the list without a file appearing here.
 
 **The bundle is the baseline, not a lock.** `cadence_rules` is live,
-editable protocol data by design (docs/design/protocol-cadence.md:
+editable protocol data by design (the protocol-cadence decision in docs/architecture-decisions.md:
 measure, experiment, update — without a deploy). An operator who
 publishes a later version live leaves this file behind, and the seed's
 report says so — `behind the live lineage (vN active), untouched` — as
 information, never a refusal. The conductor's loop reads the LIVE
 active rows over `/api/cadence/rules` and is untouched by this bundle.
+
+**So bump from the LIVE newest, never from the file** (backlog
+5449111c). A file behind live turns "bump the version" into a version
+that already exists live with other columns: on 2026-09-21 the boarding
+cooldown was bumped 6 -> 7 from this directory while live was already
+at v7, gated green, landed, and changed nothing. `boss orient`'s
+BUNDLES section says "bundle vN, live vM" for every file here, and
+`boss gate` refuses to launch a car that changes a row the live lineage
+will not take as written — naming the version that would publish.
 
 **Published by `boss-platform-workflow-seed`**, the same binary and
 the same `--seed-path` every launcher already passes, after the

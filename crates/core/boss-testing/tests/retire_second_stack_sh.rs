@@ -325,33 +325,31 @@ fn the_tree_list_is_well_formed_and_names_the_inventory() {
 }
 
 /// The list and `infra/estate/roles.toml` are two statements about the
-/// same units, so they get an equality test (CLAUDE.md §9a): every
-/// legacy-stack stem is retired as both its timer and its service, and
-/// no stem any OTHER section names — `always`, or a role boss-gcp
-/// declares — is in the list at all.
+/// same host: the list names what it must NOT keep, roles.toml what it
+/// runs. No stem any section names — `always`, or any role — is in the
+/// list at all.
+///
+/// Until 2026-09-27 this was an equality test the other way too: every
+/// `[roles.legacy-stack]` stem had to be in the list. That section
+/// described a stack gone since 2026-09-15 (ops-request 7912c9ae), held
+/// by 0 of 7 nodes, and its Class is retired through the registry's
+/// evented door (backlog 0f9a7a47) — so the list is now the ONE record
+/// of those chores, and a roles.toml section for the retired role would
+/// be a roster row for a role no host may declare.
 #[test]
-fn the_list_agrees_with_the_roles_registry() {
+fn the_list_names_no_unit_a_role_keeps_and_the_retired_role_has_no_section() {
     let list = tree_list();
-    let legacy = role_units("roles.legacy-stack");
-    // Seven since 2026-09-18: boss-conservation-invariants left with its
-    // unit files once its cluster CronJob existed (H12, backlog 236529aa).
-    assert!(legacy.len() >= 7, "legacy-stack names {legacy:?}");
-    for stem in &legacy {
-        for suffix in [".timer", ".service"] {
-            let unit = format!("{stem}{suffix}");
-            assert!(
-                list.contains(&unit),
-                "{unit} is a legacy-stack unit (infra/estate/roles.toml) but {LIST} does not retire it"
-            );
-        }
-    }
     let toml = std::fs::read_to_string(repo_root().join("infra/estate/roles.toml")).unwrap();
     let sections: Vec<&str> = toml
         .lines()
         .filter_map(|l| l.trim().strip_prefix('[').and_then(|s| s.strip_suffix(']')))
-        .filter(|s| *s != "roles.legacy-stack")
         .collect();
     assert!(sections.contains(&"always"), "{sections:?}");
+    assert!(
+        !sections.contains(&"roles.legacy-stack"),
+        "infra/estate/roles.toml still declares [roles.legacy-stack] — the role is retired \
+         (backlog 0f9a7a47); its chores are named by {LIST} alone"
+    );
     for section in sections {
         for stem in role_units(section) {
             for suffix in [".timer", ".service"] {
@@ -707,15 +705,18 @@ fn shipped_verbs(root: &Path) -> PathBuf {
 
 /// One open ops-request for boss-gcp carrying the verb and args, run
 /// through `ops-runner.sh` against a stubbed system of record. The
-/// stub `curl` answers the jobs read with the packet, records the PUT,
+/// stub `curl` answers the jobs read with the packet, keeps what it recorded on the step,
 /// and answers the estate-nodes read the script makes.
 fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json::Value>) {
     write_exec(
         &c.bin.join("curl"),
-        "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
-         for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
-         cat \"$STUB_JOBS\"\n",
+        &[
+            "#!/bin/sh\n",
+            boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
+            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
+             cat \"$STUB_JOBS\"\n",
+        ]
+        .concat(),
     );
     write_file(
         &c.root.join("jobs.json"),
@@ -723,8 +724,8 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
             r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"boss-gcp","verb":"retire-second-stack","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}]}}"#
         ),
     );
-    let put = c.root.join("put.json");
-    let _ = std::fs::remove_file(&put);
+    let step_md = c.root.join("step-metadata.json");
+    let _ = std::fs::remove_file(&step_md);
     let out = Command::new("sh")
         .arg(repo_root().join("infra/ops/ops-runner.sh"))
         .env_clear()
@@ -741,7 +742,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", c.root.join("jobs.json"))
-        .env("STUB_PUT", &put)
+        .env("STUB_STEP_METADATA", &step_md)
         .env("STUB_SNAPSHOT", c.root.join("snapshot.txt"))
         .env("STUB_STOPPED", &c.stopped)
         .env("STUB_DUMPS", &c.dumps)
@@ -759,10 +760,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let meta = std::fs::read_to_string(&put)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("PUT payload is JSON"))
-        .map(|v| v["metadata"].clone());
+    let meta = boss_testing::ops_runner_stub::step_metadata_written(&step_md);
     (text, meta)
 }
 

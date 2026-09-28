@@ -252,9 +252,22 @@ scope = "territory"
 
 [[grants]]
 role = "sales-rep"
-resources = ["job", "step"]
+resource = "step"
 action = "create"
 scope = "territory"
+
+# Opening packets is asked of the KIND (design 222fc982): Create on
+# plain `job` opens every kind, `ops-request` included, so the rep's
+# old all-kinds grant is withdrawn — declared `none` rather than
+# deleted, because publishing a seed never retires a row it no longer
+# names, and `boss tenant publish --take policy` applies this one on an
+# instance seeded before. The kinds the rep files are granted below,
+# under "Opening packets".
+[[grants]]
+role = "sales-rep"
+resource = "job"
+action = "create"
+scope = "none"
 
 [[grants]]
 role = "sales-rep"
@@ -281,8 +294,22 @@ scope = "territory"
 [[grants]]
 role = "events-coord"
 resources = ["job", "step"]
-actions = ["read", "update", "create"]
+actions = ["read", "update"]
 scope = "department:taproom"
+
+[[grants]]
+role = "events-coord"
+resource = "step"
+action = "create"
+scope = "department:taproom"
+
+# The all-kinds Create on `job`, withdrawn as sales-rep's is above; the
+# kinds the coordinator files are under "Opening packets".
+[[grants]]
+role = "events-coord"
+resource = "job"
+action = "create"
+scope = "none"
 
 [[grants]]
 roles = ["bartender", "taproom-server"]
@@ -433,6 +460,105 @@ actions = ["read", "update"]
 scope = "self"
 
 # ------------------------------------------------------------------
+# Opening packets — Create on job:<kind>.
+#
+# `POST /api/jobs` asks Create on `job:<kind>` for the kind being
+# opened (design 222fc982, backlog 6dc75abd). Create on plain `job` is
+# the ALL-KINDS grant — core gives it to platform-admin and
+# break-glass — and no brewery role holds it. Each role is granted the
+# kinds its surfaces file, measured from the web on 2026-09-27; the
+# pin is boss-brewery-engine's
+# tests/every_role_may_open_what_its_surfaces_file.rs, which names a
+# role the widget would refuse.
+#
+# Admission reads only whether a grant allows: a Create has no row yet
+# for a scope to narrow, so these say `all` unless the role's older
+# grant said otherwise.
+# ------------------------------------------------------------------
+
+# The feedback widget (libs/web-kit FeedbackControl) files
+# `user-feedback` from every page, and the shop (always on for every
+# role, libs/web-kit session/permissions.ts) files `direct-shop-order`.
+# Every role the roster staffs or classes.json declares.
+[[grants]]
+roles = [
+    "account-manager", "ap-clerk", "ar-clerk", "bartender",
+    "benefits-coord", "bookkeeper", "brand-manager", "brewer",
+    "cellar-tech", "ceo", "cfo", "controller", "coo", "cto",
+    "distribution-driver", "distribution-lead", "electrician",
+    "events-coord", "forklift-operator", "fp-analyst", "head-brewer",
+    "head-of-distribution", "head-of-marketing", "head-of-people",
+    "head-of-sales", "helpdesk", "hr-generalist", "inventory-clerk",
+    "it-director", "lab-tech", "maintenance-mgr", "mechanic",
+    "packaging-lead", "packaging-mgr", "packaging-tech", "palletizer",
+    "payroll-mgr", "qa-supervisor", "qa-tech", "recruiter",
+    "sales-lead", "sales-rep", "senior-brewer", "shift-lead",
+    "shipping-clerk", "social-media-coord", "sysadmin",
+    "taproom-server", "taproom-shift-lead", "warehouse-lead",
+    "warehouse-mgr",
+]
+resources = ["job:user-feedback", "job:direct-shop-order"]
+action = "create"
+scope = "all"
+
+# The parts page's reorder button files `ingredient-restock`: every
+# role whose classes.json row lists `parts` among its surfaces, and
+# every role whose row lists none (it sees every surface).
+[[grants]]
+roles = [
+    "ap-clerk", "brewer", "cellar-tech", "ceo", "cfo", "controller",
+    "coo", "cto", "distribution-lead", "electrician",
+    "forklift-operator", "head-brewer", "inventory-clerk", "lab-tech",
+    "maintenance-mgr", "mechanic", "packaging-lead", "qa-supervisor",
+    "qa-tech", "sales-lead", "senior-brewer", "shift-lead",
+    "taproom-shift-lead", "warehouse-lead", "warehouse-mgr",
+]
+resource = "job:ingredient-restock"
+action = "create"
+scope = "all"
+
+# The rep's accounts work — what its old all-kinds grant was for.
+[[grants]]
+role = "sales-rep"
+resources = [
+    "job:sale", "job:wholesale-keg-order", "job:seasonal-release",
+    "job:distribution-contract", "job:account-checkin", "job:keg-return",
+]
+action = "create"
+scope = "territory"
+
+# The coordinator's events.
+[[grants]]
+role = "events-coord"
+resources = ["job:taproom-event", "job:tap-launch"]
+action = "create"
+scope = "department:taproom"
+
+# The HR page starts its hire and termination workflows through the New
+# Job form. Opened by the roles this seed already lets create (hire) or
+# change (terminate) an employee row, not by every role that sees the
+# page.
+[[grants]]
+roles = ["ceo", "coo", "head-of-people", "hr-generalist", "recruiter"]
+resource = "job:brewery-hire"
+action = "create"
+scope = "all"
+
+[[grants]]
+roles = ["ceo", "coo", "head-of-people", "hr-generalist"]
+resource = "job:brewery-terminate"
+action = "create"
+scope = "all"
+
+# The workflows page proposes a new work type as a `workflow-design`
+# packet — opened by the roles that author Workflows (above: ceo, cto).
+[[grants]]
+roles = ["ceo", "cto"]
+resource = "job:workflow-design"
+action = "create"
+scope = "all"
+
+# ------------------------------------------------------------------
 # Step sign-off authority (step-signoff:<role>).
 #
 # A sign-off step's required role (`authority_role`) is enforced
@@ -578,6 +704,17 @@ resource = "step-signoff:owner"
 action = "sign-off"
 scope = "all"
 
+# weekly-leadership-review's ceo-review step requires a ceo sign-off.
+# Missing until 2026-09-25 (backlog 292c00c2): the sim-origin bypass
+# signed it in the grant's place, which stops once the bypass is bound
+# (car ab1dba92). Pinned by boss-brewery-engine's
+# every_sign_off_role_is_granted test, which reads both seed files.
+[[grants]]
+role = "ceo"
+resource = "step-signoff:ceo"
+action = "sign-off"
+scope = "all"
+
 # ------------------------------------------------------------------
 # Identity + log access as result sets.
 #
@@ -637,3 +774,57 @@ roles = [
 resource = "ledger"
 action = "read"
 scope = "all"
+
+# ------------------------------------------------------------------
+# Pay.
+#
+# `annual_salary_cents` on every people read went to any signed-in
+# viewer (backlog c7484d0e, 2026-09-23). The roster stays open — the
+# dispatcher's notifier and auto-assign read it by role — and the pay
+# on it is shown only where `compensation` Read is granted, in the
+# grant's scope. People and the books, plus platform-admin from the
+# platform defaults. audit-readonly does NOT hold it: it is also what
+# an anonymous visitor carries.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = ["ceo", "cfo", "controller", "head-of-people"]
+resource = "compensation"
+action = "read"
+scope = "all"
+
+# ------------------------------------------------------------------
+# Schedules.
+#
+# Availability, assignments, shift patterns and the week grid answered
+# any session and any headerless caller (backlog a621d091,
+# 2026-09-25). Every employee reads their own without a grant; the
+# `schedule` grant is what reading anyone else's takes, in its scope.
+# The people who staff the whole brewery read all of it; a manager
+# reads their team (themself and their direct reports). audit-readonly
+# does NOT hold it, for the reason it does not hold pay.
+#
+# The `team` list is every role some employee in employees.json reports
+# to, and nothing else — the leads run the crews whose weeks these
+# reads are for, and a role that manages nobody needs no grant to read
+# itself. Pinned by boss-brewery-engine
+# tests/every_manager_reads_their_teams_schedule.rs.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = ["ceo", "coo", "head-of-people"]
+resource = "schedule"
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = [
+    "cfo", "cto", "controller", "it-director", "head-brewer",
+    "head-of-distribution", "head-of-sales", "head-of-marketing",
+    "packaging-mgr", "warehouse-mgr", "maintenance-mgr", "qa-supervisor",
+    "shift-lead", "packaging-lead", "warehouse-lead", "sales-lead",
+    "taproom-shift-lead", "distribution-lead",
+]
+resource = "schedule"
+action = "read"
+scope = "team"

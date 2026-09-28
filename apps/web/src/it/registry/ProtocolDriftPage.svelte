@@ -47,7 +47,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import type { Remote } from '../../data/remote';
-  import { loadDriftPackets, newestMeasured, type DriftPage } from './drift';
+  import { loadDriftPackets, measurementAge, newestMeasured, STALE_AFTER_HOURS, type DriftPage } from './drift';
   import {
     adriftKinds,
     latestFor,
@@ -87,6 +87,13 @@
       poll = null;
     }
   });
+  /** The instant the measurement's age is read against. Ticked each
+   *  minute, so a tab left open across a missed 05:20Z run turns warn
+   *  without a reload (d83886c6). */
+  let now = $state(new Date().toISOString());
+  const clock = setInterval(() => {
+    now = new Date().toISOString();
+  }, 60_000);
   onMount(() => {
     void refresh();
     void refreshRequests();
@@ -96,10 +103,12 @@
   });
   onDestroy(() => {
     if (poll !== null) clearInterval(poll);
+    clearInterval(clock);
   });
 
   const ready = $derived(page.kind === 'ready' ? page.data : null);
   const newest = $derived(ready ? newestMeasured(ready.packets) : null);
+  const age = $derived(newest ? measurementAge(newest.measured.at, now) : null);
   const kinds = $derived(newest ? adriftKinds(newest.drift.fields) : []);
   const states = $derived<ReadonlyMap<string, RowState>>(
     new Map(
@@ -128,7 +137,7 @@
   <PageHeader
     eyebrow="IT · Registry · what is live that the tree does not say"
     title="Protocol drift"
-    subtitle="The authored bundle (infra/platform/workflows) against the live registry, compared by the gate's own lint once a day and filed as a packet. Each row is a field an operator reads — label, description, category — where the file and the active live row disagree; both full copies stay at their homes, and the excerpts here are the first place they differ."
+    subtitle="The authored bundle (infra/platform/workflows) against the live registry, compared by the gate's own lint once a day and filed as a packet. Each row is a compared field where the file and the active live row disagree — the measurement names which fields it compares; both full copies stay at their homes, and the excerpts here are the first place they differ."
   />
 
   {#if page.kind === 'failed'}
@@ -140,9 +149,9 @@
     <p class="pd-quiet">Reading the measured packets…</p>
   {:else if !ready || ready.total === 0}
     <p class="pd-notice">
-      No protocol-drift packet exists yet — the 05:20 measurement has not filed. The first run was expected
-      2026-09-15 05:20Z on boss-gcp (infra/protocol-drift.sh, train #376); until a packet carries a
-      measurement this tab has nothing it can honestly draw, and an empty table would read as agreement.
+      No protocol-drift packet exists — the daily 05:20Z measurement on boss-gcp has not filed a packet
+      (infra/protocol-drift.sh). Until a packet carries a measurement this tab has nothing it can honestly
+      draw, and an empty table would read as agreement.
     </p>
   {:else if !newest}
     <p class="pd-fail load-failed">
@@ -152,8 +161,21 @@
     </p>
   {:else}
     <div class="pd-section">
-      00 — THE MEASUREMENT · at head {short(newest.measured.head)}, measured {when(newest.measured.at)}
+      <span>
+        00 — THE MEASUREMENT ·
+        <a class="pd-packet" href={`/jobs/${newest.id}`} title="the packet this page is drawn from — the record">packet {short(newest.id)}</a>
+        · at head {short(newest.measured.head)}, measured {when(newest.measured.at)}
+        {#if age}
+          · <span class="pd-age" class:warn={age.stale}
+            >{age.text} ago{age.stale ? ` — past the daily ${STALE_AFTER_HOURS}h, so a 05:20Z run was missed` : ''}</span
+          >
+        {/if}
+      </span>
     </div>
+    <p class="pd-method">
+      <span class="k">compared</span>
+      {newest.measured.method_fields ?? 'the packet does not say which fields it compared'}
+    </p>
     <div class="pd-strip">
       <div title="the checkout the bundle was read from: its head commit and when that head landed">
         <div class="k">tree</div>
@@ -202,6 +224,16 @@
         <div class="v small {tone(newest.measured.lint_exit)}">{verdict(newest.measured.lint_exit)}</div>
       </div>
     </div>
+    {#if newest.drift.tenants.length > 0}
+      <!-- 90a24e28: "authored" counts tenant seeds as well as the platform
+           bundle; without this line the gap to "admitted" read as missing
+           kinds. -->
+      <p class="pd-tenants">
+        Authored includes tenant seeds:
+        {#each newest.drift.tenants as t, i (t.file)}{i > 0 ? '; ' : ''}<span class="mono">{t.file}</span>, {n(t.total)} kinds, {n(t.not_admitted)} not admitted here{/each}.
+        This instance does not run the demo tenant, by design.
+      </p>
+    {/if}
 
     <div class="pd-section">01 — FIELDS ADRIFT · {newest.drift.fields.length} row{newest.drift.fields.length === 1 ? '' : 's'}, one per kind and field</div>
     {#if newest.drift.fields.length === 0}
@@ -341,60 +373,67 @@
 <style>
   .pd-root { padding: 0 32px 32px; }
   .pd-section {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px; letter-spacing: var(--ls-eyebrow, 0.3em);
-    color: var(--signal, #5fd4a8); margin: 28px 0 8px;
+    font-family: var(--font-mono);
+    font-size: 12px; letter-spacing: var(--ls-eyebrow);
+    color: var(--signal); margin: 28px 0 8px;
     display: flex; align-items: center; gap: 12px;
   }
-  .pd-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline, #2a3138); }
-  .pd-quiet { color: var(--static, #7a838c); font-size: 13px; }
+  .pd-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
+  .pd-quiet { color: var(--static); font-size: 13px; }
   .pd-fail {
-    color: var(--warn, #d9a441); border: 1px solid var(--warn, #d9a441);
+    color: var(--warn); border: 1px solid var(--warn);
     padding: 8px 12px; font-size: 13px;
   }
   /* Not a failure: the cadence has not run yet, and the page says so
      in its own voice rather than the failure's. */
   .pd-notice {
-    color: var(--fog, #e8ecef); border: 1px solid var(--hairline, #2a3138);
+    color: var(--fog); border: 1px solid var(--hairline);
     padding: 8px 12px; font-size: 13px; max-width: 90ch;
   }
-  .mono { font-family: var(--font-mono, ui-monospace, monospace); font-variant-numeric: tabular-nums; }
-  .ok { color: var(--ok, #4fb98a); }
-  .warn { color: var(--warn, #d9a441); }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
 
   .pd-strip {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-    border: 1px solid var(--hairline, #2a3138);
+    border: 1px solid var(--hairline);
   }
-  .pd-strip > div { padding: 12px 16px; border-right: 1px solid var(--hairline, #2a3138); min-width: 0; }
+  .pd-strip > div { padding: 12px 16px; border-right: 1px solid var(--hairline); min-width: 0; }
   .pd-strip > div:last-child { border-right: 0; }
   .pd-strip .k {
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
-    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static, #7a838c);
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static);
   }
   .pd-strip .v { font-size: 28px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 4px; }
   .pd-strip .v.small { font-size: 14px; line-height: 1.5; font-weight: 400; }
-  .pd-strip .v small { font-size: 12px; color: var(--static, #7a838c); font-weight: 400; margin-left: 5px; }
+  .pd-strip .v small { font-size: 12px; color: var(--static); font-weight: 400; margin-left: 5px; }
 
   .pd-tbl { overflow-x: auto; }
   .pd-table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 760px; }
-  .pd-table th { text-align: left; font-weight: 500; color: var(--static, #7a838c); padding: 4px 8px; border-bottom: 1px solid var(--hairline, #2a3138); }
-  .pd-table td { padding: 6px 8px; border-bottom: 1px solid var(--hairline, #2a3138); vertical-align: top; white-space: nowrap; }
-  .pd-table td small { display: block; color: var(--static, #7a838c); font-size: 11px; }
+  .pd-table th { text-align: left; font-weight: 500; color: var(--static); padding: 4px 8px; border-bottom: 1px solid var(--hairline); }
+  .pd-table td { padding: 6px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; white-space: nowrap; }
+  .pd-table td small { display: block; color: var(--static); font-size: 11px; }
   .pd-table .num { text-align: right; }
   /* Published since the measurement: still the packet's row, drawn as
      history rather than as work. */
-  .pd-table tr.superseded td { color: var(--text-faint, #5c656e); }
-  .pd-table tr.superseded .excerpt { color: var(--text-faint, #5c656e); }
+  .pd-table tr.superseded td { color: var(--text-faint); }
+  .pd-table tr.superseded .excerpt { color: var(--text-faint); }
   .pd-table .excerpt {
     white-space: pre-wrap; overflow-wrap: anywhere; max-width: 40ch;
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--fog, #e8ecef);
+    font-family: var(--font-mono); font-size: 11px; color: var(--fog);
   }
 
   .pd-context { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
   .pd-context .h { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
-  .pd-context .h small { display: block; font-weight: 400; font-size: 11px; color: var(--static, #7a838c); }
+  .pd-context .h small { display: block; font-weight: 400; font-size: 11px; color: var(--static); }
   .pd-list { margin: 0; padding-left: 16px; font-size: 12px; }
-  .pd-footnote { color: var(--text-faint, #5c656e); font-size: 12px; max-width: 90ch; margin-top: 20px; }
-  .pd-approve-note { color: var(--static, #7a838c); font-size: 12px; max-width: 90ch; margin: 0 0 10px; }
+  .pd-footnote { color: var(--text-faint); font-size: 12px; max-width: 90ch; margin-top: 20px; }
+  .pd-section a.pd-packet { color: inherit; }
+  .pd-method { color: var(--static); font-size: 12px; max-width: 90ch; margin: 0 0 10px; }
+  .pd-method .k {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; margin-right: 6px;
+  }
+  .pd-tenants { color: var(--static); font-size: 12px; max-width: 90ch; margin: 8px 0 0; }
+  .pd-approve-note { color: var(--static); font-size: 12px; max-width: 90ch; margin: 0 0 10px; }
 </style>

@@ -64,13 +64,13 @@ fn fixture() -> Vec<(&'static str, NaiveDate, Value, &'static str)> {
         (
             "finance.invoice.issued",
             d(2026, 3, 10),
-            json!({"invoice_id": "i1", "amount_cents": 10_000, "line_items": [{"category": "service", "amount_cents": 10_000}]}),
+            json!({"invoice_id": "i1", "amount_cents": 10_000, "line_items": [{"category": "taproom", "amount_cents": 10_000}]}),
             "i1",
         ),
         (
             "finance.invoice.issued",
             d(2026, 3, 10),
-            json!({"invoice_id": "i2", "amount_cents": 2_500, "line_items": [{"category": "new-sales", "amount_cents": 2_500}]}),
+            json!({"invoice_id": "i2", "amount_cents": 2_500, "line_items": [{"category": "wholesale", "amount_cents": 2_500}]}),
             "i2",
         ),
         (
@@ -91,6 +91,7 @@ fn fixture() -> Vec<(&'static str, NaiveDate, Value, &'static str)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_increment_matches_rebuild_reaggregate() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let facts = fixture();
 
     // Insert facts, then post each LIVE — post_fact_in_tx increments
@@ -130,6 +131,7 @@ async fn live_increment_matches_rebuild_reaggregate() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_rollup_matches_direct_aggregation() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     for (kind, on, payload, source) in &fixture() {
         insert_fact(&db, kind, *on, payload, source).await;
     }
@@ -183,6 +185,7 @@ async fn rebuild_rollup_matches_direct_aggregation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn statement_query_matches_direct_journal() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     for (kind, on, payload, source) in &fixture() {
         insert_fact(&db, kind, *on, payload, source).await;
     }

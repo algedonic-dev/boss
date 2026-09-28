@@ -27,6 +27,7 @@
   import { decorateDagNodes, fmtDur } from '../../jobs/decorateDag';
   import type { Job } from '../../jobs/types';
   import { navigate } from '../../router';
+  import { fetchEvery, wholeOrThrow } from '../../data/paginated';
 
   type FleetNode = Readonly<{
     slug: string;
@@ -68,6 +69,9 @@
   let selectedNode = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  // An empty registry is an answer, not a failed read, so it is not
+  // painted on the failure marker `error` wears (sweep c3e4edcc).
+  let noKinds = $state(false);
 
   // Decode once, defensively, at the fetch site — the route-smoke
   // crawl runs every page against an adversarial mock, and a
@@ -107,14 +111,15 @@
   }
 
   // The node badges are server counts; the item list under a
-  // clicked node comes from the same capped jobs fetch every board
-  // uses — the panel says "N of M" when the two disagree.
+  // clicked node comes from EVERY open packet of the kind — one page
+  // of 200 until backlog b68a9dde, which the panel could only hedge
+  // about. A read that stops short fails the page, naming how many of
+  // how many it held; the panel still says "N of M" if the two
+  // disagree.
   async function loadJobs(k: string): Promise<void> {
-    const res = await fetch(`/api/jobs?kind=${encodeURIComponent(k)}&status=open&limit=200`);
-    if (!res.ok) throw new Error(`jobs: HTTP ${res.status}`);
-    const body: unknown = await res.json();
-    const data = (body as { data?: unknown } | null)?.data;
-    jobs = Array.isArray(data) ? (data as ReadonlyArray<Job>) : [];
+    jobs = wholeOrThrow(
+      await fetchEvery<Job>(`/api/jobs?kind=${encodeURIComponent(k)}&status=open`),
+    );
   }
 
   // The flow through the process, not just the live set: completed
@@ -154,7 +159,7 @@
         if (kind) await switchTo(kind);
         else {
           loading = false;
-          error = 'no Workflows in the registry';
+          noKinds = true;
         }
       } catch (e) {
         loading = false;
@@ -269,7 +274,9 @@
 {#if loading}
   <p class="fleet-msg">Reading the fleet…</p>
 {:else if error}
-  <p class="fleet-msg fleet-err">{error}</p>
+  <p class="fleet-msg load-failed" role="alert">Couldn't read the fleet — {error}</p>
+{:else if noKinds}
+  <p class="fleet-msg">No Workflows in the registry.</p>
 {:else if dag}
   <StepDag
     nodes={dag.nodes}
@@ -289,7 +296,7 @@
         </span>
       </h3>
       {#if selectedJobs.length === 0}
-        <p class="fleet-msg">Nothing visible at this step (server may count steps of Jobs beyond the 200 shown).</p>
+        <p class="fleet-msg">Nothing visible at this step (the server counts steps the open packets read here do not show).</p>
       {:else}
         <ul class="fleet-items">
           {#each selectedJobs as j (j.id)}
@@ -371,18 +378,15 @@
     align-items: baseline;
     gap: 8px;
     font-size: 13px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-scope {
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-msg {
     margin: 24px 0;
-    color: var(--static, #7A838C);
-  }
-  .fleet-err {
-    color: var(--err, #e2685c);
+    color: var(--static);
   }
   .fleet-table {
     margin-top: 16px;
@@ -393,11 +397,11 @@
   .fleet-table td {
     text-align: left;
     padding: 6px 14px 6px 0;
-    border-bottom: 1px solid var(--hairline, #2A3138);
+    border-bottom: 1px solid var(--hairline);
   }
   .fleet-table th {
     font-weight: 600;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-node-items {
     margin-top: 14px;
@@ -411,7 +415,7 @@
   .fleet-node-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-items {
     list-style: none;
@@ -429,9 +433,9 @@
     width: 100%;
     text-align: left;
     padding: 7px 12px;
-    border: 1px solid var(--hairline, #2A3138);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
-    background: var(--card, var(--ink, #12161C));
+    background: var(--card);
     cursor: pointer;
     font: inherit;
     color: inherit;
@@ -440,11 +444,11 @@
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-item-pri[data-pri='urgent'],
   .fleet-item-pri[data-pri='emergency'] {
-    color: var(--err, #e2685c);
+    color: var(--err);
   }
   .fleet-item-title {
     flex: 1;
@@ -452,12 +456,12 @@
   }
   .fleet-item-age {
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .fleet-offmap {
     margin-left: 6px;
     font-size: 11px;
     font-weight: 600;
-    color: var(--signal, #5FD4A8);
+    color: var(--signal);
   }
 </style>

@@ -10,7 +10,7 @@ to have a bunch of automated rules, which are now encoded in the
 protocol/workflow definition."
 **Related**: [job-packet-network.md](./job-packet-network.md) — the
 packet model this is the API for ·
-[requirements-based-addressing.md](./requirements-based-addressing.md) —
+[requirements-based-addressing, folded into the decision record](../architecture-decisions.md) —
 Q2's evaluator is this doc's evaluator ·
 [transactional-audit-log.md](./transactional-audit-log.md) — the
 staging discipline every consequence must ride ·

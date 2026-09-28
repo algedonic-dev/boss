@@ -14,11 +14,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use boss_core::publisher::DomainPublisher;
+use boss_policy::{Action, Resource};
+use boss_policy_client::{CurrentUser, PolicyClient};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::events::SERVICE_AGREEMENT_UPSERTED;
+use crate::http::require_on;
 
 fn default_currency() -> String {
     "USD".to_string()
@@ -33,17 +36,24 @@ pub struct AgreementsState {
     /// Authoritative clock — every emit stamps from here so sim
     /// mode produces sim-dated audit_log rows.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// The policy client the upsert asks. Required, like the invoice
+    /// surface's: until backlog d2bea664 (2026-09-27) this router took
+    /// no client and the POST asked nothing, so any caller reaching
+    /// the port could write any account's agreement.
+    pub policy: Arc<dyn PolicyClient>,
 }
 
 pub fn agreements_router(
     pool: PgPool,
     publisher: Option<DomainPublisher>,
     clock: Arc<dyn boss_clock_client::ClockClient>,
+    policy: Arc<dyn PolicyClient>,
 ) -> Router {
     let state = AgreementsState {
         pool: Arc::new(pool),
         publisher,
         clock,
+        policy,
     };
     Router::new()
         .route(
@@ -119,18 +129,32 @@ async fn list_agreements(
 
 async fn create_agreement(
     State(state): State<AgreementsState>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<ServiceAgreement>,
 ) -> Response {
+    // Policy before anything is read or written (backlog d2bea664).
+    // The door is an UPSERT: a new id creates an agreement and a known
+    // one moves its status, end date and value. It is both verbs, so it
+    // asks both — a role granted Create alone must not be able to
+    // expire someone else's contract through the create door.
+    for action in [Action::Create, Action::Update] {
+        if let Err(refused) =
+            require_on(state.policy.as_ref(), &user, action, Resource::agreement()).await
+        {
+            return refused;
+        }
+    }
     // Outbox phase 2: the state event records in the SAME tx as the
-    // upsert. This surface carries no CurrentUser extractor, so the
-    // actor is the publisher's default. The stamp mints wall time —
-    // sim time is retired from the record.
+    // upsert, signed by the caller — until d2bea664 this surface had
+    // no CurrentUser and every agreement was logged under the
+    // publisher's default actor. The stamp mints wall time — sim time
+    // is retired from the record.
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let stamp = match &state.publisher {
-        Some(p) => p.stamp_with_actor(p.default_actor()).await,
-        None => boss_core::publisher::EventStamp::new(
-            "commerce",
-            boss_core::actor::ActorId::Automation("platform".into()),
-        ),
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("commerce", actor),
     };
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,

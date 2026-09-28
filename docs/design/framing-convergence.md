@@ -434,7 +434,8 @@ regardless of what happens to the frame.
 
 ### Dangling references
 
-5. **`docs/design/protocol-cadence.md:13`** cites
+5. **`protocol-cadence.md:13`** (the doc retired on 2026-09-27, its
+   decision folded into `docs/architecture-decisions.md`) cited
    `[clock-as-service (docs/design/clock-as-service.md)]`. **That file
    does not exist** anywhere in the tree. It is also malformed as a
    markdown link, so no link check would catch it.

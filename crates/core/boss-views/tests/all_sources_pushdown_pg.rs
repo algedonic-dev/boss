@@ -239,3 +239,145 @@ async fn an_unpushable_filter_still_answers_via_the_residual() {
     assert_eq!(out.pushed_down, 0, "nothing pushable");
     assert_eq!(out.matched, 3, "residual still filtered correctly");
 }
+
+/// Backlog 2b5ad29a: a department's IN / WORKING / OUT question is
+/// `jobs.metadata.department`, and no View could ask it — neither
+/// `metadata` nor `partition` was a field of the jobs source. Both are,
+/// and both push into SQL rather than filtering the newest 5,000 rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_reach_their_metadata_and_partition_in_sql() {
+    let db = TestDb::new().await;
+    seed(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO jobs \
+            (id, kind, subject_kind, subject_id, title, owner_id, priority, status, opened_on, \
+             metadata, partition, simulated) \
+         VALUES (gen_random_uuid(), 'backlog-item', 'account', 'acc-keep', 'T', 'emp-alice', \
+                 'standard', 'open', CURRENT_DATE, '{\"department\": \"it\"}', 'simulated', true)",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("job with metadata inserts");
+    let u = user("emp-alice");
+
+    let it = run(
+        &db.pool,
+        open_policy(),
+        ViewSource::Jobs,
+        "metadata.department = \"it\"",
+        &u,
+    )
+    .await;
+    assert_eq!(it.matched, 1, "the one job whose department is it");
+    assert_eq!(
+        it.pushed_down, 1,
+        "metadata.<path> pushes, like payload.<path>"
+    );
+    assert_eq!(it.rows[0]["metadata"]["department"], "it");
+
+    let sim = run(
+        &db.pool,
+        open_policy(),
+        ViewSource::Jobs,
+        "partition = \"simulated\"",
+        &u,
+    )
+    .await;
+    assert_eq!(sim.matched, 1);
+    assert_eq!(sim.pushed_down, 1, "partition is a text column and pushes");
+}
+
+/// The served fields ARE the row: one list per source builds the SELECT,
+/// the JSON row and what `GET /api/views/sources` offers, so the column
+/// picker cannot offer a field the row lacks or miss one it carries
+/// (backlog 4a8939b5 — the events picker had lost two). Checked against
+/// real rows because the row is built from SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_source_row_carries_exactly_the_served_fields() {
+    let db = TestDb::new().await;
+    seed(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO steps (id, job_id, kind, title, assignee_id, status, sort_order) \
+         SELECT gen_random_uuid(), id, 'checklist', 'S', 'emp-alice', 'ready', 1 FROM jobs LIMIT 1",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("step inserts");
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+         VALUES (gen_random_uuid(), NOW(), 'test', 'test.happened', '{}')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("event inserts");
+    // The events source reads the projection, which only its rebuilder
+    // writes.
+    boss_views::rebuild_event_facts(&db.pool)
+        .await
+        .expect("event_facts rebuilds");
+
+    let served = boss_views::query::view_sources();
+    for schema in &served.sources {
+        let out = run(
+            &db.pool,
+            open_policy(),
+            schema.source,
+            "",
+            &user("emp-alice"),
+        )
+        .await;
+        let row = out
+            .rows
+            .first()
+            .unwrap_or_else(|| panic!("{}: a seeded row", schema.source.as_str()));
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("a row is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut fields: Vec<&str> = schema.fields.iter().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(keys, fields, "{}", schema.source.as_str());
+    }
+}
+
+/// The events source binds the scan ceiling at `$1` like every other
+/// source now (it used to interpolate it and start its terms at `$1`),
+/// so its filter terms start at `$2`. A text term and a payload path
+/// both push, and both still answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_push_down_behind_the_bound_ceiling() {
+    let db = TestDb::new().await;
+    for (kind, sku) in [
+        ("stock.moved", "FP-1"),
+        ("stock.moved", "FP-2"),
+        ("other", "FP-1"),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+             VALUES (gen_random_uuid(), NOW(), 'test', $1, $2)",
+        )
+        .bind(kind)
+        .bind(serde_json::json!({ "sku": sku }))
+        .execute(&db.pool)
+        .await
+        .expect("event inserts");
+    }
+    boss_views::rebuild_event_facts(&db.pool)
+        .await
+        .expect("event_facts rebuilds");
+    let u = user("emp-alice");
+
+    let both = run(
+        &db.pool,
+        open_policy(),
+        ViewSource::Events,
+        "kind = \"stock.moved\" AND payload.sku = \"FP-1\"",
+        &u,
+    )
+    .await;
+    assert_eq!(both.matched, 1);
+    assert_eq!(both.pushed_down, 2);
+}

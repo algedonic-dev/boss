@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { loadDriftPackets, newestMeasured, parseDriftPackets, type DriftPacket } from './drift';
+import {
+  loadDriftPackets,
+  measurementAge,
+  newestMeasured,
+  parseDriftPackets,
+  STALE_AFTER_HOURS,
+  type DriftPacket,
+} from './drift';
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -23,7 +30,10 @@ function measured(over: Record<string, unknown> = {}): Record<string, unknown> {
     fields_parsed: 49,
     fields_compared: 47,
     exempt: ['maintenance-protocol-drift'],
-    method: { comparator: 'infra/lint/the-live-protocols-are-the-authored-protocols.sh --require-live --report-json' },
+    method: {
+      comparator: 'infra/lint/the-live-protocols-are-the-authored-protocols.sh --require-live --report-json',
+      fields: 'label, description, category — and, since 2026-09-15, four step facets',
+    },
     ...over,
   };
 }
@@ -135,6 +145,58 @@ describe('parseDriftPackets', () => {
     // A drift row missing its kind is not a finding; the rest survive.
     const p = parseDriftPackets([packet('p1', {}, { fields: [{ field: 'label' }, FIELDS[0]] })]).packets[0]!;
     expect(p.drift.fields.map((f) => f.kind)).toEqual(['maintenance-sweep']);
+  });
+});
+
+// The subtitle used to enumerate the compared fields ("label,
+// description, category") and fell behind the script, which has
+// compared four step facets as well since 2026-09-15 (fb5f1c2f). The
+// script's own statement, `measured.method.fields`, is now the one copy
+// the page draws — parsed here, so a packet that omits it is said,
+// never filled in.
+describe('the compared fields are the packet\'s own statement', () => {
+  test('measured.method.fields survives verbatim', () => {
+    const p = parseDriftPackets([packet('p1')]).packets[0]!;
+    expect(p.measured.method_fields).toBe('label, description, category — and, since 2026-09-15, four step facets');
+  });
+
+  test('a packet whose method omits it reads null, never a typed default', () => {
+    expect(parseDriftPackets([packet('p1', { method: { comparator: 'x' } })]).packets[0]!.measured.method_fields).toBeNull();
+    expect(parseDriftPackets([packet('p1', { method: undefined })]).packets[0]!.measured.method_fields).toBeNull();
+  });
+
+  test('the tenant seeds the authored count includes are parsed for the line under the strip', () => {
+    // 90a24e28: the live header read "admitted 64 · authored 96" — 37 of
+    // the 96 are the demo tenant's seed kinds, which this instance does
+    // not run by design.
+    const p = parseDriftPackets([
+      packet('p1', {}, { tenants: [{ file: 'examples/brewery/seeds/workflows.toml', not_admitted: 37, total: 37 }] }),
+    ]).packets[0]!;
+    expect(p.drift.tenants).toEqual([{ file: 'examples/brewery/seeds/workflows.toml', not_admitted: 37, total: 37 }]);
+  });
+});
+
+// d83886c6: a stopped cadence would look current. The page drew the
+// newest measurement however old it was, and a clean streak ("every
+// compared field agrees") would keep rendering if the 05:20Z run
+// stopped. The age is drawn always and marked once it passes the daily
+// period plus two hours' slack.
+describe('measurementAge', () => {
+  const AT = '2026-09-27T05:21:58Z';
+  test('a measurement inside the daily period reads its age, unmarked', () => {
+    expect(measurementAge(AT, '2026-09-27T19:40:00Z')).toEqual({ text: '14h', stale: false });
+  });
+
+  test('exactly 26 h is still on time; past it is marked', () => {
+    expect(STALE_AFTER_HOURS).toBe(26);
+    expect(measurementAge(AT, '2026-09-28T07:21:58Z')?.stale).toBe(false);
+    expect(measurementAge(AT, '2026-09-28T07:22:58Z')).toEqual({ text: '26h', stale: true });
+    expect(measurementAge(AT, '2026-09-30T06:00:00Z')).toEqual({ text: '3d', stale: true });
+  });
+
+  test('an instant that cannot be read is no age at all, never an invented one', () => {
+    expect(measurementAge('not a time', '2026-09-27T19:40:00Z')).toBeNull();
+    expect(measurementAge(AT, '')).toBeNull();
   });
 });
 

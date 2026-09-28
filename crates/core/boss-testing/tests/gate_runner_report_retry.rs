@@ -21,6 +21,7 @@
 //! Skips rather than fails when `python3` or `curl` is absent, so a
 //! machine without them does not manufacture a red.
 
+use boss_testing::announce::{await_announced_port, with_announce};
 use boss_testing::repo_root;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,20 @@ use std::time::{Duration, Instant};
 const PACKET: &str = "11111111-2222-4333-8444-555555555555";
 const BEGIN: &str = "# --- report-back (begin) ---";
 const END: &str = "# --- report-back (end) ---";
+
+/// The `code` the step PUT's 409 carries when another write moved the
+/// row between the handler's read and its write (car 88123ae0) — the
+/// constant itself, not a copy of it (backlog 2aa2b19e). The runner
+/// recognises that refusal by this code; its `error` words are for a
+/// person and are free to move, so the stub answers with [`RACE_WORDS`]
+/// — words the server never says — and a runner that still matched the
+/// words would miss the race.
+const STEP_CHANGED: &str = boss_jobs::step_metadata_write::STEP_CHANGED_CODE;
+
+/// The words the stub's step-race 409 carries: deliberately NOT
+/// `STEP_CHANGED_ERROR`, so these cases prove the match is on the code,
+/// and that the words that reach the log are the server's own.
+const RACE_WORDS: &str = "the stub's words for a lost step race — nothing was written";
 
 /// The report-back block, lifted out of `run.sh` verbatim. It lives
 /// inline in the runner because the pod receives exactly one file (the
@@ -62,21 +77,38 @@ fn missing(tool: &str) -> bool {
 ///   `503:N`  — answer 503 to the first N requests (an ingress with no
 ///              endpoints mid-roll), then serve;
 ///   `never`  — 503 forever;
-///   `409`    — serve the GET, refuse every PUT with 409 (a frozen step).
+///   `409`    — serve the GET, refuse every write with 409 (a frozen step);
+///   `done:V` — the record-verdict step is ALREADY completed carrying
+///              verdict V: the merge door refuses it with 409, as the
+///              real one refuses any terminal step, and a status PUT
+///              passes as the idempotent re-send it is;
+///   `race:N` — the merge door lands, and the first N step PUTs lose the
+///              step write's compare-and-set: 409 whose `code` is
+///              [`STEP_CHANGED`] (car 88123ae0) and whose `error` is
+///              [`RACE_WORDS`], both read from its environment and
+///              written unescaped, as serde_json does;
+///   `race-old:N` — as `race:N`, but the 409 carries only the words a
+///              server from before the code sent (no `code`), which the
+///              runner still resends on for one release;
+///   `put409` — the merge door lands and every step PUT is refused 409
+///              for another reason (unresolved blockers).
+/// Writes are logged per route — `puts.log` for the step PUT,
+/// `patches.log` for the step merge door — because which door carried
+/// which keys is the property under test (backlog e39a9d2a).
 /// `delay` seconds pass before it LISTENS, so a curl in that window
 /// gets connection refused — the bare-Service shape of a roll.
 ///
 /// It announces two facts by writing the files it is told to, because
 /// they are the two the test has to wait on and cannot see from outside:
 /// `started` before the delay, and `bound` once its listener exists.
+/// `announce` is boss_testing's, prepended by `with_announce`: it renames
+/// each file into place, because `started` carries the port and a reader
+/// that saw it between `open` and `write` parsed an empty string
+/// (backlog 0d1e557e).
 const STUB: &str = r#"
-import http.server, json, socket, sys, time
+import http.server, json, os, socket, sys, time
 log, mode, delay = sys.argv[1], sys.argv[2], float(sys.argv[3])
 JOB, started_at, bound_at = sys.argv[4], sys.argv[5], sys.argv[6]
-
-def announce(path, text="ok"):
-    with open(path, "w") as f:
-        f.write(text)
 
 # THE STUB OWNS ITS PORT FROM THE FIRST INSTANT. It used to be handed a
 # port the test had bound and released — a window in which any of the
@@ -119,23 +151,50 @@ class H(http.server.BaseHTTPRequestHandler):
         if self._rolling():
             return
         if self.path == "/api/jobs/" + JOB:
+            verdict_step = {"id": "step-verdict", "spec_slug": "record-verdict",
+                            "status": "active", "metadata": {"authority_role": "platform-admin"}}
+            if mode.startswith("done:"):
+                verdict_step["status"] = "completed"
+                verdict_step["metadata"]["verdict"] = mode.split(":", 1)[1]
             self._reply(200, json.dumps({"id": JOB, "status": "open", "steps": [
-                {"id": "step-gate", "spec_slug": "gate"},
-                {"id": "step-verdict", "spec_slug": "record-verdict"},
+                {"id": "step-gate", "spec_slug": "gate", "status": "completed"},
+                verdict_step,
             ]}).encode())
         else:
             self._reply(404)
-    def do_PUT(self):
+    def _write(self, path):
         if self._rolling():
             return
         n = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(n).decode()
-        with open(log, "a") as f:
+        with open(path, "a") as f:
             f.write(self.path + " " + body + "\n")
-        if mode == "409":
-            self._reply(409, b'{"error":"step is completed"}')
+        frozen = mode.startswith("done:") and path.endswith("patches.log")
+        if mode.startswith("race:") and path.endswith("puts.log"):
+            seen["puts"] = seen.get("puts", 0) + 1
+            if seen["puts"] <= int(mode.split(":")[1]):
+                body = {"error": os.environ["RACE_WORDS"], "code": os.environ["STEP_CHANGED"],
+                        "step_id": "step-verdict",
+                        "hint": "nothing was written; send the same request again"}
+                self._reply(409, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+                return
+        if mode.startswith("race-old:") and path.endswith("puts.log"):
+            seen["puts"] = seen.get("puts", 0) + 1
+            if seen["puts"] <= int(mode.split(":")[1]):
+                body = {"error": os.environ["STEP_CHANGED_OLD"], "step_id": "step-verdict"}
+                self._reply(409, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+                return
+        if mode == "put409" and path.endswith("puts.log"):
+            self._reply(409, b'{"error":"step has unresolved blockers"}')
+            return
+        if mode == "409" or frozen:
+            self._reply(409, b'{"error":"step is terminal"}')
         else:
-            self._reply(200)
+            self._reply(204, b"")
+    def do_PUT(self):
+        self._write(log)
+    def do_PATCH(self):
+        self._write(log.replace("puts.log", "patches.log"))
 
 # listen() is the line past which a connection to the port can no longer
 # be refused — exactly the fact `start_stub` waits for. The server takes
@@ -184,20 +243,24 @@ impl Stub {
     }
 
     fn puts(&self) -> Vec<String> {
-        std::fs::read_to_string(self.dir.join("puts.log"))
+        self.logged("puts.log")
+    }
+
+    /// The writes that went through the step MERGE door
+    /// (`PATCH …/steps/{id}/metadata`).
+    fn patches(&self) -> Vec<String> {
+        self.logged("patches.log")
+    }
+
+    fn logged(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join(name))
             .map(|s| s.lines().map(str::to_string).collect())
             .unwrap_or_default()
     }
 }
 
 fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "gate-report-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+    boss_testing::scratch_dir(&format!("gate-report-{tag}"))
 }
 
 fn start_stub(tag: &str, mode: &str, delay_secs: f32) -> Stub {
@@ -208,7 +271,7 @@ fn start_stub(tag: &str, mode: &str, delay_secs: f32) -> Stub {
     let script = dir.join("stub.py");
     let started = dir.join("started");
     let bound = dir.join("bound");
-    std::fs::write(&script, STUB).expect("write stub");
+    std::fs::write(&script, with_announce(STUB)).expect("write stub");
     let child = Command::new("python3")
         .arg(&script)
         .arg(dir.join("puts.log"))
@@ -217,6 +280,12 @@ fn start_stub(tag: &str, mode: &str, delay_secs: f32) -> Stub {
         .arg(PACKET)
         .arg(&started)
         .arg(&bound)
+        .env("STEP_CHANGED", STEP_CHANGED)
+        .env("RACE_WORDS", RACE_WORDS)
+        .env(
+            "STEP_CHANGED_OLD",
+            boss_jobs::step_metadata_write::STEP_CHANGED_ERROR_BEFORE_THE_CODE,
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -245,18 +314,8 @@ fn start_stub(tag: &str, mode: &str, delay_secs: f32) -> Stub {
     // `started` first, ALWAYS: a stub with a delay owes the test `delay`
     // seconds of darkness, and measuring that from `spawn()` hands
     // python's boot time to the race in the other direction.
-    stub.await_fact(
-        &started,
-        Duration::from_secs(30),
-        "the stub process never started",
-    );
     // `started` carries the port the stub bound — read it, never guess it.
-    stub.port = std::fs::read_to_string(&started)
-        .expect("started marker")
-        .trim()
-        .parse()
-        .expect("the started marker carries the stub's port");
-    assert!(stub.port != 0, "the stub announced port 0");
+    stub.port = await_announced_port(&mut stub.child, &started, Duration::from_secs(30));
     if delay_secs == 0.0 {
         stub.await_fact(&bound, Duration::from_secs(10), "the stub never bound");
     }
@@ -332,17 +391,140 @@ fn a_report_that_meets_a_rolling_sor_retries_until_it_lands() {
         joined.contains("recorded on packet") && joined.contains("attempt 4"),
         "the success line must name the packet and the attempt that landed:\n{joined}"
     );
-    let puts = stub.puts();
+    let patches = stub.patches();
     assert_eq!(
-        puts.len(),
+        patches.len(),
         1,
-        "exactly one verdict write must land: {puts:?}"
+        "exactly one verdict merge must land: {patches:?}"
     );
     assert!(
-        puts[0].starts_with(&format!("/api/jobs/{PACKET}/steps/step-verdict "))
-            && puts[0].contains("\"verdict\": \"green\""),
-        "the write goes to the record-verdict step with the verdict: {}",
-        puts[0]
+        patches[0].starts_with(&format!("/api/jobs/{PACKET}/steps/step-verdict/metadata "))
+            && patches[0].contains("\"verdict\": \"green\""),
+        "the verdict goes to the record-verdict step's merge door: {}",
+        patches[0]
+    );
+    let puts = stub.puts();
+    assert_eq!(puts.len(), 1, "exactly one completion lands: {puts:?}");
+    let (path, body) = puts[0].split_once(' ').expect("path and body");
+    assert_eq!(path, format!("/api/jobs/{PACKET}/steps/step-verdict"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).expect("PUT body is JSON"),
+        serde_json::json!({"status": "completed"}),
+        "and the PUT that completes it carries only the status"
+    );
+}
+
+/// THE VERDICT RIDES THE MERGE DOOR; THE PUT CARRIES ONLY THE STATUS.
+///
+/// Backlog e39a9d2a, car 2 of its plan (correction 2026-09-23). The
+/// step PUT REPLACES metadata wholesale, and the registry materializes
+/// keys onto every step at admission — `metadata_defaults`, plus
+/// `authority_role`, `station`, `audience`, `claimable` — so a PUT
+/// built without a prior read drops every key it did not think to send.
+/// This runner reported every gate verdict that way:
+/// `{status, metadata: {verdict, receipt}}` and no read. The server is
+/// to refuse such a body (the item's last car); until then it silently
+/// sheds the step's own keys, and once it refuses, every gate would
+/// stop reporting. So the keys go through `PATCH …/steps/{id}/metadata`,
+/// which merges against the row as it stands and cannot race, and the
+/// completion is a status-only PUT that carries nothing to drop.
+///
+/// ORDER IS LOAD-BEARING: merge first, then status. The step's
+/// required-at-done fields are validated when it flips to completed, so
+/// the verdict must already be on the row when the PUT arrives.
+#[test]
+fn the_verdict_rides_the_merge_door_and_the_put_carries_only_status() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("merge-door", "503:0", 0.0);
+    let (lines, ok) = run_report(&stub, "0", "green");
+    let joined = lines.join("\n");
+    assert!(ok, "the report must land:\n{joined}");
+
+    let patches = stub.patches();
+    assert_eq!(patches.len(), 1, "one merge: {patches:?}");
+    let (path, body) = patches[0].split_once(' ').expect("path and body");
+    assert_eq!(
+        path,
+        format!("/api/jobs/{PACKET}/steps/step-verdict/metadata"),
+        "the keys go through the step merge door"
+    );
+    let merged: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("merge body is JSON ({e}): {body}"));
+    let keys: Vec<&str> = merged
+        .as_object()
+        .expect("the merge body is an object of top-level keys")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["receipt", "verdict"],
+        "the merge carries exactly the runner's two keys — no `status`, which on \
+         the merge door would be a metadata key named status: {body}"
+    );
+    assert_eq!(merged["verdict"], "green");
+
+    let puts = stub.puts();
+    assert_eq!(puts.len(), 1, "one completion: {puts:?}");
+    let (path, body) = puts[0].split_once(' ').expect("path and body");
+    assert_eq!(path, format!("/api/jobs/{PACKET}/steps/step-verdict"));
+    let put: serde_json::Value = serde_json::from_str(body).expect("PUT body is JSON");
+    assert_eq!(
+        put,
+        serde_json::json!({"status": "completed"}),
+        "the PUT must carry NO metadata — a metadata body replaces the step's \
+         stored keys wholesale, which is the defect"
+    );
+}
+
+/// A RETRY AFTER A WRITE THAT LANDED. A timeout can hide a completion
+/// that did land; the next attempt then finds the step terminal, and
+/// the merge door refuses a terminal step outright (the PUT had an
+/// idempotent-re-send carve-out; the merge door has none). When the
+/// step already carries THIS verdict the report is done — saying so is
+/// the truth, and a refusal would send a green down the unreported
+/// branch.
+#[test]
+fn a_verdict_already_on_the_step_is_recorded_not_rewritten() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("already", "done:green", 0.0);
+    let (lines, ok) = run_report(&stub, "0", "green");
+    let joined = lines.join("\n");
+    assert!(ok, "the verdict is on the record:\n{joined}");
+    assert!(
+        joined.contains("already carries verdict green"),
+        "the log says why nothing was written:\n{joined}"
+    );
+    assert!(stub.patches().is_empty(), "no merge: {:?}", stub.patches());
+    assert!(stub.puts().is_empty(), "no PUT: {:?}", stub.puts());
+}
+
+/// ...but a terminal step carrying a DIFFERENT verdict is a frozen step
+/// this run cannot write to (a reused packet, cf0021ae), and that must
+/// refuse loudly rather than report success.
+#[test]
+fn a_terminal_step_with_another_verdict_is_refused() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("other", "done:red", 0.0);
+    let (lines, ok) = run_report(&stub, "0 0", "green");
+    let joined = lines.join("\n");
+    assert!(
+        !ok,
+        "a frozen step with another verdict is not a landed report:\n{joined}"
+    );
+    assert!(
+        joined.contains("not retrying") && joined.contains("409"),
+        "the merge door's refusal is named and not retried:\n{joined}"
+    );
+    assert!(
+        stub.puts().is_empty(),
+        "no completion after a refused merge"
     );
 }
 
@@ -390,6 +572,10 @@ fn a_sor_that_never_returns_exhausts_the_retries_and_says_so() {
         "the last line must say the retries are exhausted:\n{joined}"
     );
     assert!(stub.puts().is_empty(), "nothing can have landed:\n{joined}");
+    assert!(
+        stub.patches().is_empty(),
+        "nothing can have landed:\n{joined}"
+    );
 }
 
 /// A refusal that is ABOUT the write (a frozen step answers 409) is not a
@@ -410,9 +596,127 @@ fn a_definitive_refusal_is_not_retried() {
         "the refusal must be named and not retried:\n{joined}"
     );
     assert_eq!(
-        stub.puts().len(),
+        stub.patches().len(),
         1,
         "exactly one write was attempted:\n{joined}"
+    );
+    assert!(
+        stub.puts().is_empty(),
+        "a refused merge is not followed by a completion:\n{joined}"
+    );
+}
+
+/// A COMPLETION THAT LOST THE STEP RACE IS SENT ONCE MORE (backlog
+/// 2a6d0b86, review of car 88123ae0). That car makes the step PUT
+/// refuse, with a 409 carrying [`STEP_CHANGED`], a write computed from
+/// a read another write has since moved — where it used to answer
+/// success and erase the other write. This runner's completion is
+/// exactly the shape that can lose that race, and it read ANY 4xx as
+/// final: the report refused outright, and the conductor later closed
+/// the gate-run `lost` over a real green or red. The refusal says
+/// nothing was written, and the body is status-only, so the same body
+/// is sent once more — and lands.
+#[test]
+fn a_completion_that_lost_the_step_race_is_sent_once_more_and_lands() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("race-once", "race:1", 0.0);
+    let (lines, ok) = run_report(&stub, "0 0 0", "green");
+    let joined = lines.join("\n");
+    assert!(
+        ok,
+        "one lost race is not a refused report — the resend lands:\n{joined}"
+    );
+    assert_eq!(stub.patches().len(), 1, "one merge:\n{joined}");
+    let puts = stub.puts();
+    assert_eq!(
+        puts.len(),
+        2,
+        "the lost completion and exactly one resend:\n{joined}"
+    );
+    for put in &puts {
+        let (path, body) = put.split_once(' ').expect("path and body");
+        assert_eq!(path, format!("/api/jobs/{PACKET}/steps/step-verdict"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).expect("PUT body is JSON"),
+            serde_json::json!({"status": "completed"}),
+            "the resend is the same status-only body"
+        );
+    }
+    assert!(
+        joined.contains("sending the same status-only body once more"),
+        "the log says why a second PUT went out:\n{joined}"
+    );
+    assert!(
+        joined.contains("recorded on packet") && joined.contains("attempt 1"),
+        "the resend is inside the attempt, not a retry of the report:\n{joined}"
+    );
+}
+
+/// ...and a completion that loses it AGAIN is refused by name, never
+/// looped: two lost races in a row is not the ordinary timing a single
+/// resend answers, and the report must stop and say which refusal it
+/// met rather than spend its retry schedule re-sending.
+#[test]
+fn a_completion_that_loses_the_step_race_twice_is_refused_by_name() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("race-always", "race:99", 0.0);
+    let (lines, ok) = run_report(&stub, "0 0 0", "green");
+    let joined = lines.join("\n");
+    assert!(!ok, "a second lost race is a refused report:\n{joined}");
+    assert_eq!(
+        stub.puts().len(),
+        2,
+        "one resend, never a loop — and the report does not retry it:\n{joined}"
+    );
+    assert!(
+        joined.contains("lost the step race twice") && joined.contains(RACE_WORDS),
+        "the refusal is named by the server's own words:\n{joined}"
+    );
+    assert!(
+        joined.contains("not retrying"),
+        "a refusal about the write is not a roll:\n{joined}"
+    );
+}
+
+/// FOR ONE RELEASE, THE OLD WORDS ARE THE RACE TOO (the review of car
+/// 24eb9471): a jobs API from before the code answers with its old words
+/// and no `code`, and the runner still resends once. Delete with
+/// `STEP_CHANGED_ERROR_BEFORE_THE_CODE`.
+#[test]
+fn a_completion_that_lost_the_race_in_the_old_words_is_sent_once_more() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("race-old-once", "race-old:1", 0.0);
+    let (lines, ok) = run_report(&stub, "0 0 0", "green");
+    let joined = lines.join("\n");
+    assert!(ok, "the resend lands:\n{joined}");
+    assert_eq!(stub.puts().len(), 2, "one resend:\n{joined}");
+}
+
+/// Any OTHER 409 on the completion is still final: only the refusal
+/// that says nothing was written earns a resend.
+#[test]
+fn a_completion_refused_for_another_reason_is_not_resent() {
+    if skip() {
+        return;
+    }
+    let stub = start_stub("put-409", "put409", 0.0);
+    let (lines, ok) = run_report(&stub, "0 0", "green");
+    let joined = lines.join("\n");
+    assert!(!ok, "{joined}");
+    assert_eq!(
+        stub.puts().len(),
+        1,
+        "a refusal that is not the step race is never resent:\n{joined}"
+    );
+    assert!(
+        joined.contains("step has unresolved blockers"),
+        "the refusal carries the server's words, not only its status:\n{joined}"
     );
 }
 
@@ -480,17 +784,17 @@ fn the_landed_receipt_records_the_report_backs_own_story() {
     let (lines, ok) = run_report(&stub, "0 0 0 0 0", "green");
     let joined = lines.join("\n");
     assert!(ok, "the report must land once the SoR is back:\n{joined}");
-    let puts = stub.puts();
-    assert_eq!(puts.len(), 1, "exactly one write lands: {puts:?}");
+    let patches = stub.patches();
+    assert_eq!(patches.len(), 1, "exactly one merge lands: {patches:?}");
 
-    let body = puts[0]
+    let body = patches[0]
         .split_once(' ')
         .map(|(_, b)| b.to_string())
-        .unwrap_or_else(|| panic!("the logged PUT has a body: {}", puts[0]));
-    let put: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("PUT body is JSON ({e}): {body}"));
-    let raw = put
-        .pointer("/metadata/receipt")
+        .unwrap_or_else(|| panic!("the logged merge has a body: {}", patches[0]));
+    let merged: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("merge body is JSON ({e}): {body}"));
+    let raw = merged
+        .pointer("/receipt")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the write carries a receipt: {body}"));
     let receipt: serde_json::Value = serde_json::from_str(raw)
@@ -537,12 +841,12 @@ fn a_first_attempt_report_records_a_clean_story() {
     let (lines, ok) = run_report(&stub, "0 0 0", "green");
     let joined = lines.join("\n");
     assert!(ok, "the report must land:\n{joined}");
-    let puts = stub.puts();
-    assert_eq!(puts.len(), 1, "one write: {puts:?}");
-    let body = puts[0].split_once(' ').expect("body").1.to_string();
-    let put: serde_json::Value = serde_json::from_str(&body).expect("PUT body is JSON");
-    let raw = put
-        .pointer("/metadata/receipt")
+    let patches = stub.patches();
+    assert_eq!(patches.len(), 1, "one merge: {patches:?}");
+    let body = patches[0].split_once(' ').expect("body").1.to_string();
+    let merged: serde_json::Value = serde_json::from_str(&body).expect("merge body is JSON");
+    let raw = merged
+        .pointer("/receipt")
         .and_then(|v| v.as_str())
         .expect("receipt present");
     let receipt: serde_json::Value = serde_json::from_str(raw).expect("receipt is JSON");

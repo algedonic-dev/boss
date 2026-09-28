@@ -1,8 +1,9 @@
 //! HTTP surface for Views.
 //!
-//! `GET/POST /api/views`, `GET/PUT/DELETE /api/views/{id}`, and
+//! `GET/POST /api/views`, `GET/PUT/DELETE /api/views/{id}`,
 //! `GET /api/views/{id}/results` — the definition CRUD plus the one
-//! endpoint that runs it.
+//! endpoint that runs it — and `GET /api/views/sources`, what each
+//! source offers the author of one.
 
 use std::sync::Arc;
 
@@ -209,6 +210,7 @@ pub struct ResultsQuery {
 pub fn router(state: ViewsApiState) -> Router {
     Router::new()
         .route("/api/views/health", get(health))
+        .route("/api/views/sources", get(sources))
         .route("/api/views", get(list_views).post(create_view))
         .route(
             "/api/views/{id}",
@@ -227,6 +229,17 @@ async fn health() -> Response {
     Json(serde_json::json!({ "status": "ok", "service": "views" })).into_response()
 }
 
+/// `GET /api/views/sources` — each source's fields, the ones a filter
+/// pushes into SQL, and the scan ceiling (backlog 4a8939b5).
+///
+/// Read from the lists the resolver itself selects and pushes with, so
+/// the page offers exactly what a View can reach. Not caller-scoped: it
+/// describes the sources' shapes, never a row, and whether the caller
+/// may read a source is answered when they run a View over it.
+async fn sources() -> Response {
+    Json(crate::query::view_sources()).into_response()
+}
+
 fn err_to_response(e: ViewsError) -> Response {
     match e {
         ViewsError::NotFound(s) => (StatusCode::NOT_FOUND, s).into_response(),
@@ -240,6 +253,16 @@ fn err_to_response(e: ViewsError) -> Response {
             .into_response(),
         ViewsError::Invalid(s) => (StatusCode::BAD_REQUEST, s).into_response(),
         ViewsError::Storage(s) => (StatusCode::INTERNAL_SERVER_ERROR, s).into_response(),
+        // A policy answer about the CALLER, not a leak about the View:
+        // the View was already found for them, so a 403 confirms
+        // nothing a 404 would have hidden (compare `get_for_viewer`).
+        e @ ViewsError::SourceDenied { .. } => {
+            (StatusCode::FORBIDDEN, e.to_string()).into_response()
+        }
+        ViewsError::Policy(e) => {
+            tracing::warn!(error = %e, "views: caller's policy scope could not be decided");
+            e.into_response()
+        }
     }
 }
 
@@ -360,6 +383,7 @@ mod tests {
                 matched: 1,
                 pushed_down: 0,
                 truncated: false,
+                scope: crate::types::ResultScope::All,
             })
         }
     }
@@ -650,6 +674,71 @@ mod tests {
         .await;
         let results: ViewResults = serde_json::from_str(&b).expect("results");
         assert_eq!(results.rows[0]["limit_seen"], serde_json::json!(MAX_LIMIT));
+    }
+
+    /// Backlog 4a8939b5: the page kept its own copies of each source's
+    /// fields, the pushable names and the scan ceiling, and two of the
+    /// three had drifted — the events picker could not offer
+    /// `subject_kind`/`subject_id`, and the pushdown hint omitted
+    /// `payload.<path>`. The server now serves them; this pins that what
+    /// it serves is what the resolver uses.
+    #[tokio::test]
+    async fn the_sources_are_served_from_what_the_resolver_reads() {
+        use crate::pushdown::ColumnType;
+        use crate::types::{PushableField, ViewSource, ViewSources};
+
+        let app = app();
+        let (status, b) = send(&app, "GET", "/api/views/sources", "alice", None).await;
+        assert_eq!(status, StatusCode::OK, "body: {b}");
+        let served: ViewSources = serde_json::from_str(&b).expect("a sources document");
+        assert_eq!(served.scan_ceiling, crate::query::SCAN_CEILING);
+        assert_eq!(
+            served.sources.iter().map(|s| s.source).collect::<Vec<_>>(),
+            ViewSource::ALL.to_vec(),
+            "every source, in the order the composer offers them"
+        );
+        let of = |src: ViewSource| {
+            served
+                .sources
+                .iter()
+                .find(|s| s.source == src)
+                .expect("source served")
+                .clone()
+        };
+        let has_field = |src: ViewSource, f: &str| of(src).fields.iter().any(|x| x == f);
+        let pushes = |src: ViewSource, f: &str, t: ColumnType| {
+            of(src).pushable.contains(&PushableField {
+                field: f.to_string(),
+                column_type: t,
+            })
+        };
+
+        // The two the client copy dropped, and the pushdown it omitted.
+        assert!(has_field(ViewSource::Events, "subject_kind"));
+        assert!(has_field(ViewSource::Events, "subject_id"));
+        assert!(pushes(ViewSource::Events, "payload", ColumnType::Json));
+
+        // Backlog 2b5ad29a: a department's question lives in
+        // `jobs.metadata.department`, and outcomes in `steps.metadata`.
+        assert!(has_field(ViewSource::Jobs, "metadata"));
+        assert!(has_field(ViewSource::Jobs, "partition"));
+        assert!(has_field(ViewSource::Steps, "metadata"));
+        assert!(pushes(ViewSource::Jobs, "metadata", ColumnType::Json));
+        assert!(pushes(ViewSource::Jobs, "partition", ColumnType::Text));
+        assert!(pushes(ViewSource::Steps, "metadata", ColumnType::Json));
+
+        // Every pushable name is a field the row carries — a hint naming
+        // a field the picker cannot offer is the drift over again.
+        for s in &served.sources {
+            for p in &s.pushable {
+                assert!(
+                    s.fields.contains(&p.field),
+                    "{}: pushable {} is not a field",
+                    s.source.as_str(),
+                    p.field
+                );
+            }
+        }
     }
 
     #[tokio::test]

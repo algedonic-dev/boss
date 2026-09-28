@@ -1,15 +1,13 @@
 // Asset types — shape matches /api/assets + /api/assets/summary.
 
-export type AssetLifecyclePhase =
-  | 'registered' | 'received' | 'triaging' | 'refurbing' | 'qa' | 'ready'
-  | 'shipped' | 'installed' | 'out-for-service' | 'decommissioned';
-
 export type Asset = {
   asset_id: string;
   // Null until the unit is identified — identity-first: an asset is
   // `registered` (it exists) before its catalog model is known.
   sku: string | null;
-  phase: AssetLifecyclePhase;
+  // A code from the Class registry's `(asset, phase)` rows. It was a
+  // closed union here, a copy of a vocabulary that is data (53fecfc9).
+  phase: string;
   holder_kind: string | null;
   holder_id: string | null;
   warranty_through: string | null;

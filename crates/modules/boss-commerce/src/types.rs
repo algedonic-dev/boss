@@ -45,6 +45,59 @@ impl InvoiceStatus {
     pub fn is_paid(&self) -> bool {
         self.0 == Self::PAID
     }
+
+    /// The statuses that are no longer owed: paid, and written off —
+    /// the write-off credits 1100 A/R, so the receivable is gone even
+    /// though no cash came in. Every other status, a tenant's own
+    /// included, is still owed. One list, read by both adapters of
+    /// `open_ar_by_account` (backlog 5257bfa9) and of the summary's
+    /// AR aging (backlog 926d64a3) — the SPA's Finance InvoicesTab
+    /// draws "outstanding" with the same two out.
+    pub const NOT_OWED: [&'static str; 2] = [Self::PAID, Self::WRITTEN_OFF];
+
+    /// True while the invoice is still a receivable.
+    pub fn is_owed(&self) -> bool {
+        !Self::NOT_OWED.contains(&self.0.as_str())
+    }
+
+    /// The invoice transition rule, stated once (backlog 203ef806): what
+    /// a status write to `to` does to an invoice at this status. An
+    /// invoice leaves the receivable once — every owed status, a
+    /// tenant's own included, may move to any other; a status in
+    /// `NOT_OWED` is terminal, because paid and written-off have both
+    /// already taken the amount out of 1100 A/R and a flip back would
+    /// count it owed a second time. Writing the status it already has
+    /// is a redelivered drive and converges. Both adapters of the three
+    /// status verbs enforce this — Pg in the UPDATE's own WHERE — and
+    /// `tests/invoice_transitions.rs` holds both to the same table:
+    ///
+    /// | from \ to    | paid    | past-due | written-off |
+    /// |--------------|---------|----------|-------------|
+    /// | outstanding  | flip    | flip     | flip        |
+    /// | past-due     | flip    | already  | flip        |
+    /// | paid         | already | REFUSED  | REFUSED     |
+    /// | written-off  | REFUSED | REFUSED  | already     |
+    /// | (tenant, owed) | flip  | flip     | flip        |
+    pub fn transition_to(&self, to: &str) -> InvoiceTransition {
+        if self.0 == to {
+            InvoiceTransition::Already
+        } else if self.is_owed() {
+            InvoiceTransition::Flip
+        } else {
+            InvoiceTransition::Refused
+        }
+    }
+}
+
+/// What `InvoiceStatus::transition_to` decides for one status write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceTransition {
+    /// The invoice moves, and the move records its event.
+    Flip,
+    /// Already at the target: Ok, nothing changes, no event.
+    Already,
+    /// The source is terminal: refused by name, nothing changes.
+    Refused,
 }
 
 impl std::fmt::Display for InvoiceStatus {
@@ -67,7 +120,7 @@ impl From<&str> for InvoiceStatus {
 
 /// Per-line revenue bucket. Open-string newtype so tenants can
 /// declare their own categories as data without recompiling the
-/// platform. Values are kebab-case ("wholesale", "service",
+/// platform. Values are kebab-case ("wholesale", "taproom",
 /// "event-package"); the postgres column is `TEXT NOT NULL` and
 /// the wire JSON is the bare string (`#[serde(transparent)]`).
 ///
@@ -212,6 +265,55 @@ pub struct Invoice {
     pub line_items: Vec<InvoiceLineItem>,
 }
 
+impl Invoice {
+    /// PURE: every field fixed at issuance where `self` — a create body
+    /// under an id `stored` already holds — does not read as `stored`
+    /// (backlog 9d2af748). Empty means the body describes the invoice
+    /// that exists, and the create is answered rather than written.
+    /// One definition for both adapters (CLAUDE.md §9a).
+    ///
+    /// Left out: `status` and `paid_on`, which the status verbs move
+    /// after issuance — a redelivered issue carries the status the
+    /// invoice was issued at, and must neither be refused for it nor
+    /// move the invoice back. The lines are compared as a set by id,
+    /// and a line's `invoice_id` is not compared: the adapter writes
+    /// the header's id there whatever the line carried.
+    pub fn issuance_differences(&self, stored: &Invoice) -> Vec<&'static str> {
+        let lines = |inv: &Invoice| {
+            let mut lines: Vec<InvoiceLineItem> = inv
+                .line_items
+                .iter()
+                .map(|l| InvoiceLineItem {
+                    invoice_id: inv.id.clone(),
+                    ..l.clone()
+                })
+                .collect();
+            lines.sort_by(|a, b| a.id.cmp(&b.id));
+            lines
+        };
+        [
+            ("account_id", self.account_id != stored.account_id),
+            ("issued_on", self.issued_on != stored.issued_on),
+            ("due_on", self.due_on != stored.due_on),
+            ("amount_cents", self.amount_cents != stored.amount_cents),
+            ("currency", self.currency != stored.currency),
+            ("tax_cents", self.tax_cents != stored.tax_cents),
+            (
+                "tax_jurisdiction",
+                self.tax_jurisdiction != stored.tax_jurisdiction,
+            ),
+            (
+                "payment_method",
+                self.payment_method != stored.payment_method,
+            ),
+            ("line_items", lines(self) != lines(stored)),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RevenueLine {
     pub month: NaiveDate,
@@ -227,6 +329,20 @@ pub struct RevenueLine {
 // without downloading every invoice.
 // ---------------------------------------------------------------------------
 
+/// One account's open receivables, summed by the service over every
+/// invoice it holds — `GET /api/commerce/open-ar`. /ux/accounts read
+/// the invoice LIST and summed it in the browser, and the list hands
+/// over at most 1,000 rows, so past that the figure was short with
+/// nothing on the page saying so (backlog 5257bfa9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountOpenAr {
+    pub account_id: AccountId,
+    /// Sum of `amount_cents` over the account's owed invoices.
+    pub open_ar_cents: i64,
+    /// How many invoices that sum covers.
+    pub open_count: i64,
+}
+
 /// One AR aging bucket: how many unpaid invoices and how much outstanding
 /// within a days-past-due range.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,6 +351,52 @@ pub struct ArAgingBucket {
     pub label: String,
     pub count: i64,
     pub total_cents: i64,
+}
+
+impl ArAgingBucket {
+    /// Every label, in the order the summary emits them — all five
+    /// even when empty, so the frontend always sees the same shape.
+    pub const LABELS: [&'static str; 5] = ["current", "1-30", "31-60", "61-90", "90+"];
+
+    /// The bucket an owed invoice falls in, by days past its due date.
+    /// `current` is due in the future or due today.
+    pub fn label_for(days_past_due: i64) -> &'static str {
+        match days_past_due {
+            ..=0 => "current",
+            1..=30 => "1-30",
+            31..=60 => "31-60",
+            61..=90 => "61-90",
+            _ => "90+",
+        }
+    }
+
+    /// Age `(days_past_due, count, total_cents)` rows into the five
+    /// buckets. The one bucketing rule both adapters of
+    /// `invoice_summary` read (backlog 926d64a3): the Pg adapter used
+    /// to spell the thresholds in a SQL `CASE` while the in-memory one
+    /// returned no aging at all. The rows are the OWED invoices only —
+    /// `InvoiceStatus::is_owed` decides which, never a status literal.
+    pub fn age(rows: impl IntoIterator<Item = (i64, i64, i64)>) -> Vec<ArAgingBucket> {
+        let sums = rows.into_iter().fold(
+            std::collections::HashMap::<&str, (i64, i64)>::new(),
+            |mut acc, (days, count, cents)| {
+                let e = acc.entry(Self::label_for(days)).or_default();
+                *e = (e.0 + count, e.1 + cents);
+                acc
+            },
+        );
+        Self::LABELS
+            .iter()
+            .map(|label| {
+                let (count, total_cents) = sums.get(label).copied().unwrap_or_default();
+                ArAgingBucket {
+                    label: label.to_string(),
+                    count,
+                    total_cents,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Per-category revenue + COGS + margin rollup. COGS percentages are
@@ -271,8 +433,9 @@ pub struct InvoiceSummary {
     pub total_revenue_ttm_cents: i64,
     pub total_cogs_ttm_cents: i64,
     pub total_gross_margin_ttm_cents: i64,
-    /// AR aging on every unpaid invoice in the system (not just the last
-    /// 12 months). Drives the receivables card and the overview table.
+    /// AR aging on every owed invoice in the system (not just the last
+    /// 12 months) — `InvoiceStatus::is_owed`, so paid and written-off
+    /// are out. Drives the receivables card and the overview table.
     pub ar_aging: Vec<ArAgingBucket>,
     pub total_outstanding_cents: i64,
     /// Total invoice count across all statuses. Lets the list view show
@@ -288,6 +451,74 @@ pub struct InvoiceSummary {
 }
 
 #[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    /// The rule's three answers, including a tenant's own status: owed,
+    /// so it moves (backlog 203ef806). The whole table, on both
+    /// adapters, is `tests/invoice_transitions.rs`.
+    #[test]
+    fn transition_to_refuses_only_out_of_a_terminal_status() {
+        let from = |s: &str| InvoiceStatus::new(s);
+        let t = |f: &str, to: &str| from(f).transition_to(to);
+        use InvoiceTransition::*;
+        assert_eq!(t(InvoiceStatus::OUTSTANDING, InvoiceStatus::PAST_DUE), Flip);
+        assert_eq!(t("disputed", InvoiceStatus::WRITTEN_OFF), Flip);
+        assert_eq!(t(InvoiceStatus::PAST_DUE, InvoiceStatus::PAST_DUE), Already);
+        assert_eq!(t(InvoiceStatus::PAID, InvoiceStatus::PAST_DUE), Refused);
+        assert_eq!(t(InvoiceStatus::WRITTEN_OFF, InvoiceStatus::PAID), Refused);
+        assert_eq!(
+            t(InvoiceStatus::WRITTEN_OFF, InvoiceStatus::WRITTEN_OFF),
+            Already
+        );
+    }
+}
+
+#[cfg(test)]
+mod ar_aging_tests {
+    use super::*;
+
+    /// The boundaries the Pg `CASE` used to spell (`<= 0`, `<= 30`,
+    /// `<= 60`, `<= 90`, else), now the one Rust rule.
+    #[test]
+    fn label_for_matches_the_bucket_boundaries() {
+        let cases = [
+            (-5, "current"),
+            (0, "current"),
+            (1, "1-30"),
+            (30, "1-30"),
+            (31, "31-60"),
+            (60, "31-60"),
+            (61, "61-90"),
+            (90, "61-90"),
+            (91, "90+"),
+        ];
+        for (days, label) in cases {
+            assert_eq!(ArAgingBucket::label_for(days), label, "{days} days");
+        }
+    }
+
+    #[test]
+    fn age_sums_rows_into_all_five_buckets_in_order() {
+        let aging = ArAgingBucket::age([(0, 1, 100), (-3, 2, 50), (45, 1, 7), (400, 3, 9)]);
+        let got: Vec<(&str, i64, i64)> = aging
+            .iter()
+            .map(|b| (b.label.as_str(), b.count, b.total_cents))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("current", 3, 150),
+                ("1-30", 0, 0),
+                ("31-60", 1, 7),
+                ("61-90", 0, 0),
+                ("90+", 3, 9),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod part_conversion_tests {
     use super::*;
     use boss_core::primitives::Part;
@@ -297,7 +528,7 @@ mod part_conversion_tests {
         let line = InvoiceLineItem {
             id: "LINE-001".into(),
             invoice_id: "INV-2026-0042".into(),
-            revenue_category: RevenueCategory::from("new-sales"),
+            revenue_category: RevenueCategory::from("wholesale"),
             amount_cents: 125_000,
             currency: "USD".into(),
             description: "Networking switch base unit".into(),

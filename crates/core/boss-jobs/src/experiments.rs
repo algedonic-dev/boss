@@ -1,5 +1,5 @@
 //! Split admission — Tier 2 of the experiments program
-//! (docs/design/network-experiments.md, decided in packet `574c2adf`;
+//! (the network-experiments decision in docs/architecture-decisions.md, decided in packet `574c2adf`;
 //! built for packet `6ea5a12a`).
 //!
 //! Q3 made the experiment a PACKET: kind [`EXPERIMENT_KIND`], carried

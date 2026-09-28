@@ -13,7 +13,7 @@ use boss_policy_client::{
 };
 use boss_testing::TestDb;
 use boss_views::port::{ViewResolver, ViewsRepo};
-use boss_views::types::{ViewInput, ViewLayout, ViewSource, Visibility};
+use boss_views::types::{ResultScope, ViewInput, ViewLayout, ViewSource, Visibility};
 use std::sync::Arc;
 
 fn user(id: &str, role: &str) -> User {
@@ -66,6 +66,17 @@ async fn run(
     filter: &str,
     who: &User,
 ) -> boss_views::types::ViewResults {
+    try_run(pool, policy, filter, who)
+        .await
+        .expect("resolve succeeds")
+}
+
+async fn try_run(
+    pool: &sqlx::PgPool,
+    policy: Arc<dyn PolicyClient>,
+    filter: &str,
+    who: &User,
+) -> Result<boss_views::types::ViewResults, boss_views::ViewsError> {
     let repo = boss_views::PgViewsRepo::new(pool.clone());
     let view = repo
         .create(
@@ -84,7 +95,6 @@ async fn run(
     boss_views::PgViewResolver::new(pool.clone(), policy)
         .resolve(&view, who, 50)
         .await
-        .expect("resolve succeeds")
 }
 
 /// Everything readable, so the source itself can be exercised.
@@ -141,13 +151,62 @@ async fn a_self_scoped_role_sees_the_steps_assigned_to_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_role_with_no_step_grant_sees_nothing() {
+async fn a_role_with_no_step_grant_is_refused_not_answered_zero() {
+    // Backlog 5392cf23: this used to answer `matched: 0`, and the page
+    // printed "0 matches" — a denied read dressed as an empty one.
     let db = TestDb::new().await;
     seed(&db.pool).await;
 
     let denied: Arc<dyn PolicyClient> = Arc::new(FakePolicyClient::deny_all());
-    let out = run(&db.pool, denied, "", &user("emp-alice", "guest")).await;
-    assert_eq!(out.matched, 0);
+    let err = try_run(&db.pool, denied, "", &user("emp-alice", "guest"))
+        .await
+        .expect_err("a denied source is refused");
+    assert!(
+        matches!(err, boss_views::ViewsError::SourceDenied { .. }),
+        "refused as a denial, not a storage fault: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_says_whether_it_is_every_row_or_only_the_callers() {
+    // Backlog 5392cf23: an owner-scoped caller got a silently narrower
+    // row set, and nothing on the result said so.
+    let db = TestDb::new().await;
+    seed(&db.pool).await;
+
+    let all = run(&db.pool, unrestricted(), "", &user("emp-alice", "ops")).await;
+    assert_eq!(all.scope, ResultScope::All);
+
+    let self_only: Arc<dyn PolicyClient> = Arc::new(
+        FakePolicyClient::builder()
+            .allow("clerk", Action::Read, Resource::step(), Scope::Self_)
+            .build(),
+    );
+    let mine = run(&db.pool, self_only, "", &user("emp-alice", "clerk")).await;
+    assert_eq!(mine.scope, ResultScope::Owners);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steps_view_reaches_what_the_executor_recorded() {
+    // Backlog 2b5ad29a: outcomes and every executor-filled field live in
+    // `steps.metadata`, which was not a field of this source.
+    let db = TestDb::new().await;
+    seed(&db.pool).await;
+    sqlx::query("UPDATE steps SET metadata = '{\"disposition\": \"delivered\"}' WHERE assignee_id = 'emp-bob'")
+        .execute(&db.pool)
+        .await
+        .expect("metadata writes");
+
+    let delivered = run(
+        &db.pool,
+        unrestricted(),
+        "metadata.disposition = \"delivered\"",
+        &user("emp-alice", "ops"),
+    )
+    .await;
+    assert_eq!(delivered.matched, 1);
+    assert_eq!(delivered.pushed_down, 1, "metadata.<path> pushes into SQL");
+    assert_eq!(delivered.rows[0]["assignee_id"], "emp-bob");
 }
 
 #[tokio::test(flavor = "multi_thread")]

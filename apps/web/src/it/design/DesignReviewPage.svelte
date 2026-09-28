@@ -27,12 +27,18 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { navigate } from '../../router';
+  import DecidedDesigns from './DecidedDesigns.svelte';
   import {
     pageHeader,
     panelsFor,
+    parseDesignQueue,
+    progressLabel,
     queueRows,
+    relTime,
     reviewHref,
+    REVIEW_STATION,
     REVIEW_STEP_KIND,
+    stationQueuePath,
     type DesignQueueEnvelope,
     type ReviewPacket,
   } from './designLens';
@@ -43,18 +49,24 @@
 
   const header = $derived(pageHeader(queue?.lens));
   const panels = $derived(panelsFor(queue?.lens));
-  const rows = $derived(queueRows(queue?.data ?? []));
+  const rows = $derived(queueRows(queue?.data ?? [], queue?.steps));
 
   async function load(): Promise<void> {
     loading = true;
     error = null;
     try {
-      // One read, and it is the queue. If it fails the surface has
-      // nothing honest to show, so it throws rather than rendering an
-      // empty table that reads as "nothing to review".
-      const resp = await fetch('/api/stations/design-review/queue');
+      // The queue region's one read. If it fails the REGION has nothing
+      // honest to show, so it throws rather than rendering an empty
+      // table that reads as "nothing to review" — but only the region:
+      // the decided panel makes its own read whatever this one answers
+      // (backlog 3bbb194a — until then a failed queue read painted this
+      // line in place of the whole page, and WORKING and OUT were never
+      // asked for). Its Retry re-runs this read and nothing else.
+      // A 200 that is not the envelope throws too (67825067): the cast
+      // this replaced read a list as a queue with nothing waiting.
+      const resp = await fetch(stationQueuePath(REVIEW_STATION));
       if (!resp.ok) throw new Error(`queue: HTTP ${resp.status}`);
-      queue = (await resp.json()) as DesignQueueEnvelope;
+      queue = parseDesignQueue(await resp.json());
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -64,9 +76,10 @@
 
   /// The `review-design` step of an open packet, resolved on demand.
   ///
-  /// The station queue serves packets without steps (it fetches them
-  /// only when the predicate reads step state), so the step id is one
-  /// read at click time for the ONE packet being opened.
+  /// Since design-review v2 (with_steps, 2026-09-24) the envelope carries
+  /// the step and `enterReview` uses it; this read is the fallback for a
+  /// registry still at v1, which serves packets without steps, so the
+  /// step id is one read at click time for the ONE packet being opened.
   ///
   /// A failure here is not an error state: `reviewHref` falls back to
   /// the job page, which is a worse door but a real one.
@@ -82,34 +95,41 @@
   }
 
   async function enterReview(packet: ReviewPacket): Promise<void> {
-    navigate(reviewHref(packet.id, await reviewStepId(packet.id)));
+    navigate(reviewHref(packet.id, packet.reviewStepId ?? (await reviewStepId(packet.id))));
   }
 
   $effect(() => {
     void load();
   });
-
-  function relTime(iso: string): string {
-    const d = new Date(iso);
-    const now = new Date();
-    const days = Math.floor((now.getTime() - d.getTime()) / 86_400_000);
-    if (days < 1) return 'today';
-    if (days === 1) return '1d ago';
-    if (days < 30) return `${days}d ago`;
-    if (days < 365) return `${Math.floor(days / 30)}mo ago`;
-    return `${Math.floor(days / 365)}y ago`;
-  }
 </script>
 
 <PageHeader eyebrow={header.eyebrow} title={header.title} subtitle={header.subtitle} />
 
-{#if loading}
-  <p class="empty">Loading the review queue…</p>
-{:else if error}
-  <p class="design-error">Error: {error}</p>
-{:else}
-  {#each panels as panel (panel)}
-    {#if panel === 'queue'}
+<!-- Each panel is a region that loads and fails on its own (3bbb194a).
+     Until the queue answers there is no lens, and `panelsFor` falls back
+     to every panel this surface ships, so the decided panel mounts and
+     reads at once instead of waiting behind a read it does not need. -->
+{#each panels as panel (panel)}
+  {#if panel === 'queue'}
+    {#if loading}
+      <p class="empty">Loading the review queue…</p>
+    {:else if error}
+      <!-- The shared failure marker (sweep c3e4edcc) draws the failed
+           read's rail; this page's own class keeps only the spacing. -->
+      <div class="design-failed">
+        <p class="design-error load-failed" role="alert">
+          The review queue could not be read: {error}. This is not an empty queue.
+        </p>
+        <button
+          class="btn btn-sm"
+          type="button"
+          aria-label="Retry the review queue"
+          onclick={() => void load()}
+        >
+          Retry
+        </button>
+      </div>
+    {:else}
       <Section title={`Waiting on a decision (${rows.length})`} wide>
         {#if rows.length === 0}
           <p class="empty">
@@ -125,11 +145,17 @@
             In the station's order: priority, then age. The first row is
             the one it would hand out next.
           </p>
+          <!-- No Status column (backlog 84d97547). It printed the packet's
+               status, and the station admits only `open` packets, so every
+               row said `open`. The review step's status was no better — the
+               station admits only `ready` or `active`, and Save leaves a
+               review `ready` — so Answers is the column that tells rows
+               apart. -->
           <table class="design-table">
             <thead>
               <tr>
                 <th>Packet</th>
-                <th>Status</th>
+                <th>Answers</th>
                 <th>Opened</th>
                 <th>Review</th>
               </tr>
@@ -138,7 +164,12 @@
               {#each rows as packet (packet.id)}
                 <tr>
                   <td><strong>{packet.title}</strong></td>
-                  <td class="design-status">{packet.status}</td>
+                  <td
+                    class="design-progress"
+                    class:design-saved={packet.progress.kind === 'saved'}
+                  >
+                    {progressLabel(packet.progress)}
+                  </td>
                   <td class="design-when">{relTime(packet.opened_on)}</td>
                   <td>
                     <button
@@ -156,8 +187,10 @@
         {/if}
       </Section>
     {/if}
-  {/each}
-{/if}
+  {:else if panel === 'decided'}
+    <DecidedDesigns />
+  {/if}
+{/each}
 
 <style>
   .design-table {
@@ -168,54 +201,66 @@
   .design-table td {
     text-align: left;
     padding: 8px 12px;
-    border-bottom: 1px solid var(--hairline, #2A3138);
+    border-bottom: 1px solid var(--hairline);
     vertical-align: top;
     font-variant-numeric: tabular-nums;
   }
   /* Column labels are instrument text: DM Mono caps in STATIC, not bold
      browser-default headers competing with the rows. Yard-board idiom. */
   .design-table th {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 11px;
     font-weight: 400;
-    letter-spacing: var(--ls-nav, 0.14em);
+    letter-spacing: var(--ls-nav);
     text-transform: uppercase;
-    color: var(--static, #7A838C);
+    color: var(--static);
   }
   .design-table tr:last-child td {
     border-bottom: none;
   }
-  .design-status {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 11px;
-    letter-spacing: var(--ls-label, 0.1em);
-    text-transform: uppercase;
-    color: var(--static, #7A838C);
+  .design-progress {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--static);
     white-space: nowrap;
   }
+  /* A half-made decision is work in hand — it must not read like an
+     untouched row (backlog 08372fdb). */
+  .design-saved {
+    color: var(--warn);
+  }
   .design-when {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 12px;
-    color: var(--static, #7A838C);
+    color: var(--static);
     white-space: nowrap;
   }
   /* Inline literals (paths, verbs) in the system mono, pinned to 12px —
      bare <code> falls into the browser's monospace-shrink. */
   code {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: 12px;
   }
   .empty {
-    color: var(--static, #7A838C);
+    color: var(--static);
     margin: 12px 0;
     line-height: 1.5;
   }
   .design-lede {
-    color: var(--static, #7A838C);
+    color: var(--static);
     margin: 0 0 12px;
   }
-  .design-error {
-    color: var(--err, #e2685c);
+  /* The failure line and its Retry, side by side; the line takes the
+     room, the button keeps its own width. */
+  .design-failed {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
     margin: 12px 0;
+  }
+  .design-error {
+    flex: 1 1 24ch;
+    margin: 0;
   }
 </style>

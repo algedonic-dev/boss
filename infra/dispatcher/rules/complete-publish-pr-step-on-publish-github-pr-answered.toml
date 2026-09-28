@@ -35,6 +35,14 @@
 # The pattern is written without a backslash: the arg passes through
 # two string lexers (TOML, then boss-expr's), and boss-expr reads `\d`
 # as `d` (ops_judge.rs). `.` stands for the em dash in the reuse line.
+#
+# v2 (backlog 1f0aa60d, 2026-09-27): the verb's `opened` / `reusing`
+# line now ends `at <snapshot>`, and the completion copies it as
+# `snapshot_commit` beside `pr_url`. Publish 8d7a3507's open-pr was
+# completed by hand with a url and no snapshot, and read-publish-checks
+# then refused the packet (alert 487e67bf) — the next machine step
+# needs the head the PR stands on, and a completion that omits it is
+# not a completion that step can use.
 [[rule]]
 name = "complete-publish-pr-step-on-publish-github-pr-answered"
 why = """
@@ -54,9 +62,9 @@ platform owner's queue — the same door every alarm handler files
 through. Self-filters to this one verb; every other answered request
 on the topic is somebody else's.
 """
-version = 1
+version = 2
 on_event = "jobs.job.closed"
 when = 'kind = "ops-request" AND outcome = "answered"'
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { verb = '"publish-github-pr"', verdict_pattern = '"^publish-github-pr: (opened|PR already open for [^ ]+ . reusing) (?P<pr_url>https://github[.]com/[^ ]+)$"', link = '"for_publish"', steps = '"open-pr"', done_metadata = '"{\"pr_url\": \"{pr_url}\"}"', evidence_key = '"published_by"', on_failure = '"annotate-and-alert"' }
+args = { verb = '"publish-github-pr"', verdict_pattern = '"^publish-github-pr: (opened|PR already open for [^ ]+ . reusing) (?P<pr_url>https://github[.]com/[^ ]+) at (?P<snapshot_commit>[0-9a-f]+)$"', link = '"for_publish"', steps = '"open-pr"', done_metadata = '"{\"pr_url\": \"{pr_url}\", \"snapshot_commit\": \"{snapshot_commit}\"}"', evidence_key = '"published_by"', on_failure = '"annotate-and-alert"' }

@@ -327,8 +327,10 @@ pub fn default_discipline() -> Vec<DisciplineKey> {
 
 /// Priority's queue rank — emergency drains first. Kept here (not an
 /// `Ord` on the enum) so the ordering stays a station-discipline
-/// concern, not an accidental global.
-fn priority_rank(p: Priority) -> u8 {
+/// concern, not an accidental global. The top board's `outranks` read
+/// (`crate::outranks`) asks this same rank which priorities drain
+/// before standard, so the board and every station agree on it.
+pub(crate) fn priority_rank(p: Priority) -> u8 {
     match p {
         Priority::Emergency => 0,
         Priority::Urgent => 1,

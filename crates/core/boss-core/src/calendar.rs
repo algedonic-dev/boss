@@ -117,8 +117,11 @@ pub struct ReservationRequest {
     /// Free-form context shown to humans. Optional.
     #[serde(default)]
     pub notes: Option<String>,
-    /// Actor making the reservation — employee id, "system-cron",
-    /// "boss-jobs-api", etc. Recorded as `created_by`.
+    /// Actor making the reservation. Recorded as `created_by`. On the
+    /// calendar's HTTP door it is the signed caller: blank is filled
+    /// from the caller, and a different id is refused unless a sibling
+    /// service names on whose behalf it reserves (backlog 11721a25).
+    #[serde(default)]
     pub created_by: String,
 }
 

@@ -30,8 +30,9 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The ledger read gate is not this test's subject (boss-ledger's
+        // tests/the_ledger_read_gate.rs pins it).
+        policy: Arc::new(PermissivePolicyClient),
     });
 
     let posted_on = Utc::now().date_naive();
@@ -41,10 +42,9 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
         .json(&json!({
             "posted_on": posted_on.format("%Y-%m-%d").to_string(),
             "memo": "drift test: manual revenue credit",
-            "created_by": "drift-test",
             "lines": [
                 {"account_code": "1100", "debit_cents":  amount_cents, "memo": "A/R"},
-                {"account_code": "4100", "credit_cents": amount_cents, "memo": "new-sales"},
+                {"account_code": "4100", "credit_cents": amount_cents, "memo": "wholesale"},
             ],
         }))
         .send(&ledger)
@@ -61,7 +61,7 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
         commerce,
         publisher: None,
         people_client: people,
-        policy: Some(policy),
+        policy,
         clock: Arc::new(boss_clock_client::WallClockClient),
         classes_client: None,
     });
@@ -79,7 +79,7 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
     let row_4100 = summary
         .revenue_ttm
         .iter()
-        .find(|c| c.category.contains("Wholesale") || c.category == "new-sales")
+        .find(|c| c.category.contains("Wholesale") || c.category == "wholesale")
         .expect("revenue_ttm missing 4100 category row");
     assert_eq!(
         row_4100.revenue_cents, amount_cents,

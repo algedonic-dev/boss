@@ -23,6 +23,9 @@ pub(super) struct ManualEntryBody {
     posted_on: Option<NaiveDate>,
     #[serde(default)]
     memo: Option<String>,
+    /// Read only to refuse a claim: the author is the signed caller
+    /// (`super::author`, backlog 7bf42e2b), and a body naming anyone
+    /// else is a 422.
     #[serde(default)]
     created_by: Option<String>,
     lines: Vec<ManualEntryLine>,
@@ -54,6 +57,10 @@ pub(super) async fn create_manual_entry(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
+    let created_by = match super::author::author(&user, "created_by", body.created_by.as_deref()) {
+        Ok(a) => a,
+        Err(refused) => return refused.into_response(),
+    };
     if body.lines.len() < 2 {
         return (
             StatusCode::BAD_REQUEST,
@@ -92,7 +99,6 @@ pub(super) async fn create_manual_entry(
     let posted_on = body
         .posted_on
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
-    let created_by = body.created_by.unwrap_or_else(|| "admin".to_string());
 
     let lines_json: Vec<serde_json::Value> = body
         .lines
@@ -225,6 +231,8 @@ pub(super) struct CogsRecognizedBody {
     /// a provenance violation (correctness-protocol §1).
     source_table: String,
     source_id: String,
+    /// Read only to refuse a claim, as on the manual entry: the author
+    /// is the signed caller (backlog 7bf42e2b).
     #[serde(default)]
     created_by: Option<String>,
 }
@@ -244,6 +252,10 @@ pub(super) async fn cogs_recognized_handler(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
+    let created_by = match super::author::author(&user, "created_by", body.created_by.as_deref()) {
+        Ok(a) => a,
+        Err(refused) => return refused.into_response(),
+    };
     if body.total_cost_cents <= 0 {
         return (
             StatusCode::BAD_REQUEST,
@@ -255,7 +267,6 @@ pub(super) async fn cogs_recognized_handler(
     let posted_on = body
         .happened_on
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
-    let created_by = body.created_by.unwrap_or_else(|| "ledger".to_string());
     let cogs_account = body.cogs_account.unwrap_or_else(|| "5100".to_string());
     let inventory_account = body.inventory_account.unwrap_or_else(|| "1300".to_string());
 
@@ -280,13 +291,23 @@ pub(super) async fn cogs_recognized_handler(
         )
             .into_response();
     }
+    // Fold the provenance, the date and the author INTO the payload so
+    // the `ledger.cogs.recognized` event below carries everything the
+    // projection rule needs, and the fact a rebuild projects from it is
+    // byte-identical to this live one (the inventory-movement shape
+    // below; created_by rides too because it is the signed caller, which
+    // varies by caller, and the rule reads it back through `/created_by`).
+    payload["source_table"] = serde_json::Value::String(source_table.clone());
+    payload["source_id"] = serde_json::Value::String(source_id.clone());
+    payload["happened_on"] = serde_json::Value::String(posted_on.to_string());
+    payload["created_by"] = serde_json::Value::String(created_by.clone());
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => return storage_err(e),
     };
 
-    let fact_id = match crate::events::record_fact_in_tx(
+    let recorded = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
             kind: "finance.cogs.recognized",
@@ -299,9 +320,10 @@ pub(super) async fn cogs_recognized_handler(
     )
     .await
     {
-        Ok(rec) => rec.id,
+        Ok(rec) => rec,
         Err(e) => return ledger_err(e),
     };
+    let fact_id = recorded.id;
 
     let fact = crate::types::FactRef {
         id: fact_id,
@@ -322,6 +344,26 @@ pub(super) async fn cogs_recognized_handler(
         Ok((id,)) => id,
         Err(e) => return storage_err(e),
     };
+
+    // The occurrence event, in the SAME tx (outbox phase 2), gated on
+    // THIS call having inserted the fact — an idempotent replay records
+    // nothing. Until 2026-09-27 this handler staged no event at all
+    // (backlog de926d87, unlike every sibling here), so a
+    // TRUNCATE-then-replay rebuild of financial_facts from audit_log
+    // dropped every COGS entry it had posted.
+    if recorded.inserted {
+        let stamp = super::event_stamp(&state, &user).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.cogs.recognized",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
 
     if let Err(e) = tx.commit().await {
         return storage_err(e);
@@ -480,9 +522,16 @@ async fn post_inventory_movement(
         Err(e) => return ledger_err(e),
     };
     let fact_id = recorded.id;
+    // The fact's OWN kind (backlog 0b116fb9). This read
+    // "finance.inventory.transferred" for both endpoints, so a
+    // capitalization posted by the transfer's rule: invisible while the
+    // code rules map both kinds to one body, wrong the moment a tenant
+    // publishes a posting-rule row for finance.inventory.capitalized —
+    // and a rebuild, which posts by the stored kind, disagreed with the
+    // live entry.
     let fact = crate::types::FactRef {
         id: fact_id,
-        kind: "finance.inventory.transferred",
+        kind: fact_kind,
         happened_on: posted_on,
         payload: &payload,
     };

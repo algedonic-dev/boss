@@ -25,11 +25,18 @@
 //!     were kept here too, under the demo's names, on every instance;
 //!     the kinds and the sales-tax rates are the brewery's seed now, so
 //!     on a bare schema every account goes and both tax tables empty.
+//!     The same is true of the department roster since backlog 7edf0e97
+//!     (2026-09-25): the thirteen rows migration 20260919181324 seeds
+//!     are the brewery's seeds/departments.toml, so on a bare schema the
+//!     registry empties and a company's instance holds only the roster
+//!     its own tenant declares.
 //!   * DELETABLE ONLY WHEN UNREFERENCED. A fixture wearing the rows — an
 //!     employee with the role, department and location; an account of
 //!     the type; a policy grant naming a role; a job about the company
 //!     and one about a location; a child class; a tax filing naming a
-//!     tax kind, which keeps the kind AND the accounts the kind names —
+//!     tax kind, which keeps the kind AND the accounts the kind names; a
+//!     packet naming a department in its metadata, a job about one, and
+//!     a workflow row declaring one —
 //!     keeps each of them, named with the column that points at it, and
 //!     the run deletes the rest.
 //!   * A ROW THE INSTANCE'S OWN TENANT DECLARES IS NOT A CANDIDATE
@@ -41,13 +48,18 @@
 //!     BEFORE the judgement, a re-declared child keeps its example
 //!     parent (`locations.parent_id`), which a reason added after the
 //!     fact could not.
+//!   * A RETIRED EXAMPLE'S MIGRATION ROWS STILL LEAVE (backlog a8991c86,
+//!     car 6). examples/used-device-shop is gone (car 7), and the
+//!     fresh-schema line above still holds on this tree, because the rows
+//!     01-registries.sql seeds for it are declared under
+//!     infra/postgres/retired-examples/; and without that list they
+//!     would not (the control).
 //!
 //! Never against production: TestDb refuses a server hosting a database
 //! named `boss` (test_db.rs).
 
-use boss_testing::{TestDb, create_dir, repo_root, scratch_dir, write_file};
+use boss_testing::{TestDb, create_dir, feed_stdin, repo_root, scratch_dir, write_file};
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -62,11 +74,17 @@ fn plain_tenant() -> PathBuf {
     t
 }
 
-fn derive(mode: &str, tenant: &Path) -> String {
+/// The derivation's environment: empty for this tree as it stands, or
+/// `BOSS_EXAMPLES_DIR` / `BOSS_RETIRED_EXAMPLES_DIR` for a tree shaped
+/// like a later car's.
+type Env<'a> = &'a [(&'a str, &'a Path)];
+
+fn derive_in(mode: &str, tenant: &Path, env: Env) -> String {
     let out = Command::new("bash")
         .arg(repo_root().join("infra/postgres/example-reference-rows.sh"))
         .arg(mode)
         .arg(tenant)
+        .envs(env.iter().copied())
         .output()
         .expect("bash runs");
     assert!(
@@ -86,15 +104,14 @@ fn psql(url: &str, sql: &str, read_only: bool) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("psql on PATH");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        if read_only {
-            stdin
-                .write_all(b"SET default_transaction_read_only = on;\n")
-                .unwrap();
-        }
-        stdin.write_all(sql.as_bytes()).unwrap();
-    }
+    // psql's exit status, asserted below, is the verdict — not the write
+    // (backlog d93cc7d5).
+    let guard = if read_only {
+        "SET default_transaction_read_only = on;\n"
+    } else {
+        ""
+    };
+    feed_stdin(&mut child, format!("{guard}{sql}").as_bytes());
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -105,7 +122,11 @@ fn psql(url: &str, sql: &str, read_only: bool) -> String {
 }
 
 fn plan_for(url: &str, tenant: &Path) -> serde_json::Value {
-    let out = psql(url, &derive("plan-sql", tenant), true);
+    plan_in(url, tenant, &[])
+}
+
+fn plan_in(url: &str, tenant: &Path, env: Env) -> serde_json::Value {
+    let out = psql(url, &derive_in("plan-sql", tenant, env), true);
     serde_json::from_str(out.trim())
         .unwrap_or_else(|e| panic!("plan is one JSON line ({e}): {out}"))
 }
@@ -115,7 +136,11 @@ fn plan(url: &str) -> serde_json::Value {
 }
 
 fn evict_for(url: &str, tenant: &Path) -> Vec<serde_json::Value> {
-    psql(url, &derive("delete-sql", tenant), false)
+    evict_in(url, tenant, &[])
+}
+
+fn evict_in(url: &str, tenant: &Path, env: Env) -> Vec<serde_json::Value> {
+    psql(url, &derive_in("delete-sql", tenant, env), false)
         .lines()
         .map(|l| {
             serde_json::from_str(l).unwrap_or_else(|e| panic!("one JSON line per table ({e}): {l}"))
@@ -271,12 +296,83 @@ async fn classes(db: &TestDb, kind: &str, attr: &str) -> BTreeSet<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     let db = TestDb::new().await;
-    let url = db.url();
+    let deleted = what_remains_is_exactly_what_the_platform_names(&db, &[]).await;
 
-    let roles_before = classes(&db, "employee", "role").await;
-    let employment_before = classes(&db, "employee", "employment_type").await;
-    let status_before = classes(&db, "employee", "status").await;
-    let phases_before = classes(&db, "asset", "phase").await;
+    // examples/used-device-shop is gone (backlog a8991c86, car 7), and
+    // 01-registries.sql still seeds its 26 roles, ten departments, three
+    // account types, `warehouse-zone` and its companies row on every
+    // fresh instance. The line above holding on THIS tree is what the
+    // retired list buys, and every row the list names was on the fresh
+    // schema and left. That, with the DB-free pin in
+    // example_reference_rows_sh.rs (the list names only rows
+    // 01-registries.sql seeds), is the equality: the list holds every
+    // device-shop row the platform does not keep and the brewery does not
+    // carry, and nothing the migration did not seed.
+    let listed: toml::Value = toml::from_str(
+        &std::fs::read_to_string(
+            repo_root().join("infra/postgres/retired-examples/used-device-shop/seeds/classes.toml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for r in listed["class"].as_array().unwrap() {
+        let k = format!(
+            "{}:{}",
+            r["subject_kind"].as_str().unwrap(),
+            r["code"].as_str().unwrap()
+        );
+        assert!(
+            deleted.contains(&k),
+            "{k} is on the retired list, so a fresh schema held it and the run evicted it"
+        );
+    }
+}
+
+/// The control for the case above: this tree (the brewery alone since
+/// car 7) with NO retired list, and the rows only the device shop
+/// carried are no candidate at all — the hazard the car-0 measure
+/// recorded, reproduced.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_retired_list_the_device_shops_migration_rows_would_stay() {
+    let db = TestDb::new().await;
+    let url = db.url();
+    let no_list = scratch_dir("example-reference-rows-sql-no-retired");
+
+    let p = plan_in(
+        &url,
+        &plain_tenant(),
+        &[("BOSS_RETIRED_EXAMPLES_DIR", &no_list)],
+    );
+    let deletable = keys(&p["classes"]["deletable"]);
+    for stranded in [
+        "employee:refurb-tech",
+        "employee:service",
+        "account:clinic",
+        "location:warehouse-zone",
+    ] {
+        assert!(
+            !deletable.contains(stranded),
+            "the control: without the list, {stranded} is no candidate — it would stay on every fresh instance"
+        );
+    }
+    assert!(!keys(&p["companies"]["deletable"]).contains("used-device-shop"));
+}
+
+/// Plan, run and read back the eviction on a fresh schema, with the
+/// derivation reading `env`, and hold what remains to what the platform
+/// names. Returns the class keys the run deleted.
+async fn what_remains_is_exactly_what_the_platform_names(
+    db: &TestDb,
+    env: Env<'_>,
+) -> BTreeSet<String> {
+    let url = db.url();
+    let plan = |url: &str| plan_in(url, &plain_tenant(), env);
+    let evict = |url: &str| evict_in(url, &plain_tenant(), env);
+
+    let roles_before = classes(db, "employee", "role").await;
+    let employment_before = classes(db, "employee", "employment_type").await;
+    let status_before = classes(db, "employee", "status").await;
+    let phases_before = classes(db, "asset", "phase").await;
 
     // The plan on the bare schema: every present candidate is deletable.
     // The migration's tax kinds name six accounts, and until 7f163e58
@@ -285,7 +381,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     // kind the expense account its accruals debit (backlog c0b83e13):
     // the row is the one definition of both of a kind's accounts.
     let p = plan(&url);
-    let tax_accounts = set(&db, "SELECT liability_account FROM tax_kinds UNION SELECT expense_account FROM tax_kinds WHERE expense_account IS NOT NULL").await;
+    let tax_accounts = set(db, "SELECT liability_account FROM tax_kinds UNION SELECT expense_account FROM tax_kinds WHERE expense_account IS NOT NULL").await;
     assert_eq!(
         tax_accounts,
         s(&["2150", "2300", "2310", "2320", "6500", "6550"]),
@@ -297,9 +393,15 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
         "the migration's five kinds are candidates: {p}"
     );
     assert_eq!(p["sales_tax_rates"]["present"].as_u64().unwrap(), 27);
+    assert_eq!(
+        p["departments"]["present"].as_u64().unwrap(),
+        13,
+        "the thirteen rows migration 20260919181324 seeds are candidates (7edf0e97): {p}"
+    );
     for t in [
         "companies",
         "locations",
+        "departments",
         "tax_kinds",
         "sales_tax_rates",
         "gl_accounts",
@@ -332,6 +434,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
         [
             "companies",
             "locations",
+            "departments",
             "tax_kinds",
             "sales_tax_rates",
             "gl_accounts",
@@ -350,6 +453,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     for t in [
         "companies",
         "locations",
+        "departments",
         "tax_kinds",
         "sales_tax_rates",
         "gl_accounts",
@@ -371,7 +475,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     // roles the platform bundle names that the migrations seed, the
     // baseline's roles, and `owner` (01-registries.sql: the generic
     // sole-proprietor / founder role, cross-tenant by design).
-    let system = set(&db, "SELECT code FROM classes WHERE subject_kind = 'employee' AND member_attribute = 'role' AND (metadata->>'is_system_role' = 'true' OR metadata->>'is_test_fixture' = 'true')").await;
+    let system = set(db, "SELECT code FROM classes WHERE subject_kind = 'employee' AND member_attribute = 'role' AND (metadata->>'is_system_role' = 'true' OR metadata->>'is_test_fixture' = 'true')").await;
     let named: BTreeSet<String> = platform_workflow_roles()
         .intersection(&roles_before)
         .cloned()
@@ -380,7 +484,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     expected_roles.extend(baseline("role"));
     expected_roles.insert("owner".into());
     assert_eq!(
-        classes(&db, "employee", "role").await,
+        classes(db, "employee", "role").await,
         expected_roles,
         "employee roles kept = system rows + platform-named + baseline + owner"
     );
@@ -392,7 +496,7 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     // example seed (publish-request's owner_role = shift-lead is the
     // brewery's, in its classes.json — a leak this line makes visible).
     let seeds: serde_json::Value =
-        serde_json::from_str(derive("seeds", &plain_tenant()).trim()).unwrap();
+        serde_json::from_str(derive_in("seeds", &plain_tenant(), env).trim()).unwrap();
     let seeded_roles: BTreeSet<String> = seeds["classes"]
         .as_array()
         .unwrap()
@@ -409,23 +513,23 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
     }
 
     assert_eq!(
-        classes(&db, "employee", "department").await,
+        classes(db, "employee", "department").await,
         baseline("department"),
         "departments kept = the operator baseline's (it)"
     );
     assert_eq!(
-        classes(&db, "employee", "employment_type").await,
+        classes(db, "employee", "employment_type").await,
         employment_before,
         "employment types are the platform's vocabulary, untouched"
     );
-    assert_eq!(classes(&db, "employee", "status").await, status_before);
+    assert_eq!(classes(db, "employee", "status").await, status_before);
     assert_eq!(
-        classes(&db, "asset", "phase").await,
+        classes(db, "asset", "phase").await,
         phases_before,
         "module-tier vocabularies are untouched"
     );
 
-    let locations = set(&db, "SELECT id FROM locations ORDER BY id").await;
+    let locations = set(db, "SELECT id FROM locations ORDER BY id").await;
     assert!(
         locations.is_superset(&baseline("location")),
         "the baseline hires at loc-hq, which stays"
@@ -435,44 +539,62 @@ async fn on_a_fresh_schema_what_remains_is_exactly_what_the_platform_names() {
         s(&["loc-field-default", "loc-hq", "loc-remote-default"]),
         "locations kept = the platform's three defaults (01-registries.sql: HQ, the field bucket, the remote bucket)"
     );
-    let worn = set(&db, "SELECT DISTINCT kind FROM locations").await;
+    let worn = set(db, "SELECT DISTINCT kind FROM locations").await;
     assert_eq!(
-        classes(&db, "location", "kind").await,
+        classes(db, "location", "kind").await,
         worn,
         "location kinds kept = exactly the kinds the platform's default locations wear"
     );
 
-    let dflt = set(&db, "SELECT trim(both '''' from split_part(column_default, '::', 1)) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'account_type'").await;
+    let dflt = set(db, "SELECT trim(both '''' from split_part(column_default, '::', 1)) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'account_type'").await;
     assert_eq!(
-        classes(&db, "account", "type").await,
+        classes(db, "account", "type").await,
         dflt,
         "account types kept = the column's default (unspecified)"
     );
     assert_eq!(
-        classes(&db, "asset", "category").await,
+        classes(db, "asset", "category").await,
         BTreeSet::new(),
         "every asset category was an example's"
     );
     assert_eq!(
-        set(&db, "SELECT id FROM companies").await,
+        set(db, "SELECT id FROM companies").await,
         BTreeSet::new(),
         "both companies rows were examples'"
     );
     assert_eq!(
-        set(&db, "SELECT code FROM gl_accounts").await,
+        set(db, "SELECT code FROM gl_accounts").await,
         BTreeSet::new(),
         "the whole starter chart was the brewery's, the five tax accounts included (7f163e58)"
     );
     assert_eq!(
-        set(&db, "SELECT kind FROM tax_kinds").await,
+        set(db, "SELECT kind FROM tax_kinds").await,
         BTreeSet::new(),
         "every tax kind was the brewery's"
     );
     assert_eq!(
-        set(&db, "SELECT state FROM sales_tax_rate_by_state").await,
+        set(db, "SELECT state FROM sales_tax_rate_by_state").await,
         BTreeSet::new(),
         "every sales-tax rate was the brewery's"
     );
+    // The department roster (backlog 7edf0e97): every row the migration
+    // seeds is the brewery's, so a company instance's registry holds
+    // only what its tenant declares — and a Job can no longer be about
+    // an evicted department, because its identity row went with it.
+    assert_eq!(
+        set(db, "SELECT id FROM departments").await,
+        BTreeSet::new(),
+        "every department was the brewery's"
+    );
+    assert_eq!(
+        set(db, "SELECT id FROM subjects WHERE kind = 'department'").await,
+        BTreeSet::new(),
+        "and every department's identity row went with it"
+    );
+    runs.iter()
+        .filter(|r| r["table"] == "classes")
+        .flat_map(|r| keys(&r["deleted"]))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -490,7 +612,12 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
              VALUES ('11111111-1111-1111-1111-111111111111', 'org-thing', 'company', 'brewery', 'about the company', 'emp-f', 'open', 'standard', '2026-09-17', 'real'),
                     ('22222222-2222-2222-2222-222222222222', 'org-thing', 'location', 'loc-brewery-brewhouse', 'about the site', 'emp-f', 'closed', 'standard', '2026-09-17', 'simulated');
          INSERT INTO tax_filings (id, kind, jurisdiction, period_start, period_end, due_on, amount_cents, liability_account, status)
-             VALUES ('tf-f', 'sales', 'US-CA', '2026-07-01', '2026-09-30', '2026-10-31', 12500, '2300', 'accrued');",
+             VALUES ('tf-f', 'sales', 'US-CA', '2026-07-01', '2026-09-30', '2026-10-31', 12500, '2300', 'accrued');
+         INSERT INTO workflows (kind, version, status, label, category, subject_kinds, steps, owning_team, metadata)
+             VALUES ('dept-thing', 1, 'active', 'Dept thing', 'ops', '[\"department\", \"page\"]', '[]', 'acme', '{\"department\": \"support\"}');
+         INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id, status, priority, opened_on, partition, metadata)
+             VALUES ('33333333-3333-3333-3333-333333333333', 'dept-thing', 'department', 'warehouse', 'the warehouse ran its retro late', 'emp-f', 'closed', 'standard', '2026-09-19', 'real', '{}'),
+                    ('44444444-4444-4444-4444-444444444444', 'dept-thing', 'page', '/sales', 'a page audit', 'emp-f', 'open', 'standard', '2026-09-19', 'real', '{\"department\": \"sales\"}');",
     )
     .execute(&db.pool)
     .await
@@ -542,6 +669,18 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
     assert_eq!(kept(&p["tax_kinds"]["kept"]).len(), 1);
     assert_eq!(kept(&p["gl_accounts"]["kept"]).len(), 1);
     assert_eq!(kept(&p["sales_tax_rates"]["kept"]).len(), 0);
+    // A department is pointed at three ways (7edf0e97): a packet naming
+    // it in metadata.department (the page march), a Job about it, and a
+    // workflow row declaring it. Each keeps its row.
+    want(&p, "departments", "sales", &["jobs.metadata.department"]);
+    want(&p, "departments", "warehouse", &["jobs.subject_id"]);
+    want(
+        &p,
+        "departments",
+        "support",
+        &["workflows.metadata.department"],
+    );
+    assert_eq!(kept(&p["departments"]["kept"]).len(), 3);
     assert_eq!(
         kept(&p["classes"]["kept"]).len(),
         5,
@@ -580,6 +719,8 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         "brewery",
         "sales",
         "2300",
+        "warehouse",
+        "support",
     ] {
         assert!(!deleted.contains(k), "{k} was referenced and must survive");
     }
@@ -594,6 +735,8 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         "income",
         "6500",
         "CA",
+        "production",
+        "maintenance",
     ] {
         assert!(
             deleted.contains(k),
@@ -615,14 +758,29 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         .await,
         s(&["loc-brewery-brewhouse", "loc-brewery-taproom"])
     );
-    // The subjects projection rows of evicted locations/companies go with them.
-    let subjects_deleted: i64 = runs
-        .iter()
-        .filter_map(|r| r["subjects_deleted"].as_i64())
-        .sum();
     assert_eq!(
-        subjects_deleted, 0,
+        set(&db, "SELECT id FROM departments").await,
+        s(&["sales", "support", "warehouse"])
+    );
+    // The subjects projection rows of evicted locations/companies go with
+    // them — none existed on the bare schema. A department's identity row
+    // is the migration's own (20260919181324), so each evicted department
+    // takes one with it, and a kept one keeps its own.
+    let subjects_deleted = |t: &str| -> i64 {
+        runs.iter()
+            .filter(|r| r["table"] == t)
+            .filter_map(|r| r["subjects_deleted"].as_i64())
+            .sum()
+    };
+    assert_eq!(
+        subjects_deleted("companies") + subjects_deleted("locations"),
+        0,
         "no subjects rows existed on the bare schema"
+    );
+    assert_eq!(subjects_deleted("departments"), 10, "13 seeded, 3 kept");
+    assert_eq!(
+        set(&db, "SELECT id FROM subjects WHERE kind = 'department'").await,
+        s(&["sales", "support", "warehouse"])
     );
 }
 
@@ -653,6 +811,12 @@ async fn a_row_the_tenant_declares_survives_the_plan_and_the_run() {
     write_file(
         &tenant.join("seeds/chart_of_accounts.toml"),
         "[[account]]\ncode = \"1100\"\nname = \"AR\"\nkind = \"asset\"\nnormal_balance = \"debit\"\n",
+    );
+    // The brewery's `it` department, live, and its `warehouse`, declared
+    // retired (backlog 7edf0e97): both are the tenant's declaration.
+    write_file(
+        &tenant.join("seeds/departments.toml"),
+        "[[department]]\ncode = \"it\"\ndisplay_name = \"IT\"\nfunction = \"operations\"\n\n[[department]]\ncode = \"warehouse\"\ndisplay_name = \"Warehouse\"\nfunction = \"operations\"\nretired = true\n",
     );
     // The route the tenant re-declares is on the instance already
     // (published by an earlier tenant publish), under the brewery's
@@ -706,10 +870,18 @@ async fn a_row_the_tenant_declares_survives_the_plan_and_the_run() {
         "loc-brewery-taproom",
         "loc-brewery-route-mission",
         "loc-brewery-brewhouse",
+        "it",
+        "warehouse",
     ] {
         assert!(!deleted.contains(k), "{k} is the tenant's and must survive");
     }
-    for k in ["employee:finance", "employee:cto", "1000", "brewery"] {
+    for k in [
+        "employee:finance",
+        "employee:cto",
+        "1000",
+        "brewery",
+        "production",
+    ] {
         assert!(
             deleted.contains(k),
             "{k} is residue and must go: {deleted:?}"
@@ -720,6 +892,11 @@ async fn a_row_the_tenant_declares_survives_the_plan_and_the_run() {
             .await
             .contains("sales"),
         "the department the tenant declares is still on the instance"
+    );
+    assert_eq!(
+        set(&db, "SELECT id FROM departments").await,
+        s(&["it", "warehouse"]),
+        "the department rows the tenant declares, and only those"
     );
     assert_eq!(
         set(&db, "SELECT code FROM gl_accounts WHERE code = '1100'").await,

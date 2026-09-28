@@ -4,17 +4,25 @@
   // every service Job's steps pick up implicitly. Port of
   // apps/web-legacy/src/steps/GenericSurface.tsx.
 
-  import type { Snippet } from 'svelte';
+  import { untrack, type Snippet } from 'svelte';
   import {
-    isPending,
     isTerminal as _isTerminal,
     type StepStatus,
     type StepField,
   } from '../jobs/types';
   import type { SpecStep } from '../jobs/fork';
   import type { Employee } from '../people/types';
-  import { putStep } from './stepWrite';
+  import { releaseStep, saveStep, startStep } from './stepWrite';
   import { PROCEDURE_KEY } from './procedure';
+  import {
+    HOLDER_LOCKED_NOTE,
+    askReleaseReason,
+    claimedFor,
+    gestureFields,
+    holderLocked,
+    startable,
+  } from './holder';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import {
     askRoutes,
     completeLabel,
@@ -154,6 +162,19 @@
     void step.id;
     writeError = null;
   });
+  /// The picker follows the step it shows (backlog 848477c3): the same
+  /// reuse carried step A's pick onto step B, and every Save, Start and
+  /// Complete sends it. Re-read when the step or its stored holder
+  /// changes — the key is a string, so a re-fetch of the same values
+  /// does not wipe a pick in progress.
+  let holderKey = $derived(`${step.id}\u0000${step.assignee_id ?? ''}`);
+  $effect(() => {
+    void holderKey;
+    assigneeId = untrack(() => step.assignee_id ?? '');
+  });
+  /// An active step's holder is fixed until it is released (backlogs
+  /// 650ebd0c, 0f42efa0), so the picker is not offered there.
+  let locked = $derived(holderLocked(step));
   let terminal = $derived(_isTerminal(step.status));
 
   let employees = $state<Employee[]>([]);
@@ -193,47 +214,62 @@
     [...employees].sort((a, b) => (a.name ?? "").localeCompare(b.name ?? "")),
   );
 
-  function mergeMetadata(
-    existing: Record<string, unknown>,
-    d: string,
-  ): Record<string, unknown> {
-    const next = { ...existing };
-    if (d) next.due_on = d;
-    else delete next.due_on;
-    return next;
-  }
-
-  async function persist(overrides: {
-    status?: string;
-    assignee_id?: string | null;
-    metadata?: Record<string, unknown>;
-    notes?: string;
-  }): Promise<void> {
+  /// `status` is the one the gesture moves the step to — Complete — and
+  /// absent for a Save: the page's own copy of the status is a snapshot,
+  /// and sending it back released an agent's claim made after the page
+  /// was drawn (backlog 6ef4a36b). A Start sends no status either: it
+  /// saves what the page holds and then claims through the claim door,
+  /// for the holder the picker shows (design 611fbffd, clause b).
+  async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
+      // Only the keys this surface owns go to the merge door — never a
+      // spread of the step's metadata (backlog e39a9d2a). A cleared due
+      // date is an explicit null, which the door deletes; it used to be
+      // cleared by OMISSION from a wholesale PUT.
       const body = {
-        ...step,
-        job_id: jobId,
-        notes: overrides.notes ?? notes ?? undefined,
-        status: overrides.status ?? step.status,
-        assignee_id:
-          overrides.assignee_id !== undefined
-            ? overrides.assignee_id
-            : assigneeId || null,
-        metadata:
-          overrides.metadata ?? {
-            ...mergeMetadata(step.metadata, dueOn),
-            // Only send fields the operator actually filled — an
-            // empty string is not an answer, and writing one would
-            // satisfy a required-field check with nothing in it.
-            ...Object.fromEntries(
-              Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
-            ),
-          },
+        notes: notes ?? undefined,
+        ...gestureFields(step, assigneeId, status),
+        metadata: {
+          ...(dueOnDirty ? { due_on: dueOn || null } : {}),
+          // Only send fields the operator actually filled — an
+          // empty string is not an answer, and writing one would
+          // satisfy a required-field check with nothing in it.
+          ...Object.fromEntries(
+            Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
+          ),
+        },
       };
-      const res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok' && start) {
+        res = await startStep(jobId, step.id, claimedFor(assigneeId));
+      }
       if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
+      onUpdate();
+    } finally {
+      saving = false;
+    }
+  }
+
+  /// Hand an active step back: `ready`, nobody's, for the next holder
+  /// to claim (backlog 6ef4a36b — the note beside the picker said a
+  /// held step changes hands "by release", and the page had none). It
+  /// asks why first and records the answer, as `boss step release`
+  /// does; a partial release stays on screen rather than refreshing it
+  /// away (the review of car 675f1858, #2).
+  async function release(): Promise<void> {
+    const why = askReleaseReason();
+    if (why === null) return;
+    saving = true;
+    writeError = null;
+    try {
+      const by = session.value.kind === 'ready' ? session.value.user.id : null;
+      const res = await releaseStep(jobId, step, why, by);
+      if (res.kind !== 'ok') {
         writeError = res.error;
         return;
       }
@@ -353,8 +389,8 @@
              takes — and, when it cannot be pressed, the field it is
              waiting on, in the row rather than a hover title. -->
         <button
-          class="step-btn step-btn-primary"
-          onclick={() => persist({ status: 'completed' })}
+          class="btn btn-primary"
+          onclick={() => persist('completed')}
           disabled={saving || missingRequired.length > 0}
         >
           {completeText}
@@ -373,7 +409,7 @@
     <select
       id={`assignee-${step.id}`}
       bind:value={assigneeId}
-      disabled={terminal || saving}
+      disabled={terminal || saving || locked}
     >
       <option value="">— unassigned —</option>
       {#each activeEmployees as e (e.id)}
@@ -384,6 +420,9 @@
       <span class="step-meta-row small">
         ({empNames.get(step.assignee_id) ?? step.assignee_id})
       </span>
+    {/if}
+    {#if locked}
+      <span class="step-meta-row small step-holder-locked">{HOLDER_LOCKED_NOTE}</span>
     {/if}
   </div>
 
@@ -440,28 +479,42 @@
   <div class="step-actions">
     {#if dirty && !terminal}
       <button
-        class="step-btn"
-        onclick={() => persist({})}
+        class="btn"
+        onclick={() => persist()}
         disabled={saving}
       >
         {saving ? 'Saving…' : 'Save assignment'}
       </button>
     {/if}
-    {#if !terminal && isPending(step.status)}
+    {#if startable(step)}
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist({ status: 'active' })}
+        class="btn btn-primary"
+        onclick={() => persist(undefined, true)}
         disabled={saving}
       >
         Start
+      </button>
+    {/if}
+    {#if locked}
+      <!-- The release the note beside the picker names: the step goes
+           back to ready, nobody's, and the next holder claims it. The
+           server's policy decides who may; the page is behind the
+           write gate like every step surface. -->
+      <button
+        class="btn"
+        onclick={release}
+        disabled={saving}
+        title="Hand this step back — it returns to ready, and the next holder claims it"
+      >
+        Release
       </button>
     {/if}
     {#if !terminal && step.status === 'active' && !hasAsk}
       <!-- A step with no contract completes here; one WITH a contract
            completes from the ask above, where the answer is. -->
       <button
-        class="step-btn step-btn-primary"
-        onclick={() => persist({ status: 'completed' })}
+        class="btn btn-primary"
+        onclick={() => persist('completed')}
         disabled={saving}
       >
         Complete
@@ -472,8 +525,8 @@
 
 <style>
   .step-ask {
-    border: 1px solid var(--border, #e7e5e4);
-    border-left: 3px solid var(--accent, #2563eb);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
     border-radius: 6px;
     padding: 10px 12px;
     margin-bottom: 12px;
@@ -487,18 +540,19 @@
   }
   .step-ask-needs {
     font-size: 12px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim);
   }
+  /* Enamel's field label, the board's `.field label` (backlog 6f471ff6). */
   .step-field-label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-dim, #78716c);
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--text);
   }
   .step-ask-legend {
     margin-left: auto;
   }
   .step-field-required {
-    color: var(--danger, #b91c1c);
+    color: var(--err);
     margin-left: 2px;
   }
 </style>

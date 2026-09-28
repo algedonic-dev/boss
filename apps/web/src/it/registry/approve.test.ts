@@ -12,13 +12,14 @@
 //   authority  — the role the ops-request `execute` step names admits
 //                the viewer, or the control is disabled with the role
 //                named (abortAuthority's shape).
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 
 import {
   adriftKinds,
   approveAuthority,
   approveBody,
   executeAuthorityRole,
+  fileApprove,
   forceConfirmed,
   latestFor,
   modeFor,
@@ -139,6 +140,17 @@ describe('parsePublishRequests', () => {
     expect(got[2]).toMatchObject({ mode: 'force', requested_from: null });
     // A terminal rehearsal (25cb2f71, 2026-09-15) is a check, not a publish.
     expect(got[3]).toMatchObject({ mode: 'check', exit_code: '4' });
+  });
+
+  test('keys merged onto an execute still open are not an answer', () => {
+    // The runner lands its keys through the merge door before the status
+    // (backlog 2aa2b19e); a status the server refused or never got leaves
+    // them on an open step, and that is no answer (review of car 24eb9471).
+    const raw = request({ id: 'm', status: 'open', exit_code: '0' });
+    const steps = raw.steps as Array<Record<string, unknown>>;
+    const open = { ...raw, steps: steps.map((s) => (s.spec_slug === 'execute' ? { ...s, status: 'ready', completed_at: undefined } : s)) };
+    const [got] = parsePublishRequests([open]);
+    expect(got).toMatchObject({ disposition: null, exit_code: null, output: '', runner_host: null });
   });
 
   test('the query is metadata containment on the verb, not a page of every verb', () => {
@@ -303,6 +315,43 @@ describe('approveBody', () => {
   test('a null head is carried as null, never as the string "null"', () => {
     const b = approveBody(kind, 'plain', { packet: 'p', head: null }, 'emp-david');
     expect(b.metadata.drift_head).toBeNull();
+  });
+});
+
+// cece5515 (b): the write refusal. fileApprove is correct today and
+// nothing pinned it: a non-2xx throws naming the status and the body,
+// and a 2xx whose body carries no id throws rather than calling that
+// filed. ApprovePublish renders the thrown message as "The request was
+// not filed: …" (drift-page.test.ts pins that arm).
+describe('fileApprove', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const kind = adriftKinds([row({})])[0]!;
+  const body = approveBody(kind, 'plain', { packet: 'p', head: null }, 'emp-david');
+  const answer = (status: number, text: string): void => {
+    globalThis.fetch = (async () => new Response(text, { status })) as unknown as typeof fetch;
+  };
+
+  test('a created packet returns its id, POSTed to the jobs API', async () => {
+    const seen: Array<{ url: string; method: string | undefined }> = [];
+    globalThis.fetch = (async (u: string | URL | Request, init?: RequestInit) => {
+      seen.push({ url: String(u), method: init?.method });
+      return new Response(JSON.stringify({ id: 'c0ffee00-0000-4000-8000-000000000001' }), { status: 201 });
+    }) as unknown as typeof fetch;
+    expect(await fileApprove(body)).toBe('c0ffee00-0000-4000-8000-000000000001');
+    expect(seen).toEqual([{ url: '/api/jobs', method: 'POST' }]);
+  });
+
+  test('a refused create throws naming the status and the server\'s own words', async () => {
+    answer(403, 'policy: create ops-request denied');
+    await expect(fileApprove(body)).rejects.toThrow('file ops-request: HTTP 403: policy: create ops-request denied');
+  });
+
+  test('a 2xx that names no id is not called filed', async () => {
+    answer(200, JSON.stringify({ status: 'open' }));
+    await expect(fileApprove(body)).rejects.toThrow('the create returned no id');
   });
 });
 

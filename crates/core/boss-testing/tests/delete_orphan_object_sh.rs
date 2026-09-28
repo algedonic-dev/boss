@@ -81,16 +81,12 @@ fn an_owner_other_than_the_caller() -> Option<String> {
 /// box: a dir left by a root run is one `remove_dir_all` a later run as
 /// another uid cannot do — and that failure was discarded, so the run
 /// carried on and died 130 lines later on an unreadable bare
-/// `PermissionDenied` from a fixture write. The pid makes the root ours,
-/// and every failure here names the path it was at.
+/// `PermissionDenied` from a fixture write. `scratch` carries the uid
+/// and the pid, so the root is ours — the pid alone left a recycled
+/// pid's leftover from another uid in reach (307df975) — and every
+/// failure here names the path it was at.
 fn scratch(case: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "delete-orphan-object-{case}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("scratch dir {}: {e}", dir.display()));
-    dir
+    boss_testing::scratch_dir(&format!("delete-orphan-object-{case}"))
 }
 
 /// Write, naming the path when it fails. A bare `unwrap()` on a write
@@ -997,9 +993,12 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
     std::fs::create_dir_all(&bin).unwrap();
     write_exec(
         &bin.join("curl"),
-        "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
-         cat \"$STUB_JOBS\"\n",
+        &[
+            "#!/bin/sh\n",
+            boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
+            "cat \"$STUB_JOBS\"\n",
+        ]
+        .concat(),
     );
     std::fs::write(
         c.root.join("jobs.json"),
@@ -1008,8 +1007,8 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         ),
     )
     .unwrap();
-    let put = c.root.join("put.json");
-    let _ = std::fs::remove_file(&put);
+    let step_md = c.root.join("step-metadata.json");
+    let _ = std::fs::remove_file(&step_md);
     let out = Command::new("sh")
         .arg(repo_root().join("infra/ops/ops-runner.sh"))
         .env_clear()
@@ -1025,7 +1024,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", c.root.join("jobs.json"))
-        .env("STUB_PUT", &put)
+        .env("STUB_STEP_METADATA", &step_md)
         .env("BOSS_KUBECTL", &c.kubectl)
         .env("BOSS_CLUSTER_TREE", &c.tree)
         .env("STUB_LIVE", &c.live)
@@ -1037,9 +1036,6 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let meta = std::fs::read_to_string(&put)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("PUT payload is JSON"))
-        .map(|v| v["metadata"].clone());
+    let meta = boss_testing::ops_runner_stub::step_metadata_written(&step_md);
     (text, meta)
 }

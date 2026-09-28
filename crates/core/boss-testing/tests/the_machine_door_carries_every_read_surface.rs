@@ -262,6 +262,29 @@ fn the_gateway_row_is_on_the_door_and_its_reader_names_it() {
     );
 }
 
+/// The ML API is on the door because the nightly inference batch on the
+/// ml-batch-host reaches it here (backlog 9599babc, 2026-09-23): until
+/// then the batch POSTed to 127.0.0.1:7070 on boss-gcp, the retired
+/// second stack's ML API, and the system of record's risk scores stayed
+/// empty behind seven `ok` packets. The batch's address is rendered as
+/// the record's host on this port (render-sor-env.sh BOSS_ML_API_URL),
+/// so dropping the row here strands it again.
+#[test]
+fn the_ml_api_is_on_the_door_for_the_inference_batch() {
+    let port = boss_ports::prod("ml");
+    assert_eq!(
+        manifest_ports().get("ml").map(|(p, _)| *p),
+        Some(port),
+        "{MANIFEST} does not expose the ML API on its boss-ports port — the nightly batch \
+         on boss-gcp has no way to reach the instance it scores"
+    );
+    assert_eq!(
+        env_ports().get("ml").copied(),
+        Some(port),
+        "{PORTS_ENV} has no ml row — render-sor-env.sh derives BOSS_ML_API_URL from it"
+    );
+}
+
 #[test]
 fn the_jobs_api_is_still_on_the_door() {
     assert_eq!(
@@ -272,6 +295,29 @@ fn the_jobs_api_is_still_on_the_door() {
     assert!(
         reader_services().iter().any(|s| s == "jobs"),
         "{ROUTES} has no `jobs` route — nothing is left to default to"
+    );
+}
+
+/// A PORT ON THE DOOR IS A LISTENER ON THE POD. The Service can carry
+/// a port whose process listens only on loopback, and then the door
+/// refuses it while every pin above stays green: measured 2026-09-23,
+/// 10.20.0.34:7250 refused with the policy row present, because
+/// boss-policy-api binds 127.0.0.1 unless `BOSS_POLICY_BIND_HOST` says
+/// otherwise and nothing said so (car 11eea434's probe, a day not-yet).
+/// The policy API is the one service on the door whose bind is not set
+/// by generate-configs.sh, so it is widened in the pod's env.
+#[test]
+fn the_policy_api_listens_where_the_door_sends_it() {
+    assert!(
+        manifest_ports().contains_key("policy"),
+        "{MANIFEST} no longer carries policy; delete this test with it"
+    );
+    let pod = read("infra/cluster/manifests/boss.yaml");
+    assert!(
+        pod.lines()
+            .any(|l| l.trim() == r#"- {name: BOSS_POLICY_BIND_HOST, value: "0.0.0.0"}"#),
+        "infra/cluster/manifests/boss.yaml must set BOSS_POLICY_BIND_HOST to 0.0.0.0: the door \
+         carries policy, and boss-policy-api binds 127.0.0.1 without it"
     );
 }
 
@@ -333,6 +379,16 @@ fn the_route_function_sends_every_boss_accounts_path_to_accounts_and_nothing_els
         ("/api/ledger/journal-entries?limit=1", "ledger"),
         ("/api/dispatcher/rules", "dispatcher"),
         ("/api/dispatcher/rules/auto-assign/versions", "dispatcher"),
+        // The file store joined on 2026-09-23 (backlog 7610dd2f): an
+        // actor attaches a file with `boss attach`, which posts to
+        // boss-content-api's /api/files and reads the bytes back by id.
+        // `_upload-url`, `_finalize` and `_audit` are mounted under the
+        // same prefix by the same router, so they route with it.
+        ("/api/files", "content"),
+        ("/api/files?target_kind=job&target_id=j-1", "content"),
+        ("/api/files/0b8f6c1e-0000-4000-8000-000000000000", "content"),
+        ("/api/files/_audit?sample=5", "content"),
+        ("/api/filesx", "jobs"),
         ("/api/ledgers/x", "jobs"),
         ("/api/dispatchers", "jobs"),
         ("/api/jobs?kind=pr-train", "jobs"),

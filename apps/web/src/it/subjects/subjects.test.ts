@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   buildKindTree,
   groupClassesByAttribute,
+  kindModule,
+  workflowCountsByKind,
   type ClassRow,
   type SubjectKind,
 } from './subjects';
@@ -83,8 +85,80 @@ describe('groupClassesByAttribute', () => {
     expect(groups[0]![1].map((c) => c.code)).toEqual(['ceo']);
   });
 
-  test('a null member_attribute falls under "(unclassified)"', () => {
+  test('a null member_attribute with neither shape falls under "(unclassified)"', () => {
     const groups = groupClassesByAttribute([cls({ code: 'mystery', member_attribute: null })]);
     expect(groups.map(([k]) => k)).toEqual(['(unclassified)']);
+  });
+
+  // Backlog 2c7a2d5c (page audit 9f7ba57d, gap 3): the six `node`
+  // Classes carry a NULL member_attribute BY DESIGN — their membership
+  // is the node_roles junction table, named in metadata.membership
+  // (202609120300-a-node-declares-its-roles.sql). A declared shape is
+  // titled by what it declares, never called unclassified.
+  test('a null member_attribute is titled by its declared metadata.membership', () => {
+    const groups = groupClassesByAttribute([
+      cls({ code: 'gate', member_attribute: null, metadata: { membership: 'node_roles' }, sort_order: 2 }),
+      cls({ code: 'build', member_attribute: null, metadata: { membership: 'node_roles' }, sort_order: 1 }),
+      cls({ code: 'mystery', member_attribute: null }),
+    ]);
+    expect(groups.map(([k]) => k)).toEqual(['(unclassified)', 'node_roles']);
+    expect(groups[1]![1].map((c) => c.code)).toEqual(['build', 'gate']);
+  });
+
+  test('a membership that is not a non-empty string is no declaration', () => {
+    const groups = groupClassesByAttribute([
+      cls({ code: 'a', member_attribute: null, metadata: { membership: '' } }),
+      cls({ code: 'b', member_attribute: null, metadata: { membership: 7 } }),
+    ]);
+    expect(groups.map(([k]) => k)).toEqual(['(unclassified)']);
+  });
+
+  test('a member_attribute wins over a membership on the same row', () => {
+    const groups = groupClassesByAttribute([
+      cls({ code: 'ceo', member_attribute: 'role', metadata: { membership: 'node_roles' } }),
+    ]);
+    expect(groups.map(([k]) => k)).toEqual(['role']);
+  });
+});
+
+// Backlog 92ea2e00 (page audit 9f7ba57d, gap 5): `owner platform` was
+// the same on 24 of 24 kinds. A kind now names the manifest module its
+// surfaces live behind, in metadata.module; a platform kind names none.
+describe('kindModule', () => {
+  test('reads metadata.module', () => {
+    expect(kindModule(sk({ kind: 'asset', metadata: { module: 'equipment' } }))).toBe('equipment');
+  });
+
+  test('a platform kind has none', () => {
+    expect(kindModule(sk({ kind: 'employee' }))).toBeNull();
+  });
+
+  test('a module that is not a non-empty string is none', () => {
+    expect(kindModule(sk({ kind: 'x', metadata: { module: '' } }))).toBeNull();
+    expect(kindModule(sk({ kind: 'y', metadata: { module: true } }))).toBeNull();
+  });
+});
+
+describe('workflowCountsByKind', () => {
+  const wf = (kind: string, status: string, subject_kinds: ReadonlyArray<string>) => ({
+    kind,
+    status,
+    subject_kinds,
+  });
+
+  test('counts the ACTIVE workflows naming each kind in subject_kinds', () => {
+    const counts = workflowCountsByKind([
+      wf('sale', 'active', ['account', 'customer']),
+      wf('renewal', 'active', ['account']),
+      wf('old-sale', 'retired', ['account']),
+      wf('idea', 'draft', ['asset']),
+    ]);
+    expect(counts.get('account')).toBe(2);
+    expect(counts.get('customer')).toBe(1);
+    expect(counts.get('asset')).toBeUndefined();
+  });
+
+  test('a workflow naming a kind twice counts once', () => {
+    expect(workflowCountsByKind([wf('dup', 'active', ['asset', 'asset'])]).get('asset')).toBe(1);
   });
 });

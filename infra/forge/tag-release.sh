@@ -112,7 +112,7 @@ SOR_READ="${BOSS_TAG_RELEASE_SOR_READ:-$REPO/infra/forge/probe-bin/boss-sor-read
 TAGGER_NAME="${BOSS_TAG_RELEASE_TAGGER_NAME:-BOSS tag-release}"
 TAGGER_EMAIL="${BOSS_TAG_RELEASE_TAGGER_EMAIL:-tag-release@noreply.algedonic.dev}"
 TRAINS_LIMIT=200
-TRAINS_PATH="/api/jobs?kind=pr-train&status=closed&limit=$TRAINS_LIMIT"
+TRAINS_PATH="/api/jobs?kind=pr-train&status=closed&limit=$TRAINS_LIMIT&full=true"
 # The trains are read as a NAMED, READ-SCOPED actor through the reader
 # a recorded probe uses (run-car-probe.sh builds this identity for the
 # same reason: role `audit-readonly` is Read at Scope::All and nothing

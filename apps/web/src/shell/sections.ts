@@ -19,7 +19,8 @@
 //     IT tab's own landing page — rendered under Home chrome.
 //     `sections.test.ts` pins every value now (CLAUDE.md §9a).
 
-import type { Route } from '../router';
+import { notFoundBack, parseRoute, type Route } from '../router';
+import type { Department } from '@boss/web-kit/nav';
 import { ROUTE_CATALOG, appForSection, type AppId, type NavItem } from './nav-catalog';
 
 /// Sections that deliberately resolve to the Home app instead of a
@@ -39,19 +40,19 @@ export const HOME_CHROME_SECTIONS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /// Sections whose APP is carried by the route rather than by a catalog
-/// entry, each with the reason. The catalog's `app` field is static —
+/// entry, each with the reason. The catalog's `owner` field is static —
 /// one surface, one department — and that is right for every surface
 /// built for a department by name. A department's jobs view is one
-/// surface for EVERY department the Class registry declares
-/// (cc76f755, 2026-09-18): the app it renders under is the route's
-/// `code`, so no catalog row can answer for it, and `appForRoute`
-/// reads the route instead. The sidebar row that highlights for it is
-/// the permKey-less "Jobs" row AppShell adds to every department group.
+/// surface for EVERY department the registry declares (cc76f755,
+/// 2026-09-18): the app it renders under is the route's `code`, so no
+/// catalog row can answer for it, and `appForRoute` reads the route
+/// instead. The sidebar row that highlights for it is the permKey-less
+/// "Jobs" row every department's sidebar ends on (`departmentRows`).
 export const DYNAMIC_APP_SECTIONS: ReadonlyMap<string, string> = new Map([
   [
     'department-jobs',
     'the department jobs view renders under the department named in the ' +
-      'route (/ux/departments/<code>), which is registry data',
+      'route (/<code>/jobs), which is registry data',
   ],
 ]);
 
@@ -66,17 +67,34 @@ export function appForRoute(route: Route): AppId {
   return appForSection(sectionForRoute(route));
 }
 
-/// The two yards that kept rows of their own (feedback 92921c2f,
-/// 2026-09-18) are REGIONS of the world since car 4 of design
-/// d2154293, so their route is a yard floor like any other. The kind
-/// alone can no longer say which row to light: the region does, and
-/// this is the one place that reads it. Without it both would light
-/// the Train Yard's row, and a sidebar row that never highlights is
-/// a row an operator stops trusting.
-export const REGION_SECTIONS: Readonly<Record<string, string>> = {
-  receiving: 'system-receiving',
-  marshalling: 'system-marshalling',
-};
+/// The route as THIS instance can render it: unchanged, unless the
+/// department that owns it is not a live row in the registry — then the
+/// not-found page, naming the path and the department, with one door
+/// Home (backlog 64656a46, car 2 of design 8c3e9599; e543c6fe asked for
+/// exactly this). A department the company does not have is never a
+/// module-off notice, and never its own chrome: the tab bar has no tab
+/// for it, so the page would render under a tab nobody can see.
+///
+/// `roster` is `null` until the registry has ANSWERED, and while its
+/// read is failing — never read as an empty roster, which would turn
+/// every department page into not-found because a request was slow or
+/// dark (a wrong target answers instead of erroring). Unanswered, the
+/// route renders as it always did.
+///
+/// Home and the Simulator are not departments and pass untouched, as
+/// does a path the router already could not match. IT's pages answer to
+/// the registry like any department's: IT is a row (design 8c3e9599 §2).
+export function withRoster(
+  route: Route,
+  pathname: string,
+  roster: ReadonlyArray<Department> | null,
+): Route {
+  if (roster === null || route.kind === 'notFound') return route;
+  const owner = appForRoute(route);
+  if (owner === 'home' || owner === 'simulator') return route;
+  if (roster.some((d) => d.code === owner)) return route;
+  return { kind: 'notFound', path: pathname, department: owner };
+}
 
 /// Which tenant module a route needs, and the label to say it with —
 /// or null when the surface is always-on.
@@ -99,20 +117,46 @@ export function moduleForRoute(route: Route): { id: string; label: string } | nu
   return { id: entry.module, label: entry.label };
 }
 
-/// Which sidebar row a route lights.
+/// Which sidebar row a route lights — the ONE answer, and the only
+/// one this module exports. Most rows are named by the route's kind
+/// (SECTION_FOR_KIND); a row that depends on a route PARAMETER, which
+/// a kind-keyed map cannot express, gets its branch HERE, never a
+/// second exported lookup. A yard floor's region was one until car N1
+/// of design e765b3fc (2026-09-25): the two yards with rows of their
+/// own lost them to the one Department Map row, so every region lights
+/// that row and the region map that answered for them is gone.
 export function sectionForRoute(route: Route): string {
-  if (route.kind === 'systemYardFloor') {
-    return REGION_SECTIONS[route.region] ?? SECTION_FOR_ROUTE.systemYardFloor!;
+  // An unmatched path lights the row of the page its one back link
+  // opens, so it renders in the department it was under: /it/<typo> in
+  // the IT chrome, anything else in Home (design ee3a3a2f Q4). The /it
+  // catch-all returned the yard until then, which is how that chrome
+  // came for free.
+  // A path owned by a department this instance does not have lights
+  // Home, where its one door leads (`withRoster`).
+  if (route.kind === 'notFound' && route.path) {
+    return sectionForRoute(parseRoute(notFoundBack(route.path, route.department).href));
   }
-  return SECTION_FOR_ROUTE[route.kind];
+  return SECTION_FOR_KIND[route.kind];
 }
 
-export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
+/// The kind half of `sectionForRoute`: NOT authoritative alone, and so
+/// not exported. It was the public answer (as SECTION_FOR_ROUTE) until
+/// car 4 of design d2154293 retired /it/operate/receiving and
+/// /it/operate/marshalling as pages: both are yard floors now, and
+/// read off this map both light the Train Yard's row — a plausible
+/// wrong answer with no error, which is the failure a reader cannot
+/// see (backlog c6f91515, 2026-09-20). Its reader is
+/// `sectionForRoute`, which answers first for any route whose row a
+/// parameter decides.
+const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   // Renders outside AppShell (or has no sidebar row) — see
   // HOME_CHROME_SECTIONS for the reasons.
   login: 'me',
   stepFocus: 'me',
   home: 'me',
+  // The kind half only: `sectionForRoute` answers by the path's
+  // department, the way it answers a yard floor by its region.
+  notFound: 'me',
   search: 'me',
   me: 'me',
   hr: 'hr',
@@ -147,9 +191,17 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   shipmentDetail: 'shipping',
   support: 'support',
   qa: 'qa',
-  calendar: 'calendar',
-  myCalendar: 'calendar',
-  schedule: 'schedule',
+  // /ux/calendar/me is the `schedule` row's own path (Home, "My
+  // schedule"). It lit `calendar` until 2026-09-24, so it highlighted
+  // Release calendar and was gated on the calendar module — off on the
+  // live instance, so the page was ModuleDisabled (eff0c5e5).
+  myCalendar: 'schedule',
+  // /ux/service/schedule is the service department's week grid of
+  // every tech, not a personal schedule: it lights the Service queue
+  // row and takes that row's module gate. It lit `schedule` until
+  // 2026-09-24, so with the line above two pages lit My schedule
+  // (backlog 3b50fe11).
+  schedule: 'service',
   exec: 'exec',
   warehouse: 'warehouse',
   // The department jobs view: its app is the route's own code, not a
@@ -172,22 +224,18 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   systemMonitoringPerf: 'system-incidents',
   systemMonitoringEvents: 'system-incidents',
   systemMonitoringAtlas: 'system-incidents',
-  systemMonitoringConductor: 'system-incidents',
   systemFleet: 'system-incidents',
-  systemYardStatus: 'system-incidents',
   systemStepPlugins: 'system-step-plugins',
   systemStepPluginDetail: 'system-step-plugins',
   systemSubjects: 'system-subjects',
   systemRegistryDrift: 'system-registry-drift',
-  systemFeedback: 'system-feedback',
-  systemBacklog: 'system-backlog',
+  systemAgents: 'system-agents',
+  // The Department Map (design e765b3fc, car N1): the landing and every
+  // selection on it light its one row. The floors, the crew board, yard
+  // status, the conductor's feed and the feedback and backlog boards
+  // were pages with rows of their own until car N3 made each one a
+  // selection's panel.
   systemYard: 'system-yard',
-  // A yard floor is the Train Yard opened on one panel (0524fc95 car
-  // 2): it highlights the yard's own row — except for the two floors
-  // that are queue boards with sidebar rows of their own, which
-  // `sectionForRoute` answers for.
-  systemYardFloor: 'system-yard',
-  systemCrew: 'system-crew',
   systemEstate: 'system-estate',
   incidents: 'system-incidents',
   systemKb: 'system-kb',
@@ -201,8 +249,19 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   dispatcherRulesList: 'system-dispatcher',
   dispatcherRuleEdit: 'system-dispatcher',
   workflows: 'workflows',
-  workflowsAdmin: 'workflows',
   workflowNew: 'workflows',
   workflowDesign: 'workflows',
   workflowDetail: 'workflows',
 };
+
+/// Every route kind — the map's keys, which the `Record` type holds
+/// complete. Exported so a pin can walk every kind through
+/// `sectionForRoute` without reaching for the map itself.
+export const ROUTE_KINDS: ReadonlyArray<Route['kind']> = Object.keys(
+  SECTION_FOR_KIND,
+) as ReadonlyArray<Route['kind']>;
+
+/// Every section a route can light. Derived here, beside the map, so no
+/// caller has to know how many answers there are (backlog c6f91515);
+/// a parameter-decided row, when one returns, is added here too.
+export const SECTIONS_PRODUCED: ReadonlySet<string> = new Set(Object.values(SECTION_FOR_KIND));

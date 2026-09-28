@@ -19,6 +19,11 @@
 # stamps every row it reads with the bundle's default (`platform`) and
 # ignores the key, so a fresh database gets `platform` — the one field
 # of the row the tree cannot currently express.
+#
+# The live lineage's v2 (2026-09-27, backlog ede02a78) is v1 plus an
+# agent block on each work step, published from this file with
+# `boss workflow publish` after the live v1 was read back equal to it.
+# Nothing else changed.
 # ---------------------------------------------------------------------------
 
 [[workflow]]
@@ -41,6 +46,14 @@ title = "survey"
 kind = "task"
 ready_when = "steps.opened.done"
 title_template = "Find what has settled but not folded"
+# WHO EXECUTES THE FLATTEN (backlog ede02a78, 2026-09-27). The ad hoc
+# run c98e5183 waited here because `boss dispatch` refused the step by
+# name: v1 declared no agent block on any step, so no agent could be
+# handed the work — the second reason the protocol had never run. The
+# four work steps declare a block; `review` stays a person's sign-off.
+# `survey` reads the corpus and records what it found, no car: the
+# analyst setting.
+agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
 fields = [
   { name = "resolved_found", field_type = "string", required = true },
   { name = "source_docs", field_type = "string", required = true },
@@ -52,6 +65,9 @@ title = "fold"
 kind = "task"
 ready_when = "steps.survey.done"
 title_template = "Fold the settled decisions into the current-truth record"
+# A car writing settled paragraphs into docs/architecture-decisions.md —
+# the same work, and so the same setting, as design-doc's `fold`.
+agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
 fields = [
   { name = "decisions_folded", field_type = "string", required = true },
   { name = "target_sections", field_type = "string", required = true },
@@ -62,6 +78,10 @@ title = "curate"
 kind = "task"
 ready_when = "steps.fold.done"
 title_template = "Retire what is now superseded; say what is kept and why"
+# A car too, but a smaller one: deleting what the fold superseded and
+# saying what stays, after the judgement of what settled was made at
+# `survey` and `fold`.
+agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 3, effort = "medium" }
 fields = [
   { name = "retired", field_type = "string", required = true },
   { name = "kept", field_type = "string", required = true },
@@ -72,6 +92,9 @@ title = "verify"
 kind = "task"
 ready_when = "steps.curate.done"
 title_template = "Prove the corpus still resolves"
+# Runs the lints and follows the references on the landed tree and
+# records the result, no car: the analyst setting.
+agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
 fields = [
   { name = "lint", field_type = "string", required = true },
   { name = "references", field_type = "string", required = true },

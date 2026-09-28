@@ -41,8 +41,29 @@
 # precedent), and the equality pin in boss-jobs holds the bundle equal
 # to whatever the migrations produce.
 #
+# THE SECOND RULE — a migration does not rewrite an EVENTED registry row
+# (backlog fa25700f, 2026-09-27). The registries in EVENTED_TABLES
+# change through a door that publishes the fact of the change: a Class
+# through PUT /api/classes/{subject_kind}/{code} (class.updated) and
+# POST …/retire (class.retired); a Workflow through its bundle and
+# /api/workflows/{kind}/publish|retire (jobs.kind.published|retired).
+# An `UPDATE` or `DELETE FROM` on one of them inside a migration is a
+# change the audit log never hears of — the refurb asset phases were
+# retired that way on 2026-09-24, and no rebuilder can reproduce it.
+# This is unrelated to the cutover: the rule is not "rows live in a
+# bundle" but "the log hears every change", so it holds for every
+# migration. The ones that already did it ran on every instance and
+# cannot be rewritten (migrations-append-only.sh), so each is named in
+# EVENTED_ALLOWLIST with its reason — a named set, not a stamp, so the
+# ratchet admits exactly them and nothing that comes later.
+# dispatcher_rules is deliberately NOT in the list: its rows are
+# refused to a migration by no-migration-writes-a-dispatcher-rule.sh,
+# which admits a DELETE for the reason it states (b5f21e82), and a
+# second copy of that rule here would be a fact living twice (§9a).
+#
 # EXIT STATUS (house style, infra/lint/lib/git-answer.sh):
-#   0  the tree was read and no post-cutover migration inserts a row
+#   0  the tree was read, no post-cutover migration inserts a row, and
+#      no migration outside the allowlist rewrites an evented row
 #   1  the tree was read and a violation was found — the author's to fix
 #   3  the tree was never read — a fact about the MACHINE; never `clean`
 #
@@ -80,6 +101,27 @@ CUTOVER="20260918112134"
 # 20260918102236 is newer but only DROPs a column, which is schema).
 REGISTRY_TABLES="stations step_plugins cadence_rules delivery_policy"
 
+# The registries whose rows change through an evented door, so a
+# migration may not UPDATE or DELETE FROM them at all (backlog
+# fa25700f; THE SECOND RULE in the header). classes: boss-classes'
+# PUT and retire doors. workflows: the bundle and the publish/retire
+# doors in boss-jobs. subject_kinds: the registry has NO write door
+# yet — which is the reason a migration is not the answer either; the
+# door is built first.
+EVENTED_TABLES="classes subject_kinds workflows"
+
+# Migrations that rewrote an evented row before the rule existed,
+# measured 2026-09-27 on origin/main 4c250f91. One entry per line,
+# `file|reason`; the reason is required (the self-test refuses an entry
+# without one, and a pin in boss-testing refuses an entry whose file is
+# gone — a dead name would admit whatever next took it).
+EVENTED_ALLOWLIST=(
+    "01-registries.sql|the baseline that creates subject_kinds; its two UPDATEs fill calendar_reservable and birth on rows the same file inserts, before any door exists to call"
+    "20260924172233-the-refurb-asset-phases-retire.sql|retired four refurb asset phases on 2026-09-24 as a bare UPDATE, the unevented retirement this rule was written after; applied on every instance and append-only"
+    "20260926061106-an-archived-message-keeps-its-kind.sql|retired the message kind archived on 2026-09-26 after its backfill; applied on every instance and append-only, so it stays as history"
+    "20260926223752-the-audit-account-is-not-headcount.sql|merged counts_in_headcount false into the audit-readonly role Class on 2026-09-26; applied on every instance and append-only, so it stays as history"
+)
+
 # --- the scanner -------------------------------------------------------
 # One file's findings, as `<line>\t<table>`. Empty output = clean. The
 # SQL is read with `--` comments removed, so prose about an insert is
@@ -100,6 +142,59 @@ findings_in() { # file
             }
         }
     ' "$1"
+}
+
+# One file's evented-row rewrites, as `<line>\t<verb>\t<table>`. Empty
+# output = clean. `UPDATE [ONLY] [public.]<table>` and `DELETE FROM
+# [ONLY] [public.]<table>`, any case, any whitespace, every statement on
+# a line (not only the first), and a keyword left dangling at the end of
+# a line (`DELETE` / `FROM workflows`) is read with the next one and
+# reported at the line it started on. A table named after the keyword
+# is the statement's TARGET, so `UPDATE messages … FROM classes` (a
+# read) and `AFTER UPDATE ON classes` (a trigger) are not writes.
+rewrites_in() { # file
+    awk -v tables="$EVENTED_TABLES" '
+        BEGIN {
+            n = split(tables, t, /[ \n]+/); for (k = 1; k <= n; k++) if (t[k] != "") want[t[k]] = 1
+            kw = "(update([ \t]+only)?|delete[ \t]+from([ \t]+only)?)"
+            carry = ""; carry_nr = 0
+        }
+        {
+            line = $0
+            sub(/--.*$/, "", line)
+            low = tolower(line)
+            clen = 0; from_nr = carry_nr
+            if (carry != "") { low = carry " " low; clen = length(carry) + 1 }
+            carry = ""
+            rest = low; pos = 0
+            while (match(rest, "(^|[^a-z0-9_])" kw "[ \t]+(public\\.)?[a-z_]+") > 0) {
+                at = pos + RSTART
+                stmt = substr(rest, RSTART, RLENGTH)
+                pos += RSTART + RLENGTH - 1
+                rest = substr(rest, RSTART + RLENGTH)
+                sub(/^[^a-z]/, "", stmt)
+                verb = (stmt ~ /^update/) ? "updates" : "deletes from"
+                tbl = stmt
+                sub("^" kw "[ \t]+", "", tbl)
+                sub(/^public\./, "", tbl)
+                if (tbl in want) printf "%d\t%s\t%s\n", (clen > 0 && at <= clen) ? from_nr : NR, verb, tbl
+            }
+            if (match(low, "(^|[^a-z0-9_])(update([ \t]+only)?|delete([ \t]+from)?([ \t]+only)?)[ \t]*$") > 0) {
+                carry = substr(low, RSTART, RLENGTH)
+                sub(/^[^a-z]/, "", carry)
+                carry_nr = (clen > 0 && RSTART <= clen) ? from_nr : NR
+            }
+        }
+    ' "$1"
+}
+
+# Whether a migration (by basename) is named in EVENTED_ALLOWLIST.
+allowlisted() { # basename
+    local e
+    for e in "${EVENTED_ALLOWLIST[@]}"; do
+        [ "${e%%|*}" = "$1" ] && return 0
+    done
+    return 1
 }
 
 # The leading numeric prefix of a migration file name, or `none`.
@@ -168,6 +263,52 @@ self_test() {
         }
     done
 
+    # The second rule's scanner (backlog fa25700f). Accepted: a table
+    # named only as a READ or a trigger's event, DDL, prose, a table
+    # that merely starts with the name, a column called updated_at,
+    # and a foreign key's ON DELETE / ON UPDATE — none rewrites a row.
+    {
+        printf -- '-- A comment may say UPDATE classes SET retired_at to tell the story.\n'
+        printf 'UPDATE messages m SET kind = c.code FROM classes c WHERE m.kind = c.code;\n'
+        printf 'CREATE TRIGGER t AFTER UPDATE ON classes FOR EACH ROW EXECUTE FUNCTION f();\n'
+        printf 'ALTER TABLE workflows ADD COLUMN IF NOT EXISTS lens TEXT;\n'
+        printf 'UPDATE classes_archive SET x = 1;\n'
+        printf 'ALTER TABLE subject_kinds ADD CONSTRAINT p FOREIGN KEY (parent) REFERENCES subject_kinds (kind) ON DELETE CASCADE ON UPDATE CASCADE;\n'
+        printf 'SELECT updated_at FROM classes;\n'
+    } >"$t/good2.sql"
+    hits="$(rewrites_in "$t/good.sql")$(rewrites_in "$t/good2.sql")"
+    [ -z "$hits" ] || {
+        echo "$NAME: self-test FAILED — an accepted shape was read as an evented-row rewrite:" >&2
+        printf '%s\n' "$hits" >&2
+        return 1
+    }
+    # Refused, each with the line its statement STARTS on.
+    printf 'UPDATE classes SET retired_at = NOW() WHERE code = %s;\n' "'x'" >"$t/rw1.sql"
+    printf 'update\tONLY public.subject_kinds set metadata = %s;\n' "'{}'" >"$t/rw2.sql"
+    printf 'DELETE\n  FROM workflows WHERE kind = %s;\n' "'x'"              >"$t/rw3.sql"
+    printf 'SELECT 1; UPDATE Workflows SET status = %s;\n' "'retired'"     >"$t/rw4.sql"
+    printf -- '-- first\nDELETE FROM -- the row\n    classes WHERE code = %s;\n' "'x'" >"$t/rw5.sql"
+    local want
+    for f in "rw1.sql|1	updates	classes" "rw2.sql|1	updates	subject_kinds" \
+             "rw3.sql|1	deletes from	workflows" "rw4.sql|1	updates	workflows" \
+             "rw5.sql|2	deletes from	classes"; do
+        want="${f#*|}"
+        hits="$(rewrites_in "$t/${f%%|*}")"
+        [ "$hits" = "$want" ] || {
+            echo "$NAME: self-test FAILED — ${f%%|*} should read as [$want], read as [$hits]:" >&2
+            sed 's/^/    /' "$t/${f%%|*}" >&2
+            return 1
+        }
+    done
+    # Every allowlist entry names a file and says why.
+    local e
+    for e in "${EVENTED_ALLOWLIST[@]}"; do
+        case "$e" in
+            ?*'|'?*) ;;
+            *) echo "$NAME: self-test FAILED — allowlist entry is not file|reason: $e" >&2; return 1 ;;
+        esac
+    done
+
     # The cutover, both sides: a three-digit and a twelve-digit prefix
     # are history, a fourteen-digit one newer than the stamp is not, a
     # file with no numeric prefix sorts last and is not.
@@ -181,7 +322,7 @@ self_test() {
         echo "$NAME: self-test FAILED — the cutover comparison answers wrongly" >&2
         return 1
     }
-    echo "$NAME: self-test ok — schema statements, prose, an UPDATE and a prefixed table name pass; six spellings of INSERT INTO a registry table are refused; the cutover splits history from new"
+    echo "$NAME: self-test ok — schema statements, prose, an UPDATE and a prefixed table name pass; six spellings of INSERT INTO a registry table are refused; the cutover splits history from new; reads, triggers and foreign keys on an evented registry pass while five spellings of UPDATE or DELETE FROM one are refused at their line"
 }
 
 if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
@@ -196,10 +337,28 @@ status=$?
 
 scanned=0
 findings=0
+rewrites=0
+admitted=0
 while IFS= read -r file; do
     [ -n "$file" ] || continue
     [ -f "$file" ] || continue
     scanned=$((scanned + 1))
+    # The second rule reads EVERY migration; the allowlist, not the
+    # cutover, is what admits history.
+    rw="$(rewrites_in "$file")"
+    if [ -n "$rw" ]; then
+        if allowlisted "$(basename "$file")"; then
+            admitted=$((admitted + 1))
+        else
+            while IFS=$'\t' read -r lineno verb tbl; do
+                [ -n "${lineno:-}" ] || continue
+                rewrites=$((rewrites + 1))
+                echo "$NAME: $file:$lineno $verb $tbl" >&2
+            done <<RW
+$rw
+RW
+        fi
+    fi
     is_after_cutover "$(prefix_of "$(basename "$file")")" || continue
     while IFS=$'\t' read -r lineno tbl; do
         [ -n "${lineno:-}" ] || continue
@@ -209,6 +368,31 @@ while IFS= read -r file; do
 done <<EOF
 $files
 EOF
+
+if [ "$rewrites" -gt 0 ]; then
+    cat >&2 <<MSG
+
+FAIL — the migration(s) above rewrite an evented registry row in SQL
+(an update or a delete). A migration's write publishes no event, so the
+audit log — the system of record — never hears the registry changed, and no rebuilder
+can reproduce it (backlog fa25700f: the refurb asset phases were
+retired that way on 2026-09-24). Change the row through its door:
+
+  * classes — PUT /api/classes/{subject_kind}/{code} edits a Class and
+    publishes class.updated; POST /api/classes/{subject_kind}/{code}/retire
+    withdraws one and publishes class.retired (boss-classes http.rs).
+  * workflows — the protocol's file under infra/platform/workflows/,
+    with a version bump, which the platform seed publishes; retire
+    through POST /api/workflows/{kind}/retire (jobs.kind.published,
+    jobs.kind.retired). A packet in flight moves only by boss job convert.
+  * subject_kinds — the registry has no write door yet. Build the
+    evented door first (its own car); a migration is not the stand-in.
+
+A migration keeps its DDL. The migrations that did this before the rule
+existed are named in EVENTED_ALLOWLIST with their reasons; that list is
+history, not a queue — do not add a new migration to it.
+MSG
+fi
 
 if [ "$findings" -gt 0 ]; then
     cat >&2 <<MSG
@@ -243,7 +427,8 @@ historical inserts before the cutover are history and stay as they are.
 MSG
     exit 1
 fi
+[ "$rewrites" -eq 0 ] || exit 1
 
 lint_scanned "$NAME" "$scanned" "migration(s) checked against the cutover"
-echo "$NAME: ok — every migration newer than $CUTOVER declares schema only"
+echo "$NAME: ok — every migration newer than $CUTOVER declares schema only, and none rewrites an evented registry row ($admitted allowlisted)"
 exit 0

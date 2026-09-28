@@ -13,6 +13,8 @@ boss-expr = { path = "../boss-expr" }
 boss-clock-client = { path = "../boss-clock-client" }
 boss-calendar-client = { path = "../boss-calendar-client" }
 boss-events = { path = "../boss-events" }
+# The schedule read's scope gate (design ea906603; backlog e5f7b51e's rule).
+boss-policy-client = { path = "../boss-policy-client" }
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 async-trait = { workspace = true }
@@ -29,12 +31,14 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
 regex = "1"
 tempfile = "3"
-uuid = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

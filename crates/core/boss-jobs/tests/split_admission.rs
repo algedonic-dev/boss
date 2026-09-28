@@ -1,5 +1,5 @@
 //! Split admission — Tier 2 of the experiments program
-//! (docs/design/network-experiments.md; packet 6ea5a12a).
+//! (the network-experiments decision in docs/architecture-decisions.md; packet 6ea5a12a).
 //!
 //! Q3 (574c2adf): an experiment IS a packet — kind
 //! `protocol-experiment`, terminals `promoted` / `retired`. Q1: its

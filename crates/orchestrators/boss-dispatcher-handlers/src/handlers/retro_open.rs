@@ -50,6 +50,24 @@
 //! What this retires: the cadence row (an operator act — there is no
 //! write door on `/api/cadence/rules`) and, after it, the `open:` verb
 //! in boss-cli's cadence loop, which then has no user.
+//!
+//! ONLY A DEPARTMENT WITH A PROTOCOL HAS A WEEK TO REVIEW (backlog
+//! a4fda30b, decided 2026-09-25; da600d10). W39 opened a retro for all
+//! thirteen departments then held; ten declared no protocol, one sat
+//! at `collect` for four days with nothing to collect, and seven were
+//! left open when their departments retired. A department the week
+//! window would open is now read through
+//! `GET /api/departments/{code}/readiness` first, and one whose
+//! `protocols.has` is false is SKIPPED — by name, with the reason, on
+//! the platform retro this same firing opens ([`platform_packet`]'s
+//! `departments_skipped`). That packet is where it belongs: the
+//! protocol-retro reviews the platform's protocols, this rule among
+//! them, and a skip nobody can read is the silent kind. The rule's
+//! `open_without_protocol` names the one exemption, IT, whose protocols
+//! carry no department until a8458043 lands and whose retro reads the
+//! agent work profile (2f23f4c6); drop the arg when that lands. A
+//! retired department is not in the roster at all, so it is neither
+//! opened nor skipped — the list read already refuses it.
 
 use std::sync::Arc;
 
@@ -89,6 +107,26 @@ impl RetroOpen {
     fn base(&self) -> &str {
         self.jobs_base.trim_end_matches('/')
     }
+
+    /// The department's skip reason from its readiness read, or `None`
+    /// when its retro opens. `Err` is a read that could not decide —
+    /// neither an open nor a skip.
+    async fn skip_for(
+        &self,
+        code: &str,
+        exempt: Option<&str>,
+        rule_name: &str,
+    ) -> Result<Option<String>, String> {
+        let readiness = get_json(
+            &self.client,
+            &format!("{}/api/departments/{code}/readiness", self.base()),
+            rule_name,
+        )
+        .await
+        .map_err(|e| format!("readiness read failed: {e}"))?;
+        let declares = declares_a_protocol(&readiness)?;
+        Ok(skip_reason(code, declares, exempt))
+    }
 }
 
 /// Two days in the same ISO week (Monday-anchored, the week the
@@ -123,14 +161,17 @@ pub fn decide(newest_opened_on: Option<NaiveDate>, today: NaiveDate) -> Decision
 
 /// The newest packet's `opened_on` out of a `/api/jobs?…&limit=1`
 /// listing (newest-opened first), or `None` for an empty page.
-pub fn newest_opened_on(listing: &Value) -> Option<NaiveDate> {
-    listing
-        .get("data")?
-        .as_array()?
-        .first()?
-        .get("opened_on")?
-        .as_str()
-        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+///
+/// A listing with no `data` array REFUSES (backlog d4698bc2): read as
+/// an empty page it meant "no retro ever", and [`decide`] opens on
+/// that — a twin of this week's retro filed on a bad answer.
+pub fn newest_opened_on(listing: &Value) -> Result<Option<NaiveDate>, String> {
+    let rows: Vec<Value> = super::common::rows_or_refuse(listing, "the newest-retro read")?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.get("opened_on"))
+        .and_then(Value::as_str)
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()))
 }
 
 /// One department's retro packet. The Subject is the department code
@@ -164,15 +205,68 @@ pub fn department_packet(
     })
 }
 
+/// A department this firing opened no retro for, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skip {
+    pub department: String,
+    pub reason: String,
+}
+
+/// Does the department declare a protocol? The readiness read's own
+/// `protocols.has` (backlog a4fda30b, decided 2026-09-25) — the join
+/// over the workflow registry lives once, in the jobs API, and is not
+/// redone here. `null` is UNDETERMINED and refuses with the read's own
+/// reason: skipping on it would read a dark registry as "no protocol".
+pub fn declares_a_protocol(readiness: &Value) -> Result<bool, String> {
+    let part = readiness.get("protocols");
+    match part.and_then(|p| p.get("has")) {
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::Null) => Err(format!(
+            "the readiness read's protocols part is undetermined: {}",
+            part.and_then(|p| p.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given")
+        )),
+        _ => Err(format!(
+            "the readiness read carries no `protocols.has`: {readiness}"
+        )),
+    }
+}
+
+/// Why a department is skipped, or `None` when its retro opens. A
+/// department declaring a protocol opens; so does the rule's one
+/// `open_without_protocol` exemption (IT, whose protocols carry no
+/// department until a8458043 — and whose retro reads the agent work
+/// profile, 2f23f4c6). Every other department with no protocol is a
+/// retro that would spend an analyst run to report zero.
+pub fn skip_reason(code: &str, declares: bool, exempt: Option<&str>) -> Option<String> {
+    if declares || exempt == Some(code) {
+        return None;
+    }
+    Some(format!(
+        "declares no protocol: GET /api/departments/{code}/readiness answered \
+         protocols.has = false, so a retro would have nothing to review (backlog a4fda30b)"
+    ))
+}
+
 /// The platform's own retro, under the subject the cadence loop's
-/// `packet_body` already files it under so the two cannot twin.
+/// `packet_body` already files it under so the two cannot twin. It
+/// carries the firing's department skips: this is the packet that
+/// reviews the platform's protocols, this rule among them, so a skip
+/// lands on the record where the week's review reads it — not only in
+/// a journal line (a4fda30b: "a skip is visible and not silent").
 pub fn platform_packet(
     kind: &str,
     subject: &str,
     today: NaiveDate,
     owner: &str,
+    skips: &[Skip],
     ctx: &InvocationContext,
 ) -> Value {
+    let skipped: Vec<Value> = skips
+        .iter()
+        .map(|s| json!({ "department": s.department, "reason": s.reason }))
+        .collect();
     json!({
         "kind": kind,
         "subject": { "subject_kind": "custom", "id": subject },
@@ -182,6 +276,7 @@ pub fn platform_packet(
         "status": "open",
         "metadata": {
             "week": week_label(today),
+            "departments_skipped": skipped,
             "spawned_by_rule": ctx.rule_name,
             "triggered_by_event_id": ctx.triggering_event_id,
             "triggered_by_topic": ctx.triggering_topic,
@@ -282,6 +377,7 @@ impl Handler for RetroOpen {
         let department_kind = arg_string(args, "department_kind")?;
         let platform_kind = optional_string(args, "platform_kind")?;
         let platform_subject = optional_string(args, "platform_subject")?;
+        let exempt = optional_string(args, "open_without_protocol")?;
         if platform_kind.is_some() != platform_subject.is_some() {
             return Err(HandlerError::Permanent(
                 "retro.open: `platform_kind` and `platform_subject` are declared together or \
@@ -310,6 +406,7 @@ impl Handler for RetroOpen {
         // idempotent.
         let mut errors: Vec<String> = Vec::new();
         let mut opened = 0usize;
+        let mut skips: Vec<Skip> = Vec::new();
         for d in &departments {
             let path = format!(
                 "/api/jobs?kind={department_kind}&subject_id={}&limit=1",
@@ -321,8 +418,9 @@ impl Handler for RetroOpen {
                 &ctx.rule_name,
             )
             .await
+            .and_then(|l| newest_opened_on(&l).map_err(HandlerError::Downstream))
             {
-                Ok(l) => newest_opened_on(&l),
+                Ok(newest) => newest,
                 Err(e) => {
                     errors.push(format!("{}: newest-retro read failed: {e}", d.code));
                     continue;
@@ -337,6 +435,27 @@ impl Handler for RetroOpen {
                     );
                 }
                 Decision::Open => {
+                    // Only a department that declares a protocol has a
+                    // week to review (a4fda30b). Read AFTER the week
+                    // window, so a retry re-reads nothing it settled.
+                    match self
+                        .skip_for(&d.code, exempt.as_deref(), &ctx.rule_name)
+                        .await
+                    {
+                        Err(e) => {
+                            errors.push(format!("{}: {e}", d.code));
+                            continue;
+                        }
+                        Ok(Some(reason)) => {
+                            tracing::info!(department = %d.code, %reason, "retro.open: skipped");
+                            skips.push(Skip {
+                                department: d.code.clone(),
+                                reason,
+                            });
+                            continue;
+                        }
+                        Ok(None) => {}
+                    }
                     let body = department_packet(
                         department_kind,
                         &d.code,
@@ -371,14 +490,15 @@ impl Handler for RetroOpen {
                 &ctx.rule_name,
             )
             .await
+            .and_then(|l| newest_opened_on(&l).map_err(HandlerError::Downstream))
             {
                 Err(e) => errors.push(format!("{kind}: newest-retro read failed: {e}")),
-                Ok(l) => match decide(newest_opened_on(&l), today) {
+                Ok(newest) => match decide(newest, today) {
                     Decision::AlreadyThisWeek(day) => {
                         tracing::info!(kind = %kind, opened_on = %day, "retro.open: the platform retro was opened this week already");
                     }
                     Decision::Open => {
-                        let body = platform_packet(&kind, &subject, today, &owner, ctx);
+                        let body = platform_packet(&kind, &subject, today, &owner, &skips, ctx);
                         match post_json(
                             &self.client,
                             &format!("{}/api/jobs", self.base()),
@@ -403,6 +523,7 @@ impl Handler for RetroOpen {
             week = %week_label(today),
             departments = departments.len(),
             opened,
+            skipped = skips.len(),
             failed = errors.len(),
             "retro.open pass complete"
         );
@@ -489,9 +610,21 @@ mod tests {
             { "id": "a", "opened_on": "2026-09-21", "status": "open" },
             { "id": "b", "opened_on": "2026-09-14", "status": "closed" },
         ], "total": 2 });
-        assert_eq!(newest_opened_on(&l), Some(d("2026-09-21")));
-        assert_eq!(newest_opened_on(&json!({ "data": [], "total": 0 })), None);
-        assert_eq!(newest_opened_on(&json!({ "error": "x" })), None);
+        assert_eq!(newest_opened_on(&l), Ok(Some(d("2026-09-21"))));
+        assert_eq!(
+            newest_opened_on(&json!({ "data": [], "total": 0 })),
+            Ok(None)
+        );
+    }
+
+    /// Backlog d4698bc2: an error body read as "no retro ever", which
+    /// DECIDES Open — a twin of this week's retro filed on the far
+    /// side's bad answer. No `data` array refuses now, by name.
+    #[test]
+    fn a_newest_retro_read_with_no_data_array_refuses_rather_than_opening_a_twin() {
+        let why = newest_opened_on(&json!({ "error": "x" })).expect_err("no answer");
+        assert!(why.contains("no `data` array"), "{why}");
+        assert!(why.contains("the newest-retro read"), "{why}");
     }
 
     /// THE FLOOR (backlog 86ebf7fc). A roster read that SUCCEEDS and
@@ -579,6 +712,85 @@ mod tests {
         assert_eq!(b["title"], "Sales retro — week 2026-W39");
     }
 
+    /// Backlog a4fda30b: the verdict is the readiness read's own
+    /// `protocols.has`, never a second join here. `null` is UNDETERMINED
+    /// and refuses — read as "no protocol" it would skip a department on
+    /// a registry that could not answer.
+    #[test]
+    fn the_protocol_verdict_is_the_readiness_reads_has() {
+        let has = |v: Value| json!({ "protocols": { "has": v, "kinds": [] } });
+        assert_eq!(declares_a_protocol(&has(json!(true))), Ok(true));
+        assert_eq!(declares_a_protocol(&has(json!(false))), Ok(false));
+        let why = declares_a_protocol(
+            &json!({ "protocols": { "has": null, "reason": "registry dark" } }),
+        )
+        .expect_err("undetermined refuses");
+        assert!(why.contains("undetermined"), "{why}");
+        assert!(
+            why.contains("registry dark"),
+            "the refusal carries the read's reason: {why}"
+        );
+        assert!(
+            declares_a_protocol(&json!({ "error": "x" })).is_err(),
+            "no protocols part is a refusal, not a no"
+        );
+    }
+
+    /// A department with no protocol is skipped WITH its reason, and the
+    /// one exemption the rule declares (IT, until a8458043) opens anyway.
+    #[test]
+    fn a_department_without_a_protocol_is_skipped_by_name() {
+        assert_eq!(skip_reason("sales", true, None), None);
+        let why = skip_reason("support", false, None).expect("skipped");
+        assert!(why.contains("support"), "{why}");
+        assert!(why.contains("protocols.has = false"), "{why}");
+        assert_eq!(
+            skip_reason("it", false, Some("it")),
+            None,
+            "the exemption opens IT's retro"
+        );
+        assert!(
+            skip_reason("support", false, Some("it")).is_some(),
+            "the exemption names one department, not all of them"
+        );
+    }
+
+    /// The skips ride the platform retro the same firing opens — the
+    /// packet whose job is reviewing the platform's own protocols, this
+    /// rule among them — so a skip is on the record, not only in a log.
+    #[test]
+    fn the_platform_packet_carries_the_weeks_skips() {
+        let skips = vec![Skip {
+            department: "support".into(),
+            reason: "declares no protocol".into(),
+        }];
+        let b = platform_packet(
+            "protocol-retro",
+            "infra/protocol-retro",
+            d("2026-09-28"),
+            "emp-owner",
+            &skips,
+            &ctx(),
+        );
+        assert_eq!(
+            b["metadata"]["departments_skipped"],
+            json!([{ "department": "support", "reason": "declares no protocol" }])
+        );
+        let none = platform_packet(
+            "protocol-retro",
+            "infra/protocol-retro",
+            d("2026-09-28"),
+            "emp-owner",
+            &[],
+            &ctx(),
+        );
+        assert_eq!(
+            none["metadata"]["departments_skipped"],
+            json!([]),
+            "no skips is a reading too, and says so"
+        );
+    }
+
     /// The platform retro keeps the subject boss-cli's cadence loop
     /// files under (`infra/protocol-retro`), so while the old row is
     /// still active the loop's single-open check sees this packet.
@@ -589,6 +801,7 @@ mod tests {
             "infra/protocol-retro",
             d("2026-09-21"),
             "emp-owner",
+            &[],
             &ctx(),
         );
         assert_eq!(b["kind"], "protocol-retro");

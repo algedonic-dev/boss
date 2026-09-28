@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY: renders what `restart-forgejo` WOULD do to start a stopped Forgejo on the forge, and changes nothing (infra/forge/move-forgejo-data.sh --plan-restart; backlog 85d29e33). It takes no param. It reads whether Forgejo's one container is stopped, and what /opt/forgejo/data is: the move's bind of <boss-data mount>/forgejo-data (its UUID named), or a directory holding data on the root filesystem; Forgejo running, the path absent, the empty mountpoint without its bind, a mount that is not the move's, or no repository under it is a refusal, exit 78, not a plan. The plan names the one act — docker compose start forgejo, which must be a real start — what it proves (the start, /api/healthz) and what it only reports. No clock in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/move-forgejo-data.sh", "--plan-restart"],
+  "params": [],
+  "timeout": 300
+}

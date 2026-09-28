@@ -28,28 +28,51 @@
   import { href } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
 
-  type Tab =
-    | 'overview'
-    | 'invoices'
-    | 'approvals'
-    | 'income-statement'
-    | 'balance-sheet'
-    | 'cash-flow'
-    | 'trial-balance'
-    | 'tax-liability';
+  import { FINANCE_TABS, financeSearch, type FinanceTab, type FinanceView } from './financeQuery';
+  import { departmentLabel } from '@boss/web-kit/nav';
+  import { departments } from '@boss/web-kit/session/departments.svelte';
+  import DepartmentThirds from '../departments/DepartmentThirds.svelte';
 
-  const PAGE_TABS: ReadonlyArray<{ id: Tab; label: string }> = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'invoices', label: 'Invoices' },
-    { id: 'approvals', label: 'PO Approvals' },
-    { id: 'income-statement', label: 'Income statement' },
-    { id: 'balance-sheet', label: 'Balance sheet' },
-    { id: 'cash-flow', label: 'Cash flow' },
-    { id: 'trial-balance', label: 'Trial Balance' },
-    { id: 'tax-liability', label: 'Tax liability' },
-  ];
+  // `department` is the catalog entry's, handed in by App.svelte the
+  // way /ux/parts gets the warehouse's (044dffa1). Every read below is
+  // a ledger or commerce read; none is a jobs read, so until this prop
+  // a receive-a-payout packet waiting at its post step for 2.6 days was
+  // on no finance surface (backlog 4d4dc204, page audit 3f964c57 gap
+  // 2). Empty draws no panel.
+  let { view, department = '' }: { view: FinanceView; department?: string } = $props();
+  const departmentName = $derived(departmentLabel(department, departments()));
 
-  let tab = $state<Tab>('overview');
+  // The tab, and the entry or fact a link opened, live in the URL, not
+  // only in page state: a posted journal entry landed on Overview, and
+  // back or reload lost the tab (backlog 2ab44d55, page audit 3f964c57
+  // gap 7). The route seeds them once — App keys this page on the
+  // route, so a navigation remounts it — and after mount the page is
+  // the truth and the URL follows. replaceState, not a navigation:
+  // /ux/jobs's rule (f8027805), a tab is not a place the back button
+  // steps through; back from a page this one linked to returns to the
+  // URL written here. The write is the inverse of parseRoute's read, so
+  // a mount rewrites nothing.
+  // svelte-ignore state_referenced_locally
+  let tab = $state<FinanceTab>(view.tab);
+  // svelte-ignore state_referenced_locally
+  let entry = $state(view.entry);
+  // svelte-ignore state_referenced_locally
+  let fact = $state(view.fact);
+
+  $effect(() => {
+    const { pathname, search, hash } = window.location;
+    const next = financeSearch(search, { tab, entry, fact });
+    if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
+  });
+
+  /// An entry or a fact is a drill-down of the Trial Balance, so
+  /// choosing another tab closes it.
+  function chooseTab(t: FinanceTab): void {
+    if (t === tab) return;
+    tab = t;
+    entry = '';
+    fact = '';
+  }
 
   /// The invoice list as loaded — failed is its own state, rendered
   /// by InvoicesTab, so an outage never reads as "no invoices"
@@ -133,13 +156,13 @@
   </div>
 
   <nav class="tabs" role="tablist">
-    {#each PAGE_TABS as t (t.id)}
+    {#each FINANCE_TABS as t (t.id)}
       <button
         type="button"
         role="tab"
         aria-selected={tab === t.id}
         class="tab {tab === t.id ? 'tab-active' : ''}"
-        onclick={() => (tab = t.id)}
+        onclick={() => chooseTab(t.id)}
       >
         {t.label}
       </button>
@@ -164,10 +187,26 @@
     {:else if tab === 'cash-flow'}
       <CashFlowTab />
     {:else if tab === 'trial-balance'}
-      <TrialBalanceTab />
+      <TrialBalanceTab
+        linkedEntryId={entry}
+        linkedFactId={fact}
+        onCloseLinked={() => {
+          entry = '';
+          fact = '';
+        }}
+      />
     {:else if tab === 'tax-liability'}
       <TaxLiabilityTab />
     {/if}
   </div>
+
+  {#if department}
+    <!-- Outside the tab panel, so the department's packets stand under
+         every tab and a tab click never remounts (and re-reads) them. -->
+    <section class="department-jobs">
+      <h2>{departmentName} jobs</h2>
+      <DepartmentThirds code={department} />
+    </section>
+  {/if}
 </div>
 

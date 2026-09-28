@@ -5,7 +5,7 @@
 the Playground; originally planned for the GCP box, deployed
 in-cluster (see Topology and the Q5 amendment). Item `98816e6a`.
 **Related**: [dev-cluster.md](./dev-cluster.md) ·
-[payload-encryption.md](./payload-encryption.md) (the other half of
+[payload-encryption, folded into the decision record](../architecture-decisions.md) (the other half of
 "real people arrive")
 
 ## Why now, and why Kanidm

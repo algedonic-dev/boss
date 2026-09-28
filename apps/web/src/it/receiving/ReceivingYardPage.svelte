@@ -6,21 +6,22 @@
   // David, 2026-09-12, approving the prototype this ports: "each
   // department will have a view of jobs flowing in, jobs getting worked
   // within the department, and jobs flowing out" — this is IT's IN. It
-  // keeps the floor's grammar: a packet is a car, a channel is a track,
+  // keeps the floor's grammar: a packet is a car, a lane is a track,
   // the car carries its days waiting and a mark for who holds it, and
   // the same car is meant to be recognisable when it reaches the Crew
   // Board and then the Train Yard.
   //
   // WHAT IS SHOWN, in reading order: the week's flow (in, out, standing);
   // what the snapshot says — three readings that were the reason the
-  // prototype existed; arrivals per day by channel; the inbound tracks;
+  // prototype existed; arrivals per day by lane; the inbound tracks;
   // then the manifest, every standing packet oldest first, each a link
   // to the packet itself.
   //
   // NO NUMBER THIS SURFACE MAKES UP. Kinds come from the registry, not a
-  // list here; a channel is a recorded fact where the packet carries
-  // one and a derived reading (said so) otherwise; a kind whose page
-  // truncated is named; a failed read is a failure, never a clear track.
+  // list here; a lane is the server's reading of what the filer
+  // recorded, and `unclassified` where the filer named none (backlog
+  // 1eea4554); a kind whose page truncated is named; a failed read is a
+  // failure, never a clear track.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href, navigate } from '../../router';
@@ -28,17 +29,20 @@
   import { failedVerbPhrase } from '../../steps/failedVerb';
   import {
     AGE_THRESHOLDS,
-    CHANNELS,
-    CHANNEL_LABEL,
+    UNCLASSIFIED,
     arrivalsByDay,
     daysEndingOn,
     failedStep,
     inboundKinds,
-    loadKind,
+    kindSentence,
+    laneColor,
+    lanesOf,
+    loadEveryPage,
     loadWorkflows,
+    provenance,
     readings,
+    SOURCED_KIND,
     waiting,
-    type Channel,
     type InboundRow,
     type WaitingRow,
   } from './receiving';
@@ -59,9 +63,10 @@
    *  from the same rows, so a packet that closed inside the window
    *  counts as having left even if it arrived before it. */
   const WINDOW_DAYS = 8;
-  /** One page per kind. The busiest kind (backlog-item) ran 270 in a
-   *  week when this was written; a kind past this is reported, not
-   *  silently cut (a-limit-is-not-a-filter). */
+  /** The page each read asks for. Every kind is read page after page to
+   *  its total (`loadEveryPage`): backlog-item ran 822 in the window on
+   *  2026-09-24, past the one page of 500 this used to read, and every
+   *  count below was a floor (design 62de32ae decision 4). */
   const PAGE = 500;
 
   let today = $state<string>(new Date().toISOString().slice(0, 10));
@@ -80,7 +85,7 @@
     registry = { kind: 'ready', data: kinds };
     // One read per kind, together: each is small, and the registry
     // says how many there are.
-    const pages = await Promise.all(kinds.map((k) => loadKind(k, WINDOW_DAYS, PAGE)));
+    const pages = await Promise.all(kinds.map((k) => loadEveryPage(k, WINDOW_DAYS, PAGE)));
     const failed = pages.find((p) => p.kind === 'failed');
     if (failed && failed.kind === 'failed') {
       rows = failed;
@@ -115,7 +120,6 @@
     human: standing.filter((r) => r.holder.who === 'human').length,
     nobody: standing.filter((r) => r.holder.who === 'nobody').length,
   });
-  const derivedShare = $derived(all.filter((r) => r.channelBasis === 'derived').length);
 
   // The chart: one scale for every bar, ticks at round numbers the
   // tallest day reaches, departures as a dashed level on each day.
@@ -134,29 +138,44 @@
   const yOf = (v: number): number => CH_H - PAD_B - (v / scaleMax) * (CH_H - PAD_B - 24);
   const xOf = (i: number): number => PAD_L + gapX + i * (BAR_W + gapX);
 
-  type Segment = Readonly<{ channel: Channel; n: number; y: number; h: number }>;
-  function segments(byChannel: Readonly<Partial<Record<Channel, number>>>): ReadonlyArray<Segment> {
-    return CHANNELS.reduce<{ y: number; out: Segment[] }>(
-      (acc, c) => {
-        const n = byChannel[c] ?? 0;
+  // The lanes this read carries, in the server's spelling, and one hue
+  // each for the chart, the tracks and the manifest.
+  const lanes = $derived(lanesOf(all));
+  const hue = (lane: string): string => laneColor(lane, lanes);
+
+  type Segment = Readonly<{ lane: string; n: number; y: number; h: number }>;
+  function segments(byLane: Readonly<Record<string, number>>): ReadonlyArray<Segment> {
+    return lanes.reduce<{ y: number; out: Segment[] }>(
+      (acc, lane) => {
+        const n = byLane[lane] ?? 0;
         if (n === 0) return acc;
         const h = yOf(0) - yOf(n);
         const y = acc.y - h;
-        return { y, out: [...acc.out, { channel: c, n, y, h }] };
+        return { y, out: [...acc.out, { lane, n, y, h }] };
       },
       { y: yOf(0), out: [] },
     ).out;
   }
 
-  const byChannel = $derived(
-    CHANNELS.map((c) => ({
-      channel: c,
-      arrived: flow.reduce((n, d) => n + (d.byChannel[c] ?? 0), 0),
-      cars: standing.filter((r) => r.channel === c),
+  const byLane = $derived(
+    lanes.map((lane) => ({
+      lane,
+      arrived: flow.reduce((n, d) => n + (d.byLane[lane] ?? 0), 0),
+      cars: standing.filter((r) => r.lane === lane),
     })),
   );
-
-  const shortLabel = (c: Channel): string => CHANNEL_LABEL[c].split(' ·')[0] ?? c;
+  // The untriaged pile, not flat (design 3036296f mechanism D): the
+  // standing backlog items by the source and area the server read, the
+  // unrecorded as one named group (receiving.ts::provenance).
+  const prov = $derived(provenance(standing));
+  /** What each unrecorded basis means, in the words a reader needs. */
+  const BASIS_WORDS: Readonly<Record<string, string>> = {
+    'ad-hoc': 'an old ad-hoc key only (source_car, source_packet, found_by)',
+    prose: 'a sentence',
+    unreadable: 'a source object this reading cannot read',
+    missing: 'nothing',
+  };
+  const basisWords = (b: string): string => BASIS_WORDS[b] ?? b;
   const openPacket = (jobId: string) => navigate(`/jobs/${jobId}`);
   // A car whose ready step's verb FAILED says so in its title, and the
   // manifest prints the verb's line with the alert it filed (backlog
@@ -167,7 +186,7 @@
     return `${r.title} — ${r.age} d, on ${r.holder.label}${f ? ` — ${failedVerbPhrase(f)}` : ''}`;
   };
 
-  // What the zoomed territory draws: a platform per inbound channel,
+  // What the zoomed territory draws: a platform per inbound lane,
   // or the honest reason there is none. The registry read decides
   // which kinds are inbound, so a registry that did not answer is an
   // unavailable deck rather than an empty one.
@@ -247,7 +266,7 @@
             the oldest {said.feedbackStanding.oldestDays} days.
           {/if}
         </b>
-        <span class="why">Feedback is the one channel where a person wrote the packet.</span>
+        <span class="why">A <span class="mono">user-feedback</span> packet is one a person wrote through the feedback door.</span>
       </div>
       <div class="ry-finding" class:ok={said.onOneActor.of === 0}>
         <b>{said.onOneActor.count} of {said.onOneActor.of} standing packets are on one actor — {said.onOneActor.actor}.</b>
@@ -257,16 +276,16 @@
         </span>
       </div>
       <div class="ry-finding" class:ok={said.unrecorded.count === 0}>
-        <b>{said.unrecorded.count} of {said.unrecorded.of} arrivals record no channel.</b>
+        <b>{said.unrecorded.count} of {said.unrecorded.of} arrivals record no lane.</b>
         <span class="why">
-          {derivedShare} of {all.length} channels on this page are derived from the kind or the
-          reporter rather than read off the packet. A <span class="mono">channel</span> key at
-          filing makes this row a fact.
+          A lane is what the filer recorded (<span class="mono">boss job file --channel</span>),
+          read by the server; a packet that names none is {UNCLASSIFIED.lane}, never guessed
+          from its kind or its reporter.
         </span>
       </div>
     </div>
 
-    <div class="ry-section">01 — ARRIVALS PER DAY, BY CHANNEL</div>
+    <div class="ry-section">01 — ARRIVALS PER DAY, BY LANE</div>
     <div class="ry-panel">
       <svg viewBox="0 0 {CH_W} {CH_H}" class="ry-chart" role="img" aria-label="inbound packets per day">
         {#each ticks as v (v)}
@@ -274,9 +293,9 @@
           <text x={PAD_L - 6} y={yOf(v) + 4} text-anchor="end" class="cl">{v}</text>
         {/each}
         {#each flow as d, i (d.day)}
-          {#each segments(d.byChannel) as s (s.channel)}
-            <rect x={xOf(i)} y={s.y} width={BAR_W} height={s.h} class="bar {s.channel}">
-              <title>{d.day} · {s.n} {shortLabel(s.channel)}</title>
+          {#each segments(d.byLane) as s (s.lane)}
+            <rect x={xOf(i)} y={s.y} width={BAR_W} height={s.h} style:fill={hue(s.lane)}>
+              <title>{d.day} · {s.n} {s.lane}</title>
             </rect>
           {/each}
           <text x={xOf(i) + BAR_W / 2} y={yOf(d.arrived) - 5} text-anchor="middle" class="cv">{d.arrived}</text>
@@ -287,8 +306,8 @@
         {/each}
       </svg>
       <div class="ry-legend">
-        {#each CHANNELS as c (c)}
-          <span><i class={c}></i>{CHANNEL_LABEL[c]}</span>
+        {#each lanes as lane (lane)}
+          <span><i style:background={hue(lane)}></i>{lane}</span>
         {/each}
         <span><span class="dash"></span>left (closed that day)</span>
       </div>
@@ -296,9 +315,9 @@
 
     <div class="ry-section">02 — INBOUND TRACKS, WHAT IS STANDING</div>
     <div class="ry-tracks">
-      {#each byChannel as t (t.channel)}
+      {#each byLane as t (t.lane)}
         <div class="ry-track">
-          <div class="tk-name"><i class={t.channel}></i>{CHANNEL_LABEL[t.channel]}</div>
+          <div class="tk-name"><i style:background={hue(t.lane)}></i>{t.lane}</div>
           <div class="tk-num">{t.arrived} in · {t.cars.length} standing</div>
           <div class="tk-cars">
             {#if t.cars.length === 0}
@@ -327,7 +346,87 @@
       <span>a dot marks a car on a person · a dashed outline, a car on nobody</span>
     </div>
 
-    <div class="ry-section">03 — THE MANIFEST, OLDEST FIRST</div>
+    {#snippet carMark(r: WaitingRow)}
+      <a
+        class="car {r.band} h-{r.holder.who}"
+        href={href(`/jobs/${r.id}`)}
+        title={carTitle(r)}
+        onclick={(e) => {
+          e.preventDefault();
+          openPacket(r.id);
+        }}><span>{r.age}</span></a
+      >
+    {/snippet}
+
+    <!-- WHERE THE UNTRIAGED ITEMS CAME FROM (design 3036296f mechanism D,
+         backlog 9b473d4a): one flat pile was the whole reading until the
+         filer recorded a source. Grouped by the key the server read; the
+         unrecorded are one visible group, never dropped. -->
+    <div class="ry-section">03 — WHERE THE UNTRIAGED BACKLOG ITEMS CAME FROM</div>
+    {#if prov.items === 0}
+      <p class="ry-quiet">No {SOURCED_KIND} is standing untriaged.</p>
+    {:else}
+      <div class="ry-findings" data-testid="ry-provenance">
+        {#each prov.kinds as k (k.kind)}
+          <div class="ry-finding" class:err={k.urgent > 0}><b>{kindSentence(k)}.</b></div>
+        {/each}
+        <div class="ry-finding" class:ok={prov.unrecorded.rows.length === 0}>
+          <b>{prov.unrecorded.rows.length} of {prov.items} with no recorded source.</b>
+          <span class="why">
+            {#each Object.entries(prov.unrecorded.byBasis) as [basis, n] (basis)}
+              {n} {n === 1 ? 'carries' : 'carry'} {basisWords(basis)}.
+            {/each}
+            A source is recorded by <span class="mono">boss job file --source</span>.
+          </span>
+        </div>
+      </div>
+      <div class="ry-tracks">
+        {#each prov.groups as g (g.key)}
+          <div class="ry-track">
+            <div class="tk-name">
+              <span class="mono dim">{g.kind}</span>
+              {#if g.id}
+                {@const id = g.id}
+                <a
+                  class="mono"
+                  href={href(`/jobs/${id}`)}
+                  onclick={(e) => {
+                    e.preventDefault();
+                    openPacket(id);
+                  }}>{g.label}</a
+                >
+              {:else}
+                <span class="mono">{g.label}</span>
+              {/if}
+            </div>
+            <div class="tk-num">{g.rows.length} standing{g.urgent > 0 ? ` · ${g.urgent} urgent` : ''}</div>
+            <div class="tk-cars">
+              {#each g.rows as r (r.id)}{@render carMark(r)}{/each}
+            </div>
+          </div>
+        {/each}
+        <div class="ry-track">
+          <div class="tk-name">no recorded source</div>
+          <div class="tk-num">{prov.unrecorded.rows.length} standing</div>
+          <div class="tk-cars">
+            {#if prov.unrecorded.rows.length === 0}
+              <span class="ry-empty">every standing item names its source</span>
+            {:else}
+              {#each prov.unrecorded.rows as r (r.id)}{@render carMark(r)}{/each}
+            {/if}
+          </div>
+        </div>
+      </div>
+      <div class="ry-areas">
+        <span class="k">By area</span>
+        {#each prov.areas as a (a.area)}
+          <span class="pill">{a.area} {a.rows.length}{a.urgent > 0 ? ` · ${a.urgent} urgent` : ''}</span>
+        {/each}
+        <span class="pill dim">no area {prov.noArea.length}</span>
+      </div>
+    {/if}
+
+    <div class="ry-section">04 — THE MANIFEST, OLDEST FIRST</div>
     {#if standing.length === 0}
       <p class="ry-quiet">The inbound track is clear.</p>
     {:else}
@@ -336,7 +435,7 @@
           <thead>
             <tr>
               <th class="num">Waiting</th>
-              <th>Channel</th>
+              <th>Lane</th>
               <th>Kind</th>
               <th>Packet</th>
               <th>Ready step</th>
@@ -349,9 +448,11 @@
               <tr>
                 <td class="num {r.band}">{r.age} d</td>
                 <td>
-                  <span class="pill {r.channel}" title={r.channelBasis === 'recorded' ? 'recorded on the packet' : 'derived from the kind or reporter'}>
-                    {shortLabel(r.channel)}{#if r.channelBasis === 'derived'}<span class="dim"> ?</span>{/if}
-                  </span>
+                  <span
+                    class="pill"
+                    style:border-color={hue(r.lane)}
+                    title={r.laneBasis === 'recorded' ? 'recorded by its filer' : 'its filer recorded no lane'}
+                  >{r.lane}</span>
                 </td>
                 <td class="mono dim">{r.kind}</td>
                 <td class="ttl">
@@ -402,7 +503,8 @@
       <span class="mono">simulated=false&amp;closed_within={WINDOW_DAYS}</span>, so every open packet
       is here and departures are counted from <span class="mono">closed_on</span>. Ages count from
       <span class="mono">opened_on</span>. Thresholds are the Marshalling Yard's proposal until the
-      packet carries its own. A channel marked <span class="mono">?</span> was derived, not recorded.
+      packet carries its own. Lanes are the server's reading of what each filer recorded, in its
+      own vocabulary; <span class="mono">{UNCLASSIFIED.lane}</span> is a filer who named none.
     </p>
   {/if}
 </div>
@@ -410,112 +512,112 @@
 <style>
   .ry-root { padding: 0 32px 32px; }
   .ry-section {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px; letter-spacing: var(--ls-eyebrow, 0.3em);
-    color: var(--signal, #5fd4a8); margin: 28px 0 8px;
+    font-family: var(--font-mono);
+    font-size: 12px; letter-spacing: var(--ls-eyebrow);
+    color: var(--signal); margin: 28px 0 8px;
     display: flex; align-items: center; gap: 12px;
   }
-  .ry-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline, #2a3138); }
-  .ry-quiet { color: var(--static, #7a838c); font-size: 13px; }
+  .ry-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
+  .ry-quiet { color: var(--static); font-size: 13px; }
   .ry-fail {
-    color: var(--warn, #d9a441); border: 1px solid var(--warn, #d9a441);
+    color: var(--warn); border: 1px solid var(--warn);
     padding: 8px 12px; font-size: 13px;
   }
-  .mono { font-family: var(--font-mono, ui-monospace, monospace); }
-  .dim { color: var(--static, #7a838c); }
+  .mono { font-family: var(--font-mono); }
+  .dim { color: var(--static); }
 
   .ry-strip {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    border: 1px solid var(--hairline, #2a3138); margin-top: 16px;
+    border: 1px solid var(--hairline); margin-top: 16px;
   }
-  .ry-strip > div { padding: 12px 16px; border-right: 1px solid var(--hairline, #2a3138); }
+  .ry-strip > div { padding: 12px 16px; border-right: 1px solid var(--hairline); }
   .ry-strip > div:last-child { border-right: 0; }
   .ry-strip .k {
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
-    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static, #7a838c);
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static);
   }
   .ry-strip .v { font-size: 28px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 4px; }
-  .ry-strip .v small { font-size: 12px; color: var(--static, #7a838c); font-weight: 400; margin-left: 5px; }
-  .ry-strip .v.warn { color: var(--warn, #d9a441); }
-  .ry-strip .v.err { color: var(--err, #e2685c); }
+  .ry-strip .v small { font-size: 12px; color: var(--static); font-weight: 400; margin-left: 5px; }
+  .ry-strip .v.warn { color: var(--warn); }
+  .ry-strip .v.err { color: var(--err); }
 
   .ry-findings { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-  .ry-finding { border-left: 3px solid var(--warn, #d9a441); padding: 2px 0 2px 14px; font-size: 13px; }
-  .ry-finding.err { border-left-color: var(--err, #e2685c); }
-  .ry-finding.ok { border-left-color: var(--ok, #4fb98a); }
+  .ry-finding { border-left: 3px solid var(--warn); padding: 2px 0 2px 14px; font-size: 13px; }
+  .ry-finding.err { border-left-color: var(--err); }
+  .ry-finding.ok { border-left-color: var(--ok); }
   .ry-finding b { font-weight: 500; }
-  .ry-finding .why { display: block; color: var(--static, #7a838c); margin-top: 3px; }
+  .ry-finding .why { display: block; color: var(--static); margin-top: 3px; }
 
-  .ry-panel { border: 1px solid var(--hairline, #2a3138); padding: 14px 16px; }
+  .ry-panel { border: 1px solid var(--hairline); padding: 14px 16px; }
   .ry-chart { width: 100%; height: auto; display: block; }
-  .ry-chart .grid { stroke: var(--hairline, #2a3138); stroke-width: 1; }
-  .ry-chart .cl { fill: var(--static, #7a838c); font: 11px var(--font-mono, ui-monospace, monospace); }
-  .ry-chart .cv { fill: var(--fog, #e8ecef); font: 11px var(--font-mono, ui-monospace, monospace); }
-  .ry-chart .left { stroke: var(--fog, #e8ecef); stroke-width: 1.5; stroke-dasharray: 3 2; }
+  .ry-chart .grid { stroke: var(--hairline); stroke-width: 1; }
+  .ry-chart .cl { fill: var(--static); font: 11px var(--font-mono); }
+  .ry-chart .cv { fill: var(--fog); font: 11px var(--font-mono); }
+  .ry-chart .left { stroke: var(--fog); stroke-width: 1.5; stroke-dasharray: 3 2; }
   .ry-legend {
     display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;
-    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--static, #7a838c);
+    font-family: var(--font-mono); font-size: 11px; color: var(--static);
   }
   .ry-legend i, .tk-name i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
-  .ry-legend .dash { display: inline-block; width: 18px; border-top: 1.5px dashed var(--fog, #e8ecef); vertical-align: 3px; margin-right: 6px; }
+  .ry-legend .dash { display: inline-block; width: 18px; border-top: 1.5px dashed var(--fog); vertical-align: 3px; margin-right: 6px; }
 
-  /* One hue per channel, used by the bars, the track marks and the pills. */
-  .bar.feedback, i.feedback { fill: var(--signal, #5fd4a8); background: var(--signal, #5fd4a8); }
-  .bar.monitoring, i.monitoring { fill: var(--err, #e2685c); background: var(--err, #e2685c); }
-  .bar.session, i.session { fill: var(--brew-amber-soft, #e8c37a); background: var(--brew-amber-soft, #e8c37a); }
-  .bar.design, i.design { fill: var(--warn, #d9a441); background: var(--warn, #d9a441); }
-  .bar.protocol, i.protocol { fill: var(--border-strong, #3a434d); background: var(--border-strong, #3a434d); }
-  .bar.unrecorded, i.unrecorded { fill: var(--text-faint, #5c656e); background: var(--text-faint, #5c656e); }
-  .pill { display: inline-block; border: 1px solid var(--hairline, #2a3138); padding: 1px 7px; font: 11px var(--font-mono, ui-monospace, monospace); white-space: nowrap; }
-  .pill.feedback { border-color: var(--signal, #5fd4a8); }
-  .pill.monitoring { border-color: var(--err, #e2685c); }
-  .pill.design { border-color: var(--warn, #d9a441); }
+  /* One hue per lane (receiving.ts::laneColor), set inline on the bars,
+     the track marks and the pills. */
+  .pill { display: inline-block; border: 1px solid var(--hairline); padding: 1px 7px; font: 11px var(--font-mono); white-space: nowrap; }
 
-  .ry-tracks { border: 1px solid var(--hairline, #2a3138); }
+  .ry-tracks { border: 1px solid var(--hairline); }
   .ry-track {
     display: grid; grid-template-columns: 280px 130px 1fr; gap: 12px; align-items: center;
-    padding: 10px 16px; border-bottom: 1px solid var(--hairline, #2a3138);
+    padding: 10px 16px; border-bottom: 1px solid var(--hairline);
   }
   .ry-track:last-child { border-bottom: 0; }
   .tk-name { font-size: 13px; }
-  .tk-num { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--static, #7a838c); white-space: nowrap; }
+  .tk-num { font-family: var(--font-mono); font-size: 11px; color: var(--static); white-space: nowrap; }
   .tk-cars { display: flex; gap: 4px; flex-wrap: wrap; min-height: 22px; align-items: center; }
-  .ry-empty { color: var(--text-faint, #5c656e); font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; }
+  .ry-empty { color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; }
   .car {
     display: inline-grid; place-items: center; width: 30px; height: 22px; position: relative;
-    font: 11px var(--font-mono, ui-monospace, monospace); text-decoration: none;
-    color: var(--void, #0d1014); background: var(--ok, #4fb98a);
+    font: 11px var(--font-mono); text-decoration: none;
+    color: var(--void); background: var(--ok);
   }
-  .car.aging { background: var(--warn, #d9a441); }
-  .car.stale { background: var(--err, #e2685c); }
-  .car.h-human::after { content: ''; position: absolute; right: 2px; top: 2px; width: 5px; height: 5px; border-radius: 50%; background: var(--void, #0d1014); }
-  .car.h-nobody { background: transparent; color: var(--fog, #e8ecef); outline: 1px dashed var(--static, #7a838c); outline-offset: -1px; }
-  .car.h-nobody.aging { color: var(--warn, #d9a441); outline-color: var(--warn, #d9a441); }
-  .car.h-nobody.stale { color: var(--err, #e2685c); outline-color: var(--err, #e2685c); }
-  .car:focus-visible { outline: 2px solid var(--signal, #5fd4a8); outline-offset: 1px; }
-  .ry-key { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--static, #7a838c); }
-  .ry-key .fresh { color: var(--ok, #4fb98a); }
-  .ry-key .aging { color: var(--warn, #d9a441); }
-  .ry-key .stale { color: var(--err, #e2685c); }
+  .car.aging { background: var(--warn); }
+  .car.stale { background: var(--err); }
+  .car.h-human::after { content: ''; position: absolute; right: 2px; top: 2px; width: 5px; height: 5px; border-radius: 50%; background: var(--void); }
+  .car.h-nobody { background: transparent; color: var(--fog); outline: 1px dashed var(--static); outline-offset: -1px; }
+  .car.h-nobody.aging { color: var(--warn); outline-color: var(--warn); }
+  .car.h-nobody.stale { color: var(--err); outline-color: var(--err); }
+  .car:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+  .ry-key { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--static); }
+  .ry-key .fresh { color: var(--ok); }
+  .ry-key .aging { color: var(--warn); }
+  .ry-key .stale { color: var(--err); }
+
+  .ry-areas {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px;
+  }
+  .ry-areas .k {
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--static);
+  }
 
   .ry-tbl { overflow-x: auto; }
   .ry-table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 760px; }
   .ry-table th {
-    text-align: left; font-family: var(--font-mono, ui-monospace, monospace);
+    text-align: left; font-family: var(--font-mono);
     font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--static, #7a838c); font-weight: 400;
-    border-bottom: 1px solid var(--hairline, #2a3138); padding: 4px 12px 4px 0;
+    color: var(--static); font-weight: 400;
+    border-bottom: 1px solid var(--hairline); padding: 4px 12px 4px 0;
   }
-  .ry-table td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--hairline, #2a3138); vertical-align: top; }
-  .ry-table th.num, .ry-table td.num { text-align: right; font-family: var(--font-mono, ui-monospace, monospace); font-variant-numeric: tabular-nums; white-space: nowrap; }
-  td.num.fresh { color: var(--static, #7a838c); }
-  td.num.aging { color: var(--warn, #d9a441); }
-  td.num.stale { color: var(--err, #e2685c); }
+  .ry-table td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  .ry-table th.num, .ry-table td.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.num.fresh { color: var(--static); }
+  td.num.aging { color: var(--warn); }
+  td.num.stale { color: var(--err); }
   td.ttl { max-width: 520px; }
-  td .id { display: block; font: 11px var(--font-mono, ui-monospace, monospace); color: var(--text-faint, #5c656e); margin-top: 2px; }
+  td .id { display: block; font: 11px var(--font-mono); color: var(--text-faint); margin-top: 2px; }
   td.hold { white-space: nowrap; }
-  td.hold.h-human { color: var(--signal, #5fd4a8); }
-  td.hold.h-nobody { color: var(--warn, #d9a441); }
-  .ry-footnote { color: var(--text-faint, #5c656e); font-size: 12px; max-width: 80ch; margin-top: 20px; }
+  td.hold.h-human { color: var(--signal); }
+  td.hold.h-nobody { color: var(--warn); }
+  .ry-footnote { color: var(--text-faint); font-size: 12px; max-width: 80ch; margin-top: 20px; }
   @media (max-width: 720px) { .ry-track { grid-template-columns: 1fr; } }
 </style>

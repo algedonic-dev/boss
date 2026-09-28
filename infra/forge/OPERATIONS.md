@@ -53,14 +53,16 @@ closed for everything in the installer's `UNITS` list.
 
 | unit | cadence | does | fails loudly how |
 |---|---|---|---|
-| `forge-converge` | 10 min (boot +4) | fetch forge main and check it out under the checkout lock (as the owner), run `install.sh` — the host adopts its own units | journal; a broken install leaves the previous units running |
+| `forge-converge` | 10 min (boot +4) | fetch forge main and check it out under the checkout lock (as the owner), run `install.sh` — the host adopts its own units — then `protect-main.sh`: forge main's branch protection made what `main-protection.json` declares (direct push, force push and deletion refused; a PR merge still passes) and read back, with the checkout's own forge credential. It cannot stop Forgejo's push-mirror sync, which writes main locally as `Gitea <gitea@fake.local> update by push` and never passes the hook protection lives in; the conductor's ancestry arm is the guard for that writer (backlog f9256445) | journal; a broken install leaves the previous units running; `main_protection` on the packet says created / edited / already as declared, or `FAILED:` with the forge's HTTP status (the run is red) |
 | `cluster-deploy-runner` | 10 min (boot +3), and on every merge via the `converge` ops verb | fetch and check out forge main under the checkout lock, build the cluster image on the rootless daemon, push it to the registry, roll the cluster, then verify every manifest under `infra/cluster/manifests` is applied and not drifted | exit 1 on drift or an unreadable manifest; the conductor's converge step reads the result; a run started by a `converge` ops-request PATCHes that packet with `converged: <sha>`, `converge_held: <reason>` or `converge_failed: <stage> (exit N)` when it ends |
 | `disk-floor-sweep` | hourly (boot +5) | two passes. **Every** run prunes the **system** daemon's per-train `boss-ci:<sha>` images older than `BOSS_CI_IMAGE_AGE_HOURS` (6h), keeping the newest 3 — only sha-shaped tags, so `rust1.96` and `latest` are never candidates. **Below** `BOSS_DISK_FLOOR_GB` (100 in the service) it goes on to the emergency remediations: all unused system-daemon images over 4h, the whole rootless builder cache, dangling images, registry-verified old tags — in that fixed order, stopping at the floor; regenerable caches only, never volumes | exits non-zero with `FLOOR UNMET — a human decides next` rather than deleting harder, and non-zero when the age pass could not reach the system daemon (a prune of the wrong daemon would report success and free nothing) |
 | `reap-dead-ci-jobs` | daily (boot +15) | remove the containers and volumes of crashed CI jobs | journal |
 | `estate-observe-host` | 15 min (boot +3) | record this host's disk, load and units into the estate as observations; the conductor's boarding refuses on a positive "host is short" reading | journal; a stale series reads as unverifiable, and boarding proceeds with one loud line |
+| `estate-observe-units` | 5 min (boot +2) (since 2026-09-26, backlog c98dcf38) | record what this host's units are doing — every pair `install.sh` installs (its `rows` mode is the roster) plus the ops runner — as a `host-units` observation on node `forge`; estate compare turns an unhealthy one into `unit_unhealthy:forge/<unit>` and estate.alarm files it after three comparisons. Runs as root for `journalctl -u`; owes forge-converge nothing | exits 1 naming each unhealthy unit, with its last 20 journal lines on the observation; the packet wrap is best-effort, so a dark API still leaves a failed observer here |
 | `boss-ops-runner` | ~1 min | answer `ops-request` packets filed against `forge` with a verb from `infra/ops/verbs/` (one file per verb) | `refused` outcome on the packet; installed by `install.sh` since 2026-09-05 (a drop-in carries this host's identity) |
 | `systemd-journal-gatewayd` | socket-activated, no timer | serve this host's journal over HTTP on `:19531` — the read door the pod uses when there is no ssh and the API is dark | **it does not fail loudly, and that is the point of `journal-read.sh`.** The distro's units, enabled (never copied) by `install.sh`; if the package is absent the installer says so and carries on, because a visibility door must not be able to abort the converge. It has **no periodic restart**: bounding the process with `RuntimeMaxSec=` would leave the unit `failed` after every expiry, and `infra/estate/observe-units.sh` reads `ActiveState=failed` as unhealthy — an hourly red nobody reads is the same defect as no check at all (CLAUDE.md §Diagnosis). When it wedges, `journal-read.sh` refuses and prints `systemctl restart systemd-journal-gatewayd.service` |
 | `cluster-watchdog` | 5 min (boot +2) | know the cluster is working from outside it; roll to the last converged build after three dark checks | its own journal line every tick, `hands needed` when it cannot act |
+| `forge-backup` | nightly 09:40 UTC, `Persistent` (since 2026-09-23, backlog 121831e6) | `forgejo dump` inside the `forgejo` container, streamed to `/var/backups/boss/forge/forge-<stamp>.tar.gz` (root, 0700/0600 — it carries app.ini's secrets and the signing keys): the repositories and the database as `forgejo-db.sql`, with the registry, custom dir, logs, index and repo archives skipped. Verified before it is kept, newest 14 kept. **Local only** — no copy leaves this host until the offsite legs get a credential here | exits non-zero with `REFUSED — <why>` (below 20 GB + the 5 GB ceiling free, container down, a dump that died or hit the ceiling, an archive missing the database, app.ini or a repository, or carrying registry data); the packet's `refused` names it and every run's packet says `offsite: none` |
 
 Two disk floors, deliberately different: the locomotive refuses a CI
 run below **70 GB** free at run start, and the sweep keeps **100 GB**
@@ -118,7 +120,11 @@ No ssh from the pod. Three doors, all read-only:
   about a minute with the output on the packet's `execute` step. Verbs:
   `df`, `uptime`, `timer-list`, `unit-status <unit>`, `journal-tail
   <unit> [n]`, `disk-report` (what is consuming disk — both daemons,
-  Forgejo's data, the checkout), `reach <ipv4> <port>` (one TCP
+  Forgejo's data, the checkout), `forge-log <since> <until> [lines]`
+  (Forgejo's own server log off the system daemon, at most 15 minutes
+  and 2000 lines, query-string values redacted, plus the reflog of
+  `refs/heads/main` over the same window — who pushed what, and from
+  where), `reach <ipv4> <port>` (one TCP
   connect from this host's vantage — the WireGuard overlay and the
   LAN the pod cannot route to; nothing sent), and the mutating verbs, each
   authorized by name in `infra/ops/verbs/reclaim-disk.json`: `reclaim-disk <floor>` (the
@@ -142,7 +148,14 @@ No ssh from the pod. Three doors, all read-only:
   `dauld-github-token`, and refuses loudly without it; `--check`
   validates its inputs with no network), `read-publish-checks` (the
   second machine step of publish-to-github v7: waits for the mirror
-  PR's check-runs over the PUBLIC API — no token — reads the CodeQL
+  PR's code-scanning check-runs (CodeQL and its Analyze jobs, backlog
+  d167e7d7) and then completes the step only once EVERY check has
+  completed — a check still running, the mirror's own gate among them,
+  is `not yet` (exit 75, the runner not held), re-read every fifteen minutes by
+  `reread-publish-pr-every-15-minutes`, `unfinished` four hours after the PR
+  opened, and a failing one makes the reading red and is named, backlog
+  c6cb678b) over the PUBLIC API — no token —
+  reads the CodeQL
   annotations and writes the reading onto the publish packet as
   `code_scanning`, so the `judge-checks` step and David's merge follow a
   judged reading instead of a red badge; the wait blocks this runner

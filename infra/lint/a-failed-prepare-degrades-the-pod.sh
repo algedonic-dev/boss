@@ -18,6 +18,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 export STUB_DIR="$tmp"
 export BOSS_PREPARE_RETRY_SECONDS=0
+# The sim runs only when the deployment (or the tenant manifest, through
+# derive_sim_env) says so — unset is OFF since backlog d65bd066 — so the
+# paths that expect a daemon ask for one.
+export BOSS_SIM_ENABLED=true
 
 # shellcheck source=/dev/null
 . "$lib"

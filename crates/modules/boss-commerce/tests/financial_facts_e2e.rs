@@ -28,7 +28,7 @@ fn invoice(id: &str, status: InvoiceStatus, paid_on: Option<NaiveDate>) -> Invoi
         line_items: vec![InvoiceLineItem {
             id: format!("{id}-l1"),
             invoice_id: id.to_string(),
-            revenue_category: RevenueCategory::from("new-sales"),
+            revenue_category: RevenueCategory::from("wholesale"),
             amount_cents: 1_200_000,
             currency: "USD".to_string(),
             description: "Device sale".to_string(),
@@ -69,6 +69,7 @@ async fn entry_count_for(db: &TestDb, source_id: &str, kind: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_invoice_emits_issued_fact() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     commerce
@@ -105,7 +106,7 @@ async fn create_invoice_emits_issued_fact() {
     assert_eq!(payload["account_id"], "account-ff-1");
     assert_eq!(payload["amount_cents"], 1_200_000);
     assert_eq!(payload["currency"], "USD");
-    assert_eq!(payload["line_items"][0]["revenue_category"], "new-sales");
+    assert_eq!(payload["line_items"][0]["revenue_category"], "wholesale");
     assert_eq!(payload["line_items"][0]["amount_cents"], 1_200_000);
 }
 
@@ -118,6 +119,7 @@ async fn create_invoice_emits_issued_fact() {
 #[tokio::test(flavor = "multi_thread")]
 async fn issued_fact_is_byte_identical_to_rebuild_from_event() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let enriched = commerce
@@ -170,6 +172,7 @@ async fn issued_fact_is_byte_identical_to_rebuild_from_event() {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_paid_invoice_emits_both_facts() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let paid_on = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
@@ -205,6 +208,7 @@ async fn mark_invoice_paid_emits_no_paid_fact() {
     // not. Tenants that explicitly want the single-shot path can
     // call `record_fact_in_tx` directly.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     commerce
@@ -250,6 +254,7 @@ async fn mark_invoice_paid_emits_no_paid_fact() {
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_is_idempotent() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let inv = invoice("inv-ff-4", InvoiceStatus::OUTSTANDING.into(), None);
@@ -267,12 +272,18 @@ async fn replay_is_idempotent() {
 async fn mark_paid_then_replayed_create_does_not_duplicate() {
     // Replay of a paid-state create after an earlier mark_paid.
     // mark_invoice_paid no longer emits a fact (see the
-    // mark_invoice_paid_emits_no_paid_fact test for the why), but
-    // the create-already-paid path still emits one when the
-    // status arrives as 'paid' and payment_method is unset (the
-    // legacy single-shot tenant path). On replay we get exactly
-    // one of each fact kind from the two operations.
+    // mark_invoice_paid_emits_no_paid_fact test for the why). The
+    // create-already-paid path emits one when the status arrives as
+    // 'paid' and payment_method is unset (the legacy single-shot
+    // tenant path) — but only on the create that WRITES the invoice.
+    // A create under an id that already names the invoice writes
+    // nothing (backlog 9d2af748): until then this replay posted a
+    // finance.invoice.paid for a payment the verb had deliberately
+    // left to the settlement chain — the A/R credit that verb's own
+    // test says a two-phase tenant then takes twice. One issued fact,
+    // no paid fact.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     commerce
@@ -299,15 +310,16 @@ async fn mark_paid_then_replayed_create_does_not_duplicate() {
         fact_count(&db, "finance.invoice.issued", "inv-ff-5").await,
         1
     );
-    // Exactly one — from the paid-state create path. The
-    // mark_invoice_paid call between the two creates emits no
-    // finance.invoice.paid fact.
-    assert_eq!(fact_count(&db, "finance.invoice.paid", "inv-ff-5").await, 1);
+    // None: the mark_invoice_paid call between the two creates emits
+    // no finance.invoice.paid fact, and the replayed create writes
+    // nothing at all.
+    assert_eq!(fact_count(&db, "finance.invoice.paid", "inv-ff-5").await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mark_paid_missing_invoice_writes_no_fact() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let err = commerce.mark_invoice_paid("inv-does-not-exist").await;
@@ -362,6 +374,7 @@ async fn fg_on_hand(db: &TestDb, sku: &str) -> i32 {
 #[tokio::test(flavor = "multi_thread")]
 async fn issuing_never_touches_fg_and_shortage_does_not_block() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let sku = "BEER-IPA-HALF-BBL";

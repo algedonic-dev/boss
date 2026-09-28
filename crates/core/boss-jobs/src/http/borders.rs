@@ -20,6 +20,11 @@ use super::*;
 
 use crate::borders::{self, BORDERS, CadenceFiring, DispatcherFiring, MachineKind};
 
+/// Why a caller whose scope reads no packets reads no machine's firing
+/// record — the rule of backlog e5f7b51e, said as a refusal by scope.
+const MACHINES_WITHHELD: &str = "this caller's policy scope reads no packets, so the firing \
+                                 record of the machinery that moves them is not read for it";
+
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct BordersQuery {
     window: Option<String>,
@@ -42,13 +47,28 @@ pub(super) async fn yard_borders<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(rows) => rows,
         Err(resp) => return resp,
     };
-    let firings = cadence_firings(&state).await;
-    let dispatcher = dispatcher_firings(&state).await;
+    // The machine records are not scoped by packet, so they ride the
+    // map's own gate: a caller whose scope reads no packets — a request
+    // with no identity is one — gets them withheld, as it gets the empty
+    // map. Until backlog e5f7b51e they asked nothing and answered every
+    // machine's last-fired instant to that caller, beside the region
+    // half that refused it; until 493cebf3 the border then called the
+    // refusal "could not be read", a failure's words.
+    let withheld = rows.reads_no_packets.then_some(MACHINES_WITHHELD);
+    let (firings, dispatcher) = if rows.reads_no_packets {
+        (None, None)
+    } else {
+        (
+            cadence_firings(&state).await,
+            dispatcher_firings(&state).await,
+        )
+    };
     let regions = rows.inputs(now, window_hours);
     let map = borders::borders(&borders::BorderInputs {
         regions: &regions,
         firings: firings.as_deref(),
         dispatcher_firings: dispatcher.as_deref(),
+        machines_withheld: withheld,
     });
     let mut v = serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {

@@ -87,12 +87,13 @@ async fn get(router: axum::Router, path: &str) -> (StatusCode, Value) {
 #[tokio::test(flavor = "multi_thread")]
 async fn health_is_ok() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/health").await;
     assert_eq!(status, StatusCode::OK);
@@ -102,12 +103,13 @@ async fn health_is_ok() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_accounts_returns_seeded_chart() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/accounts").await;
     assert_eq!(status, StatusCode::OK);
@@ -200,11 +202,12 @@ async fn list_accounts_returns_seeded_chart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn trial_balance_reflects_posted_entries() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     // Issue an invoice + pay it. Trial balance should show:
     //  A/R: 1000 debit, 1000 credit → balance 0
     //  Cash: 1000 debit → balance 1000
     //  Revenue Service: 1000 credit → balance 1000
-    let p_issue = json!({"invoice_id": "i1", "amount_cents": 1_000, "line_items": [{"category": "service", "amount_cents": 1_000}]});
+    let p_issue = json!({"invoice_id": "i1", "amount_cents": 1_000, "line_items": [{"category": "taproom", "amount_cents": 1_000}]});
     let p_paid = json!({"invoice_id": "i1", "amount_cents": 1_000});
     seed_entry(
         &db,
@@ -227,8 +230,8 @@ async fn trial_balance_reflects_posted_entries() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/trial-balance").await;
     assert_eq!(status, StatusCode::OK);
@@ -252,8 +255,9 @@ async fn trial_balance_reflects_posted_entries() {
 #[tokio::test(flavor = "multi_thread")]
 async fn trial_balance_as_of_filters_by_date() {
     let db = TestDb::new().await;
-    let p1 = json!({"invoice_id": "i1", "amount_cents": 100, "line_items": [{"category": "service", "amount_cents": 100}]});
-    let p2 = json!({"invoice_id": "i2", "amount_cents": 900, "line_items": [{"category": "service", "amount_cents": 900}]});
+    db.declare_revenue_categories_of("brewery").await;
+    let p1 = json!({"invoice_id": "i1", "amount_cents": 100, "line_items": [{"category": "taproom", "amount_cents": 100}]});
+    let p2 = json!({"invoice_id": "i2", "amount_cents": 900, "line_items": [{"category": "taproom", "amount_cents": 900}]});
     seed_entry(
         &db,
         "finance.invoice.issued",
@@ -275,8 +279,8 @@ async fn trial_balance_as_of_filters_by_date() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     // As of end-of-March: only the $100 invoice is in scope.
     let (status, body) = get(r, "/api/ledger/trial-balance?as_of=2026-03-31").await;
@@ -288,7 +292,8 @@ async fn trial_balance_as_of_filters_by_date() {
 #[tokio::test(flavor = "multi_thread")]
 async fn entries_lookup_by_account_code() {
     let db = TestDb::new().await;
-    let p = json!({"invoice_id": "i1", "amount_cents": 500, "line_items": [{"category": "new-sales", "amount_cents": 500}]});
+    db.declare_revenue_categories_of("brewery").await;
+    let p = json!({"invoice_id": "i1", "amount_cents": 500, "line_items": [{"category": "wholesale", "amount_cents": 500}]});
     seed_entry(
         &db,
         "finance.invoice.issued",
@@ -302,8 +307,8 @@ async fn entries_lookup_by_account_code() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/entries?account_code=4100").await;
     assert_eq!(status, StatusCode::OK);
@@ -316,77 +321,48 @@ async fn entries_lookup_by_account_code() {
 #[tokio::test(flavor = "multi_thread")]
 async fn entries_requires_account_or_fact_filter() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let resp = r
-        .oneshot(
-            Request::builder()
-                .uri("/api/ledger/entries")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let (status, body) = get(r, "/api/ledger/entries").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "one of account_code or fact_id is required");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn entries_lookup_by_source_pair() {
-    // IT panel's activity tabs use this path: given a projection id
-    // (here source_table='invoices', source_id='i-src-1'), fetch the
-    // one journal entry it produced in a single round-trip.
+async fn entries_no_longer_filter_by_source_pair() {
+    // The (source_table, source_id) filter was deleted with its one
+    // caller, the web's loadEntryBySource (backlog 2349285d): the
+    // pair is now an unknown parameter, so a query carrying only it
+    // is refused exactly like an empty one.
     let db = TestDb::new().await;
-    let p = json!({"invoice_id": "i-src-1", "amount_cents": 500, "line_items": [{"category": "new-sales", "amount_cents": 500}]});
-    seed_entry(
-        &db,
-        "finance.invoice.issued",
-        NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
-        &p,
-        "i-src-1",
-    )
-    .await;
-
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(
         r,
         "/api/ledger/entries?source_table=invoices&source_id=i-src-1",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let entries = body.as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["fact_source_id"], "i-src-1");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn entries_source_filter_requires_both_halves() {
-    let db = TestDb::new().await;
-    let r = router(LedgerApiState {
-        pool: db.pool.clone(),
-        publisher: None,
-        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
-    let (status, _) = get(r, "/api/ledger/entries?source_table=invoices").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "one of account_code or fact_id is required");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_entry_detail_returns_lines() {
     let db = TestDb::new().await;
-    let p = json!({"invoice_id": "i1", "amount_cents": 500, "line_items": [{"category": "new-sales", "amount_cents": 500}]});
+    db.declare_revenue_categories_of("brewery").await;
+    let p = json!({"invoice_id": "i1", "amount_cents": 500, "line_items": [{"category": "wholesale", "amount_cents": 500}]});
     let fact_id = seed_entry(
         &db,
         "finance.invoice.issued",
@@ -401,8 +377,8 @@ async fn get_entry_detail_returns_lines() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, list) = get(r, &format!("/api/ledger/entries?fact_id={fact_id}")).await;
     let entry_id = list[0]["id"].as_str().unwrap();
@@ -411,8 +387,8 @@ async fn get_entry_detail_returns_lines() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, &format!("/api/ledger/entries/{entry_id}")).await;
     assert_eq!(status, StatusCode::OK);
@@ -496,12 +472,13 @@ async fn post_as_auditor(router: axum::Router, path: &str, body: Value) -> (Stat
 #[tokio::test(flavor = "multi_thread")]
 async fn post_manual_entry_happy_path() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -509,7 +486,6 @@ async fn post_manual_entry_happy_path() {
         json!({
             "posted_on": "2026-03-15",
             "memo": "Q1 rent accrual",
-            "created_by": "cfo",
             "lines": [
                 {"account_code": "6200", "debit_cents": 250_000, "memo": "April rent"},
                 {"account_code": "2100", "credit_cents": 250_000},
@@ -522,7 +498,10 @@ async fn post_manual_entry_happy_path() {
     assert!(body["entry_id"].as_str().is_some());
     assert_eq!(body["posted_on"], "2026-03-15");
 
-    // The fact landed as kind=finance.manual.entry with the recorded author.
+    // The fact landed as kind=finance.manual.entry, authored by the
+    // signed caller — this request is unsigned, so the platform
+    // automation its event is stamped with (backlog 7bf42e2b; a signed
+    // author is pinned in tests/a_ledger_write_is_authored_by_its_signer.rs).
     let (kind, created_by): (String, String) = sqlx::query_as(
         "SELECT kind, created_by FROM financial_facts \
          WHERE id = $1::uuid",
@@ -532,7 +511,7 @@ async fn post_manual_entry_happy_path() {
     .await
     .unwrap();
     assert_eq!(kind, "finance.manual.entry");
-    assert_eq!(created_by, "cfo");
+    assert_eq!(created_by, "automation:platform");
 
     // And the lines projected into the GL with the right codes + amounts.
     let lines: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -554,12 +533,13 @@ async fn post_manual_entry_happy_path() {
 #[tokio::test(flavor = "multi_thread")]
 async fn post_manual_entry_rejects_unbalanced() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _body) = post_json(
         r,
@@ -578,12 +558,13 @@ async fn post_manual_entry_rejects_unbalanced() {
 #[tokio::test(flavor = "multi_thread")]
 async fn post_manual_entry_rejects_unknown_account() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _body) = post_json(
         r,
@@ -602,6 +583,7 @@ async fn post_manual_entry_rejects_unknown_account() {
 #[tokio::test(flavor = "multi_thread")]
 async fn post_manual_entry_rejects_locked_period() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
 
     // Lock January 2026 up-front so the manual entry dated inside it
     // must be rejected. boss_ledger::periods exposes the lock helper.
@@ -627,8 +609,8 @@ async fn post_manual_entry_rejects_locked_period() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _body) = post_json(
         r,
@@ -652,6 +634,7 @@ async fn post_manual_entry_rejects_locked_period() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cash_flow_unpaid_invoice_produces_no_operating_cash() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     // Issue a service invoice but don't collect it. Revenue is
     // recognized (net_income = +1000), but no cash moves (the JE is
     // DR 1100 AR / CR revenue — nothing touches the cash pool), so
@@ -660,7 +643,7 @@ async fn cash_flow_unpaid_invoice_produces_no_operating_cash() {
     let payload = json!({
         "invoice_id": "cfo-1",
         "amount_cents": 1_000,
-        "line_items": [{"category": "service", "amount_cents": 1_000}],
+        "line_items": [{"category": "taproom", "amount_cents": 1_000}],
     });
     seed_entry(
         &db,
@@ -675,8 +658,8 @@ async fn cash_flow_unpaid_invoice_produces_no_operating_cash() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/cash-flow?from=2026-03-01&to=2026-03-31").await;
     assert_eq!(status, StatusCode::OK);
@@ -690,10 +673,11 @@ async fn cash_flow_unpaid_invoice_produces_no_operating_cash() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cash_flow_paid_invoice_shows_cash_delta() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let p_issue = json!({
         "invoice_id": "cfo-2",
         "amount_cents": 1_000,
-        "line_items": [{"category": "service", "amount_cents": 1_000}],
+        "line_items": [{"category": "taproom", "amount_cents": 1_000}],
     });
     let p_paid = json!({"invoice_id": "cfo-2", "amount_cents": 1_000});
     seed_entry(
@@ -717,8 +701,8 @@ async fn cash_flow_paid_invoice_shows_cash_delta() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/cash-flow?from=2026-03-01&to=2026-03-31").await;
     assert_eq!(status, StatusCode::OK);
@@ -755,6 +739,7 @@ async fn cash_flow_direct_sums_buckets_and_reconciles_against_cash_pool() {
     // GL cash-pool delta = +10_000 − 3_000 − 4_000 − 2_000 = +1_000.
     // → reconciled, gap = 0.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let d = |day: u32| NaiveDate::from_ymd_opt(2026, 4, day).unwrap();
 
     seed_entry(
@@ -815,8 +800,8 @@ async fn cash_flow_direct_sums_buckets_and_reconciles_against_cash_pool() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(
         r,
@@ -843,12 +828,13 @@ async fn cash_flow_direct_sums_buckets_and_reconciles_against_cash_pool() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cash_flow_direct_empty_period_returns_zeros() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(
         r,
@@ -885,11 +871,12 @@ async fn bank_settlement_create_and_settle_round_trip() {
     // to post finance.payment.settled (DR 1000 / CR 1010). After both,
     // the trial balance shows Cash +amount, A/R -amount, Cash in Transit 0.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     // A/R needs a prior credit so it can drop — seed an invoice-issued fact.
     let p_issue = json!({
         "invoice_id": "inv-bank-1",
         "amount_cents": 5_000,
-        "line_items": [{"category": "service", "amount_cents": 5_000}],
+        "line_items": [{"category": "taproom", "amount_cents": 5_000}],
     });
     seed_entry(
         &db,
@@ -905,8 +892,8 @@ async fn bank_settlement_create_and_settle_round_trip() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r1,
@@ -932,8 +919,8 @@ async fn bank_settlement_create_and_settle_round_trip() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r2, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -952,8 +939,8 @@ async fn bank_settlement_create_and_settle_round_trip() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r3,
@@ -970,8 +957,8 @@ async fn bank_settlement_create_and_settle_round_trip() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r4, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -991,11 +978,12 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
     // Two pending rows: one due today, one due tomorrow. Sweep with
     // as_of=today picks up only the first.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     for (inv_id, set_id) in [("inv-s1", "set-today"), ("inv-s2", "set-tomorrow")] {
         let p_issue = json!({
             "invoice_id": inv_id,
             "amount_cents": 1_000,
-            "line_items": [{"category": "service", "amount_cents": 1_000}],
+            "line_items": [{"category": "taproom", "amount_cents": 1_000}],
         });
         seed_entry(
             &db,
@@ -1010,8 +998,8 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
         // set-today → expected_settle_on = 2026-03-20 (ach default = +1 day)
         // set-tomorrow → expected_settle_on = 2026-03-21
@@ -1042,8 +1030,8 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -1060,8 +1048,8 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, list) = get(r, "/api/ledger/bank-settlements").await;
     let rows = list.as_array().unwrap();
@@ -1075,10 +1063,11 @@ async fn bank_settlement_create_is_idempotent_on_id() {
     // Re-POST with the same id must not create a second fact or a second
     // journal entry.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let p_issue = json!({
         "invoice_id": "inv-idem",
         "amount_cents": 2_000,
-        "line_items": [{"category": "service", "amount_cents": 2_000}],
+        "line_items": [{"category": "taproom", "amount_cents": 2_000}],
     });
     seed_entry(
         &db,
@@ -1095,8 +1084,8 @@ async fn bank_settlement_create_is_idempotent_on_id() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
         let (status, _) = post_json(
             r,
@@ -1130,8 +1119,8 @@ async fn bank_settlement_create_is_idempotent_on_id() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1142,12 +1131,13 @@ async fn bank_settlement_create_is_idempotent_on_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cash_flow_empty_period_returns_zeros() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/cash-flow?from=2026-01-01&to=2026-01-31").await;
     assert_eq!(status, StatusCode::OK);
@@ -1199,6 +1189,7 @@ async fn payroll_run_posts_compound_journal_entry() {
     //   CR 2150   3,700 (withheld + employer tax)
     //   CR 1000   9,400 (net)
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 1_000_000).await;
     for (id, dept, role) in [
         ("emp-pay-1", "sales", "sales-rep"),
@@ -1212,8 +1203,8 @@ async fn payroll_run_posts_compound_journal_entry() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -1246,8 +1237,8 @@ async fn payroll_run_posts_compound_journal_entry() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1271,6 +1262,7 @@ async fn payroll_run_is_idempotent_on_id() {
     // row without posting a second journal entry or inserting a
     // duplicate fact.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 1_000_000).await;
     seed_employee(&db, "emp-idem-1", "finance", "controller").await;
     let body = json!({
@@ -1290,8 +1282,8 @@ async fn payroll_run_is_idempotent_on_id() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
         let (status, _) = post_json(r, "/api/ledger/payroll-runs", body.clone()).await;
         assert_eq!(status, StatusCode::OK);
@@ -1318,8 +1310,8 @@ async fn payroll_run_is_idempotent_on_id() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1330,6 +1322,7 @@ async fn payroll_run_is_idempotent_on_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn payroll_run_detail_returns_header_plus_lines() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 1_000_000).await;
     seed_employee(&db, "emp-det-1", "sales", "sales-rep").await;
     seed_employee(&db, "emp-det-2", "sales", "sales-rep").await;
@@ -1337,8 +1330,8 @@ async fn payroll_run_detail_returns_header_plus_lines() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1362,8 +1355,8 @@ async fn payroll_run_detail_returns_header_plus_lines() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/payroll-runs/pr-det").await;
     assert_eq!(status, StatusCode::OK);
@@ -1379,13 +1372,14 @@ async fn payroll_run_detail_returns_header_plus_lines() {
 #[tokio::test(flavor = "multi_thread")]
 async fn payroll_run_rejects_line_arithmetic_mismatch() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_employee(&db, "emp-bad", "sales", "sales-rep").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1417,7 +1411,7 @@ async fn seed_sales_tax_accrual(db: &TestDb, source_id: &str, tax_cents: i64) {
         "amount_cents": 100_000 + tax_cents,
         "currency": "USD",
         "line_items": [
-            {"category": "service", "amount_cents": 100_000, "currency": "USD"},
+            {"category": "taproom", "amount_cents": 100_000, "currency": "USD"},
         ],
         "tax_lines": [
             {"account": "2300", "jurisdiction": "US-CA", "amount_cents": tax_cents},
@@ -1438,14 +1432,15 @@ async fn sales_tax_accrual_credits_2300() {
     // Issue an invoice with a sales-tax line; the ledger should credit
     // 2300 Sales Tax Payable for the tax amount + A/R for revenue+tax.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_sales_tax_accrual(&db, "inv-tax-1", 7_250).await;
 
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1466,6 +1461,7 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
     // amount, 2300 should net to zero, and a `finance.tax.remitted`
     // fact should exist.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 100_000).await;
     seed_sales_tax_accrual(&db, "inv-rem-1", 10_000).await;
     seed_sales_tax_accrual(&db, "inv-rem-2", 5_000).await;
@@ -1475,8 +1471,8 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1500,8 +1496,8 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -1517,8 +1513,8 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1548,6 +1544,7 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tax_filing_remit_is_idempotent() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 100_000).await;
     seed_sales_tax_accrual(&db, "inv-idem-1", 12_000).await;
 
@@ -1565,8 +1562,8 @@ async fn tax_filing_remit_is_idempotent() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(r, "/api/ledger/tax-filings", body).await;
     assert_eq!(status, StatusCode::OK);
@@ -1577,8 +1574,8 @@ async fn tax_filing_remit_is_idempotent() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
         let (status, _) = post_json(
             r,
@@ -1603,8 +1600,8 @@ async fn tax_filing_remit_is_idempotent() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1619,6 +1616,7 @@ async fn tax_filing_upsert_is_idempotent_on_period() {
     // Two POSTs with different PK ids but the same
     // (kind, jurisdiction, period) must collapse onto one row.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let body1 = json!({
         "id": "tf-a",
         "kind": "sales",
@@ -1645,8 +1643,8 @@ async fn tax_filing_upsert_is_idempotent_on_period() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
         let (status, _) = post_json(r, "/api/ledger/tax-filings", b).await;
         assert_eq!(status, StatusCode::OK);
@@ -1670,14 +1668,15 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
     // After both legs: 6500 debit-positive, 2310 zero, and Cash =
     // 1,000,000 opening − 500,000 remittance = 500,000.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 1_000_000).await;
 
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1703,8 +1702,8 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1722,8 +1721,8 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1737,8 +1736,8 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -1751,14 +1750,15 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tax_liability_summary_includes_accrued_and_next_due() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_sales_tax_accrual(&db, "inv-sum-1", 3_000).await;
 
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_json(
         r,
@@ -1781,8 +1781,8 @@ async fn tax_liability_summary_includes_accrued_and_next_due() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(r, "/api/ledger/tax-liability").await;
     assert_eq!(status, StatusCode::OK);
@@ -1830,7 +1830,7 @@ async fn seed_revenue_schedule(
               revenue_account, deferred_account, total_cents, start_date, \
               end_date, frequency, recognized_to_date_cents, \
               next_recognition_date, status) \
-         VALUES ($1, 'service_agreement', $1, $2, 'contracts', \
+         VALUES ($1, 'service_agreement', $1, $2, 'distribution', \
                  '4140', '2200', $3, $4, $5, 'monthly', 0, $6, 'active')",
     )
     .bind(id)
@@ -1847,6 +1847,7 @@ async fn seed_revenue_schedule(
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_revenue_runoff_projects_active_schedules() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_runoff_account(&db, "prac-runoff").await;
     // Two active schedules: a $1,200/12-month contract starting May 2026,
     // and a $600/6-month contract starting June 2026 with cursor pre-
@@ -1882,8 +1883,8 @@ async fn deferred_revenue_runoff_projects_active_schedules() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = get(
         r,
@@ -1927,13 +1928,14 @@ async fn auditor_role_is_rejected_from_every_ledger_write() {
     // runs — parallel to the UI-level `role === 'auditor'` hiding in
     // `apps/web/src/finance/FinancePage.svelte`.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let mk = || {
         router(LedgerApiState {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // No read gate in tests; production wires one.
-            policy: None,
+            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         })
     };
 
@@ -2016,7 +2018,7 @@ async fn auditor_role_is_rejected_from_every_ledger_write() {
                 "source_kind": "service_agreement",
                 "source_id": "sa-no-write",
                 "account_id": "p-1",
-                "revenue_category": "contracts",
+                "revenue_category": "distribution",
                 "revenue_account": "4140",
                 "deferred_account": "2200",
                 "total_cents": 1200,
@@ -2043,9 +2045,10 @@ async fn auditor_role_is_rejected_from_every_ledger_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn close_yearly_period_posts_closing_entries_and_locks() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
 
     // Seed some FY-2026 activity: $5,000 revenue + $2,000 expense.
-    // Two revenue lines ($3k service + $2k new-sales) so we exercise
+    // Two revenue lines ($3k taproom + $2k wholesale) so we exercise
     // the multi-account path. Expense side uses the payroll rule
     // (DR 6100 gross + CR 2150 + 1000), but since that mingles cash
     // and payroll-liability, use manual entries for the expense so
@@ -2054,8 +2057,8 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         "invoice_id": "inv-close-1",
         "amount_cents": 5_000,
         "line_items": [
-            { "category": "service", "amount_cents": 3_000 },
-            { "category": "new-sales", "amount_cents": 2_000 },
+            { "category": "taproom", "amount_cents": 3_000 },
+            { "category": "wholesale", "amount_cents": 2_000 },
         ],
     });
     seed_entry(
@@ -2083,8 +2086,8 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -2106,8 +2109,8 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(r, "/api/ledger/periods", json!({"year": 2026})).await;
     assert_eq!(status, StatusCode::OK, "create period body={body:?}");
@@ -2119,11 +2122,11 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{period_id}/close");
-    let (status, body) = post_json(r, &path, json!({"closed_by": "emp-close-test"})).await;
+    let (status, body) = post_json(r, &path, json!({})).await;
     assert_eq!(status, StatusCode::OK, "close body={body:?}");
     assert_eq!(body["status"], "locked");
     assert_eq!(body["revenue_closed_cents"], 5_000);
@@ -2137,8 +2140,8 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance?as_of=2026-12-31").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -2148,7 +2151,7 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
             .and_then(|r| r["balance_cents"].as_i64())
             .unwrap_or(0)
     };
-    assert_eq!(balance("4100"), 0, "new-sales revenue closed");
+    assert_eq!(balance("4100"), 0, "wholesale revenue closed");
     assert_eq!(balance("4120"), 0, "service revenue closed");
     assert_eq!(balance("6200"), 0, "rent expense closed");
     assert_eq!(balance("3000"), 3_000, "RE absorbed net income");
@@ -2158,8 +2161,8 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status2, body2) = post_json(r, &path, json!({})).await;
     assert_eq!(status2, StatusCode::OK);
@@ -2177,12 +2180,13 @@ async fn close_yearly_period_writes_off_wip_variance() {
     // must write off to retained earnings — 1310 ends the year at
     // zero, and the drained COGS account is NOT re-inflated.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
 
     // Revenue $5,000 (issued + collected so cash is funded).
     let invoice_payload = json!({
         "invoice_id": "inv-wip-close-1",
         "amount_cents": 5_000,
-        "line_items": [{ "category": "new-sales", "amount_cents": 5_000 }],
+        "line_items": [{ "category": "wholesale", "amount_cents": 5_000 }],
     });
     seed_entry(
         &db,
@@ -2206,8 +2210,8 @@ async fn close_yearly_period_writes_off_wip_variance() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -2230,8 +2234,8 @@ async fn close_yearly_period_writes_off_wip_variance() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(
         r,
@@ -2253,8 +2257,8 @@ async fn close_yearly_period_writes_off_wip_variance() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, body) = post_json(r, "/api/ledger/periods", json!({"year": 2026})).await;
     assert_eq!(status, StatusCode::OK, "create period body={body:?}");
@@ -2264,11 +2268,11 @@ async fn close_yearly_period_writes_off_wip_variance() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{period_id}/close");
-    let (status, body) = post_json(r, &path, json!({"closed_by": "emp-wip-close"})).await;
+    let (status, body) = post_json(r, &path, json!({})).await;
     assert_eq!(status, StatusCode::OK, "close body={body:?}");
     assert_eq!(body["status"], "locked");
     assert_eq!(body["net_income_cents"], 3_000);
@@ -2280,8 +2284,8 @@ async fn close_yearly_period_writes_off_wip_variance() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (_, tb) = get(r, "/api/ledger/trial-balance?as_of=2026-12-31").await;
     let rows = tb["rows"].as_array().unwrap();
@@ -2310,7 +2314,8 @@ async fn close_yearly_period_writes_off_wip_variance() {
 async fn close_monthly_period_is_rejected() {
     // Only yearly periods can be closed via /close — monthly use /lock.
     let db = TestDb::new().await;
-    let p = json!({"invoice_id": "i-monthly", "amount_cents": 100, "line_items": [{"category": "service", "amount_cents": 100}]});
+    db.declare_revenue_categories_of("brewery").await;
+    let p = json!({"invoice_id": "i-monthly", "amount_cents": 100, "line_items": [{"category": "taproom", "amount_cents": 100}]});
     seed_entry(
         &db,
         "finance.invoice.issued",
@@ -2329,8 +2334,8 @@ async fn close_monthly_period_is_rejected() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{monthly_id}/close");
     let (status, _) = post_json(r, &path, json!({})).await;
@@ -2340,12 +2345,13 @@ async fn close_monthly_period_is_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_revenue_runoff_clamps_horizon_and_handles_empty_db() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     // months=0 should clamp up to 1; months=999 should clamp down to 60.
     let (status, body) = get(r, "/api/ledger/deferred-revenue-runoff?months=999").await;
@@ -2377,6 +2383,7 @@ async fn deferred_revenue_runoff_clamps_horizon_and_handles_empty_db() {
 #[tokio::test(flavor = "multi_thread")]
 async fn balance_sheet_holds_across_periods() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
 
     // Seed activity in TWO different calendar years so the
     // previous calendar-year-start filter would have orphaned
@@ -2384,7 +2391,7 @@ async fn balance_sheet_holds_across_periods() {
     // to unclosed net income.
     let p_issue_old = json!({
         "invoice_id": "old", "amount_cents": 5_000,
-        "line_items": [{"category": "service", "amount_cents": 5_000}]
+        "line_items": [{"category": "taproom", "amount_cents": 5_000}]
     });
     let p_paid_old = json!({"invoice_id": "old", "amount_cents": 5_000});
     seed_entry(
@@ -2406,7 +2413,7 @@ async fn balance_sheet_holds_across_periods() {
 
     let p_issue_new = json!({
         "invoice_id": "new", "amount_cents": 3_000,
-        "line_items": [{"category": "service", "amount_cents": 3_000}]
+        "line_items": [{"category": "taproom", "amount_cents": 3_000}]
     });
     let p_paid_new = json!({"invoice_id": "new", "amount_cents": 3_000});
     seed_entry(
@@ -2430,8 +2437,8 @@ async fn balance_sheet_holds_across_periods() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
 
     // Trial balance: every JE balances by construction (the
@@ -2471,14 +2478,15 @@ async fn balance_sheet_holds_across_periods() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bills_approve_routes_by_category_then_pay_run_drains_ap() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_opening_cash(&db, 1_000_000).await;
 
     let state = || LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     };
 
     // Approve a rent bill (→ 6200) and a utilities bill (→ 6300). The free
@@ -2541,12 +2549,13 @@ async fn bills_approve_routes_by_category_then_pay_run_drains_ap() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bills_approve_is_idempotent_on_id() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let state = || LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     };
     let body =
         json!({"id": "bill-x", "vendor": "V", "bill_category": "rent", "amount_cents": 50_000});
@@ -2565,12 +2574,13 @@ async fn bills_approve_is_idempotent_on_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bills_reject_auditor_writes() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_as_auditor(
         r,
@@ -2586,12 +2596,13 @@ async fn bills_reject_auditor_writes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn keg_deposit_settlement_books_both_legs_and_drains_the_liability() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let state = || LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     };
     let body = json!({
         "job_id": "job-keg-1",
@@ -2685,12 +2696,13 @@ async fn keg_deposit_settlement_books_both_legs_and_drains_the_liability() {
 #[tokio::test(flavor = "multi_thread")]
 async fn keg_deposit_settlement_rejects_non_conserving_counts_as_422() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     // 1 out, 1 returned AND 1 lost — the shape the free-field faker
     // used to produce (feedback 52f49cc7). Deterministic data error →
@@ -2722,12 +2734,13 @@ async fn keg_deposit_settlement_rejects_non_conserving_counts_as_422() {
 #[tokio::test(flavor = "multi_thread")]
 async fn keg_deposit_settlement_rejects_auditor_writes() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, _) = post_as_auditor(
         r,
@@ -2756,12 +2769,13 @@ async fn keg_deposit_same_day_settlement_survives_a_rebuild() {
     // drains, and the "1000 Cash must not go negative" guard would
     // abort the rebuild on an empty ledger.
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
+        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let (status, resp) = post_json(
         r,
@@ -2838,7 +2852,7 @@ fn chart_state(db: &TestDb) -> LedgerApiState {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        policy: None,
+        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     }
 }
 
@@ -2850,6 +2864,7 @@ fn chart_state(db: &TestDb) -> LedgerApiState {
 #[tokio::test(flavor = "multi_thread")]
 async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_difference() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let rows = json!([
         {"code": "1000", "name": "Bank", "kind": "asset", "normal_balance": "debit"},
         {"code": "1010", "name": "Cash in Transit", "kind": "asset", "normal_balance": "debit"},
@@ -2958,6 +2973,7 @@ async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_differ
 #[tokio::test(flavor = "multi_thread")]
 async fn chart_batch_refuses_an_invalid_kind_by_row_and_writes_nothing() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let rows = json!([
         {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
         {"code": "6200", "name": "Infrastructure", "kind": "cost", "normal_balance": "debit"},
@@ -2980,6 +2996,7 @@ async fn chart_batch_refuses_an_invalid_kind_by_row_and_writes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let rows = json!([
         {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
     ]);
@@ -2990,7 +3007,20 @@ async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_ca
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = post_json(router(chart_state(&db)), "/api/ledger/accounts/batch", rows).await;
+    let (status, _) = post_json(
+        router(chart_state(&db)),
+        "/api/ledger/accounts/batch",
+        rows.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Backlog 85e7f10f: a sim chain is not an identity. Anonymous ON one
+    // — what a forged `x-sim-origin` produced — is refused the same way.
+    let (status, _) = boss_core::sim_origin::with_sim_chain(
+        true,
+        post_json(router(chart_state(&db)), "/api/ledger/accounts/batch", rows),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM gl_accounts WHERE code = '4300'")
         .fetch_one(&db.pool)
@@ -3011,6 +3041,7 @@ async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_ca
 #[tokio::test(flavor = "multi_thread")]
 async fn tax_batch_inserts_if_absent_keeps_a_migration_row_and_names_the_difference() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     // The starter chart holds 2300 and 6500; 2900 is the tenant's own.
     let (status, _) = post_as_operator(
         router(chart_state(&db)),
@@ -3123,6 +3154,7 @@ async fn tax_batch_inserts_if_absent_keeps_a_migration_row_and_names_the_differe
 #[tokio::test(flavor = "multi_thread")]
 async fn tax_batch_refuses_an_account_the_chart_does_not_hold_and_writes_nothing() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let body = json!({
         "tax_kind": [
             {"kind": "gross-receipts", "liability_account": "2900"},
@@ -3163,6 +3195,7 @@ async fn tax_batch_refuses_an_account_the_chart_does_not_hold_and_writes_nothing
 #[tokio::test(flavor = "multi_thread")]
 async fn tax_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let body =
         json!({"sales_tax_rate": [{"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400}]});
     let (status, _) = post_as_auditor(
@@ -3172,7 +3205,19 @@ async fn tax_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_call
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = post_json(router(chart_state(&db)), "/api/ledger/tax/batch", body).await;
+    let (status, _) = post_json(
+        router(chart_state(&db)),
+        "/api/ledger/tax/batch",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Backlog 85e7f10f: anonymous on a sim chain is refused too.
+    let (status, _) = boss_core::sim_origin::with_sim_chain(
+        true,
+        post_json(router(chart_state(&db)), "/api/ledger/tax/batch", body),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (n,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM sales_tax_rate_by_state WHERE state = 'HI'")

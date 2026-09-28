@@ -44,9 +44,15 @@ fn has(tool: &str) -> bool {
 
 const SCRIPT: &str = "infra/gcp/uninstall-not-in-role.sh";
 const INSTALLER: &str = "infra/gcp/install-units.sh";
-/// The roles boss-gcp declared on 2026-09-15 (legacy-stack gone since
-/// car 3 landed on #362).
-const ROLES: &str = r#"["wireguard-bastion","off-cluster-observer","ml-batch-host"]"#;
+/// The roles the fixture host declares. A FIXTURE, not boss-gcp's live
+/// set: the verb's derivation is under test, so what matters is that a
+/// role with several unit rows is left out. Until 2026-09-27 that role
+/// was `legacy-stack` and this was boss-gcp's real declaration; its
+/// roles.toml section was deleted with its Class (backlog 0f9a7a47), so
+/// the live roles now name every row and the fixture leaves out
+/// `off-cluster-observer` (four rows) instead.
+const DECLARED: &[&str] = &["wireguard-bastion", "ml-batch-host"];
+const ROLES: &str = r#"["wireguard-bastion","ml-batch-host"]"#;
 
 /// The stems `infra/estate/roles.toml` names under one section header,
 /// read the way `install-units.sh`'s `role_units` reads them: each
@@ -71,30 +77,38 @@ fn role_units(section: &str) -> Vec<String> {
     out
 }
 
-/// The stems the three declared roles plus `always` name — what the
-/// host keeps.
+/// Every `[roles.<name>]` section roles.toml declares, by name.
+fn role_sections() -> Vec<String> {
+    std::fs::read_to_string(repo_root().join("infra/estate/roles.toml"))
+        .expect("infra/estate/roles.toml")
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("[roles.")?.strip_suffix(']'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The stems the declared roles plus `always` name — what the host
+/// keeps.
 fn kept_stems() -> Vec<String> {
     let mut out = role_units("always");
-    for role in [
-        "roles.wireguard-bastion",
-        "roles.off-cluster-observer",
-        "roles.ml-batch-host",
-    ] {
-        out.extend(role_units(role));
+    for role in DECLARED {
+        out.extend(role_units(&format!("roles.{role}")));
     }
     out
 }
 
-/// The stems outside those roles. `infra/lint/boss-gcp-converges-itself.sh`
-/// pins roles.toml against the TIMERS array (every stem in exactly one
-/// section), so under the three declared roles this is the legacy-stack
-/// section and nothing else.
+/// The stems every OTHER section names. The installer refuses a stem
+/// named twice, so each stem is in exactly one section and this is the
+/// roster minus the kept set.
 fn not_in_role_stems() -> Vec<String> {
-    let mut out = role_units("roles.legacy-stack");
-    out.extend(role_units("roles.cluster-operator"));
-    // Seven since 2026-09-18: boss-conservation-invariants left with its
-    // unit files once its cluster CronJob existed (H12, backlog 236529aa).
-    assert!(out.len() >= 7, "legacy-stack names {out:?}");
+    let out: Vec<String> = role_sections()
+        .iter()
+        .filter(|r| !DECLARED.contains(&r.as_str()))
+        .flat_map(|r| role_units(&format!("roles.{r}")))
+        .collect();
+    // At least three stems: the mid-way failure case below needs a
+    // fifth planned unit, the absent-unit case a second stem.
+    assert!(out.len() >= 3, "the not-in-role fixture names {out:?}");
     out
 }
 
@@ -371,7 +385,7 @@ fn the_installer_roster_mode_answers_the_roles() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
-    let (rc, text) = run("wireguard-bastion,off-cluster-observer,ml-batch-host");
+    let (rc, text) = run(&DECLARED.join(","));
     assert_eq!(rc, 0, "roster mode did not exit 0:\n{text}");
     let not_in: Vec<String> = text
         .lines()
@@ -528,10 +542,10 @@ fn refuses_when_the_roles_are_not_a_live_non_empty_reading() {
 fn refuses_when_every_row_is_in_role() {
     let c = Case::new("all-in-role");
     let before = c.etc_listing();
-    write_file(
-        &c.nodes,
-        r#"{"data":[{"id":"boss-gcp","roles":["wireguard-bastion","off-cluster-observer","ml-batch-host","cluster-operator","legacy-stack"]}]}"#,
-    );
+    // Every role roles.toml declares — the live boss-gcp shape since the
+    // legacy-stack section left it (backlog 0f9a7a47).
+    let every = serde_json::json!({"data": [{"id": "boss-gcp", "roles": role_sections()}]});
+    write_file(&c.nodes, &every.to_string());
     for mode in ["--dry-run", "--for-real"] {
         let (rc, text) = c.run(&[mode]);
         assert_eq!(rc, 2, "an empty set under {mode} was not refused:\n{text}");
@@ -718,15 +732,18 @@ fn shipped_verbs(root: &Path) -> PathBuf {
 
 /// One open ops-request for boss-gcp carrying the verb and args, run
 /// through `ops-runner.sh` against a stubbed system of record. The
-/// stub `curl` answers the jobs read with the packet, records the PUT,
+/// stub `curl` answers the jobs read with the packet, keeps what it recorded on the step,
 /// and answers the estate-nodes read the script makes.
 fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json::Value>) {
     write_exec(
         &c.bin.join("curl"),
-        "#!/bin/sh\n\
-         for a in \"$@\"; do case \"$a\" in @*) cp \"${a#@}\" \"$STUB_PUT\"; exit 0;; esac; done\n\
-         for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
-         cat \"$STUB_JOBS\"\n",
+        &[
+            "#!/bin/sh\n",
+            boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
+            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
+             cat \"$STUB_JOBS\"\n",
+        ]
+        .concat(),
     );
     write_file(
         &c.root.join("jobs.json"),
@@ -734,8 +751,8 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
             r#"{{"data":[{{"id":"aaaaaaaa-0000-4000-8000-000000000000","status":"open","metadata":{{"host":"boss-gcp","verb":"uninstall-not-in-role","args":{args}}},"steps":[{{"id":"s-execute","spec_slug":"execute","status":"ready","metadata":{{"authority_role":"platform-admin"}}}}]}}]}}"#
         ),
     );
-    let put = c.root.join("put.json");
-    let _ = std::fs::remove_file(&put);
+    let step_md = c.root.join("step-metadata.json");
+    let _ = std::fs::remove_file(&step_md);
     let mut cmd = Command::new("sh");
     cmd.arg(repo_root().join("infra/ops/ops-runner.sh"));
     c.env(&mut cmd);
@@ -743,17 +760,14 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", c.root.join("jobs.json"))
-        .env("STUB_PUT", &put);
+        .env("STUB_STEP_METADATA", &step_md);
     let out = cmd.output().expect("ops-runner.sh runs");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let meta = std::fs::read_to_string(&put)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("PUT payload is JSON"))
-        .map(|v| v["metadata"].clone());
+    let meta = boss_testing::ops_runner_stub::step_metadata_written(&step_md);
     (text, meta)
 }
 

@@ -93,6 +93,7 @@ fn fixture(id: &str, account: &str, lines: Vec<(RevenueCategory, i64, &str)>) ->
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_reproduces_invoices_and_line_items() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     let commerce = Arc::new(PgCommerce::new(db.pool.clone()));
     let actor = boss_core::actor::ActorId::Automation("test".into());
 
@@ -101,14 +102,22 @@ async fn rebuild_reproduces_invoices_and_line_items() {
         "INV-001",
         "acc-001",
         vec![
-            (RevenueCategory::from("service"), 5_000, "tune-up"),
-            (RevenueCategory::from("parts"), 3_000, "spare cartridge"),
+            (RevenueCategory::from("taproom"), 5_000, "tune-up"),
+            (
+                RevenueCategory::from("event-package"),
+                3_000,
+                "spare cartridge",
+            ),
         ],
     );
     let i2 = fixture(
         "INV-002",
         "acc-002",
-        vec![(RevenueCategory::from("contracts"), 12_000, "annual support")],
+        vec![(
+            RevenueCategory::from("distribution"),
+            12_000,
+            "annual support",
+        )],
     );
 
     // Drive both creates through the repo alone — the adapter records
@@ -121,7 +130,8 @@ async fn rebuild_reproduces_invoices_and_line_items() {
             &EventStamp::new("commerce", actor.clone()).with_timestamp(now),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_invoice();
 
     let now2 = Utc::now();
     commerce
@@ -131,7 +141,8 @@ async fn rebuild_reproduces_invoices_and_line_items() {
             &EventStamp::new("commerce", actor.clone()).with_timestamp(now2),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_invoice();
 
     // Mark INV-001 paid — the paid event records in the flip's tx.
     let now3 = Utc::now();

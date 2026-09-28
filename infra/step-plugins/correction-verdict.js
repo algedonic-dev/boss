@@ -141,10 +141,32 @@
     document.head.appendChild(el);
   }
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    })[c]);
+  // The surface is built as nodes, never as an HTML string (backlog
+  // 4a359b51, 2026-09-27): the claim, the measurement and the corrected
+  // packet's title are metadata any actor may write, and a string of
+  // markup is one missed escape from running it. A string child is a
+  // Text node by append's definition.
+  function h(tag, attrs, ...children) {
+    const el = document.createElement(tag);
+    if (attrs) {
+      for (const k in attrs) {
+        const v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'className') el.className = v;
+        else if (k.startsWith('on') && typeof v === 'function') {
+          el.addEventListener(k.slice(2).toLowerCase(), v);
+        } else if (k === 'checked' || k === 'disabled' || k === 'value') {
+          el[k] = v;
+        } else {
+          el.setAttribute(k, String(v));
+        }
+      }
+    }
+    for (const child of children.flat()) {
+      if (child == null || child === false) continue;
+      el.append(child instanceof Node ? child : String(child));
+    }
+    return el;
   }
 
   /// A field that should be there but is not renders as a visible
@@ -154,9 +176,9 @@
   /// to hide behind whitespace.
   function body(text, missingLabel) {
     if (text != null && String(text).trim() !== '') {
-      return `<p class="scv-body">${esc(text)}</p>`;
+      return h('p', { className: 'scv-body' }, String(text));
     }
-    return `<p class="scv-body scv-missing">${esc(missingLabel)}</p>`;
+    return h('p', { className: 'scv-body scv-missing' }, missingLabel);
   }
 
   const OPTIONS = [
@@ -194,8 +216,9 @@
 
     function render() {
       if (terminal) {
-        root.innerHTML =
-          `<div class="scv-done">Verdict recorded: <strong>${esc(verdict || 'none')}</strong>.</div>`;
+        root.replaceChildren(
+          h('div', { className: 'scv-done' }, 'Verdict recorded: ', h('strong', null, verdict || 'none'), '.'),
+        );
         return;
       }
 
@@ -207,68 +230,86 @@
       const correctsId = jm.corrects;
       const correctsTitle = jm.corrects_title;
 
-      root.innerHTML = `
-        <div class="scv-head">
-          <h3>Is this correction right?</h3>
-          ${
-            correctsId
-              ? `<span class="scv-corrects">correcting
-                   <a href="/ux/jobs/${esc(correctsId)}">${esc(correctsTitle || correctsId)}</a>
-                 </span>`
-              : ''
-          }
-        </div>
-
-        <div class="scv-compare">
-          <div class="scv-pane scv-claim">
-            <h4>What was claimed</h4>
-            ${body(claim, 'No claim recorded on the evidence step — send this back rather than judging it.')}
-          </div>
-          <div class="scv-pane scv-measured">
-            <h4>What was measured</h4>
-            ${body(measured, 'No measurement recorded — there is nothing here to accept.')}
-          </div>
-        </div>
-
-        <details class="scv-detail">
-          <summary>How it was measured</summary>
-          ${body(method, 'No method recorded.')}
-        </details>
-        <details class="scv-detail">
-          <summary>Where the claim still lives</summary>
-          ${body(where, 'Not recorded — accepting this leaves nobody knowing what to edit.')}
-        </details>
-
-        <div class="scv-choice">
-          ${OPTIONS.map(
-            (o) => `
-            <label class="scv-opt${verdict === o.value ? ' scv-on' : ''}">
-              <input type="radio" name="scv-verdict" value="${o.value}"
-                     ${verdict === o.value ? 'checked' : ''} />
-              <span>
-                <p class="scv-opt-label">${esc(o.label)}</p>
-                <p class="scv-opt-what">${esc(o.what)}</p>
-              </span>
-            </label>`,
-          ).join('')}
-        </div>
-
-        <div class="scv-actions">
-          <button type="button" ${verdict && !saving ? '' : 'disabled'}>
-            ${saving ? 'Recording…' : 'Record verdict'}
-          </button>
-          ${saveError ? `<span class="scv-err">${esc(saveError)}</span>` : ''}
-        </div>
-      `;
-
-      root.querySelectorAll('input[name="scv-verdict"]').forEach((input) => {
-        input.addEventListener('change', () => {
-          verdict = input.value;
-          render();
-        });
-      });
-      const btn = root.querySelector('.scv-actions button');
-      if (btn) btn.addEventListener('click', save);
+      root.replaceChildren(
+        h(
+          'div',
+          { className: 'scv-head' },
+          h('h3', null, 'Is this correction right?'),
+          correctsId
+            ? h(
+                'span',
+                { className: 'scv-corrects' },
+                'correcting ',
+                // The fixed path prefix keeps a scheme out of the href.
+                h('a', { href: `/ux/jobs/${correctsId}` }, correctsTitle || correctsId),
+              )
+            : null,
+        ),
+        h(
+          'div',
+          { className: 'scv-compare' },
+          h(
+            'div',
+            { className: 'scv-pane scv-claim' },
+            h('h4', null, 'What was claimed'),
+            body(claim, 'No claim recorded on the evidence step — send this back rather than judging it.'),
+          ),
+          h(
+            'div',
+            { className: 'scv-pane scv-measured' },
+            h('h4', null, 'What was measured'),
+            body(measured, 'No measurement recorded — there is nothing here to accept.'),
+          ),
+        ),
+        h(
+          'details',
+          { className: 'scv-detail' },
+          h('summary', null, 'How it was measured'),
+          body(method, 'No method recorded.'),
+        ),
+        h(
+          'details',
+          { className: 'scv-detail' },
+          h('summary', null, 'Where the claim still lives'),
+          body(where, 'Not recorded — accepting this leaves nobody knowing what to edit.'),
+        ),
+        h(
+          'div',
+          { className: 'scv-choice' },
+          OPTIONS.map((o) =>
+            h(
+              'label',
+              { className: `scv-opt${verdict === o.value ? ' scv-on' : ''}` },
+              h('input', {
+                type: 'radio',
+                name: 'scv-verdict',
+                value: o.value,
+                checked: verdict === o.value,
+                onChange: () => {
+                  verdict = o.value;
+                  render();
+                },
+              }),
+              h(
+                'span',
+                null,
+                h('p', { className: 'scv-opt-label' }, o.label),
+                h('p', { className: 'scv-opt-what' }, o.what),
+              ),
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { className: 'scv-actions' },
+          h(
+            'button',
+            { type: 'button', disabled: !verdict || saving, onClick: save },
+            saving ? 'Recording…' : 'Record verdict',
+          ),
+          saveError ? h('span', { className: 'scv-err' }, saveError) : null,
+        ),
+      );
     }
 
     async function save() {

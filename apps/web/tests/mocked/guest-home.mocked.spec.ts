@@ -10,7 +10,7 @@
 // Two properties worth holding: the guest branch is taken at all, and
 // the feedback track reports what is real rather than what flatters.
 
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route } from './_test';
 
 const FEEDBACK = [
   // Nobody has picked this one up yet.

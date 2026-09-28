@@ -37,6 +37,91 @@ set -euo pipefail
 cd "$(dirname "$0")" || exit 1
 HERE="$(pwd)"
 
+# Every unit this host runs. A unit absent from this list is a unit
+# nobody installs, which is the entire defect above.
+#
+# reap-dead-ci-jobs: removes the corpses of crashed CI jobs and the
+#   named volumes they hold. A crashed job's volume is NAMED, so
+#   `docker volume prune` skips it — on 2026-08-14 one held 63GB and
+#   left the next run 74GB, less than a cold `cargo test` needs, and
+#   the symptom was four unrelated boss-ledger tests failing on
+#   "could not extend file".
+# cluster-deploy-runner: builds forge main and rolls the cluster onto
+#   it every ten minutes. This is the SECOND deploy path — the
+#   conductor deploys boss-gcp — and the reason "the train deployed"
+#   and "the cluster is current" can differ by ten minutes.
+# disk-floor-sweep: below BOSS_DISK_FLOOR_GB free on the root volume,
+#   reclaims regenerable docker caches in a fixed order and stops at
+#   the floor; an unmet floor is a failed unit, which is the alarm.
+#   Exists because cluster-deploy-runner's cleanup only runs when main
+#   moves — which needs CI — which needs disk. Circular exactly when
+#   the disk fills, which it did on 2026-09-02, blocking every train.
+# forge-converge: runs THIS script from forge main on a timer, so a
+#   unit that lands on main installs itself on the next tick instead of
+#   waiting for someone to remember to ssh in. It is the fix for the
+#   whole class this file's header describes; disk-floor-sweep sitting
+#   uninstalled through the 2026-09-03 fill is the most recent instance.
+#   The bootstrap that installs forge-converge is the one surviving hand
+#   action — after it, the host converges like the cluster.
+# estate-observe-host: the forge observes itself every 15 minutes —
+#   the estate loop's tightest disk was the one box with no observer
+#   (49a8d842), and the boarding host check (BOSS_TRAIN_CI_HOST) can
+#   only read a host that reports. Same script as boss-gcp's observer,
+#   HOST_ID=forge.
+# cluster-watchdog: the loop that knows the cluster is working from
+#   OUTSIDE it — reads the API, compares what serves with what the
+#   converge last stamped, rolls to that build by name when the API
+#   has been dark longer than a deploy, and says so every 5 minutes.
+#   No maintenance wrap, by design: the 2026-09-05 outage lasted four
+#   hours because every loop that could act needed the API it watched.
+# forge-backup: a nightly `forgejo dump` of the repositories and
+#   Forgejo's database, verified and kept here in a bounded count
+#   (backlog 121831e6). Until it, the forge held the only copy of the
+#   repository, the runner registration and the signing keys, and
+#   nothing copied them. Local only — the offsite legs need a
+#   credential this host does not hold, and every run says so.
+# estate-observe-units: the forge watches its OWN units every five
+#   minutes (backlog c98dcf38) — the same observer boss-gcp runs,
+#   HOST_ID=forge, its roster read off THIS list through the `rows` /
+#   `roster` modes below. Until it, the unit observer ran on boss-gcp
+#   alone, and forge-converge.service closed failed 72 times in twelve
+#   hours on 2026-09-26 while no ESTATE ALARM fired.
+UNITS=(
+    reap-dead-ci-jobs
+    cluster-deploy-runner
+    disk-floor-sweep
+    forge-converge
+    estate-observe-host
+    cluster-watchdog
+    forge-backup
+    estate-observe-units
+)
+
+# THE READ-ONLY MODES, before anything that writes or needs root. The
+# unit observer (infra/estate/observe-units.sh, OBSERVE_UNITS_INSTALLER
+# pointed here by infra/forge/estate-observe-units.service) derives the
+# forge's watch roster from these, in the shape boss-gcp's installer
+# prints (infra/gcp/install-units.sh `rows` / `roster`), so what the
+# forge installs and what it watches are ONE list (CLAUDE.md §9a).
+# Every row is in role: this host installs its whole list, whatever its
+# roles; the ops runner, which IS role-gated, the observer asks
+# install-ops-runner.sh --in-role about itself.
+case "${1:-}" in
+    rows)
+        for u in "${UNITS[@]}"; do echo "$u:forge"; done
+        exit 0
+        ;;
+    roster)
+        for u in "${UNITS[@]}"; do echo "in-role $u"; done
+        exit 0
+        ;;
+    "") ;;
+    *)
+        echo "usage: $0 [rows|roster]" >&2
+        exit 2
+        ;;
+esac
+
 # What this run leaves for forge-converge's own packet — counts, each
 # sub-installer's verdict, every anomaly verbatim. A no-op unless the
 # caller set BOSS_RUN_SUMMARY_FILE; forge-converge.service does. The forge
@@ -80,52 +165,6 @@ export BOSS_SOR_ENV="$SOR_ENV"
 # shellcheck source=infra/lib/sor.sh
 . "${HERE}/../lib/sor.sh"
 sor_require BOSS_JOBS_URL BOSS_FORGE_JOURNAL_URL
-
-# Every unit this host runs. A unit absent from this list is a unit
-# nobody installs, which is the entire defect above.
-#
-# reap-dead-ci-jobs: removes the corpses of crashed CI jobs and the
-#   named volumes they hold. A crashed job's volume is NAMED, so
-#   `docker volume prune` skips it — on 2026-08-14 one held 63GB and
-#   left the next run 74GB, less than a cold `cargo test` needs, and
-#   the symptom was four unrelated boss-ledger tests failing on
-#   "could not extend file".
-# cluster-deploy-runner: builds forge main and rolls the cluster onto
-#   it every ten minutes. This is the SECOND deploy path — the
-#   conductor deploys boss-gcp — and the reason "the train deployed"
-#   and "the cluster is current" can differ by ten minutes.
-# disk-floor-sweep: below BOSS_DISK_FLOOR_GB free on the root volume,
-#   reclaims regenerable docker caches in a fixed order and stops at
-#   the floor; an unmet floor is a failed unit, which is the alarm.
-#   Exists because cluster-deploy-runner's cleanup only runs when main
-#   moves — which needs CI — which needs disk. Circular exactly when
-#   the disk fills, which it did on 2026-09-02, blocking every train.
-# forge-converge: runs THIS script from forge main on a timer, so a
-#   unit that lands on main installs itself on the next tick instead of
-#   waiting for someone to remember to ssh in. It is the fix for the
-#   whole class this file's header describes; disk-floor-sweep sitting
-#   uninstalled through the 2026-09-03 fill is the most recent instance.
-#   The bootstrap that installs forge-converge is the one surviving hand
-#   action — after it, the host converges like the cluster.
-# estate-observe-host: the forge observes itself every 15 minutes —
-#   the estate loop's tightest disk was the one box with no observer
-#   (49a8d842), and the boarding host check (BOSS_TRAIN_CI_HOST) can
-#   only read a host that reports. Same script as boss-gcp's observer,
-#   HOST_ID=forge.
-# cluster-watchdog: the loop that knows the cluster is working from
-#   OUTSIDE it — reads the API, compares what serves with what the
-#   converge last stamped, rolls to that build by name when the API
-#   has been dark longer than a deploy, and says so every 5 minutes.
-#   No maintenance wrap, by design: the 2026-09-05 outage lasted four
-#   hours because every loop that could act needed the API it watched.
-UNITS=(
-    reap-dead-ci-jobs
-    cluster-deploy-runner
-    disk-floor-sweep
-    forge-converge
-    estate-observe-host
-    cluster-watchdog
-)
 
 installed=0
 for u in "${UNITS[@]}"; do

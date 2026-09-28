@@ -102,6 +102,30 @@ fn metadata_arg_json(v: &Value) -> Option<serde_json::Value> {
     }
 }
 
+/// The id of the child a delegate-subjob step opens, derived from that
+/// step and nothing else (backlog 558396ff).
+///
+/// The spawn is two writes — POST the child, then PUT the parent step's
+/// `embedded_job` — and since car 88123ae0 the PUT is refused 409 when it
+/// races a metadata write, writing nothing. The handler errs, the event
+/// is NAKed and redelivered, and the POST runs again: with an id the
+/// server minted, every refusal was one more child job (conservation).
+/// Keyed on the parent step, the re-sent POST names the packet the first
+/// one opened, and the jobs API answers it rather than admitting it
+/// twice. The step, not the delivery: one delegate-subjob step owns one
+/// child, however many times its `step.ready` is read.
+fn delegated_child_id(parent_step_id: &str) -> String {
+    /// A fixed namespace for these ids, so the same step derives the
+    /// same child on every dispatcher and every redelivery.
+    const DELEGATED_CHILD: uuid::Uuid =
+        uuid::Uuid::from_u128(0x5a5a_d7c1_0000_4000_8000_5583_96ff_0001);
+    uuid::Uuid::new_v5(
+        &DELEGATED_CHILD,
+        format!("delegate-subjob-child:{parent_step_id}").as_bytes(),
+    )
+    .to_string()
+}
+
 #[async_trait]
 impl Handler for JobsSpawn {
     fn name(&self) -> &'static str {
@@ -136,16 +160,15 @@ impl Handler for JobsSpawn {
         // Build the actor identity per the rule-as-actor model. This
         // string lands in audit_log via the gateway's x-boss-user
         // header → jobs-api → events.JOB_OPENED.
+        //
+        // The ONE dispatcher identity (`super::actor`), not a local
+        // copy (backlog 2d221b76). This handler signed as role `system`,
+        // which no policy row grants anything: the child POST asks the
+        // policy nothing and was admitted, and the parent-step PUT below
+        // asks for (update, step) and was refused 403 on every
+        // redelivery, so no delegate-subjob step could ever be linked.
         let actor_id = format!("rule:{}", ctx.rule_name);
-        let user_header = json!({
-            "id": actor_id,
-            "role": "system",
-            "access_tier": "operator",
-            "territory_account_ids": [],
-            "direct_report_ids": [],
-            "department": null,
-        })
-        .to_string();
+        let user_header = super::actor::dispatcher_actor_header(&ctx.rule_name);
 
         let mut metadata = json!({
             "spawned_by_rule": ctx.rule_name,
@@ -186,7 +209,7 @@ impl Handler for JobsSpawn {
             Some(Value::String(s)) if !s.is_empty() => s.clone(),
             _ => format!("Auto-spawn from rule {}", ctx.rule_name),
         };
-        let body = json!({
+        let mut body = json!({
             "kind": kind,
             "subject": {
                 "subject_kind": subject_kind,
@@ -199,6 +222,14 @@ impl Handler for JobsSpawn {
             "metadata": metadata,
             "tags": ["dispatcher-spawned"]
         });
+        // A delegate-subjob child carries an id derived from its parent
+        // step, so the redelivery that follows a refused link below
+        // re-sends the SAME packet and the jobs API answers it instead
+        // of admitting a second child (558396ff). An ordinary spawn has
+        // no step to key on and keeps the server-minted id.
+        if let (Some(psid), Some(map)) = (&parent_step_id, body.as_object_mut()) {
+            map.insert("id".to_string(), json!(delegated_child_id(psid)));
+        }
 
         let url = format!("{}/api/jobs", self.jobs_base.trim_end_matches('/'));
         // The spawned Job inherits the triggering event's sim-ness.
@@ -363,6 +394,283 @@ mod tests {
             Some(json!("x"))
         );
         assert_eq!(metadata_arg_json(&Value::Absent), None);
+    }
+
+    /// A jobs API that holds packets by id the way the real one does
+    /// since 558396ff (an id already held is answered, not re-created),
+    /// and refuses the FIRST step PUT the way a PUT racing a metadata
+    /// write is refused since car 88123ae0: 409, nothing written.
+    #[derive(Default)]
+    struct FakeJobsApi {
+        children: std::sync::Mutex<Vec<String>>,
+        embedded: std::sync::Mutex<Vec<String>>,
+    }
+
+    async fn serve(api: Arc<FakeJobsApi>) -> String {
+        use axum::extract::{Json, State};
+        use axum::http::StatusCode;
+        use axum::routing::{post, put};
+
+        async fn create(
+            State(api): State<Arc<FakeJobsApi>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            // No id on the wire is a fresh packet, as serde's default
+            // mints one server-side.
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("minted-{}", api.children.lock().unwrap().len()));
+            let mut children = api.children.lock().unwrap();
+            if children.contains(&id) {
+                return (StatusCode::OK, Json(json!({ "id": id })));
+            }
+            children.push(id.clone());
+            (StatusCode::CREATED, Json(json!({ "id": id })))
+        }
+        async fn link(
+            State(api): State<Arc<FakeJobsApi>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            let mut embedded = api.embedded.lock().unwrap();
+            embedded.push(
+                body["embedded_job"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if embedded.len() == 1 {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NO_CONTENT
+            }
+        }
+
+        let app = axum::Router::new()
+            .route("/api/jobs", post(create))
+            .route("/api/jobs/{job}/steps/{step}", put(link))
+            .with_state(api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_delegate_spawn_opens_one_child() {
+        // Backlog 558396ff, from the review of car 88123ae0. The spawn
+        // POSTs the child, then PUTs the parent step's `embedded_job`.
+        // A PUT that races a metadata write is refused 409 and writes
+        // nothing; the handler errs, the event is NAKed, JetStream
+        // redelivers it, and the POST runs again. With an id the server
+        // minted, that was a second child every time.
+        let api = Arc::new(FakeJobsApi::default());
+        let h = JobsSpawn::new(serve(api.clone()).await);
+        let ctx = InvocationContext {
+            rule_name: "spawn-subjob-on-delegate-subjob-step-ready".into(),
+            triggering_event_id: "evt-ready-1".into(),
+            triggering_topic: "step.ready.delegate-subjob".into(),
+            event_payload: json!({ "job_id": "parent-job-1", "step_id": "parent-step-1" }),
+        };
+        let args = [
+            ("kind".to_string(), Value::String("equipment-repair".into())),
+            ("subject_kind".to_string(), Value::String("asset".into())),
+            ("subject".to_string(), Value::String("SYS-42".into())),
+            (
+                "parent_step_id".to_string(),
+                Value::String("parent-step-1".into()),
+            ),
+        ];
+
+        let first = h.invoke(&args, &ctx).await;
+        assert!(
+            first.is_err(),
+            "precondition: the refused link is an error, so the event is redelivered"
+        );
+        h.invoke(&args, &ctx)
+            .await
+            .expect("the redelivery links the child");
+
+        let children = api.children.lock().unwrap().clone();
+        assert_eq!(
+            children.len(),
+            1,
+            "one delegate-subjob step, one child — got {children:?}"
+        );
+        let embedded = api.embedded.lock().unwrap().clone();
+        assert_eq!(
+            embedded,
+            vec![children[0].clone(), children[0].clone()],
+            "both link attempts name the one child"
+        );
+    }
+
+    /// A jobs API whose admission and step PUT ask the policy the way
+    /// the real ones do (`create_job`: `check(user, Create, job)`;
+    /// `update_step`: `check(user, Update, step)`; 403 on Deny), through
+    /// the real header extractor and the real engine over the rules core
+    /// ships. It records who each open and each link was signed as.
+    #[derive(Default)]
+    struct PolicedJobsApi {
+        opened_as: std::sync::Mutex<Vec<String>>,
+        linked_as: std::sync::Mutex<Vec<String>>,
+    }
+
+    fn shipped_policy() -> boss_policy_client::PolicyEngine<boss_policy_client::InMemoryPolicy> {
+        boss_policy_client::PolicyEngine::new(Arc::new(
+            boss_policy_client::InMemoryPolicy::with_rules(
+                boss_policy_client::defaults::default_rules(),
+            ),
+        ))
+    }
+
+    async fn serve_policed(api: Arc<PolicedJobsApi>) -> String {
+        use axum::extract::{Json, State};
+        use axum::http::StatusCode;
+        use axum::routing::{post, put};
+        use boss_policy_client::{Action, CurrentUser, Resource};
+
+        async fn create(
+            State(api): State<Arc<PolicedJobsApi>>,
+            CurrentUser(user): CurrentUser,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            // Admission asks (create, job), as create_job does since
+            // backlog f306b249. Until then it asked nothing, so the
+            // child was always admitted — which is why the link's
+            // refusal was invisible: a child existed, its link did not.
+            // With admission asking, a `system` spawn would open nothing.
+            let decision = shipped_policy()
+                .check(&user, Action::Create, Resource::job())
+                .await
+                .expect("the in-memory engine answers");
+            if !decision.is_allowed() {
+                return (StatusCode::FORBIDDEN, Json(json!({})));
+            }
+            api.opened_as.lock().unwrap().push(user.id);
+            (StatusCode::CREATED, Json(json!({ "id": body["id"] })))
+        }
+        async fn link(
+            State(api): State<Arc<PolicedJobsApi>>,
+            CurrentUser(user): CurrentUser,
+        ) -> StatusCode {
+            let decision = shipped_policy()
+                .check(&user, Action::Update, Resource::step())
+                .await
+                .expect("the in-memory engine answers");
+            if !decision.is_allowed() {
+                return StatusCode::FORBIDDEN;
+            }
+            api.linked_as.lock().unwrap().push(user.id);
+            StatusCode::NO_CONTENT
+        }
+
+        let app = axum::Router::new()
+            .route("/api/jobs", post(create))
+            .route("/api/jobs/{job}/steps/{step}", put(link))
+            .with_state(api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_parent_step_link_is_signed_with_an_identity_the_policy_lets_write_a_step() {
+        // Backlog 2d221b76, from the adversarial review of the
+        // packet-scope car. The spawn signed its writes as role
+        // `system`, which no policy row grants anything — not in the
+        // rules core ships, and not on the live estate (GET
+        // /api/policy/rules, 2026-09-27: zero rows for `system`; only
+        // platform-admin and break-glass hold update on step). The
+        // child POST was admitted without a policy question, so the
+        // child opened and the parent step's `embedded_job` PUT was
+        // refused 403, every time, on every redelivery.
+        //
+        // The fixture can catch it: the same engine refuses `system`.
+        let system: boss_policy_client::User = serde_json::from_value(json!({
+            "id": "rule:spawn-subjob-on-delegate-subjob-step-ready",
+            "role": "system",
+            "access_tier": "operator",
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+            "department": null,
+        }))
+        .unwrap();
+        assert!(
+            !shipped_policy()
+                .check(
+                    &system,
+                    boss_policy_client::Action::Update,
+                    boss_policy_client::Resource::step()
+                )
+                .await
+                .unwrap()
+                .is_allowed(),
+            "precondition: the shipped policy refuses role `system` a step write"
+        );
+        // And, since backlog f306b249 made admission ask, an open: every
+        // spawn — not only a delegate-subjob's — would open nothing as
+        // `system` (15 live rules, ~125 opens in the 36 hours measured).
+        assert!(
+            !shipped_policy()
+                .check(
+                    &system,
+                    boss_policy_client::Action::Create,
+                    boss_policy_client::Resource::job()
+                )
+                .await
+                .unwrap()
+                .is_allowed(),
+            "precondition: the shipped policy refuses role `system` an open"
+        );
+
+        let api = Arc::new(PolicedJobsApi::default());
+        let h = JobsSpawn::new(serve_policed(api.clone()).await);
+        let ctx = InvocationContext {
+            rule_name: "spawn-subjob-on-delegate-subjob-step-ready".into(),
+            triggering_event_id: "evt-ready-1".into(),
+            triggering_topic: "step.ready.delegate-subjob".into(),
+            event_payload: json!({ "job_id": "parent-job-1", "step_id": "parent-step-1" }),
+        };
+        let args = [
+            ("kind".to_string(), Value::String("approval".into())),
+            ("subject_kind".to_string(), Value::String("job".into())),
+            ("subject".to_string(), Value::String("parent-job-1".into())),
+            (
+                "parent_step_id".to_string(),
+                Value::String("parent-step-1".into()),
+            ),
+        ];
+
+        h.invoke(&args, &ctx)
+            .await
+            .expect("the policy lets the dispatcher link the child to its parent step");
+        assert_eq!(
+            api.opened_as.lock().unwrap().clone(),
+            vec!["rule:spawn-subjob-on-delegate-subjob-step-ready".to_string()],
+            "the child is opened once, signed as the rule that fired"
+        );
+        assert_eq!(
+            api.linked_as.lock().unwrap().clone(),
+            vec!["rule:spawn-subjob-on-delegate-subjob-step-ready".to_string()],
+            "the link is written once, and the audit actor is still the rule that fired"
+        );
+    }
+
+    #[test]
+    fn a_child_id_is_derived_from_its_parent_step_alone() {
+        // The key is the STEP, not the delivery: a redelivery carries
+        // the same event id, but so would nothing else that re-announces
+        // the step, and one delegate-subjob step owns one child.
+        let a = delegated_child_id("parent-step-1");
+        assert_eq!(a, delegated_child_id("parent-step-1"));
+        assert_ne!(a, delegated_child_id("parent-step-2"));
+        assert!(
+            uuid::Uuid::parse_str(&a).is_ok(),
+            "a job id is a uuid on the wire: {a}"
+        );
     }
 
     #[tokio::test]

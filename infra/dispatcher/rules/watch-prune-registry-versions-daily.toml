@@ -1,0 +1,91 @@
+# Read every run of the unattended daily registry prune, and alarm on
+# any run that did not do its job.
+#
+# THE GAP (backlog 8d77d670, the adversarial review of the daily car,
+# H1). prune-registry-versions-daily files a MUTATING delete every day
+# with nobody filing it and nobody reading it. Its ops-request closes
+# `answered` whenever the verb RAN — exit 2 (refused: an underivable
+# keep half, the per-run ceiling, a 403) and exit 1 (failed part-way)
+# included — and `refused` when the runner would not run it at all.
+# The silence sweep reads only that a packet ARRIVED. So a refused or
+# failed night was a closed packet nobody opened, and the bound the
+# design bought (97add747) could stop holding in silence.
+#
+# THE READER. `ops.judge` in WATCH mode: this rule names no follow-on
+# (no then_verb / then_host / then_args), so the handler files nothing
+# on a clean run and ONE urgent alarm, keyed for_request, on a run that
+# FAILED (non-zero, not 75), was REFUSED by the runner, exited 0 with no
+# verdict line, or carries a verdict `when` is false over. The alarm
+# names the verb, the trouble, the line the run said, and the head of
+# its output — the first 40 lines / 4,000 chars (ops_judge's
+# OUTPUT_HEAD_*). The prune does NOT print its verdict first: a dozen
+# lines of keep-set and registry preamble come first, then the one-line
+# JSON record (about 2 KB on its own), then the verdict, then the
+# per-version list. On the review of the daily car (backlog 1bef55a6)
+# the verdict sat at char ~3,228 of those 4,000; in the test fixture it
+# is line 14, char ~3,390. So the head is the run's context, not
+# its verdict; the verdict reaches the alarm as the quoted line itself
+# (`failed`), never by fitting in the head.
+#
+# THE VERDICT is the prune's own clean real-run line,
+# `OK — deleted N of M planned version(s) ...`, and `when` asks that
+# every planned version went. N is the planned versions a re-list after
+# the deletes no longer holds — so a version another run deleted first
+# (404) is done and no alarm, while a route that answers 404 to every
+# DELETE is not (backlog 1bef55a6 and its review, finding 1; the script
+# fails that run itself). A pass that read under 90% of its tags'
+# indexes plans from too little; it no longer says `deleted 0 of 0` and
+# exits 0 — it prints FAILED and exits 1, and this watch alarms on the
+# exit. The line also carries `<read_pct> percent; <unclassified>
+# unclassified kept`, which `when` judges (v2, below).
+# The pattern avoids the em-dash (`.*` spans it) and a backslash: the
+# arg crosses TOML's lexer and then boss-expr's. Pinned by
+# crates/core/boss-dispatcher/tests/prune_registry_versions_daily_rule.rs,
+# which reads the line out of the script.
+#
+# A REQUEST THAT NEVER CLOSES is not this rule's: it listens to closes.
+# It is `ops-runner-queue-watched-every-5-minutes`'s (backlog a45b38c1),
+# which reads every open ops-request by metadata.host and files an
+# urgent alarm once a host's oldest runnable request has waited past
+# five minutes — a dead or wedged forge runner, a host that is down.
+# The daily request stays in that view because it names its host and
+# asks no passkey approval; the same test file pins both (backlog
+# 1bef55a6 (2)).
+[[rule]]
+name = "watch-prune-registry-versions-daily"
+why = """
+A CROSS-PROTOCOL READER no Workflow consequence can express: the
+ops-request protocol closes a request when its verb has run, and it
+cannot read the run's exit or output to decide that the run failed —
+`jobs.job.closed` carries neither. Measured on the review of backlog
+8d77d670 (design 97add747, the daily unattended --for-real registry
+prune authorised by David on 2026-09-27): a refused (exit 2) or failed
+(exit 1) run closes `answered`, and the only other reader, the cadence
+silence sweep, sees an arrival. ops.judge already reads a closed
+request's exit and verdict line and files a for_request-keyed alarm
+for a failed verb; this rule runs it as a watch, with no follow-on, so
+a run that did not delete what it planned is an urgent packet rather
+than a closed one. Redelivery-safe: the request carries `judged` once
+read, and an open alarm with the same for_request is reused.
+"""
+# v2 (backlog 1bef55a6 and its two adversarial reviews): the verdict
+# also carries how much of the registry the run could judge, and `when`
+# judges it. `deleted` is the planned versions a re-list after the
+# deletes no longer holds, never the DELETEs' answers (review finding 1).
+# `listed >= total`: the first listing read every version the forge
+# counts (re-review finding 1 — a short listing planned 0 and passed; the
+# script refuses that too, so this is the second reader, and `>=` because
+# a push between two pages can list one version twice). `read_pct >= 90`:
+# the run read enough indexes to judge (review finding 2). There is NO
+# clause on a plan of 0 (the re-review's call, finding 5): the live
+# registry always holds permanent non-sha tags (rust1.96), so `planned 0
+# with unclassified > 0` would alarm every quiet day, and a WHOLE listing
+# read at >= 90% already proves a plan of 0 honest. The pattern is
+# anchored at the line's start, so no text another line carries can be
+# read as this verb's verdict (re-review finding 3).
+version = 2
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"prune-registry-versions-daily"', verdict_pattern = '"^prune-registry-versions: OK . deleted (?P<deleted>[0-9]+) of (?P<planned>[0-9]+) planned .* listed (?P<listed>[0-9]+) of (?P<total>[0-9]+) versions, indexes read [0-9]+ of [0-9]+ tag.s., (?P<read_pct>[0-9]+) percent; (?P<unclassified>[0-9]+) unclassified kept"', when = '"deleted = planned AND listed >= total AND read_pct >= 90"' }

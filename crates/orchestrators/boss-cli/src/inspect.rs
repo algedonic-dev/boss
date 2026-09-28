@@ -68,6 +68,15 @@ fn unwrap_rows(body: &Value) -> &[Value] {
     &[]
 }
 
+/// `(rows read, DB-wide total)` when an envelope carries fewer rows
+/// than its `total` — the part of the list this read never saw. A bare
+/// array says nothing either way, so it answers `None`.
+fn unread_tail(body: &Value) -> Option<(usize, u64)> {
+    let read = unwrap_rows(body).len();
+    let total = body.get("total").and_then(Value::as_u64)?;
+    (total > read as u64).then_some((read, total))
+}
+
 /// Render a value as a one-line string fit for a table cell.
 /// Strings come through unquoted; everything else is JSON-encoded
 /// and truncated.
@@ -165,7 +174,10 @@ pub async fn accounts(
     json: bool,
     gateway: &str,
 ) -> Result<()> {
-    let url = format!("{gateway}/api/people/accounts");
+    // The directory is a bounded page since backlog 2d1d298e: ask for
+    // the service's most (1000, boss-accounts' MAX_LIST_LIMIT — a
+    // larger ask is clamped) and say below when even that was short.
+    let url = format!("{gateway}/api/people/accounts?limit=1000");
     let body = fetch_json(&url).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
@@ -181,8 +193,14 @@ pub async fn accounts(
     }
     let total_matching = rows.len();
     rows.truncate(limit as usize);
+    let tail = unread_tail(&body).map(|(read, total)| {
+        format!("Searched the first {read} of {total} accounts; the rest were not read.")
+    });
     if rows.is_empty() {
         println!("No accounts found.");
+        if let Some(t) = &tail {
+            println!("{t}");
+        }
         return Ok(());
     }
     println!(
@@ -207,7 +225,34 @@ pub async fn accounts(
             total_matching
         );
     }
+    if let Some(t) = &tail {
+        println!("{t}");
+    }
     Ok(())
+}
+
+/// The listing read behind `boss inspect jobs`. An account is a Subject,
+/// and the listing has ONE subject filter, `subject_id`, for every kind:
+/// this sent `account_id=` until 2026-09-23, which the listing ignored
+/// and now refuses with a 400 (backlog 7f3e871a).
+fn jobs_url(
+    gateway: &str,
+    status: Option<&str>,
+    kind: Option<&str>,
+    account_id: Option<&str>,
+    limit: u32,
+) -> String {
+    let mut url = format!("{gateway}/api/jobs?limit={limit}");
+    if let Some(s) = status {
+        url.push_str(&format!("&status={s}"));
+    }
+    if let Some(k) = kind {
+        url.push_str(&format!("&kind={k}"));
+    }
+    if let Some(a) = account_id {
+        url.push_str(&format!("&subject_id={a}"));
+    }
+    url
 }
 
 pub async fn jobs(
@@ -218,16 +263,7 @@ pub async fn jobs(
     json: bool,
     gateway: &str,
 ) -> Result<()> {
-    let mut url = format!("{gateway}/api/jobs?limit={limit}");
-    if let Some(s) = status {
-        url.push_str(&format!("&status={s}"));
-    }
-    if let Some(k) = kind {
-        url.push_str(&format!("&kind={k}"));
-    }
-    if let Some(a) = account_id {
-        url.push_str(&format!("&account_id={a}"));
-    }
+    let url = jobs_url(gateway, status, kind, account_id, limit);
     let body = fetch_json(&url).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
@@ -360,6 +396,19 @@ mod tests {
     }
 
     #[test]
+    fn an_envelope_past_its_page_names_the_unread_tail() {
+        // 2d1d298e: the accounts read is a bounded page now, so a
+        // client-side name search covers only what came back — and
+        // must say so rather than answer "No accounts found".
+        let capped = json!({"data": [{"a": 1}, {"a": 2}], "total": 5});
+        assert_eq!(unread_tail(&capped), Some((2, 5)));
+        let whole = json!({"data": [{"a": 1}], "total": 1});
+        assert_eq!(unread_tail(&whole), None);
+        let bare = json!([{"a": 1}]);
+        assert_eq!(unread_tail(&bare), None);
+    }
+
+    #[test]
     fn unwrap_rows_handles_envelope_and_bare_array() {
         let envelope = json!({"data": [{"a": 1}, {"a": 2}], "total": 99});
         assert_eq!(unwrap_rows(&envelope).len(), 2);
@@ -376,6 +425,24 @@ mod tests {
         assert_eq!(cell(Some(&Value::Bool(true))), "true");
         assert_eq!(cell(None), "-");
         assert_eq!(cell(Some(&Value::Null)), "-");
+    }
+
+    /// `--account-id` narrows on `subject_id`, the listing's one subject
+    /// filter. It sent `account_id=`, which the listing never read, so
+    /// `boss inspect jobs --account-id X` printed everyone's jobs; the
+    /// listing now answers that with a 400 (backlog 7f3e871a).
+    #[test]
+    fn jobs_url_filters_an_account_by_subject_id() {
+        let url = jobs_url("http://gw", Some("open"), Some("sale"), Some("acct-1"), 20);
+        assert_eq!(
+            url,
+            "http://gw/api/jobs?limit=20&status=open&kind=sale&subject_id=acct-1"
+        );
+        assert!(!url.contains("account_id"), "{url}");
+        assert_eq!(
+            jobs_url("http://gw", None, None, None, 5),
+            "http://gw/api/jobs?limit=5"
+        );
     }
 
     #[test]

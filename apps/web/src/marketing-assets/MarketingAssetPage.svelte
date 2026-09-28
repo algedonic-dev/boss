@@ -9,6 +9,9 @@
   import { type MarketingAsset } from './types';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { href } from '../router';
+  import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
+  import { failedRead, loadingRead, okRead, readStateOfResponse, type ReadState } from '../data/readState';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type Props = { assetId: string };
   let { assetId }: Props = $props();
@@ -20,7 +23,12 @@
   /// lookup gets to make (packet 3fba9c35).
   let loadFailed = $state<string | null>(null);
   let loading = $state(true);
-  let empNames = $state<Map<string, string>>(new Map());
+  let empNames = $state<ReadonlyMap<string, string>>(new Map());
+  let namesRead = $state<ReadState>(okRead);
+  /// The version-history read. Until backlog 865d3d51 it was an
+  /// `if (hResp.ok)` with no else, so a refusal left `history` empty
+  /// and the page said "No prior versions — this is the original."
+  let historyRead = $state<ReadState>(loadingRead);
 
   let decoded = $derived(decodeURIComponent(assetId));
 
@@ -40,12 +48,12 @@
     const id = decoded;
     let cancelled = false;
     loading = true;
+    historyRead = loadingRead;
     (async () => {
       try {
-        const [aResp, hResp, pResp] = await Promise.all([
+        const [aResp, hResp] = await Promise.all([
           fetch(`/api/catalog/marketing-assets/${encodeURIComponent(id)}`),
           fetch(`/api/catalog/marketing-assets/${encodeURIComponent(id)}/history`),
-          fetch('/api/people'),
         ]);
         if (aResp.status === 404) {
           if (!cancelled) {
@@ -64,23 +72,45 @@
             loadFailed = `HTTP ${aResp.status}`;
           }
         }
-        if (hResp.ok) {
-          const body = (await hResp.json()) as MarketingAsset[];
-          if (!cancelled) history = Array.isArray(body) ? body : [];
-        }
-        if (pResp.ok) {
-          const people = (await pResp.json()) as Array<{ id: string; name: string }>;
-          const m = new Map<string, string>();
-          for (const e of people) m.set(e.id, e.name);
-          if (!cancelled) empNames = m;
+        const historyUrl = `/api/catalog/marketing-assets/${encodeURIComponent(id)}/history`;
+        const hRead = readStateOfResponse(historyUrl, hResp);
+        const hBody: unknown = hRead.kind === 'ok' ? await hResp.json() : null;
+        if (!cancelled) {
+          history = Array.isArray(hBody) ? (hBody as MarketingAsset[]) : [];
+          historyRead =
+            hRead.kind === 'ok' && !Array.isArray(hBody)
+              ? failedRead(`${historyUrl}: the answer was not a list`)
+              : hRead;
         }
       } catch (e) {
         if (!cancelled) {
           asset = null;
           loadFailed = e instanceof Error ? e.message : String(e);
+          historyRead = failedRead(loadFailed);
         }
       }
       if (!cancelled) loading = false;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // Names only the owner and the brand reviewer, one row each, and says
+  // so when a name cannot load. Until backlog 1e73bd93 this rode the
+  // record's own Promise.all as a read of the WHOLE roster, and a
+  // refusal was an `if (pResp.ok)` with no else, so both people
+  // silently became ids (see ../data/ownerNames.ts).
+  let peopleKey = $derived(personIdsOf([asset?.owner_id, asset?.brand_reviewed_by]).join('\n'));
+  $effect(() => {
+    const ids = peopleKey ? peopleKey.split('\n') : [];
+    let cancelled = false;
+    (async () => {
+      const out = await loadOwnerNames(ids);
+      if (!cancelled) {
+        empNames = out.names;
+        namesRead = out.read;
+      }
     })();
     return () => {
       cancelled = true;
@@ -136,7 +166,7 @@
           <Meta label="Links">
               {a.linked_device_skus.length + a.linked_account_ids.length + a.linked_campaign_ids.length}
           </Meta>
-          <Meta label="Versions">{history.length || 1}</Meta>
+          <Meta label="Versions">{historyRead.kind === 'ok' ? history.length || 1 : '?'}</Meta>
           <Meta label="Updated">{formatDate(a.updated_at)}</Meta>
         </div>
       </div>
@@ -144,11 +174,18 @@
 
     <div class="tab-grid">
       <Section title="Profile">
+          {#if namesRead.kind === 'failed'}
+            <p class="empty load-failed" role="alert">
+              Couldn't load the names on this asset — {namesRead.error}. People show as ids.
+            </p>
+          {/if}
           <dl class="kv">
             <dt>File</dt>
             <dd>
-              {#if a.file_url}
-                <a href={a.file_url} target="_blank" rel="noopener noreferrer">{a.file_url}</a>
+              {#if safeLinkHref(a.file_url)}
+                <a href={safeLinkHref(a.file_url)} target="_blank" rel="noopener noreferrer">{a.file_url}</a>
+              {:else if a.file_url}
+                {a.file_url}
               {:else}
                 —
               {/if}
@@ -221,7 +258,7 @@
                   {#each a.linked_device_skus as id (id)}
                     {@const path = id.startsWith('FP-') ? `/ux/products/${encodeURIComponent(id)}` : `/ux/catalog/${encodeURIComponent(id)}`}
                     <li style="margin-bottom:4px">
-                      <a href={href(path)}>{id}</a>
+                      <a href={safeLinkHref(href(path))}>{id}</a>
                     </li>
                   {/each}
                 </ul>
@@ -269,8 +306,14 @@
       </Section>
     </div>
 
-    <Section title={`Version history (${history.length || 1})`} wide>
-        {#if history.length <= 1}
+    <Section title={`Version history (${historyRead.kind === 'ok' ? history.length || 1 : '?'})`} wide>
+        {#if historyRead.kind === 'failed'}
+          <p class="empty load-failed" role="alert">
+            Couldn't load the version history — {historyRead.error}
+          </p>
+        {:else if historyRead.kind === 'loading'}
+          <p class="empty">Loading the version history…</p>
+        {:else if history.length <= 1}
           <p class="empty">
             No prior versions — this is the original.
             {#if hasSuccessor}
@@ -316,20 +359,10 @@
           </table>
         {/if}
     </Section>
-
-    <Section title="Insights" wide>
-        <p class="empty">
-          Download count, campaigns used in, and motion references will land
-          with the attribution plugin once it grows past read-only mode.
-        </p>
-    </Section>
-
-    <Section title="In-flight motions" wide>
-        <p class="empty">
-          Active <code>marketing-motion</code> Jobs referencing this asset
-          via their tier 3 checklist step will surface here once session 1's
-          motion execution picks up assets in metadata.
-        </p>
-    </Section>
+    <!-- "Insights" and "In-flight motions" placeholders retired
+         2026-09-24 (backlog a8991c86): each promised a read from the
+         device shop's marketing-motion Workflow and its attribution
+         plugin, both gone. The Campaigns list above is the live way from
+         an asset to the Jobs about it. -->
   {/if}
 </div>

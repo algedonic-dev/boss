@@ -7,7 +7,9 @@
 //! - **Phase 0 — metadata shapes.** Every value in a step's
 //!   `metadata_defaults` matches its StepType field's declared type
 //!   (catches a not-in-enum value like `channel = "in-person"` at
-//!   author time instead of mid-run).
+//!   author time instead of mid-run), and every step-authored field
+//!   declares a type the validator can run — a builtin or a `|` enum
+//!   (fcae2bfa: a single-token `green` accepted any value).
 //! - **Phase 1 — structural.** At least one trigger (`ready_when =
 //!   "true"`), at least one terminal, every `steps.<slug>` reference
 //!   resolves, the dependency graph is acyclic, and every leaf is a
@@ -46,6 +48,13 @@
 //!   `human_only = false` with no block claims agent-workability the
 //!   dispatch door cannot honour. Refused naming the step and, for the
 //!   model, the models it could have named.
+//! - **Phase 9 — a declared writer is one the server can resolve.** A
+//!   field's `writer` is satisfied only by a credential a server door
+//!   resolved (design f623e425), so a writer no door resolves — a typo,
+//!   an empty string, a principal whose door is not mounted yet — would
+//!   lock the key against every caller and wedge a required one's
+//!   completion. Refused naming the field and the resolvable principals
+//!   (backlog 6c9183de, review S4).
 //!
 //! Runs at author time (`POST /api/workflows/_validate`), publish
 //! time (every registry path that can set a row ACTIVE — see
@@ -56,7 +65,7 @@
 //! name the problem the whole time, and publish never asked it.
 
 use crate::registry::{StepSpec, WorkflowSpec, predicate_refs_job_metadata, predicate_step_refs};
-use crate::step_registry::StepRegistry;
+use crate::step_registry::{StepRegistry, field_type_problem};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -89,6 +98,7 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
     let mut errs = Vec::new();
     // Phase 0 — metadata default value shapes.
     for step in &spec.steps {
+        check_field_types_are_known(spec, step, &mut errs);
         check_metadata_defaults_values(spec, step, registry, &mut errs);
         check_item_keys_name_an_array(spec, step, &mut errs);
         check_covers_names_an_array_on_the_same_step(spec, step, &mut errs);
@@ -111,6 +121,15 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
     // Phase 8 — an agent block is runnable.
     for step in &spec.steps {
         check_agent_block_is_runnable(spec, step, &mut errs);
+    }
+    // Phase 9 — a declared writer is one a credential door resolves.
+    for step in &spec.steps {
+        check_writers_are_resolvable(
+            spec,
+            step,
+            crate::field_writer::RESOLVABLE_PRINCIPALS,
+            &mut errs,
+        );
     }
     errs
 }
@@ -1097,6 +1116,87 @@ fn check_metadata_defaults_values(
 /// True when the value is an obvious placeholder rather than a real
 /// default (e.g. `""` for a date field a downstream step populates at
 /// completion time).
+/// Every step-authored field declares a type the completion validator
+/// can run: a builtin or a `|` enum ([`field_type_problem`], the one
+/// grammar). The validator refuses every value of an unknown type, so a
+/// row that published one would describe a step no executor can
+/// complete; refused here instead, naming the field (backlog fcae2bfa —
+/// emergency-merge v1's `receipt_verdict = "green"`).
+fn check_field_types_are_known(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    for field in &step.fields {
+        if let Some(why) = field_type_problem(&field.field_type) {
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
+                step: step.title.clone(),
+                reason: format!("field '{}': {why}", field.name),
+            });
+        }
+    }
+}
+
+/// Phase 9: a field's declared `writer` is a principal some server-side
+/// credential door resolves (backlog 6c9183de, review S4 of car
+/// 1e603cfd, 2026-09-26). The step doors admit a declared writer ONLY
+/// through a [`crate::field_writer::CredentialedCaller`] a door
+/// inserted, never through the self-asserted id — so a writer no door
+/// resolves is satisfied by no caller at all. A typo (`runner:osp`), an
+/// empty string, or `runner:ops` declared before its door is mounted
+/// would lock that key against every writer, and a required one would
+/// wedge the step's completion with no way to fill it. Refused here,
+/// naming the step, the field, the writer and the principals that are
+/// resolvable, rather than discovered as a 409 on a live packet.
+///
+/// `resolvable` is [`crate::field_writer::RESOLVABLE_PRINCIPALS`] in
+/// every call but the tests, which hand it a list to prove the rule
+/// reads the list and not a spelling of its own.
+fn check_writers_are_resolvable(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    resolvable: &[&str],
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    for field in &step.fields {
+        let Some(writer) = field.writer.as_deref() else {
+            continue;
+        };
+        if resolvable.contains(&writer) {
+            continue;
+        }
+        let known = if resolvable.is_empty() {
+            "no principal is resolvable yet — the credential door that resolves one adds it to \
+             boss_jobs::field_writer::RESOLVABLE_PRINCIPALS in the same car"
+                .to_string()
+        } else {
+            format!(
+                "the resolvable principals are {}",
+                resolvable
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(),
+            step: step.title.clone(),
+            reason: format!(
+                "field '{}' declares writer `{writer}`, which no credential door resolves, so no \
+                 caller could ever write the key{} — {known}",
+                field.name,
+                if field.required {
+                    " and the step could never complete"
+                } else {
+                    ""
+                },
+            ),
+        });
+    }
+}
+
 /// `item_keys` describes the elements of an ARRAY field; on any other
 /// type it describes nothing, and admission would silently never check
 /// it. Refuse the spec instead of storing a shape nobody reads.
@@ -1117,12 +1217,72 @@ fn check_item_keys_name_an_array(
                 ),
             });
         }
+        // The inline value bound (design 26a89f11) describes elements
+        // too, and on a non-array would be stored and never held.
+        if let Some(max) = field.item_value_max_bytes
+            && field.field_type != "array"
+        {
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
+                step: step.title.clone(),
+                reason: format!(
+                    "field '{}' declares item_value_max_bytes = {max} but is a '{}', not an \
+                     array — the bound is on element values and would never be checked",
+                    field.name, field.field_type
+                ),
+            });
+        }
+        // `item_one_of` (design 26a89f11's file_refs arm) is a choice
+        // between element keys; every way of stating it that no element
+        // could satisfy, or that no check would ever read, is refused.
+        if !field.item_one_of.is_empty() {
+            let keys = &field.item_one_of;
+            let mut reasons = Vec::new();
+            if field.field_type != "array" {
+                reasons.push(format!(
+                    "field '{}' declares item_one_of {keys:?} but is a '{}', not an array — \
+                     item_one_of describes array elements and would never be checked",
+                    field.name, field.field_type
+                ));
+            }
+            if keys.len() < 2 {
+                reasons.push(format!(
+                    "field '{}' declares item_one_of {keys:?} — a choice needs at least two \
+                     keys; a single required key belongs in item_keys",
+                    field.name
+                ));
+            }
+            let also_required: Vec<&String> = keys
+                .iter()
+                .filter(|k| field.item_keys.contains(k))
+                .collect();
+            if !also_required.is_empty() {
+                reasons.push(format!(
+                    "field '{}' names {also_required:?} in both item_keys and item_one_of — a \
+                     key cannot be required of every element and exclusive of the others",
+                    field.name
+                ));
+            }
+            if keys.iter().enumerate().any(|(i, k)| keys[..i].contains(k)) {
+                reasons.push(format!(
+                    "field '{}' names a key in item_one_of {keys:?} more than once",
+                    field.name
+                ));
+            }
+            errs.extend(reasons.into_iter().map(|reason| WorkflowLintError {
+                workflow: spec.kind.clone(),
+                step: step.title.clone(),
+                reason,
+            }));
+        }
     }
 }
 
-/// `covers` relates two ARRAY fields on ONE step — the anchors of the
-/// covered field must each be answered by an element of this one. A
-/// `covers` that names a missing field, a non-array, or itself would be
+/// `covers` and `binds` each relate two ARRAY fields on ONE step by
+/// element anchor — `covers`: every anchor of the covered field must be
+/// answered by an element here; `binds` (design 26a89f11): an element
+/// here may name anchors of the bound field, and only ones it carries. A
+/// relation that names a missing field, a non-array, or itself would be
 /// stored and never checked (or checked vacuously); refuse the spec.
 fn check_covers_names_an_array_on_the_same_step(
     spec: &WorkflowSpec,
@@ -1130,41 +1290,44 @@ fn check_covers_names_an_array_on_the_same_step(
     errs: &mut Vec<WorkflowLintError>,
 ) {
     for field in &step.fields {
-        let Some(covered) = &field.covers else {
-            continue;
-        };
-        let reason = if field.field_type != "array" {
-            Some(format!(
-                "field '{}' declares covers = '{covered}' but is a '{}', not an array — \
-                 coverage is a relation between element anchors and would never be checked",
-                field.name, field.field_type
-            ))
-        } else if covered == &field.name {
-            Some(format!(
-                "field '{}' declares covers = itself, which is vacuously true and checks nothing",
-                field.name
-            ))
-        } else {
-            match step.fields.iter().find(|f| &f.name == covered) {
-                None => Some(format!(
-                    "field '{}' declares covers = '{covered}', but this step has no field of that \
-                     name — coverage is checked at done against a field on the SAME step",
+        for (relation, target) in [("covers", &field.covers), ("binds", &field.binds)] {
+            let Some(target) = target else {
+                continue;
+            };
+            let reason = if field.field_type != "array" {
+                Some(format!(
+                    "field '{}' declares {relation} = '{target}' but is a '{}', not an array — \
+                     {relation} is a relation between element anchors and would never be checked",
+                    field.name, field.field_type
+                ))
+            } else if target == &field.name {
+                Some(format!(
+                    "field '{}' declares {relation} = itself, which is vacuously true and checks \
+                     nothing",
                     field.name
-                )),
-                Some(f) if f.field_type != "array" => Some(format!(
-                    "field '{}' declares covers = '{covered}', which is a '{}', not an array — \
-                     there are no element anchors to cover",
-                    field.name, f.field_type
-                )),
-                Some(_) => None,
+                ))
+            } else {
+                match step.fields.iter().find(|f| &f.name == target) {
+                    None => Some(format!(
+                        "field '{}' declares {relation} = '{target}', but this step has no field \
+                         of that name — {relation} is checked against a field on the SAME step",
+                        field.name
+                    )),
+                    Some(f) if f.field_type != "array" => Some(format!(
+                        "field '{}' declares {relation} = '{target}', which is a '{}', not an \
+                         array — there are no element anchors to relate",
+                        field.name, f.field_type
+                    )),
+                    Some(_) => None,
+                }
+            };
+            if let Some(reason) = reason {
+                errs.push(WorkflowLintError {
+                    workflow: spec.kind.clone(),
+                    step: step.title.clone(),
+                    reason,
+                });
             }
-        };
-        if let Some(reason) = reason {
-            errs.push(WorkflowLintError {
-                workflow: spec.kind.clone(),
-                step: step.title.clone(),
-                reason,
-            });
         }
     }
 }
@@ -1199,10 +1362,12 @@ fn check_field_value(field_type: &str, value: &Value, field_name: &str) -> Optio
         "date" => value.as_str().is_some_and(|s| s.len() == 10),
         "date-time" => value.as_str().is_some_and(|s| s.len() >= 19),
         "uri" => value.is_string(),
-        s if s.contains('|') => {
+        s if field_type_problem(s).is_none() => {
             let allowed: Vec<&str> = s.split('|').collect();
             value.as_str().is_some_and(|v| allowed.contains(&v))
         }
+        // An unknown type is refused once, by `check_field_types_are_known`,
+        // not again for every default a step sets under it.
         _ => true,
     };
     if ok {
@@ -1497,6 +1662,10 @@ mod tests {
             filled_by: boss_core::job::FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into()],
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         };
         let spec_with = |field_type: &str| {
             WorkflowSpec::platform_seed(
@@ -1540,6 +1709,105 @@ mod tests {
         );
     }
 
+    /// Backlog fcae2bfa: nothing refused a field type the validator
+    /// cannot run, so emergency-merge v1 published `receipt_verdict`
+    /// typed `green` and every value completed that required field. An
+    /// unknown type is refused at publish, naming the step, the field
+    /// and the grammar; a pipe enum of the same word passes.
+    #[test]
+    fn an_unknown_field_type_is_refused_at_publish() {
+        let reg = StepRegistry::v1();
+        let spec_with = |field_type: &str| {
+            let mut spec = viable_spec("em");
+            spec.steps[1].fields = vec![boss_core::job::StepField {
+                name: "receipt_verdict".into(),
+                field_type: field_type.into(),
+                required: true,
+                filled_by: boss_core::job::FilledBy::Executor,
+                item_keys: Vec::new(),
+                covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
+            }];
+            spec
+        };
+        let errs = validate_workflow(&spec_with("green"), &reg);
+        assert!(
+            errs.iter().any(|e| e.step == "finish"
+                && e.reason.contains("receipt_verdict")
+                && e.reason.contains("'green' is not a field type")),
+            "{errs:?}"
+        );
+        assert!(gate_active(&spec_with("green")).is_err());
+        let errs = validate_workflow(&spec_with("green|failed|refused"), &reg);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// Backlog 6c9183de, review S4 of car 1e603cfd (2026-09-26): a
+    /// declared writer is satisfied only by a credential a server door
+    /// resolved, so a writer no door resolves — a typo, an empty string,
+    /// or `runner:ops` before its credential door is mounted — locks the
+    /// key against every caller, and a required one wedges the step's
+    /// completion. Refused at publish, naming the step, the field and
+    /// the writer; a writer the resolvable list names passes.
+    #[test]
+    fn a_writer_no_credential_door_resolves_is_refused_at_publish() {
+        let reg = StepRegistry::v1();
+        let spec_with = |writer: &str| {
+            let mut spec = viable_spec("carry");
+            spec.steps[1].fields = vec![boss_core::job::StepField {
+                name: "plan".into(),
+                field_type: "string".into(),
+                required: true,
+                filled_by: boss_core::job::FilledBy::Executor,
+                item_keys: Vec::new(),
+                covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: Some(writer.into()),
+            }];
+            spec
+        };
+        // Today no door resolves any principal, so even the design's own
+        // `runner:ops` is refused until the car that mounts its door.
+        for writer in ["runner:ops", "runner:osp", "", "  "] {
+            let errs = validate_workflow(&spec_with(writer), &reg);
+            assert!(
+                errs.iter().any(|e| e.step == "finish"
+                    && e.reason.contains("'plan'")
+                    && e.reason.contains("writer")),
+                "{writer:?}: {errs:?}"
+            );
+            assert!(gate_active(&spec_with(writer)).is_err(), "{writer:?}");
+        }
+        // The rule reads the list it is handed, so the day a door
+        // resolves `runner:ops` the same declaration passes, and a typo
+        // of it still does not.
+        let mut errs = Vec::new();
+        check_writers_are_resolvable(
+            &spec_with("runner:ops"),
+            &spec_with("runner:ops").steps[1],
+            &["runner:ops"],
+            &mut errs,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        check_writers_are_resolvable(
+            &spec_with("runner:osp"),
+            &spec_with("runner:osp").steps[1],
+            &["runner:ops"],
+            &mut errs,
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].reason.contains("`runner:ops`"), "{errs:?}");
+        // A field with no declared writer is untouched by the rule.
+        let mut plain = spec_with("runner:ops");
+        plain.steps[1].fields[0].writer = None;
+        assert!(validate_workflow(&plain, &reg).is_empty());
+    }
+
     /// `covers` must relate two array fields on the same step; each way
     /// it can fail to is refused by name, and the intended shape passes.
     #[test]
@@ -1552,6 +1820,10 @@ mod tests {
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
             covers: covers.map(str::to_string),
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         };
         let spec_with = |fields: Vec<boss_core::job::StepField>| {
             WorkflowSpec::platform_seed(
@@ -1614,6 +1886,99 @@ mod tests {
         assert!(e.iter().any(|r| r.contains("not an array")), "{e:?}");
         let e = covers_errs(vec![mk("resolutions", "array", Some("resolutions"))]);
         assert!(e.iter().any(|r| r.contains("itself")), "{e:?}");
+
+        // `binds` (design 26a89f11) is the same kind of relation — two
+        // array fields on one step, related by element anchor — so it is
+        // held to the same rule: a binds that names nothing, a
+        // non-array, or itself would be stored and never checked.
+        let bind = |name: &str, field_type: &str, binds: Option<&str>| boss_core::job::StepField {
+            binds: binds.map(str::to_string),
+            ..mk(name, field_type, None)
+        };
+        let binds_errs = |fields| {
+            validate_workflow(&spec_with(fields), &reg)
+                .into_iter()
+                .filter(|e| e.reason.contains("binds"))
+                .map(|e| e.reason)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            binds_errs(vec![
+                bind("questions", "array", Some("exhibits")),
+                bind("exhibits", "array", None),
+            ])
+            .is_empty(),
+            "the intended shape passes"
+        );
+        let e = binds_errs(vec![bind("questions", "array", Some("exhibits"))]);
+        assert!(
+            e.iter().any(|r| r.contains("no field of that name")),
+            "{e:?}"
+        );
+        let e = binds_errs(vec![
+            bind("questions", "array", Some("exhibits")),
+            bind("exhibits", "string", None),
+        ]);
+        assert!(e.iter().any(|r| r.contains("not an array")), "{e:?}");
+        let e = binds_errs(vec![bind("questions", "array", Some("questions"))]);
+        assert!(e.iter().any(|r| r.contains("itself")), "{e:?}");
+
+        // A value bound describes array ELEMENTS, like item_keys, and on
+        // any other field would never be checked.
+        let bounded = |field_type: &str| boss_core::job::StepField {
+            item_value_max_bytes: Some(262_144),
+            ..mk("exhibits", field_type, None)
+        };
+        let bound_errs = |fields| {
+            validate_workflow(&spec_with(fields), &reg)
+                .into_iter()
+                .filter(|e| e.reason.contains("item_value_max_bytes"))
+                .map(|e| e.reason)
+                .collect::<Vec<_>>()
+        };
+        assert!(bound_errs(vec![bounded("array")]).is_empty());
+        assert_eq!(bound_errs(vec![bounded("string")]).len(), 1);
+
+        // `item_one_of` (design 26a89f11's file_refs arm) describes array
+        // elements too, and is held the way binds is: on a non-array it
+        // would never be checked; with fewer than two keys it is not a
+        // choice; a key also in item_keys would be required AND
+        // exclusive at once; a repeated key is a choice between one
+        // thing and itself.
+        let one_of =
+            |field_type: &str, keys: &[&str], item_keys: &[&str]| boss_core::job::StepField {
+                item_one_of: keys.iter().map(|k| k.to_string()).collect(),
+                item_keys: item_keys.iter().map(|k| k.to_string()).collect(),
+                ..mk("exhibits", field_type, None)
+            };
+        let one_of_errs = |fields| {
+            validate_workflow(&spec_with(fields), &reg)
+                .into_iter()
+                .filter(|e| e.reason.contains("item_one_of"))
+                .map(|e| e.reason)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            one_of_errs(vec![one_of(
+                "array",
+                &["html", "file_ref"],
+                &["anchor", "title"]
+            )])
+            .is_empty(),
+            "the intended shape passes"
+        );
+        let e = one_of_errs(vec![one_of("string", &["html", "file_ref"], &[])]);
+        assert!(e.iter().any(|r| r.contains("not an array")), "{e:?}");
+        let e = one_of_errs(vec![one_of("array", &["html"], &[])]);
+        assert!(e.iter().any(|r| r.contains("at least two")), "{e:?}");
+        let e = one_of_errs(vec![one_of("array", &["html", "file_ref"], &["html"])]);
+        assert!(
+            e.iter()
+                .any(|r| r.contains("item_keys") && r.contains("html")),
+            "{e:?}"
+        );
+        let e = one_of_errs(vec![one_of("array", &["html", "html"], &[])]);
+        assert!(e.iter().any(|r| r.contains("more than once")), "{e:?}");
     }
 
     /// An empty string can never be a member of an enum, so `""` as a
@@ -1654,6 +2019,10 @@ mod tests {
                             filled_by: boss_core::job::FilledBy::Executor,
                             item_keys: Vec::new(),
                             covers: None,
+                            binds: None,
+                            item_value_max_bytes: None,
+                            item_one_of: Vec::new(),
+                            writer: None,
                         }],
                         metadata_defaults: serde_json::json!({ "route": default }),
                         terminal: Some(Terminal {
@@ -1811,6 +2180,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     ..Default::default()
                 },
@@ -1825,6 +2198,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     // Stamped at materialization, so the step carries the
                     // key from the moment it exists — which is why the
@@ -1897,6 +2274,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     ..Default::default()
                 },
@@ -1911,6 +2292,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     ..Default::default()
                 },
@@ -1969,6 +2354,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     ..Default::default()
                 },
@@ -2022,6 +2411,10 @@ mod tests {
                         filled_by: boss_core::job::FilledBy::Executor,
                         item_keys: Vec::new(),
                         covers: None,
+                        binds: None,
+                        item_value_max_bytes: None,
+                        item_one_of: Vec::new(),
+                        writer: None,
                     }],
                     ..Default::default()
                 },
@@ -2137,6 +2530,10 @@ mod tests {
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         }
     }
 
@@ -2188,6 +2585,10 @@ mod tests {
             filled_by: boss_core::job::FilledBy::Executor,
             item_keys: Vec::new(),
             covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
         });
         assert!(
             validate_workflow(&spec, &reg)

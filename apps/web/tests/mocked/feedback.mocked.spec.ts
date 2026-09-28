@@ -9,7 +9,7 @@
 // an account. Post a Job without that shape and feedback becomes an
 // unaddressable pile.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './_test';
 import { mountPage } from './_helpers';
 import { installApiFloor } from './_smokeMocks';
 

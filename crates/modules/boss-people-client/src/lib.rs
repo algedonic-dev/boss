@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use boss_core::http_client::{self, HttpClientError, ServiceLabel};
 
 pub mod platform_owner;
-pub use platform_owner::ReqwestPlatformOwner;
+pub use platform_owner::{PLATFORM_OWNER_READER, ReqwestPlatformOwner};
 
 /// Service-name marker for the shared [`HttpClientError`]. Keeps the
 /// `Display` text reading `"people service unreachable: …"`.

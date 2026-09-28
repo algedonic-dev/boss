@@ -6,7 +6,10 @@
   // pipeline, Refurb queue) can mount this component with a kind
   // pre-filter. Same pattern as the React app.
 
+  import { onMount } from 'svelte';
   import { navigate, href } from '../router';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { shortId } from '../data/ids';
   import { subjectLabel, subjectPath, type Job } from './types';
@@ -15,6 +18,9 @@
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
   import { registeredAdHoc } from './adHoc';
+  import { kindsForDepartment } from './newJobKinds';
+  import { ACCOUNTS_LIST_URL } from '../accounts/api';
+  import { jobsFilterSearch, searchWithoutNewJob } from './filterQuery';
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
@@ -26,13 +32,14 @@
     initialDepartment = '',
     initialStatus = 'open',
     initialOwnerId = '',
-    initialSubjectKind = '',
     initialSubjectId = '',
     pageTitle,
     eyebrow = 'Work',
     initialNewJobOpen = false,
+    initialNewJobKind = '',
     initialNewJobSubjectKind = '',
     initialNewJobSubjectId = '',
+    writesFiltersToUrl = false,
   } = $props<{
     initialKind?: string;
     initialKindPrefix?: string;
@@ -48,18 +55,27 @@
     initialDepartment?: string;
     initialStatus?: string;
     // #93: list-filter props. owner_id filters by Job.owner_id;
-    // subjectKind+subjectId filter by Job.subject_kind+subject_id.
+    // subjectId filters by Job.subject_id. A subjectKind prop was
+    // captured and never sent — the jobs API has no such filter — and
+    // went with backlog 45ca0f89.
     initialOwnerId?: string;
-    initialSubjectKind?: string;
     initialSubjectId?: string;
     pageTitle?: string;
     eyebrow?: string;
     // Deep-link params from /jobs?new=1&subject_kind=…&subject_id=…
     // (Phase 3 of create-Job UX; populated when a Subject detail
-    // page sends the user here pre-filled).
+    // page sends the user here pre-filled). The Kind is the deep link's
+    // `kind`, which under `new=1` names the new job's workflow and
+    // filters nothing (HrPage's link; backlog 3f5cce16).
     initialNewJobOpen?: boolean;
+    initialNewJobKind?: string;
     initialNewJobSubjectKind?: string;
     initialNewJobSubjectId?: string;
+    /// Set by the /jobs mount only: the route whose query parseRoute
+    /// reads the filters from, so the only one a written filter can
+    /// come back through. The Service queue and the Sales pipeline
+    /// mount this page on paths that parse no query.
+    writesFiltersToUrl?: boolean;
   }>();
 
   let kind = $state(initialKind);
@@ -73,11 +89,39 @@
   let error = $state<string | null>(null);
   let total = $state(0);
 
+  // The filters live in the URL, not only in page state: choosing All
+  // and reloading used to come back as Open, and a filtered view could
+  // not be shared (backlog f8027805). replaceState, not a navigation —
+  // a filter is not a place the back button should step through, and
+  // App re-parses the route on popstate only. The write is the inverse
+  // of parseRoute's read, so a mount rewrites nothing.
+  $effect(() => {
+    if (!writesFiltersToUrl) return;
+    const { pathname, search, hash } = window.location;
+    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter });
+    if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
+  });
+
   // Auto-load kinds for the filter dropdown on mount; no user
   // interaction required.
   $effect(() => {
     void loadKinds();
   });
+
+  // The list is paged against the server's `total` (backlog d1310776).
+  // It read one page of 200, newest first, with no offset and no word
+  // that more existed: measured 2026-09-23, 286 open under a header
+  // saying so and 86 of them — the OLDEST, which the standing order
+  // works first — reachable from nowhere on /ux/jobs, /ux/service or
+  // /ux/sales. The page belongs to the filter it was turned under, so
+  // any filter change lands back on the first page without an effect
+  // of its own to reset it.
+  const PAGE_SIZE = 200;
+  const filterKey = $derived(
+    JSON.stringify([kind, initialKindPrefix, initialDepartment, status, initialOwnerId, subjectIdFilter]),
+  );
+  let turned = $state<{ key: string; offset: number }>({ key: '', offset: 0 });
+  const offset = $derived(turned.key === filterKey ? turned.offset : 0);
 
   $effect(() => {
     const k = kind;
@@ -85,8 +129,8 @@
     const dept = initialDepartment;
     const s = status;
     const o = initialOwnerId;
-    const sk = initialSubjectKind;
     const si = subjectIdFilter;
+    const at = offset;
     let cancelled = false;
     loading = true;
 
@@ -97,7 +141,8 @@
     if (s) params.set('status', s);
     if (o) params.set('owner_id', o);
     if (si) params.set('subject_id', si);
-    params.set('limit', '200');
+    params.set('limit', String(PAGE_SIZE));
+    if (at > 0) params.set('offset', String(at));
 
     (async () => {
       try {
@@ -123,10 +168,11 @@
     };
   });
 
+  // Blocked and Pending sign-off were offered here until 2026-09-24:
+  // no Job ever held either, so each could only answer "No jobs
+  // match." (page audit 473f4f92, retired in backlog 3c3dc8f3).
   const STATUS_OPTIONS = [
     { v: 'open', l: 'Open' },
-    { v: 'blocked', l: 'Blocked' },
-    { v: 'pending-sign-off', l: 'Pending sign-off' },
     { v: 'closed', l: 'Closed' },
     { v: '', l: 'All' },
   ];
@@ -162,6 +208,9 @@
     category?: string | null;
     subject_kinds: string[];
     steps?: StepSpecRow[] | null;
+    /// Where a row declares its department (`department`), which the
+    /// new-Job form's picker reads on a department's page.
+    metadata?: Record<string, unknown> | null;
   };
   type SubjectOption = { id: string; label: string };
   type SubjectOptionsState = {
@@ -208,16 +257,23 @@
     !!formKind && !!formSubjectKind && formSubjectId.trim().length > 0,
   );
 
+  // The kinds the form offers: the whole registry on a page mounted for
+  // no department, else the kinds declaring the page's department and
+  // the ad-hoc row. The Sales pipeline offered all 64 live kinds, two
+  // of them Sales's (backlog dc06c0fc).
+  const pickableKinds = $derived(kindsForDepartment(kinds, initialDepartment));
+
   const allowedSubjectKinds = $derived.by(() => {
     const spec = kinds.find((k) => k.kind === formKind);
     if (spec) return spec.subject_kinds;
-    // No kind picked yet — if the user came in via a deep-link
-    // with a subject_kind, surface that as the only option so the
-    // subject_kind select isn't empty. Otherwise show every
-    // subject_kind that any kind in the registry references.
-    if (formSubjectKind) return [formSubjectKind];
+    // No kind picked yet: every subject_kind any offered kind
+    // references, plus the one already chosen (a deep link's, before
+    // the registry has answered). The chosen one used to be the ONLY
+    // option, so `account` could not be picked before a Kind, though
+    // Ad hoc takes one (backlog d0b93b80).
     const all = new Set<string>();
-    for (const k of kinds) for (const sk of k.subject_kinds) all.add(sk);
+    for (const k of pickableKinds) for (const sk of k.subject_kinds) all.add(sk);
+    if (formSubjectKind) all.add(formSubjectKind);
     return Array.from(all);
   });
   const selectedKindSpec = $derived(
@@ -240,8 +296,8 @@
   // subject.
   const visibleKinds = $derived(
     formSubjectKind
-      ? kinds.filter((k) => k.subject_kinds.includes(formSubjectKind))
-      : kinds,
+      ? pickableKinds.filter((k) => k.subject_kinds.includes(formSubjectKind))
+      : pickableKinds,
   );
 
   /// `retry: true` is an operator gesture (focusing the Kind filter,
@@ -271,7 +327,7 @@
   // mapping reflects the actual service URLs in the dev-server +
   // gateway proxy table.
   const SUBJECT_LIST_URLS: Record<string, string> = {
-    account: '/api/people/accounts',
+    account: ACCOUNTS_LIST_URL,
     vendor: '/api/inventory/vendors',
     employee: '/api/people',
     location: '/api/locations',
@@ -279,8 +335,24 @@
     purchase_order: '/api/inventory/purchase-orders?limit=500',
   };
 
+  /// Subject kinds whose list read is out. Not state: nothing renders
+  /// it. The loader's guard was set only by an ANSWER, and opening the
+  /// form asks twice before the first answers — the defaulting effect
+  /// writes formSubjectKind and re-runs — so every open read the list
+  /// twice (backlog d0b93b80).
+  const subjectOptionsInFlight = new Set<string>();
+
   async function loadSubjectOptions(kind: string): Promise<void> {
-    if (subjectOptions[kind]) return;
+    if (subjectOptions[kind] || subjectOptionsInFlight.has(kind)) return;
+    subjectOptionsInFlight.add(kind);
+    try {
+      await readSubjectOptions(kind);
+    } finally {
+      subjectOptionsInFlight.delete(kind);
+    }
+  }
+
+  async function readSubjectOptions(kind: string): Promise<void> {
     const url = SUBJECT_LIST_URLS[kind];
     if (!url) {
       // No autocomplete for this subject_kind (e.g. custom,
@@ -354,8 +426,8 @@
     // submit.
     formOwnerId = userId ?? '';
     // Opening the form is a gesture too, and the form is unusable
-    // without the registry — but it is reached from the deep-link
-    // effect as well, which is why that effect guards on newJobOpen.
+    // without the registry. The deep link reaches it from onMount,
+    // which tracks nothing, so the retry cannot loop.
     void loadKinds({ retry: true });
     void loadOwners();
     // If the deep-link picked a subject_kind, prime its
@@ -368,26 +440,40 @@
 
   // Auto-open the form on mount when the deep-link params are
   // present. The Subject detail pages send users here via
-  // /jobs?new=1&subject_kind=account&subject_id=acc-bigseed-0001;
-  // landing on the page with the form already populated is the
-  // whole point of the deep-link.
-  $effect(() => {
-    if (initialNewJobOpen && !newJobOpen) {
+  // /ux/jobs?new=1&subject_kind=account&subject_id=<id>; landing on
+  // the page with the form already populated is the whole point of
+  // the deep-link.
+  //
+  // ONCE, at mount. This was an effect that opened the form whenever
+  // `initialNewJobOpen && !newJobOpen` — so Cancel, which sets
+  // newJobOpen false while the prop stays true (the route is not
+  // re-parsed on replaceState), reopened it at once, reset, and what
+  // the operator typed was lost (backlog d0b93b80). App remounts this
+  // page on every navigation, so a new deep link is a new mount.
+  onMount(() => {
+    if (initialNewJobOpen) {
       openNewJob({
+        kind: initialNewJobKind,
         subjectKind: initialNewJobSubjectKind,
         subjectId: initialNewJobSubjectId,
       });
     }
   });
 
-  // When kind changes, default subject_kind to the first allowed
-  // (so the form renders a usable input even before the user
-  // touches it). Also kicks off the per-kind subject autocomplete
-  // fetch so the datalist populates by the time the user lands on
-  // the input.
+  // When a kind is chosen, the subject kind follows it: the first the
+  // kind accepts, unless the one already chosen is among them. Also
+  // kicks off the subject autocomplete fetch so the datalist populates
+  // by the time the user lands on the input.
+  //
+  // Only a CHOSEN kind defaults it. With no kind this took the first
+  // subject kind of the whole union on opening, and the Kind picker
+  // then narrowed to the kinds taking that — `custom`, which hid
+  // "Receive an inquiry" (an account kind) on the Sales pipeline until
+  // the user switched subject kinds first (backlog 685f43aa).
   $effect(() => {
-    const first = allowedSubjectKinds[0];
-    if (first && !allowedSubjectKinds.includes(formSubjectKind)) {
+    const accepted = selectedKindSpec?.subject_kinds ?? [];
+    const first = accepted[0];
+    if (first && !accepted.includes(formSubjectKind)) {
       formSubjectKind = first;
     }
     if (formSubjectKind) {
@@ -470,8 +556,16 @@
   <PageHeader
     eyebrow={eyebrow}
     title={titleFor}
-    subtitle={`${total.toLocaleString()} ${status || 'any-status'}`}
-    motif="hops"
+    subtitle={error
+      ? // A failed read leaves `total` at 0 (or at the last filter's
+        // count), and "0 open" above the failure line reads as an
+        // answer (backlog e98cabd0, sweep c3e4edcc). Unknown, so say so.
+        'Job count unknown — the read failed'
+      : loading
+        ? // `total` starts at 0 and, on a re-read, belongs to the last
+          // filter: "0 open" sat above "Loading…" (backlog d0b93b80).
+          'Counting…'
+        : `${total.toLocaleString()} ${status || 'in all statuses'}`}
   />
 
   <!-- Filters: narrow the list down without leaving the page. The
@@ -499,7 +593,7 @@
       <span>Subject id</span>
       <input
         type="text"
-        placeholder="e.g. acc-bigseed-0012"
+        placeholder="An exact subject id"
         bind:value={subjectIdFilter}
       />
     </label>
@@ -519,11 +613,11 @@
     <!-- Admission is a write: a guest sees the entry buttons disabled
          (readonly gate) rather than a composer whose POST 403s. -->
     <WriteGate>
-      <button type="button" class="btn-primary" onclick={() => openNewJob()}>
+      <button type="button" class="btn btn-primary" onclick={() => openNewJob()}>
         Start a new Job
       </button>
       {#if adHoc}
-        <button type="button" class="btn-secondary" onclick={() => openNewJob({ kind: adHoc.kind })}>
+        <button type="button" class="btn" onclick={() => openNewJob({ kind: adHoc.kind })}>
           Create Ad Hoc Job
         </button>
       {/if}
@@ -543,10 +637,19 @@
               </option>
             {/each}
           </select>
-          {#if formSubjectKind && visibleKinds.length < kinds.length}
+          {#if initialDepartment && kinds.length > 0 && pickableKinds.length === 0}
+            <!-- A department nothing declares offers no kind, and says
+                 so rather than falling back to the whole registry
+                 (backlog dc06c0fc). -->
+            <small class="hint">No kind declares the {initialDepartment} department</small>
+          {:else if formSubjectKind && visibleKinds.length < pickableKinds.length}
             <small class="hint">
-              Filtered to kinds that accept a {formSubjectKind} subject
-              ({visibleKinds.length} of {kinds.length})
+              <!-- Plural, so no article to get wrong ("a account",
+                   backlog d0b93b80) — and not the words "subject kind":
+                   this hint is inside the Kind label, so it is part of
+                   the Kind select's accessible name. -->
+              Filtered to kinds that accept {formSubjectKind} subjects
+              ({visibleKinds.length} of {pickableKinds.length})
             </small>
           {/if}
         </label>
@@ -648,28 +751,26 @@
       <div class="form-actions">
         <button
           type="submit"
-          class="btn-primary"
+          class="btn btn-primary"
           disabled={formSubmitting || !canSubmit}
         >
           {formSubmitting ? 'Creating…' : 'Create Job'}
         </button>
         <button
           type="button"
-          class="btn-secondary"
+          class="btn"
           onclick={() => {
             newJobOpen = false;
-            // If the user landed via a deep-link
-            // (?new=1&subject_kind=…), clear the URL params on
-            // cancel so a refresh doesn't re-open the form. Use
-            // history.replaceState to avoid pushing a back-button
-            // entry for the cancellation.
-            if (
-              typeof window !== 'undefined' &&
-              window.location.search.includes('new=1')
-            ) {
-              const path = window.location.pathname + window.location.hash;
-              window.history.replaceState(null, '', path);
-            }
+            // If the user landed via a deep-link (?new=1&subject_kind=…),
+            // take its new-job half out of the URL on cancel so a refresh
+            // doesn't re-open the form — and ONLY that half: the whole
+            // query went until backlog d0b93b80, the filters' parameters
+            // with it, while the filters stayed set. replaceState, so
+            // the cancellation is no back-button entry.
+            if (!writesFiltersToUrl) return;
+            const { pathname, search, hash } = window.location;
+            const next = searchWithoutNewJob(search, { kind, status, subjectId: subjectIdFilter });
+            if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
           }}
           disabled={formSubmitting}
         >
@@ -687,6 +788,7 @@
           <button
             type="button"
             class="filter-button {status === opt.v ? 'filter-button-active' : ''}"
+            aria-pressed={status === opt.v}
             onclick={() => (status = opt.v)}
           >
             {opt.l}
@@ -699,7 +801,9 @@
       {#if loading}
         <p class="empty">Loading…</p>
       {:else if error}
-        <p class="empty">Couldn't load jobs: {error}</p>
+        <!-- The shared failure marker (sweep c3e4edcc): this line is
+             /ux/jobs's, /ux/service's and /ux/sales's. -->
+        <p class="empty load-failed" role="alert">Couldn't load jobs: {error}</p>
       {:else if jobs.length === 0}
         <p class="empty">No jobs match.</p>
       {:else}
@@ -717,35 +821,14 @@
           </thead>
           <tbody>
             {#each jobs as j (j.id)}
-              <tr
-                class="data-table-row-link"
-                onclick={() => navigate(entityHref('job', j.id))}
-              >
+              <tr use:rowLink={{ onActivate: () => navigate(entityHref('job', j.id)), label: j.title }}>
                 <td class="mono">
-                  <a
-                    href={entityHref('job', j.id)}
-                    onclick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(entityHref('job', j.id));
-                    }}
-                  >
-                    {shortId(j.id)}
-                  </a>
+                  <Link to={entityHref('job', j.id)}>{shortId(j.id)}</Link>
                 </td>
                 <td>{j.kind}</td>
                 <td>{j.title}</td>
                 <td class="mono">
-                  <a
-                    href={href(subjectPath(j.subject))}
-                    onclick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(href(subjectPath(j.subject)));
-                    }}
-                  >
-                    {subjectLabel(j.subject)}
-                  </a>
+                  <Link to={href(subjectPath(j.subject))}>{subjectLabel(j.subject)}</Link>
                 </td>
                 <td>{j.status}</td>
                 <td>{j.priority}</td>
@@ -754,6 +837,33 @@
             {/each}
           </tbody>
         </table>
+      {/if}
+      {#if !loading && !error && (offset > 0 || offset + jobs.length < total)}
+        <!-- Only when the filter matches more than one page holds; a
+             list that fits says nothing more than its header does. -->
+        <nav class="job-pager" aria-label="Pages of jobs">
+          <p>
+            Showing {jobs.length > 0
+              ? `${(offset + 1).toLocaleString()}–${(offset + jobs.length).toLocaleString()}`
+              : 'none'} of {total.toLocaleString()}, newest first
+          </p>
+          <button
+            type="button"
+            class="btn"
+            disabled={offset === 0}
+            onclick={() => (turned = { key: filterKey, offset: Math.max(0, offset - PAGE_SIZE) })}
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            class="btn"
+            disabled={jobs.length === 0 || offset + jobs.length >= total}
+            onclick={() => (turned = { key: filterKey, offset: offset + jobs.length })}
+          >
+            Next
+          </button>
+        </nav>
       {/if}
     </section>
   </div>
@@ -767,8 +877,8 @@
     align-items: end;
     margin-bottom: 16px;
     padding: 12px 16px;
-    background: rgba(0, 0, 0, 0.02);
-    border: 1px solid rgba(0, 0, 0, 0.08);
+    background: var(--wash);
+    border: 1px solid var(--hairline);
     border-radius: 6px;
   }
   .job-filter {
@@ -778,7 +888,7 @@
     font-size: 12px;
   }
   .job-filter > span {
-    color: rgba(0, 0, 0, 0.55);
+    color: var(--static);
     text-transform: uppercase;
     letter-spacing: 0.4px;
     font-size: 10px;
@@ -788,9 +898,9 @@
   .job-filter input {
     padding: 6px 10px;
     font-size: 13px;
-    border: 1px solid rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--hairline);
     border-radius: 4px;
-    background: white;
+    background: var(--ink);
     min-width: 160px;
   }
   .job-filter-clear {
@@ -798,13 +908,25 @@
     padding: 6px 12px;
     font-size: 12px;
     background: transparent;
-    color: rgba(0, 0, 0, 0.6);
-    border: 1px solid rgba(0, 0, 0, 0.18);
+    color: var(--static);
+    border: 1px solid var(--hairline);
     border-radius: 4px;
     cursor: pointer;
   }
   .job-filter-clear:hover {
-    background: rgba(0, 0, 0, 0.04);
+    background: var(--wash);
+  }
+  .job-pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-top: 12px;
+  }
+  .job-pager p {
+    margin: 0;
+    color: var(--static);
+    font-size: 13px;
   }
   .job-actions {
     display: flex;
@@ -818,28 +940,8 @@
     display: flex;
     gap: 12px;
   }
-  .btn-primary,
-  .btn-secondary {
-    padding: 8px 16px;
-    border-radius: 6px;
-    font: inherit;
-    cursor: pointer;
-    border: 1.5px solid var(--brew-amber);
-  }
-  .btn-primary {
-    background: var(--brew-amber);
-    color: var(--brew-malt);
-  }
-  .btn-primary:disabled {
-    opacity: 0.6;
-    cursor: progress;
-  }
-  .btn-secondary {
-    background: transparent;
-    color: var(--brew-malt);
-  }
   .new-job-form {
-    background: var(--brew-amber-bg, rgba(212, 165, 91, 0.08));
+    background: var(--brew-amber-bg);
     border: 1.5px solid var(--brew-amber);
     border-radius: 8px;
     padding: 16px;
@@ -864,7 +966,7 @@
   }
   .form-row label span {
     font-size: 12px;
-    color: var(--muted, #666);
+    color: var(--static);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -872,22 +974,22 @@
   .form-row select {
     padding: 6px 10px;
     border-radius: 4px;
-    border: 1px solid var(--border, #ccc);
-    background: white;
+    border: 1px solid var(--border);
+    background: var(--ink);
     font: inherit;
     min-width: 220px;
   }
   .form-error {
-    color: #b00020;
+    color: var(--err);
     margin: 0;
   }
   .kind-description {
     margin: 0;
     padding: 8px 12px;
-    background: var(--brew-amber-bg, rgba(212, 165, 91, 0.05));
+    background: var(--brew-amber-bg);
     border-left: 3px solid var(--brew-amber);
     border-radius: 2px;
-    color: var(--brew-malt, #3d2c1a);
+    color: var(--brew-malt);
     font-size: 13px;
     line-height: 1.45;
   }
@@ -897,7 +999,7 @@
     padding: 1px 6px;
     border-radius: 3px;
     background: var(--brew-amber);
-    color: white;
+    color: var(--on-band);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -905,13 +1007,13 @@
     vertical-align: middle;
   }
   .hint {
-    color: var(--muted, #888);
+    color: var(--static);
     font-size: 11px;
     margin-top: 4px;
   }
   .step-preview {
-    background: rgba(255, 255, 255, 0.6);
-    border: 1px dashed var(--brew-amber, #d4a55b);
+    background: var(--ink);
+    border: 1px dashed var(--brew-amber);
     border-radius: 6px;
     padding: 8px 12px;
     font-size: 13px;
@@ -919,7 +1021,7 @@
   .step-preview > summary {
     cursor: pointer;
     font-weight: 500;
-    color: var(--brew-malt, #3d2c1a);
+    color: var(--brew-malt);
     list-style: none;
   }
   .step-preview > summary::-webkit-details-marker { display: none; }
@@ -949,27 +1051,27 @@
     border-radius: 3px;
   }
   .step-preview-list li:nth-child(odd) {
-    background: rgba(212, 165, 91, 0.06);
+    background: var(--warn-wash);
   }
   .step-preview-tier {
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--muted, #888);
+    color: var(--static);
   }
   .step-preview-kind {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: var(--mono);
     font-size: 11px;
-    color: var(--brew-malt, #3d2c1a);
-    background: rgba(212, 165, 91, 0.18);
+    color: var(--brew-malt);
+    background: var(--warn-wash);
     padding: 1px 6px;
     border-radius: 3px;
   }
-  .step-preview-title { color: var(--text, #1c1917); }
+  .step-preview-title { color: var(--text); }
   .step-preview-signoff {
     font-size: 11px;
-    color: #2563eb;
-    background: rgba(37, 99, 235, 0.08);
+    color: var(--signal);
+    background: var(--signal-wash);
     padding: 1px 6px;
     border-radius: 3px;
   }

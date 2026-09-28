@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::port::{ClassError, ClassRepository, declared_event};
+use crate::port::{ClassError, ClassRepository, declared_event, retired_event, updated_event};
 
 pub struct PgClasses {
     pool: PgPool,
@@ -96,13 +96,43 @@ impl ClassRepository for PgClasses {
         Ok(exists)
     }
 
-    async fn update(&self, class: &Class) -> Result<bool, ClassError> {
+    async fn update(&self, class: &Class, stamp: &EventStamp) -> Result<bool, ClassError> {
+        // One transaction for the read, the UPDATE and its fact
+        // (backlog 10dabe13): the row is locked while the before image
+        // is read, so the `class.updated` names exactly what this edit
+        // replaced, and the row and the fact commit or roll back
+        // together. Until 2026-09-27 this was a bare UPDATE on the
+        // pool that left nothing in the log.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ClassError::Storage(e.to_string()))?;
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM classes \
+             WHERE subject_kind = $1 AND code = $2 FOR UPDATE"
+        );
+        let Some(held) = sqlx::query_as::<_, ClassRow>(&sql)
+            .bind(&class.subject_kind)
+            .bind(&class.code)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ClassError::Storage(e.to_string()))?
+            .map(Class::from)
+        else {
+            return Ok(false);
+        };
+        // A body identical to the held row changes no state, so it
+        // writes nothing and records nothing (idempotence).
+        let Some(event) = updated_event(stamp, &held, class)? else {
+            return Ok(true);
+        };
         // The composite key is deliberately absent from the SET list:
         // a code is an identity other rows point at, so renaming it in
         // place would orphan them silently. `retired_at` is likewise
         // untouched — retiring a Class is its own action, not a side
         // effect of editing a label.
-        let result = sqlx::query(
+        sqlx::query(
             "UPDATE classes SET \
              display_name = $3, parent_code = $4, member_attribute = $5, \
              metadata = $6, sort_order = $7, updated_at = now() \
@@ -115,35 +145,58 @@ impl ClassRepository for PgClasses {
         .bind(&class.member_attribute)
         .bind(&class.metadata)
         .bind(class.sort_order)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ClassError::Storage(e.to_string()))?;
-        Ok(result.rows_affected() > 0)
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ClassError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| ClassError::Storage(e.to_string()))?;
+        Ok(true)
     }
 
-    async fn retire(&self, class_ref: &ClassRef) -> Result<bool, ClassError> {
+    async fn retire(&self, class_ref: &ClassRef, stamp: &EventStamp) -> Result<bool, ClassError> {
         // Stamp only when not already stamped — when a Class was
         // withdrawn is a fact, and a repeat call must not move it.
-        let stamped = sqlx::query(
+        // RETURNING hands back the row as stamped, so the
+        // `class.retired` staged beside it in the same transaction
+        // carries the exact `retired_at` the row holds (backlog
+        // 10dabe13).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ClassError::Storage(e.to_string()))?;
+        let sql = format!(
             "UPDATE classes SET retired_at = now(), updated_at = now() \
-             WHERE subject_kind = $1 AND code = $2 AND retired_at IS NULL",
-        )
-        .bind(&class_ref.subject_kind)
-        .bind(&class_ref.code)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| ClassError::Storage(e.to_string()))?;
-        if stamped.rows_affected() > 0 {
+             WHERE subject_kind = $1 AND code = $2 AND retired_at IS NULL \
+             RETURNING {SELECT_COLUMNS}"
+        );
+        let stamped: Option<ClassRow> = sqlx::query_as(&sql)
+            .bind(&class_ref.subject_kind)
+            .bind(&class_ref.code)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ClassError::Storage(e.to_string()))?;
+        if let Some(row) = stamped {
+            boss_events::outbox::record_event_in_tx(&mut tx, &retired_event(stamp, &row.into()))
+                .await
+                .map_err(ClassError::Storage)?;
+            tx.commit()
+                .await
+                .map_err(|e| ClassError::Storage(e.to_string()))?;
             return Ok(true);
         }
-        // Nothing stamped: either already retired (idempotent success)
-        // or no such row (the caller's 404).
+        // Nothing stamped: either already retired (idempotent success,
+        // no fact — nothing moved) or no such row (the caller's 404).
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM classes WHERE subject_kind = $1 AND code = $2)",
         )
         .bind(&class_ref.subject_kind)
         .bind(&class_ref.code)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| ClassError::Storage(e.to_string()))?;
         Ok(exists)

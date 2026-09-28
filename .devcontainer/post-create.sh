@@ -39,7 +39,7 @@ cat <<'EOF'
 
  Build + gate the workspace:
    cargo build --workspace
-   cargo clippy --workspace --all-features --tests -- -D warnings
+   cargo clippy --workspace --all-features --all-targets -- -D warnings
    cargo test --all-features
    cargo fmt -- --check
 

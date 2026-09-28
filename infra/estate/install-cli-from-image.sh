@@ -118,8 +118,27 @@
 # caller can tell a wait from a fault. On the forge the converge that
 # installs the CLI runs on the host that builds the image, ten minutes
 # apart, so the first tick after every train lands in this state; a
-# red there would be a red on every train (infra/forge/install.sh
-# waits; boss-gcp's converge, every half hour, still reds and heals).
+# red there would be a red on every train. Both callers wait on it:
+# infra/forge/install.sh, and since 2026-09-26 boss-gcp's converge,
+# which until then redded and healed every half hour (backlog f15ff5f2)
+# and now reds only on a wait older than its limit.
+#
+# THE CODE-BRANCH COUNTER RIDES THE SAME DOOR (backlog c4d60110). The
+# daily codebase-metrics chore on boss-gcp filed
+# `code_branches_on_kind: null` on 11 of 11 packets (2026-09-17..27):
+# `boss-leaked-policy` was on no path it looked at, because nothing had
+# ever put it on the host. The image already carries it — stage 4
+# copies every `boss-*` release binary into /usr/local/bin, and on
+# boss:c033e6a (measured 2026-09-27) the one layer that holds
+# usr/local/bin/boss holds usr/local/bin/boss-leaked-policy too — so
+# this script takes it out of the same verified layer walk into the
+# same generation, as <store>/<sha>/boss-leaked-policy, and
+# boss-codebase-metrics.service names <store>/current/boss-leaked-policy
+# (a test holds the two equal). It is decided the way the CLI is — the
+# topmost layer that mentions it, a whiteout meaning deleted — but it is
+# NEVER the CLI's precondition: an image without it installs the CLI
+# and records `cli_leaked_policy` = `absent: <why>`, and the chore then
+# files `unrunnable:` naming the path, rather than a guess.
 #
 # IDEMPOTENT AND CHEAP WHEN NOTHING MOVED: a tick whose `current`
 # already names the sha re-verifies through the wrapper and fetches
@@ -199,6 +218,12 @@ REGISTRY_HOST="${IMAGE_REPO%%/*}"
 REPO_PATH="${IMAGE_REPO#*/}"
 REGISTRY_URL="$SCHEME://$REGISTRY_HOST"
 MEMBER="usr/local/bin/boss"
+# The codebase-metrics chore's counter, installed beside the CLI when the
+# image carries it (see THE CODE-BRANCH COUNTER above). Its basename is
+# what lands in the generation; the unit's BOSS_LEAKED_POLICY_BIN is
+# pinned to <STORE default>/current/<that basename>.
+COUNTER_MEMBER="usr/local/bin/boss-leaked-policy"
+COUNTER="${COUNTER_MEMBER##*/}"
 case "${BOSS_CLI_PLATFORM:-}" in
     "") case "$(uname -m 2>/dev/null)" in
             x86_64) PLATFORM="amd64/linux" ;;
@@ -247,6 +272,38 @@ confirmed() { # <line> -> 0 iff it names this sha
 }
 
 mkdir -p "$STORE" || refuse "failed: cannot create $STORE" "the generation store could not be created"
+
+# --- one install at a time per store ----------------------------------------
+# CONCURRENT INSTALLS TAKE TURNS (backlog 9e1f037a). Every run of one
+# sha stages in the same `.staging-<sha>` and begins by removing it, so
+# two runs at once delete and refill each other's pull mid-walk. On the
+# dev pod that is the common case, not a corner: every builder's shim
+# runs this before a write verb once a train lands (and re-runs it every
+# 30 s while the image is late), beside the sidecar's hourly pass.
+# Measured 2026-09-23 against the real registry, image boss:8c122d9 —
+# the one the packet's "blob digest mismatch" named: alone it installs
+# clean; two to four concurrent runs gave 12 refusals in 14, every one
+# of them blaming the IMAGE ("layer 26 is '', not a gzip tar", "has no
+# amd64/linux manifest", "arrived with no bytes"), and one walked past
+# the layer that carries the binary — which is how the packet's refusal
+# came to name layer 1 at all. So the whole run holds one lock on the
+# store: the runs that waited find the generation the first installed
+# and fetch nothing (`relinked`/`unchanged`), and the lock also covers
+# `current`, the wrapper and the prune, which every sha shares. The fd
+# is opened read-only — flock needs no write access, and the store is
+# shared between accounts (the pod's dev container and its sidecar). A
+# wait past the bound is `not yet` (75): the holder is pulling, and
+# the callers that retry on 75 retry.
+LOCK="$STORE/.install.lock"
+LOCK_WAIT="${BOSS_CLI_LOCK_WAIT:-$PULL_TIMEOUT}"
+command -v flock >/dev/null 2>&1 \
+    || refuse "refused: no flock on this host" "two installs into $STORE at once destroy each other's staging, so this run takes $LOCK first, and flock (util-linux) is not on PATH"
+[ -e "$LOCK" ] || : >>"$LOCK" 2>/dev/null
+exec 9<"$LOCK" || refuse "failed: cannot open $LOCK" "the store's install lock could not be opened for reading"
+if ! flock -w "$LOCK_WAIT" 9; then
+    refuse "not yet: another install into $STORE held its lock for ${LOCK_WAIT}s" \
+        "a concurrent run of this installer is still pulling into $STORE (BOSS_CLI_LOCK_WAIT=${LOCK_WAIT}s); nothing was touched. Retry: the waiter that gets the lock finds its generation, if the holder installed one, and fetches nothing."
+fi
 
 # --- the wrapper, current with the tree -------------------------------------
 # Copied, never linked: /opt/boss is a checkout the converge moves, and
@@ -327,6 +384,9 @@ digest_of() {
 prev="$(readlink "$STORE/current" 2>/dev/null || true)"
 action=""
 stage=""
+# The counter's verdict: empty until a layer decides it, then
+# `installed` or `absent: <why>`.
+counter=""
 if [ -x "$STORE/$SHA/boss" ]; then
     # Already on disk: a previous tick installed (and confirmed) it, or
     # `current` was moved away by hand. Re-link below; never re-pull.
@@ -450,6 +510,28 @@ else
         if ! tar -tzf "$blob" >"$pull/layer.list" 2>"$pull/layer.err"; then
             refuse "refused: layer $i of $IMAGE is not a readable gzip tar" "tar said: $(tr '\n' ' ' <"$pull/layer.err")"
         fi
+        # The counter, decided in the first layer that mentions it —
+        # BEFORE the CLI's check below, which ends the walk and removes
+        # the pull. A problem with it is recorded, never refused.
+        if [ -z "$counter" ]; then
+            if grep -qx -- "$COUNTER_MEMBER" "$pull/layer.list"; then
+                if tar -xzf "$blob" -C "$pull" -- "$COUNTER_MEMBER" 2>"$pull/counter.err" \
+                    && [ -f "$pull/$COUNTER_MEMBER" ] && [ ! -L "$pull/$COUNTER_MEMBER" ] \
+                    && mv -f "$pull/$COUNTER_MEMBER" "$stage/$COUNTER" && chmod 0755 "$stage/$COUNTER"; then
+                    counter="installed"
+                    say "layer $i also carries $COUNTER_MEMBER; staged beside the CLI"
+                else
+                    counter="absent: layer $i of $IMAGE lists $COUNTER_MEMBER but no regular file could be staged from it ($(tr '\n' ' ' <"$pull/counter.err"))"
+                fi
+            else
+                cwh="$(grep -m 1 -x -e "$(dirname "$COUNTER_MEMBER")/.wh.$COUNTER" \
+                              -e "$(dirname "$COUNTER_MEMBER")/.wh..wh.opq" \
+                              -e "usr/local/.wh.bin" -e "usr/local/.wh..wh.opq" \
+                              -e "usr/.wh.local" -e "usr/.wh..wh.opq" \
+                              -e ".wh.usr" -e ".wh..wh.opq" "$pull/layer.list")"
+                [ -n "$cwh" ] && counter="absent: $IMAGE deletes $COUNTER_MEMBER (whiteout $cwh in layer $i)"
+            fi
+        fi
         if grep -qx -- "$MEMBER" "$pull/layer.list"; then
             found="$i"
             say "layer $i of $nlayers ($ldigest, $lsize bytes) carries $MEMBER; digest verified"
@@ -480,6 +562,10 @@ else
         i=$((i - 1))
     done
     [ -n "$found" ] || refuse "refused: no layer of $IMAGE carries $MEMBER" "$nlayers layers were listed and none has the CLI; the image is not one the Dockerfile's stage 4 built. Nothing was installed."
+    # The walk stops at the CLI's layer, so a counter no layer at or
+    # above it mentions is absent from this install — stage 4 copies both
+    # in one COPY, so a lower layer carrying it alone is not this image.
+    [ -n "$counter" ] || counter="absent: no layer of $IMAGE at or above the CLI's (layer $found) carries $COUNTER_MEMBER"
     chmod 0755 "$stage/boss"
 
     # CONFIRM THE STAGED BINARY BEFORE IT BECOMES A GENERATION: run it
@@ -528,6 +614,15 @@ ls -1t "$STORE" 2>/dev/null | grep -x '[0-9a-f]\{40\}' | tail -n +"$((KEEP + 1))
         rm -rf "${STORE:?}/$old" && say "pruned generation ${old:0:8}"
     done
 
+# The counter as the generation now holds it — which also answers for a
+# tick that pulled nothing (`unchanged`/`relinked`).
+if [ -x "$STORE/$SHA/$COUNTER" ]; then
+    counter="installed"
+elif [ -z "$counter" ]; then
+    counter="absent: the generation $STORE/$SHA was installed without $COUNTER_MEMBER (before the counter rode this door, or from an image without it); the next sha's generation brings it"
+fi
+say "counter: $STORE/current/$COUNTER — $counter"
+run_summary_field cli_leaked_policy "$counter"
 run_summary_field cli_result ok
 run_summary_field cli_action "$action"
 say "CONFIRMED — $LINK is the tree's CLI at ${SHA:0:8} ($action, image $IMAGE): $line"

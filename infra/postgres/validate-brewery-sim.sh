@@ -117,8 +117,7 @@ echo "    clock-api sim mode confirmed (epoch primed to ${START})"
 echo "==> [1/10] dropping + recreating boss DB"
 # Stop every boss service that holds a connection to the boss DB.
 # `|| true` so a missing-on-this-box unit doesn't abort the script
-# (different fleets carry different subsets — boss-cybernetics is
-# optional, the brewery deploy currently doesn't run it).
+# (different fleets carry different subsets).
 SERVICES=(
     boss-jobs-api
     boss-policy-api
@@ -132,7 +131,6 @@ SERVICES=(
     boss-content-api
     boss-messages-api
     boss-ml-api
-    boss-cybernetics
     boss-dispatcher
     # 2026-05-27: products / classes / locations / subject-kinds /
     # calendar were missing from this list, so the
@@ -224,7 +222,6 @@ START_ORDER=(
     boss-content-api
     boss-messages-api
     boss-ml-api
-    boss-cybernetics
     boss-jobs-api
     boss-dispatcher
 )
@@ -404,7 +401,11 @@ for _i in $(seq 1 90); do
     # Fetch, then ask whether anything came back: on an empty body
     # `jq -e` exits 0 printing NOTHING, so ppl_n was the empty string and
     # the -gt below was a bash error rather than a retry (d96e38ab).
-    ppl_body=$(curl -s "http://127.0.0.1:7500/api/people" 2>/dev/null || true)
+    # Signed: the roster refuses a caller with no identity (cda177ef),
+    # and a refusal body would read here as a roster that never warms.
+    ppl_body=$(curl -s \
+        -H 'x-boss-user: {"id":"automation:brewery-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}' \
+        "http://127.0.0.1:7500/api/people" 2>/dev/null || true)
     ppl_n=0
     if jq_doc_text "$ppl_body"; then
         ppl_n=$(printf '%s' "$ppl_body" | jq 'length' 2>/dev/null || echo 0)

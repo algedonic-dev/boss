@@ -13,12 +13,17 @@ boss-dispatcher = { path = "../../core/boss-dispatcher" }
 boss-core = { path = "../../core/boss-core" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-nats = { path = "../../core/boss-nats" }
-boss-jobs = { path = "../../core/boss-jobs" }
+# `postgres`: the binary wires the firing record's one reader,
+# `PgDispatcherFirings`, into `GET /api/dispatcher/schedule` (ea906603).
+boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
 boss-people-client = { path = "../../modules/boss-people-client" }
 boss-expr = { path = "../../core/boss-expr" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-calendar-client = { path = "../../core/boss-calendar-client" }
 boss-events = { path = "../../core/boss-events" }
+# The binary wires the schedule read's scope gate (ea906603); the tests
+# used it before the binary did.
+boss-policy-client = { path = "../../core/boss-policy-client" }
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +46,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+http-body-util = "0.1"
+tower = { workspace = true }
 
 [lints]
 workspace = true

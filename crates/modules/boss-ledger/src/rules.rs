@@ -50,6 +50,7 @@
 //! `financial_facts.payload` and emit cents into `JournalLineDraft`.
 
 use crate::error::LedgerError;
+use crate::revenue_accounts::RevenueAccounts;
 use crate::types::{FactRef, JournalEntryDraft, JournalLineDraft};
 
 /// A versioned posting interpretation. Same fact in + same version → same
@@ -73,6 +74,17 @@ pub trait RuleSet: Send + Sync {
 /// `gl_fact_projection_rules` registry AND skipped here.
 pub fn is_gl_inert(kind: &str) -> bool {
     matches!(kind, "finance.inventory.received")
+}
+
+/// The fact kinds whose code rule credits a revenue account chosen by
+/// the line's revenue category — the ones the posting path reads the
+/// revenue-category Classes for (backlog aa860c6d). Every other kind
+/// evaluates without that read.
+pub fn credits_revenue_by_category(kind: &str) -> bool {
+    matches!(
+        kind,
+        "finance.invoice.issued" | "finance.revenue.recognized"
+    )
 }
 
 /// Top-level evaluation — delegates to the ruleset and validates the
@@ -103,16 +115,34 @@ pub fn evaluate(
 /// alongside this one and bumps `version()`; the
 /// `gl_journal_entries.rule_version_id` column lets historical
 /// rows stay pinned to whatever ruleset produced them.
-pub struct BossRuleSet;
+///
+/// It carries the one piece of tenant data its revenue rules need —
+/// the revenue category → account map, read off the Class registry
+/// (backlog aa860c6d) — so evaluation stays a pure function of the
+/// fact and the map. `BossRuleSet::default()` declares no category:
+/// every other rule evaluates, and a revenue line refuses by name.
+#[derive(Debug, Clone, Default)]
+pub struct BossRuleSet {
+    revenue_accounts: RevenueAccounts,
+}
+
+impl BossRuleSet {
+    /// The version every entry the code rules post is stamped with.
+    pub const VERSION: i32 = 1;
+
+    pub fn new(revenue_accounts: RevenueAccounts) -> Self {
+        Self { revenue_accounts }
+    }
+}
 
 impl RuleSet for BossRuleSet {
     fn version(&self) -> i32 {
-        1
+        Self::VERSION
     }
 
     fn evaluate(&self, fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
         match fact.kind {
-            "finance.invoice.issued" => invoice_issued(fact),
+            "finance.invoice.issued" => invoice_issued(fact, &self.revenue_accounts),
             "finance.invoice.paid" => invoice_paid(fact),
             "finance.invoice.written_off" => invoice_written_off(fact),
             "finance.payment.received" => payment_received(fact),
@@ -131,7 +161,7 @@ impl RuleSet for BossRuleSet {
             "finance.tax.remitted" => tax_remitted(fact),
             "finance.keg_deposit.charged" => keg_deposit_charged(fact),
             "finance.keg_deposit.released" => keg_deposit_released(fact),
-            "finance.revenue.recognized" => revenue_recognized(fact),
+            "finance.revenue.recognized" => revenue_recognized(fact, &self.revenue_accounts),
             "finance.manual.entry" => manual_entry(fact),
             "finance.period.closed" => period_closed(fact),
             other => Err(LedgerError::UnknownFactKind(other.to_string())),
@@ -141,63 +171,9 @@ impl RuleSet for BossRuleSet {
 
 // --- Rule implementations -------------------------------------------------
 
-/// Revenue category → revenue account code.
-///
-/// Loaded once at first call from a TOML map. The embedded
-/// `seeds/revenue_accounts.toml` ships the default brewery +
-/// device-shop mappings; per-tenant overrides land via the
-/// `BOSS_LEDGER_REVENUE_ACCOUNTS_TOML` env var pointing at a
-/// sibling file (replaces — does not merge with — the default).
-/// Same data-as-data shape as D1 (step_types.toml) + D2
-/// (phase_two_models.toml).
-const REVENUE_ACCOUNTS_TOML: &str = include_str!("../seeds/revenue_accounts.toml");
-
-fn revenue_accounts() -> &'static std::collections::HashMap<String, &'static str> {
-    static CACHE: std::sync::OnceLock<std::collections::HashMap<String, &'static str>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        // Prefer the env-supplied override; fall back to the embedded default.
-        let body = match std::env::var("BOSS_LEDGER_REVENUE_ACCOUNTS_TOML") {
-            Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "BOSS_LEDGER_REVENUE_ACCOUNTS_TOML unreadable; falling back to embedded defaults"
-                );
-                REVENUE_ACCOUNTS_TOML.to_string()
-            }),
-            Err(_) => REVENUE_ACCOUNTS_TOML.to_string(),
-        };
-        let parsed: std::collections::HashMap<String, String> =
-            toml::from_str(&body).expect("revenue_accounts.toml must parse");
-        parsed
-            .into_iter()
-            .map(|(k, v)| (k, &*Box::leak(v.into_boxed_str())))
-            .collect()
-    })
-}
-
-/// Public view of the revenue-category → account-code map. Built
-/// off the same TOML the rules consume — commerce reads this to
-/// invert the mapping for per-category COGS rollups. Callers must
-/// NOT mutate the returned map; the lifetime is for the rest of the
-/// process.
-pub fn revenue_accounts_map() -> &'static std::collections::HashMap<String, &'static str> {
-    revenue_accounts()
-}
-
-fn revenue_account_for(category: &str) -> Result<&'static str, LedgerError> {
-    revenue_accounts()
-        .get(category)
-        .copied()
-        .ok_or_else(|| LedgerError::InvalidPayload {
-            kind: "finance.invoice.issued".to_string(),
-            reason: format!("unknown revenue category `{category}`"),
-        })
-}
-
 /// Bill category → GL debit account-code map. Same TOML-backed,
-/// `OnceLock`-cached, env-overridable shape as `revenue_accounts()`.
+/// `OnceLock`-cached, env-overridable shape the revenue map had until
+/// it moved onto the Class registry (backlog aa860c6d).
 /// Routes vendor-bill spend: asset categories capitalize
 /// (inventory→1300, equipment→1500), expense categories hit the P&L
 /// (rent→6200, utilities/insurance/…→6300). The embedded
@@ -1314,7 +1290,10 @@ impl RecognitionPattern {
 /// separate fact (`finance.cogs.recognized`) from the
 /// `products.consume` side-effect handler at the FG row's actual
 /// weighted-moving-average cost.
-fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
+fn invoice_issued(
+    fact: &FactRef<'_>,
+    revenue: &RevenueAccounts,
+) -> Result<JournalEntryDraft, LedgerError> {
     let items = fact
         .payload
         .get("line_items")
@@ -1349,7 +1328,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
         // or `revenue_category` (rebuild path: gl_fact_projection_rules is
         // a 1:1 passthrough, so the source event's `revenue_category` field
         // survives). Both name the same concept; the rule resolves either
-        // to the same revenue account via `revenue_account_for`.
+        // to the same revenue account via `RevenueAccounts::account_for`.
         let category = li
             .get("category")
             .or_else(|| li.get("revenue_category"))
@@ -1362,7 +1341,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
             RecognitionPattern::Immediate => {
                 // Validate the category resolves to a known revenue
                 // account — same contract as v1.
-                revenue_account_for(category)?;
+                revenue.account_for(fact.kind, category)?;
                 revenue_total += amount;
                 *immediate_by_category
                     .entry(category.to_string())
@@ -1373,7 +1352,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
                 // through to the schedule row + eventual recognition
                 // entry, which credits the revenue account for that
                 // category.
-                revenue_account_for(category)?;
+                revenue.account_for(fact.kind, category)?;
                 deferred_total += amount;
                 *deferred_by_category
                     .entry(category.to_string())
@@ -1438,7 +1417,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
 
     let mut sort: i16 = 1;
     for (category, amount) in immediate_by_category {
-        let code = revenue_account_for(&category)?;
+        let code = revenue.account_for(fact.kind, &category)?.to_string();
         lines.push(JournalLineDraft::credit(code, amount, sort));
         sort += 1;
     }
@@ -1486,7 +1465,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
 ///   "period_start": "2026-02-01",
 ///   "period_end":   "2026-02-28",
 ///   "amount_cents": 100000,
-///   "category":     "contracts",
+///   "category":     "distribution",
 ///   "account_id":  "account-00042"
 /// }
 /// ```
@@ -1496,7 +1475,10 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
 /// DR 2200 Deferred Revenue   amount_cents
 /// CR <revenue_account>       amount_cents
 /// ```
-fn revenue_recognized(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
+fn revenue_recognized(
+    fact: &FactRef<'_>,
+    revenue: &RevenueAccounts,
+) -> Result<JournalEntryDraft, LedgerError> {
     let amount = cents_from_payload(fact.payload.get("amount_cents"))
         .ok_or_else(|| payload_err(fact.kind, "amount_cents missing"))?;
     if amount <= 0 {
@@ -1507,7 +1489,7 @@ fn revenue_recognized(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerErr
         .get("category")
         .and_then(|v| v.as_str())
         .ok_or_else(|| payload_err(fact.kind, "category missing"))?;
-    let revenue_account = revenue_account_for(category)?;
+    let revenue_account = revenue.account_for(fact.kind, category)?.to_string();
 
     let memo = fact
         .payload
@@ -1534,6 +1516,24 @@ fn revenue_recognized(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerErr
 mod v2_tests {
     use super::*;
 
+    /// A tenant's revenue-category Classes, as the posting path reads
+    /// them: category -> the Class's `gl_account` (backlog aa860c6d).
+    /// The brewery example tenant's own chart codes.
+    fn rules() -> BossRuleSet {
+        BossRuleSet::new(RevenueAccounts::from_classes(
+            [
+                ("wholesale", "4100"),
+                ("retail", "4110"),
+                ("merchandise", "4110"),
+                ("taproom", "4120"),
+                ("event-package", "4130"),
+                ("distribution", "4140"),
+                ("uncategorized", "4140"),
+            ]
+            .map(|(c, a)| (c.to_string(), Some(a.to_string()))),
+        ))
+    }
+
     fn fact<'a>(id: uuid::Uuid, kind: &'a str, payload: &'a serde_json::Value) -> FactRef<'a> {
         FactRef {
             id,
@@ -1549,12 +1549,12 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-1",
             "line_items": [{
-                "category": "contracts",
+                "category": "distribution",
                 "amount_cents": 1_200_000,
                 "recognition_pattern": "ratable",
             }],
         });
-        let draft = evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).unwrap();
+        let draft = evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).unwrap();
         assert!(draft.is_balanced());
         assert_eq!(draft.total_debits(), 1_200_000);
         // Exactly one credit: 2200 for the full amount.
@@ -1577,19 +1577,19 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-bundle",
             "line_items": [
-                { "category": "new-sales", "amount_cents": 500_000, "recognition_pattern": "immediate" },
-                { "category": "contracts", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
+                { "category": "wholesale", "amount_cents": 500_000, "recognition_pattern": "immediate" },
+                { "category": "distribution", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
             ],
         });
-        let draft = evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).unwrap();
+        let draft = evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).unwrap();
         assert!(draft.is_balanced());
         // Total debits: AR carries revenue + deferred + tax. These
         // lines carry no SKU/cost_basis, so there's no FG COGS leg
         // (COGS rides the invoice only for FG lines — see
         // `invoice_issued_v2`).
         assert_eq!(draft.total_debits(), 1_700_000);
-        // Credits: 4100 = 500_000 (immediate new-sales) + 2200 =
-        // 1_200_000 (deferred contracts).
+        // Credits: 4100 = 500_000 (immediate wholesale) + 2200 =
+        // 1_200_000 (deferred distribution).
         let mut credits: Vec<(&str, i64)> = draft
             .lines
             .iter()
@@ -1609,11 +1609,11 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-multi",
             "line_items": [
-                { "category": "contracts", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
-                { "category": "service",   "amount_cents":   300_000, "recognition_pattern": "ratable" },
+                { "category": "distribution", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
+                { "category": "retail",    "amount_cents":   300_000, "recognition_pattern": "ratable" },
             ],
         });
-        let draft = evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).unwrap();
+        let draft = evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).unwrap();
         assert!(draft.is_balanced());
         // Both credits go to 2200; memos carry the categories.
         let deferred: Vec<&JournalLineDraft> = draft
@@ -1623,8 +1623,8 @@ mod v2_tests {
             .collect();
         assert_eq!(deferred.len(), 2);
         let memos: Vec<&str> = deferred.iter().filter_map(|l| l.memo.as_deref()).collect();
-        assert!(memos.iter().any(|m| m.contains("contracts")));
-        assert!(memos.iter().any(|m| m.contains("service")));
+        assert!(memos.iter().any(|m| m.contains("distribution")));
+        assert!(memos.iter().any(|m| m.contains("retail")));
     }
 
     #[test]
@@ -1634,13 +1634,13 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-tax",
             "line_items": [
-                { "category": "contracts", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
+                { "category": "distribution", "amount_cents": 1_200_000, "recognition_pattern": "ratable" },
             ],
             "tax_lines": [
                 { "account": "2300", "amount_cents": 96_000, "jurisdiction": "US-CA" },
             ],
         });
-        let draft = evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).unwrap();
+        let draft = evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).unwrap();
         assert!(draft.is_balanced());
         assert_eq!(draft.total_debits(), 1_296_000);
     }
@@ -1651,13 +1651,12 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-m",
             "line_items": [{
-                "category": "contracts",
+                "category": "distribution",
                 "amount_cents": 1_200_000,
                 "recognition_pattern": "milestone",
             }],
         });
-        let err =
-            evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).unwrap_err();
+        let err = evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).unwrap_err();
         assert!(format!("{err:?}").contains("milestone"));
     }
 
@@ -1667,12 +1666,12 @@ mod v2_tests {
         let payload = serde_json::json!({
             "invoice_id": "inv-u",
             "line_items": [{
-                "category": "contracts",
+                "category": "distribution",
                 "amount_cents": 100,
                 "recognition_pattern": "quarterly",
             }],
         });
-        assert!(evaluate(&BossRuleSet, &fact(id, "finance.invoice.issued", &payload)).is_err(),);
+        assert!(evaluate(&rules(), &fact(id, "finance.invoice.issued", &payload)).is_err(),);
     }
 
     #[test]
@@ -1683,14 +1682,10 @@ mod v2_tests {
             "period_start": "2026-02-01",
             "period_end":   "2026-02-28",
             "amount_cents": 100_000,
-            "category":     "contracts",
+            "category":     "distribution",
             "account_id":  "account-00001",
         });
-        let draft = evaluate(
-            &BossRuleSet,
-            &fact(id, "finance.revenue.recognized", &payload),
-        )
-        .unwrap();
+        let draft = evaluate(&rules(), &fact(id, "finance.revenue.recognized", &payload)).unwrap();
         assert!(draft.is_balanced());
         assert_eq!(draft.total_debits(), 100_000);
         let debit: &JournalLineDraft = draft.lines.iter().find(|l| l.debit_cents > 0).unwrap();
@@ -1708,15 +1703,11 @@ mod v2_tests {
                 "period_start": "2026-02-01",
                 "period_end":   "2026-02-28",
                 "amount_cents": amount,
-                "category":     "contracts",
+                "category":     "distribution",
                 "account_id":  "account-00001",
             });
             assert!(
-                evaluate(
-                    &BossRuleSet,
-                    &fact(id, "finance.revenue.recognized", &payload),
-                )
-                .is_err()
+                evaluate(&rules(), &fact(id, "finance.revenue.recognized", &payload),).is_err()
             );
         }
     }
@@ -1732,13 +1723,7 @@ mod v2_tests {
             "category":     "bogus",
             "account_id":  "account-00001",
         });
-        assert!(
-            evaluate(
-                &BossRuleSet,
-                &fact(id, "finance.revenue.recognized", &payload)
-            )
-            .is_err(),
-        );
+        assert!(evaluate(&rules(), &fact(id, "finance.revenue.recognized", &payload)).is_err(),);
     }
 
     // --- finance.period.closed -------------------------------------------
@@ -1767,7 +1752,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced());
         assert_eq!(draft.total_debits(), 120_000);
         // Lines: 2 DR revenue + 2 CR expense + 1 CR RE = 5 lines.
@@ -1818,7 +1803,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced(), "WIP variance close must balance");
         // Expected: DR 4100 100k, CR 5100 60k, CR RE 40k, DR RE 25k, CR 1310 25k.
         // Total debits = 100k + 25k = 125k. Total credits = 60k + 40k + 25k = 125k.
@@ -1877,7 +1862,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         // 4100, 5100, 6100 (4200 skipped as zero), RE roll, 1310 DR, RE CR.
         assert_eq!(draft.lines.len(), 6);
         let orders: Vec<i16> = draft.lines.iter().map(|l| l.sort_order).collect();
@@ -1914,7 +1899,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced());
         // DR 4100 100k + DR 1310 7k = 107k total debits.
         assert_eq!(draft.total_debits(), 107_000);
@@ -1957,7 +1942,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced());
         // DR 4100, CR 5100, CR RE — no 1310 line.
         assert_eq!(draft.lines.len(), 3);
@@ -1989,7 +1974,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let err = evaluate(&BossRuleSet, &fact_ref).unwrap_err();
+        let err = evaluate(&rules(), &fact_ref).unwrap_err();
         assert!(
             matches!(err, LedgerError::InvalidPayload { .. }),
             "expected InvalidPayload, got {err:?}"
@@ -2013,7 +1998,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2025, 4, 1).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced(), "capitalization must balance");
         assert_eq!(draft.total_debits(), 42_000);
         let raw = draft
@@ -2049,7 +2034,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced());
         let re = draft
             .lines
@@ -2083,7 +2068,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        let draft = evaluate(&rules(), &fact_ref).unwrap();
         assert!(draft.is_balanced());
         // 1 DR revenue (4140) + 1 CR RE — zero-balance 4100 and 6100 dropped.
         assert_eq!(draft.lines.len(), 2);
@@ -2105,7 +2090,7 @@ mod v2_tests {
             happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             payload: &payload,
         };
-        let err = evaluate(&BossRuleSet, &fact_ref).unwrap_err();
+        let err = evaluate(&rules(), &fact_ref).unwrap_err();
         assert!(
             matches!(err, LedgerError::InvalidPayload { .. }),
             "expected InvalidPayload, got {err:?}"
@@ -2120,11 +2105,8 @@ mod v2_tests {
             "amount_cents": 75_000_i64,
             "account_id": "acc-X",
         });
-        let draft = evaluate(
-            &BossRuleSet,
-            &fact(id, "finance.invoice.written_off", &payload),
-        )
-        .expect("write-off should evaluate");
+        let draft = evaluate(&rules(), &fact(id, "finance.invoice.written_off", &payload))
+            .expect("write-off should evaluate");
         assert!(draft.is_balanced(), "DR/CR must balance");
         let dr_6700 = draft
             .lines

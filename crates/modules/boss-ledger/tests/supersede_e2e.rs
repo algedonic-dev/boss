@@ -48,7 +48,7 @@ async fn seed_invoice_fact(db: &TestDb, invoice_id: &str) {
         "account_id": "acct-A",
         "currency": "USD",
         "line_items": [
-            {"description": "Setup fee", "amount_cents": 50000, "category": "service"},
+            {"description": "Setup fee", "amount_cents": 50000, "category": "taproom"},
         ],
     });
     insert_audit_event(
@@ -66,6 +66,7 @@ async fn seed_invoice_fact(db: &TestDb, invoice_id: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn supersede_marks_reason_and_drops_journal_entries() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_invoice_fact(&db, "inv-supersede-001").await;
 
     let entries_before: (i64,) = sqlx::query_as(
@@ -127,6 +128,7 @@ async fn supersede_marks_reason_and_drops_journal_entries() {
 #[tokio::test(flavor = "multi_thread")]
 async fn second_supersede_returns_already_superseded() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_invoice_fact(&db, "inv-supersede-002").await;
 
     let req = SupersedeRequest {
@@ -160,6 +162,7 @@ async fn second_supersede_returns_already_superseded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn supersede_returns_not_found_for_unknown_natural_key() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
 
     let req = SupersedeRequest {
         kind: "finance.invoice.issued".into(),
@@ -176,6 +179,7 @@ async fn supersede_returns_not_found_for_unknown_natural_key() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_replays_supersede_event_from_audit_log() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_invoice_fact(&db, "inv-supersede-003").await;
 
     // Apply the supersede the same way the HTTP handler does:
@@ -262,6 +266,7 @@ async fn rebuild_replays_supersede_event_from_audit_log() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_superseded_fact_posts_nothing_when_re_posted() {
     let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
     seed_invoice_fact(&db, "inv-supersede-004").await;
 
     let req = SupersedeRequest {

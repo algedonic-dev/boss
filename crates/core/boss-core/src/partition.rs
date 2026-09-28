@@ -2,7 +2,7 @@
 //!
 //! `real` is the operating company. `simulated` is the demo tenant's
 //! synthetic load (the brewery sim). `shadow` is the experiment lane
-//! (docs/design/network-experiments.md, Tier 3; packet 508cc38c, Q2
+//! (the network-experiments decision in docs/architecture-decisions.md, Tier 3; packet 508cc38c, Q2
 //! decided 2026-08-22): a protocol run against a mirror of real
 //! traffic that must reach a terminal WITHOUT effects. The three values
 //! are one fact — decided ONCE at admission and immutable thereafter —
