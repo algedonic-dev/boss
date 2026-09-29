@@ -113,7 +113,7 @@ mod tests {
         drop(listener);
         let app = router(SearchApiState {
             pool: sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
-            policy: Arc::new(ReqwestPolicyClient::new(dark)),
+            policy: Arc::new(ReqwestPolicyClient::new("search", dark)),
         });
         let resp = app
             .oneshot(

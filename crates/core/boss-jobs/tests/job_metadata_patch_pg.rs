@@ -67,6 +67,7 @@ async fn merge_adds_removes_and_leaves_the_closed_envelope_alone() {
         .merge_job_metadata_at(
             &j.id,
             &patch(serde_json::json!({ "watchlist_dismissed": "true", "stale": null })),
+            None,
             &stamp(),
         )
         .await
@@ -113,7 +114,12 @@ async fn a_jsonb_null_metadata_folds_to_an_object() {
     repo.create_job(&j).await.unwrap();
 
     let merged = repo
-        .merge_job_metadata_at(&j.id, &patch(serde_json::json!({ "a": "1" })), &stamp())
+        .merge_job_metadata_at(
+            &j.id,
+            &patch(serde_json::json!({ "a": "1" })),
+            None,
+            &stamp(),
+        )
         .await
         .unwrap();
     assert_eq!(merged.metadata, serde_json::json!({ "a": "1" }));
@@ -140,6 +146,7 @@ async fn a_close_keeps_a_key_merged_after_the_closers_read_the_row() {
     repo.merge_job_metadata_at(
         &j.id,
         &patch(serde_json::json!({ "merged_sha": "abc123" })),
+        None,
         &stamp(),
     )
     .await
@@ -236,6 +243,77 @@ async fn a_close_keeps_a_key_merged_after_the_closers_read_the_row() {
     assert!(matches!(err, JobsError::NotFound(_)), "got: {err}");
 }
 
+/// A MERGE JUDGED ON A READ LANDS ONLY ON THAT READ (the review of car
+/// 06973644, finding B). The metadata door decides whether a patch puts
+/// an experiment's split in force by merging it into the row it READ;
+/// the adapter merged into the row as it stood at write time. A writer
+/// between the two — an arm moved onto a draft at split 0 — and a patch
+/// judged harmless (`split: 100` over a published arm) put that draft
+/// in force with no one asked. Handed the read, the merge refuses when
+/// the row's status or metadata moved, writing and recording nothing;
+/// handed the row as it stands, it lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_judged_on_a_read_refuses_once_the_row_moved() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let j = job(
+        "00000000-0000-0000-0000-0000000000b1",
+        serde_json::json!({ "candidate_version": 1, "split": 0 }),
+    );
+    repo.create_job(&j).await.unwrap();
+    let read = repo.get_job(&j.id).await.unwrap().unwrap();
+
+    // Another writer, between the judge's read and its merge.
+    repo.merge_job_metadata_at(
+        &j.id,
+        &patch(serde_json::json!({ "candidate_version": 3 })),
+        None,
+        &stamp(),
+    )
+    .await
+    .unwrap();
+    let updates_before: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM event_outbox WHERE kind = 'jobs.job.updated'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+    let err = repo
+        .merge_job_metadata_at(
+            &j.id,
+            &patch(serde_json::json!({ "split": 100 })),
+            Some(&read),
+            &stamp(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, JobsError::JobChanged { .. }), "got: {err}");
+    let stored = repo.get_job(&j.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.metadata["split"], 0,
+        "the refused merge wrote nothing"
+    );
+    let updates_after: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM event_outbox WHERE kind = 'jobs.job.updated'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(updates_after, updates_before, "and recorded nothing");
+
+    // Judged on the row as it now stands, the same patch lands.
+    let merged = repo
+        .merge_job_metadata_at(
+            &j.id,
+            &patch(serde_json::json!({ "split": 100 })),
+            Some(&stored),
+            &stamp(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged.metadata["split"], 100);
+    assert_eq!(merged.metadata["candidate_version"], 3);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn merging_into_a_missing_job_is_not_found() {
     let db = TestDb::new().await;
@@ -243,7 +321,12 @@ async fn merging_into_a_missing_job_is_not_found() {
     let missing =
         JobId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-0000000000ff").unwrap());
     let err = repo
-        .merge_job_metadata_at(&missing, &patch(serde_json::json!({ "a": "1" })), &stamp())
+        .merge_job_metadata_at(
+            &missing,
+            &patch(serde_json::json!({ "a": "1" })),
+            None,
+            &stamp(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, JobsError::NotFound(_)), "got: {err}");

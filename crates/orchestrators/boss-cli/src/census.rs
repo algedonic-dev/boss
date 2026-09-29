@@ -545,18 +545,18 @@ pub struct Options {
 /// edge and strips inbound `x-boss-*`, so operator tooling has no way
 /// to present itself there (same path `boss queue` takes).
 struct Api {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     base: String,
     calls: usize,
 }
 
 impl Api {
-    fn new(base: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    fn new(base: String) -> Result<Self> {
+        Ok(Self {
+            client: crate::gate::machine_client()?,
             base,
             calls: 0,
-        }
+        })
     }
 
     async fn get_raw(&mut self, path: &str) -> Result<(reqwest::StatusCode, Value)> {
@@ -574,7 +574,7 @@ impl Api {
 /// borrows the client (the car list, via `gate::all_cars_via`) counts
 /// its own pages and adds them to [`Api::calls`].
 async fn get_raw_at(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     base: &str,
     path: &str,
 ) -> Result<(reqwest::StatusCode, Value)> {
@@ -594,7 +594,11 @@ async fn get_raw_at(
     Ok((status, body))
 }
 
-async fn get_at(client: &reqwest::Client, base: &str, path: &str) -> Result<Value> {
+async fn get_at(
+    client: &boss_core::machine_token::Client,
+    base: &str,
+    path: &str,
+) -> Result<Value> {
     let (status, body) = get_raw_at(client, base, path).await?;
     if !status.is_success() {
         bail!("GET {base}{path} -> HTTP {status}");
@@ -662,7 +666,7 @@ async fn collect(opts: Options, now: DateTime<Utc>) -> Result<Census> {
     // via gate::resolve_jobs_base.
     let base = crate::gate::resolve_jobs_base(opts.jobs_url.as_deref())?;
     let base = base.trim_end_matches('/').to_string();
-    let mut api = Api::new(base.clone());
+    let mut api = Api::new(base.clone())?;
     let mut notes: Vec<String> = Vec::new();
 
     // --- stations -------------------------------------------------

@@ -128,6 +128,13 @@ metadata_defaults = { verdict = "" }
 name = "verdict"
 field_type = "approved|declined|answered"
 required = true
+# The kind's other required field ("The substance: what was decided and
+# why"), declared so the step's contract is whole wherever it is read
+# (backlog a14f04b3; tests/a_step_declares_what_its_kind_requires.rs).
+[[workflow.step.fields]]
+name = "answer"
+field_type = "string"
+required = true
 
 [[workflow.step]]
 title = "build"

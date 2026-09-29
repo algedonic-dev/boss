@@ -8,5 +8,6 @@
   "params": [
     { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
   ],
-  "timeout": 300
+  "timeout": 300,
+  "effect": "^reap-terminated-pods: (reaped [0-9]+ pod[(]s[)]|plan .+ still holds and names no pod — nothing to reap)$"
 }

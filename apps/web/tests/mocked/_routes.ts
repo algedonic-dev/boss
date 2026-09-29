@@ -104,10 +104,10 @@ export const ROUTES: ReadonlyArray<string> = [
   // The codebase — its own sidebar row since feedback 9827c699
   // (2026-09-14; a Design tab before, backlog 06048ade). Its one read is
   // `/api/jobs?kind=maintenance-codebase-metrics`; under the mock's `[]`
-  // catch-all it renders "no packet carries a measurement" as a bordered
-  // notice, and under the outage it renders `load-failed`. The row's
-  // path is what the catalog registers; the older tab path,
-  // /it/design/codebase, retired with car N3 of design e765b3fc.
+  // catch-all it renders "No codebase-metrics packet exists yet — the
+  // 05:10 measurement has not filed" as a bordered notice, and under the
+  // outage it renders `load-failed`. The row's path is what the catalog
+  // registers (the older tab path is in RETIRED_ROUTES below).
   '/it/codebase',
   // Protocol drift — a Registry tab (4ae9969e). Its one read is
   // `/api/jobs?kind=maintenance-protocol-drift`; under the mock's `[]`
@@ -120,6 +120,11 @@ export const ROUTES: ReadonlyArray<string> = [
   // agent", and under the outage it renders `load-failed`. The per-agent
   // reads (runs, held steps) fire only for a listed agent.
   '/it/registry/agents',
+  // Credentials — a Registry tab (851259b9). Its registry read is
+  // `/api/credentials`; under the mock's `[]` catch-all it renders "the
+  // registry holds no credential" beside the declare form, and under the
+  // outage it renders `load-failed`.
+  '/it/registry/credentials',
   // The risk watchlist. Since CAR-6 it HAS a catalog entry, so the
   // drift test in route-smoke.mocked.spec.ts now enforces its presence
   // here instead of this line being the whole of its coverage.

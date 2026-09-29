@@ -247,7 +247,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
     -D) hdr="$2"; shift ;;
-    -H) case "$2" in Authorization:*) auth="$2" ;; esac; shift ;;
+    -H) case "$2" in
+          Authorization:*) echo "$2" >> "$STUB_CURL_LOG.argv-auth" ;;
+          @*) auth="$(cat "${2#@}")" ;;
+        esac; shift ;;
     --max-time|-w) shift ;;
     -*) ;;
     *) url="$1" ;;
@@ -483,6 +486,15 @@ fn the_image_is_fetched_by_its_short_tag_and_the_full_sha_is_never_requested() {
     let c = Case::new("short-tag");
     let (rc, out) = c.run(SHA_A, &[]);
     assert_eq!(rc, 0, "{out}");
+    // The pull token rode in a header FILE: the stub honours only `-H
+    // @file` as a credential and logs any `Authorization:` handed over in
+    // argv, where every local user reads it in ps (backlog 5f3ad356).
+    let argv_auth = c.curl_log.with_extension("log.argv-auth");
+    assert!(
+        !argv_auth.exists(),
+        "the pull token must never be in curl's argv: {}",
+        std::fs::read_to_string(&argv_auth).unwrap_or_default()
+    );
     let reqs = c.requests();
     let short = format!(
         "http://{REGISTRY_HOST}/v2/david/boss/manifests/{}",
@@ -1247,6 +1259,13 @@ impl Converge {
             // The address file the converge renders before it installs
             // anything: into the scratch root here, never /etc.
             .env("BOSS_GCP_CONVERGE_SOR_ENV", self.case.root.join("sor.env"))
+            // The journal cap (backlog d3c7eada): its drop-in into the
+            // scratch root, never /etc, and a restart that does nothing.
+            .env(
+                "BOSS_JOURNALD_CONF_DIR",
+                self.case.root.join("journald.conf.d"),
+            )
+            .env("BOSS_JOURNALD_SYSTEMCTL", "true")
             .env(
                 "BOSS_GCP_CONVERGE_INSTALLER",
                 self.case.bin.join("installer-ok"),
@@ -1480,6 +1499,53 @@ fn a_stubbed_cli_step_exit_75_is_a_wait_and_exit_1_is_a_red() {
         "",
         "a refusal is not a wait: {out}"
     );
+}
+
+/// A FAILED JOURNAL CAP NEVER HOLDS THE CLI BACK (backlog d3c7eada,
+/// review b5adba9d). journald is not what the converge delivers: a
+/// restart that keeps failing must leave the CLI step running on every
+/// tick, and the failure stays red — recorded on the packet and the exit
+/// non-zero at the END, over the CLI's success and over its wait's
+/// exit 0 alike.
+#[test]
+fn a_failed_journal_cap_still_runs_the_cli_step_and_reds_at_the_end() {
+    if !tools() || !has("git") {
+        return;
+    }
+    let cv = Converge::new("journal-cap-fails");
+    let stub = |rc: i32| {
+        let p = cv.case.bin.join(format!("cli-exit-{rc}"));
+        write_exec(
+            &p,
+            &format!("#!/usr/bin/env bash\necho \"stub cli step: sha=$1 exit {rc}\"\nexit {rc}\n"),
+        );
+        p
+    };
+    for cli_rc in [0, 75] {
+        let cli = stub(cli_rc);
+        let (rc, out) = cv.run(&[
+            ("BOSS_JOURNALD_SYSTEMCTL", "false".into()),
+            ("BOSS_GCP_CONVERGE_CLI_INSTALLER", cli.display().to_string()),
+        ]);
+        assert!(
+            out.contains("stub cli step: sha="),
+            "a failed journal cap must not stop the CLI step (cli exit {cli_rc}): {out}"
+        );
+        assert_ne!(
+            rc, 0,
+            "a failed journal cap reds the run at the end (cli exit {cli_rc}): {out}"
+        );
+        assert!(
+            cv.case.summary("journal_cap").starts_with("failed (exit"),
+            "the packet says the cap failed: {}",
+            cv.case.summary("journal_cap")
+        );
+        assert!(
+            cv.case.summary("anomalies").contains("journal cap"),
+            "and a note says why: {}",
+            cv.case.summary("anomalies")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

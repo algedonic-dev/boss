@@ -120,6 +120,24 @@ describe('the human/agent separation', () => {
     expect(q.notMineToDo.length).toBe(0);
   });
 
+  test('a human-kind step whose own agent block hands it to an agent is not offered to a person', () => {
+    // Backlog 1dd6d7ad: the publish review step of 246d597a is kind
+    // `checklist` (completion human) but carries an analyst block and
+    // human_only=false. It sat on David's queue and read as his: "I
+    // thought you were ready for me because it was in my backlog."
+    // The server reads the step's own block into `agent_takes`.
+    const review = row({ step: { assignee_id: null, kind: 'checklist', completion: 'human', agent_takes: true } });
+    const his = row({ step: { assignee_id: null, kind: 'checklist', completion: 'human', agent_takes: false } });
+    const older = row({ step: { assignee_id: null, kind: 'checklist', completion: 'human' } });
+    expect(needsAPerson(review)).toBe(false);
+    expect(needsAPerson(his)).toBe(true);
+    // A server that predates the fact reads as before — a person's.
+    expect(needsAPerson(older)).toBe(true);
+    const q = splitQueues([review, his, older], 'me');
+    expect(q.notMineToDo).toEqual([review]);
+    expect(q.upForGrabs.length).toBe(2);
+  });
+
   test('a claimed agent step stays with its claimant, not in the automation list', () => {
     // The split only ever partitions UNCLAIMED rows. Somebody already
     // holding an agent-completion step is mid-flight on it, and moving

@@ -43,7 +43,7 @@
   } = $props<{
     initialKind?: string;
     initialKindPrefix?: string;
-    /// A department Class code. The listing narrows to the packets
+    /// A departments-registry code. The listing narrows to the packets
     /// whose workflow row declares it — the server's join, not this
     /// page's guess. The Service queue and the Sales pipeline are
     /// mounted with it; both used to be mounted with a hardcoded
@@ -608,6 +608,14 @@
       </button>
     {/if}
   </div>
+  <!-- A failed registry read leaves Kind offering "All kinds" alone,
+       which reads as a valid, empty filter. The failure was written to
+       the new-job form's line only, unseen while the form is closed
+       (backlog 3b1ec06e, page audit 473f4f92 gap 3), so it is said here
+       too, on the shared marker, for as long as the page holds it. -->
+  {#if kindsError}
+    <p class="load-failed kinds-failed" role="alert">Couldn't load job kinds: {kindsError}</p>
+  {/if}
 
   <div class="job-actions">
     <!-- Admission is a write: a guest sees the entry buttons disabled
@@ -932,6 +940,10 @@
     display: flex;
     gap: 12px;
     margin-bottom: 16px;
+  }
+  /* Layout only: .load-failed draws the card, rail and ink. */
+  .kinds-failed {
+    margin: 0 0 16px;
   }
   /* The readonly gate is a mechanism, not a layout box — hand the
      action row's flex layout down to it so the two buttons keep

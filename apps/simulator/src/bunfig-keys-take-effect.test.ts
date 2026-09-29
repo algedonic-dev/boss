@@ -11,6 +11,7 @@ import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { scaled } from '../../web/src/dev-load';
 import { NO_BUNFIG, readDevBundle } from '../../web/scripts/serve-static-plugins';
 
 const SIMULATOR = join(import.meta.dir, '..');
@@ -33,5 +34,8 @@ test(
     expect(without.answered, without.output).toBe('/ 200, script 200');
     expect(without.compiledRoot, 'with an empty bunfig').toBe(false);
   },
-  30_000,
+  // Two dev-server boots, each bundling the SPA: 5.0 s alone on the dev
+  // pod, 30 155 ms and red in a loaded train gate (backlog ebb750cd), so
+  // the budget scales with the load the gate-runner declares.
+  scaled(30_000),
 );

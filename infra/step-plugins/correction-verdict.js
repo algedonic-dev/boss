@@ -331,26 +331,16 @@
           body: JSON.stringify({ verdict }),
         });
         if (!pr.ok) throw new Error(`metadata merge HTTP ${pr.status}: ${await pr.text()}`);
-        // 2. The PATCH answers 204 with no body, and the completion PUT
-        //    below still replaces metadata wholesale — so read the
-        //    post-merge row back and complete with THAT, never the
-        //    snapshot. (No single-step GET exists; the job's steps
-        //    list is the read the API offers.)
-        const lr = await fetch(`/api/jobs/${jobId}/steps`);
-        if (!lr.ok) throw new Error(`step read-back HTTP ${lr.status}: ${await lr.text()}`);
-        const stepsNow = await lr.json();
-        const fresh = Array.isArray(stepsNow)
-          ? stepsNow.find((s) => s.id === step.id)
-          : null;
-        if (!fresh) throw new Error('step read-back: step missing from its own job');
-        // 3. Complete with the true final shape — the fresh row's
-        //    metadata rides the body verbatim.
+        // 2. Complete with the status alone (backlog e39a9d2a, design
+        //    93d2bddb). This read the merged row back and PUT it whole
+        //    — correct, but a metadata body on the step PUT, and that
+        //    PUT is closing to any metadata body. The PUT keeps every
+        //    field a body omits, so the merge above is what the step
+        //    completes with.
         const r = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(
-            Object.assign({}, fresh, { job_id: jobId, status: 'completed' }),
-          ),
+          body: JSON.stringify({ status: 'completed' }),
         });
         // Read the code. A swallowed non-2xx here would leave the
         // surface looking saved while the fork never moved, which is

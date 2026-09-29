@@ -27,7 +27,7 @@ struct ConsumedPart {
 }
 
 pub struct InventoryPartsConsume {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     inventory_base: String,
 }
 

@@ -401,6 +401,84 @@ export async function completeWithPresence(
   };
 }
 
+/** What an elevation grants: the tier, and when it ends (epoch seconds). */
+export type Elevation = Readonly<{
+  access_tier: string;
+  elevated_at: number;
+  expires_at: number;
+}>;
+
+/**
+ * Operator access for the platform owner (backlog 3c92c5b8): the passkey
+ * signs a fresh gateway challenge, and the gateway raises THIS session to
+ * the operator tier if — and only if — it is the platform owner's, until
+ * the session itself ends. Every login starts at the user tier; OIDC alone
+ * never elevates. The gateway's refusal text is thrown as it said it.
+ */
+export async function elevateSession(): Promise<Elevation> {
+  const begin = await fetch('/api/auth/passkey/elevate/begin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  if (!begin.ok) {
+    const text = await begin.text().catch(() => '');
+    throw new Error(text || `operator access unavailable (${begin.status})`);
+  }
+  const opts = (await begin.json()) as {
+    challenge_id: string;
+    publicKey: {
+      challenge: string;
+      rpId?: string;
+      allowCredentials: { type: 'public-key'; id: string }[];
+      userVerification: UserVerificationRequirement;
+      timeout: number;
+    };
+  };
+  let credential: PublicKeyCredential | null = null;
+  try {
+    credential = (await navigator.credentials.get({
+      publicKey: {
+        challenge: b64urlToBytes(opts.publicKey.challenge).buffer as ArrayBuffer,
+        rpId: opts.publicKey.rpId,
+        allowCredentials: opts.publicKey.allowCredentials.map((c) => ({
+          type: c.type,
+          id: b64urlToBytes(c.id).buffer as ArrayBuffer,
+        })),
+        userVerification: opts.publicKey.userVerification,
+        timeout: opts.publicKey.timeout,
+      },
+    })) as PublicKeyCredential | null;
+  } catch (err) {
+    throw new Error(assertionFailure(err, opts.publicKey.allowCredentials.length));
+  }
+  if (!credential) throw new Error('Passkey prompt returned no credential.');
+  const assertion = credential.response as AuthenticatorAssertionResponse;
+  const finish = await fetch('/api/auth/passkey/elevate/finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challenge_id: opts.challenge_id,
+      credential: {
+        id: credential.id,
+        rawId: bytesToB64url(credential.rawId),
+        type: credential.type,
+        response: {
+          authenticatorData: bytesToB64url(assertion.authenticatorData),
+          clientDataJSON: bytesToB64url(assertion.clientDataJSON),
+          signature: bytesToB64url(assertion.signature),
+          userHandle: assertion.userHandle ? bytesToB64url(assertion.userHandle) : null,
+        },
+      },
+    }),
+  });
+  if (!finish.ok) {
+    const text = await finish.text().catch(() => '');
+    throw new Error(`operator access refused (${finish.status}): ${text}`);
+  }
+  return (await finish.json()) as Elevation;
+}
+
 /** Enrolment: register a new passkey for the signed-in employee. */
 export async function enrollPasskey(label: string): Promise<void> {
   const begin = await fetch('/api/auth/passkey/register/begin', {

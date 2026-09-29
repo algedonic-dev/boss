@@ -21,5 +21,6 @@
       "pattern": "^boss(-[a-z0-9]+)*$"
     }
   ],
-  "timeout": 300
+  "timeout": 300,
+  "effect": "^retire-example-reference-rows: (for-real|dry-run) namespace=.+ deleted=[0-9]+$"
 }

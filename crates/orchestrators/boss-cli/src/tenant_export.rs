@@ -81,8 +81,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use boss_core::machine_token::BlockingClient;
 use boss_core::tenant_manifest::TenantToml;
-use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
 use crate::tenant_publish::{Bases, SEED_USER};
@@ -126,19 +126,22 @@ pub struct Snapshot {
 // Reading the instance
 // ---------------------------------------------------------------------------
 
-fn seed_client() -> Result<Client> {
+fn seed_client() -> Result<BlockingClient> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
         reqwest::header::HeaderValue::from_static(SEED_USER),
     );
-    Ok(Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .default_headers(headers)
-        .build()?)
+    // Stamps the machine token per request and follows no redirect
+    // (design 6805c764 car 2, the CLI slice): the gate guards reads too.
+    Ok(BlockingClient::build(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .default_headers(headers),
+    )?)
 }
 
-fn get(client: &Client, base: &str, path: &str) -> Result<Value> {
+fn get(client: &BlockingClient, base: &str, path: &str) -> Result<Value> {
     let u = format!("{}{path}", base.trim_end_matches('/'));
     let resp = client.get(&u).send().with_context(|| format!("GET {u}"))?;
     let status = resp.status();
@@ -179,7 +182,7 @@ fn rows_of(v: Value) -> Result<Vec<Value>> {
 
 /// One list door read, its rows refused rather than guessed, and the
 /// refusal naming the door that answered.
-fn list(client: &Client, base: &str, path: &str) -> Result<Vec<Value>> {
+fn list(client: &BlockingClient, base: &str, path: &str) -> Result<Vec<Value>> {
     rows_of(get(client, base, path)?).with_context(|| format!("GET {base}{path}"))
 }
 

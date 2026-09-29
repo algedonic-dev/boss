@@ -523,7 +523,7 @@ test.describe('/ux/sales — empty, loading, and failed reads', () => {
     await expect(subtitle(page)).toHaveText('Job count unknown — the read failed');
   });
 
-  test('a failed registry read: the filter offers only "All kinds", and opening the form asks once more and says why', async ({ page }) => {
+  test('a failed registry read: the filter offers only "All kinds" and says why, and opening the form asks once more', async ({ page }) => {
     const seen = watch(page);
     await installSales(page);
     await page.route(REGISTRY, (r) => json(r, { error: 'registry down' }, 503));
@@ -532,8 +532,11 @@ test.describe('/ux/sales — empty, loading, and failed reads', () => {
     expect(await settledReads(page, () => seen.registry, 1)).toBe(1);
     await expect(kindFilter(page).locator('option')).toHaveText(['All kinds']);
     await expect(adHocButton(page)).toHaveCount(0);
-    // The list is unaffected by the registry's failure.
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+    // The list is unaffected by the registry's failure, so the one
+    // marker on the page is the registry's, said with the form closed
+    // (backlog 3b1ec06e: it used to say nothing until the form opened).
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load job kinds: HTTP 503");
+    await expect(page.getByText("Couldn't load jobs")).toHaveCount(0);
 
     await startNew(page).click();
     await expect(form(page).locator('p.form-error')).toHaveText('HTTP 503');

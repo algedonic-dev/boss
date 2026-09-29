@@ -33,16 +33,17 @@ function writePersonaCookie(id: string): void {
 // The pure half lives in ./classify so it can be tested without the
 // Svelte compiler; re-exported here so existing importers are
 // unaffected.
-import type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody, ViewerRead } from './classify';
-import { guestEmployee, classifyProbe, readPeopleRow } from './classify';
-export type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody, ViewerRead };
-export { guestEmployee, classifyProbe, readPeopleRow };
+import type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody, ViewerRead, PolicyUser } from './classify';
+import { guestEmployee, classifyProbe, readPeopleRow, probePolicyUser } from './classify';
+export type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody, ViewerRead, PolicyUser };
+export { guestEmployee, classifyProbe, readPeopleRow, probePolicyUser };
 export { BREAK_GLASS_ROLE, breakGlassOperator } from './classify';
 
 export const session = $state<SessionEnvelope>({
   value: { kind: 'loading' },
   fromGateway: false,
   readonly: false,
+  policyUser: null,
 });
 
 /// The honest synthetic identity for a read-only visitor. The old
@@ -70,6 +71,9 @@ export async function loadSession(): Promise<void> {
       if (classified) {
         session.fromGateway = true;
         session.readonly = classified.readonly;
+        // Who policy judges this session as: the gateway's own answer,
+        // never the people row (./can; backlog 9dad102c).
+        session.policyUser = probePolicyUser(body);
         session.value = classified.value;
         return;
       }
@@ -85,6 +89,7 @@ export async function loadSession(): Promise<void> {
   // every write returned 403, and it is the last piece of the mode
   // that made "who am I" a different question from "who does the
   // server think I am".
+  session.policyUser = null;
   session.value = { kind: 'unauthenticated' };
 }
 
@@ -124,6 +129,9 @@ export async function setPersona(
     // once-guest session rendering GuestHome and inert write surfaces
     // after it became a real operator.
     session.readonly = false;
+    // The dev-server signs the persona's own id and role into
+    // x-boss-user, so that is who policy judges.
+    session.policyUser = { id: emp.id, role: emp.role };
     session.value = { kind: 'ready', user: emp };
   }
 }

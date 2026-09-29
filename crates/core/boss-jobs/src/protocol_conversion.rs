@@ -41,7 +41,7 @@
 //! evidence that was never produced.
 
 use crate::registry::{StepSpec, WorkflowSpec};
-use boss_core::job::Assurance;
+use boss_core::job::{Assurance, StepStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Why a version pair is not automatically convertible. Each names the
@@ -84,6 +84,15 @@ pub enum Bites {
     /// packet and never become workable. Appending a terminal to a
     /// protocol is the common harmless case.
     IfPacketPast,
+    /// A changed `ready_when`. It bites a step that has LEFT pending —
+    /// ready, active or completed — because the predicate that opened
+    /// it is the old one, and nothing re-judges a step once it opened.
+    /// A step still pending has never been ready, and a skipped one was
+    /// skipped by the readiness engine alone (no actor, no evidence):
+    /// the re-pin re-derives both under the target ([`crate::repin`]),
+    /// so the target's predicate is simply the one they are walked by
+    /// (backlog 4c6b4b74). A step the packet does not carry bites.
+    IfPastPending,
     /// Structural: the packet cannot be walked either way.
     Always,
 }
@@ -123,6 +132,13 @@ impl Obstacle {
     fn step_past(slug: &str, reason: impl Into<String>) -> Self {
         Self {
             bites: Bites::IfPacketPast,
+            ..Self::step(slug, reason)
+        }
+    }
+    /// A changed predicate: harmless until the step has opened.
+    fn step_if_opened(slug: &str, reason: impl Into<String>) -> Self {
+        Self {
+            bites: Bites::IfPastPending,
             ..Self::step(slug, reason)
         }
     }
@@ -193,9 +209,11 @@ fn required_fields(s: &StepSpec) -> BTreeSet<&str> {
 /// it. Deciding per step-state rather than per version pair is what
 /// makes conversion routine instead of dragon-infested.
 ///
-/// `done` holds the slugs of steps this packet has already completed.
-/// Structural obstacles and workflow-level ones bite regardless — this
-/// filters, it never overrides.
+/// `at` holds the status of each step on this packet, by slug. It used
+/// to be only the completed slugs, which could not tell a step that has
+/// never been ready from one that is (backlog 4c6b4b74). Structural
+/// obstacles and workflow-level ones bite regardless — this filters, it
+/// never overrides.
 ///
 /// It judges the MOVE, and the verdict leans on what the move writes:
 /// "a step still ahead simply collects it" and "an inserted step ahead
@@ -204,11 +222,19 @@ fn required_fields(s: &StepSpec) -> BTreeSet<&str> {
 /// every inserted one ([`crate::repin::plan`], design 7cf202a9 Q2). A
 /// door that moved only the pinned version would make both false —
 /// which the first door did, measured on page-audit c0d2caf0 (1e973965).
+/// The same holds for a changed `ready_when` on a pending or skipped
+/// step ([`Bites::IfPastPending`]): it is true only because the re-pin
+/// re-derives those steps' readiness under the target.
 pub fn convertibility_for_packet(
     from: &WorkflowSpec,
     to: &WorkflowSpec,
-    done: &BTreeSet<String>,
+    at: &BTreeMap<String, StepStatus>,
 ) -> Convertibility {
+    let done: BTreeSet<&str> = at
+        .iter()
+        .filter(|(_, s)| **s == StepStatus::Completed)
+        .map(|(slug, _)| slug.as_str())
+        .collect();
     // Position in `to`, so an inserted step can be compared against how
     // far the packet has actually walked.
     let order: BTreeMap<&str, usize> = to
@@ -218,11 +244,18 @@ pub fn convertibility_for_packet(
         .map(|(i, s)| (s.title.as_str(), i))
         .collect();
     let past = |slug: &str| -> bool {
-        let Some(&at) = order.get(slug) else {
+        let Some(&pos) = order.get(slug) else {
             return true; // cannot place it — do not claim it is harmless
         };
-        done.iter()
-            .any(|d| order.get(d.as_str()).is_some_and(|&i| i > at))
+        done.iter().any(|d| order.get(d).is_some_and(|&i| i > pos))
+    };
+    // A step the packet does not carry cannot be placed, so it is not
+    // claimed harmless.
+    let past_pending = |slug: &str| -> bool {
+        !matches!(
+            at.get(slug),
+            Some(StepStatus::Pending) | Some(StepStatus::Skipped)
+        )
     };
 
     let biting: Vec<Obstacle> = convertibility(from, to)
@@ -231,9 +264,10 @@ pub fn convertibility_for_packet(
         .filter(|o| match (&o.step, o.bites) {
             // Workflow-level, and anything structural, always bites.
             (None, _) | (_, Bites::Always) => true,
-            (Some(slug), Bites::IfDone) => done.contains(slug),
-            (Some(slug), Bites::IfNotDone) => !done.contains(slug),
+            (Some(slug), Bites::IfDone) => done.contains(slug.as_str()),
+            (Some(slug), Bites::IfNotDone) => !done.contains(slug.as_str()),
             (Some(slug), Bites::IfPacketPast) => past(slug),
+            (Some(slug), Bites::IfPastPending) => past_pending(slug),
         })
         .cloned()
         .collect();
@@ -403,9 +437,14 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
         // can un-ready a ready step or re-ready a completed one. A
         // WEAKER predicate is genuinely safe, but proving implication
         // between two expressions is a different piece of work than
-        // this function, so any change is referred rather than guessed.
+        // this function, so any change is referred rather than guessed
+        // — for a step that has OPENED. One still pending or skipped is
+        // re-derived under the target by the re-pin, so for it the
+        // question of implication never arises (backlog 4c6b4b74:
+        // every backlog-item stuck at `measure` on v2-v11 was refused
+        // here on steps that had never been ready).
         if f.ready_when != t.ready_when {
-            obstacles.push(Obstacle::step(
+            obstacles.push(Obstacle::step_if_opened(
                 slug,
                 format!(
                     "`ready_when` changed ({} -> {}) — this check does not \
@@ -830,8 +869,82 @@ mod tests {
     // Per-packet conversion: decide on where the packet stands.
     // -----------------------------------------------------------------
 
-    fn done(slugs: &[&str]) -> BTreeSet<String> {
-        slugs.iter().map(|s| s.to_string()).collect()
+    fn done(slugs: &[&str]) -> BTreeMap<String, StepStatus> {
+        slugs
+            .iter()
+            .map(|s| (s.to_string(), StepStatus::Completed))
+            .collect()
+    }
+
+    fn standing(steps: &[(&str, StepStatus)]) -> BTreeMap<String, StepStatus> {
+        steps.iter().map(|(s, st)| (s.to_string(), *st)).collect()
+    }
+
+    /// The v2 -> v14 backlog-item move, reduced (backlog 4c6b4b74):
+    /// `build` gains a `measure` arm. On 70da1212 triage routed
+    /// `verify`, so `build` was SKIPPED under v2 and `measure` is
+    /// active. Nothing opened `build`, so its new predicate asks
+    /// nothing of the past — the re-pin re-derives it.
+    fn gains_a_measure_arm() -> (WorkflowSpec, WorkflowSpec) {
+        let mut measure = step("measure");
+        measure.ready_when = "steps.triage.done".to_string();
+        let mut build = step("build");
+        build.ready_when =
+            "steps.triage.done AND steps.triage.metadata.disposition = \"build\"".to_string();
+        let before = wf(vec![step("triage"), measure.clone(), build.clone()]);
+        build.ready_when = format!(
+            "({}) OR (steps.measure.done AND steps.measure.metadata.disposition = \"build\")",
+            build.ready_when
+        );
+        (before, wf(vec![step("triage"), measure, build]))
+    }
+
+    #[test]
+    fn a_changed_predicate_on_a_step_that_never_opened_is_re_derived_not_referred() {
+        let (before, after) = gains_a_measure_arm();
+        assert!(
+            !convertibility(&before, &after).is_automatic(),
+            "the version pair still refers — it speaks for packets whose build opened"
+        );
+        for build in [StepStatus::Skipped, StepStatus::Pending] {
+            let at = standing(&[
+                ("triage", StepStatus::Completed),
+                ("measure", StepStatus::Active),
+                ("build", build),
+            ]);
+            assert_eq!(
+                convertibility_for_packet(&before, &after, &at),
+                Convertibility::Automatic,
+                "build is {build:?}: no predicate of it ever held, so the target's is the one \
+                 it is walked by"
+            );
+        }
+    }
+
+    /// THE CONTROL, and the refusal the packet asked to keep: once a
+    /// step has opened, the predicate that opened it is the old one,
+    /// and this check still cannot prove the new one agrees.
+    #[test]
+    fn a_changed_predicate_on_a_step_that_opened_is_still_referred() {
+        let (before, after) = gains_a_measure_arm();
+        for build in [StepStatus::Ready, StepStatus::Active, StepStatus::Completed] {
+            let at = standing(&[
+                ("triage", StepStatus::Completed),
+                ("measure", StepStatus::Skipped),
+                ("build", build),
+            ]);
+            let v = convertibility_for_packet(&before, &after, &at);
+            assert!(
+                v.obstacles()
+                    .iter()
+                    .any(|o| o.step.as_deref() == Some("build") && o.reason.contains("ready_when")),
+                "build is {build:?}: {v:?}"
+            );
+        }
+        assert!(
+            !convertibility_for_packet(&before, &after, &standing(&[])).is_automatic(),
+            "a step the packet does not carry cannot be placed, so it bites"
+        );
     }
 
     /// THE CASE THIS WAS BUILT FOR. ship-a-change v31 appends a third

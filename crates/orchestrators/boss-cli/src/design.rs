@@ -533,7 +533,7 @@ pub(crate) fn read_exhibit(
 /// receipt copied, not retyped. The review surface checks what it
 /// fetches against that sha256 before it renders anything.
 pub(crate) async fn carry_exhibits(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     content_base: &str,
     target: &crate::attach::Target,
     exhibits: &[Exhibit],
@@ -714,7 +714,7 @@ pub async fn run(
     {
         bail!("{msg}");
     }
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
 
     // `--answers`: the feedback (or backlog item) this design decides.
     // Read BEFORE filing — the edge needs the full id, and the packet
@@ -1465,7 +1465,7 @@ mod tests {
             label: "the review step".into(),
         };
         let carried = carry_exhibits(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &target,
             &[small.clone(), big_exhibit],
@@ -1488,7 +1488,8 @@ mod tests {
         assert_eq!(e2["size_bytes"], json!(big.len()));
         let file = e2["file_ref"].as_str().expect("a file id");
 
-        let listed: Value = reqwest::Client::new()
+        let listed: Value = crate::gate::machine_client()
+            .unwrap()
             .get(format!(
                 "{base}/api/files?target_kind=step&target_id={}",
                 target.id
@@ -1503,7 +1504,7 @@ mod tests {
 
         // An unnamed attach is refused before the socket, naming why.
         let err = carry_exhibits(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &target,
             &[Exhibit::Attach {

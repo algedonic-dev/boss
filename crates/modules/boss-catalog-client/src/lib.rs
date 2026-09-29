@@ -64,7 +64,7 @@ pub trait CatalogClient: Send + Sync {
 
 pub struct ReqwestCatalogClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestCatalogClient {

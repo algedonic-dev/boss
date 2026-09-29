@@ -56,24 +56,102 @@ use statements::*;
 use tax::*;
 use tax_registry::*;
 
-/// Backend write-gate on `/api/ledger/*`. The `auditor` role is
-/// strictly read-only — prior hardening pass only hid the write
-/// buttons on the Finance UI; this returns 403 so a hand-crafted
-/// curl from an auditor session can't bypass the UI. Matches the
-/// `role === 'auditor'` check in `apps/web/src/finance/
-/// FinancePage.svelte`.
-fn reject_if_auditor(user: &User) -> Option<Response> {
-    if user.role == "auditor" {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                "auditor role is read-only for /api/ledger/*",
-            )
-                .into_response(),
-        );
-    }
-    None
+/// Who may write, asked of policy (backlog 34f0a954, 2026-09-28):
+/// `action` on `resource` through the registry-write ladder
+/// ([`boss_policy_client::writes::require_registry_write`], the classes
+/// doors' since 553cf479) — no caller 401, a deny or a grant narrower
+/// than `all` 403 (the books belong to no person and no department), a
+/// policy service that cannot answer its own 503. Until then these doors
+/// checked `reject_if_auditor` alone, so the router-wide `ledger` READ
+/// grant was all a caller needed to post a journal entry, pay a bill or
+/// file a tax return: the `smoke-tester` fixture role, which holds that
+/// read by the shipped defaults and is not on the gateway's read-only
+/// floor, wrote the ledger through every one of them. That check refused
+/// the role string "auditor", which no seed, fixture or core role
+/// carries, and was deleted once no door called it (backlog 432f0eb4).
+///
+/// The deploy superuser holds every action asked here from the platform
+/// defaults — the finance page's operator, and what the dispatcher's
+/// rules, `boss tenant publish` and a tenant engine's prepare sign as;
+/// the simulator is admitted by the binary's
+/// `SimBypassPolicyClient::from_env`; a tenant grants its finance leads
+/// `ledger` in its own seed.
+async fn require_write(
+    parts: &mut axum::http::request::Parts,
+    state: &Arc<LedgerApiState>,
+    action: boss_policy_client::Action,
+    resource: boss_policy_client::Resource,
+) -> Result<User, Response> {
+    use axum::extract::FromRequestParts;
+    let boss_policy_client::CurrentUser(user) =
+        boss_policy_client::CurrentUser::from_request_parts(parts, state).await?;
+    boss_policy_client::writes::require_registry_write(
+        state.policy.as_ref(),
+        &user,
+        action,
+        resource,
+    )
+    .await?;
+    Ok(user)
 }
+
+/// The caller of a door that ADDS a row to the books — a journal entry,
+/// a settlement, a bill, a payroll run, a filing — admitted by
+/// Create on `ledger` ([`require_write`]). An extractor rather
+/// than a call in each handler so it runs before the body is read: a
+/// refusal needs no well-formed body and says nothing about one.
+pub(super) struct LedgerCreate(pub(super) User);
+
+/// The caller of a door that CHANGES a row already on the books —
+/// settling, sweeping, paying, remitting, superseding — admitted by
+/// Update on `ledger` ([`require_write`]).
+pub(super) struct LedgerUpdate(pub(super) User);
+
+/// The caller of a door that publishes a posting or projection rule,
+/// admitted by Create on `posting-rule` ([`require_write`], backlog
+/// 432f0eb4). Not `ledger`: the posting path takes the NEWEST version of
+/// a fact kind's rule (`load_newest_rule_in_tx`), so a holder of the
+/// `ledger` grant a tenant gives its finance leads could publish version
+/// N+1 and redirect every later automated posting without writing one
+/// entry. The rules are the operating model's machinery, like the chart
+/// (`ledger-account`) and the tax regime.
+pub(super) struct PostingRuleCreate(pub(super) User);
+
+/// The caller of the rate-schedule upsert, admitted by Create on
+/// `tax-regime` ([`require_write`], backlog 432f0eb4) — the resource the
+/// tenant's filing kinds and sales-tax rates are declared under. It rode
+/// `ledger` Update until then; Create, because the door is an upsert and
+/// a grant that may only change a row must not add one.
+pub(super) struct TaxRegimeCreate(pub(super) User);
+
+/// Each extractor above is one `(action, resource)` pair asked through
+/// [`require_write`]; the pair is the whole difference between them.
+macro_rules! asks {
+    ($door:ident, $action:ident, $resource:ident) => {
+        impl axum::extract::FromRequestParts<Arc<LedgerApiState>> for $door {
+            type Rejection = Response;
+
+            async fn from_request_parts(
+                parts: &mut axum::http::request::Parts,
+                state: &Arc<LedgerApiState>,
+            ) -> Result<Self, Response> {
+                require_write(
+                    parts,
+                    state,
+                    boss_policy_client::Action::$action,
+                    boss_policy_client::Resource::$resource(),
+                )
+                .await
+                .map(Self)
+            }
+        }
+    };
+}
+
+asks!(LedgerCreate, Create, ledger);
+asks!(LedgerUpdate, Update, ledger);
+asks!(PostingRuleCreate, Create, posting_rule);
+asks!(TaxRegimeCreate, Create, tax_regime);
 
 #[derive(Clone)]
 pub struct LedgerApiState {
@@ -106,16 +184,15 @@ pub struct LedgerApiState {
 ///
 /// Everything here is the company's finances: the trial balance, all
 /// three statements, every journal entry, tax liability, bills. None
-/// of it had any read gate at all — `reject_if_auditor` is a WRITE
-/// gate (it stops an auditor session curling a POST past the hidden
-/// UI buttons), so a caller who could reach the port could read the
-/// whole ledger.
+/// of it had any read gate at all, so a caller who could reach the port
+/// could read the whole ledger.
 ///
-/// A layer rather than a per-handler check on purpose. The write gate
-/// is called from 21 handlers by hand; that shape works right up until
-/// someone adds a route and forgets, and a forgotten read gate is
-/// invisible until it is someone else's incident. A layer cannot be
-/// forgotten by a new route.
+/// A layer rather than a per-handler check on purpose: a forgotten read
+/// gate is invisible until it is someone else's incident, and a layer
+/// cannot be forgotten by a new route. The WRITE gate is per door
+/// ([`LedgerCreate`] / [`LedgerUpdate`]) because each door names its
+/// own verb; `tests/a_ledger_write_asks_policy.rs` reads every write
+/// route off this router and refuses one that admits a ledger reader.
 ///
 /// `/health` is exempt: monitoring probes it without a session, and it
 /// returns no financial data.
@@ -166,11 +243,46 @@ pub(crate) async fn event_stamp(
     state: &LedgerApiState,
     user: &boss_policy_client::User,
 ) -> boss_core::publisher::EventStamp {
-    let actor = author::signer(user);
+    stamp_as(state, author::signer(user)).await
+}
+
+/// [`event_stamp`] for a door that has already resolved who signs — the
+/// registry-write ladder's actor (backlog 59deda40), which has no
+/// fallback author on any path.
+pub(crate) async fn stamp_as(
+    state: &LedgerApiState,
+    actor: boss_core::actor::ActorId,
+) -> boss_core::publisher::EventStamp {
     match &state.publisher {
         Some(p) => p.stamp_with_actor(actor).await,
         None => boss_core::publisher::EventStamp::new("ledger", actor),
     }
+}
+
+/// The chart and tax doors' policy question (backlog 59deda40,
+/// 2026-09-28): Create on the door's own registry, through the
+/// registry-write ladder
+/// ([`boss_policy_client::writes::require_registry_write`], the classes
+/// doors' since 553cf479) — no caller 401, a deny or a grant narrower
+/// than `all` 403, a policy service that cannot answer 503 — and on an
+/// allow the stamp the door's facts are signed with. Until then both
+/// doors checked the caller's access tier and never asked policy, so no
+/// rule could widen or narrow who declares the chart or the tax regime.
+/// The sim is admitted by the binary's `SimBypassPolicyClient::from_env`
+/// (85e7f10f).
+async fn authorize_declaration(
+    state: &LedgerApiState,
+    user: &User,
+    resource: boss_policy_client::Resource,
+) -> Result<boss_core::publisher::EventStamp, Response> {
+    let actor = boss_policy_client::writes::require_registry_write(
+        state.policy.as_ref(),
+        user,
+        boss_policy_client::Action::Create,
+        resource,
+    )
+    .await?;
+    Ok(stamp_as(state, actor).await)
 }
 
 pub fn router(state: LedgerApiState) -> Router {
@@ -394,7 +506,7 @@ mod tests {
             pool: PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
             publisher: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
-            policy: Arc::new(boss_policy_client::ReqwestPolicyClient::new(dark)),
+            policy: Arc::new(boss_policy_client::ReqwestPolicyClient::new("ledger", dark)),
         });
         let resp = app
             .oneshot(

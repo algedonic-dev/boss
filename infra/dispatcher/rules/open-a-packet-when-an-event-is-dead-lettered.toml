@@ -1,0 +1,54 @@
+# The bus refused an event, and a person hears about it (backlog
+# e4019cbc, the adversarial review of the gateway-auth car, finding H1).
+#
+# The outbox relay used to stop its batch on ANY publish error and
+# retry the same head row forever, so one event over NATS max_payload
+# stalled delivery for every service behind it, with only a
+# `tracing::warn` to say so. It now classifies the error: a transport
+# failure still stops the batch and retries; a deterministic refusal
+# (payload over max_payload, invalid subject) dead-letters the row —
+# `event_outbox.dead_lettered_at` + `dead_letter_reason`, payload kept
+# whole, audit row already committed — stages
+# `events.outbox.dead_lettered` in the same transaction, and goes on.
+# This rule files the backlog-item that event is for.
+#
+# WHY A backlog-item. What to do with a refused fact is a person's call
+# — shrink the writer that produced it, raise the server's max_payload,
+# or accept it as audit-only — and the item's `triage` step is where
+# that call is made and evidenced. The event's own id rides on the item
+# as `triggered_by_event_id` (`jobs.spawn` stamps it), and the outbox
+# row it names holds the payload, so the evidence is one read away.
+#
+# NO DEDUP. Each REFUSAL is one fact: the relay's update is guarded on
+# the row still being pending, so one publish attempt sets a row aside
+# once and alarms once. A row can be refused more than once, though:
+# `boss events redeliver <outbox id>` (backlog e22b692e) puts a dead
+# letter back on the queue, and if the cause was not fixed the relay
+# refuses it again and this rule files a SECOND item for the same
+# outbox_id. That is deliberate — a redelivery that failed is news, and
+# the second item names the same row — so the rule still does not
+# dedup. The staging bound in `record_event_in_tx` refuses an oversized
+# event in its writer's own transaction, so a dead letter should be
+# rare, and every one is worth reading.
+[[rule]]
+name = "open-a-packet-when-an-event-is-dead-lettered"
+why = """
+EXTERNAL INGRESS, and a CROSS-PROTOCOL REACTOR. The cause is the bus:
+NATS refused one event outright, and no packet's protocol moved — the
+refused event may belong to any service or none, so no Workflow `on`
+consequence can see it, and a protocol cannot open a packet of another
+kind. Measured 2026-09-28 on origin/main 2923cad0 (backlog e4019cbc):
+`drain_outbox_once` answered every publish error with a warn and a
+`break`, so a refused row reached no event, no packet and no step, and
+stalled every row behind it. No authority widened: the only write is
+one standard backlog-item on the queue the kind's owner_role already
+answers for.
+"""
+# v2 (backlog 732c3cf9, 2026-09-29): the `do` args were edited at v1
+# after the row was seeded, so the seed kept the v1 row and the edit was
+# not live. A content edit is a version bump.
+version = 2
+on_event = "events.outbox.dead_lettered"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"backlog-item\"", subject_kind = "\"custom\"", subject = "\"events\"", title = "\"The bus refused an event, and the relay dead-lettered it\"", "metadata.input_channel" = "\"telemetry/monitoring\"", "metadata.area" = "\"events\"", "metadata.outbox_id" = "outbox_id", "metadata.event_id" = "event_id", "metadata.event_kind" = "event_kind", "metadata.event_source" = "event_source", "metadata.payload_bytes" = "payload_bytes", "metadata.reason" = "reason", "metadata.description" = "\"The outbox relay's publish of one event was refused by the bus deterministically, so the relay set the row aside and delivered the rows behind it. The event (event_id, kind event_kind, staged by event_source) is in audit_log; it never reached the bus, so no subscriber saw it. Its outbox row (event_outbox.id = outbox_id) keeps the payload whole, with the refusal in dead_letter_reason; reason carries the same words. Decide at triage: shrink what the writer puts on the event, raise the server's max_payload, or accept the fact as audit-only. Once the cause is fixed, boss events redeliver outbox_id puts the row back on the relay's queue (it then reaches subscribers after the later events already delivered); to accept it as audit-only, boss events redeliver outbox_id --resolve --reason-file PATH records why, and a resolution is final.\"" }

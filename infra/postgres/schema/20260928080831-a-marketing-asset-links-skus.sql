@@ -1,0 +1,27 @@
+-- 20260928080831-a-marketing-asset-links-skus.sql — the marketing
+-- asset's SKU links lose the device shop's name.
+--
+-- WHY (backlog f925b58b; page audit 7cdb095b gap 9, decided
+-- 2026-09-28). `linked_device_skus` is a used-device-shop leftover:
+-- the shop was retired on 2026-09-24 (a8991c86), and the one tenant
+-- that uses the page links products, not devices. MEASURED 2026-09-28
+-- on origin/main 7b46f277: 39 of the 39 SKUs linked in the example
+-- tenant's marketing-assets.json are `FP-` products, and
+-- the detail page routed by that prefix — `FP-` to /ux/products,
+-- anything else to the shop's /ux/catalog. The same car renames the
+-- field in boss-catalog's types and adapter, the web types and pages,
+-- and the seed, and links every SKU to its product page.
+--
+-- WHY A RENAME AND NOT EXPAND/CONTRACT (docs/design/schema-migrations.md).
+-- The column is read by one service, boss-catalog-api, which starts
+-- only where a tenant turns on `equipment` or `marketing-assets` (off
+-- on the system of record), and no event carries the field: a
+-- marketing-asset write leaves no fact yet (boss-events
+-- writes-without-a-fact.txt names both gaps), so no log payload holds
+-- the old name for a rebuilder to misread. What an old catalog pod can
+-- lose is its marketing-asset reads for the length of one rollout on
+-- the playground. Pre-1.0.0 a one-person company moves outright rather
+-- than carry a shim. The GIN index follows the column (Postgres keeps
+-- it on a rename) and was already named `marketing_assets_linked_skus_gin`.
+
+ALTER TABLE marketing_assets RENAME COLUMN linked_device_skus TO linked_skus;

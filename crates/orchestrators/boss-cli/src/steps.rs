@@ -76,6 +76,51 @@ pub enum Cmd {
         /// of its id, or the full uuid). Recorded as `duplicate_of`.
         #[arg(long)]
         of: Option<String>,
+        /// Mark the item trust-boundary: its car waits at the dock HELD
+        /// for an adversarial review. One of the areas
+        /// `infra/platform/trust-areas.toml` lists (a name it does not
+        /// list is refused, naming them). Written onto the packet as
+        /// `metadata.trust_boundary`, which `boss brief`/`boss dispatch`
+        /// print with the `--hold` the builder's gate needs, and which
+        /// `boss gate` refuses a park without `--hold` on (backlog
+        /// 486dde37). A `build` or `design` route without it names the
+        /// areas. The list is read from the worktree the verb runs in,
+        /// else the checkout `BOSS_TREE` names (the pod's shim sets it),
+        /// else the one this binary was built from; with none of them it
+        /// refuses before writing, naming each (backlog a693cf9d).
+        #[arg(long, value_name = "AREA", requires = "trust_reason")]
+        trust_boundary: Option<String>,
+        /// What crosses the area — recorded beside it for the builder
+        /// and the reviewer. SINGLE-quote it (backlog 2376b89e).
+        #[arg(long, value_name = "WHY", requires = "trust_boundary")]
+        trust_reason: Option<String>,
+    },
+    /// Mark an item trust-boundary after its triage: its car waits at the dock HELD.
+    ///
+    /// The door for an item triaged before the mark existed, or whose
+    /// triager missed it (backlog b9352041). The area must be one
+    /// `infra/platform/trust-areas.toml` lists — the refusal names them —
+    /// and the mark is written as `metadata.trust_boundary` through the
+    /// job's merge door, then read back. It touches no step. An item
+    /// already marked in that area is left as it is and said so.
+    Mark {
+        /// The item: 8+ characters of its id, or the full uuid.
+        item: String,
+        /// The area the change crosses — one the list holds.
+        #[arg(long, value_name = "AREA")]
+        trust_boundary: String,
+        /// What crosses the area — recorded beside it for the builder
+        /// and the reviewer. SINGLE-quote it (backlog 2376b89e).
+        #[arg(
+            long,
+            value_name = "WHY",
+            required_unless_present = "trust_reason_file"
+        )]
+        trust_reason: Option<String>,
+        /// The reason, read from this file — no shell between the bytes
+        /// and the record. Exclusive with --trust-reason.
+        #[arg(long, conflicts_with = "trust_reason")]
+        trust_reason_file: Option<std::path::PathBuf>,
     },
     /// Complete a design-doc's ready `fold` step with what current truth gained.
     ///
@@ -130,6 +175,49 @@ pub enum Cmd {
         /// (backlog 2376b89e).
         #[arg(long)]
         diagnosis_file: Option<std::path::PathBuf>,
+        /// Release a car held for its adversarial review on that
+        /// review's verdict: the FULL id of the reviewer's agent-run,
+        /// whose `boss review` recorded RELEASE at the car's current
+        /// forge head. The release is recorded on the review step with
+        /// the head, the review, who released it, when, and main — and
+        /// the conductor boards the car only while its head is that
+        /// head (backlog b7b02024, design 7cedfa29).
+        ///
+        /// A HUMAN ALONE, WITH NO AGENT RUNNING (DR rule 62dac114: no dead
+        /// end on the operator's path), releases a review-held car in
+        /// three commands — only the run that BUILT the car is refused:
+        ///
+        /// 1. boss job file --kind agent-run --title 'Review of <car> by <you>'   (prints the new run's full id)
+        ///
+        /// 2. BOSS_AGENT_RUN=<that id> boss review <car> --verdict release
+        ///
+        /// 3. boss release <car> --review <that id>
+        ///
+        /// The run opened in step 1 has no agent to report it, so the
+        /// silence clock later closes it `died` and /it/crew shows it as
+        /// such. That is expected, and says nothing about the release.
+        /// Pinned end to end, as a human through the real jobs router, by
+        /// `a_human_alone_releases_a_review_held_car_through_the_three_verbs`.
+        #[arg(long, conflicts_with = "diagnosis_file")]
+        review: Option<String>,
+    },
+    /// Record this run's review verdict on a car: RELEASE or CHANGES.
+    ///
+    /// Runs inside the reviewer's own run (`BOSS_AGENT_RUN`) and writes
+    /// `review = {car, branch, reviewed_sha, verdict, findings, at}` on
+    /// that agent-run packet, the sha read from the forge. The run that
+    /// built the car is refused. A RELEASE is what `boss release <car>
+    /// --review <run>` releases on (backlog b7b02024, design 7cedfa29).
+    Review {
+        /// The car: its branch, or 8+ characters of its id.
+        car: String,
+        /// `release` or `changes`.
+        #[arg(long)]
+        verdict: String,
+        /// The review's findings, read from this file — no shell
+        /// between the prose and the record (backlog 2376b89e).
+        #[arg(long)]
+        findings_file: Option<std::path::PathBuf>,
     },
     /// Step verbs that belong to no one protocol — today, the generic completion.
     Step {
@@ -214,6 +302,8 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             evidence,
             evidence_file,
             of,
+            trust_boundary,
+            trust_reason,
         } => {
             let evidence = crate::prose::text_or_file(
                 "--evidence",
@@ -221,7 +311,42 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                 evidence,
                 evidence_file.as_deref(),
             )?;
-            triage(&wire, &item, &disposition, &evidence, of.as_deref()).await
+            // Judged against the list HERE, before anything is read or
+            // written: an area the list does not hold costs one line.
+            let mark = match (trust_boundary, trust_reason) {
+                (Some(area), Some(why)) => {
+                    let areas = crate::trust_boundary::read_areas_for_the_verb()?;
+                    Some(
+                        crate::trust_boundary::mark(&areas, &area, &why)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    )
+                }
+                _ => None,
+            };
+            triage(
+                &wire,
+                &item,
+                &disposition,
+                &evidence,
+                of.as_deref(),
+                mark.as_ref(),
+            )
+            .await
+        }
+        Cmd::Mark {
+            item,
+            trust_boundary,
+            trust_reason,
+            trust_reason_file,
+        } => {
+            let why = crate::prose::text_or_file(
+                "--trust-reason",
+                "--trust-reason-file",
+                trust_reason,
+                trust_reason_file.as_deref(),
+            )?;
+            let areas = crate::trust_boundary::read_areas_for_the_verb()?;
+            mark_trust_boundary(&wire, &item, &areas, &trust_boundary, &why).await
         }
         Cmd::Fold {
             design,
@@ -241,10 +366,45 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::Release {
             car,
             diagnosis_file: None,
+            review: Some(review),
+        } => {
+            crate::review_verdict::release(&wire, &car, &review, crate::review_verdict::forge_sha)
+                .await
+        }
+        Cmd::Release {
+            car,
+            diagnosis_file: None,
+            review: None,
         } => hold(&wire, &car, None).await,
+        Cmd::Review {
+            car,
+            verdict,
+            findings_file,
+        } => {
+            let findings = match findings_file {
+                Some(p) => crate::prose::text_or_file(
+                    "--findings-file",
+                    "--findings-file",
+                    None,
+                    Some(p.as_path()),
+                )?,
+                None => String::new(),
+            };
+            let run = std::env::var(crate::gate::AGENT_RUN_ENV).ok();
+            crate::review_verdict::record(
+                &wire,
+                &car,
+                &verdict,
+                &findings,
+                run.as_deref(),
+                crate::review_verdict::forge_sha,
+            )
+            .await
+        }
         Cmd::Release {
             car,
             diagnosis_file: Some(path),
+            ..
         } => {
             let diagnosis = crate::prose::text_or_file(
                 "--diagnosis-file",
@@ -708,6 +868,29 @@ pub(crate) fn release_patch_body() -> Value {
     json!({ "hold": Value::Null })
 }
 
+/// What a BARE release tells the operator. A hold judged at a head
+/// (`hold_sha`, a review hold) is not released by clearing the marker:
+/// the conductor boards such a car only on a release that names a
+/// review whose verdict is RELEASE at its current head, and holds it
+/// again otherwise (backlog b7b02024, design 7cedfa29 D6). The write is
+/// not refused — a human's road stays as it was until design 7cedfa29
+/// Q1 is built (car 3, behind 62dac114) — but it is not left to be
+/// discovered at the next tick.
+pub(crate) fn bare_release_note(review: &Value) -> String {
+    let judged = review
+        .pointer(&format!("/metadata/{}", boss_jobs::car::HOLD_SHA))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    if judged {
+        "this was a REVIEW hold (it records hold_sha): the conductor holds the car again at \
+         the next tick unless a review releases it — `boss review <car> --verdict release` \
+         inside the reviewer's run, then `boss release <car> --review <that run's full id>`"
+            .to_string()
+    } else {
+        "it boards at the next tick".to_string()
+    }
+}
+
 // ----------------------------------------------------------------------
 // The wire: one signed client, the reads and the read-backs.
 // ----------------------------------------------------------------------
@@ -717,7 +900,7 @@ pub(crate) fn release_patch_body() -> Value {
 /// call, so a test can hand in a named actor and drive the whole
 /// verb against a stub socket without touching the process env.
 pub(crate) struct Wire {
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
     base: String,
     caller: Option<identity::Caller>,
 }
@@ -726,18 +909,15 @@ impl Wire {
     /// The live one: the system of record `BOSS_JOBS_URL` names and the
     /// actor `BOSS_ACTOR` (or the actor file) names.
     pub(crate) fn live() -> Result<Self> {
-        Ok(Self::at(
-            crate::gate::resolve_jobs_base(None)?,
-            identity::caller(),
-        ))
+        Self::at(crate::gate::resolve_jobs_base(None)?, identity::caller())
     }
 
-    pub(crate) fn at(base: String, caller: Option<identity::Caller>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
+    pub(crate) fn at(base: String, caller: Option<identity::Caller>) -> Result<Self> {
+        Ok(Self {
+            http: crate::gate::machine_client()?,
             base,
             caller,
-        }
+        })
     }
 
     /// One signed call. `pub(crate)` since 13d1fff3: the cadence
@@ -997,6 +1177,33 @@ pub(crate) async fn triage(
     disposition: &str,
     evidence: &str,
     of: Option<&str>,
+    // The trust-boundary mark, already judged against the list at the
+    // verb's edge (`trust_boundary::mark`), or none.
+    mark: Option<&crate::trust_boundary::Mark>,
+) -> Result<()> {
+    triage_with(
+        wire,
+        item,
+        disposition,
+        evidence,
+        of,
+        mark,
+        crate::trust_boundary::read_areas_for_the_verb,
+    )
+    .await
+}
+
+/// [`triage`], with the reader of the trust-area list handed in — the
+/// verb's is [`crate::trust_boundary::read_areas_for_the_verb`], and a
+/// test's is a list or a failure it chose.
+pub(crate) async fn triage_with(
+    wire: &Wire,
+    item: &str,
+    disposition: &str,
+    evidence: &str,
+    of: Option<&str>,
+    mark: Option<&crate::trust_boundary::Mark>,
+    read_areas: impl FnOnce() -> Result<Vec<crate::trust_boundary::Area>>,
 ) -> Result<()> {
     let packet = wire.resolve(item, None).await?;
     let step = open_step(&packet, "triage").map_err(|e| anyhow!("{e}"))?;
@@ -1020,18 +1227,129 @@ pub(crate) async fn triage(
         .map_err(|e| anyhow!("{}: {e}", short(&packet)))?;
     let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
     let sid = step_id(step)?;
+    // THE OFFER'S LIST BEFORE THE ROUTE (backlog a693cf9d): a route that
+    // opens a build, on an item nobody marked, names the trust areas —
+    // and the list is read HERE, before any write, because a list that
+    // could not be read used to cost one stderr line after the item had
+    // already been routed unmarked. A refusal leaves the step open.
+    let offer = if mark.is_none()
+        && matches!(disposition, "build" | "design")
+        && crate::trust_boundary::declared(&packet).is_none()
+    {
+        Some(read_areas().with_context(|| {
+            format!(
+                "{}: a `{disposition}` route on an unmarked item offers the trust areas, and \
+                 {} could not be read — nothing was written; the triage step is still open",
+                short(&packet),
+                crate::trust_boundary::REGISTRY
+            )
+        })?)
+    } else {
+        None
+    };
+    // THE MARK BEFORE THE ROUTE (backlog 486dde37): once `build` is
+    // recorded the item can be dispatched, and a dispatch that reads it
+    // unmarked briefs its builder to gate unheld. Every refusal above
+    // has already had its say, so a mark never lands on a refused route.
+    if let Some(m) = mark {
+        wire.patch_job_metadata(jid, json!({ crate::trust_boundary::KEY: m.value() }))
+            .await
+            .context("writing the trust-boundary mark onto the packet")?;
+    }
     wire.complete_step(jid, sid, &writes).await?;
 
     let after = wire.packet(jid).await?;
     confirm_completed(step_after(&after, sid)?, &writes)?;
+    if let Some(m) = mark
+        && crate::trust_boundary::declared(&after).as_ref() != Some(m)
+    {
+        bail!(
+            "{}: triage completed, but the packet does not hold the trust-boundary mark that \
+             was sent ({}) — re-mark it with `boss mark` before it is dispatched",
+            short(&packet),
+            m.value()
+        );
+    }
+    // THE OFFER: a route that opens a build, on an item nobody marked,
+    // names the areas — the triager is the one who measured the change.
+    // The list was read above, before the first write.
+    if let Some(areas) = &offer
+        && crate::trust_boundary::declared(&after).is_none()
+    {
+        eprintln!("{}", crate::trust_boundary::offer(areas, jid));
+    }
     println!(
-        "boss triage: {} \"{}\" — triage completed: {disposition}{}\n  {}",
+        "boss triage: {} \"{}\" — triage completed: {disposition}{}{}\n  {}",
         short(&packet),
         title_of(&packet),
         original
             .as_ref()
             .map(|o| format!(" of {} \"{}\"", short(o), title_of(o)))
             .unwrap_or_default(),
+        mark.and_then(|m| m.area.as_deref())
+            .map(|a| format!(", marked trust-boundary ({a}) — its car is gated held"))
+            .unwrap_or_default(),
+        standing(&after)
+    );
+    Ok(())
+}
+
+/// `boss mark`: the trust-boundary mark on an item already triaged
+/// (backlog b9352041). Judged against the list before anything is read,
+/// written through the job's merge door — never a step — and read back:
+/// a 2xx the packet does not reflect is a failure. An item already
+/// marked in that area is left alone ([`crate::trust_boundary::plan`]).
+pub(crate) async fn mark_trust_boundary(
+    wire: &Wire,
+    item: &str,
+    areas: &[crate::trust_boundary::Area],
+    area: &str,
+    reason: &str,
+) -> Result<()> {
+    use crate::trust_boundary::{KEY, Plan, declared, mark, plan};
+    let want = mark(areas, area, reason).map_err(|e| anyhow!("{e}"))?;
+    let packet = wire.resolve(item, None).await?;
+    let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
+    let area = want.area.as_deref().unwrap_or("?");
+    let was = match plan(&packet, &want) {
+        Plan::Already(have) => {
+            println!(
+                "boss mark: {} \"{}\" — already marked trust-boundary ({area}): {}; nothing \
+                 written. Its car is gated held.",
+                short(&packet),
+                title_of(&packet),
+                have.reason.as_deref().unwrap_or("(no reason recorded)")
+            );
+            return Ok(());
+        }
+        Plan::Write(was) => was,
+    };
+    wire.patch_job_metadata(jid, json!({ KEY: want.value() }))
+        .await
+        .context("writing the trust-boundary mark onto the packet")?;
+    let after = wire.packet(jid).await?;
+    if declared(&after).as_ref() != Some(&want) {
+        bail!(
+            "{}: the API answered the write, but the packet does not hold the trust-boundary \
+             mark that was sent ({}) — it reads {}",
+            short(&packet),
+            want.value(),
+            after
+                .get("metadata")
+                .and_then(|m| m.get(KEY))
+                .cloned()
+                .unwrap_or(Value::Null)
+        );
+    }
+    println!(
+        "boss mark: {} \"{}\" — marked trust-boundary ({area}){}; its car is gated held\n  {}",
+        short(&packet),
+        title_of(&packet),
+        was.map(|m| format!(
+            ", replacing the mark in area {}",
+            m.area.as_deref().unwrap_or("(none recorded)")
+        ))
+        .unwrap_or_default(),
         standing(&after)
     );
     Ok(())
@@ -1135,10 +1453,11 @@ pub(crate) async fn hold(wire: &Wire, car: &str, reason: Option<&str>) -> Result
                 .unwrap_or_else(|| "with no hold".into())
         ),
         (None, None) => println!(
-            "boss release: {} {branch} \"{}\" — released (was: {})\n  it boards at the next tick",
+            "boss release: {} {branch} \"{}\" — released (was: {})\n  {}",
             short(&packet),
             title_of(&packet),
-            already.unwrap_or_default()
+            already.unwrap_or_default(),
+            bare_release_note(review)
         ),
         (None, Some(held)) => {
             bail!("the API answered the write but the review step still reads as held: {held:?}")
@@ -2479,13 +2798,14 @@ mod tests {
             original,
         ])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         triage(
             &wire,
             "0d2e1655",
             "duplicate",
             "same defect, older packet",
             Some("236529aa"),
+            None,
         )
         .await
         .expect("completes");
@@ -2523,6 +2843,187 @@ mod tests {
         );
     }
 
+    /// THE TRIAGER MARKS A TRUST-BOUNDARY ITEM (backlog 486dde37). The
+    /// mark goes onto the packet through the job's merge door BEFORE the
+    /// step completes — the route is the last write, as it always was —
+    /// and is read back with the completion. A refused route writes no
+    /// mark either.
+    #[tokio::test]
+    async fn triage_marks_a_trust_boundary_item_before_it_routes_it() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![step("filed", "completed"), backlog_triage("ready")],
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let mark = crate::trust_boundary::Mark {
+            area: Some("credentials".into()),
+            reason: Some("reads the broker's Secret".into()),
+        };
+        let err = triage(&wire, "0d2e1655", "wontfix", "x", None, Some(&mark))
+            .await
+            .expect_err("a refused route");
+        assert!(err.to_string().contains("wontfix"), "{err}");
+        assert!(s.puts.lock().unwrap().is_empty(), "no mark without a route");
+
+        triage(
+            &wire,
+            "0d2e1655",
+            "build",
+            "holds on main",
+            None,
+            Some(&mark),
+        )
+        .await
+        .expect("routes and marks");
+        let puts = s.puts.lock().unwrap().clone();
+        assert_eq!(
+            puts[0],
+            (
+                "/0d2e1655-02c0-47d1-942a-5c8ae661f27f/metadata".to_string(),
+                json!({ "trust_boundary": mark.value() })
+            ),
+            "the mark first, on the packet: {puts:?}"
+        );
+        assert_eq!(puts.len(), 3, "the mark, the merge, the status: {puts:?}");
+        let after = s.packets.lock().unwrap();
+        assert_eq!(
+            crate::trust_boundary::declared(&after[0]),
+            Some(mark),
+            "read back off the packet"
+        );
+        assert_eq!(after[0]["steps"][1]["status"], "completed");
+    }
+
+    /// The live list, read from the tree by the manifest's path — not
+    /// `git rev-parse`, which the gate's uid may be refused on a tree it
+    /// does not own.
+    fn areas() -> Vec<crate::trust_boundary::Area> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        crate::trust_boundary::read_areas(&root).expect("the trust-area list reads")
+    }
+
+    /// `boss mark` (backlog b9352041): an item ALREADY TRIAGED is marked
+    /// through the job's merge door, validated against the list, and the
+    /// mark is read back. It touches no step — the triage stays
+    /// completed and the build stays where it was. This is the pin that
+    /// `boss job patch` is not the only writer of the key: until this
+    /// verb, it was, and it writes whatever it is given.
+    #[tokio::test]
+    async fn mark_writes_the_key_through_the_job_merge_door_and_touches_no_step() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![backlog_triage("completed"), step("build", "active")],
+        )])
+        .await;
+        let steps_before = s.packets.lock().unwrap()[0]["steps"].clone();
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        mark_trust_boundary(
+            &wire,
+            "0d2e1655",
+            &areas(),
+            "gateway-route",
+            "trusts x-boss-user from the LAN",
+        )
+        .await
+        .expect("marks");
+        let puts = s.puts.lock().unwrap().clone();
+        assert_eq!(
+            puts,
+            vec![(
+                "/0d2e1655-02c0-47d1-942a-5c8ae661f27f/metadata".to_string(),
+                json!({ crate::trust_boundary::KEY: {
+                    "area": "gateway-route", "reason": "trusts x-boss-user from the LAN" } })
+            )],
+            "one write, to the job's merge door, carrying the key"
+        );
+        let after = s.packets.lock().unwrap();
+        assert_eq!(
+            crate::trust_boundary::declared(&after[0]),
+            Some(crate::trust_boundary::Mark {
+                area: Some("gateway-route".into()),
+                reason: Some("trusts x-boss-user from the LAN".into()),
+            })
+        );
+        assert_eq!(after[0]["steps"], steps_before, "no step was touched");
+    }
+
+    /// An unlisted area, a blank reason and an unnamed actor are each
+    /// refused before anything reaches the socket, and the area refusal
+    /// names the list.
+    #[tokio::test]
+    async fn every_mark_refusal_happens_before_any_write() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![backlog_triage("completed"), step("build", "active")],
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = mark_trust_boundary(&wire, "0d2e1655", &areas(), "secrets", "x")
+            .await
+            .expect_err("unlisted");
+        let err = err.to_string();
+        assert!(
+            err.contains("secrets")
+                && err.contains(crate::trust_boundary::REGISTRY)
+                && err.contains("credentials"),
+            "names the list: {err}"
+        );
+        let err = mark_trust_boundary(&wire, "0d2e1655", &areas(), "policy", "  ")
+            .await
+            .expect_err("blank");
+        assert!(err.to_string().contains("--trust-reason"), "{err}");
+        let unnamed = Wire::at(s.base.clone(), None).unwrap();
+        let err = mark_trust_boundary(&unnamed, "0d2e1655", &areas(), "policy", "grants")
+            .await
+            .expect_err("unnamed");
+        assert!(format!("{err:#}").contains(identity::ACTOR_ENV), "{err:#}");
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+    }
+
+    /// IDEMPOTENT over a hand mark: the three items the coordinator
+    /// marked through `boss job patch` on 2026-09-28 (b8e75382,
+    /// 6c9183de, 2710c8fc) carry `marked_at`/`marked_by`/`note` beside
+    /// the area. `boss mark` in the same area says so and writes
+    /// nothing — it does not clobber the note that explains the mark.
+    #[tokio::test]
+    async fn mark_on_an_item_already_marked_in_that_area_writes_nothing() {
+        let mut p = packet(
+            "backlog-item",
+            vec![backlog_triage("completed"), step("build", "ready")],
+        );
+        p["metadata"][crate::trust_boundary::KEY] = json!({
+            "area": "policy",
+            "marked_at": "2026-09-28T04:59:58Z",
+            "marked_by": "agent-claude",
+            "note": "marked through boss job patch because the validated mark door (b9352041) is not built yet",
+            "reason": "Policy authority is not bounded",
+        });
+        let s = stub(vec![p.clone()]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        mark_trust_boundary(&wire, "0d2e1655", &areas(), "policy", "again")
+            .await
+            .expect("already marked is not an error");
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing written");
+        assert_eq!(s.packets.lock().unwrap()[0], p, "the hand mark stands");
+    }
+
+    /// A 2xx that did not land the mark is a failure, not "marked".
+    #[tokio::test]
+    async fn a_mark_the_packet_does_not_reflect_is_a_failure() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![backlog_triage("completed")],
+        )])
+        .await;
+        s.drop_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = mark_trust_boundary(&wire, "0d2e1655", &areas(), "publish", "mirrors")
+            .await
+            .expect_err("a dropped write must not read as marked");
+        assert!(err.to_string().contains("does not hold"), "{err}");
+    }
+
     /// The refusals happen BEFORE the write: a wrong disposition, a
     /// packet not at triage, and an unnamed actor each leave the stub
     /// with no PUT at all.
@@ -2533,8 +3034,8 @@ mod tests {
             vec![step("filed", "completed"), backlog_triage("ready")],
         )])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
-        let err = triage(&wire, "0d2e1655", "wontfix", "x", None)
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = triage(&wire, "0d2e1655", "wontfix", "x", None, None)
             .await
             .expect_err("wontfix");
         assert!(
@@ -2542,7 +3043,7 @@ mod tests {
                 .contains("[verify, design, build, duplicate, stale, decline]"),
             "{err}"
         );
-        let err = triage(&wire, "0d2e1655", "duplicate", "x", None)
+        let err = triage(&wire, "0d2e1655", "duplicate", "x", None, None)
             .await
             .expect_err("no --of");
         assert!(err.to_string().contains("--of"), "{err}");
@@ -2552,13 +3053,14 @@ mod tests {
             "duplicate",
             "x",
             Some("ffffffff-0000-0000-0000-000000000000"),
+            None,
         )
         .await
         .expect_err("--of names nothing");
         assert!(err.to_string().contains("--of ffffffff"), "{err}");
         // Backlog 5083d6f5: a write nobody named does not go out.
-        let unnamed = Wire::at(s.base.clone(), None);
-        let err = triage(&unnamed, "0d2e1655", "stale", "gone", None)
+        let unnamed = Wire::at(s.base.clone(), None).unwrap();
+        let err = triage(&unnamed, "0d2e1655", "stale", "gone", None, None)
             .await
             .expect_err("unnamed");
         assert!(err.to_string().contains(identity::ACTOR_ENV), "{err}");
@@ -2568,11 +3070,94 @@ mod tests {
         );
         // And the one that is not a refusal: already triaged.
         s.packets.lock().unwrap()[0]["steps"][1]["status"] = json!("completed");
-        let err = triage(&wire, "0d2e1655", "stale", "gone", None)
+        let err = triage(&wire, "0d2e1655", "stale", "gone", None, None)
             .await
             .expect_err("done");
         assert!(err.to_string().contains("`triage` is completed"), "{err}");
         assert!(s.puts.lock().unwrap().is_empty());
+    }
+
+    /// THE OFFER NEVER SKIPS IN SILENCE (backlog a693cf9d). Run from an
+    /// analyst's scratchpad, the offer used to print one stderr line
+    /// AFTER the triage had completed and routed an item unmarked. A
+    /// `build` or `design` route on an unmarked item now reads the list
+    /// FIRST, and a list it cannot read refuses the verb before any write
+    /// — the step stays open, so the triager can mark it and route again.
+    #[tokio::test]
+    async fn a_route_whose_trust_areas_cannot_be_read_refuses_before_any_write() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![step("filed", "completed"), backlog_triage("ready")],
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        for route in ["build", "design"] {
+            let err = triage_with(&wire, "0d2e1655", route, "holds", None, None, || {
+                Err(anyhow!("no list: looked in the cwd, BOSS_TREE"))
+            })
+            .await
+            .expect_err("no list, no route");
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("no list: looked in the cwd, BOSS_TREE")
+                    && err.contains(crate::trust_boundary::REGISTRY)
+                    && err.contains("nothing was written"),
+                "the refusal carries where it looked and says the step is untouched: {err}"
+            );
+        }
+        assert!(s.puts.lock().unwrap().is_empty(), "no write went out");
+        assert_eq!(s.packets.lock().unwrap()[0]["steps"][1]["status"], "ready");
+    }
+
+    /// The list is read only where the offer would be made: a route that
+    /// opens no build, and an item someone already marked, never ask.
+    #[tokio::test]
+    async fn only_an_unmarked_build_or_design_route_needs_the_list() {
+        let unreadable =
+            || -> Result<Vec<crate::trust_boundary::Area>> { Err(anyhow!("no list anywhere")) };
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![step("filed", "completed"), backlog_triage("ready")],
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        triage_with(&wire, "0d2e1655", "stale", "gone", None, None, unreadable)
+            .await
+            .expect("a stale route offers nothing, so it needs no list");
+
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![step("filed", "completed"), backlog_triage("ready")],
+        )])
+        .await;
+        s.packets.lock().unwrap()[0]["metadata"][crate::trust_boundary::KEY] =
+            json!({ "area": "credentials", "reason": "marked by hand" });
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        triage_with(&wire, "0d2e1655", "build", "holds", None, None, unreadable)
+            .await
+            .expect("an item already marked is offered nothing");
+    }
+
+    /// And where the list IS read, the route goes through: the areas
+    /// were in hand before the first write.
+    #[tokio::test]
+    async fn an_unmarked_build_route_reads_the_list_and_routes() {
+        let s = stub(vec![packet(
+            "backlog-item",
+            vec![step("filed", "completed"), backlog_triage("ready")],
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        triage_with(&wire, "0d2e1655", "build", "holds", None, None, || {
+            Ok(areas())
+        })
+        .await
+        .expect("routes");
+        assert_eq!(s.puts.lock().unwrap().len(), 2, "the merge, the status");
+        assert_eq!(
+            s.packets.lock().unwrap()[0]["steps"][1]["status"],
+            "completed"
+        );
     }
 
     /// A 204 that changed nothing is a failure, not "triaged". The stub
@@ -2583,8 +3168,8 @@ mod tests {
     async fn a_put_the_packet_does_not_reflect_is_a_failure() {
         let s = stub(vec![packet("backlog-item", vec![backlog_triage("ready")])]).await;
         s.drop_puts.store(true, std::sync::atomic::Ordering::SeqCst);
-        let wire = Wire::at(s.base.clone(), named());
-        let err = triage(&wire, "0d2e1655", "stale", "gone", None)
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = triage(&wire, "0d2e1655", "stale", "gone", None, None)
             .await
             .expect_err("a dropped write must not read as triaged");
         assert!(
@@ -2606,7 +3191,7 @@ mod tests {
             &["order", "delete-bare-metal"],
         )])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         fold(
             &wire,
             "0d2e1655",
@@ -2637,7 +3222,7 @@ mod tests {
     #[tokio::test]
     async fn fold_refuses_an_undecided_review_before_any_write() {
         let s = stub(vec![design("ready", "pending", &[])]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = fold(&wire, "0d2e1655", "x", None)
             .await
             .expect_err("review open");
@@ -2648,7 +3233,7 @@ mod tests {
         assert!(s.puts.lock().unwrap().is_empty());
         // Not a design-doc at all: the kind filter finds nothing.
         let s = stub(vec![packet("backlog-item", vec![step("triage", "ready")])]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = fold(&wire, "0d2e1655", "x", None)
             .await
             .expect_err("not a design");
@@ -2658,13 +3243,110 @@ mod tests {
     /// Hold by branch, release by id prefix — `boss prove`'s resolver
     /// — and the review step reads back held, then not.
     #[tokio::test]
+    async fn review_then_release_records_the_verdict_and_the_head_it_read() {
+        use crate::review_verdict::{record, release};
+        const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
+        const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+        const H1: &str = "1111111111111111111111111111111111111111";
+        const H2: &str = "2222222222222222222222222222222222222222";
+        const MAIN: &str = "3333333333333333333333333333333333333333";
+        let mut held = car(
+            "ready",
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+        );
+        held["metadata"]["agent_run"] = json!(BUILDER);
+        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let builder = json!({"id": BUILDER, "kind": "agent-run", "status": "open", "metadata": {}});
+        let s = stub(vec![held, reviewer, builder]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let forge = |head: &'static str| {
+            move |r: &str| -> Result<String> {
+                Ok(if r == "refs/heads/main" { MAIN } else { head }.to_string())
+            }
+        };
+
+        // No run in the shell, the builder's own run, a verdict off the
+        // list: each refused before anything is written.
+        for (run, verdict, want) in [
+            (None, "release", "BOSS_AGENT_RUN"),
+            (Some(BUILDER), "release", "built car"),
+            (Some(RUN), "lgtm", "one of release | changes"),
+        ] {
+            let err = record(&wire, "fix/held", verdict, "", run, forge(H1))
+                .await
+                .expect_err(want);
+            assert!(err.to_string().contains(want), "{want} in {err}");
+        }
+        assert!(s.puts.lock().unwrap().is_empty());
+
+        // A release with no review recorded yet is refused.
+        let err = release(&wire, "fix/held", RUN, forge(H1))
+            .await
+            .expect_err("no verdict yet");
+        assert!(
+            err.to_string().contains("records no review verdict"),
+            "{err}"
+        );
+
+        record(
+            &wire,
+            "fix/held",
+            "release",
+            "no findings",
+            Some(RUN),
+            forge(H1),
+        )
+        .await
+        .expect("the reviewer records RELEASE at H1");
+        // The head moved to H2 after the review: no release of H2.
+        let err = release(&wire, "fix/held", RUN, forge(H2))
+            .await
+            .expect_err("reviewed H1, head is H2");
+        assert!(err.to_string().contains("reviewed 11111111"), "{err}");
+        assert!(
+            boss_jobs::stranded::hold_reason(&s.packets.lock().unwrap()[0]["steps"][1]["metadata"])
+                .is_some(),
+            "a refused release leaves the hold on"
+        );
+
+        release(&wire, "fix/held", RUN, forge(H1))
+            .await
+            .expect("released on the verdict at the head it read");
+        let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
+        assert!(md.get("hold").is_none(), "{md}");
+        let rec = &md[boss_jobs::car::RELEASE];
+        assert_eq!(rec["sha"], json!(H1));
+        assert_eq!(rec["review"], json!(RUN));
+        assert_eq!(rec["verdict"], json!("release"));
+        assert_eq!(rec["by"], json!("claude@algedonic.dev"));
+        assert_eq!(rec["main_sha"], json!(MAIN));
+        assert_eq!(
+            md[boss_jobs::car::HOLD_SHA],
+            json!(H1),
+            "the judged head stays"
+        );
+    }
+
+    /// A bare release of a REVIEW hold says the conductor will hold it
+    /// again; of any other hold, that it boards.
+    #[test]
+    fn a_bare_release_of_a_review_hold_says_it_does_not_board() {
+        let review = json!({"metadata": {boss_jobs::car::HOLD_SHA: "1111"}});
+        assert!(bare_release_note(&review).contains("--review"));
+        assert_eq!(
+            bare_release_note(&json!({"metadata": {}})),
+            "it boards at the next tick"
+        );
+    }
+
+    #[tokio::test]
     async fn hold_then_release_write_the_marker_on_the_review_step() {
         let s = stub(vec![car(
             "ready",
             json!({ "authority_role": "platform-admin" }),
         )])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         hold(&wire, "fix/held", Some("waiting on a kubectl delete"))
             .await
             .expect("holds");
@@ -2714,7 +3396,7 @@ mod tests {
                     "steps": [json!({ "id": "s-r", "spec_slug": "review", "status": "completed", "metadata": {} })] }),
         ])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = hold(&wire, "fix/held", Some("  "))
             .await
             .expect_err("blank");
@@ -2793,7 +3475,7 @@ mod tests {
     #[tokio::test]
     async fn a_struck_car_is_released_on_a_diagnosis_naming_a_red_gate_run_it_rode() {
         let s = stub(the_yard()).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let diagnosis = format!(
             "Both reds were car dcdc6c64's combined-tree stub gap, not this car: gate-run \
              {RED_RUN} failed only on its test. Also read {OTHER_RUN}, a train this car was not on."
@@ -2852,7 +3534,7 @@ mod tests {
     #[tokio::test]
     async fn a_diagnosis_naming_no_red_gate_run_the_car_rode_is_refused_before_any_write() {
         let s = stub(the_yard()).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = crate::strike_release::release_struck(
             &wire,
             "fix/held",
@@ -2896,7 +3578,7 @@ mod tests {
     #[tokio::test]
     async fn a_car_with_no_strikes_has_nothing_for_a_diagnosis_to_clear() {
         let s = stub(vec![car("ready", json!({}))]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = crate::strike_release::release_struck(&wire, "fix/held", RED_RUN)
             .await
             .expect_err("no strikes");
@@ -2913,7 +3595,7 @@ mod tests {
     #[tokio::test]
     async fn a_bare_release_on_a_struck_car_names_the_diagnosis_door() {
         let s = stub(vec![struck_car()]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = hold(&wire, "fix/held", None)
             .await
             .expect_err("a struck car is not released by a bare release");
@@ -3169,7 +3851,7 @@ mod tests {
             "steps": [measure_step("ready"), step("file", "pending")],
         })])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         complete(
             &wire,
             "0c4ff12b",
@@ -3243,7 +3925,7 @@ mod tests {
             }),
         ])
         .await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
 
         let err = complete(
             &wire,
@@ -3289,7 +3971,7 @@ mod tests {
         })])
         .await;
         s.drop_puts.store(true, std::sync::atomic::Ordering::SeqCst);
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = complete(
             &wire,
             "0c4ff12b",
@@ -3491,7 +4173,7 @@ mod tests {
     #[tokio::test]
     async fn step_release_hands_a_stranded_step_back_to_the_station() {
         let s = stub(vec![held_packet(claimed("active", Some(HELD_RUN)))]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         release_step(
             &wire,
             "bd93d2be",
@@ -3540,7 +4222,7 @@ mod tests {
     #[tokio::test]
     async fn a_blank_reason_and_an_unheld_step_are_refused_before_the_first_write() {
         let s = stub(vec![held_packet(claimed("ready", None))]).await;
-        let wire = Wire::at(s.base.clone(), named());
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
         let err = release_step(&wire, "bd93d2be", "build", "   ")
             .await
             .expect_err("blank");

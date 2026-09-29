@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
+use boss_policy_client::{Action, CurrentUser, Resource};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -29,14 +29,40 @@ pub(super) struct LockBody {
     locked_by: Option<String>,
 }
 
+/// Closing a month or reopening one, asked of policy (backlog 25a4f7f9,
+/// 2026-09-28): `action` on `ledger-period` through the registry-write
+/// ladder ([`boss_policy_client::writes::require_registry_write`]) — no
+/// caller 401, a deny or a grant narrower than `all` 403 (a period
+/// belongs to no person and no department), a policy service that
+/// cannot answer 503. Until then these two doors checked
+/// `reject_if_auditor` alone, so the router-wide `ledger` READ grant was
+/// all a caller needed to freeze a month's checksum or reopen it. The
+/// actor the ladder answers is the one `super::author` already records,
+/// since a signed caller is required first.
+async fn authorize_period_write(
+    state: &LedgerApiState,
+    user: &boss_policy_client::User,
+    action: Action,
+) -> Result<(), Response> {
+    boss_policy_client::writes::require_registry_write(
+        state.policy.as_ref(),
+        user,
+        action,
+        Resource::ledger_period(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Lock is Close on `ledger-period` ([`authorize_period_write`]).
 pub(super) async fn lock_handler(
     State(state): State<Arc<LedgerApiState>>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
     body: Option<Json<LockBody>>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
+    if let Err(refused) = authorize_period_write(&state, &user, Action::Close).await {
+        return refused;
     }
     let said = body.and_then(|b| b.0.locked_by);
     let locked_by = match super::author::author(&user, "locked_by", said.as_deref()) {
@@ -54,13 +80,16 @@ pub(super) async fn lock_handler(
     }
 }
 
+/// Reopen is Update on `ledger-period` ([`authorize_period_write`]): a
+/// separate grant from closing, because reopening a month is what lets
+/// its history be rewritten.
 pub(super) async fn unlock_handler(
     State(state): State<Arc<LedgerApiState>>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
+    if let Err(refused) = authorize_period_write(&state, &user, Action::Update).await {
+        return refused;
     }
     let stamp = super::event_stamp(&state, &user).await;
     match crate::periods::unlock_period(&state.pool, id, &stamp, &user.id).await {
@@ -84,14 +113,32 @@ pub(super) struct CreatePeriodBody {
     year: i32,
 }
 
+/// The caller of `POST /api/ledger/periods` — creating a fiscal year —
+/// admitted by Create on `ledger-period` ([`authorize_period_write`]),
+/// the resource locking, reopening and closing a period ask, so one
+/// grant covers a year's whole life (backlog 34f0a954). It asked
+/// `reject_if_auditor` alone until then, so a `ledger` reader could open
+/// a year. An extractor, so the ask runs before the body is read.
+pub(super) struct PeriodCreate(boss_policy_client::User);
+
+impl axum::extract::FromRequestParts<Arc<LedgerApiState>> for PeriodCreate {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<LedgerApiState>,
+    ) -> Result<Self, Response> {
+        let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
+        authorize_period_write(state, &user, Action::Create).await?;
+        Ok(Self(user))
+    }
+}
+
 pub(super) async fn create_period_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    PeriodCreate(user): PeriodCreate,
     Json(body): Json<CreatePeriodBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let starts_on = match NaiveDate::from_ymd_opt(body.year, 1, 1) {
         Some(d) => d,
         None => {
@@ -230,14 +277,19 @@ struct ClosePeriodResponse {
     wip_variance_cents: i64,
 }
 
+/// The year-end close locks a year, so it asks what locking a month asks:
+/// Close on `ledger-period` ([`authorize_period_write`]). It checked
+/// `reject_if_auditor` alone until the review of car 25a4f7f9, which
+/// left any ledger reader able to post a year's closing entries and
+/// lock it while locking one month needed the grant.
 pub(super) async fn close_period_handler(
     State(state): State<Arc<LedgerApiState>>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
     body: Option<Json<CloseBody>>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
+    if let Err(refused) = authorize_period_write(&state, &user, Action::Close).await {
+        return refused;
     }
     let body = body.map(|b| b.0).unwrap_or(CloseBody {
         closed_by: None,

@@ -24,6 +24,7 @@
   import { href, navigate } from '../../router';
   import type { Remote } from '../../data/remote';
   import {
+    answeredHours,
     constraintOf,
     drainHours,
     joinSidings,
@@ -36,6 +37,7 @@
     waitText,
     waitsCountLine,
     whyNotMoving,
+    windowLine,
     type Siding,
     type StationFlowEnvelope,
     type StationLoadEnvelope,
@@ -65,13 +67,26 @@
   let load = $state<Remote<StationLoadEnvelope>>({ kind: 'loading' });
   let flow = $state<Remote<StationFlowEnvelope>>({ kind: 'loading' });
   let waits = $state<Remote<ReturnType<typeof parseQueueAge>>>({ kind: 'loading' });
+  /** The hours the SHOWN flow read asked for — not the button, which
+   *  moves the moment it is pressed, while the answer it asks for is
+   *  still on its way. */
+  let flowAsked = $state<number>(24);
+  /** Which refresh is the latest. Not reactive: nothing renders it. */
+  let generation = 0;
 
   async function refresh(): Promise<void> {
+    // Overlapping refreshes (a quick click, the poll) are SEQUENCED: an
+    // answer a later refresh superseded is dropped whole, so a slow
+    // 24 h read can never land under a pressed 7 d (backlog 371aa184).
+    const mine = ++generation;
+    const hours = windowHours;
     // The three reads are independent, so they go out together.
-    const [l, f, w] = await Promise.all([loadStations(), loadFlow(windowHours), loadWaits()]);
+    const [l, f, w] = await Promise.all([loadStations(), loadFlow(hours), loadWaits()]);
+    if (mine !== generation) return;
     load = l;
     flow = f;
     waits = w;
+    flowAsked = hours;
   }
 
   onMount(() => {
@@ -95,9 +110,16 @@
   // Stations overlap, so the depth column does not add up to the work;
   // this says by how much, from the server's own counts (140a2222).
   const overlap = $derived(load.kind === 'ready' ? overlapLine(load.data) : null);
+  // Every per-window figure is judged in the window the server COUNTED
+  // (the envelope's window_hours, which it clamps), and the board says
+  // so when that is not the window pressed (backlog 371aa184).
+  const judgedHours = $derived(
+    flow.kind === 'ready' ? answeredHours(flow.data, flowAsked) : flowAsked,
+  );
+  const windowNote = $derived(flow.kind === 'ready' ? windowLine(judgedHours, windowHours) : null);
   const holding = $derived(sidings.filter((s) => s.depth > 0));
   const clear = $derived(sidings.filter((s) => s.depth === 0));
-  const constraint = $derived(constraintOf(sidings, windowHours));
+  const constraint = $derived(constraintOf(sidings, judgedHours));
   const blind = $derived(sidings.filter((s) => s.flow.kind === 'unavailable'));
   const longest = $derived(
     waits.kind === 'ready' ? longestWaits(waits.data.waits, WAIT_ROWS) : [],
@@ -108,7 +130,7 @@
 
   function clearText(s: Siding): string {
     if (s.flow.kind !== 'counted') return '—';
-    const h = drainHours(s.depth, s.flow.served, windowHours);
+    const h = drainHours(s.depth, s.flow.served, judgedHours);
     return h === null ? 'not draining' : `${h.toFixed(0)} h`;
   }
 
@@ -130,7 +152,7 @@
         ? { kind: 'unavailable', why: flow.error }
         : load.kind === 'loading' || flow.kind === 'loading'
           ? { kind: 'reading' }
-          : { kind: 'ready', region: 'marshalling', platforms: marshallingPlatforms(sidings, windowHours) },
+          : { kind: 'ready', region: 'marshalling', platforms: marshallingPlatforms(sidings, judgedHours) },
   );
   $effect(() => {
     ondeck(deck);
@@ -155,6 +177,9 @@
         onclick={() => pick(h)}>{WINDOW_LABEL[h]}</button
       >
     {/each}
+    {#if windowNote !== null}
+      <span class="my-window">{windowNote}</span>
+    {/if}
     {#if flow.kind === 'ready' && flow.data.asOf}
       <span class="my-asof">read {flow.data.asOf}</span>
     {/if}
@@ -205,7 +230,24 @@
         <tbody>
           {#each holding as s (s.station)}
             <tr class:constraint={constraint.kind === 'station' && constraint.station === s.station}>
-              <td class="mono">{s.station}</td>
+              <td class="mono">
+                <span class="my-station">{s.station}</span>
+                <!-- The per-kind drill-down, where the station's predicate
+                     names one Workflow kind (c7c5c1de): which step of
+                     that kind the pile stands at, and whether it drains.
+                     A station spanning kinds names none, so gets none. -->
+                {#if s.workflowKind}
+                  <a
+                    class="my-drill"
+                    href={href(`/it/operate/bottlenecks?kind=${encodeURIComponent(s.workflowKind)}`)}
+                    title="Where this station's {s.workflowKind} packets stand, step by step — the Bottlenecks drill-down"
+                    onclick={(e) => {
+                      e.preventDefault();
+                      navigate(`/it/operate/bottlenecks?kind=${encodeURIComponent(s.workflowKind ?? '')}`);
+                    }}>{s.workflowKind} by step</a
+                  >
+                {/if}
+              </td>
               <td class="num">
                 {s.depth}{#if s.wipLimit !== null}<span class="dim"> / {s.wipLimit}</span>{/if}
               </td>
@@ -216,7 +258,7 @@
               </td>
               <td class="num">{netText(s)}</td>
               <td class="num">{clearText(s)}</td>
-              <td class="why">{whyNotMoving(s, windowHours)}</td>
+              <td class="why">{whyNotMoving(s, judgedHours)}</td>
             </tr>
           {/each}
         </tbody>
@@ -336,6 +378,7 @@
     margin-left: auto; font-family: var(--font-mono);
     font-size: 11px; color: var(--static);
   }
+  .my-window { font-family: var(--font-mono); font-size: 11px; color: var(--warn); }
   .my-constraint {
     border: 1px solid var(--hairline); border-left-width: 3px;
     padding: 10px 12px; display: flex; flex-direction: column; gap: 4px;
@@ -364,6 +407,9 @@
   .my-table td.nobody { color: var(--err); }
   .my-table td.why { color: var(--static); }
   .my-table a { color: inherit; }
+  .my-table a.my-drill {
+    margin-left: 8px; font-size: 11px; color: var(--static);
+  }
   .mono { font-family: var(--font-mono); }
   .dim { color: var(--static); }
   .my-blind { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }

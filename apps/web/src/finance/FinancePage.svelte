@@ -3,8 +3,9 @@
   //
   // Eight tabs: Overview (AR/AP aging + margins), Invoices (filterable
   // list), PO Approvals (draft POs), and the five ledger-derived
-  // financial statements. New Invoice / New JE actions render unless
-  // the user is an auditor.
+  // financial statements. New Invoice / New JE actions render only when
+  // the session is off the read-only floor AND policy allows each one
+  // (./readOnly financeOffersWrite; backlog 9dad102c).
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
@@ -25,8 +26,11 @@
     type CommerceSummary,
   } from './api';
   import type { PagedResult } from '../data/paginated';
+  import { loadingRead, readStateOf } from '../data/readState';
   import { href } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import { financeOffersWrite } from './readOnly';
+  import { permission } from '@boss/web-kit/session/permission.svelte';
 
   import { FINANCE_TABS, financeSearch, type FinanceTab, type FinanceView } from './financeQuery';
   import { departmentLabel } from '@boss/web-kit/nav';
@@ -84,13 +88,18 @@
   let invoices = $derived(
     invoicesResult?.kind === 'ready' ? invoicesResult.page.data : [],
   );
-  let invoicesError = $derived(
-    invoicesResult?.kind === 'failed' ? invoicesResult.error : null,
-  );
+  // Not answered yet is loading, not an empty book (backlog 0ef5e008).
+  let invoicesRead = $derived(invoicesResult ? readStateOf(invoicesResult) : loadingRead);
 
-  let readOnly = $derived(
-    session.value.kind === 'ready' && session.value.user.role === 'auditor',
-  );
+  // The read-only floor (backlog 432f0eb4) AND policy's answer for the
+  // session user on each link's own write (9dad102c) — Create on
+  // `invoice` (boss-commerce) and Create on `ledger` (the journal-entry
+  // door). Hidden until an Allow arrives; the server's 403 stays the
+  // authority.
+  const mayInvoice = permission('create', 'invoice');
+  const mayPost = permission('create', 'ledger');
+  let offerInvoice = $derived(financeOffersWrite(session, mayInvoice.value));
+  let offerEntry = $derived(financeOffersWrite(session, mayPost.value));
 
   $effect(() => {
     let cancelled = false;
@@ -144,10 +153,12 @@
   />
 
   <div class="finance-actions" style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap">
-    {#if !readOnly}
+    {#if offerInvoice}
       <Link to={href('/ux/finance/new')} className="fin-new-invoice">
         + New invoice
       </Link>
+    {/if}
+    {#if offerEntry}
       <Link to={href('/ux/finance/journal-entries/new')} className="fin-new-invoice">
         + New journal entry
       </Link>
@@ -175,7 +186,7 @@
     {:else if tab === 'invoices'}
       <InvoicesTab
         {invoices}
-        loadError={invoicesError}
+        read={invoicesRead}
         totalCount={summary?.total_invoice_count ?? invoices.length}
       />
     {:else if tab === 'approvals'}

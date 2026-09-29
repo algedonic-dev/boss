@@ -56,7 +56,7 @@ async fn create_list_get_round_trip() {
             "description": "Primary hero image for Q2 campaign",
             "file_url": "https://assets.boss.test/hero-m22.jpg",
             "tags": ["hero", "m22", "q2-campaign"],
-            "linked_device_skus": ["LMN-M22-V3"],
+            "linked_skus": ["LMN-M22-V3"],
             "linked_campaign_ids": ["cmp-q2-2026"],
             "owner_id": "emp-mkt-1"
         }))
@@ -67,6 +67,10 @@ async fn create_list_get_round_trip() {
     assert_eq!(body["id"], "ma-1");
     assert_eq!(body["kind"], "photo");
     assert_eq!(body["tags"].as_array().unwrap().len(), 3);
+    // f925b58b: the field is `linked_skus` — the device shop's
+    // `linked_device_skus` is gone from the row and the wire alike.
+    assert_eq!(body["linked_skus"], json!(["LMN-M22-V3"]));
+    assert!(body.get("linked_device_skus").is_none(), "{body}");
 
     let list_resp = TestRequest::get("/api/catalog/marketing-assets")
         .send(&app(&db))
@@ -81,6 +85,11 @@ async fn create_list_get_round_trip() {
     get_resp.assert_status(StatusCode::OK);
     let one = get_resp.assert_json::<serde_json::Value>();
     assert_eq!(one["title"], "Hero shot — Halcyon M22");
+    assert_eq!(
+        one["linked_skus"],
+        json!(["LMN-M22-V3"]),
+        "read back from the column"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

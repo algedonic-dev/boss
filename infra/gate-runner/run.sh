@@ -356,6 +356,108 @@ if [ ! -d "$SEED" ]; then
     rm -f /gate-target/receipt.json
 fi
 
+# SEED THE TARGET from the warm snapshot. The math this replaces: a
+# cold workspace build writes ~74G of target/ and costs 20+ minutes of
+# compile (measured; boss-dev.yaml Q1). The seed copy moves the same
+# bytes at disk speed — minutes, not tens of minutes — and cargo then
+# rebuilds only the workspace crates, which is the ~14-minute warm
+# gate this rig is known for. The copy runs under a SHARED flock:
+# many seeding readers may overlap freely, but none may overlap the
+# refresher rewriting the snapshot (exclusive lock, end of this
+# script) — a half-rewritten seed under a reader is how you get
+# corrupt rlibs beneath fresh-looking fingerprints, a red that is
+# nobody's code. On any failure or a 15-minute lock timeout, fall
+# back to a cold build: slow and correct.
+#
+# THE COPY RUNS BEFORE THE CLONE, and the order is the correctness
+# property, not tidiness (backlog 646c0ade). `cp -a` keeps the seed's
+# mtimes, and cargo trusts an artifact that is not older than its
+# sources — so a seeded artifact NEWER than a cloned file is reused, and
+# the run links the seeding run's build of that crate (main's tree or a
+# train's, not this branch's): a false green, the gate-side twin of the
+# wt-cargo wrong binary (1150c518). The copy used to run after the
+# clone, and the order held only by timing: a reader that cloned and
+# then waited on the shared lock while a refresh held the exclusive one
+# copied the NEW seed, whose newest artifact was one svelte-check older
+# than the refresh. Triage run 4814939a read 60 pods on 2026-09-28 and
+# found every run clone-newer — by 2.6 s at the worst pairing of the
+# measured extremes (svelte-check 14 s at its fastest; clone to lock
+# 11.4 s at its slowest). Here, every seeded artifact was written
+# before the seed was installed, which is before this copy, which is
+# before every file the clone writes: clone-newer by construction,
+# whatever any duration does. seed_target reads nothing the clone
+# makes. `seed_order_json` below measures the order after the checkout
+# and the receipt carries it, so it is read on every gate-run packet
+# rather than believed.
+#
+# THE SEED IS LOOKED FOR INSIDE THE LOCK (backlog ae39a328). The
+# refresher deletes $SEED/target under its exclusive lock and renames
+# the new one into place before letting go, so a `-d` test made before
+# taking the shared lock can land in that window, see no seed, and
+# build cold. Triage run c221e11e read 236 gate pods (2026-09-27/28): 2
+# went cold, exactly the two whose start fell inside a refresh. Tested
+# inside the lock, a reader blocked behind a refresh copies the seed it
+# just installed; `.seed-head` is read in the same hold, so the head
+# reported is the head copied. The cold cost in the message is that
+# triage's measurement, one branch against itself: 11.3 min cold, 7.7
+# warm.
+mkdir -p /gate-target/target
+seed_target() { # <destination target dir>
+    local t0=$SECONDS rc=0 head
+    # --reflink=auto: on one filesystem (the seed is a local PV on the
+    # build node's xfs since 5b3dabb5) this shares extents and writes
+    # only metadata; anywhere else it falls back to a plain copy. The
+    # timing line below is the measurement either way. Exit 3 is "no
+    # seed", distinct from flock's timeout and cp's failure (both 1).
+    head=$( ( flock -s -w 900 9 || exit 1
+              [ -d "$SEED/target" ] || exit 3
+              cp -a --reflink=auto "$SEED/target/." "$1/" || exit 1
+              cat "$SEED/.seed-head" 2>/dev/null || echo '<unrecorded>'
+            ) 9>>"$SEED_LOCK" ) || rc=$?
+    case $rc in
+        0) echo "gate-runner: target seeded from head $head in $((SECONDS - t0))s" ;;
+        3) echo "gate-runner: no warm seed at $SEED/target — cold build (~4 min extra, measured 2026-09-28)" ;;
+        *) echo "gate-runner: seed copy failed or lock timed out after $((SECONDS - t0))s — cold build instead"
+           rm -rf "$1"
+           mkdir -p "$1" ;;
+    esac
+}
+if [ -d "$SEED" ]; then seed_target /gate-target/target; fi
+
+# THE ORDER, MEASURED (646c0ade). One line of JSON for the receipt: the
+# newest seeded artifact's mtime, the oldest cloned source's (.git is
+# not a source), the margin in seconds, and `order` — `clone-newer`
+# (margin > 0), `SEED-NEWER` (a tie counts: cargo reads an artifact no
+# older than its source as fresh), or `cold` (nothing was seeded, so
+# nothing can be trusted wrongly). Worst pair against worst pair, so a
+# positive margin covers every artifact against every source. awk keeps
+# find's own text for the winner: its default print format would round
+# an epoch to six digits.
+seed_order_json() { # <target dir> <repo dir>
+    local newest oldest
+    newest=$(find "$1" -type f -printf '%T@\n' 2>/dev/null \
+        | awk 'NR == 1 || $1 + 0 > m { m = $1 + 0; s = $1 } END { if (NR) print s }') || newest=""
+    oldest=$(find "$2" -path "$2/.git" -prune -o -type f -printf '%T@\n' 2>/dev/null \
+        | awk 'NR == 1 || $1 + 0 < m { m = $1 + 0; s = $1 } END { if (NR) print s }') || oldest=""
+    python3 - "$newest" "$oldest" <<'PY'
+import datetime, json, sys
+newest, oldest = sys.argv[1], sys.argv[2]
+def iso(t):
+    if not t:
+        return None
+    return datetime.datetime.fromtimestamp(float(t), datetime.timezone.utc).isoformat(timespec="milliseconds")
+out = {"seed_newest_artifact": iso(newest), "clone_oldest_source": iso(oldest)}
+if newest and oldest:
+    margin = float(oldest) - float(newest)
+    out["margin_s"] = round(margin, 3)
+    out["order"] = "clone-newer" if margin > 0 else "SEED-NEWER"
+else:
+    out["margin_s"] = None
+    out["order"] = "cold" if not newest else "no-sources"
+print(json.dumps(out, separators=(",", ":")))
+PY
+}
+
 # Forge auth. The repo is not anonymously clonable: a bare clone dies
 # with "could not read Username for http://...", which is the error
 # dev-node-checkout.md called the last blocker. The token arrives as a
@@ -381,6 +483,13 @@ cd /gate-target/repo
 git fetch origin "$GATE_BRANCH:refs/remotes/origin/$GATE_BRANCH"
 git checkout -B "$GATE_BRANCH" "origin/$GATE_BRANCH"
 HEAD_SHA=$(git rev-parse HEAD)
+# The checkout is the last write to the sources and nothing has built
+# yet, so this is the order cargo will judge. It rides the receipt as
+# `seed_order` (the summary block below); a failed measurement is an
+# absent field, never a failed gate.
+t_order=$SECONDS
+SEED_ORDER=$(seed_order_json /gate-target/target /gate-target/repo) || SEED_ORDER=""
+echo "gate-runner: seed order ${SEED_ORDER:-<unmeasured>} (measured in $((SECONDS - t_order))s)"
 
 export CARGO_TARGET_DIR=/gate-target/target
 # THE CRATE CACHE SURVIVES THE RUN, and it is a correctness fix before
@@ -418,38 +527,6 @@ else
 fi
 mkdir -p "$CARGO_HOME"
 
-# SEED THE TARGET from the warm snapshot. The math this replaces: a
-# cold workspace build writes ~74G of target/ and costs 20+ minutes of
-# compile (measured; boss-dev.yaml Q1). The seed copy moves the same
-# bytes at disk speed — minutes, not tens of minutes — and cargo then
-# rebuilds only the workspace crates, which is the ~14-minute warm
-# gate this rig is known for. The copy runs under a SHARED flock:
-# many seeding readers may overlap freely, but none may overlap the
-# refresher rewriting the snapshot (exclusive lock, end of this
-# script) — a half-rewritten seed under a reader is how you get
-# corrupt rlibs beneath fresh-looking fingerprints, a red that is
-# nobody's code. On any failure or a 15-minute lock timeout, fall
-# back to a cold build: slow and correct.
-mkdir -p /gate-target/target
-seed_target() {
-    if [ ! -d "$SEED/target" ]; then
-        echo "gate-runner: no warm seed at $SEED/target — cold build (~20+ min extra)"
-        return 0
-    fi
-    local t0=$SECONDS
-    # --reflink=auto: on one filesystem (the seed is a local PV on the
-    # build node's xfs since 5b3dabb5) this shares extents and writes
-    # only metadata; anywhere else it falls back to a plain copy. The
-    # timing line below is the measurement either way.
-    if ( flock -s -w 900 9 && cp -a --reflink=auto "$SEED/target/." /gate-target/target/ ) 9>>"$SEED_LOCK"; then
-        echo "gate-runner: target seeded from head $(cat "$SEED/.seed-head" 2>/dev/null || echo '<unrecorded>') in $((SECONDS - t0))s"
-    else
-        echo "gate-runner: seed copy failed or lock timed out after $((SECONDS - t0))s — cold build instead"
-        rm -rf /gate-target/target
-        mkdir -p /gate-target/target
-    fi
-}
-if [ -d "$SEED" ]; then seed_target; fi
 # Build parallelism follows the CPU the container was actually GIVEN.
 # It was pinned at 4, so raising the gate ceiling from 6 CPU to 20 in
 # the build-node car bought nothing measurable: the gate was never
@@ -481,6 +558,19 @@ CPUS=$(gate_cpus)
 # unattributable. Widen it as a separate, measured change.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$CPUS}" RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2-wide"
+
+# THIS IS A LOADED GATE, SAID TO THE WEB SUITES (backlog ebb750cd). On
+# 2026-09-28 two trains went red in the web suite on tests that pass in
+# well under a second on the dev pod — a mocked paint at 27.6 s against
+# a 15 s expect, a unit file at 30.2 s against 30 s — while three gates
+# each built cargo 20-wide on w-1's one NVMe. Their budgets are stated
+# for a quiet run; under this, apps/web/src/dev-load.ts scales every one
+# by its GATE_LOAD_SCALE. Only this runner sets it — a developer's run,
+# wt-web and forge CI stay on the quiet budgets — and the name is pinned
+# to the web tree's by the_gate_states_its_web_load.rs. No retry: what
+# each test took goes on the receipt as `web_timings` (infra/gate.sh).
+export BOSS_WEB_GATE_LOAD=1
+echo "gate-runner: web budgets scaled for gate load (BOSS_WEB_GATE_LOAD=1; the factor is GATE_LOAD_SCALE in apps/web/src/dev-load.ts)"
 
 # Warm the web toolchain: the mocked suite's webServer boot on a cold
 # container exceeded its timeout three times on 2026-08-23; every spec
@@ -580,7 +670,14 @@ from collections import deque
 receipt_path, log_path, replay_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
 REPLAY_TAIL = 300      # lines per failed check replayed to the pod log
-PARSE_TAIL = 2000      # lines per failed check this parser reads
+# Lines per failed check this parser reads. It was 2 000 while cargo
+# stopped at the first failing binary, which put every failure at the
+# end of the check. Since `--no-fail-fast` (backlog 3bef4198) an early
+# binary's failure is followed by every later binary passing - tens of
+# thousands of lines on a full gate - so the whole check is read; this
+# bound only stops a runaway log from taking the pod's memory.
+PARSE_TAIL = 400000
+REPLAY_BLOCKS = 600    # lines of earlier failure blocks replayed ahead of the tail
 RAW_TAIL = 200         # lines of gate.log when nothing can be parsed
 PER_CHECK = 5          # named failures per check on the receipt
 TOTAL_ENTRIES = 40     # entries on the whole receipt
@@ -765,10 +862,114 @@ def error_lines(body):
     return out
 
 
+# A `✘` is printed for every test whose status is not `passed` - and
+# that includes a `test.fail()` spec that failed exactly as told, which
+# Playwright counts PASSED. The `✘` line alone cannot say which it was
+# (the list reporter only colours the two differently, and the gate's
+# log has no colour). Red gate-run 5b5a04d8 (2026-09-28, backlog
+# 42981848) quoted four such specs as its first four verdict lines and
+# cut one of the two that really timed out. Playwright's own roll-up
+# CAN say: its `N failed` block lists exactly the tests whose outcome
+# was unexpected, in the same `[project] › file:line:col › title` the
+# `✘` line carries before its `(retry #n)` and `(duration)`. So a `✘` is
+# quoted as a verdict when the roll-up counts its test failed, and the
+# ones it does not are counted and said - never dropped in silence.
+RE_SPEC_CROSS = re.compile(r"^\s*✘\s+(?:\d+\s+)?(.*)$")
+RE_SPEC_LOCATION = re.compile(r"(\S+:\d+:\d+)")
+
+
+def failed_by_rollup(body):
+    """The test titles Playwright's `N failed` roll-up lists (each line
+    indented under it), or `None` when the output holds no roll-up that
+    names any - a run killed before Playwright's epilogue."""
+    titles = []
+    for i, line in enumerate(body):
+        if not RE_SPEC_SUMMARY.match(line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        for nxt in body[i + 1:]:
+            if not nxt.strip() or len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            titles.append(nxt.strip())
+    return titles or None
+
+
+def counted_failed(cross, titles):
+    """Is this `✘` line's test one the roll-up counts failed?"""
+    m = RE_SPEC_CROSS.match(cross)
+    rest = m.group(1).strip() if m else cross.strip()
+    return any(rest == t or rest.startswith(t + " (") for t in titles)
+
+
+def unexpected_crosses(crosses, body):
+    """(the `✘` lines to quote as verdicts, a note saying what the choice
+    rests on - or None when every `✘` was a failure and the roll-up says
+    so)."""
+    if not crosses:
+        return crosses, None
+    titles = failed_by_rollup(body)
+    if titles is None:
+        return crosses, ("no Playwright roll-up naming the failed specs in this output (the "
+                         "run ended before its summary), so an expected failure (test.fail) "
+                         "cannot be told from a real one - every ✘ line is quoted")
+    unmatched = [t for t in titles if not any(counted_failed(c, [t]) for c in crosses)]
+    if unmatched:
+        return crosses, ("Playwright's roll-up names %d failed spec(s) no ✘ line matches (first: "
+                         "%s), so the ✘ lines cannot be sorted by it - every ✘ line is quoted"
+                         % (len(unmatched), unmatched[0]))
+    kept = [c for c in crosses if counted_failed(c, titles)]
+    if len(kept) == len(crosses):
+        return kept, None
+    return kept, ("%d ✘ line(s) not quoted: Playwright's roll-up counts %d spec(s) failed and "
+                  "these are not among them - an expected failure (test.fail, counted "
+                  "passed) or a flaky spec's failed attempt (counted flaky)" % (
+                      len(crosses) - len(kept), len(titles)))
+
+
+# A TIMEOUT'S CAUSE, BESIDE ITS `✘` (backlog a766e20d). Red gate-run
+# 5b5a04d8 (2026-09-28) failed on two specs, each `(4.0m)`, and the line
+# that said why - `Test timeout of 240000ms exceeded while setting up
+# "page".`, under each one's numbered `N) [project] › file:line:col ›
+# title` block - matched no verdict pattern, so `fails` never quoted it,
+# on the kind of red that made 8 same-head reds in 7 days. The same run
+# quoted each block's `Error Context: test-results/…` line as an error:
+# RE_ERROR takes `Error` and a space, and that line is the PATH of the
+# page snapshot gate.sh keeps (see `context`), not a verdict. Only the
+# Playwright reading refuses it; cargo and svelte still need the space.
+RE_SPEC_NUMBERED = re.compile(r"^\s*\d+\) (\S.*?)[\s─]*$")
+RE_SPEC_REASON = re.compile(r"^\s*(Test timeout of \d+ms exceeded\b.*?)\s*$")
+RE_SPEC_CONTEXT_PATH = re.compile(r"^\s*Error Context: ")
+
+
+def spec_reasons(body):
+    """{numbered block's title: the timeout line under it}, first one
+    per title (a retried test prints the same reason per attempt)."""
+    out, title = {}, None
+    for line in body:
+        m = RE_SPEC_NUMBERED.match(line)
+        if m:
+            title = m.group(1)
+            continue
+        m = RE_SPEC_REASON.match(line)
+        if m and title is not None:
+            out.setdefault(title, m.group(1))
+    return out
+
+
+def with_reason(cross, reasons):
+    """The `✘` line, and the reason its numbered block gives, if any."""
+    for title, why in reasons.items():
+        if counted_failed(cross, [title]):
+            return "%s - %s" % (cross, why)
+    return cross
+
+
 def spec_verdicts(body):
     """Playwright's verdict lines, ranked - or `[]` for a check that is
     not Playwright-shaped (no `✘` marker and no `N failed` roll-up), so
-    an `Error:` line from svelte-check is never called a failing spec.
+    an `Error:` line from svelte-check is never called a failing spec -
+    and a note, or None, saying which `✘` lines were set aside and why
+    (see `unexpected_crosses`).
     Each Expected/Received diff is ONE entry: its two headers and up to
     DIFF_LINES of its `+`/`-` lines, saying how many more there were.
     (Backlog 3a6f61d6, 2026-09-18: until this ranking existed the alert
@@ -804,12 +1005,106 @@ def spec_verdicts(body):
                     len(rows) - DIFF_LINES))
             diffs.append(" / ".join(head + kept))
             continue
+        elif RE_SPEC_CONTEXT_PATH.match(line):
+            pass
         elif RE_ERROR.match(line) and line.lstrip().startswith("Error"):
             errors.append(line.strip())
         i += 1
     if not fails and not summary:
-        return []
-    return fails + summary + errors + diffs
+        return [], None
+    fails, note = unexpected_crosses(fails, body)
+    reasons = spec_reasons(body)
+    fails = [with_reason(c, reasons) for c in fails]
+    return fails + summary + errors + diffs, note
+
+
+# bun's unit-test verdicts (backlog 4d928d0a). The 00:01Z train of
+# 2026-09-28 was disassembled on web-suite and `fails` said only
+# `error: script "test:unit" exited with code 1`, while the excerpt
+# beside it named the file and the test that timed out. The web unit
+# suites run one file per `bun test` process
+# (apps/web/scripts/each-test-file-alone.ts), which prints a failing
+# file's whole output under `===== <file> — exit N, run alone =====`.
+# bun 1.3 prints an assertion's or a throw's `error:` line (and its `at`
+# location) ABOVE the `(fail) <test> [ms]` line, and a timeout's reason
+# (`^ this test timed out after …`) BELOW it.
+RE_BUN_ALONE = re.compile(r"^===== (\S+) — exit (\d+), run alone =====$")
+RE_BUN_FILE = re.compile(r"^(\S+[._](?:test|spec)\.[cm]?[jt]sx?):$")
+RE_BUN_OUTCOME = re.compile(r"^\((pass|fail|skip|todo)\) (.*)$")
+RE_BUN_FAIL = re.compile(r"^\(fail\) ")
+RE_BUN_ERROR = re.compile(r"^(error: .+|[A-Z]\w*(?:Error|Exception)\b.*)$")
+RE_BUN_AT = re.compile(r"^\s+at .*?\(?(\S+:\d+:\d+)\)?$")
+RE_BUN_FRAME = re.compile(r"^\s*\d+ \|")
+RE_BUN_REASON = re.compile(r"^\s+\^ (this test .+)$")
+
+
+def bun_reason(body, since, i):
+    """Why the `(fail)` at `i` failed: the timeout line below it, or the
+    first error line bun printed since the previous outcome (with the
+    lines that continue it, up to its `at` location, and the location)."""
+    if i + 1 < len(body):
+        m = RE_BUN_REASON.match(body[i + 1])
+        if m:
+            return m.group(1)
+    return bun_error(body[since:i]) or "no error line above it in this check's output"
+
+
+def bun_error(lines):
+    """The first error bun printed in `lines`: its line, the non-blank
+    lines continuing it up to its `at` location (MESSAGE_LINES at most,
+    saying what it left), and that location."""
+    start = next((k for k, l in enumerate(lines) if RE_BUN_ERROR.match(l)), None)
+    if start is None:
+        return ""
+    msg, where = [lines[start].strip()], ""
+    for nxt in lines[start + 1:]:
+        m = RE_BUN_AT.match(nxt)
+        if m:
+            where = " (at %s)" % m.group(1)
+            break
+        if RE_BUN_FRAME.match(nxt) or RE_BUN_OUTCOME.match(nxt) or nxt.startswith("-----"):
+            break
+        if nxt.strip():
+            msg.append(nxt.strip())
+    if len(msg) > MESSAGE_LINES:
+        msg = msg[:MESSAGE_LINES] + ["(+%d more message line(s); the excerpt has them)" % (
+            len(msg) - MESSAGE_LINES)]
+    return " ".join(msg) + where
+
+
+def bun_failures(body):
+    """(file, test or None, why) for each unit test bun said failed, in
+    order - and for each file the per-file runner said failed with NO
+    `(fail)` line (an import that threw, an unhandled error between
+    tests), one entry naming the file and its first error."""
+    out, file_, since = [], None, 0
+    alone = []      # (file, exit code, header index)
+    failed_in = set()
+    for i, line in enumerate(body):
+        m = RE_BUN_ALONE.match(line)
+        if m:
+            file_, since = m.group(1), i + 1
+            alone.append((file_, m.group(2), i))
+            continue
+        m = RE_BUN_FILE.match(line)
+        if m:
+            if file_ is None or not file_.endswith(m.group(1)):
+                file_ = m.group(1)
+            since = i + 1
+            continue
+        m = RE_BUN_OUTCOME.match(line)
+        if m:
+            if m.group(1) == "fail":
+                out.append((file_, m.group(2), bun_reason(body, since, i)))
+                failed_in.add(file_)
+            since = i + 1
+    for n, (name, code, at) in enumerate(alone):
+        if name in failed_in:
+            continue
+        end = alone[n + 1][2] if n + 1 < len(alone) else len(body)
+        why = bun_error(body[at + 1:end]) or "no error line in its output"
+        out.append((name, None, "exit %s, run alone, with no (fail) line: %s" % (code, why)))
+    return out
 
 
 RE_UNREACHABLE = re.compile(
@@ -839,7 +1134,7 @@ def network_refusal(name, body):
     hits = [l for l in body if RE_UNREACHABLE.search(l) and not RE_LOCAL.search(l)]
     if len(hits) < 3:
         return None
-    if failing_tests(body) or panics(body) or spec_verdicts(body):
+    if failing_tests(body) or panics(body) or spec_verdicts(body)[0] or bun_failures(body):
         return None
     judged = [e for e in error_lines(body) if not RE_UNREACHABLE.search(e)
               and not re.search(r"InstallFailed|install failed|network", e)]
@@ -859,7 +1154,63 @@ def clip(entry):
         len(entry) - ENTRY_CHARS)
 
 
-RE_MARK = (RE_STDOUT, RE_PANIC_OLD, RE_PANIC_NEW, RE_ERROR, RE_SPEC_FAIL)
+RE_RESULT_LINE = re.compile(r"^test result: ")
+
+
+def failure_blocks(body, before):
+    """libtest's failure block for each binary that failed, among
+    `body[:before]`: from its first `failures:` line through its
+    `test result:` line, and the `error: test failed, to rerun pass
+    `-p <crate> --test <binary>`` line after it, which names the binary.
+
+    With `--no-fail-fast` (backlog 3bef4198) these are what a replay of
+    the tail alone would lose: every later binary's passing output comes
+    after them."""
+    out, start = [], None
+    for i, line in enumerate(body[:before]):
+        if start is None and line.strip() == "failures:":
+            start = i
+        elif start is not None and RE_RESULT_LINE.match(line):
+            end = i + 1
+            while end < min(len(body), i + 3) and (not body[end].strip()
+                                                   or body[end].startswith("error: test failed")):
+                end += 1
+            out.append((start, end))
+            start = None
+    return out
+
+
+def selection(body, total):
+    """What the replay prints for one check (and so what its excerpt is
+    cut from): the last REPLAY_TAIL lines, preceded by every failure
+    block that sits above them, bounded, with each omission stated.
+    Returns (header, lines)."""
+    tail_from = max(len(body) - REPLAY_TAIL, 0)
+    tail = body[tail_from:]
+    blocks = failure_blocks(body, tail_from)
+    if not blocks:
+        return "last %d of %d line(s):" % (len(tail), total), tail
+    early = []
+    for start, end in blocks:
+        early += body[start:end]
+    dropped = 0
+    if len(early) > REPLAY_BLOCKS:
+        dropped = len(early) - REPLAY_BLOCKS
+        early = early[:REPLAY_BLOCKS]
+    lines = early
+    if dropped:
+        lines.append("... (+%d line(s) of earlier failure blocks omitted - this replay keeps %d)"
+                     % (dropped, REPLAY_BLOCKS))
+    gap = tail_from - blocks[-1][1]
+    lines.append("... (%d line(s) between the last failure block and the check's last %d "
+                 "omitted - no failure block in them)" % (max(gap, 0), len(tail)))
+    header = ("%d failure block(s) from earlier in the check, then its last %d of %d line(s):"
+              % (len(blocks), len(tail), total))
+    return header, lines + tail
+
+
+RE_MARK = (RE_STDOUT, RE_PANIC_OLD, RE_PANIC_NEW, RE_ERROR, RE_SPEC_FAIL, RE_BUN_ALONE,
+           RE_BUN_FAIL)
 
 
 def marks_a_failure(line):
@@ -961,6 +1312,20 @@ def detail(name, got):
                        "Job log replay lists them" % (name, len(tests) - PER_CHECK, len(tests)))
         return out
 
+    unit = bun_failures(body)
+    if unit:
+        for file_, test, why in unit[:PER_CHECK]:
+            if test is None:
+                out.append("%s: %s - %s" % (name, file_, why))
+            else:
+                out.append("%s: %s - (fail) %s - %s" % (name, file_ or "(file not named)",
+                                                         test, why))
+        if len(unit) > PER_CHECK:
+            out.append("%s: + %d more failing unit test(s) not named here (%d in all) - the "
+                       "excerpt and the Job log replay list them" % (
+                           name, len(unit) - PER_CHECK, len(unit)))
+        return out
+
     loose = [(loc, msg) for _, loc, msg in found]
     if loose:
         for loc, msg in loose[:PER_CHECK]:
@@ -971,10 +1336,12 @@ def detail(name, got):
                 name, len(loose) - PER_CHECK, len(loose)))
         return out
 
-    specs = spec_verdicts(body)
+    specs, set_aside = spec_verdicts(body)
     if specs:
         out.append("%s: no cargo test failure in this check's output; %d playwright verdict "
                    "line(s), first %d:" % (name, len(specs), min(PER_CHECK, len(specs))))
+        if set_aside:
+            out.append("%s: %s" % (name, set_aside))
         out += ["%s: | %s" % (name, s) for s in specs[:PER_CHECK]]
         if len(specs) > PER_CHECK:
             out.append("%s: + %d more verdict line(s) not quoted here - the excerpt has "
@@ -996,12 +1363,92 @@ def detail(name, got):
     return out
 
 
-def write(entries, replay, excerpts=None):
+# WHAT PLAYWRIGHT SAW, ON THE RECORD (backlog 4d928d0a). gate.sh keeps
+# every error context a failed web suite wrote - the page snapshot at the
+# moment a spec failed - whole, in a file beside the receipt, and names
+# it under `evidence`. That file dies with this pod, so it is copied onto
+# the receipt as `fails_context: {"<check>": "..."}` and into the replay.
+# Bounded like the excerpt, for the same transport, per spec so a
+# mass-fail still shows more than one page, and every cut states itself.
+CONTEXT_PER_SPEC = 2000   # characters of one spec's context on the receipt
+CONTEXT_CHARS = 6000      # characters of `fails_context` per check
+CONTEXT_TOTAL = 12000     # characters of `fails_context` on the whole receipt
+CONTEXT_REPLAY = 20000    # lines of a check's kept evidence replayed to the pod log
+
+
+def spec_contexts(text):
+    """The kept file, split on the `===== <path> =====` header gate.sh
+    writes above each spec's context."""
+    blocks = []
+    for line in text.split("\n"):
+        if (line.startswith("===== ") and line.endswith(" =====")) or not blocks:
+            blocks.append([line])
+        else:
+            blocks[-1].append(line)
+    return ["\n".join(b).rstrip("\n") for b in blocks if any(l.strip() for l in b)]
+
+
+RE_CONTEXT_LOCATION = re.compile(r"^- Location: (\S+)$", re.M)
+
+
+def context(text, budget, failed=None):
+    """One check's `fails_context`: each spec's context up to
+    CONTEXT_PER_SPEC, as many as fit the smaller of CONTEXT_CHARS and
+    what is left of CONTEXT_TOTAL, then a line saying how many there
+    were and what was left out.
+
+    Playwright writes a context for an expected failure (`test.fail`)
+    too, so the contexts of the specs its roll-up counts `failed` are
+    placed first: gate-run 5b5a04d8 spent its budget on four expected
+    failures and omitted `it-map-routes.mocked.spec.ts:163`'s page, one of
+    the two that timed out (backlog 42981848). Nothing is dropped for
+    it - the order changes, the count and the replay do not. Since
+    a766e20d gate.sh keeps only the contexts its roll-up lists, so this
+    order matters only when it could not read one."""
+    specs = spec_contexts(text)
+    at = {m.group(1) for t in (failed or []) for m in [RE_SPEC_LOCATION.search(t)] if m}
+    first = [s for s in specs if any(m in at for m in RE_CONTEXT_LOCATION.findall(s))]
+    specs = first + [s for s in specs if s not in first]
+    cap = min(CONTEXT_CHARS, budget)
+    out, used = [], 0
+    for spec in specs:
+        piece = spec
+        if len(piece) > CONTEXT_PER_SPEC:
+            piece = piece[:CONTEXT_PER_SPEC] + (
+                "\n... (+%d char(s) of this context omitted - the receipt keeps %d per spec; "
+                "the Job log replay has it whole)" % (len(spec) - CONTEXT_PER_SPEC,
+                                                     CONTEXT_PER_SPEC))
+        if used + len(piece) + 1 > cap - 400:
+            break
+        out.append(piece)
+        used += len(piece) + 1
+    note = "(%d spec context(s) in all" % len(specs)
+    if first and len(first) < len(specs):
+        note += ("; the %d of the spec(s) Playwright's roll-up counts failed come first, the "
+                 "rest (an expected failure writes one too) after" % len(first))
+    if len(out) < len(specs):
+        note += ("; %d omitted here - the receipt keeps %d char(s) of them per check, %d in "
+                 "all; the Job log replay has them whole" % (len(specs) - len(out), CONTEXT_CHARS,
+                                                             CONTEXT_TOTAL))
+    return "\n".join(out + [note + ")"])
+
+
+def read_evidence(path):
+    """(text, None) or (None, why it could not be read)."""
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read(), None
+    except (OSError, TypeError) as exc:
+        return None, "(the evidence file %s could not be read: %s)" % (path, exc)
+
+
+def write(entries, replay, excerpts=None, contexts=None):
     with open(replay_path, "w") as fh:
         fh.write("\n".join(replay) + ("\n" if replay else ""))
     if entries is None:
         return
     RECEIPT["fails_excerpt"] = excerpts or {}
+    RECEIPT["fails_context"] = contexts or {}
     if len(entries) > TOTAL_ENTRIES:
         dropped = len(entries) - TOTAL_ENTRIES + 1
         entries = entries[:TOTAL_ENTRIES - 1] + [
@@ -1082,8 +1529,8 @@ for name in failed:
         replay.append("  (the check produced no output at all)")
         excerpts[name] = "(the check produced no output at all)"
         continue
-    tail = body[-REPLAY_TAIL:]
-    replay.append("  last %d of %d line(s):" % (len(tail), total))
+    header, tail = selection(body, total)
+    replay.append("  " + header)
     replay += ["  " + line for line in tail]
     # The receipt's copy of the same lines, within what the total cap
     # has left. A check the total cannot fit still gets an entry that
@@ -1095,7 +1542,33 @@ for name in failed:
                          "has it)" % (EXCERPT_TOTAL, len(excerpts))
     else:
         excerpts[name] = excerpt(tail, left)
-write(entries, replay, excerpts)
+
+# The evidence gate.sh kept for a failed check, onto the record and into
+# the replay - see "WHAT PLAYWRIGHT SAW" above.
+contexts = {}
+evidence = RECEIPT.get("evidence")
+for name, path in (evidence.items() if isinstance(evidence, dict) else []):
+    text, why = read_evidence(path)
+    replay.append("")
+    replay.append("----- EVIDENCE: %s (%s) -----" % (name, path))
+    if text is None:
+        contexts[name] = why
+        replay.append("  " + why)
+        continue
+    lines = text.split("\n")
+    kept = lines[:CONTEXT_REPLAY]
+    replay += ["  " + line for line in kept]
+    if len(lines) > CONTEXT_REPLAY:
+        replay.append("  ... (+%d line(s) omitted - this replay keeps %d, and the file itself "
+                      "died with this pod)" % (len(lines) - CONTEXT_REPLAY,
+                                                                   CONTEXT_REPLAY))
+    left = CONTEXT_TOTAL - sum(len(c) for c in contexts.values())
+    got = found.get(name)
+    failed_specs = failed_by_rollup(got[0]) if got and got[0] else None
+    contexts[name] = context(text, left, failed_specs) if left >= EXCERPT_FLOOR else (
+        "(context omitted - this receipt caps `fails_context` at %d char(s) in all; the Job "
+        "log replay has it)" % CONTEXT_TOTAL)
+write(entries, replay, excerpts, contexts)
 PY
 # --- failure detail (end) ---
 
@@ -1130,15 +1603,27 @@ PY
 # A `fails` that merely restated the check names would be a fact living
 # twice inside one document with nothing holding the two equal
 # (CLAUDE.md §9a), which is why it does not.
-SUMMARY=$(python3 - "$RECEIPT" "$HEAD_SHA" <<'PY'
+#
+# `seed_order` is the runner's own measurement, not gate.sh's: whether
+# every cloned source is newer than every seeded artifact (646c0ade). It
+# is added to an unreadable receipt too — a run that died is exactly
+# the one whose build a reader may want to rule a stale artifact out of.
+SUMMARY=$(python3 - "$RECEIPT" "$HEAD_SHA" "${SEED_ORDER:-}" <<'PY'
 import json, sys
+def with_order(body):
+    if isinstance(body, dict) and sys.argv[3]:
+        try:
+            body["seed_order"] = json.loads(sys.argv[3])
+        except ValueError:
+            body["seed_order"] = {"unparsed": sys.argv[3]}
+    return body
 try:
-    print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))
+    print(json.dumps(with_order(json.load(open(sys.argv[1]))), separators=(",", ":")))
 except Exception as e:
     # gate.sh died before writing a receipt, or wrote something
     # unparseable. That is its own verdict, never a silent green.
-    print(json.dumps({"verdict": "unreadable", "head": sys.argv[2],
-                      "error": str(e)}, separators=(",", ":")))
+    print(json.dumps(with_order({"verdict": "unreadable", "head": sys.argv[2],
+                                 "error": str(e)}), separators=(",", ":")))
 PY
 )
 # --- receipt summary (end) ---

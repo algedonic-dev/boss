@@ -144,7 +144,8 @@ install_rc=0
 #
 # THE CREDENTIAL IS THE CHECKOUT'S OWN: the token file the deposit
 # above keeps (the same value the fetch's helper read), copied by root
-# into a root-only header file with a builtin, and deleted on exit. It
+# into a root-only header file with a builtin — made in the unit's
+# RUNTIME_DIRECTORY (never written without one; see below) — and deleted on exit. It
 # never reaches an argv or the journal. The deposit runs first on every
 # pass, so the pass that cuts the checkout over already reads the file
 # here; a pass with no file (the deposit refused, and said why on this
@@ -159,39 +160,103 @@ install_rc=0
 # rather than assumed; nothing here mints or places a credential
 # (CLAUDE.md §Doors, the credential broker). Run after install.sh, which
 # renders the /etc/boss/sor.env that carries BOSS_FORGE_URL.
+#
+# THE HEADER LIVES IN THE UNIT'S RUNTIME DIRECTORY, OR IS NOT WRITTEN
+# (backlog 359a811c, 2026-09-28). forge-converge.service declares
+# RuntimeDirectory=: tmpfs under /run, 0700, removed by systemd when the
+# oneshot run stops WHATEVER the exit — so after the SIGKILL
+# TimeoutStartSec sends second too — and a power loss clears it. Until
+# then the header was a `mktemp -t` file under the host's shared /tmp,
+# which the EXIT trap removes on every end but those two, and there the
+# token stayed until tmp cleanup (the ops runner's same defect: 5f77b205).
+# The first of a colon list, should the unit ever declare two.
+#
+# No fallback to /tmp. Without the directory, NO header is written and the
+# two readers of it — protect-main and offsite-push — are skipped, the
+# run ending 78 (REFUSED) with `refused` on its packet. Everything ABOVE
+# still ran — the deposit, the fetch, install.sh — and the DR render below
+# still runs: none of them touches this header, and install.sh is the step
+# that installs the unit carrying the directive. That is load-bearing, and
+# the first draft of this car got it wrong (adversarial review, 2026-09-28):
+# cluster-deploy-runner checks this same checkout out at the new sha about
+# a minute after every train merge, so the timer's next tick runs THIS
+# script under the OLD unit, which has no directory. Refusing the whole
+# run there would never install the new unit and would refuse every tick
+# after — a wedge only a hand `sudo install.sh` clears. Refusing only the
+# header, that tick installs the unit and the next one runs clean.
+rtdir="${RUNTIME_DIRECTORY:-}"
+rtdir="${rtdir%%:*}"
 protect_rc=0
-auth_hdr="$(mktemp -t forge-auth.XXXXXX)"
-chmod 600 "$auth_hdr"
-trap 'rm -f "$BOSS_CONVERGE_SNAPSHOT" "$auth_hdr"' EXIT
-# The token file is the OWNER's to write and this script runs as root, so
-# root never reads it (review A1 of the re-review of 5ef6db0b,
-# 2026-09-26): a symlink planted there to /etc/boss-ops/kubeconfig was
-# read as root and sent to the forge in this header. A symlink gets no
-# header, which protect-main names; the file is read as the owner, who
-# cannot read what they could not already.
-if [ -L "$FORGE_TOKEN_FILE" ]; then
-    echo "forge-converge: $FORGE_TOKEN_FILE is a symlink, not the deposit's own file; protect-main gets no header" >&2
-elif [ -s "$FORGE_TOKEN_FILE" ] \
-    && FORGE_TOKEN="$(runuser -u "$OWNER" -- cat -- "$FORGE_TOKEN_FILE")"; then
-    printf 'Authorization: token %s\n' "$FORGE_TOKEN" >"$auth_hdr"
-    unset FORGE_TOKEN
+offsite_rc=0
+auth_hdr=""
+if [ -z "$rtdir" ] || [ ! -d "$rtdir" ]; then
+    echo "forge-converge: REFUSED the forge header — RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'); forge-converge.service's RuntimeDirectory= sets it, and the token is written nowhere else. protect-main and offsite-push are skipped this run; install.sh ran, so the next tick runs under a unit that has it." >&2
+    run_summary_field refused "RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'): no forge header, protect-main and offsite-push skipped"
+    protect_rc=78
+    offsite_rc=78
+else
+    # STALE HEADERS FROM BEFORE THIS CAR. A run SIGKILLed or cut by a power
+    # loss while the header lived in /tmp left it there; nothing writes
+    # that glob any more, and a oneshot never runs beside itself, so every
+    # such file older than this run's directory is a leftover. Bounded to
+    # the top level of /tmp and files this account owns (root, on the host).
+    stale="$(find "${BOSS_FORGE_STALE_HEADER_DIR:-/tmp}" -maxdepth 1 -type f -uid "$(id -u)" \
+        -name 'forge-auth.*' ! -newer "$rtdir" -delete -print 2>/dev/null | wc -l)" || stale="unknown"
+    run_summary_field stale_headers_removed "$stale"
+
+    auth_hdr="$(mktemp -p "$rtdir" forge-auth.XXXXXX)"
+    chmod 600 "$auth_hdr"
+    trap 'rm -f "$BOSS_CONVERGE_SNAPSHOT" "$auth_hdr"' EXIT
+    # The token file is the OWNER's to write and this script runs as root,
+    # so root never reads it (review A1 of the re-review of 5ef6db0b,
+    # 2026-09-26): a symlink planted there to /etc/boss-ops/kubeconfig was
+    # read as root and sent to the forge in this header. A symlink gets no
+    # header, which protect-main names; the file is read as the owner, who
+    # cannot read what they could not already.
+    if [ -L "$FORGE_TOKEN_FILE" ]; then
+        echo "forge-converge: $FORGE_TOKEN_FILE is a symlink, not the deposit's own file; protect-main gets no header" >&2
+    elif [ -s "$FORGE_TOKEN_FILE" ] \
+        && FORGE_TOKEN="$(runuser -u "$OWNER" -- cat -- "$FORGE_TOKEN_FILE")"; then
+        printf 'Authorization: token %s\n' "$FORGE_TOKEN" >"$auth_hdr"
+        unset FORGE_TOKEN
+    fi
+    BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/protect-main.sh" || protect_rc=$?
 fi
-BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/protect-main.sh" || protect_rc=$?
+
+# THE DR COPY'S GITHUB TOKEN, RENDERED ON EVERY TICK AND BEFORE THE PUSH
+# (design 76155676, backlog 81eb6d4d). It is a GitHub App installation
+# token that lives ONE HOUR; the credential broker re-mints it into
+# Secret boss/github-dr-push-token before it expires, and this copies the
+# live value into the root-only file the off-site push reads for
+# algedonic-dev/boss-dr — or removes the file when the Secret holds
+# nothing live, so the push refuses on an empty slot instead of pushing
+# with a dead token. The destination is the DR target's `token_file` in
+# offsite-push.json (backlog 761bc8a9); credential_render_sh.rs pins the
+# two equal.
+render_rc=0
+"$INFRA/forge/credential-render.sh" \
+    --rule "$INFRA/dispatcher/rules/broker-rotates-the-github-dr-push-token.toml" \
+    --dest "${BOSS_GITHUB_DR_TOKEN_FILE:-/etc/boss-publish/github-dr.token}" || render_rc=$?
 
 # THE OFF-SITE COPY, pushed by us and not by Forgejo (backlog 21d54f4a,
 # decided 2026-09-26: no mirror can wipe what it mirrors). Forgejo's push
 # mirror is `git push -f --mirror` whatever its filter, and it was the
 # writer that rewound main on 2026-09-25; infra/forge/offsite-push.sh is
-# the one definition and carries the reasoning. A plain push of publish/*
-# — never main: the fork is public (backlog 67931115) — to
-# dauld/boss-mirror as offsite-push.json declares — a non-fast-forward is
-# refused and named, never overwritten — read back, and only then the
-# Forgejo push mirror deleted. Same forge header as
-# protect-main (deleting a mirror is the same repository administration);
-# the GitHub token is the publish verb's file, read by git's credential
-# helper, never here.
-offsite_rc=0
-BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/offsite-push.sh" || offsite_rc=$?
+# the one definition and carries the reasoning. A plain push of what
+# offsite-push.json declares — a non-fast-forward is refused and named,
+# never overwritten — read back, and only then the Forgejo push mirror
+# deleted. Main goes, alone, to the PRIVATE DR copy algedonic-dev/boss-dr
+# (backlog 761bc8a9), read with the token rendered just above. It
+# declares NOTHING for the public fork dauld/boss-mirror: not main
+# (backlog 67931115), not publish/* (backlog a2b58aab) — the fork gets
+# publish branches only from publish-github-pr.sh, scanned and approved.
+# Same forge header as protect-main (deleting a mirror is the same
+# repository administration); each GitHub token is its target's own
+# file, read by git's credential helper, never here — and an empty DR
+# slot is a refusal on this packet, not a skip.
+if [ "$offsite_rc" -eq 0 ]; then
+    BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/offsite-push.sh" || offsite_rc=$?
+fi
 
 # install.sh's verdict first (it is the older and wider one), then the
 # protection's, then the off-site push's, then the deposit's: any reds
@@ -199,4 +264,5 @@ BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$REPO/infra/forge/offsite-push.sh" || o
 [ "$install_rc" -eq 0 ] || exit "$install_rc"
 [ "$protect_rc" -eq 0 ] || exit "$protect_rc"
 [ "$offsite_rc" -eq 0 ] || exit "$offsite_rc"
+[ "$render_rc" -eq 0 ] || exit "$render_rc"
 exit "$deposit_rc"

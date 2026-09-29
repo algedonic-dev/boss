@@ -10,6 +10,8 @@ pub mod messages_events_pg;
 #[cfg(feature = "postgres")]
 pub mod outbox;
 #[cfg(feature = "postgres")]
+pub mod outbox_http;
+#[cfg(feature = "postgres")]
 pub mod replay;
 pub mod store;
 #[cfg(feature = "postgres")]

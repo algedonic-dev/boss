@@ -139,7 +139,6 @@ mod tests {
                 cadence: None,
                 anchor_date: None,
                 business_calendar: None,
-                regate_hold_minutes: None,
             },
             created_at: now(),
         }

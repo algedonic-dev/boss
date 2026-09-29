@@ -25,6 +25,12 @@ Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-converge.summary.jso
 # the run step, rather than whatever the machine calls itself (backlog
 # 79f7678b, 2026-09-26).
 Environment=HOST_ID=forge
-ExecStartPre=/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-converge "Cluster converge on forge main"
+# `-`: the packet is visibility, never a precondition. This is the loop
+# that deploys a fix to the SoR, so it cannot wait on the SoR — not while
+# it is dark (2026-09-05) and not while it answers 503 on a policy outage
+# (backlog 9fd7f51e). The wrap exits 0 on both; the `-` covers a wrap
+# that fails for any other reason. Pinned by
+# the_chore_runs_through_a_sor_that_answers_badly.rs.
+ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-converge "Cluster converge on forge main"
 ExecStart=/home/david/boss/infra/forge/cluster-deploy-runner.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-cluster-converge run

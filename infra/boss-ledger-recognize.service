@@ -23,7 +23,7 @@ Environment=BOSS_LEDGER_RULESET=2
 # alone, so a tick over an empty revenue_schedules table read exactly
 # like one that recognized a year.
 Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-ledger-recognize.summary.json
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-recognize "Revenue-recognition run"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-recognize "Revenue-recognition run"
 ExecStart=/usr/local/bin/boss-ledger-recognize --config /etc/boss-ledger-api.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-ledger-recognize run
 # Runs as root to match boss-ledger-api.service + the

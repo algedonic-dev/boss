@@ -365,7 +365,7 @@ pub async fn callback(
 
     // Q2: authenticate, never provision. The IdP said who they are;
     // only the People domain says whether they work here.
-    let scope = match bootstrap_email(&state.http, &email).await {
+    let scope = match bootstrap_email(&state.machine, &email).await {
         Some(s) => s,
         None => {
             // The denial event is the record now (gateway-audit-
@@ -723,6 +723,8 @@ mod tests {
             store,
             session_key: vec![9u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit,
             guest_access: crate::local_auth::GuestAccess::Off,
             oidc: Some(OidcRuntime::new(OidcConfig {

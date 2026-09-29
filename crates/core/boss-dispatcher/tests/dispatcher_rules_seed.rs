@@ -324,6 +324,112 @@ async fn a_version_bump_in_the_tree_supersedes_the_live_row() {
     );
 }
 
+/// A rule file EDITED WITHOUT A VERSION BUMP is not live, and the seed
+/// SAYS so instead of reporting it `present` (backlog 732c3cf9).
+///
+/// Measured 2026-09-29: four rule files carried content their live v1
+/// row did not — the per-request GitHub token's `request_id`, its org
+/// filter, the retro exemption, the dead-letter packet's args — because
+/// each was edited at the version the row already held, and the seed
+/// touches nothing that exists at the authored version. The boot line
+/// read "already matches the authored directory present=88". The row
+/// is still left alone (a version is append-only, and inventing v+1
+/// would land a fresh database on a different version than a converged
+/// one); what changes is that the difference is NAMED, field by field,
+/// and never counted as a match.
+///
+/// The control: an edit to a comment or to `why` — neither of which the
+/// row stores — is not a difference, so the seed does not cry wolf on
+/// the edits that need no bump.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_edited_at_the_same_version_is_reported_drifted_not_present() {
+    use boss_dispatcher::rules::seed::SeedHeadline;
+
+    let db = TestDb::new().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = authored_copy(&tmp);
+    let first = seed_authored_rules(&db.pool, &dir)
+        .await
+        .expect("derive the registry from the directory");
+    assert!(
+        first.drifted.is_empty(),
+        "a registry derived from the directory has no drift: {:?}",
+        first.drifted
+    );
+
+    // The control first: prose the row does not hold.
+    let quiet = "converge-on-merge";
+    let file = dir.join(format!("{quiet}.toml"));
+    let src = std::fs::read_to_string(&file).expect("read the rule file");
+    std::fs::write(&file, format!("# a comment the row never held\n{src}"))
+        .expect("write the commented file");
+    let report = seed_authored_rules(&db.pool, &dir).await.expect("seed");
+    assert!(
+        report.drifted.is_empty() && report.present.iter().any(|n| n == quiet),
+        "a comment is not a content change: {report:?}"
+    );
+    assert_eq!(report.headline(), SeedHeadline::Matches);
+
+    // The defect: the `do` list edited, `version` untouched. A second
+    // `do` step is a content change whatever the file already says, and
+    // needs no knowledge of its existing args.
+    let name = "complete-marker-on-step-ready";
+    let before = active_version(&db.pool, name)
+        .await
+        .expect("the seed published it");
+    let file = dir.join(format!("{name}.toml"));
+    let src = std::fs::read_to_string(&file).expect("read the rule file");
+    assert!(
+        src.trim_end().ends_with("handler = \"jobs.complete_step\""),
+        "the fixture rule ends in its one `do` step, so a second appends cleanly:\n{src}"
+    );
+    std::fs::write(
+        &file,
+        format!("{src}[[rule.do]]\nhandler = \"webhook.notify\"\n"),
+    )
+    .expect("write the edited rule file");
+
+    let report = seed_authored_rules(&db.pool, &dir).await.expect("seed");
+    let drift = report
+        .drifted
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("the edited rule must be reported drifted: {report:?}"));
+    assert_eq!(drift.version, before as u32);
+    assert_eq!(
+        drift.fields,
+        vec!["do"],
+        "the drift names the field that differs"
+    );
+    assert!(
+        !report.present.iter().any(|n| n == name),
+        "a drifted rule is not `present` — that word is what hid it: {report:?}"
+    );
+    assert_eq!(
+        report.headline(),
+        SeedHeadline::Differs,
+        "a pass with a drifted rule must not report a match"
+    );
+    assert_eq!(
+        active_version(&db.pool, name).await,
+        Some(before),
+        "the live row stays where it is; the seed reports, it does not rewrite a version"
+    );
+    let live = load_active_rules(&db.pool)
+        .await
+        .expect("load active rules");
+    let row = live
+        .rules
+        .iter()
+        .find(|r| r.name == name)
+        .expect("still enforced");
+    assert_eq!(
+        row.do_steps.len(),
+        1,
+        "the row's content is untouched — the edit is NOT live, which is the finding"
+    );
+}
+
 /// The seed never walks a version BACK. An operator publishing live
 /// through `POST /api/dispatcher/rules` is still supported — that is
 /// what "registry data, editable without a deploy" means — so a live

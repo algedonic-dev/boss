@@ -71,7 +71,7 @@ async fn smoke_tester_can_read_workflows_through_real_policy_api() {
 
     // Wire jobs-api against the real policy-api over HTTP. This is
     // the same shape boss_jobs_api.rs builds in production.
-    let policy: Arc<dyn PolicyClient> = Arc::new(ReqwestPolicyClient::new(url));
+    let policy: Arc<dyn PolicyClient> = Arc::new(ReqwestPolicyClient::new("jobs", url));
 
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();

@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     // instance.
     let policy_url = std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"));
     let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-        boss_policy_client::ReqwestPolicyClient::new(policy_url.clone()),
+        boss_policy_client::ReqwestPolicyClient::new("calendar", policy_url.clone()),
     ));
     info!(%policy_url, "policy client wired");
 

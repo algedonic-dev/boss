@@ -18,7 +18,7 @@ struct ProducedPart {
 }
 
 pub struct InventoryPartsProduce {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     inventory_base: String,
 }
 

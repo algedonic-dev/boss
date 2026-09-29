@@ -285,7 +285,7 @@ async fn list() -> Result<()> {
     let base = jobs_base()?;
     let url = format!("{base}/api/credentials");
     // Waits out a jobs-API roll (backlog 034002b3), like every verb.
-    let client = reqwest::Client::new();
+    let client = crate::gate::machine_client()?;
     let user = crate::identity::header(&crate::identity::reader());
     let resp = crate::train::send_through_a_roll(&format!("GET {url}"), || {
         client.get(&url).header("x-boss-user", user.as_str())

@@ -140,6 +140,19 @@ async fn issued_fact_is_byte_identical_to_rebuild_from_event() {
     .await
     .unwrap();
 
+    // The create staged its own `commerce.invoice.created` in
+    // event_outbox; the relay moves it into audit_log before any
+    // rebuild may replay (design b046f510 refuses one that would drop
+    // it).
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(
+        &db.pool,
+        &(bus as std::sync::Arc<dyn boss_core::port::EventBus>),
+        100,
+    )
+    .await
+    .unwrap();
+
     // The event exactly as the handler emits it, plus the publisher envelope.
     let mut event_payload = boss_commerce::events::invoice_created_payload(&enriched);
     event_payload["_actor"] = serde_json::json!("sim:workforce");

@@ -87,7 +87,6 @@ use super::common::{
     owner_for_filing, post_json, recovery_note, relapse_patch, retraction, rows_or_refuse,
     with_lane, withdrawal_fields, write_json,
 };
-use super::sensor_poll::firing_instant;
 
 /// How often a runner polls, in seconds — `OnUnitActiveSec=1min` in
 /// `infra/ops/boss-ops-runner.timer`, the one unit both hosts install
@@ -474,7 +473,7 @@ fn recovery_evidence(q: Option<&HostQueue>, host: &str, now: DateTime<Utc>) -> S
 // ---------------------------------------------------------------------------
 
 pub struct OpsQueueAlarm {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who the packets this handler files are owned by — the platform
     /// owner through the port (backlog 3c23662d); never a literal.
@@ -634,7 +633,9 @@ impl Handler for OpsQueueAlarm {
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let rule = ctx.rule_name.as_str();
-        let now = firing_instant(&ctx.event_payload);
+        // The tick's instant (`_at`); refused, never the wall clock,
+        // when the firing carries none (eabc5943).
+        let now = ctx.firing_instant()?;
         let open = open_jobs_of_kind(&self.client, self.base(), "ops-request", rule).await?;
         let queues = queues(&open);
         let alarms_url = self.url(&[
@@ -693,6 +694,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "ops-runner-queue-watched-every-5-minutes".into(),
             triggering_event_id: format!("clock-tick:{NOW}"),
             triggering_topic: "clock.tick".into(),

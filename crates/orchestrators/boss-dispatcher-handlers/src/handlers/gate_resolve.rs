@@ -33,7 +33,7 @@ use super::common::{
 };
 
 pub struct GateResolve {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     products_base: String,
     registry: Arc<StepRegistry>,
@@ -54,7 +54,7 @@ impl GateResolve {
     }
 
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         products_base: impl Into<String>,
         registry: Arc<StepRegistry>,
@@ -589,6 +589,7 @@ mod tests {
 
     fn ctx_for(payload: JsonValue) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "gate-resolve-test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.demand-gate".into(),

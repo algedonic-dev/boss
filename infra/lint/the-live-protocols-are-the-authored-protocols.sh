@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
 # preflight: serial — reads the live protocol registry off the jobs API through lib/sor-read.sh, waiting out a roll; one reader of the record per pre-flight
+# consist: skip — compares the LIVE registry to a tree, so its answer is a fact about the estate, not a function of the sha a gate vouches for; the live run belongs after the converge (design d349e0ba)
+#
+# WHY NO GATE RUNS THIS (design d349e0ba, backlog b79054b2, 2026-09-28).
+# Until then it was in the pre-flight roster, and the roster test
+# (`a_lint_that_scanned_nothing_is_red.rs`) ran it a second time inside
+# `test`. Gate 2f82e7fa went red on both: train #782 landed
+# `break-glass-enrolment`, the converge seeded it live, and a car whose
+# base predated #782 had no file for it — a live kind the tree under
+# test could not author, so the car's BASE decided its verdict. The
+# comparison is right; the moment was wrong. After a merge has
+# converged, tree, image and registry are supposed to agree, so that is
+# where the design runs it, filing each disagreement as work. The
+# self-test and the static half still run on every scoped gate: the
+# tree-wide pin `a_lint_that_reads_the_api_waits_out_a_roll.rs` runs
+# this script on the tree against a refused registry and wants exit 3,
+# so a static finding (exit 1) reds it.
 #
 # the-live-protocols-are-the-authored-protocols — every protocol the
 # running registry admits Jobs under is one this tree writes down.
@@ -136,6 +152,26 @@
 # block joined the facets on 2026-09-19 (backlog 1b847556): it is
 # structural like `fields`, and a live row lacking it read "agree".
 #
+# AND, SINCE 2026-09-28, EVERY OTHER KEY (backlog 462cdfe3). The item
+# said rotate-a-credential was "v4 in the tree and v2 live" and asked
+# why drift had not named it. It had nothing to name: a workflow file
+# declares no version (the registry assigns max+1), the "v3"/"v4" in
+# that file's header are revisions of its prose, and live v2 (published
+# 2026-09-26 07:13Z) matched the file key for key. But the question
+# found the real gap one key over: incident's file said
+# `surfaces = ["system-incidents"]` and publish-request's
+# `owner_role = "platform-admin"`, both landed by cars, while the live
+# rows still said `system-design` and `shift-lead` — tree revisions the
+# registry never took, reading "56 live rows agree". Workflow `metadata`
+# was not compared, nor optional fields, predicates, step kinds or
+# procedures, on the normalisation argument above. Measured that day
+# over all 56 kinds, only `authority_role` needed any (the publish path
+# fills it when a step names none); every other key compared verbatim.
+# So every key both copies can state is compared under its own name,
+# and the publish-filled one only when the file names it. The file
+# still carries no version, so a finding names the LIVE version it was
+# measured against; the tree side of it is the file at this checkout.
+#
 # NOT A CASE FOR WIDENING `kind_body_matches`. That function governs
 # every bootstrap-created row, so widening it would change reconcile's
 # behaviour for rows this problem is not about — and since
@@ -155,6 +191,8 @@
 #
 # Usage:  infra/lint/the-live-protocols-are-the-authored-protocols.sh
 #           [--require-live] [--report-json <file>] [--self-test]
+#         infra/lint/the-live-protocols-are-the-authored-protocols.sh
+#           --compare <bundle_dir> <live_json>
 #
 #   --require-live  For a caller with somewhere to put the answer (a
 #                   sweep, a cadence, an operator asking the question
@@ -175,6 +213,14 @@
 #   --self-test     Run the fixture cases and say what they proved.
 #                   They run on every invocation regardless; the flag
 #                   only makes them speak.
+#   --compare       Run ONLY the field comparator: <bundle_dir> against
+#                   the live answer saved at <live_json>, printing its
+#                   COUNTS / DRIFT / ABSENT / NOROW lines and exiting
+#                   with its own codes (above `fields_report`). No
+#                   network, no self-test, no static half. It exists so
+#                   boss-testing/tests/the_drift_facets_are_one_list.rs
+#                   can run this comparator and `boss tenant publish`'s
+#                   over one bundle and one answer (backlog e5dc276d).
 #
 #   Exit codes:  0 clean (or drift, reported, bare invocation; or the
 #                  static half clean under BOSS_ESTATE=none)
@@ -235,6 +281,8 @@ FIELD_FLOOR=20
 REQUIRE_LIVE=0
 SELF_TEST=0
 REPORT_JSON=""
+COMPARE_BUNDLE=""
+COMPARE_LIVE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --require-live) REQUIRE_LIVE=1 ;;
@@ -242,6 +290,9 @@ while [ $# -gt 0 ]; do
             [ -n "${2:-}" ] || { echo "$NAME: --report-json needs a file path" >&2; exit 64; }
             REPORT_JSON="$2"; shift ;;
         --self-test)    SELF_TEST=1 ;;
+        --compare)
+            [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "$NAME: --compare needs <bundle_dir> <live_json>" >&2; exit 64; }
+            COMPARE_BUNDLE="$2"; COMPARE_LIVE="$3"; shift 2 ;;
         *) echo "$NAME: unknown argument: $1" >&2; exit 64 ;;
     esac
     shift
@@ -304,17 +355,18 @@ bundle_dir, live_path, floor = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.a
 # it. A finding no action can close trains a reader to skip the whole
 # report (§Diagnosis, "a check nobody reads").
 #
-# DELIBERATELY NOT COMPARED: `subject_kinds`, `metadata_schema`,
-# `entitlements`, `metadata`, `on_complete_create`, and the parts of
-# `steps` that STEP_FACETS below does not render (predicates, kinds,
-# field types, metadata_defaults; NOT `agent`, which is compared — see
-# the facet list). Those are STRUCTURAL — they decide
-# what the protocol does — and they need the same normalisation the
-# publish path applies (defaults filled, predicates parsed) before an
-# equality means anything, which is a check of its own, not a line in
-# this one. Also out: `version`, `status`, `created_at`,
-# `authoring_job_id` — four columns with no TOML key at all, so the file
-# cannot disagree with them.
+# UNTIL 2026-09-28 this paragraph listed `subject_kinds`,
+# `metadata_schema`, `entitlements`, `metadata` and the rest of `steps`
+# (predicates, kinds, field types, metadata_defaults) as DELIBERATELY
+# NOT COMPARED, because they would "need the publish path's
+# normalisation before an equality means anything". Measured over all
+# 56 compared kinds, that was true of one key, `authority_role`, and
+# false of the others — and leaving them out hid two live rows lagging
+# their files (backlog 462cdfe3). They are compared now, each under its
+# own name, by the EVERY OTHER KEY block below the step facets. Still
+# out: `version`, `status`, `created_at`, `authoring_job_id` — four
+# columns with no TOML key at all, so the file cannot disagree with
+# them — and `owning_team`, for the reason above.
 FIELDS = ("label", "description", "category")
 
 # THE STEP FACETS, compared since 2026-09-15 (backlog 0ccf23ec). Steps
@@ -339,6 +391,10 @@ FIELDS = ("label", "description", "category")
 #   steps.<title>.required      the sorted names of that step's
 #                               required fields — the completion
 #                               contract; `proof` is the worked case
+#   steps.<title>.optional      the sorted `name:type` of every field
+#                               NOT required (2026-09-28, 462cdfe3):
+#                               rotate-a-credential's `old_token` was
+#                               one, and `required` cannot see it
 #   steps.<title>.title_template  the step's label as rendered; the
 #                               same class as `label` one level up,
 #                               and where pr-train's live v17 (yard
@@ -381,9 +437,70 @@ def step_facets(steps):
             if isinstance(f, dict) and f.get("required") is True
         )
         out[f"steps.{t}.required"] = ",".join(required)
+        out[f"steps.{t}.optional"] = ",".join(sorted(
+            f"{f.get('name', '')}:{f.get('field_type', '')}" for f in fields
+            if isinstance(f, dict) and f.get("required") is not True
+        ))
         out[f"steps.{t}.title_template"] = str(s.get("title_template", ""))
         out[f"steps.{t}.agent"] = agent_facet(s.get("agent"))
+        for key, value in s.items():
+            if key not in STEP_NAMED:
+                out[f"steps.{t}.{key}"] = canon(value)
     return out, titles
+
+# EVERY OTHER KEY, since 2026-09-28 (backlog 462cdfe3). The list above
+# was curated, and a curated list answers only the questions its author
+# thought of: rotate-a-credential's file-side "v3" added an OPTIONAL
+# field and a procedure, incident's file moved the protocol to another
+# surface, publish-request's changed its owner role — and every one of
+# them read "agree", because none touched a required field, a title or
+# a label. The reason those keys were out ("they need the publish
+# path's normalisation before an equality means anything") was
+# MEASURED that day against all 56 compared kinds: predicates, step
+# kinds, field types, metadata_defaults, terminals, audiences,
+# subject_kinds, metadata, metadata_schema and entitlements all compare
+# verbatim, once "the file is silent" and "the row holds null / false /
+# an empty list" are read as the same claim and a number is read as a
+# float (TOML 2, registry 2.0 — the agent block's rule). ONE key did
+# not: `authority_role`, which the publish path fills from the owner
+# role when a step names none (13 steps that day), so it is compared
+# only when the FILE names one. Every other key is compared under its
+# own name, so a key added to a step tomorrow is compared the day it
+# is written rather than the day someone remembers this list.
+#
+# THESE LISTS LIVE TWICE, and a test holds them equal (backlog
+# e5dc276d). `boss tenant publish` asks the same question through
+# `boss_jobs::bootstrap::workflow_changes`, whose constants are these
+# five lists under their Rust names; that copy lacked `agent` for nine
+# days and every key above for one, because a comment said "the SAME
+# list" and nothing checked it. `boss-testing/tests/the_drift_facets_
+# are_one_list.rs` reads each `NAME = ` line below and compares it entry
+# by entry, and runs both comparators over the real bundle through
+# `--compare`. Keep each list on ONE line that starts with its name.
+NAMED_STEP_FACETS = ("required", "optional", "title_template", "agent")
+STEP_NAMED = {"title", "title_template", "agent", "fields"}
+ROW_ONLY = {"kind", "version", "status", "created_at", "authoring_job_id", "owning_team", "step", "steps"}
+FILLED_WHEN_SILENT = {"authority_role"}
+
+def canon(value):
+    """One canonical string for a structural value; None for no claim.
+
+    Absent, null, false, "" and an empty list or table are one claim —
+    the publish path writes the default the file was silent about.
+    """
+    if value is None or value is False or value in ("", [], {}):
+        return None
+    def norm(x):
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, dict):
+            return {k: norm(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [norm(v) for v in x]
+        return x
+    return json.dumps(norm(value), sort_keys=True, ensure_ascii=False, default=str)
 
 def agent_facet(block):
     """The agent block as one canonical string, or None for no block.
@@ -400,15 +517,26 @@ def agent_facet(block):
     }
     return json.dumps(canon, sort_keys=True, ensure_ascii=False)
 
-def facets_to_compare(tree_titles, live_titles):
+def facets_to_compare(tree_facets, live_facets, tree_titles, live_titles):
     both = set(tree_titles) & set(live_titles)
     yield "steps.count"
     yield "steps.titles"
     for t in tree_titles:
         if t in both:
-            yield f"steps.{t}.required"
-            yield f"steps.{t}.title_template"
-            yield f"steps.{t}.agent"
+            named = [f"steps.{t}.{k}" for k in NAMED_STEP_FACETS]
+            yield from named
+            rest = {
+                f"steps.{t}.{k}"
+                for side in (step_keys(tree_facets, t), step_keys(live_facets, t))
+                for k in side
+            }
+            yield from sorted(rest - set(named))
+
+def step_keys(facets, title):
+    """The per-step keys one side states for `title`, named facets excluded."""
+    prefix = f"steps.{title}."
+    return [k[len(prefix):] for k in facets if k.startswith(prefix)
+            and k[len(prefix):] not in NAMED_STEP_FACETS]
 
 try:
     doc = json.load(open(live_path))
@@ -494,12 +622,23 @@ for f in files:
                 continue
             drifted += 1
             lines.append(drift_line(kind, field, row, tree, live))
+        # Every other workflow-level key, under its own name (see
+        # ROW_ONLY and canon above): metadata, subject_kinds,
+        # metadata_schema, entitlements, and whatever is added next.
+        for key in sorted((set(wf) | set(row)) - ROW_ONLY - set(FIELDS)):
+            tree, live = canon(wf.get(key)), canon(row.get(key))
+            if tree == live:
+                continue
+            drifted += 1
+            lines.append(drift_line(kind, key, row, tree, live))
         # The TOML key is `step` ([[workflow.step]]); the row's is `steps`.
         tree_facets, tree_titles = step_facets(wf.get("step"))
         live_facets, live_titles = step_facets(row.get("steps"))
-        for facet in facets_to_compare(tree_titles, live_titles):
-            tree, live = tree_facets[facet], live_facets[facet]
+        for facet in facets_to_compare(tree_facets, live_facets, tree_titles, live_titles):
+            tree, live = tree_facets.get(facet), live_facets.get(facet)
             if tree == live:
+                continue
+            if tree is None and facet.rsplit(".", 1)[-1] in FILLED_WHEN_SILENT:
                 continue
             drifted += 1
             lines.append(drift_line(kind, facet, row, tree, live))
@@ -556,10 +695,12 @@ PY
 #     fields:   { parsed, compared, drifted,
 #                 drift:  [{kind, field, live_version, at, tree_len,
 #                           live_len, tree_window, live_window}…],
-#                         `field` is a compared field (`description`)
+#                         `field` is a compared field (`description`),
+#                         a workflow key (`metadata`, `subject_kinds`…)
 #                         or a step facet (`steps.count`, `steps.titles`,
-#                         `steps.<title>.required`,
-#                         `steps.<title>.title_template`)
+#                         `steps.<title>.required`, `.optional`,
+#                         `.title_template`, `.agent`, or any other key
+#                         of the step: `.ready_when`, `.metadata_defaults`…)
 #                 absent: [{kind, field}…] }, the file makes no claim
 #     pending:  [kind…],                      authored, not yet admitted
 #     tenants:  [{file, not_admitted, total}…] }
@@ -771,8 +912,12 @@ FX
         || { echo "self-test FAILED: the required-set finding carries no excerpt of the live set: $out" >&2; rm -rf "$t"; return 1; }
     grep -qF "DRIFT	beta	steps.proven.title_template	v3" <<< "$out" \
         || { echo "self-test FAILED: a step label that differs was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
-    grep -qF "drifted=4" <<< "$out" \
-        || { echo "self-test FAILED: four step facets adrift were not counted as four: $out" >&2; rm -rf "$t"; return 1; }
+    # The live `method` is OPTIONAL and the file lacks it: named since
+    # 2026-09-28 (case 3d says why), so this fixture drifts five facets.
+    grep -qF "DRIFT	beta	steps.proven.optional	v3" <<< "$out" \
+        || { echo "self-test FAILED: an optional field the file lacks was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "drifted=5" <<< "$out" \
+        || { echo "self-test FAILED: five step facets adrift were not counted as five: $out" >&2; rm -rf "$t"; return 1; }
     grep -q "steps\.opened\." <<< "$out" \
         && { echo "self-test FAILED: a step that agrees was named: $out" >&2; rm -rf "$t"; return 1; }
     grep -q "steps\.settled\." <<< "$out" \
@@ -841,6 +986,75 @@ FX
     [ "$rc" -eq 0 ] || { echo "self-test FAILED: a live row carrying the file's agent block exited $rc: $out" >&2; rm -rf "$t"; return 1; }
     grep -qF "drifted=0" <<< "$out" \
         || { echo "self-test FAILED: the same agent block on both sides (TOML 5, JSON 5.0) read as drift: $out" >&2; rm -rf "$t"; return 1; }
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+FX
+
+    # 3d. A TREE REVISION THE REGISTRY NEVER TOOK, in the facets the list
+    #    above used to leave out (2026-09-28, backlog 462cdfe3). The file
+    #    adds an OPTIONAL field, rewrites a step's procedure, re-orders a
+    #    predicate, and moves the protocol to another surface — none of
+    #    which touches a required field, a title or a label, so every one
+    #    read "agree". Measured that day: incident's file said
+    #    `surfaces = ["system-incidents"]` and publish-request's
+    #    `owner_role = "platform-admin"`, both landed by cars, and the live
+    #    rows still said `system-design` and `shift-lead`. Each finding
+    #    must be named by its key; what the PUBLISH PATH fills in when a
+    #    file is silent (`authority_role` from the owner role, `false`,
+    #    `null`, an empty list) must not be; and a number spelled 2 in
+    #    TOML and 2.0 by the registry must agree.
+    cat > "$t/bundle/beta.toml" <<'FX'
+[[workflow]]
+kind = "beta"
+label = "Beta"
+category = "platform"
+owning_team = "platform"
+description = "The second protocol."
+metadata = { surfaces = ["system-incidents"] }
+
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+title_template = "Opened"
+duration_hours = 2
+
+[[workflow.step]]
+title = "revoke"
+kind = "task"
+ready_when = "steps.opened.done && steps.opened.done"
+title_template = "Revoke"
+metadata_defaults = { procedure = "Revoke the old token at the issuer." }
+[[workflow.step.fields]]
+name = "revoked"
+field_type = "string"
+required = true
+[[workflow.step.fields]]
+name = "old_token"
+field_type = "string"
+FX
+    printf '%s' '[{"kind":"alpha","version":1,"status":"active","label":"Alpha","category":"platform","owning_team":"platform","description":"The first protocol."},
+                  {"kind":"beta","version":3,"status":"active","label":"Beta","category":"platform","owning_team":"platform","description":"The second protocol.","metadata":{"surfaces":["system-design"]},"metadata_schema":null,"entitlements":[],
+                   "steps":[{"title":"opened","kind":"trigger","ready_when":"true","title_template":"Opened","fields":[],"agent":null,"duration_hours":2.0,"authority_role":"platform-admin","claimable":false,"terminal":null},
+                            {"title":"revoke","kind":"task","ready_when":"steps.opened.done","title_template":"Revoke","fields":[{"name":"revoked","field_type":"string","required":true}],"agent":null,"authority_role":"platform-admin","metadata_defaults":{"procedure":"Revoke it."}}]}]' > "$t/unpublished.json"
+    out=$(fields_report "$t/bundle" "$t/unpublished.json" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test FAILED: an unpublished tree revision exited $rc: $out" >&2; rm -rf "$t"; return 1; }
+    for want in "DRIFT	beta	metadata	v3" "DRIFT	beta	steps.revoke.optional	v3" \
+                "DRIFT	beta	steps.revoke.metadata_defaults	v3" "DRIFT	beta	steps.revoke.ready_when	v3"; do
+        grep -qF "$want" <<< "$out" \
+            || { echo "self-test FAILED: an unpublished tree revision was not named as '$want': $out" >&2; rm -rf "$t"; return 1; }
+    done
+    grep -qF "system-incidents" <<< "$out" \
+        || { echo "self-test FAILED: the metadata finding carries no excerpt of the file's value: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "drifted=4" <<< "$out" \
+        || { echo "self-test FAILED: four unpublished facets were not counted as four: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qE "authority_role|claimable|terminal|metadata_schema|entitlements|duration_hours" <<< "$out" \
+        && { echo "self-test FAILED: a value the publish path fills in, or a number spelled 2 and 2.0, was named as drift: $out" >&2; rm -rf "$t"; return 1; }
     cat > "$t/bundle/beta.toml" <<'FX'
 [[workflow]]
 kind = "beta"
@@ -933,9 +1147,14 @@ PY
     fi
 
     rm -rf "$t"
-    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a step the file lacks is named by count and title list and a required field or step label that differs is named by its step, a live step lacking the agent block its file declares is named by its step while the same block on both sides agrees with the budget as 5 and 5.0, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, and --require-live exits 75 naming the target it could not reach, and the JSON report carries the same kind/field/version/excerpt, counts and verdict as the text"
+    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a step the file lacks is named by count and title list and a required field or step label that differs is named by its step, a live step lacking the agent block its file declares is named by its step while the same block on both sides agrees with the budget as 5 and 5.0, a tree revision the registry never took (an optional field, a procedure, a predicate, the workflow metadata) is named by its key while a value the publish path fills in when the file is silent is not, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, and --require-live exits 75 naming the target it could not reach, and the JSON report carries the same kind/field/version/excerpt, counts and verdict as the text"
     return 0
 }
+
+if [ -n "$COMPARE_BUNDLE" ]; then
+    fields_report "$COMPARE_BUNDLE" "$COMPARE_LIVE"
+    exit $?
+fi
 
 self_test || exit 1
 [ "$SELF_TEST" -eq 0 ] || exit 0

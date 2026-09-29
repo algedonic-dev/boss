@@ -1,0 +1,8 @@
+{
+  "about": "MUTATING — discards the recovery kit cut-recovery-kit left in the forge's RAM (infra/forge/recovery-kit.sh --discard; backlog c1bb822e, the adversarial review of car 3d12b774 finding 5). Authorized by David 2026-09-29 with the kit itself. It removes every file under /run/boss-recovery-kit and unmounts the tmpfs, under the same lock the cut and the reader take, so a stream in flight finishes first or this refuses. A write that reads back discards the kit on its own; this verb is for a kit cut and never written, or one to be dropped at once. Bounded to that one directory, which the script names — nothing from the packet. No kit cut is an answer, not a failure.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/recovery-kit.sh", "--discard"],
+  "params": [],
+  "timeout": 60,
+  "effect": "^recovery-kit: (kit .+ discarded; .+ read back empty and (unmounted|still a mounted tmpfs .+)|no kit is cut [(].+ is not a mounted tmpfs[)] — nothing to discard)$"
+}

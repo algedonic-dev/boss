@@ -208,11 +208,15 @@ closed set, the type system shouldn't either).
 
 **Which attributes validate against the registry:**
 
-- `employees.role`, `employees.department`,
-  `employees.employment_type`, and `employees.status` validate
-  against the matching `(subject_kind='employee', member_attribute=…)`
-  Class rows; their CHECK constraints are dropped and
-  `classes_api_url` is required in `PeopleApiConfig`.
+- `employees.role`, `employees.employment_type`, and
+  `employees.status` validate against the matching
+  `(subject_kind='employee', member_attribute=…)` Class rows; their
+  CHECK constraints are dropped and `classes_api_url` is required in
+  `PeopleApiConfig`. `employees.department` did too until backlog
+  `c87e3d6d` (2026-09-27): a department is a Subject with identity, so
+  its column validates against the `departments` registry
+  (`GET /api/departments`) and the department Classes retired — a
+  department's Classes are only its `function` taxonomy.
 - Account-team roles (`boss-accounts`, `account_team_members.rs`)
   validate via `class_exists("employee", role)`.
 - Catalog asset models (`boss-catalog/src/http.rs`) validate

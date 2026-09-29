@@ -257,7 +257,7 @@ pub(crate) enum Outcome {
 /// through. `session` is the work-session packet, when the hook has one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn from_hook_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     repo: &Path,
     input: &Value,
@@ -408,7 +408,7 @@ pub async fn run(session: String) -> Result<()> {
         .filter(|v| !v.trim().is_empty())
         .map(std::path::PathBuf::from);
     from_hook_at(
-        &reqwest::Client::new(),
+        &crate::gate::machine_client()?,
         &base,
         &repo,
         &input,
@@ -724,7 +724,7 @@ mod wire_tests {
         definitions: Option<&std::path::Path>,
     ) -> Outcome {
         from_hook_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             base,
             &repo(),
             input,

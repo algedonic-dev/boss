@@ -154,17 +154,29 @@ fn access_declares_an_ssh_application_in_front_of_the_door() {
     );
 }
 
+/// The client steps' one copy, read by the /it/estate page AND the
+/// printed recovery sheet (design 125d405d collapsed the page's literal
+/// into it, so the paper is not a second spelling).
+const DOOR_DATA: &str = "apps/web/src/it/estate/dev-door.json";
+
 #[test]
 fn the_estate_page_spells_the_same_hostname_as_the_route() {
     // CLAUDE.md §9a: the hostname lives in the tree twice — the route
-    // the connector serves and the block the page prints — because the
-    // jobs API serves no read of either. Collapsing it needs the
-    // estate reader (d471a8ce); until then it is pinned here, and this
-    // test names the file that is wrong when they drift.
+    // the connector serves and the data file the page and the paper
+    // print from — because the jobs API serves no read of either.
+    // Pinned here, and this test names the file that is wrong when
+    // they drift.
+    let data: serde_json::Value =
+        serde_json::from_str(&read(DOOR_DATA)).expect("dev-door.json parses");
+    assert_eq!(
+        data["host"].as_str(),
+        Some(DOOR),
+        "{DOOR_DATA} must name the same hostname infra/cluster/tunnel-origins.toml routes"
+    );
     let page = read("apps/web/src/it/estate/estate.ts");
     assert!(
-        page.contains(&format!("'{DOOR}'")),
-        "apps/web/src/it/estate/estate.ts must name the same hostname infra/cluster/tunnel-origins.toml routes"
+        page.contains("from './dev-door.json'"),
+        "the page reads the one copy rather than spelling the host again"
     );
     assert!(
         !page.contains("10.20.0.35"),
@@ -273,9 +285,9 @@ fn the_access_principal_may_log_in_as_root() {
 fn the_estate_page_asks_for_a_short_lived_certificate() {
     // Without --short-lived-cert the stanza cloudflared writes carries
     // no CertificateFile, and ssh offers no certificate at all.
-    let page = read("apps/web/src/it/estate/estate.ts");
+    let data = read(DOOR_DATA);
     assert!(
-        page.contains("cloudflared access ssh-config --hostname ${host} --short-lived-cert"),
-        "apps/web/src/it/estate/estate.ts must print the ssh-config command with --short-lived-cert"
+        data.contains("cloudflared access ssh-config --hostname {host} --short-lived-cert"),
+        "{DOOR_DATA} must carry the ssh-config command with --short-lived-cert"
     );
 }

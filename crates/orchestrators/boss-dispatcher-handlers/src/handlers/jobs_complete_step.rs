@@ -46,7 +46,7 @@ use std::sync::Arc;
 use super::common::{StepEvent, dispatcher_actor_header, sim_origin_value};
 
 pub struct JobsCompleteStep {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     registry: Arc<StepRegistry>,
 }
@@ -63,7 +63,7 @@ impl JobsCompleteStep {
     /// Construct with a custom reqwest client (tests point it at a
     /// mock server; production passes a fresh client).
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         registry: Arc<StepRegistry>,
     ) -> Arc<Self> {
@@ -217,6 +217,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "complete-marker-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.trigger".into(),

@@ -215,7 +215,7 @@ pub(crate) struct Attached {
 /// tests go through, as `gate::api_at_signed` is): a refused signature
 /// never reaches the socket.
 pub(crate) async fn attach_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     content_base: &str,
     target: &Target,
     path: &Path,
@@ -382,7 +382,7 @@ async fn run(packet: &str, file: &Path, step: Option<&str>) -> Result<()> {
     }
     file_that_fits(file)?;
 
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let jobs_base = crate::gate::resolve_jobs_base(None)?;
     let id = crate::job::fetch_and_resolve(&http, packet).await?;
     let job = crate::gate::api(
@@ -493,7 +493,7 @@ pub(crate) mod tests {
         let path = file_of("proof.bin", &bytes);
         let base = store().await;
         let a = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &job_target(),
             &path,
@@ -507,7 +507,8 @@ pub(crate) mod tests {
         assert_eq!(a.uploaded_by, "agent-test", "the row names who attached it");
 
         // The attachment is listed on the target it was sent to.
-        let listed: Value = reqwest::Client::new()
+        let listed: Value = crate::gate::machine_client()
+            .unwrap()
             .get(format!(
                 "{base}/api/files?target_kind=job&target_id={}",
                 job_target().id
@@ -525,7 +526,7 @@ pub(crate) mod tests {
     async fn an_unnamed_write_is_refused_before_the_socket() {
         let path = file_of("a.txt", b"hello");
         let e = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             NOWHERE,
             &job_target(),
             &path,
@@ -541,7 +542,7 @@ pub(crate) mod tests {
     async fn a_file_past_the_limit_is_refused_before_it_is_sent_naming_the_limit() {
         let path = file_of("big.bin", &vec![b'x'; largest_file() as usize + 1]);
         let e = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             NOWHERE,
             &job_target(),
             &path,
@@ -561,7 +562,7 @@ pub(crate) mod tests {
     async fn the_largest_file_the_verb_sends_is_taken_by_the_real_door() {
         let path = file_of("edge.bin", &vec![b'y'; largest_file() as usize]);
         let a = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &store().await,
             &job_target(),
             &path,
@@ -587,7 +588,7 @@ pub(crate) mod tests {
         );
         let path = file_of("a.txt", b"hello");
         let e = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &serve(off).await,
             &job_target(),
             &path,
@@ -627,7 +628,7 @@ pub(crate) mod tests {
             );
         let path = file_of("a.txt", &bytes);
         let e = attach_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &serve(liar).await,
             &job_target(),
             &path,

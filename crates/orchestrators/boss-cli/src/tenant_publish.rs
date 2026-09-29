@@ -89,8 +89,8 @@
 //! the decision is in docs/architecture-decisions.md.
 //!
 //! SIGNED, NOT SIMULATED. Every write carries `x-boss-user` as
-//! `automation:tenant-seed` (platform-admin / operator — the tier the
-//! doors gate on) and NOT `x-sim-origin`: the engines mark their seed
+//! `automation:tenant-seed` (platform-admin, whom policy grants
+//! Create/Update/Retire on `class` — the question the classes doors ask) and NOT `x-sim-origin`: the engines mark their seed
 //! writes as a sim chain, which stamps the resulting events
 //! `_simulated`, and the cutover TRIMS simulated rows. A real company's
 //! declarations are real.
@@ -99,11 +99,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use boss_core::machine_token::BlockingClient;
 use boss_core::publish::{
     FieldChange, KeptRow, PublishMode, UpdatedRow, render_kept, render_updated,
 };
 use boss_core::tenant_manifest::TenantToml;
-use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -1063,7 +1063,7 @@ pub fn plan(dir: &Path) -> Result<Plan> {
     })
 }
 
-fn seed_client() -> Result<Client> {
+fn seed_client() -> Result<BlockingClient> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
@@ -1073,10 +1073,14 @@ fn seed_client() -> Result<Client> {
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
-    Ok(Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .default_headers(headers)
-        .build()?)
+    // Stamps the machine token per request and follows no redirect
+    // (design 6805c764 car 2, the CLI slice): a publish walk writes to
+    // every service port the gate will guard.
+    Ok(BlockingClient::build(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .default_headers(headers),
+    )?)
 }
 
 fn url(base: &str, path: &str) -> String {
@@ -1153,7 +1157,12 @@ fn declared_changes(current: &Value, declared: &Value) -> Vec<FieldChange> {
 /// while the file said `loc-algedonic-hq`), the bootstrap case; on a
 /// running instance the same overlay reverted every operator edit at
 /// the next boot, which is the collision the design decided against.
-fn seed_people(client: &Client, people_base: &str, roster: &[Value], take: bool) -> Result<String> {
+fn seed_people(
+    client: &BlockingClient,
+    people_base: &str,
+    roster: &[Value],
+    take: bool,
+) -> Result<String> {
     let (rows, links) = manager_split(roster.to_vec());
     let post_url = url(people_base, "/api/people");
     let (mut posted, mut same) = (0usize, 0usize);
@@ -1273,7 +1282,7 @@ fn seed_people(client: &Client, people_base: &str, roster: &[Value], take: bool)
 /// both engines run before opening design Jobs, so role-bearing steps
 /// assign to real holders instead of dead-lettering against a cold
 /// roster. Best-effort: a timeout logs and proceeds.
-fn wait_for_people_projection(client: &Client, people_base: &str, threshold: usize) {
+fn wait_for_people_projection(client: &BlockingClient, people_base: &str, threshold: usize) {
     let list_url = url(people_base, "/api/people");
     let (mut prev, mut stable) = (0usize, 0u32);
     for _ in 0..90 {
@@ -1309,7 +1318,7 @@ fn wait_for_people_projection(client: &Client, people_base: &str, threshold: usi
 /// back, the declared body is PUT through that door, and the change is
 /// named field by field from the row read.
 fn take_classes(
-    client: &Client,
+    client: &BlockingClient,
     classes_base: &str,
     rows: &[Value],
     kept: &[KeptRow],
@@ -1361,7 +1370,7 @@ fn take_classes(
 }
 
 /// Send one door. Returns the outcome line's tail.
-fn send(client: &Client, bases: &Bases, door: &Door, take: &Take) -> Result<String> {
+fn send(client: &BlockingClient, bases: &Bases, door: &Door, take: &Take) -> Result<String> {
     match door {
         Door::Classes { rows } => {
             let u = url(&bases.classes, "/api/classes/batch");
@@ -1598,7 +1607,7 @@ fn rules_outcome(resp: reqwest::blocking::Response, u: &str) -> Result<String> {
 /// it took the name from. The next publish then reads the tenant's
 /// own row as ahead of its file, and leaves it alone.
 fn publish_rule(
-    client: &Client,
+    client: &BlockingClient,
     dispatcher_base: &str,
     source: &str,
     rule: &boss_dispatcher::rules::registry::RawRule,

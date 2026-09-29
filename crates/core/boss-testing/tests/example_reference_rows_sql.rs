@@ -29,7 +29,11 @@
 //!     (2026-09-25): the thirteen rows migration 20260919181324 seeds
 //!     are the brewery's seeds/departments.toml, so on a bare schema the
 //!     registry empties and a company's instance holds only the roster
-//!     its own tenant declares.
+//!     its own tenant declares — all but `it`, since backlog c87e3d6d
+//!     (2026-09-27): an employee's department is a departments row now,
+//!     so the department the operator baseline hires into is the
+//!     platform's row, and the `it` department CLASS — the last one the
+//!     platform kept — is residue with no department Class left behind.
 //!   * DELETABLE ONLY WHEN UNREFERENCED. A fixture wearing the rows — an
 //!     employee with the role, department and location; an account of
 //!     the type; a policy grant naming a role; a job about the company
@@ -395,8 +399,9 @@ async fn what_remains_is_exactly_what_the_platform_names(
     assert_eq!(p["sales_tax_rates"]["present"].as_u64().unwrap(), 27);
     assert_eq!(
         p["departments"]["present"].as_u64().unwrap(),
-        13,
-        "the thirteen rows migration 20260919181324 seeds are candidates (7edf0e97): {p}"
+        12,
+        "the thirteen rows migration 20260919181324 seeds are candidates (7edf0e97) — all but \
+         the platform's `it` (c87e3d6d): {p}"
     );
     for t in [
         "companies",
@@ -514,8 +519,9 @@ async fn what_remains_is_exactly_what_the_platform_names(
 
     assert_eq!(
         classes(db, "employee", "department").await,
-        baseline("department"),
-        "departments kept = the operator baseline's (it)"
+        BTreeSet::new(),
+        "no department Class is kept: an employee's department is a departments row since \
+         c87e3d6d, and the baseline's (it) is kept THERE — above"
     );
     assert_eq!(
         classes(db, "employee", "employment_type").await,
@@ -557,6 +563,16 @@ async fn what_remains_is_exactly_what_the_platform_names(
         BTreeSet::new(),
         "every asset category was an example's"
     );
+    // 9b28f849 (decided 2026-09-28): the marketing-asset kinds are a
+    // Tier-2 module's taxonomy that 01-registries.sql seeded into every
+    // instance. The brewery declares the ones it uses, the retired list
+    // names `brief-body` and `retro`, so a company instance that never
+    // turns the module on keeps none.
+    assert_eq!(
+        classes(db, "marketing-asset", "kind").await,
+        BTreeSet::new(),
+        "every marketing-asset kind was an example's"
+    );
     assert_eq!(
         set(db, "SELECT id FROM companies").await,
         BTreeSet::new(),
@@ -578,18 +594,20 @@ async fn what_remains_is_exactly_what_the_platform_names(
         "every sales-tax rate was the brewery's"
     );
     // The department roster (backlog 7edf0e97): every row the migration
-    // seeds is the brewery's, so a company instance's registry holds
-    // only what its tenant declares — and a Job can no longer be about
-    // an evicted department, because its identity row went with it.
+    // seeds is the brewery's but the platform's own — the department the
+    // operator baseline hires into (c87e3d6d) — so a company instance's
+    // registry holds that one and what its tenant declares, and a Job
+    // can no longer be about an evicted department, because its
+    // identity row went with it.
     assert_eq!(
         set(db, "SELECT id FROM departments").await,
-        BTreeSet::new(),
-        "every department was the brewery's"
+        baseline("department"),
+        "every department was the brewery's but the baseline's (it)"
     );
     assert_eq!(
         set(db, "SELECT id FROM subjects WHERE kind = 'department'").await,
-        BTreeSet::new(),
-        "and every department's identity row went with it"
+        baseline("department"),
+        "and every evicted department's identity row went with it"
     );
     runs.iter()
         .filter(|r| r["table"] == "classes")
@@ -617,7 +635,10 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
              VALUES ('dept-thing', 1, 'active', 'Dept thing', 'ops', '[\"department\", \"page\"]', '[]', 'acme', '{\"department\": \"support\"}');
          INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id, status, priority, opened_on, partition, metadata)
              VALUES ('33333333-3333-3333-3333-333333333333', 'dept-thing', 'department', 'warehouse', 'the warehouse ran its retro late', 'emp-f', 'closed', 'standard', '2026-09-19', 'real', '{}'),
-                    ('44444444-4444-4444-4444-444444444444', 'dept-thing', 'page', '/sales', 'a page audit', 'emp-f', 'open', 'standard', '2026-09-19', 'real', '{\"department\": \"sales\"}');",
+                    ('44444444-4444-4444-4444-444444444444', 'dept-thing', 'page', '/sales', 'a page audit', 'emp-f', 'open', 'standard', '2026-09-19', 'real', '{\"department\": \"sales\"}');
+         UPDATE agents SET department = 'people' WHERE id = 'agent-claude';
+         INSERT INTO requisitions (id, role, department, status, opened_on, target_fill_date, location, hiring_manager_id)
+             VALUES ('req-f', 'ceo', 'qa', 'open', '2026-09-01', '2026-10-01', 'loc-hq', 'emp-f');",
     )
     .execute(&db.pool)
     .await
@@ -671,8 +692,15 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
     assert_eq!(kept(&p["sales_tax_rates"]["kept"]).len(), 0);
     // A department is pointed at three ways (7edf0e97): a packet naming
     // it in metadata.department (the page march), a Job about it, and a
-    // workflow row declaring it. Each keeps its row.
-    want(&p, "departments", "sales", &["jobs.metadata.department"]);
+    // workflow row declaring it — and, since an employee's department is
+    // a departments row (c87e3d6d), three more: an employee, an agent
+    // or a requisition sitting in it. Each keeps its row.
+    want(
+        &p,
+        "departments",
+        "sales",
+        &["jobs.metadata.department", "employees.department"],
+    );
     want(&p, "departments", "warehouse", &["jobs.subject_id"]);
     want(
         &p,
@@ -680,7 +708,9 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         "support",
         &["workflows.metadata.department"],
     );
-    assert_eq!(kept(&p["departments"]["kept"]).len(), 3);
+    want(&p, "departments", "people", &["agents.department"]);
+    want(&p, "departments", "qa", &["requisitions.department"]);
+    assert_eq!(kept(&p["departments"]["kept"]).len(), 5);
     assert_eq!(
         kept(&p["classes"]["kept"]).len(),
         5,
@@ -758,9 +788,10 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         .await,
         s(&["loc-brewery-brewhouse", "loc-brewery-taproom"])
     );
+    // Plus the platform's `it`, never a candidate (c87e3d6d).
     assert_eq!(
         set(&db, "SELECT id FROM departments").await,
-        s(&["sales", "support", "warehouse"])
+        s(&["it", "people", "qa", "sales", "support", "warehouse"])
     );
     // The subjects projection rows of evicted locations/companies go with
     // them — none existed on the bare schema. A department's identity row
@@ -777,10 +808,14 @@ async fn a_referenced_row_is_kept_and_named_and_the_rest_go() {
         0,
         "no subjects rows existed on the bare schema"
     );
-    assert_eq!(subjects_deleted("departments"), 10, "13 seeded, 3 kept");
+    assert_eq!(
+        subjects_deleted("departments"),
+        7,
+        "13 seeded, `it` the platform's, 5 kept"
+    );
     assert_eq!(
         set(&db, "SELECT id FROM subjects WHERE kind = 'department'").await,
-        s(&["sales", "support", "warehouse"])
+        s(&["it", "people", "qa", "sales", "support", "warehouse"])
     );
 }
 

@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Marketing-asset kind (photo, video, deck, one-pager, brief-body, …).
+/// Marketing-asset kind (photo, video, deck, one-pager, …).
 /// Free-text wrapper around a kebab-case string; tenants extend via the
 /// Class registry under `subject_kind='marketing-asset'` (the code is the
 /// kind string). The `marketing_assets` row stores the code; validation
@@ -61,7 +61,7 @@ pub struct MarketingAsset {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub linked_device_skus: Vec<String>,
+    pub linked_skus: Vec<String>,
     #[serde(default)]
     pub linked_account_ids: Vec<String>,
     #[serde(default)]
@@ -98,7 +98,7 @@ pub struct NewMarketingAsset {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub linked_device_skus: Vec<String>,
+    pub linked_skus: Vec<String>,
     #[serde(default)]
     pub linked_account_ids: Vec<String>,
     #[serde(default)]
@@ -123,7 +123,7 @@ pub struct UpdateMarketingAsset {
     pub description: Option<String>,
     pub file_url: Option<String>,
     pub tags: Option<Vec<String>>,
-    pub linked_device_skus: Option<Vec<String>>,
+    pub linked_skus: Option<Vec<String>>,
     pub linked_account_ids: Option<Vec<String>>,
     pub linked_campaign_ids: Option<Vec<String>>,
     pub owner_id: Option<String>,

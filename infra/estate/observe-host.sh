@@ -28,12 +28,14 @@
 set -eu
 # shellcheck source=/dev/null
 . "$(dirname "$0")/observe-lib.sh"
-# The declared root material, read by the ONE check the converge also
+# The declared credentials, read by the ONE check the converge also
 # uses (backlog 714bc71f). Carried on every host's reading; estate.compare
-# judges it against the host's declared roles, so this script needs no
-# copy of which host owes what.
+# judges it against the host's declared roles. WHICH credentials this
+# host owes is the `[ops_credentials.$HOST_ID]` table of the estate.toml
+# beside this script (backlog f371c749), the file estate.compare reads.
 # shellcheck source=/dev/null
 . "$(dirname "$0")/ops-credentials.sh"
+BOSS_ESTATE_SOURCE="${BOSS_ESTATE_SOURCE:-$(dirname "$0")/estate.toml}"
 
 : "${HOST_ID:?HOST_ID is required and must match the estate node id}"
 : "${JOBS_API:?JOBS_API is required}"
@@ -50,7 +52,7 @@ disk_gb=$(( (disk_kb + 524288) / 1048576 ))
 free_gb=$(( (free_kb + 524288) / 1048576 ))
 up_s=$(awk '{print int($1)}' /proc/uptime)
 ops_dir="${BOSS_OPS_DIR:-/etc/boss-ops}"
-ops_state=$(ops_credentials_state)
+ops_state=$(ops_credentials_state "$HOST_ID")
 
 observation=$(jq -n \
   --arg ops_dir "$ops_dir" \

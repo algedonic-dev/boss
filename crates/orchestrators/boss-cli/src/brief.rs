@@ -572,19 +572,15 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
             lanes: vec![LANE_CAR],
             grounding: Grounding::Derived(vec![Reading::read(test_db, admin_url.clone())]),
         },
-        Invariant {
-            name: "order",
-            authority: gate.to_string(),
-            lines: vec![
-                "failing test -> watch it fail -> fix -> cargo fmt -> COMMIT AND PUSH".into(),
-                "-> then any optional local check. The gate is the compile authority;".into(),
-                "a cold local build that is never pushed parks a car with nothing on it.".into(),
-            ],
-            lanes: vec![LANE_CAR],
-            // WRITTEN: the gate runs these checks, it does not spell
-            // this order for a builder's afternoon (c94ddc6f).
-            grounding: Grounding::Written,
-        },
+        // NO `order` INVARIANT (backlog e30ac196, 2026-09-28). One was
+        // typed here on 2026-09-11 — "cargo fmt -> COMMIT AND PUSH ->
+        // then any optional local check" — citing infra/gate.sh, which
+        // spells no order. Builder rule 4 (fmt, add, commit, clippy,
+        // the whole suites, the pre-flight, THEN push) arrived a week
+        // later and said the opposite, so one brief carried both and a
+        // builder could follow one and breach the other (run 78f58d9c
+        // did). The written line held nothing its source did not, so it
+        // is gone rather than pinned: the order lives once, in rule 4.
         // Three dots on the diff, and not as a matter of taste: two-dot
         // diffs the two TIPS, so it is right only while the line above
         // it has already exited 0 — origin/main an ancestor of HEAD is
@@ -1354,7 +1350,10 @@ pub(crate) fn profile_on_step(job: Option<&Value>, row: Option<&Value>) -> Optio
 /// The registry's ACTIVE Workflow row for this packet's kind, read
 /// best-effort. Two readers now — the lane fallback above and
 /// [`protocol_section`] — so it is ONE call, not two (794e8d61).
-pub(crate) async fn active_row(http: &reqwest::Client, job: &Value) -> Option<Value> {
+pub(crate) async fn active_row(
+    http: &boss_core::machine_token::Client,
+    job: &Value,
+) -> Option<Value> {
     let kind = job.get("kind").and_then(Value::as_str)?;
     crate::gate::api(
         http,
@@ -1401,6 +1400,17 @@ pub(crate) fn render_with(
     if let Some(job) = job {
         out.push_str(&packet_section(job));
         out.push('\n');
+        // DIRECTLY UNDER THE PACKET (backlog 486dde37): whether its car
+        // is gated held is a fact of the packet, and the builder meets it
+        // before anything that tells it how to gate. The list is read
+        // only for a marked packet, and an unreadable one is said.
+        if crate::trust_boundary::declared(job).is_some() {
+            let areas = crate::trust_boundary::read_areas(repo).ok();
+            if let Some(trust) = crate::trust_boundary::brief_section(job, areas.as_deref()) {
+                out.push_str(&trust);
+                out.push('\n');
+            }
+        }
         if let Some(named) = prior.and_then(crate::prior_work::section) {
             out.push_str(&named);
             out.push('\n');
@@ -1424,7 +1434,7 @@ pub(crate) fn render_with(
 
 pub async fn run(packet_ref: Option<String>, profile_override: Option<String>) -> Result<()> {
     let repo = repo_root()?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let job = match packet_ref {
         Some(r) => {
             let id = crate::job::fetch_and_resolve(&http, &r).await?;
@@ -2724,6 +2734,37 @@ tenant_repo = \"acme/no-ref\"
         assert!(packet < protocol && protocol < step, "{out}");
     }
 
+    /// A TRUST-BOUNDARY PACKET'S BRIEF NAMES THE HOLD (backlog
+    /// 486dde37). The mark rides the packet; the brief — and so every
+    /// prompt `boss dispatch` prints, which is this rendering — says it
+    /// directly under the packet, with the area read from the list and
+    /// the `--hold` the gate will refuse the park without. An unmarked
+    /// packet's brief carries no such section.
+    #[test]
+    fn a_trust_boundary_packets_brief_names_the_hold_under_the_packet() {
+        let mut job = pinned_at_v2();
+        job["metadata"]["trust_boundary"] =
+            json!({ "area": "gateway-route", "reason": "adds a public route" });
+        let out = render(&repo(), Some(&job), "builder", None, None).expect("renders");
+        let packet = out.find("== THE PACKET").expect("the packet half");
+        let trust = out.find("== TRUST BOUNDARY —").expect("the trust section");
+        let protocol = out.find("== THE PROTOCOL").expect("the protocol half");
+        assert!(packet < trust && trust < protocol, "{out}");
+        assert!(out.contains("adds a public route"), "{out}");
+        assert!(
+            out.contains("--hold 'trust-boundary car (area gateway-route"),
+            "{out}"
+        );
+        assert!(
+            out.contains(crate::trust_boundary::REGISTRY),
+            "the area is judged against the list: {out}"
+        );
+
+        let unmarked =
+            render(&repo(), Some(&pinned_at_v2()), "builder", None, None).expect("renders");
+        assert!(!unmarked.contains("== TRUST BOUNDARY —"), "{unmarked}");
+    }
+
     /// THE PRE-FLIGHT DOOR IS READ, NOT RESTATED (backlog 5d919334,
     /// 2026-09-22). CLAUDE.md §Doors decides which mode a builder runs
     /// before a push; the builder rules carried their own copy of it,
@@ -2759,6 +2800,42 @@ tenant_repo = \"acme/no-ref\"
             lines.matches("infra/gate.sh ").count(),
             1,
             "the pre-flight invariant names a gate.sh mode more than once:\n{lines}"
+        );
+    }
+
+    /// ONE ORDER, AND IT CHECKS BEFORE IT PUSHES (backlog e30ac196,
+    /// 2026-09-28). The brief carried a typed `order` invariant —
+    /// "cargo fmt -> COMMIT AND PUSH -> then any optional local check",
+    /// marked written and citing infra/gate.sh, which states no order —
+    /// while builder rule 4 and the brief's own `pre-flight` invariant
+    /// put fmt, commit, clippy, the whole suites and the pre-flight
+    /// BEFORE the push. Builder run 78f58d9c followed the first and
+    /// breached the second. The order now lives once, in rule 4; this
+    /// pins that nothing ahead of the pre-flight command in a rendered
+    /// builder brief tells a builder to push, and that the rules' own
+    /// push command comes after it.
+    #[test]
+    fn a_builder_brief_names_no_push_before_its_preflight() {
+        let claude = std::fs::read_to_string(repo().join("CLAUDE.md")).expect("CLAUDE.md");
+        let door = preflight_door(&claude).expect("CLAUDE.md §Doors carries the pre-flight door");
+        let preflight = format!("bash {door}");
+        let out = render(&repo(), None, "builder", None, None).expect("renders");
+        let at = out
+            .find(&preflight)
+            .expect("a builder brief prints the pre-flight command");
+        for line in out[..at].lines() {
+            assert!(
+                !line.to_lowercase().contains("push"),
+                "a builder brief says push before it names the pre-flight `{preflight}` — \
+                 builder rule 4 is the one order, and it checks first: {line:?}"
+            );
+        }
+        let push = out
+            .find("git push origin HEAD:")
+            .expect("the builder rules name the push command");
+        assert!(
+            at < push,
+            "the builder rules name `git push` before the pre-flight `{preflight}`"
         );
     }
 

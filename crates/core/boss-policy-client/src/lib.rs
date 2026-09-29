@@ -24,6 +24,7 @@
 //! empty page (backlog 45553536). Only decisions the service made are
 //! cached.
 
+pub mod coverage;
 pub mod defaults;
 pub mod engine;
 pub mod in_memory;
@@ -272,11 +273,14 @@ pub fn is_sim_identity(user: &User) -> bool {
 
 /// The ONE predicate every sim-bypass site asks (backlog 85e7f10f):
 /// this instance runs a sim, the request is on a sim chain, AND the
-/// caller is a sim identity. The operator-tier doors (classes,
-/// locations, calendar, the ledger's chart and tax registry) write
-/// `sim_bypass_allowed(&user) || tier_ok`; no site reads the chain flag
+/// caller is a sim identity. The registry doors that wrote it beside a
+/// tier check (classes, locations, calendar, the ledger's chart and tax
+/// registry) ask policy now (553cf479, 59deda40), which asks it through
+/// [`SimBypassPolicyClient`]; no site reads the chain flag
 /// or the switch for authorization on its own, which is what let
-/// `sim || tier_ok` open each of them to a header.
+/// `sim || tier_ok` open each of them to a header. The classes doors
+/// ask Create/Update/Retire on `class` (553cf479); the four seed
+/// registries ask Create on their own resource (59deda40).
 pub fn sim_bypass_allowed(user: &User) -> bool {
     sim_bypass_admits(sim_enabled(), user)
 }
@@ -402,27 +406,84 @@ struct CacheEntry {
 
 pub struct ReqwestPolicyClient {
     base_url: String,
-    http: reqwest::Client,
+    /// Stamped with the machine token, redirects off. Every service asks
+    /// policy through this client on nearly every request, and until
+    /// review S2 of design 6805c764 car 2 it sent no token at all — so a
+    /// policy port in `enforce` would have refused every check, and every
+    /// service would have failed closed on everything.
+    ///
+    /// And SIGNED as the calling service ([`User::service`]) by a default
+    /// header, so no check it makes can go out unsigned (backlog b8e75382
+    /// F7 / e84de48e; the escalation router's shape). Until 2026-09-29
+    /// every service asked `/check` with no `x-boss-user`, which is why
+    /// the policy service still answers an unsigned question about anyone
+    /// — the arm the next car closes.
+    http: boss_core::machine_token::Client,
     cache: RwLock<HashMap<CacheKey, CacheEntry>>,
     ttl: std::time::Duration,
 }
 
 impl ReqwestPolicyClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self::with_timeout(base_url, std::time::Duration::from_secs(5))
+    /// `service` is the calling service's `boss-ports` name — the one it
+    /// passes to `machine_gate::mount` — and every check is signed as
+    /// [`User::service`] of it.
+    pub fn new(service: &str, base_url: impl Into<String>) -> Self {
+        Self::with_timeout(service, base_url, std::time::Duration::from_secs(5))
     }
 
     /// `new` with the whole-request timeout named. Private: production
     /// takes 5 s through `new`; the loopback tests take a wider one,
     /// because a host too starved to answer in 5 s turned their status
     /// assertions into transport errors (train 40256c45, 2026-09-26).
-    fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+    fn with_timeout(
+        service: &str,
+        base_url: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self::with_source(
+            service,
+            base_url,
+            timeout,
+            boss_core::machine_token::shared(),
+        )
+    }
+
+    /// `with_timeout` stamping from a given source (the tests' own).
+    fn with_source(
+        service: &str,
+        base_url: impl Into<String>,
+        timeout: std::time::Duration,
+        token: std::sync::Arc<boss_core::machine_token::Source>,
+    ) -> Self {
+        // Control characters are dropped from the name first, so the
+        // JSON is always a header value (serde_json escapes the rest).
+        // Were it ever not, the client logs it and asks unsigned — the
+        // answer every check got before 2026-09-29 — rather than panic
+        // in library code (review b8e7, F4).
+        let service: String = service.chars().filter(|c| !c.is_control()).collect();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let signed = serde_json::to_string(&User::service(&service))
+            .map_err(|e| e.to_string())
+            .and_then(|json| {
+                reqwest::header::HeaderValue::from_bytes(json.as_bytes()).map_err(|e| e.to_string())
+            });
+        match signed {
+            Ok(signed) => {
+                headers.insert("x-boss-user", signed);
+            }
+            Err(e) => {
+                tracing::error!(%service, error = %e, "policy client cannot sign; asking unsigned")
+            }
+        }
         Self {
             base_url: base_url.into(),
-            http: reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("reqwest client"),
+            http: boss_core::machine_token::Client::build_with_source(
+                reqwest::Client::builder()
+                    .timeout(timeout)
+                    .default_headers(headers),
+                token,
+            )
+            .expect("reqwest client"),
             cache: RwLock::new(HashMap::new()),
             ttl: std::time::Duration::from_secs(60),
         }
@@ -515,15 +576,23 @@ impl PolicyClient for ReqwestPolicyClient {
                 )))
             }
             Ok(r) => {
-                // A 4xx: the service refused the QUESTION (this client
-                // asked it wrongly). Fail closed as a deny, since asking
-                // again asks wrongly again — but not cached, because it
-                // is not a decision about this caller either.
+                // A 4xx (or a stray 3xx — redirects are off): the service
+                // refused the QUESTION, not the user. Until hold (b) of
+                // review b8e7 (2026-09-29) this was an uncached Deny, so a
+                // policy edit that broke this client's own signed identity
+                // denied every user everything and logged it as a
+                // permission fact. It is an error now, answered by the
+                // door as an outage (503) — still fail closed, never an
+                // Allow, and never cached.
                 let status = r.status();
-                tracing::warn!(%status, "policy service returned non-2xx; deny");
-                Ok(Decision::Deny {
-                    reason: format!("policy service returned {status}"),
-                })
+                tracing::error!(
+                    %status,
+                    "policy service refused the check itself (not a decision about the user); \
+                     refusing as unreachable"
+                );
+                Err(PolicyClientError::Unreachable(format!(
+                    "policy service refused the check: {status}"
+                )))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "policy service unreachable; refusing");
@@ -624,6 +693,14 @@ impl FakePolicyClientBuilder {
 
     pub fn with_override(mut self, ov: crate::UserOverride) -> Self {
         self.overrides.push(ov);
+        self
+    }
+
+    /// Seed the core default rules, as the live policy service reconciles
+    /// them at boot — so a door's test judges it against the grant that
+    /// ships, not against one written for the test (backlog 553cf479).
+    pub fn with_default_rules(mut self) -> Self {
+        self.rules.extend(crate::defaults::default_rules());
         self
     }
 
@@ -893,7 +970,7 @@ mod tests {
     /// car's own gate. A stub made to answer after 6 s reproduces both
     /// failures verbatim through `new`, and passes through this.
     fn loopback_client(url: String) -> ReqwestPolicyClient {
-        ReqwestPolicyClient::with_timeout(url, std::time::Duration::from_secs(60))
+        ReqwestPolicyClient::with_timeout("test", url, std::time::Duration::from_secs(60))
     }
 
     /// A base URL nothing listens on: bound, read, and released.
@@ -943,7 +1020,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dark_policy_service_is_an_error_on_check_and_on_scope() {
-        let c = ReqwestPolicyClient::new(dark_policy_url().await);
+        let c = ReqwestPolicyClient::new("test", dark_policy_url().await);
         let check = c.check(&user(), Action::Read, Resource::job()).await;
         assert!(
             matches!(check, Err(PolicyClientError::Unreachable(_))),
@@ -959,21 +1036,151 @@ mod tests {
         );
     }
 
+    /// A 4xx is the policy service refusing the QUESTION, not deciding
+    /// about the user, so it is an ERROR the door answers as an outage
+    /// (503), never a Deny (403) that reads as a permission fact. Hold
+    /// (b) of review b8e7, 2026-09-29: now that every check is signed, a
+    /// policy edit that drops the service's own grant surfaced as a 403
+    /// on /check, and the client turned it into every user being denied
+    /// everything — in the log, a permission fact where the fact was a
+    /// broken caller. Both arms still fail closed: no Allow.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_policy_4xx_still_refuses_and_is_not_cached() {
-        let (url, seen) = policy_stub(1, axum::http::StatusCode::BAD_REQUEST).await;
-        let c = loopback_client(url);
-        let first = c
-            .check(&user(), Action::Read, Resource::job())
+    async fn a_policy_4xx_is_an_error_not_a_users_deny_and_is_not_cached() {
+        for status in [
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::FORBIDDEN,
+        ] {
+            let (url, seen) = policy_stub(1, status).await;
+            let c = loopback_client(url);
+            let first = c.check(&user(), Action::Read, Resource::job()).await;
+            match &first {
+                Err(PolicyClientError::Unreachable(detail)) => assert!(
+                    detail.contains(status.as_str()),
+                    "names the status: {detail}"
+                ),
+                other => panic!("a {status} is an outage, never a decision: {other:?}"),
+            }
+            let second = c
+                .check(&user(), Action::Read, Resource::job())
+                .await
+                .unwrap();
+            assert!(second.is_allowed(), "not a decision the service made");
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    /// Review S2 of design 6805c764 car 2: every policy check went out
+    /// with no machine token, so a policy port in `enforce` refused
+    /// every service's every check. Asked on the wire, through the
+    /// production adapter: the check carries the value the source holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_carries_the_machine_token() {
+        use boss_core::machine_token::{HEADER, Source};
+        let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+        let tokens = seen.clone();
+        let app = axum::Router::new().route(
+            "/api/policy/check",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let tokens = tokens.clone();
+                async move {
+                    tokens.lock().unwrap().push(
+                        headers
+                            .get(HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from),
+                    );
+                    axum::Json(Decision::Allow { scope: Scope::All })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let c = ReqwestPolicyClient::with_source(
+            "test",
+            format!("http://{addr}"),
+            std::time::Duration::from_secs(60),
+            Arc::new(Source::fixed(Some("estate-token".into()))),
+        );
+        assert!(
+            c.check(&user(), Action::Read, Resource::job())
+                .await
+                .unwrap()
+                .is_allowed()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("estate-token".to_string())],
+            "the check reached policy without the machine token"
+        );
+    }
+
+    /// Backlog b8e75382 (F7) / e84de48e: every service asked `/check`
+    /// with NO `x-boss-user`, so the policy service could not tell a
+    /// service from a stranger on its port, and had to keep answering an
+    /// unsigned question about anyone. Asked on the wire, through the
+    /// production adapter: every check — a cached key's first ask, and a
+    /// second key — presents the calling service as [`User::service`],
+    /// the one shape the policy service judges it by, and the user the
+    /// question is ABOUT still rides in the body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_check_is_signed_as_the_calling_service() {
+        type Seen = Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>;
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/api/policy/check",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let log = log.clone();
+                    async move {
+                        log.lock().unwrap().push((
+                            headers
+                                .get("x-boss-user")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from),
+                            body,
+                        ));
+                        axum::Json(Decision::Allow { scope: Scope::All })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let c = ReqwestPolicyClient::with_timeout(
+            "ledger",
+            format!("http://{addr}"),
+            std::time::Duration::from_secs(60),
+        );
+        c.check(&user(), Action::Read, Resource::job())
             .await
             .unwrap();
-        assert!(!first.is_allowed(), "a 4xx fails closed: {first:?}");
-        let second = c
-            .check(&user(), Action::Read, Resource::job())
+        c.check(&user(), Action::Update, Resource::step())
             .await
             .unwrap();
-        assert!(second.is_allowed(), "not a decision the service made");
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "each key is asked once: {seen:?}");
+        for (signed, body) in &seen {
+            let raw = signed
+                .as_deref()
+                .unwrap_or_else(|| panic!("a check went out unsigned: {body}"));
+            let caller: User = serde_json::from_str(raw).expect("x-boss-user is a User");
+            assert_eq!(
+                serde_json::to_value(&caller).unwrap(),
+                serde_json::to_value(User::service("ledger")).unwrap()
+            );
+            assert_eq!(caller.id, "automation:ledger");
+            assert_eq!(
+                body["user"]["id"], "emp-test",
+                "the body still names who it is about"
+            );
+        }
     }
 
     // -- The cache is keyed on what the decision reads (backlog 8878f85f)
@@ -1117,7 +1324,7 @@ mod tests {
     async fn a_real_outage_answers_without_the_policy_services_address() {
         use axum::response::IntoResponse;
         let url = dark_policy_url().await;
-        let c = ReqwestPolicyClient::new(url.clone());
+        let c = ReqwestPolicyClient::new("test", url.clone());
         let err = c
             .check(&user(), Action::Read, Resource::job())
             .await

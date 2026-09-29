@@ -33,7 +33,7 @@ struct OrderedItem {
 }
 
 pub struct InventoryPoPlace {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     inventory_base: String,
 }
 
@@ -201,6 +201,7 @@ mod tests {
         let mut bad = step_done_payload();
         bad.as_object_mut().unwrap().remove("completed_on");
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.done.procurement".into(),
@@ -216,6 +217,7 @@ mod tests {
         let mut bad = step_done_payload();
         bad.as_object_mut().unwrap().remove("metadata");
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.done.procurement".into(),
@@ -278,6 +280,7 @@ mod tests {
 
     fn ctx_for(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.done.procurement".into(),

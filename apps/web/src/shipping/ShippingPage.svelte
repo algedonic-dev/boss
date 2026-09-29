@@ -13,6 +13,8 @@
   import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
   import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
+  import { emptyState, readStateOfLoad } from '../data/readState';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import {
     CARRIER_LABEL,
     STATUS_LABEL,
@@ -35,6 +37,7 @@
     'label-created', 'picked-up', 'in-transit', 'delivered', 'exception',
   ];
 
+  const SHIPMENTS_URL = '/api/shipping/shipments?limit=1000';
   let shipmentsPage = $state<Paged<Shipment> | null>(null);
   /// Non-null when the load failed — rendered instead of the empty
   /// state, so an outage never reads as "no shipments" (packet
@@ -55,7 +58,7 @@
     let cancelled = false;
     loading = true;
     (async () => {
-      const result = await fetchPaged<Shipment>('/api/shipping/shipments?limit=1000');
+      const result = await fetchPaged<Shipment>(SHIPMENTS_URL);
       if (!cancelled) {
         if (result.kind === 'ready') {
           shipmentsPage = result.page;
@@ -92,6 +95,16 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, no shipments, or the filters hid them — the default
+  // Undelivered filter hides a book of delivered ones (backlog 0ef5e008).
+  let listState = $derived(
+    emptyState(
+      [{ source: SHIPMENTS_URL, state: readStateOfLoad(loading, loadFailed) }],
+      shipments.length,
+      visible.length,
+    ),
   );
 
   // Fixed-order shipment lists were useless at seed scale (CAR-4).
@@ -206,14 +219,8 @@
     </aside>
 
     <section class="list-section">
-      {#if loading}
-        <p class="empty">Loading…</p>
-      {:else if loadFailed}
-        <p class="empty load-failed" role="alert">
-          Couldn't load shipments — {loadFailed}
-        </p>
-      {:else if visible.length === 0}
-        <p class="empty">No shipments match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <ListEmpty view={listState} words={{ what: 'shipments', noun: 'shipments' }} />
       {:else}
         <table class="data-table data-table-striped">
           <thead>

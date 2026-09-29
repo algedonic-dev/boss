@@ -591,3 +591,35 @@ async fn a_kind_lists_every_identity_row_sorted_with_its_label() {
         ])
     );
 }
+
+/// `boss-rebuild-all` says every step holds its projection's
+/// `pg_advisory_xact_lock` under `lock_key(<step>)`; `subjects` took
+/// none (backlog 8d5ac7c5). Holding `lock_key("subjects")` on another
+/// session must hold the TRUNCATE-and-reproject back until it is
+/// released.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rebuild_waits_on_the_subjects_rebuild_lock() {
+    let db = TestDb::new().await;
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(boss_core::rebuild::lock_key("subjects"))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let pool = db.pool.clone();
+    let rebuild =
+        tokio::spawn(async move { boss_subject_kinds::subjects::rebuild_subjects(&pool).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !rebuild.is_finished(),
+        "the rebuild ran while another session held the subjects rebuild lock"
+    );
+
+    holder.rollback().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), rebuild)
+        .await
+        .expect("the rebuild finishes once the lock is released")
+        .unwrap()
+        .expect("rebuild");
+}

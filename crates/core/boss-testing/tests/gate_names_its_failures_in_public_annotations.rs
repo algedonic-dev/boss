@@ -381,9 +381,6 @@ exit 22
         .env("BOSS_JOBS_URL", "http://jobs.invalid")
         .env("BOSS_GITHUB_API", "https://api.github.invalid")
         .env("BOSS_MIRROR_SLUG", "fixture-upstream/mirror")
-        .env("BOSS_CHECKS_POLL_SECONDS", "0")
-        .env("BOSS_CHECKS_MAX_POLLS", "3")
-        .env("BOSS_CHECKS_DEADLINE_SECONDS", "300")
         .output()
         .expect("read-publish-checks runs");
     let text = both(&out);

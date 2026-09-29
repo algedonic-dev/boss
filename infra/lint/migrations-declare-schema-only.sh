@@ -46,7 +46,9 @@
 # change through a door that publishes the fact of the change: a Class
 # through PUT /api/classes/{subject_kind}/{code} (class.updated) and
 # POST …/retire (class.retired); a Workflow through its bundle and
-# /api/workflows/{kind}/publish|retire (jobs.kind.published|retired).
+# /api/workflows/{kind}/publish|retire (jobs.kind.published|retired); a
+# SubjectKind's metadata through PATCH /api/subject-kinds/{kind}/metadata
+# (subject_kind.updated).
 # An `UPDATE` or `DELETE FROM` on one of them inside a migration is a
 # change the audit log never hears of — the refurb asset phases were
 # retired that way on 2026-09-24, and no rebuilder can reproduce it.
@@ -105,9 +107,9 @@ REGISTRY_TABLES="stations step_plugins cadence_rules delivery_policy"
 # migration may not UPDATE or DELETE FROM them at all (backlog
 # fa25700f; THE SECOND RULE in the header). classes: boss-classes'
 # PUT and retire doors. workflows: the bundle and the publish/retire
-# doors in boss-jobs. subject_kinds: the registry has NO write door
-# yet — which is the reason a migration is not the answer either; the
-# door is built first.
+# doors in boss-jobs. subject_kinds: boss-subject-kinds' metadata PATCH
+# door (backlog abc2e9d5, subject_kind.updated); a kind's other columns
+# have no door yet, which is the reason to build one, not to migrate.
 EVENTED_TABLES="classes subject_kinds workflows"
 
 # Migrations that rewrote an evented row before the rule existed,
@@ -385,8 +387,11 @@ retired that way on 2026-09-24). Change the row through its door:
     with a version bump, which the platform seed publishes; retire
     through POST /api/workflows/{kind}/retire (jobs.kind.published,
     jobs.kind.retired). A packet in flight moves only by boss job convert.
-  * subject_kinds — the registry has no write door yet. Build the
-    evented door first (its own car); a migration is not the stand-in.
+  * subject_kinds — PATCH /api/subject-kinds/{kind}/metadata merges keys
+    into one kind's metadata (a null deletes) and publishes
+    subject_kind.updated (boss-subject-kinds http.rs; platform-admin's
+    Update on subject-kind). A kind's key, label, parent and ownership
+    have no door yet; build that one first, never a migration.
 
 A migration keeps its DDL. The migrations that did this before the rule
 existed are named in EVENTED_ALLOWLIST with their reasons; that list is

@@ -59,6 +59,17 @@
 //! string; a rule that pointed at an object would match nothing and
 //! say so.
 //!
+//! ## Matching the packet itself — no `match_step` (design b35456ac)
+//!
+//! `match_step` is optional. Absent, `match_field` is read off the
+//! candidate packet's OWN metadata rather than a completed step's. A
+//! packet a rule FILED carries its edge there — `jobs.spawn` writes
+//! `metadata.<field>` args onto the Job, never onto a step — so the
+//! machine-filed `rerail-a-car` repair names its car as `metadata.car`,
+//! and the car's close completes the repair naming it as `overtaken`
+//! (rule `rerail-a-car-is-overtaken-when-its-car-closes`). Every rule
+//! written before names a `match_step` and reads exactly as it did.
+//!
 //! ## What is written
 //!
 //! `done_metadata` is the same shape `jobs.complete_linked_step` takes:
@@ -102,7 +113,7 @@ use std::sync::Arc;
 const DEFAULT_EVIDENCE_KEY: &str = "matched_from";
 
 pub struct JobsCompleteStepMatching {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -116,7 +127,10 @@ impl JobsCompleteStepMatching {
 
     /// Construct with a custom reqwest client (tests point it at a
     /// local stand-in for jobs-api).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -190,8 +204,10 @@ struct Facts<'a> {
 }
 
 /// The string a JSON scalar compares as; `None` for anything that is
-/// not one (an object, an array, null).
-fn scalar_text(v: &serde_json::Value) -> Option<String> {
+/// not one (an object, an array, null). Shared with
+/// `jobs.retract_matching`, which compares a packet's metadata to an
+/// event's value the same way (backlog ac0a0abd).
+pub(crate) fn scalar_text(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -275,7 +291,12 @@ impl Handler for JobsCompleteStepMatching {
     ) -> Result<(), HandlerError> {
         let kind = arg_string(args, "kind")?;
         let step_slug = arg_string(args, "step")?;
-        let match_step = arg_string(args, "match_step")?;
+        // Optional since design b35456ac: absent, `match_field` is read
+        // off the candidate packet's OWN metadata (see the module doc).
+        let match_step = match arg(args, "match_step") {
+            None => None,
+            Some(_) => Some(arg_string(args, "match_step")?),
+        };
         let match_field = arg_string(args, "match_field")?;
         let event_path = arg_string(args, "event_path")?;
         let evidence_key = match arg(args, "evidence_key") {
@@ -314,11 +335,14 @@ impl Handler for JobsCompleteStepMatching {
         let candidates = open_jobs_of_kind(&self.client, self.base(), kind, &ctx.rule_name).await?;
         let mut matched = 0usize;
         for job in &candidates {
-            let recorded = step_by_slug(job, match_step)
-                .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
-                .and_then(|s| s.get("metadata"))
-                .and_then(|m| m.get(match_field))
-                .and_then(scalar_text);
+            let recorded = match match_step {
+                Some(slug) => step_by_slug(job, slug)
+                    .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
+                    .and_then(|s| s.get("metadata")),
+                None => job.get("metadata"),
+            }
+            .and_then(|m| m.get(match_field))
+            .and_then(scalar_text);
             if recorded.as_deref() != Some(value.as_str()) {
                 continue;
             }
@@ -369,7 +393,8 @@ impl Handler for JobsCompleteStepMatching {
             tracing::debug!(
                 rule = %ctx.rule_name,
                 job = %triggering_id,
-                "no open {kind} packet records {match_step}.{match_field} = {value:?}"
+                "no open {kind} packet records {}.{match_field} = {value:?}",
+                match_step.unwrap_or("metadata")
             );
         }
         Ok(())
@@ -392,6 +417,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "site-goes-live-on-converge".into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -620,7 +646,7 @@ mod tests {
             site(SITE_B, LIVE_B, "def456", "ready"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         let calls = puts.lock().unwrap().clone();
@@ -664,7 +690,7 @@ mod tests {
             site(SITE_A, LIVE_A, "abc123", "active"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         let calls = puts.lock().unwrap().clone();
         assert_eq!(calls.len(), 2, "the merge, then the flip: {calls:?}");
@@ -680,7 +706,7 @@ mod tests {
             site(SITE_B, LIVE_B, "def456", "ready"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -698,7 +724,7 @@ mod tests {
             site(SITE_A, LIVE_A, "abc123", "ready"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         h.invoke(&args(), &ctx(close_marker()))
             .await
@@ -714,7 +740,7 @@ mod tests {
             site(SITE_A, LIVE_A, "abc123", "completed"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -731,7 +757,7 @@ mod tests {
             site(SITE_A, LIVE_A, "abc123", "pending"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty());
     }
@@ -746,7 +772,7 @@ mod tests {
             site(SITE_A, LIVE_A, "abc123", "ready"),
         ])
         .await;
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty());
     }
@@ -759,9 +785,54 @@ mod tests {
         let mut a = args();
         a.retain(|(k, _)| k != "event_path");
         a.push(("event_path".to_string(), Value::String("id".into())));
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), base);
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&a, &ctx(close_marker())).await.expect("runs");
         assert_eq!(puts.lock().unwrap().len(), 2, "the merge, then the flip");
+    }
+
+    /// NO `match_step`: the value is the candidate packet's OWN metadata
+    /// (design b35456ac). A `rerail-a-car` repair records the car it was
+    /// filed for as `metadata.car`, and no step of it names the car, so
+    /// the car's close completes the repair naming it — and only that one.
+    #[tokio::test]
+    async fn without_a_match_step_the_packets_own_metadata_is_matched() {
+        let repair = |id: &str, step_id: &str, car: &str| {
+            json!({
+                "id": id,
+                "kind": "rerail-a-car",
+                "status": "open",
+                "metadata": { "car": car },
+                "steps": [
+                    { "id": format!("{id}-filed"), "spec_slug": "filed", "status": "completed",
+                      "metadata": {} },
+                    { "id": step_id, "spec_slug": "rerail", "status": "active",
+                      "metadata": { "authority_role": "platform-admin" } },
+                ],
+            })
+        };
+        let (base, puts) = mock_jobs(vec![
+            repair(SITE_A, LIVE_A, CONVERGE),
+            repair(SITE_B, LIVE_B, "someone-elses-car"),
+        ])
+        .await;
+        let a = vec![
+            ("kind".to_string(), Value::String("rerail-a-car".into())),
+            ("step".to_string(), Value::String("rerail".into())),
+            ("match_field".to_string(), Value::String("car".into())),
+            ("event_path".to_string(), Value::String("id".into())),
+            (
+                "done_metadata".to_string(),
+                Value::String(r#"{"result": "overtaken"}"#.into()),
+            ),
+        ];
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
+        h.invoke(&a, &ctx(close_marker())).await.expect("runs");
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "the merge, then the flip: {calls:?}");
+        assert_eq!(calls[0].0, SITE_A, "the repair naming the closed car");
+        assert_eq!(calls[0].2["result"], "overtaken");
+        assert_eq!(calls[0].2[DEFAULT_EVIDENCE_KEY], CONVERGE);
+        assert_eq!((calls[1].0.as_str(), calls[1].1.as_str()), (SITE_A, LIVE_A));
     }
 
     /// `is_unset` semantics: a value a person already wrote on the step
@@ -829,7 +900,10 @@ mod tests {
     fn a_missing_required_arg_is_a_missing_arg_error() {
         let mut a = args();
         a.retain(|(k, _)| k != "match_field");
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), "http://unused");
+        let h = JobsCompleteStepMatching::with_client(
+            crate::handlers::common::api_client(),
+            "http://unused",
+        );
         let err = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(h.invoke(&a, &ctx(close_marker())))
@@ -842,7 +916,10 @@ mod tests {
     /// the rules visualization draws the loop from).
     #[test]
     fn the_handler_is_registered_under_its_name() {
-        let h = JobsCompleteStepMatching::with_client(reqwest::Client::new(), "http://unused");
+        let h = JobsCompleteStepMatching::with_client(
+            crate::handlers::common::api_client(),
+            "http://unused",
+        );
         assert_eq!(h.name(), "jobs.complete_step_matching");
         assert_eq!(
             crate::cascade::handler_emits()

@@ -58,6 +58,12 @@ kind = "workflow-publish"
 ready_when = "steps.approve.done AND steps.approve.metadata.decision = \"approved\""
 title_template = "Publish to registry"
 terminal = { outcome = "published" }
+# The kind requires the spec at done ("Full WorkflowSpec blob to
+# publish"); declared so the step's contract is whole wherever it is
+# read, since this kind has no surface of its own and the step page
+# builds its form from the declared fields (backlog a14f04b3;
+# tests/a_step_declares_what_its_kind_requires.rs).
+fields = [{ name = "workflow_spec", field_type = "object", required = true }]
 
 [[workflow.step]]
 title = "not-published"

@@ -31,9 +31,19 @@ pub struct WebhookNotify {
 }
 
 impl WebhookNotify {
+    /// A client of its OWN, never `common::api_client()`: that one stamps
+    /// the estate machine token on every request, and this handler
+    /// POSTs every forwarded event to whatever host the URL names — a
+    /// party outside the estate. Until backlog ee96c839 (2026-09-28) it
+    /// sent on `api_client()`, so the configured host itself received the
+    /// token. No default headers, and redirects off so a 3xx cannot
+    /// carry the event body on to a host nobody configured.
     pub fn new(webhook_url: Option<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: crate::handlers::common::api_client(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client always builds"),
             webhook_url: webhook_url.filter(|s| !s.trim().is_empty()),
         })
     }
@@ -97,6 +107,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "forward-invoice-created".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "commerce.invoice.created".into(),

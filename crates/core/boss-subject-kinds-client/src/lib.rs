@@ -38,7 +38,7 @@ pub trait SubjectKindsClient: Send + Sync {
 /// unresponsive registry can't wedge a write indefinitely.
 pub struct ReqwestSubjectKindsClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestSubjectKindsClient {

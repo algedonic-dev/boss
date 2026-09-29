@@ -66,7 +66,16 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
     // failed read of either leaves the reading null and judges nothing —
     // never an empty list, which would say every move took a declared
     // route.
+    //
+    // A caller whose scope reads no packets — a request with no
+    // identity is one — gets it NOT READ, null like an unwired record
+    // (backlog e5f7b51e, its note of 2026-09-27). The moves record is
+    // not scoped by packet, so until this such a caller was answered
+    // the empty map with every undeclared crossing hung on it, count
+    // and last instant: the half-a-gate the borders' machine firings
+    // were withheld for.
     let map = match state.yard_moves.as_ref() {
+        Some(_) if rows.reads_no_packets => map,
         Some(feed) => {
             let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
             let crossings = feed.store.crossings(since).await.ok();

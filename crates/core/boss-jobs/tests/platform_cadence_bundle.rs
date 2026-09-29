@@ -122,14 +122,12 @@ async fn every_bundled_rule_is_publishable_at_its_declared_version() {
                 row.min_dock_depth,
                 row.cooldown_minutes,
                 row.every_minutes,
-                row.regate_hold_minutes,
                 row.verb.as_str()
             ),
             (
                 declared.row.min_dock_depth,
                 declared.row.cooldown_minutes,
                 declared.row.every_minutes,
-                declared.row.regate_hold_minutes,
                 declared.row.verb.as_str()
             ),
             "{}: the served row must carry what its bundle file declares",
@@ -199,36 +197,39 @@ anchor_date = \"2026-08-28\"
     assert_eq!(row.at_times, Some(serde_json::json!(["06:10"])));
     assert_eq!(row.cadence.as_deref(), Some("daily"));
     assert_eq!(row.business_calendar, None);
-    assert_eq!(row.regate_hold_minutes, None, "absent means no hold");
 }
 
-/// THE DOCK'S TWO RULES (design 42279fb2, backlog 4890165b). The boarding
-/// rule carries the bound a departure waits for the dock's re-gate round
-/// — and ONLY a departing rule may carry one, which the table's own CHECK
-/// refuses too — and the dock refreshes on a wall clock of its own, short
-/// enough to relaunch re-gates between departures rather than once per
-/// departure window.
+/// THE HOLD IS GONE FROM THE ROW (backlog d1d4275d). `regate_hold_minutes`
+/// bounded how long a departure waited for the dock's re-gate round
+/// (design 42279fb2); the board stopped waiting on re-gates in backlog
+/// 96f02540, and the column was declared and unread until this version
+/// of the boarding rule dropped it. A row that still declares it is
+/// refused by name — the loader denies unknown keys — rather than
+/// carrying a number nothing reads.
 #[test]
-fn the_dock_refreshes_on_its_own_clock_and_a_departure_declares_its_hold() {
+fn a_rule_declaring_a_departure_hold_is_refused_by_name() {
+    let held = "\
+[[cadence_rule]]
+name = \"train-board-on-dock-depth\"
+version = 10
+status = \"active\"
+verb = \"board\"
+basis = \"queue-depth\"
+min_dock_depth = 1
+cooldown_minutes = 30
+regate_hold_minutes = 15
+";
+    let err = parse_cadence_rules(held, "train-board-on-dock-depth.toml")
+        .expect_err("the row no longer has a departure hold");
+    assert!(err.to_string().contains("regate_hold_minutes"), "{err}");
+}
+
+/// THE DOCK'S REFRESH RULE (design 42279fb2, backlog 4890165b): the dock
+/// refreshes on a wall clock of its own, short enough to relaunch
+/// re-gates between departures rather than once per departure window.
+#[test]
+fn the_dock_refreshes_on_its_own_clock() {
     let rules = bundle();
-    let board = rules
-        .iter()
-        .find(|s| s.name() == "train-board-on-dock-depth")
-        .expect("the boarding rule is declared");
-    assert!(
-        board.row.regate_hold_minutes.is_some_and(|m| m > 0),
-        "the boarding rule declares how long a departure waits for the re-gate round: {:?}",
-        board.row
-    );
-    for s in &rules {
-        if s.row.regate_hold_minutes.is_some() {
-            assert!(
-                boss_jobs::cadence::departs_a_train(&s.row.verb),
-                "{}: only a rule that departs a train can hold a departure",
-                s.name()
-            );
-        }
-    }
     let refresh = rules
         .iter()
         .find(|s| s.name() == "train-dock-refresh")

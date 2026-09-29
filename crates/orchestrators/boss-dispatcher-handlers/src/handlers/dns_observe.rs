@@ -1052,7 +1052,7 @@ pub fn already_open(listing: &Json, key: &str) -> Result<Option<String>, String>
 // ---------------------------------------------------------------------------
 
 pub struct DnsObserve {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     zone: Arc<dyn ZoneRecords>,
     access: Arc<dyn AccessApps>,
@@ -3212,6 +3212,7 @@ measured = "2026-09-20: read from the IdP"
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "dns-observe-on-observe-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.task".into(),

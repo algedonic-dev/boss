@@ -20,7 +20,9 @@ use boss_core::job::Subject;
 
 use boss_core::publish::PublishMode;
 
-use crate::port::{BusinessCalendarsOutcome, CalendarClient, CalendarError, account_for};
+use crate::port::{
+    BusinessCalendarsOutcome, CalendarClient, CalendarError, account_for, published_fact,
+};
 
 #[derive(Default)]
 pub struct InMemoryCalendar {
@@ -217,19 +219,26 @@ impl CalendarClient for InMemoryCalendar {
         &self,
         calendars: &[BusinessCalendar],
         mode: PublishMode,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<BusinessCalendarsOutcome, CalendarError> {
-        let mut store = self.business_calendars.write().unwrap();
-        let mut out = BusinessCalendarsOutcome {
-            received: calendars.len(),
-            ..Default::default()
-        };
-        for cal in calendars {
-            let held = store.get(&cal.code).cloned();
-            if held.is_none() || mode.is_take() {
-                store.insert(cal.code.clone(), cal.clone());
+        let mut facts = Vec::new();
+        let out = {
+            let mut store = self.business_calendars.write().unwrap();
+            let mut out = BusinessCalendarsOutcome {
+                received: calendars.len(),
+                ..Default::default()
+            };
+            for cal in calendars {
+                let held = store.get(&cal.code).cloned();
+                if let Some(fact) = published_fact(stamp, held.as_ref(), cal, mode)? {
+                    store.insert(cal.code.clone(), cal.clone());
+                    facts.push(fact);
+                }
+                account_for(&mut out, held.as_ref(), cal, mode);
             }
-            account_for(&mut out, held.as_ref(), cal, mode);
-        }
+            out
+        };
+        facts.into_iter().for_each(|f| self.record(f));
         Ok(out)
     }
 }

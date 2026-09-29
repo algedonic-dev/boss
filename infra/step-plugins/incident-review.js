@@ -349,23 +349,15 @@
       saveError = null;
       render();
       try {
-        // This surface records no metadata keys of its own, so there
-        // is nothing to merge through the step metadata PATCH — but
-        // the completion PUT still replaces metadata wholesale, and it
-        // used to re-send the page-load snapshot: a lost update that
-        // silently reverted any key recorded server-side after this
-        // page loaded. Read the row as it stands and attest THAT.
-        // (No single-step GET exists; the job's steps list is the
-        // read the API offers.)
-        const lr = await fetch(`/api/jobs/${jobId}/steps`);
-        if (!lr.ok) {
-          throw new Error(`step read-back HTTP ${lr.status}: ${await lr.text()}`);
-        }
-        const stepsNow = await lr.json();
-        const fresh = Array.isArray(stepsNow)
-          ? stepsNow.find((s) => s.id === step.id)
-          : null;
-        if (!fresh) throw new Error('step read-back: step missing from its own job');
+        // This surface records no metadata keys of its own, so it
+        // writes no metadata at all: the completion is the status
+        // alone (backlog e39a9d2a, design 93d2bddb). It first re-sent
+        // the page-load snapshot, a lost update that reverted any key
+        // recorded after this page loaded, then read the row back and
+        // PUT that whole — correct, but a metadata body on the step
+        // PUT, and that PUT is closing to any metadata body. The PUT
+        // keeps every field a body omits.
+        //
         // Stamp every required sign-off role first, in the step's
         // final shape (v1 of the workflow requires none; this stays
         // generic so a v2 that adds one keeps working).
@@ -382,9 +374,7 @@
         const r = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(
-            Object.assign({}, fresh, { job_id: jobId, status: 'completed' }),
-          ),
+          body: JSON.stringify({ status: 'completed' }),
         });
         // Read the code — a swallowed non-2xx leaves the surface
         // looking saved while the packet never moved.

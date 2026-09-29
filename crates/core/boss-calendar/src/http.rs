@@ -24,9 +24,11 @@
 //!   — publish
 //!   business calendars, insert-if-absent by code (design e187198f: the
 //!   instance is the truth; `take` replaces a held code wholesale).
-//!   Body: `Vec<BusinessCalendar>`. Operator-gated
-//!   (with the `x-sim-origin` bypass). Returns
+//!   Body: `Vec<BusinessCalendar>`. Create on `business-calendar`, and
+//!   Update too under `take` (backlog 59deda40). Returns
 //!   `{ received, inserted, kept: [{id, differs}], updated: [{id, changes}], unchanged }`.
+//!   Each code it inserts or replaces stages one fact signed by the
+//!   caller (backlog 05f61acf).
 //! - `GET  /api/calendar/business-calendars` — every business calendar
 //!   with its closed-day set, sorted by code (the batch's own input
 //!   shape: what `boss tenant export` writes the seed file from, backlog
@@ -48,7 +50,7 @@ use boss_core::calendar::{BusinessCalendar, ReservationId, ReservationRequest, T
 use boss_core::job::Subject;
 use boss_core::publish::ModeQuery;
 use boss_policy_client::writes::{recorded_author, require_reaching, require_reaching_row};
-use boss_policy_client::{AccessTier, Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
 
 use crate::port::{CalendarClient, CalendarError};
 
@@ -174,6 +176,19 @@ async fn event_stamp(state: &CalendarApiState) -> boss_core::publisher::EventSta
             "calendar",
             boss_core::actor::ActorId::Automation("calendar".into()),
         ),
+    }
+}
+
+/// The outbox stamp signed as `actor` — the caller a door's policy
+/// ladder resolved, never a fallback (the classes doors' shape). With a
+/// publisher, its clock probe still settles `_simulated`.
+async fn stamp_as(
+    state: &CalendarApiState,
+    actor: boss_core::actor::ActorId,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("calendar", actor),
     }
 }
 
@@ -317,26 +332,58 @@ async fn cancel_by_reason(
 /// `psql -f`. Each calendar is upserted by `code`; its closed-day set is
 /// replaced wholesale.
 ///
-/// Gated to operator-tier callers — every seed path signs operator
-/// tier — or a sim caller on a sim instance
-/// (`boss_policy_client::sim_bypass_allowed`; the header alone opened
-/// it until 2026-09-25, backlog 85e7f10f). Reads stay open; only this
-/// write is privileged.
+/// Asks policy (backlog 59deda40, 2026-09-28): Create on
+/// `business-calendar` to declare, and Update as well under `?mode=take`,
+/// which overwrites a held code. Until then the door checked the
+/// caller's access tier (`Operator`, or a sim caller on a sim instance)
+/// and never asked policy, so no rule could widen or narrow who edits
+/// the calendars the dispatcher's timing triggers resolve business days
+/// from. Through the registry-write ladder
+/// ([`boss_policy_client::writes::require_registry_write`], the classes
+/// doors' since 553cf479): no caller 401, a deny or a grant narrower
+/// than `all` 403, a policy service that cannot answer 503. Both grants
+/// are platform-admin's in the core defaults — what `boss tenant
+/// publish` and a tenant engine's prepare sign as — and the sim is admitted by
+/// the binary's `SimBypassPolicyClient::from_env` (85e7f10f). Reads stay
+/// open.
+///
+/// Who did it is on the record (backlog 05f61acf, 2026-09-28): the door
+/// threw away the actor the ladder resolved, and the publish staged no
+/// event, so a take that replaced a held calendar's closed-day set left
+/// no row, event or log line naming its caller. The stamp now carries
+/// that actor, and each code the batch changes stages one
+/// `business-calendar.declared` / `.updated` fact in the write's own
+/// transaction ([`crate::port::published_fact`]).
 async fn batch_business_calendars(
     State(state): State<CalendarApiState>,
     CurrentUser(user): CurrentUser,
     Query(ModeQuery { mode }): Query<ModeQuery>,
     Json(calendars): Json<Vec<BusinessCalendar>>,
 ) -> Response {
-    let sim = boss_policy_client::sim_bypass_allowed(&user);
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
-    if !(sim || tier_ok) {
-        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
+    let ask = |action: Action| {
+        boss_policy_client::writes::require_registry_write(
+            state.policy.as_ref(),
+            &user,
+            action,
+            Resource::business_calendar(),
+        )
+    };
+    // The actor the ladder resolves is the one every fact this batch
+    // stages is signed with (backlog 05f61acf: it was discarded here).
+    let actor = match ask(Action::Create).await {
+        Ok(actor) => actor,
+        Err(refusal) => return refusal,
+    };
+    if mode.is_take()
+        && let Err(refusal) = ask(Action::Update).await
+    {
+        return refusal;
     }
+    let stamp = stamp_as(&state, actor).await;
 
     match state
         .calendar
-        .publish_business_calendars(&calendars, mode)
+        .publish_business_calendars(&calendars, mode, &stamp)
         .await
     {
         Ok(out) => Json(out).into_response(),
@@ -419,13 +466,20 @@ mod tests {
     }
 
     fn app_with(policy: Arc<dyn PolicyClient>) -> Router {
-        let cal: Arc<dyn CalendarClient> = Arc::new(InMemoryCalendar::new());
-        router(CalendarApiState {
-            calendar: cal,
+        app_over(policy).0
+    }
+
+    /// [`app_with`], and the store behind it — so a test can read the
+    /// facts a request did (or did not) record.
+    fn app_over(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryCalendar>) {
+        let cal = Arc::new(InMemoryCalendar::new());
+        let app = router(CalendarApiState {
+            calendar: cal.clone(),
             publisher: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
             policy,
-        })
+        });
+        (app, cal)
     }
 
     /// `x-boss-user` for `id` at `role`.
@@ -642,35 +696,35 @@ mod tests {
         assert_eq!(existing, missing, "tells a real id from a missing one");
     }
 
+    /// A policy service that cannot be asked.
+    struct Dark;
+    #[async_trait::async_trait]
+    impl PolicyClient for Dark {
+        async fn check(
+            &self,
+            _: &boss_policy_client::User,
+            _: Action,
+            _: Resource,
+        ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "dark".into(),
+            ))
+        }
+        async fn scope_predicate(
+            &self,
+            _: &boss_policy_client::User,
+            _: Resource,
+        ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "dark".into(),
+            ))
+        }
+    }
+
     /// A policy service that cannot be asked is an outage, not a
     /// permission fact: the write answers 503 and holds nothing.
     #[tokio::test]
     async fn a_policy_outage_refuses_the_write_with_503() {
-        struct Dark;
-        #[async_trait::async_trait]
-        impl PolicyClient for Dark {
-            async fn check(
-                &self,
-                _: &boss_policy_client::User,
-                _: Action,
-                _: Resource,
-            ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError>
-            {
-                Err(boss_policy_client::PolicyClientError::Unreachable(
-                    "dark".into(),
-                ))
-            }
-            async fn scope_predicate(
-                &self,
-                _: &boss_policy_client::User,
-                _: Resource,
-            ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError>
-            {
-                Err(boss_policy_client::PolicyClientError::Unreachable(
-                    "dark".into(),
-                ))
-            }
-        }
         let app = app_with(Arc::new(Dark));
         let admin = caller("emp-david", "platform-admin");
         let resp = reserve(
@@ -922,7 +976,7 @@ mod tests {
         assert_eq!(json["existing"][0]["reason_ref_id"], "stp-1");
     }
 
-    // --- business-calendar batch (operator-gated) + get round-trip ---
+    // --- business-calendar batch (policy-gated) + get round-trip ---
 
     /// `x-boss-user` JSON for an operator-tier caller — mirrors the
     /// header the gateway injects + the seed binaries send.
@@ -1138,24 +1192,187 @@ mod tests {
         );
     }
 
+    // ---- the policy question (backlog 59deda40) -------------------------
+
+    /// `x-boss-user` JSON for a caller of the given role and tier.
+    fn signed(id: &str, role: &str, tier: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "role": role,
+            "access_tier": tier,
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+        })
+        .to_string()
+    }
+
+    /// A `?mode=take` batch as `user`.
+    fn take_request(user_header: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/calendar/business-calendars/batch?mode=take")
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A caller the tier check refused — USER tier, a role the core
+    /// defaults grant nothing — declares a calendar once a policy rule
+    /// grants it Create on `business-calendar`; overwriting a held code
+    /// with `?mode=take` is Update as well, so a Create-only grant is
+    /// refused it and the held closed set stays.
     #[tokio::test]
-    async fn batch_upsert_forbidden_for_non_operator() {
-        // No `x-boss-user` header → anonymous, AccessTier::User.
-        let resp = app()
-            .oneshot(batch_request(None, one_calendar(&["2026-01-01"])))
+    async fn a_granting_rule_lets_a_non_admin_declare_and_take_needs_update_too() {
+        let grant = |actions: &[Action]| -> Arc<dyn PolicyClient> {
+            Arc::new(
+                actions
+                    .iter()
+                    .fold(FakePolicyClient::builder().with_default_rules(), |b, a| {
+                        b.allow(
+                            "calendar-keeper",
+                            *a,
+                            Resource::business_calendar(),
+                            Scope::All,
+                        )
+                    })
+                    .build(),
+            )
+        };
+        let keeper = signed("emp-keeper", "calendar-keeper", "user");
+        let (create_only, cal) = app_over(grant(&[Action::Create]));
+        let resp = create_only
+            .clone()
+            .oneshot(batch_request(Some(&keeper), one_calendar(&["2026-01-01"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = create_only
+            .clone()
+            .oneshot(take_request(&keeper, one_calendar(&["2026-12-25"])))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let (_, held) = get_calendar(&create_only, "us-banking").await;
+        assert_eq!(held.unwrap()["closed"], serde_json::json!(["2026-01-01"]));
+        assert_eq!(
+            calendar_facts(&cal).len(),
+            1,
+            "the declaration's fact alone: the refused take records nothing"
+        );
+
+        let both = app_with(grant(&[Action::Create, Action::Update]));
+        let resp = both
+            .clone()
+            .oneshot(take_request(&keeper, one_calendar(&["2026-12-25"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, cal) = get_calendar(&both, "us-banking").await;
+        assert_eq!(cal.unwrap()["closed"], serde_json::json!(["2026-12-25"]));
+    }
+
+    /// A platform-admin at operator tier — everything the tier check
+    /// admitted — is refused 403 by a user override that denies it, with
+    /// policy's reason, and no calendar lands.
+    #[tokio::test]
+    async fn a_denying_override_refuses_a_platform_admin() {
+        let admin_id = "claude@algedonic.dev";
+        let (app, cal) = app_over(Arc::new(
+            FakePolicyClient::builder()
+                .with_default_rules()
+                .with_override(boss_policy_client::UserOverride {
+                    id: "deny-calendars".into(),
+                    user_id: admin_id.into(),
+                    resource: Resource::business_calendar(),
+                    action: Action::Create,
+                    scope: Scope::None,
+                    reason: "calendars frozen for the audit".into(),
+                    expires_at: None,
+                })
+                .build(),
+        ));
+        let resp = app
+            .clone()
+            .oneshot(batch_request(
+                Some(&signed(admin_id, "platform-admin", "operator")),
+                one_calendar(&["2026-01-01"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("calendars frozen"));
+        let (status, _) = get_calendar(&app, "us-banking").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(calendar_facts(&cal).is_empty(), "a refusal records nothing");
+    }
+
+    /// The rest of the ladder, and each refusal writes nothing: no
+    /// identity is 401 — and so is a header claiming the anonymous id
+    /// with a platform role, or a blank id — a role the defaults grant
+    /// nothing is 403, a policy service that cannot answer is its own
+    /// 503, never an allow.
+    #[tokio::test]
+    async fn the_batch_refuses_before_it_writes() {
+        let dark: Arc<dyn PolicyClient> = Arc::new(Dark);
+        let cases: [(Option<String>, Arc<dyn PolicyClient>, StatusCode); 5] = [
+            (None, defaults(), StatusCode::UNAUTHORIZED),
+            (
+                Some(signed(
+                    boss_policy_client::User::ANONYMOUS_ID,
+                    "platform-admin",
+                    "operator",
+                )),
+                defaults(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(signed("", "platform-admin", "operator")),
+                defaults(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(signed("emp-audit", "audit-readonly", "operator")),
+                defaults(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(operator_header()),
+                dark,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (user, policy, want) in cases {
+            let (app, cal) = app_over(policy);
+            let resp = app
+                .clone()
+                .oneshot(batch_request(
+                    user.as_deref(),
+                    one_calendar(&["2026-01-01"]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{user:?}");
+            let (status, _) = get_calendar(&app, "us-banking").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{user:?}");
+            assert!(
+                calendar_facts(&cal).is_empty(),
+                "a refusal records nothing: {user:?}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn a_sim_chain_alone_is_not_operator_tier() {
+    async fn a_sim_chain_alone_is_not_a_caller() {
         // Backlog 85e7f10f (2026-09-25): a sim chain is not an identity.
         // Anonymous on a chain (the task-local set directly — the router
-        // omits the middleware) is refused and no calendar lands: only a
-        // sim caller on a sim instance takes the bypass
-        // (boss_policy_client::sim_bypass_allowed).
-        let app = app();
+        // omits the middleware) is refused 401 and no calendar lands:
+        // only a sim caller on a sim instance takes the bypass, which the
+        // binary's `SimBypassPolicyClient::from_env` installs.
+        let (app, cal) = app_over(defaults());
         let resp = boss_core::sim_origin::with_sim_chain(
             true,
             app.clone()
@@ -1163,8 +1380,125 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let (status, _) = get_calendar(&app, "us-banking").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(calendar_facts(&cal).is_empty(), "a refusal records nothing");
+    }
+
+    // ---- who a publish is recorded as (backlog 05f61acf) ----------------
+
+    /// Business-calendar facts the in-memory store recorded, as
+    /// `(kind, payload)`.
+    fn calendar_facts(cal: &InMemoryCalendar) -> Vec<(String, serde_json::Value)> {
+        cal.recorded_events()
+            .into_iter()
+            .filter(|e| e.kind.starts_with("business-calendar."))
+            .map(|e| (e.kind, e.payload))
+            .collect()
+    }
+
+    /// The door signs the fact with the actor the policy ladder resolved
+    /// (backlog 05f61acf, 2026-09-28: it asked policy and threw the
+    /// actor away, and the publish staged no fact, so a `?mode=take`
+    /// that replaced a held calendar's closed-day set left no row, event
+    /// or log line naming who did it). A declaration records who
+    /// declared it; a kept row records nothing, because nothing changed;
+    /// a take records who took it and each change from → to; a take
+    /// that restates the held row changes nothing and records nothing.
+    #[tokio::test]
+    async fn a_take_that_replaces_a_held_calendar_records_who_took_it() {
+        let cal = Arc::new(InMemoryCalendar::new());
+        let app = router(CalendarApiState {
+            calendar: cal.clone(),
+            publisher: None,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+            policy: Arc::new(
+                FakePolicyClient::builder()
+                    .with_default_rules()
+                    .allow(
+                        "calendar-keeper",
+                        Action::Create,
+                        Resource::business_calendar(),
+                        Scope::All,
+                    )
+                    .allow(
+                        "calendar-keeper",
+                        Action::Update,
+                        Resource::business_calendar(),
+                        Scope::All,
+                    )
+                    .build(),
+            ),
+        });
+        let declarer = signed("emp-declarer", "calendar-keeper", "user");
+        let taker = signed("emp-taker", "calendar-keeper", "user");
+
+        let resp = app
+            .clone()
+            .oneshot(batch_request(
+                Some(&declarer),
+                one_calendar(&["2026-01-01"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let facts = calendar_facts(&cal);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        let (kind, payload) = &facts[0];
+        assert_eq!(kind, crate::events::BUSINESS_CALENDAR_DECLARED);
+        assert_eq!(payload["code"], "us-banking");
+        assert_eq!(payload["closed"], serde_json::json!(["2026-01-01"]));
+        assert_eq!(payload["mode"], "insert-if-absent");
+        assert_eq!(payload["declared_by"], "emp-declarer");
+        assert_eq!(payload["_actor"], "emp-declarer");
+
+        // Kept under the default: nothing written, nothing recorded.
+        let resp = app
+            .clone()
+            .oneshot(batch_request(Some(&taker), one_calendar(&["2026-12-25"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(calendar_facts(&cal).len(), 1, "a kept row records nothing");
+
+        // The take replaces the held closed set, and says who did it.
+        let resp = app
+            .clone()
+            .oneshot(take_request(&taker, one_calendar(&["2026-12-25"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let facts = calendar_facts(&cal);
+        assert_eq!(facts.len(), 2, "{facts:?}");
+        let (kind, payload) = &facts[1];
+        assert_eq!(kind, crate::events::BUSINESS_CALENDAR_UPDATED);
+        assert_eq!(payload["code"], "us-banking");
+        assert_eq!(payload["mode"], "take");
+        assert_eq!(payload["closed"], serde_json::json!(["2026-12-25"]));
+        assert_eq!(payload["changes"][0]["field"], "closed");
+        assert_eq!(
+            payload["changes"][0]["from"],
+            serde_json::json!(["2026-01-01"])
+        );
+        assert_eq!(
+            payload["changes"][0]["to"],
+            serde_json::json!(["2026-12-25"])
+        );
+        assert_eq!(payload["updated_by"], "emp-taker");
+        assert_eq!(payload["_actor"], "emp-taker");
+
+        // The same take again restates the held row: no second fact.
+        let resp = app
+            .clone()
+            .oneshot(take_request(&taker, one_calendar(&["2026-12-25"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            calendar_facts(&cal).len(),
+            2,
+            "an unchanged take records nothing"
+        );
     }
 }

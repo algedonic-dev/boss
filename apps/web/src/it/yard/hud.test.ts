@@ -162,11 +162,30 @@ describe('NEEDS YOU — /api/jobs/assignments?for=me, the viewer and every alias
       stepTitle: 'Approve the merge',
       priority: null,
       age: '2d',
+      agentTakes: false,
     });
     expect(board.lines[1]?.priority).toBe('urgent');
     expect(board.lines[2]?.age).toBe('today');
     expect(board.count).toEqual({ kind: 'value', text: '3', troubled: false });
     expect(board.whom).toBe('emp-david · platform-admin');
+  });
+
+  it('a role step whose own agent block hands it to an agent says so on its line', () => {
+    // Backlog 1dd6d7ad: the publish review step of 246d597a — a
+    // checklist on David's role, carrying an analyst block — read as
+    // waiting on him. The line now says an agent takes it.
+    const board = needsYouBoard(
+      needs([
+        row({}, { id: 's-agent', kind: 'checklist', assignee_id: null, agent_takes: true }),
+        row({}, { id: 's-his', kind: 'checklist', assignee_id: null, agent_takes: false }),
+      ]),
+      NOW,
+    );
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    expect(board.lines.map((l) => [l.id, l.agentTakes])).toEqual([
+      ['s-agent', true],
+      ['s-his', false],
+    ]);
   });
 
   it('a step someone else holds is theirs, not yours', () => {

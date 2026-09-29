@@ -144,3 +144,83 @@ export function countLabel(label: string, read: ReadState, count: number): strin
 export function blankMeaning(read: ReadState): 'absent' | 'unknown' {
   return read.kind === 'ok' ? 'absent' : 'unknown';
 }
+
+// ---------------------------------------------------------------------
+// WHAT AN EMPTY LIST SAYS (backlog 0ef5e008).
+// ---------------------------------------------------------------------
+//
+// Seven list pages had one empty branch, `visible.length === 0` →
+// "No X match those filters.", which blamed the operator's filters for
+// a source that was simply empty. VendorsList (35aeb30d), WatchlistPage
+// (9289e682) and MarketingAssetsList had each grown the missing branch
+// by hand — three copies of one idea, and seven pages still without it
+// (CLAUDE.md 9a). An empty list is one of three facts, and they are
+// answered here once: the read FAILED (and says which read), NOTHING
+// exists, or the FILTERS hid everything that does. ListEmpty.svelte
+// renders the answer; no page writes a "match those filters" line of its
+// own, and a pin (an-empty-list-says-why.test.ts) holds the tree to it.
+
+/// What a filtered list's empty surface is. `rows` is the one answer
+/// with no empty line: there is something to show.
+export type EmptyState =
+  | { kind: 'loading' }
+  | { kind: 'failed'; error: string }
+  | { kind: 'none' }
+  | { kind: 'filtered' }
+  | { kind: 'rows' };
+
+/// A failure names the read it came from. `fetchPaged` and the shape
+/// checks already put the path in the error; a thrown network error
+/// ("Failed to fetch") does not, and a line that cannot say WHICH read
+/// failed sends the operator to find out. An error that already names an
+/// API path is left as it is — a list built from several reads names the
+/// one that failed, which is more than the list's own source can.
+function naming(source: string, error: string): string {
+  return error.includes(source) || error.includes('/api/') ? error : `${source}: ${error}`;
+}
+
+/// The list's reads (primary first, as `listView` takes them), how many
+/// rows they built, and how many the filters left. The reads are judged
+/// before either count, for `listView`'s reasons.
+export function emptyState(
+  reads: ReadonlyArray<NamedRead>,
+  sourceCount: number,
+  visibleCount: number,
+): EmptyState {
+  const view = listView(reads, sourceCount);
+  switch (view.kind) {
+    case 'failed':
+      return { kind: 'failed', error: naming(view.source, view.error) };
+    case 'loading':
+      return { kind: 'loading' };
+    case 'empty':
+      return { kind: 'none' };
+    case 'rows':
+      return visibleCount === 0 ? { kind: 'filtered' } : { kind: 'rows' };
+  }
+}
+
+/// A page's words for its empty list. `what` completes "Couldn't load
+/// …" ("the roster", "your inbox"); `noun` is the rows' plural; `none`
+/// replaces "No <noun> yet." where the page knows why there are none.
+export type EmptyWords = Readonly<{ what: string; noun: string; none?: string }>;
+
+/// The line an empty list shows, or null when there are rows. `alert`
+/// marks the failure line, which pages render as `role="alert"`.
+export function emptyLine(
+  view: EmptyState,
+  words: EmptyWords,
+): Readonly<{ text: string; alert: boolean }> | null {
+  switch (view.kind) {
+    case 'failed':
+      return { text: `Couldn't load ${words.what} — ${view.error}`, alert: true };
+    case 'loading':
+      return { text: 'Loading…', alert: false };
+    case 'none':
+      return { text: words.none ?? `No ${words.noun} yet.`, alert: false };
+    case 'filtered':
+      return { text: `No ${words.noun} match those filters.`, alert: false };
+    case 'rows':
+      return null;
+  }
+}

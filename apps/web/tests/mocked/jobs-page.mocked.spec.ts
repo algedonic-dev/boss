@@ -35,7 +35,6 @@
 // item, and are meant to be edited by the car that answers it, so the
 // answer shows up here as a changed expectation rather than a silently
 // passing one:
-//   gap 3  3b1ec06e  a failed registry read leaves Kind looking valid
 //   gap 5  ce8f634a  a failed people read leaves Owner looking empty
 //   gap 6  6c9672c2  owner_id / kind_prefix narrow with no visible sign
 //   gap 10 8708447c  no column for the step a packet waits at, its
@@ -43,7 +42,9 @@
 //   gap 11 75d1b902  no department filter, column or link
 // Answered on main before this spec, each pinned by its own spec named
 // above: gap 2 4af37dd8, gap 4 e98cabd0, gap 7 03e198e5, gap 8 45ca0f89,
-// gap 9 3c3dc8f3. Answered here: gap 1 d1310776 (200 rows, no offset,
+// gap 9 3c3dc8f3; gap 3 3b1ec06e (a failed registry read left Kind
+// looking valid) answered after it, its line edited below and its three
+// routes pinned by jobs-kinds-failed-read. Answered here: gap 1 d1310776 (200 rows, no offset,
 // no notice when total was larger), pinned under "the pager". This spec also found seven defects the audit did not
 // list, pinned here as UNFILED when it landed; backlog d0b93b80 fixed
 // all seven, and each line that pinned one now pins the fix and names
@@ -469,30 +470,34 @@ test.describe('/ux/jobs — the filters', () => {
     await expect(page.locator('.catalog').getByText(/department/i)).toHaveCount(0);
   });
 
-  test('a failed registry read leaves Kind offering "All kinds" alone and says nothing until the form opens', async ({ page }) => {
+  test('a failed registry read leaves Kind offering "All kinds" alone and says so beside the filter, form closed', async ({ page }) => {
     const seen = await openList(page, { registry: (r) => json(r, 'registry down', 503) });
     await expect(bodyRows(page)).toHaveCount(3);
     expect(await settledReads(page, () => seen.registry, 1)).toBe(1);
 
-    // Gap 3 (3b1ec06e): no failure line anywhere with the form closed,
-    // and the Ad Hoc button is simply absent.
+    // Gap 3 (3b1ec06e), answered: the select still offers "All kinds"
+    // alone — there is nothing else to offer — but the page says why,
+    // on the shared marker, with the form closed. It said nothing until
+    // the form opened, so the filter looked valid and empty. The list's
+    // own read worked, so this is the only marker on the page.
     await expect(kindFilter(page).locator('option')).toHaveText(['All kinds']);
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
-    await expect(page.getByText('HTTP 503')).toHaveCount(0);
+    await expect(page.locator('form.new-job-form')).toHaveCount(0);
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load job kinds: HTTP 503");
     await expect(button(page, 'Create Ad Hoc Job')).toHaveCount(0);
 
     // Focusing the select is the gesture that asks again — and a second
-    // failure is just as silent.
+    // failure is said the same way.
     await kindFilter(page).focus();
     await expect.poll(() => seen.registry).toBe(2);
-    await expect(page.getByText('HTTP 503')).toHaveCount(0);
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load job kinds: HTTP 503");
 
-    // Opening the form asks a third time, and the form is the one place
-    // the failure is said: its bare status, with no noun.
+    // Opening the form asks a third time; the form says it too, beside
+    // the Kind it cannot fill: its bare status, with no noun.
     await button(page, 'Start a new Job').click();
     await expect.poll(() => seen.registry).toBe(3);
     await expect(formError(page)).toHaveText('HTTP 503');
     await expect(field(page, 'Kind').locator('option')).toHaveText(['— select —']);
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load job kinds: HTTP 503");
   });
 });
 

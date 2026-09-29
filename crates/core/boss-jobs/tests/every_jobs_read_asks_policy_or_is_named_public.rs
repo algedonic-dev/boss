@@ -117,20 +117,14 @@ const PUBLIC: &[(&str, &str)] = &[
 /// asking policy, measured on this car. Delete a row when its route is
 /// fixed — the test fails until you do. Never add one without a reason
 /// a reviewer can argue with.
-const PENDING: &[(&str, &str)] = &[
-    (
-        "/api/estate/nodes",
-        "the estate registry: every host's LAN address, roles and capacity. Not refusable yet: infra/estate/node-roles.sh reads it with a bare curl on every host converge, and a refusal there installs the cached roles or [always] only — the converge must sign first",
-    ),
-    (
-        "/api/estate/observations",
-        "the estate loop's observation series (disk, units, evictions); commented guest-readable since d471a8ce, and its shell readers are not all signed — the same decision as /api/estate/nodes",
-    ),
-    (
-        "/api/estate/comparisons",
-        "the estate loop's comparison series; the same decision as /api/estate/nodes",
-    ),
-];
+///
+/// EMPTY since fix/every-estate-reader-signs-then-the-estate-reads-ask-policy
+/// (2026-09-28). Its last three rows were the estate reads —
+/// `/api/estate/nodes`, `/observations`, `/comparisons` — held here
+/// until every in-tree reader signed (node-roles.sh's bare curl was the
+/// one that did not; `every_estate_read_is_signed` in boss-testing now
+/// holds them all), and then made to ask Read on `estate`.
+const PENDING: &[(&str, &str)] = &[];
 
 /// A query string a route cannot be reached without: its extractor
 /// refuses the request (400) before the handler runs, which would say
@@ -534,6 +528,7 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
             boss_jobs::agents::http::AgentsApiState {
                 registry: Arc::new(boss_jobs::agents::InMemoryAgents::new()),
                 classes: None,
+                departments: None,
             },
         ))
         .merge(boss_jobs::department::http::router(

@@ -13,7 +13,7 @@
   import { untrack } from 'svelte';
   import { isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   import type { Employee } from '../people/types';
-  import { putStep, releaseStep, startStep } from './stepWrite';
+  import { releaseStep, saveStep, startStep } from './stepWrite';
   import {
     HOLDER_LOCKED_NOTE,
     askReleaseReason,
@@ -108,25 +108,22 @@
   );
 
   /// `status` only when the gesture moves the step, and the holder only
-  /// when the picker changed it — neither from the snapshot this body
-  /// is otherwise built on (backlog 6ef4a36b; GenericSurface says why).
-  /// A Start saves and then claims (design 611fbffd, clause b).
+  /// when the picker changed it — never from the page's snapshot of the
+  /// step (backlog 6ef4a36b; GenericSurface says why). A Start saves and
+  /// then claims (design 611fbffd, clause b). Its one key,
+  /// `delivery_window`, goes to the step merge door and the rest to a PUT
+  /// carrying no metadata (backlog e39a9d2a, Stage 2): the spread of the
+  /// step's metadata it used to send re-wrote whatever the page had read.
   async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
-      const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
       const body = {
-        ...drawn,
-        job_id: jobId,
         notes: notes || undefined,
         ...gestureFields(step, assigneeId, status),
-        metadata: {
-          ...step.metadata,
-          delivery_window: deliveryWindow,
-        },
+        metadata: { delivery_window: deliveryWindow },
       };
-      let res = await putStep(jobId, step.id, body);
+      let res = await saveStep(jobId, step.id, body);
       if (res.kind === 'ok' && start) {
         res = await startStep(jobId, step.id, claimedFor(assigneeId));
       }

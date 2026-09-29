@@ -32,7 +32,8 @@
 //   gap 2 c3e4edcc  the one failure line is not `.load-failed` —
 //                   ANSWERED: it is, and the header says unknown
 //   gap 3 003f4db2  the route is not gated by the warehouse module
-//   gap 4 35aeb30d  the empty line blames filters when there are none
+//   gap 4 35aeb30d  the empty line blames filters when there are none —
+//                   ANSWERED: an empty source says "No vendors yet."
 //   gap 5 d18b68cf  a null payment_terms paints a blank cell
 //   gap 6 e9c8e28d  the vendor link lands on an uncatalogued route
 //   gap 7 8d564435  the open/unpaid predicates and the NAME join are
@@ -204,12 +205,12 @@ test.describe('/ux/vendors — the served instance (warehouse off, no inventory 
     expect(ROUTE_CATALOG.warehouse.module).toBe('warehouse');
     await expect(page.locator('.module-disabled')).toHaveCount(0);
 
-    await expect(empty(page)).toHaveText("Couldn't load vendors: vendors HTTP 502");
+    await expect(empty(page)).toHaveText("Couldn't load vendors — /api/inventory/vendors: HTTP 502");
     // Gap 2 (c3e4edcc), answered: the line is the FAILURE_MARKER the
     // outage crawl reads, and the header above it no longer states
     // zeros as fact.
     await expect(page.locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
-      "Couldn't load vendors: vendors HTTP 502",
+      "Couldn't load vendors — /api/inventory/vendors: HTTP 502",
     );
     await expectHeader(page, 'Vendors', UNKNOWN_SUBTITLE);
     await expect(button(page, 'All (0)')).toBeVisible();
@@ -373,17 +374,24 @@ test.describe('/ux/vendors — fixtures', () => {
 });
 
 test.describe('/ux/vendors — empty and failed reads', () => {
-  test('an empty backend paints the filters line, with no filter set', async ({ page }) => {
+  test('an empty backend says there are no vendors, and a filter on it still blames nothing', async ({ page }) => {
     await install(page, { vendors: [], orders: [], invoices: [] });
     await mountPage(page, PATH, { titleMatch: /0 vendors/ });
 
     await expectHeader(page, '0 vendors', ZERO_SUBTITLE);
-    // Gap 4 (35aeb30d): no filter is set, and the line blames filters.
+    // Gap 4 (35aeb30d), answered: with no filter set the page used to
+    // say "No vendors match those filters." — an empty source blamed on
+    // the filters. Emptiness and filtering are two lines now.
     await expect(page.locator('button.filter-btn-active')).toHaveText(['All (0)', 'All']);
     await expect(searchbox(page)).toHaveValue('');
-    await expect(empty(page)).toHaveText('No vendors match those filters.');
+    await expect(empty(page)).toHaveText('No vendors yet.');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(page.locator('table.data-table')).toHaveCount(0);
+
+    // A search on an empty source has nothing to narrow: the line stays
+    // the source's, not the filter's.
+    await searchbox(page).fill('cascade');
+    await expect(empty(page)).toHaveText('No vendors yet.');
   });
 
   test('a refused orders read and a refused invoices read each say so, and their columns read unknown', async ({ page }) => {
@@ -443,9 +451,21 @@ test.describe('/ux/vendors — empty and failed reads', () => {
     await install(page, { ...FIXTURES, vendors: (r: Route) => json(r, 'forbidden', 403) });
     await mountPage(page, PATH);
 
-    await expect(empty(page)).toHaveText("Couldn't load vendors: vendors HTTP 403");
+    await expect(empty(page)).toHaveText("Couldn't load vendors — /api/inventory/vendors: HTTP 403");
     await expectHeader(page, 'Vendors', UNKNOWN_SUBTITLE);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(1);
+  });
+
+  // Backlog 0ef5e008: a 200 that was neither shape of list was coerced
+  // to no vendors, and read "No vendors yet."
+  test('a 200 vendors body that is not a list shape is a failed read, never "No vendors yet."', async ({ page }) => {
+    await install(page, { ...FIXTURES, vendors: (r: Route) => json(r, { error: 'contract changed' }) });
+    await mountPage(page, PATH);
+
+    await expect(empty(page)).toHaveText(
+      "Couldn't load vendors — /api/inventory/vendors: HTTP 200, but the body is an object with no data list, not a list or a {data: [...]} envelope",
+    );
+    await expect(page.getByText('No vendors yet.')).toHaveCount(0);
   });
 
   // Backlog aaeb02d6: these two used to pin the misnaming. A network

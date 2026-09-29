@@ -144,6 +144,13 @@ if [ "${1:-}" = "--built" ]; then prefer=build; shift; fi
 store="${BOSS_SHIM_IMAGE_STORE:-/work/tools/image-cli}"
 target="${BOSS_SHIM_TARGET_ROOT:-/scratch}/target"
 repo="$(dirname "$(dirname "$here")")"
+# The trust verbs (`boss triage`'s offer, `--trust-boundary`, `boss
+# mark`) read infra/platform/trust-areas.toml from the worktree they
+# run in, else from BOSS_TREE — and an analyst runs them from its
+# scratchpad, which is no worktree, while the image CLI's build path is
+# not on the pod (backlog a693cf9d). The checkout this shim lives in is
+# the one to name; a caller's own is kept.
+export BOSS_TREE="${BOSS_TREE:-$repo}"
 install="bash $repo/infra/cluster/dev-scratch-reclaim.sh --cli"
 rebuild="cargo build -p boss-cli"
 

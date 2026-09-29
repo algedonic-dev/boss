@@ -36,7 +36,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct InventoryOverheadAbsorb {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     inventory_base: String,
 }

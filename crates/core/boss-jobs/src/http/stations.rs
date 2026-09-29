@@ -392,6 +392,11 @@ pub(super) async fn stations_load<R: JobsRepository + 'static, B: EventBus + 'st
         rows.push(serde_json::json!({
             "station": bound.name,
             "kind": bound.kind,
+            // The Workflow kind the predicate holds, beside the STATION
+            // kind above — what the Department Map links to the per-kind
+            // drill-down (/it/operate/bottlenecks?kind=…). Null when the
+            // predicate spans kinds (backlog c7c5c1de).
+            "workflow_kind": bound.predicate.kind,
             "depth": depth,
             "wip_limit": bound.wip_limit,
             "over_limit": bound.wip_limit.is_some_and(|l| depth as i64 > i64::from(l)),

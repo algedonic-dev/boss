@@ -13,7 +13,10 @@
 // Read here once so the step surface and the yard say the same thing
 // for the same note (§9a). The keys mirror the handler's PATCH body
 // (jobs_complete_linked_step.rs::annotate_and_alert) and are pinned
-// on that side by tests/publish_pr_answer.rs.
+// on that side by tests/publish_pr_answer.rs, which also holds them
+// equal to `boss_jobs::http::FAILED_VERB_KEYS` — the keys a list read
+// with `failed_verbs=true` lifts onto a SLIM step as `failed_verb`,
+// which is where the receiving yard reads them (backlog ea80b5fd).
 
 export type FailedVerb = Readonly<{
   /** The verb's last FAILED line, verbatim — never paraphrased. */

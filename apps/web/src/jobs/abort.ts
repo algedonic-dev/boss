@@ -68,23 +68,22 @@ export function reasonIsSentence(reason: string): boolean {
   return reason.trim().split(/\s+/).filter((w) => w.length > 0).length >= 3;
 }
 
-/// The step PUT body that records the abort, or null when the reason is
-/// not a sentence (nothing to send — the modal keeps the field open).
+/// The write that records the abort, for `saveStep`, or null when the
+/// reason is not a sentence (nothing to send — the modal keeps the field
+/// open).
 ///
-/// The metadata is MERGED with what the step already carries: a step
-/// PUT replaces top-level metadata wholesale, and `outcome_kind` — the
-/// very fact that makes this step the abort — lives in that object.
+/// The reason is the only key: it goes through the step merge door, which
+/// leaves every other key as it stands on the row — `outcome_kind`, the
+/// very fact that makes this step the abort, among them — and then the
+/// status alone through the PUT (backlog e39a9d2a, Stage 2). It used to
+/// re-send the page's copy of the metadata on the PUT to keep them.
 /// No `completed_by`: the server stamps the signing actor at the flip
 /// and overwrites anything a human session sends (c17871fe).
 export function abortBody(
-  terminal: Pick<Step, 'metadata'>,
   reason: string,
 ): { status: 'completed'; metadata: Record<string, unknown> } | null {
   if (!reasonIsSentence(reason)) return null;
-  return {
-    status: 'completed',
-    metadata: { ...(terminal.metadata ?? {}), reason: reason.trim() },
-  };
+  return { status: 'completed', metadata: { reason: reason.trim() } };
 }
 
 export type AbortAuthority =

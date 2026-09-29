@@ -1,39 +1,10 @@
 <script lang="ts">
-  // Policy-rule edit modal. Port of EditFlyout in PolicyPage.tsx.
+  // Policy-rule edit modal: one rule's scope, opened from a matrix cell on
+  // /it/registry/policy.
 
   import type { PolicyRule, Scope } from './policyTypes';
-  import { classesFor } from '@boss/web-kit/session/classes.svelte';
-
-  // Departments come from the Class registry — the canonical
-  // tenant-extensible taxonomy. Brewery sees production /
-  // packaging / taproom; used-device-shop sees refurb / service.
-  // No per-tenant code; one row per department in the registry,
-  // and the dropdown picks them up automatically.
-  //
-  // Scope shapes that don't map to a department (none / self /
-  // team / territory / all) are core policy primitives and stay
-  // hardcoded here — they're part of the policy model, not
-  // tenant data.
-  const CORE_SCOPES: Array<{ value: string; label: string }> = [
-    { value: 'none', label: 'None — denied' },
-    { value: 'self', label: 'Self — own rows' },
-    { value: 'team', label: 'Team — self + direct reports' },
-    { value: 'territory', label: 'Territory — account team' },
-    { value: 'all', label: 'All — org-wide' },
-  ];
-
-  let SCOPE_OPTIONS = $derived<Array<{ value: string; label: string }>>([
-    ...CORE_SCOPES,
-    ...classesFor('employee', 'department').map((c) => ({
-      value: `department:${c.code}`,
-      label: `Department: ${c.code}`,
-    })),
-  ]);
-
-  function scopeForDisplay(s: Scope): string {
-    if (typeof s === 'string') return s;
-    return `department:${s.department}`;
-  }
+  import { departments, departmentsReadFailed } from '@boss/web-kit/session/departments.svelte';
+  import { scopeForDisplay, scopeOptions } from './policyView';
 
   type Props = {
     rule: PolicyRule;
@@ -42,6 +13,21 @@
     onSaved: () => void;
   };
   let { rule, changedBy, onClose, onSaved }: Props = $props();
+
+  // Department scopes come from the departments registry (GET
+  // /api/departments) — the list an employee's department is validated
+  // against, so a `department:<code>` scope names a code an employee can
+  // actually hold. It read the `(employee, department)` Classes until
+  // backlog c87e3d6d retired that second list. The core scopes and the
+  // rule's own current scope come from ./policyView, so a department the
+  // registry does not list (or could not be read for) is still the option
+  // that is selected, never a blank the Save would silently rewrite
+  // (backlog ba8411da) — and a FAILED read says so, rather than reading as
+  // a company with no departments (720d6345).
+  let SCOPE_OPTIONS = $derived(
+    scopeOptions(departments().map((d) => d.code), scopeForDisplay(rule.scope)),
+  );
+  let departmentsFailed = $derived(departmentsReadFailed());
 
   let scope = $state(scopeForDisplay(rule.scope));
   let reason = $state('');
@@ -106,6 +92,11 @@
         {/each}
       </select>
     </label>
+    {#if departmentsFailed}
+      <p class="empty load-failed" style="margin:-4px 0 12px; font-size:13px">
+        Department scopes could not be listed: the departments registry read failed.
+      </p>
+    {/if}
 
     <label style="display:block; margin-bottom:12px">
       Reason for change (required — goes to audit log)
@@ -116,7 +107,7 @@
       ></textarea>
     </label>
 
-    {#if err}<p style="color:var(--err); font-size:13px">{err}</p>{/if}
+    {#if err}<p role="alert" style="color:var(--err); font-size:13px">{err}</p>{/if}
 
     <div style="display:flex; justify-content:flex-end; gap:8px">
       <button type="button" class="btn" onclick={onClose} disabled={saving}>Cancel</button>

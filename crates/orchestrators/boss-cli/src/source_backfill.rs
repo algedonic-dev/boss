@@ -329,7 +329,7 @@ where
 
 /// Every open backlog-item, page after page until the rows agree with
 /// the server's `total` — a limit is not a filter.
-async fn open_items(http: &reqwest::Client) -> Result<Vec<Value>> {
+async fn open_items(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
     const PAGE: usize = 200;
     let mut rows: Vec<Value> = Vec::new();
     loop {
@@ -365,7 +365,7 @@ fn short(id: &str) -> &str {
 }
 
 pub async fn run(apply: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let items = open_items(&http).await?;
     let get = |path: String| {
         let http = &http;

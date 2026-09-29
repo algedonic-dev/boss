@@ -23,17 +23,19 @@
 //! silence. This batch IS the tenant's update door: the declaration is
 //! the whole row, so a per-row PUT would only repeat it.
 //!
-//! A declared `role` or `department` is a Class code under
-//! `(employee, role)` / `(employee, department)` — the same registry
-//! rows `boss-people` checks an employee's against, through the same
-//! `ClassesClient` — and this door checks it BEFORE the batch lands
-//! (backlog ab192a9f): an undeclared code refuses the whole batch by
-//! agent, attribute and code. The check lives here, not in the
-//! adapters, because this is the one write path and the code is data
-//! the database cannot vouch for (a CHECK copied from the registry
-//! would drift from it). `classes: None` skips it, the people
+//! A declared `role` is a Class code under `(employee, role)` and a
+//! declared `department` a row of the departments registry — the same
+//! rows `boss-people` checks an employee's against — and this door
+//! checks both BEFORE the batch lands (backlog ab192a9f): an
+//! undeclared code refuses the whole batch by agent, attribute and
+//! code. The department was an `(employee, department)` Class until
+//! backlog c87e3d6d (2026-09-27) collapsed that second list onto the
+//! registry. The check lives here, not in the adapters, because this
+//! is the one write path and the code is data the database cannot
+//! vouch for (a CHECK copied from the registry would drift from it).
+//! `classes: None` / `departments: None` skip them, the people
 //! adapter's posture for in-memory and test paths; the service binary
-//! always wires it.
+//! always wires both.
 
 use std::sync::Arc;
 
@@ -48,6 +50,7 @@ use boss_core::primitives::ClassRef;
 use boss_core::publish::ModeQuery;
 use boss_policy_client::CurrentUser;
 
+use crate::department::registry::DepartmentRegistry;
 use crate::trust::{can_read, is_trusted};
 
 use super::port::{AgentsError, AgentsRegistry};
@@ -55,38 +58,68 @@ use super::types::{AgentInput, validate_agent};
 
 pub struct AgentsApiState {
     pub registry: Arc<dyn AgentsRegistry>,
-    /// The Class registry an agent's `role` / `department` are checked
-    /// against. `None` skips the check (test and in-memory paths).
+    /// The Class registry an agent's `role` is checked against. `None`
+    /// skips the check (test and in-memory paths).
     pub classes: Option<Arc<dyn ClassesClient>>,
+    /// The departments registry an agent's `department` is checked
+    /// against — the rows `GET /api/departments` serves, the same ones
+    /// an employee's department is validated against since backlog
+    /// c87e3d6d (it was an `(employee, department)` Class until then).
+    /// `None` skips the check (test and in-memory paths).
+    pub departments: Option<Arc<dyn DepartmentRegistry>>,
 }
 
-/// Why a declared role or department is refused: the code is not an
-/// active Class under `(employee, <attribute>)`. `Ok(None)` when every
-/// declared code is held; `Err` when the registry could not answer,
-/// which is a different fact from "not held" and is answered as one.
+/// Why a declared department is refused: the code is not an active
+/// row of the departments registry. `Ok(None)` when every declared
+/// department is held; `Err` when the registry could not answer.
+async fn undeclared_department(
+    departments: &dyn DepartmentRegistry,
+    rows: &[AgentInput],
+) -> Result<Option<String>, String> {
+    if rows.iter().all(|a| a.department.is_none()) {
+        return Ok(None);
+    }
+    let held = departments
+        .list()
+        .await
+        .map_err(|e| format!("departments registry: {e}"))?;
+    Ok(rows.iter().find_map(|a| {
+        let code = a.department.as_deref()?;
+        (!held.iter().any(|d| d.code == code)).then(|| {
+            format!(
+                "agent {}: department `{code}` is not an active department in the departments \
+                 registry (GET /api/departments) — declare it in seeds/departments.toml first, \
+                 as for an employee's",
+                a.id
+            )
+        })
+    }))
+}
+
+/// Why a declared role is refused: the code is not an active Class
+/// under `(employee, role)`. `Ok(None)` when every declared role is
+/// held; `Err` when the registry could not answer, which is a
+/// different fact from "not held" and is answered as one.
 async fn undeclared_class(
     classes: &dyn ClassesClient,
     rows: &[AgentInput],
 ) -> Result<Option<String>, String> {
     for a in rows {
-        for (attribute, code) in [("role", &a.role), ("department", &a.department)] {
-            let Some(code) = code else { continue };
-            // On its OWN axis (backlog ab1e6ff8): the employee drawer
-            // holds role, department, status and employment_type codes
-            // side by side, and `class_exists` accepted a department as
-            // a role.
-            let held = classes
-                .class_exists_on(&ClassRef::new("employee", code.as_str()), attribute)
-                .await
-                .map_err(|e| format!("classes registry: {e}"))?;
-            if !held {
-                return Ok(Some(format!(
-                    "agent {}: {attribute} `{code}` is not an active Class in the registry \
-                     (subject_kind employee, member_attribute {attribute}) — declare the Class \
-                     in seeds/classes.json first, as for an employee's",
-                    a.id
-                )));
-            }
+        let Some(code) = &a.role else { continue };
+        // On its OWN axis (backlog ab1e6ff8): the employee drawer holds
+        // role, status and employment_type codes side by side, and
+        // `class_exists` accepted a department as a role.
+        let held = classes
+            .class_exists_on(&ClassRef::new("employee", code.as_str()), "role")
+            .await
+            .map_err(|e| format!("classes registry: {e}"))?;
+        if !held {
+            return Ok(Some(format!(
+                "agent {}: role `{code}` is not an active Class in the registry \
+                 (subject_kind employee, member_attribute role) — declare the Class \
+                 in seeds/classes.json first, as for an employee's",
+                a.id
+            )));
         }
     }
     Ok(None)
@@ -146,6 +179,13 @@ async fn publish(
             Err(why) => return (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
         }
     }
+    if let Some(departments) = &state.departments {
+        match undeclared_department(departments.as_ref(), &rows).await {
+            Ok(None) => {}
+            Ok(Some(why)) => return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
+            Err(why) => return (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
+        }
+    }
     // Same envelope construction as the credentials door: the actor
     // the request signed with rides as `_actor` (and is named again
     // as `declared_by` on each inserted row's fact), the stamp is
@@ -172,6 +212,8 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::agents::InMemoryAgents;
+    use crate::department::declare::DepartmentInput;
+    use crate::department::registry::InMemoryDepartments;
 
     fn header(id: &str, role: &str, tier: AccessTier) -> String {
         serde_json::to_string(&User {
@@ -234,13 +276,16 @@ mod tests {
         router(AgentsApiState {
             registry: registry.clone() as Arc<dyn AgentsRegistry>,
             classes: None,
+            departments: None,
         })
     }
 
-    /// The door with the Class registry wired, holding exactly the
-    /// tenant's `engineering-agent` role and `engineering` department,
-    /// each on its own axis — the shape the live registry serves (every
-    /// live employee Class carries a member_attribute, 2026-09-23).
+    /// The door with both registries wired: the Class registry holding
+    /// the tenant's `engineering-agent` role and — the shape the live
+    /// drawer had on 2026-09-27 — an `engineering` department CLASS,
+    /// and the departments registry holding `it` alone. Since backlog
+    /// c87e3d6d an agent's department is a departments row, so the
+    /// Class no longer admits it.
     fn app_with_classes(registry: &Arc<InMemoryAgents>) -> Router {
         use boss_classes_client::FakeClassesClient;
         use boss_core::primitives::Class;
@@ -260,6 +305,15 @@ mod tests {
                 on("engineering-agent", "role"),
                 on("engineering", "department"),
             ]))),
+            departments: Some(Arc::new(InMemoryDepartments::new().with(
+                &DepartmentInput {
+                    code: "it".into(),
+                    display_name: "IT".into(),
+                    function: "operations".into(),
+                    sort_order: 1,
+                    retired: false,
+                },
+            ))),
         })
     }
 
@@ -481,20 +535,21 @@ mod tests {
         );
     }
 
-    /// An agent's role and department are Class codes under
-    /// `(employee, role)` / `(employee, department)` — the rows an
-    /// employee's are validated against (backlog ab192a9f). A declared
+    /// An agent's role is a Class code under `(employee, role)` and its
+    /// department a row of the departments registry — what an
+    /// employee's are validated against (backlog ab192a9f; the
+    /// department since c87e3d6d). A declared
     /// code the registry holds lands and reads back; one it does not
     /// hold refuses the WHOLE batch, 422, naming the agent, the
     /// attribute and the code, and nothing lands. A row that declares
     /// neither reads `role: null` — the KEY is always on the wire, so
     /// a reader tells "holds no role" from "an older registry".
     #[tokio::test]
-    async fn a_role_and_a_department_are_class_codes_checked_at_the_door() {
+    async fn a_role_is_a_class_and_a_department_a_registry_row_checked_at_the_door() {
         let registry = Arc::new(InMemoryAgents::new());
         let mut declared = batch();
         declared[0]["role"] = json!("engineering-agent");
-        declared[0]["department"] = json!("engineering");
+        declared[0]["department"] = json!("it");
         let (status, body) = send(
             app_with_classes(&registry),
             "POST",
@@ -514,16 +569,22 @@ mod tests {
         .await;
         let listing: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(listing["data"][0]["role"], "engineering-agent");
-        assert_eq!(listing["data"][0]["department"], "engineering");
+        assert_eq!(listing["data"][0]["department"], "it");
 
         // An undeclared code, and a declared code on the OTHER axis: a
         // department is not a role however active its row is (backlog
         // ab1e6ff8 — this door asked the axis-blind question until then).
-        for (attribute, code) in [
-            ("role", "wizard"),
-            ("department", "narnia"),
-            ("role", "engineering"),
-            ("department", "engineering-agent"),
+        // And `engineering`, a department CLASS the departments registry
+        // does not hold — agent-claude's live department on 2026-09-27
+        // (c87e3d6d): the Class no longer admits it. A role refusal
+        // names the Class registry, a department refusal the
+        // departments registry.
+        for (attribute, code, registry_named) in [
+            ("role", "wizard", "Class"),
+            ("department", "narnia", "departments registry"),
+            ("role", "engineering", "Class"),
+            ("department", "engineering-agent", "departments registry"),
+            ("department", "engineering", "departments registry"),
         ] {
             let mut bad = declared.clone();
             bad[0][attribute] = json!(code);
@@ -544,7 +605,7 @@ mod tests {
                 body.contains("agent-claude")
                     && body.contains(attribute)
                     && body.contains(code)
-                    && body.contains("Class"),
+                    && body.contains(registry_named),
                 "{attribute}: {body}"
             );
         }

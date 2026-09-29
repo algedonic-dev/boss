@@ -12,8 +12,22 @@
 
 use sqlx::PgPool;
 
+/// Held for the whole TRUNCATE-and-reproject so two rebuilds never
+/// interleave — the lock every `boss-rebuild-all` step takes. This one
+/// took none until backlog 8d5ac7c5.
+const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("campaigns");
+
 pub async fn rebuild_campaigns(pool: &PgPool) -> Result<u64, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(REBUILD_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("taking the campaigns rebuild lock: {e}"))?;
+    // `created` is the only kind replayed here, so a live campaign
+    // whose fact is still in event_outbox would be gone for good —
+    // refuse instead (design b046f510).
+    boss_events::outbox::lock_and_assert_log_complete(&mut tx, &["campaigns"]).await?;
     sqlx::query("TRUNCATE campaigns")
         .execute(&mut *tx)
         .await

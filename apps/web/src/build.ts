@@ -10,6 +10,8 @@ import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join as pathJoin } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { MERMAID_ROUTE } from './it/mermaidUrl';
+import { copyMermaidInto } from './mermaid-vendor';
 
 const OUT = 'dist';
 await rm(OUT, { recursive: true, force: true });
@@ -191,5 +193,9 @@ if (!result.success) {
     console.log(`post-build: rewrote index.html script → ${want}`);
   }
 }
+
+// Mermaid, for /it/kb's diagrams, rides beside the bundle rather than in
+// it — see src/mermaid-vendor.ts (backlog 4718d918).
+console.log(`vendor: copied ${copyMermaidInto(OUT)} mermaid files → ${OUT}${MERMAID_ROUTE}`);
 
 console.log(`built ${result.outputs.length} files → ${OUT}/`);

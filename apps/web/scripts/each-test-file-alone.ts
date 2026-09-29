@@ -29,6 +29,9 @@
 // run. JOBS is bounded, not one per CPU, because the gate pod requests
 // 4 CPUs and several gates share a node.
 import { availableParallelism } from 'node:os';
+import { basename } from 'node:path';
+
+import { GATE_LOAD_ENV, TIMINGS_ENV, appendTimings, loadScale, scaled, timingLine } from '../src/dev-load';
 
 /// Bun's own test-file names (`bun test` collects `*.test.*`,
 /// `*_test.*`, `*.spec.*` and `*_spec.*`), so this runs the files that
@@ -61,7 +64,20 @@ export const JOBS = Math.max(1, Math.min(4, availableParallelism()));
 /// `--timeout` on the command line is the spelling bun honours, and
 /// each-test-file-alone.test.ts runs a test past the default to prove
 /// this one reaches it.
-export const TEST_TIMEOUT_MS = 30_000;
+///
+/// And it is the QUIET budget (backlog ebb750cd). On 2026-09-28 00:01Z
+/// a train gate beside two 20-wide cargo builds lost
+/// bunfig-keys-take-effect.test.ts at 30 155 ms — 5.0 s alone on the
+/// dev pod, 14.9 s inside the whole run there — with the leak pin at
+/// 38 s and a static pin at 15.5 s beside it. Inside a loaded gate the
+/// gate-runner declares the load and this scales (src/dev-load.ts).
+export const TEST_TIMEOUT_MS = scaled(30_000);
+
+/// Each file's run as one line of the gate's timings file: its wall
+/// time (spawn, import and every test in it), its suite, its verdict.
+export function fileTimings(results: ReadonlyArray<FileRun>, suite: string): string[] {
+  return results.map((r) => timingLine(r.ms, suite, r.code === 0 ? 'passed' : 'failed', r.file));
+}
 
 export type FileRun = Readonly<{ file: string; code: number; ms: number; output: string }>;
 
@@ -144,11 +160,19 @@ async function main(roots: ReadonlyArray<string>): Promise<number> {
   // Bun's own per-file "N pass" line, summed, so a green run still says
   // how many tests it ran — the one number the shared run printed.
   const passed = results.reduce((n, r) => n + Number(r.output.match(/^\s*(\d+) pass$/m)?.[1] ?? 0), 0);
+  // The budget is on the line because in a gate it is not the quiet one:
+  // a red read beside "30000 ms" and one read beside "120000 ms (x4)"
+  // are different findings.
+  const scale = loadScale();
+  const budget = `${TEST_TIMEOUT_MS} ms per test${scale > 1 ? ` (x${scale}, ${GATE_LOAD_ENV})` : ''}`;
   console.log(
     `each-test-file-alone: ${results.length - failed.length}/${results.length} files passed ` +
-      `(${passed} tests), each in its own process, ${JOBS} at a time, in ${secs}s ` +
+      `(${passed} tests), each in its own process, ${JOBS} at a time, in ${secs}s, ${budget} ` +
       `(slowest: ${slowest.map((r) => `${r.file} ${r.ms}ms`).join(', ')})`,
   );
+  // Every file's time, for the gate's receipt (`web_timings`); nothing
+  // outside the gate, which sets no file.
+  appendTimings(process.env[TIMINGS_ENV], fileTimings(results, `unit:${basename(cwd)}`));
   if (failed.length > 0) {
     console.error(
       `each-test-file-alone: ${failed.length} file(s) FAIL when run alone: ` +

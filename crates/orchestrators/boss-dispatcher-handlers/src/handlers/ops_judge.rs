@@ -543,7 +543,7 @@ fn meta_args(job: &serde_json::Value) -> Vec<String> {
 }
 
 pub struct OpsJudge {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who a failed-verb alarm is addressed to — the platform owner as
     /// the people registry answers it, like every other filer here.
@@ -564,7 +564,7 @@ impl OpsJudge {
 
     /// Tests point the client at a local stand-in for jobs-api.
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
@@ -930,6 +930,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: RULE.into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -1104,7 +1105,7 @@ mod tests {
     /// an alarm it files is addressed to.
     fn judge(base: String) -> Arc<OpsJudge> {
         OpsJudge::with_client(
-            reqwest::Client::new(),
+            crate::handlers::common::api_client(),
             base,
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )

@@ -78,7 +78,7 @@ pub async fn inject_role_headers(
         {
             req.headers_mut().insert("x-boss-employee-id", val);
         }
-        if let Ok(val) = axum::http::HeaderValue::from_str(&session.access_tier) {
+        if let Ok(val) = axum::http::HeaderValue::from_str(session.access_tier()) {
             req.headers_mut().insert("x-boss-access-tier", val);
         }
         // Presence ticket swap (docs/design/presence.md): a verified
@@ -156,16 +156,17 @@ fn strip_boss_headers(headers: &mut axum::http::HeaderMap) {
 /// from `GET /api/people/{id}/scope` and baked into the cookie.
 /// That keeps the per-request injection zero-cost; staleness is
 /// bounded by the 8h session TTL.
-fn build_user_json(session: &Session) -> String {
-    let access_tier_value = match session.access_tier.as_str() {
-        "operator" => "operator",
-        _ => "user",
-    };
+pub(crate) fn build_user_json(session: &Session) -> String {
+    // "operator" only for an ELEVATED session — `Session::access_tier`
+    // answers it from the stored tier and the elevation's instant
+    // together (adversarial review of car 0bde9b99, M2).
+    let access_tier_value = session.access_tier();
     // The signed `employee_id` when the session has one, otherwise the
     // username. A guest session has no employee_id by design, so it
     // identifies downstream as `guest@algedonic.dev` — which is what
-    // should appear against anything it touches.
-    let id = session.employee_id.as_deref().unwrap_or(&session.username);
+    // should appear against anything it touches. `Session::policy_id`,
+    // because `/api/session` hands the same id to the SPA (9dad102c).
+    let id = session.policy_id();
     // Default-fall-through is `visitor` (design 2830b6b7; it was
     // `audit-readonly`, the widest read) so that any session reaching a
     // backend without an explicit role gets the least access and writes
@@ -284,6 +285,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         axum::Router::new()
             .route("/probe", axum::routing::get(probe))
@@ -385,6 +388,81 @@ mod tests {
         assert!(seen.contains("x-boss-role=team-lead;"), "{seen}");
     }
 
+    /// Backlog 3c92c5b8, 2026-09-27: the IT registries answered 403 to
+    /// the platform owner's browser because no session was ever operator
+    /// tier. What a service BELIEVES about a session is what its own
+    /// extractor reads off `x-boss-user` — `boss_policy_client::
+    /// CurrentUser`, the one boss-jobs' `trust::can_read` is asked of — so
+    /// that is what this reads, through the middleware. The owner's
+    /// passkey-elevated session arrives as `Operator` (which `can_read`
+    /// and `is_trusted` admit); the same owner's session straight from an
+    /// OIDC login, and another platform-admin's, arrive as `User` (which
+    /// they refuse, the 403 already pinned in boss-jobs' trust tests).
+    #[tokio::test]
+    async fn only_the_owners_passkey_elevated_session_reaches_a_service_as_operator() {
+        use axum::extract::FromRequestParts;
+        use boss_policy_client::{AccessTier, CurrentUser};
+        async fn tier(req: Request<axum::body::Body>) -> String {
+            let (mut parts, _) = req.into_parts();
+            match CurrentUser::from_request_parts(&mut parts, &()).await {
+                Ok(CurrentUser(user)) => format!("{:?}", user.access_tier),
+                Err(_) => "refused".to_string(),
+            }
+        }
+        let state = Arc::new(crate::AppState {
+            session_key: TEST_KEY.to_vec(),
+            proxy_client: reqwest::Client::new(),
+            perf: Arc::new(crate::perf::PerfCollector::new()),
+            machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
+        });
+        let app = axum::Router::new()
+            .route("/whoami", axum::routing::get(tier))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                inject_role_headers,
+            ));
+        let seen_as = |session: Session| {
+            let app = app.clone();
+            async move {
+                let cookie = format!("{}={}", session::COOKIE_NAME, session.encode(TEST_KEY));
+                let req = Request::builder()
+                    .uri("/whoami")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                probe_response(app, req).await
+            }
+        };
+        let owner = "emp-owner";
+        let login = |employee: &str| {
+            let mut s = Session::new(format!("{employee}@example.com"), 3600);
+            s.employee_id = Some(employee.to_string());
+            s.role = Some(boss_core::roles::PLATFORM_ADMIN_ROLE.to_string());
+            s
+        };
+        let elevated = boss_gateway::elevation::elevate(&login(owner), owner, 1)
+            .expect("the owner's session is elevated");
+        assert_eq!(
+            seen_as(elevated).await,
+            format!("{:?}", AccessTier::Operator)
+        );
+        assert_eq!(
+            seen_as(login(owner)).await,
+            format!("{:?}", AccessTier::User),
+            "an OIDC-only login is user tier, owner or not"
+        );
+        assert!(
+            boss_gateway::elevation::elevate(&login("emp-other-admin"), owner, 1).is_err(),
+            "another platform-admin's passkey elevates nothing"
+        );
+        assert_eq!(
+            seen_as(login("emp-other-admin")).await,
+            format!("{:?}", AccessTier::User)
+        );
+    }
+
     // --- The machine door behind the gateway (design 6805c764, car 2;
     // backlog 2710c8fc). A service port, gated in `enforce` with the
     // estate token in its `current` slot, reached two ways: straight at
@@ -431,6 +509,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Arc::new(Source::fixed(token.map(String::from))),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         let forward = |req: Request<axum::body::Body>| async move {
             let (parts, body) = req.into_parts();
@@ -575,6 +655,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Arc::new(Source::fixed(Some(ESTATE_TOKEN.into()))),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         axum::Router::new()
             .fallback(axum::routing::get(probe))

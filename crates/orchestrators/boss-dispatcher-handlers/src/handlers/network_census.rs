@@ -106,7 +106,7 @@ const NON_TERMINAL: [&str; 2] = ["draft", "open"];
 const TERMINAL: [&str; 2] = ["closed", "cancelled"];
 
 pub struct NetworkCensus {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -118,7 +118,10 @@ impl NetworkCensus {
         })
     }
 
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -674,6 +677,7 @@ mod tests {
         ])
         .await;
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "network-census-daily".into(),
             triggering_event_id: "clock-2026-09-23".into(),
             triggering_topic: "schedule".into(),
@@ -702,6 +706,7 @@ mod tests {
         ])
         .await;
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "network-census-daily".into(),
             triggering_event_id: "clock-2026-09-23".into(),
             triggering_topic: "schedule".into(),
@@ -731,6 +736,7 @@ mod tests {
         ])
         .await;
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "network-census-daily".into(),
             triggering_event_id: "clock-2026-09-23".into(),
             triggering_topic: "schedule".into(),

@@ -238,6 +238,12 @@ async fn post(
 async fn a_rule_write_with_no_identity_is_refused_401() {
     let app = router(state(unreachable_pool(), defaults_policy()));
     let claims_the_sentinel = signer("emp-mallory", User::ANONYMOUS_ROLE);
+    // The shape the subject-kinds review flagged (abc2e9d5, LOW-1) and
+    // f5e0670d point 2 names here: the no-header sentinel's ID with a
+    // platform role passed `is_anonymous()`, which reads the role alone,
+    // and the row was signed `anonymous`. A blank id is no caller either.
+    let claims_the_anonymous_id = signer(User::ANONYMOUS_ID, "platform-admin");
+    let names_nobody = signer("", "platform-admin");
     for (label, uri, body) in writes("r") {
         for (who, header) in [
             ("no header", None),
@@ -245,6 +251,11 @@ async fn a_rule_write_with_no_identity_is_refused_401() {
                 "a header claiming the guest role",
                 Some(claims_the_sentinel.as_str()),
             ),
+            (
+                "a header claiming the anonymous id at platform-admin",
+                Some(claims_the_anonymous_id.as_str()),
+            ),
+            ("a blank id at platform-admin", Some(names_nobody.as_str())),
         ] {
             let (status, _, text) = post(&app, &uri, header, body.as_ref()).await;
             assert_eq!(
@@ -279,6 +290,116 @@ async fn a_rule_write_by_any_role_but_platform_admin_is_refused_403() {
             );
         }
     }
+}
+
+/// A platform-admin a user override denies is refused 403 at each door,
+/// with policy's reason (backlog 59deda40: the doors now ask through the
+/// registry-write ladder, so an override narrows the deploy superuser as
+/// it narrows anyone). The pool cannot connect, so nothing was written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denying_override_refuses_a_platform_admin_403() {
+    let admin_id = "claude@algedonic.dev";
+    let policy = [Action::Create, Action::Publish, Action::Retire]
+        .into_iter()
+        .fold(
+            boss_policy_client::FakePolicyClient::builder().with_default_rules(),
+            |b, a| {
+                b.with_override(boss_policy_client::UserOverride {
+                    id: format!("deny-rules-{}", a.as_str()),
+                    user_id: admin_id.into(),
+                    resource: Resource::dispatcher_rule(),
+                    action: a,
+                    scope: Scope::None,
+                    reason: "rules frozen for the incident".into(),
+                    expires_at: None,
+                })
+            },
+        )
+        .build();
+    let app = router(state(unreachable_pool(), Arc::new(policy)));
+    let admin = signer(admin_id, "platform-admin");
+    for (label, uri, body) in writes("r") {
+        let (status, _, text) = post(&app, &uri, Some(&admin), body.as_ref()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+        assert!(text.contains("rules frozen"), "{label}: {text}");
+    }
+}
+
+/// A grant narrower than `all` does not reach a rule: a dispatcher rule
+/// belongs to no person and no department, so a department-scoped grant
+/// cannot be shown to cover it (the registry-write ladder, backlog
+/// 59deda40). Until then any allow at any scope passed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_department_scoped_grant_is_refused_403() {
+    let policy = [Action::Create, Action::Publish, Action::Retire]
+        .into_iter()
+        .fold(
+            boss_policy_client::FakePolicyClient::builder().with_default_rules(),
+            |b, a| {
+                b.allow(
+                    "it-lead",
+                    a,
+                    Resource::dispatcher_rule(),
+                    Scope::Department("it".into()),
+                )
+            },
+        )
+        .build();
+    let app = router(state(unreachable_pool(), Arc::new(policy)));
+    let lead = signer("emp-it-lead", "it-lead");
+    for (label, uri, body) in writes("r") {
+        let (status, _, text) = post(&app, &uri, Some(&lead), body.as_ref()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+    }
+}
+
+/// A role the core defaults grant nothing drafts, publishes and retires
+/// once a policy rule grants it the three actions on `dispatcher-rule`
+/// at `all`, and each row names that caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_granting_rule_lets_a_non_admin_write_and_each_row_names_it() {
+    let db = TestDb::new().await;
+    let policy = [Action::Create, Action::Publish, Action::Retire]
+        .into_iter()
+        .fold(
+            boss_policy_client::FakePolicyClient::builder().with_default_rules(),
+            |b, a| b.allow("rules-author", a, Resource::dispatcher_rule(), Scope::All),
+        )
+        .build();
+    let app = router(state(db.pool.clone(), Arc::new(policy)));
+    let author = signer("emp-rules-author", "rules-author");
+    let name = "a-granted-rule";
+    let (status, _, text) = post(
+        &app,
+        "/api/dispatcher/rules",
+        Some(&author),
+        Some(&draft_body(name)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    for (verb, want) in [
+        ("publish", StatusCode::OK),
+        ("retire", StatusCode::NO_CONTENT),
+    ] {
+        let (status, _, text) = post(
+            &app,
+            &format!("/api/dispatcher/rules/{name}/{verb}"),
+            Some(&author),
+            None,
+        )
+        .await;
+        assert_eq!(status, want, "{verb}: {text}");
+    }
+    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT created_by, published_by, retired_by FROM dispatcher_rules \
+         WHERE name = $1 AND version = 1",
+    )
+    .bind(name)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let me = Some("emp-rules-author".to_string());
+    assert_eq!(row, (me.clone(), me.clone(), me));
 }
 
 #[tokio::test(flavor = "multi_thread")]

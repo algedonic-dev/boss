@@ -29,6 +29,12 @@ subtle = "2"
 # (design 6805c764, car 1). Every such binary already links axum.
 axum = { workspace = true }
 
+[features]
+# `machine_token::BlockingClient`, the stamping client on reqwest's
+# blocking half, for the seed and publish walks (design 6805c764 car 2).
+# Off by default so a service that never blocks does not build it.
+blocking = ["reqwest/blocking"]
+
 [dev-dependencies]
 proptest = "1"
 tower = { workspace = true }

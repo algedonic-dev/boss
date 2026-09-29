@@ -165,6 +165,14 @@ impl AgentRunLog for InMemoryAgentRuns {
         Ok(out)
     }
 
+    async fn count_runs(&self, filter: &RunFilter) -> Result<u64, AgentRunError> {
+        let every = RunFilter {
+            limit: None,
+            ..filter.clone()
+        };
+        Ok(self.list_runs(&every).await?.len() as u64)
+    }
+
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError> {
         let mut out = self.card.clone();
         out.sort_by(|a, b| a.model.cmp(&b.model));

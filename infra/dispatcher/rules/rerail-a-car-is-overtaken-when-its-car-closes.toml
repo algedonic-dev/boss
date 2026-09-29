@@ -1,0 +1,38 @@
+# A repair ends when its car does (design b35456ac, decision 7).
+#
+# `rerail-a-car-left-behind-on-a-conflict` files a `rerail-a-car` packet
+# carrying the car's id as `metadata.car`. A car can close while its
+# repair is still open — it lands after the collision that held it fails
+# to, or an operator abandons or retires it — and a repair left open
+# behind a closed car is residue: it sits in MY WORK asking a builder to
+# rerail something that no longer rides, and its open packet keeps the
+# trigger's dedup closed for that subject.
+#
+# So ANY close of a car — merged, abandoned, retired — completes the open
+# repair naming it at its `rerail` step with `result = overtaken`, which
+# carries the packet to its own `overtaken` terminal. A repair that
+# already ended (`rerailed` or `refused`) is closed and not listed; a
+# redelivery finds the step completed and writes nothing.
+#
+# THE KEY IS ON THE REPAIR'S JOB METADATA, not on one of its steps, so
+# the rule names no `match_step` (`jobs.complete_step_matching` reads the
+# candidate packet's own metadata then). The car's close marker carries
+# its `id`, which is the value the repair recorded.
+#
+# The stall and left-behind alarms are untouched: they stay the human's
+# path when a repair ends `refused` (decision 8).
+[[rule]]
+name = "rerail-a-car-is-overtaken-when-its-car-closes"
+why = """
+A CROSS-PROTOCOL REACTOR: a `ship-a-change` car closing completes the
+open `rerail-a-car` repair filed for it — two protocols, so no single
+Workflow can declare it. Without it a car that landed or was abandoned
+while its repair ran would leave that repair open in a builder's queue,
+asking for work on a car that no longer rides (design b35456ac).
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = "kind = \"ship-a-change\""
+[[rule.do]]
+handler = "jobs.complete_step_matching"
+args = { kind = "\"rerail-a-car\"", step = "\"rerail\"", match_field = "\"car\"", event_path = "\"id\"", evidence_key = "\"overtaken_by\"", done_metadata = '"{\"result\": \"overtaken\", \"evidence\": \"The car {event.id} closed {event.outcome} before this rerail finished, so there is nothing left to rerail. Closed by machine from the car closing, not by judgement.\"}"' }

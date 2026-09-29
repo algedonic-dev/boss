@@ -29,7 +29,7 @@ struct LineItemInput {
 }
 
 pub struct CommerceInvoiceIssue {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     commerce_base: String,
 }
 

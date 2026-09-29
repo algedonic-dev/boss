@@ -30,6 +30,8 @@ import index from '../index.html';
 import { type Misses, apiHandler, isMocked, missSummary } from './dev-mocked';
 import { readyLine } from './dev-ready';
 import { DEFAULT_PORT, TREE_ID, TREE_PATH, treeResponse } from './dev-tree';
+import { MERMAID_ROUTE } from './it/mermaidUrl';
+import { vendoredMermaidFile } from './mermaid-vendor';
 
 const PORT = Number(process.env['PORT'] ?? DEFAULT_PORT);
 
@@ -200,6 +202,14 @@ function servePlugin(path: string): Response {
   return new Response('plugin not found', { status: 404 });
 }
 
+function serveMermaid(path: string): Response {
+  const file = vendoredMermaidFile(path);
+  if (file === null) return new Response('not a mermaid file', { status: 404 });
+  return new Response(readFileSync(file), {
+    headers: { 'content-type': 'application/javascript; charset=utf-8' },
+  });
+}
+
 // Tenant module manifest — `[modules]` block from the active tenant's
 // tenant.toml. The SPA fetches this once on session load and gates
 // sidebar entries by it. Production gateway will serve the same
@@ -275,6 +285,11 @@ serve({
       return handleApi(req, url.pathname, url);
     },
     '/plugins/*': (req) => servePlugin(new URL(req.url).pathname),
+    // Mermaid for /it/kb, by URL and never through this bundle — see
+    // src/mermaid-vendor.ts for the 7.3 -> 16.8 MB it cost every page
+    // when it was an import (backlog 4718d918).
+    // (The key is computed, so bun's route typing cannot name `req`.)
+    [`${MERMAID_ROUTE}*`]: (req: Request) => serveMermaid(new URL(req.url).pathname),
     // Bun bundles index.html + all imported Svelte/TS/CSS sources
     // behind this entry; `development: true` attaches the HMR client
     // so browsers pick up source changes without a full reload.
@@ -291,6 +306,7 @@ console.log(
     : `  api proxy → ${SCRATCH ? 'SCRATCH ports (boss_scratch DB) for paired services' : 'prod service ports (boss DB)'}`,
 );
 console.log('  /plugins/* → /var/lib/boss/step-plugins/');
+console.log(`  ${MERMAID_ROUTE}* → node_modules/mermaid/dist (ESM build, for /it/kb)`);
 console.log(`  serving tree: ${TREE_ID} (named at ${TREE_PATH})`);
 
 // The runner stops this server with SIGTERM once Playwright is done;

@@ -146,8 +146,14 @@ test('rejected handoff confirmations revert to the server-confirmed state', asyn
     { kind: 'handoff', label: 'Handoff', category: 'generic', ux: 'inline',
       description: '', surface: 'handoff' },
   ]);
-  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1$`), (r) =>
-    json(r, { error: 'db down' }, 500));
+  // The confirmations are metadata, so the write that records them is
+  // the step merge door (backlog e39a9d2a, Stage 2) — refuse that one,
+  // and the PUT behind it, which must then never be sent.
+  const sent: string[] = [];
+  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1(/metadata)?$`), (r) => {
+    sent.push(`${r.request().method()} ${new URL(r.request().url()).pathname}`);
+    return json(r, { error: 'db down' }, 500);
+  });
 
   await page.goto(`/ux/jobs/${JOB_ID}`);
   const surface = page.locator('.sg-detail');
@@ -161,6 +167,7 @@ test('rejected handoff confirmations revert to the server-confirmed state', asyn
   // rejected — both sides fall back to the confirmed (server) state.
   await expect(boxes.nth(0)).not.toBeChecked();
   await expect(boxes.nth(1)).not.toBeChecked();
+  expect(sent).toEqual([`PATCH /api/jobs/${JOB_ID}/steps/s1/metadata`]);
 });
 
 test('a failed step-types load is an error with a Retry, not a permanent downgrade to the generic surface', async ({ page }) => {

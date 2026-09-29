@@ -85,8 +85,12 @@ cat >"$tmp/nodes.json" <<'JSON'
             "conditions":[{"type":"Ready","status":"True"}]}}
 ]}
 JSON
-printf '{"node":{"nodeName":"w-1","fs":{"availableBytes":418759086080,"capacityBytes":997807714304}}}\n' \
-    >"$tmp/stats-w-1.json"
+# w-1's free figure, as the forge's talos-nodefs reading carries it
+# (backlog eeac3d56: it is no longer read through the kubelet here).
+jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ total: 1, data: [ { payload: {
+    scope: "talos-nodefs", observer: "boss-estate-observe-nodefs", mount: "/var", observed_at: $at,
+    nodes: [ { id: "w-1", address: "10.20.0.21", disk_gb: 929, disk_free_gb: 390 } ] } } ] }' \
+    >"$tmp/nodefs-page.json"
 # /api/dispatcher/readyz as DispatcherLiveness::snapshot renders it.
 cat >"$tmp/readyz.json" <<'JSON'
 {"ready":true,"assigning":true,"assignment_events":412,"rules_running":true,"rules_events":9031,
@@ -100,10 +104,6 @@ mkdir -p "$tmp/bin"
 cat >"$tmp/bin/kubectl" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then cat "$FIXTURES/nodes.json"; exit 0; fi
-if [[ "${1:-}" == "get" && "${2:-}" == "--raw" ]]; then
-    node="${3#/api/v1/nodes/}"; node="${node%%/*}"
-    cat "$FIXTURES/stats-$node.json"; exit 0
-fi
 if [[ "${1:-}" == "get" && "${2:-}" == "jobs" ]]; then echo '{"items":[]}'; exit 0; fi
 echo "kubectl stub: unexpected args: $*" >&2
 exit 99
@@ -130,6 +130,7 @@ case "$method $url" in
             wrong-surface) printf '{"recorded":true}\n'; exit 0 ;;
             *) echo "curl stub: READYZ_MODE unset" >&2; exit 98 ;;
         esac ;;
+    "GET "*'?scope=talos-nodefs'*) cat "$FIXTURES/nodefs-page.json"; exit 0 ;;
     "POST "*/api/estate/observation) printf '{"recorded":true}\n202'; exit 0 ;;
     *) printf '{"error":"stub has no answer for %s %s"}\n500' "$method" "$url"; exit 0 ;;
 esac

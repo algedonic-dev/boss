@@ -122,12 +122,15 @@ pub(crate) const COMPILED_CI_HOST_FLOOR_GB: i64 = 40;
 /// most of its siblings this constant DID have a pre-registry ancestor —
 /// `gate.rs`'s `DEFAULT_MAX_CONCURRENT`, kept there now only as the
 /// ultimate fallback when neither the env override nor a policy row can
-/// be read. Three is the measured comfort zone on the build node (w-1):
-/// at FIVE concurrent gates I/O pressure hit 65% and a ~35-minute gate
-/// took ~93, so per-verdict latency degraded past two gates' worth of
-/// queueing (2026-08-26). Raising it to 4 is a policy edit, not a
-/// deploy — which is the whole point of moving it here.
-pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 3;
+/// be read. Three was the comfort zone on the build node (w-1); FIVE is
+/// the measured cliff — I/O pressure hit 65% and a ~35-minute gate took
+/// ~93, so per-verdict latency degraded past two gates' worth of
+/// queueing (2026-08-26). Four is the next step between them, taken as
+/// policy v3 on 2026-09-28 (backlog 366c2ed5, David: 'Go to 4') after a
+/// day of three saturated bays, and measured for a day on that packet
+/// before five is considered. Raising it was a policy edit plus this
+/// fallback's pin, not a deploy — which is the point of moving it here.
+pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 4;
 
 // WHICH LINTS THE CONSIST CHECK LEAVES OUT IS NOT POLICY ANY MORE. It
 // was, from 2026-08-24 to 2026-09-18 (`consist_excluded_lints` on the
@@ -314,8 +317,9 @@ mod tests {
              a FULL gate build that now runs in-cluster"
         );
         assert_eq!(
-            p.gate_max_concurrent, 3,
-            "gate.rs DEFAULT_MAX_CONCURRENT — the measured comfort zone on w-1"
+            p.gate_max_concurrent, 4,
+            "gate.rs DEFAULT_MAX_CONCURRENT — policy v3 (backlog 366c2ed5, David \
+             2026-09-28): four bays, the next step below the measured cliff at five"
         );
         assert_eq!(
             p.version, NO_VERSION,
@@ -600,15 +604,37 @@ mod db_tests {
     /// and migrations equal; this test keeps the third side of the
     /// triangle, the one that sees what a fresh database actually
     /// serves.
+    ///
+    /// WHAT A FRESH DATABASE SERVES IS MIGRATIONS THEN SEED. Until
+    /// 2026-09-28 this read the migrations' row alone, which was the
+    /// served row only while the bundle sat at the migrations' v2. The
+    /// first bundle-only bump — v3, the fourth gate bay (backlog
+    /// 366c2ed5) — made the migrations HISTORY: every deployment's boot
+    /// runs the platform seed, which publishes v3 over them. So this
+    /// runs the same seed over the same bundle and reads what the jobs
+    /// API would then serve; the migrations stay exactly as they are.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_seeded_policy_equals_the_compiled_fallback() {
         let db = boss_testing::TestDb::new().await;
         let repo = PgDeliveryPolicy::new(db.pool.clone());
+        let bundle = boss_jobs::seed_loader::load_delivery_policies(
+            boss_jobs::delivery_policy_seed::platform_delivery_policy_path(),
+        )
+        .expect("the platform delivery-policy bundle parses");
+        boss_jobs::delivery_policy_seed::seed_delivery_policies(
+            &repo,
+            &bundle,
+            &boss_core::actor::ActorId::Automation("platform-workflow-seed".into()),
+            chrono::Utc::now(),
+            false,
+        )
+        .await
+        .expect("the bundle seeds over the migrations, as every boot does");
         let row = repo
             .active_policy(POLICY_NAME)
             .await
             .unwrap()
-            .expect("the seed migration leaves one active policy");
+            .expect("migrations then seed leave one active policy");
         let seeded = parse(row).expect("the seeded row parses");
 
         let compiled = DeliveryPolicy::compiled();

@@ -443,7 +443,9 @@ test.describe('/ux/people — links and back', () => {
 });
 
 test.describe('/ux/people — empty and failed reads never paint alike', () => {
-  test('an empty roster is counted as empty and says no employee matches', async ({ page }) => {
+  // Backlog 0ef5e008: an empty roster said "No employees match those
+  // filters." with nothing for a filter to hide. It says there are none.
+  test('an empty roster is counted as empty and says there are no employees', async ({ page }) => {
     await install(page, []);
     await mountPage(page, PATH, { titleMatch: /0 active employees/ });
 
@@ -452,12 +454,12 @@ test.describe('/ux/people — empty and failed reads never paint alike', () => {
     await expect(filters(page).getByRole('button')).toHaveText([
       'List', 'Hierarchy', 'Active (0)', 'On Leave (0)', 'Terminated (0)', 'All (0)', 'All (0)',
     ]);
-    await expect(empty(page)).toHaveText('No employees match those filters.');
+    await expect(empty(page)).toHaveText('No employees yet.');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(page.locator('table.data-table')).toHaveCount(0);
 
     await button(page, 'View', 'Hierarchy').click();
-    await expect(empty(page)).toHaveText('No employees match those filters.');
+    await expect(empty(page)).toHaveText('No employees yet.');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 
@@ -478,9 +480,11 @@ test.describe('/ux/people — empty and failed reads never paint alike', () => {
   // a body that is not JSON is the parser's, whose wording is V8's and
   // so is matched only as far as the page's own prefix.
   const FAILURES: ReadonlyArray<readonly [string, (r: Route) => Promise<void>, string | RegExp]> = [
-    ['refused (500)', (r) => json(r, 'people store down', 500), "Couldn't load the roster — people HTTP 500"],
-    ['forbidden (403)', (r) => json(r, 'forbidden', 403), "Couldn't load the roster — people HTTP 403"],
-    ['unreachable', (r) => r.abort('connectionrefused'), "Couldn't load the roster — Failed to fetch"],
+    ['refused (500)', (r) => json(r, 'people store down', 500), "Couldn't load the roster — /api/people: HTTP 500"],
+    ['forbidden (403)', (r) => json(r, 'forbidden', 403), "Couldn't load the roster — /api/people: HTTP 403"],
+    ['unreachable', (r) => r.abort('connectionrefused'), "Couldn't load the roster — /api/people: Failed to fetch"],
+    // A 200 that is not a list was cast to the roster (backlog 0ef5e008).
+    ['a 200 that is not a list', (r) => json(r, { data: [] }), "Couldn't load the roster — /api/people: HTTP 200, but the body is an object, not a list"],
     ['not JSON', (r) => r.fulfill({ status: 200, contentType: 'application/json', body: 'not json' }), /^\s*Couldn't load the roster — \S.*\S\s*$/],
   ];
   for (const [how, answer, line] of FAILURES) {

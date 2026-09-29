@@ -11,7 +11,18 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
   import type { PurchaseOrder, Vendor, VendorInvoice } from './types';
-  import { failedRead, okRead, readStateOfResponse, type ReadState } from '../data/readState';
+  import {
+    emptyState,
+    failedRead,
+    okRead,
+    readStateOfLoad,
+    readStateOfResponse,
+    type ReadState,
+  } from '../data/readState';
+  import { readRows } from '../data/shape';
+  import ListEmpty from '../data/ListEmpty.svelte';
+
+  const VENDORS_URL = '/api/inventory/vendors';
 
   let vendors = $state<Vendor[]>([]);
   let pos = $state<PurchaseOrder[]>([]);
@@ -56,14 +67,16 @@
     (async () => {
       try {
         const [vResp, orders, invoices] = await Promise.all([
-          fetch('/api/inventory/vendors'),
+          fetch(VENDORS_URL),
           sideRead<PurchaseOrder>('/api/inventory/orders'),
           sideRead<VendorInvoice>('/api/inventory/vendor-invoices'),
         ]);
-        if (!vResp.ok) throw new Error(`vendors HTTP ${vResp.status}`);
-        const vBody = await vResp.json();
+        if (!vResp.ok) throw new Error(`${VENDORS_URL}: HTTP ${vResp.status}`);
+        // A 200 that is not a list shape is a failed read, not "No
+        // vendors yet." (backlog 0ef5e008).
+        const vRows = readRows(VENDORS_URL, await vResp.json()) as Vendor[];
         if (!cancelled) {
-          vendors = Array.isArray(vBody) ? vBody : (vBody.data ?? []);
+          vendors = [...vRows];
           pos = orders.rows;
           bills = invoices.rows;
           ordersRead = orders.read;
@@ -119,6 +132,15 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, no vendors, or the filters hid them (backlog 0ef5e008).
+  let listState = $derived(
+    emptyState(
+      [{ source: VENDORS_URL, state: readStateOfLoad(loading, error) }],
+      vendors.length,
+      visible.length,
+    ),
   );
 
   let totalOpenPos = $derived(rows.reduce((s, r) => s + r.openPos, 0));
@@ -199,12 +221,11 @@
           </p>
         {/each}
       {/if}
-      {#if loading}
-        <p class="empty">Loading…</p>
-      {:else if error}
-        <p class="empty load-failed" role="alert">Couldn't load vendors: {error}</p>
-      {:else if visible.length === 0}
-        <p class="empty">No vendors match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <!-- An empty source is not a filter's fault: until backlog
+             35aeb30d this read the filters line with no filter set. The
+             helper decides it now, as on every list page (0ef5e008). -->
+        <ListEmpty view={listState} words={{ what: 'vendors', noun: 'vendors' }} />
       {:else}
         <table class="data-table data-table-striped">
           <thead>

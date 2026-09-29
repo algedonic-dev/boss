@@ -27,7 +27,11 @@
 // both, so the pin lives beside open-page-audits.test.ts and runs in
 // `bun run test:unit`.
 import { expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { TIMINGS_ENV } from '../src/dev-load';
 import { freePort } from '../src/dev-tree';
 import { MISS_SUMMARY_PREFIX } from '../src/dev-mocked';
 
@@ -51,6 +55,13 @@ test(
     // Our own port, so this never disturbs — or is disturbed by — an
     // operator dev-server on the preferred 5174 (backlog eaca07e1).
     const port = await freePort();
+    // Riding along, because this is the one unit test that already pays
+    // for a real Playwright run (backlog ebb750cd): with the gate's
+    // timings file named, the config loads scripts/timings-reporter.ts
+    // and the run's one spec lands in it. Proven by effect, since a
+    // reporter the config names but Playwright never loads is silence.
+    const timingsDir = mkdtempSync(join(tmpdir(), 'leak-pin-timings-'));
+    const timings = join(timingsDir, 'web-timings.tsv');
     const proc = Bun.spawn(['bun', 'tests/run-mocked.ts'], {
       cwd: WEB_ROOT,
       env: {
@@ -60,6 +71,7 @@ test(
         // directory instead of tests/mocked, so the floorless fixture
         // is never part of the normal suite.
         BOSS_MOCKED_TEST_DIR: './tests/leak-pin',
+        [TIMINGS_ENV]: timings,
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -86,6 +98,15 @@ test(
     expect(output).toContain('refusing this run');
     expect(output).toContain('installApiFloor(page)');
     expect(code).toBe(1);
+
+    // The timings reporter ran: one line, the spec's, passed, with a time.
+    try {
+      const lines = readFileSync(timings, 'utf8').trimEnd().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^\d+\tmocked\tpassed\ttests\/leak-pin\/leaks-one-api-read\.spec\.ts:\d+ › /);
+    } finally {
+      rmSync(timingsDir, { recursive: true, force: true });
+    }
   },
   RUN_TIMEOUT_MS,
 );

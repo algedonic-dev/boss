@@ -749,7 +749,7 @@ mod tests {
             )),
             resolver: Arc::new(PgViewResolver::new(
                 PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
-                Arc::new(boss_policy_client::ReqwestPolicyClient::new(dark)),
+                Arc::new(boss_policy_client::ReqwestPolicyClient::new("views", dark)),
             )),
             os_map: None,
             flow: None,

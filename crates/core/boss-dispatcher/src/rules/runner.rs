@@ -15,6 +15,7 @@ use super::firings::{Firing, FiringSink, Outcome, dead_letter_id, fired_rules, f
 use super::handler::{self, HandlerRegistry};
 use super::registry::{self, Registry};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -33,6 +34,18 @@ use tracing::{debug, error, info, warn};
 /// lost. Saturate the DB, don't error it — dead-letters reappearing is the
 /// signal this went too high.
 const MAX_CONCURRENT_EVENTS: usize = 12;
+
+/// PURE: the envelope's own `timestamp` — the instant the fact was
+/// recorded, which a handler stamps instead of the dispatcher's clock
+/// (backlog eabc5943). `None` for an envelope without a readable one;
+/// a handler that needs an instant then refuses by name.
+fn envelope_timestamp(envelope: &Value) -> Option<DateTime<Utc>> {
+    envelope
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+}
 
 /// What the rules runner needs to operate.
 pub struct RulesRunner {
@@ -100,9 +113,13 @@ impl RulesRunner {
         info!("rules runner: tailing audit_log as 'dispatcher-rules-log' (BOSS_RULES_SOURCE=log)");
         loop {
             let report = tail
-                .drain_once(500, |topic, event_id, payload, attempt| async move {
-                    self.handle(&topic, &event_id, &payload, attempt).await
-                })
+                .drain_once(
+                    500,
+                    |topic, event_id, payload, attempt, recorded_at| async move {
+                        self.handle(&topic, &event_id, &payload, attempt, Some(recorded_at))
+                            .await
+                    },
+                )
                 .await;
             match report {
                 Ok(r) => {
@@ -192,6 +209,7 @@ impl RulesRunner {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
+                    let recorded_at = envelope_timestamp(&envelope);
                     let payload = envelope.get("payload").cloned().unwrap_or(envelope);
                     // The delivery count `settle` will read, read here so
                     // `handle` knows whether a failure now is the last
@@ -204,7 +222,9 @@ impl RulesRunner {
                         .map(|i| i.delivered)
                         .unwrap_or(boss_nats::durable::MAX_DELIVER)
                         .max(1) as u32;
-                    let outcome = self.handle(&subject, &event_id, &payload, attempt).await;
+                    let outcome = self
+                        .handle(&subject, &event_id, &payload, attempt, recorded_at)
+                        .await;
                     // ACK on success; NAK (→ redeliver) on transient failure —
                     // dead-letter once the budget is spent; immediate Term on a
                     // permanent failure (deterministic data error — every
@@ -232,12 +252,16 @@ impl RulesRunner {
     /// error are all in one place (`a9c498eb`). The transport still owns
     /// the settling; `handle` only has to know that a failure now is the
     /// last one the budget allows.
+    ///
+    /// `recorded_at` is the event's own timestamp, handed to every
+    /// handler on its context (backlog eabc5943).
     async fn handle(
         &self,
         topic: &str,
         event_id: &str,
         payload: &Value,
         attempt: u32,
+        recorded_at: Option<DateTime<Utc>>,
     ) -> boss_nats::durable::Settle {
         use boss_nats::durable::Settle;
         let registry::MatchOutcome { matched, skipped } =
@@ -267,13 +291,21 @@ impl RulesRunner {
         if matched.is_empty() {
             return Settle::Ack;
         }
-        let results =
-            match handler::dispatch(&matched, &self.handlers, event_id, topic, payload).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Settle::Retry(format!("dispatching matched rules for {topic}: {e}"));
-                }
-            };
+        let results = match handler::dispatch(
+            &matched,
+            &self.handlers,
+            event_id,
+            topic,
+            payload,
+            recorded_at,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Settle::Retry(format!("dispatching matched rules for {topic}: {e}"));
+            }
+        };
         // Collect handler failures and propagate them: a failed handler must
         // surface as an `Err` here so the caller NAKs the message and the
         // server redelivers it. The previous version logged failures but
@@ -707,7 +739,7 @@ handler = "boom"
             "job_id": "j1", "step_id": "s1", "kind": "billing"
         });
         let res = runner
-            .handle("step.done.billing", "evt-1", &payload, FIRST)
+            .handle("step.done.billing", "evt-1", &payload, FIRST, None)
             .await;
         // A transient failure must surface as Retry so the message NAKs.
         match res {
@@ -732,12 +764,80 @@ handler = "boom"
             firings: None,
         };
         let res = runner
-            .handle("step.done.unmatched", "evt", &serde_json::json!({}), FIRST)
+            .handle(
+                "step.done.unmatched",
+                "evt",
+                &serde_json::json!({}),
+                FIRST,
+                None,
+            )
             .await;
         assert!(
             matches!(res, boss_nats::durable::Settle::Ack),
             "an unmatched event must ACK, not retry"
         );
+    }
+
+    /// The envelope's `timestamp` is read as the instant the fact was
+    /// recorded; an envelope without one reads as none, never as now.
+    #[test]
+    fn the_envelopes_timestamp_is_the_recorded_instant() {
+        let envelope = serde_json::json!({
+            "id": "evt-act",
+            "timestamp": "2026-09-28T04:31:07.25Z",
+            "kind": "events.outbox.redelivered",
+            "payload": {"outbox_id": 4242},
+        });
+        assert_eq!(
+            envelope_timestamp(&envelope).map(|t| t.to_rfc3339()),
+            Some("2026-09-28T04:31:07.250+00:00".to_string())
+        );
+        assert_eq!(envelope_timestamp(&serde_json::json!({"id": "x"})), None);
+        assert_eq!(
+            envelope_timestamp(&serde_json::json!({"timestamp": "yesterday"})),
+            None
+        );
+    }
+
+    /// Every handler a fact fires is handed the fact's own instant on
+    /// its context (backlog eabc5943) — what it stamps is the record's
+    /// time, not the moment the dispatcher read it.
+    #[tokio::test]
+    async fn handle_hands_the_events_timestamp_to_the_handler() {
+        let toml = r#"
+[[rule]]
+name = "r"
+on_event = "events.outbox.redelivered"
+[[rule.do]]
+handler = "rec"
+"#;
+        let recorder = handler::RecordingHandler::new("rec");
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(recorder.clone());
+        let runner = RulesRunner {
+            registry: Registry::from_toml(toml).unwrap(),
+            handlers,
+            helpers: Arc::new(NoHelpers),
+            dead_letters: None,
+            live: None,
+            firings: None,
+        };
+        let at = DateTime::parse_from_rfc3339("2026-09-28T04:31:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let res = runner
+            .handle(
+                "events.outbox.redelivered",
+                "evt-act",
+                &serde_json::json!({"outbox_id": 4242}),
+                FIRST,
+                Some(at),
+            )
+            .await;
+        assert!(matches!(res, boss_nats::durable::Settle::Ack));
+        let calls = recorder.calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].event_timestamp, Some(at));
     }
 
     struct FixedHandler {
@@ -810,7 +910,7 @@ handler = "h.trans"
             TWO_HANDLER_RULES,
         );
         match runner
-            .handle("step.done.x", "e1", &serde_json::json!({}), FIRST)
+            .handle("step.done.x", "e1", &serde_json::json!({}), FIRST, None)
             .await
         {
             boss_nats::durable::Settle::Permanent(msg) => {
@@ -835,7 +935,7 @@ handler = "h.trans"
             TWO_HANDLER_RULES,
         );
         match runner
-            .handle("step.done.x", "e1", &serde_json::json!({}), FIRST)
+            .handle("step.done.x", "e1", &serde_json::json!({}), FIRST, None)
             .await
         {
             boss_nats::durable::Settle::Retry(msg) => {
@@ -853,7 +953,7 @@ handler = "h.trans"
         );
         assert!(matches!(
             runner
-                .handle("step.done.x", "e1", &serde_json::json!({}), FIRST)
+                .handle("step.done.x", "e1", &serde_json::json!({}), FIRST, None)
                 .await,
             boss_nats::durable::Settle::Ack
         ));
@@ -908,7 +1008,13 @@ handler = "maintenance.sweep.inspect"
             sink.clone(),
         );
         let settle = runner
-            .handle("step.ready.checklist", "evt-sweep", &sweep_payload(), FINAL)
+            .handle(
+                "step.ready.checklist",
+                "evt-sweep",
+                &sweep_payload(),
+                FINAL,
+                None,
+            )
             .await;
         assert!(
             matches!(settle, boss_nats::durable::Settle::Retry(_)),
@@ -948,7 +1054,13 @@ handler = "maintenance.sweep.inspect"
             sink.clone(),
         );
         let settle = runner
-            .handle("step.ready.checklist", "evt-sweep", &sweep_payload(), FIRST)
+            .handle(
+                "step.ready.checklist",
+                "evt-sweep",
+                &sweep_payload(),
+                FIRST,
+                None,
+            )
             .await;
         assert!(matches!(settle, boss_nats::durable::Settle::Permanent(_)));
         let landed = sink.landed().await;
@@ -971,6 +1083,7 @@ handler = "maintenance.sweep.inspect"
                     "evt-sweep",
                     &sweep_payload(),
                     attempt,
+                    None,
                 )
                 .await;
             assert!(matches!(settle, boss_nats::durable::Settle::Retry(_)));
@@ -991,7 +1104,13 @@ handler = "maintenance.sweep.inspect"
         let sink = RecordingDeadLetters::failing();
         let runner = sweep_runner(|| Err(HandlerError::Downstream("503".into())), sink.clone());
         let settle = runner
-            .handle("step.ready.checklist", "evt-sweep", &sweep_payload(), FINAL)
+            .handle(
+                "step.ready.checklist",
+                "evt-sweep",
+                &sweep_payload(),
+                FINAL,
+                None,
+            )
             .await;
         match settle {
             boss_nats::durable::Settle::Retry(msg) => assert!(
@@ -1022,7 +1141,13 @@ handler = "maintenance.sweep.inspect"
         let runner = sweep_runner(|| Err(HandlerError::Downstream("503".into())), sink.clone());
         for _ in 0..2 {
             runner
-                .handle("step.ready.checklist", "evt-sweep", &sweep_payload(), FINAL)
+                .handle(
+                    "step.ready.checklist",
+                    "evt-sweep",
+                    &sweep_payload(),
+                    FINAL,
+                    None,
+                )
                 .await;
         }
         let landed = sink.landed().await;
@@ -1067,6 +1192,7 @@ handler = "h.invoice"
                 "evt-inv",
                 &serde_json::json!({"id": "inv-1"}),
                 FINAL,
+                None,
             )
             .await;
         assert!(matches!(settle, boss_nats::durable::Settle::Retry(_)));
@@ -1107,6 +1233,7 @@ handler = "h.invoice"
                 "evt-inv",
                 &serde_json::json!({"id": "inv-1"}),
                 FINAL,
+                None,
             )
             .await;
         let snap = live.snapshot();
@@ -1124,7 +1251,13 @@ handler = "h.invoice"
         let mut runner = sweep_runner(|| Err(HandlerError::Downstream("503".into())), sink.clone());
         runner.live = Some(live.clone());
         runner
-            .handle("step.ready.checklist", "evt-sweep", &sweep_payload(), FINAL)
+            .handle(
+                "step.ready.checklist",
+                "evt-sweep",
+                &sweep_payload(),
+                FINAL,
+                None,
+            )
             .await;
         let snap = live.snapshot();
         assert_eq!(snap["dead_letters"], 2, "{snap}");
@@ -1143,6 +1276,7 @@ handler = "h.invoice"
                 "evt-sweep-2",
                 &sweep_payload(),
                 FINAL,
+                None,
             )
             .await;
         let snap = live.snapshot();
@@ -1187,6 +1321,7 @@ handler = "h.invoice"
                 "evt-inv",
                 &serde_json::json!({"id": "inv-1"}),
                 FINAL,
+                None,
             )
             .await;
         assert!(matches!(settle, boss_nats::durable::Settle::Retry(_)));
@@ -1222,6 +1357,7 @@ handler = "h.invoice"
                 "evt-inv-2",
                 &serde_json::json!({"id": "inv-2"}),
                 FIRST,
+                None,
             )
             .await;
         assert!(firings.recorded.lock().await.is_empty());
@@ -1241,6 +1377,7 @@ handler = "h.invoice"
                 "evt-inv",
                 &serde_json::json!({"id": "inv-1"}),
                 FINAL,
+                None,
             )
             .await;
         assert!(
@@ -1270,7 +1407,7 @@ handler = "h.invoice"
         let mut payload = sweep_payload();
         payload["_simulated"] = serde_json::json!(true);
         runner
-            .handle("step.ready.checklist", "evt-sweep", &payload, FINAL)
+            .handle("step.ready.checklist", "evt-sweep", &payload, FINAL, None)
             .await;
         assert!(sink.landed().await[0].1.simulated);
     }
@@ -1305,7 +1442,7 @@ handler = "h.invoice"
         let mut runner = runner_with(vec![("h.ok", || Ok(()))], ONE_OK_RULE);
         runner.firings = Some(firings.clone());
         let res = runner
-            .handle("step.done.x", "evt-7", &serde_json::json!({}), FIRST)
+            .handle("step.done.x", "evt-7", &serde_json::json!({}), FIRST, None)
             .await;
         assert!(matches!(res, boss_nats::durable::Settle::Ack));
         let rows = firings.recorded.lock().await.clone();
@@ -1343,7 +1480,7 @@ handler = "h.invoice"
         );
         runner.firings = Some(firings.clone());
         let _ = runner
-            .handle("step.done.x", "evt-9", &serde_json::json!({}), FIRST)
+            .handle("step.done.x", "evt-9", &serde_json::json!({}), FIRST, None)
             .await;
         assert_eq!(
             firings.rules().await,
@@ -1360,7 +1497,7 @@ handler = "h.invoice"
         let mut runner = runner_with(vec![("h.ok", || Ok(()))], ONE_OK_RULE);
         runner.firings = Some(Arc::new(FailingFirings));
         let res = runner
-            .handle("step.done.x", "evt-11", &serde_json::json!({}), FIRST)
+            .handle("step.done.x", "evt-11", &serde_json::json!({}), FIRST, None)
             .await;
         assert!(
             matches!(res, boss_nats::durable::Settle::Ack),

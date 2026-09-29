@@ -28,6 +28,7 @@ import {
   parseComparisons,
   parseHostComparisons,
   parseLoopPackets,
+  registryFailure,
   parseNodes,
   parseObservations,
   parseSeriesPage,
@@ -37,7 +38,18 @@ import {
   STALE_MIN_OBSERVATIONS,
   STALE_MULTIPLIER,
   unitsVerdict,
+  alarmCoverText,
+  alarmsOn,
+  MACHINE_FIELDS,
+  machineDrift,
+  machineSight,
+  machineValue,
+  OPEN_ALARMS_READ,
+  parseAlarms,
+  seenCell,
   type Comparison,
+  type EstateNode,
+  type EstateState,
   type LoopRow,
 } from './estate';
 
@@ -561,6 +573,7 @@ describe('fetchEstate', () => {
     expect(s.cluster.kind).toBe('failed');
     expect(s.comparisons.kind).toBe('failed');
     expect(s.hostComparisons.kind).toBe('failed');
+    expect(s.alarms.kind).toBe('failed');
     // With neither host source answering, no host series was planned —
     // and the state says it does not know, rather than "no hosts".
     expect(s.hosts).toEqual({ known: false, series: [] });
@@ -862,6 +875,194 @@ describe('the dev workspace door', () => {
   });
 });
 
+// DECLARED BESIDE OBSERVED (backlog ab3c54d7; page audit 2cff1d6e, GAP
+// 7). The machines table showed declared values only, while every host
+// comparison named a machine and a field — measured live 2026-09-28:
+// forge memory_gb declared 30, observed 31; boss-gcp 15, observed 16.
+
+/** An estate as fetchEstate lands it, every read answered and empty. */
+function estateOf(over: Partial<EstateState> = {}): EstateState {
+  const ready = <T,>(data: T) => ({ kind: 'ready' as const, data });
+  return {
+    nodes: ready([]),
+    cluster: ready({ rows: [], returned: 0, total: 0 }),
+    comparisons: ready([]),
+    hostComparisons: ready({ rows: [], total: 0 }),
+    hosts: { known: true, series: [] },
+    loops: [],
+    alarms: ready({ rows: [], total: 0 }),
+    ...over,
+  };
+}
+
+const [forgeNode, w1Node] = parseNodes([
+  node({ id: 'forge', role: 'forge', address: '192.0.2.15', cpu: 16, memory_gb: 30, disk_gb: 500 }),
+  node({ id: 'w-1', role: 'talos-worker', address: '192.0.2.14', cpu: 32, memory_gb: 63, disk_gb: 929 }),
+]) as [EstateNode, EstateNode];
+
+const seriesOf = (scope: string, nodes: unknown[]) => ({
+  kind: 'ready' as const,
+  data: parseSeriesPage({ data: [obsEvent(scope, '2026-09-28T08:00:00Z', nodes)], total: 1 }, scope, null),
+});
+
+describe('observed beside declared, per machine', () => {
+  test('a host is read from its own host series, a cluster node from the cluster series', () => {
+    const s = estateOf({
+      cluster: seriesOf('kubernetes-nodes', [{ id: 'w-1', cpu: 32, memory_gb: 62 }]),
+      hosts: {
+        known: true,
+        series: [{
+          host: 'forge',
+          readings: seriesOf('host', [{ id: 'forge', address: '192.0.2.15', cpu: 16, memory_gb: 31, disk_gb: 480 }]),
+          units: seriesOf('host-units', [{ id: 'forge', units: [] }]),
+        }],
+      },
+    });
+    expect(machineSight(s, forgeNode)).toEqual({ kind: 'seen', node: { id: 'forge', address: '192.0.2.15', cpu: 16, memory_gb: 31, disk_gb: 480 } });
+    expect(machineSight(s, w1Node)).toEqual({ kind: 'seen', node: { id: 'w-1', cpu: 32, memory_gb: 62 } });
+  });
+
+  test('a machine missing from its newest reading, a series with none, and a failed read each say which', () => {
+    expect(machineSight(estateOf({ cluster: seriesOf('kubernetes-nodes', [{ id: 'cp-1' }]) }), w1Node)).toEqual({ kind: 'absent' });
+    expect(machineSight(estateOf(), w1Node)).toEqual({ kind: 'no-reading' });
+    expect(machineSight(estateOf({ cluster: { kind: 'failed', error: 'x: HTTP 503' } }), w1Node)).toEqual({ kind: 'unread' });
+    // A host whose series was never planned (neither source answered) is
+    // unread, never "not seen".
+    expect(machineSight(estateOf({ hosts: { known: false, series: [] } }), forgeNode)).toEqual({ kind: 'unread' });
+  });
+
+  test('the drift a comparison names is found per machine, from the cluster verdict and from the host\'s own', () => {
+    const cluster = parseComparisons([{ payload: {
+      scope: 'kubernetes-nodes', observed_at: '2026-09-28T08:00:00Z', counts: { drift: 1 },
+      findings: { drift: [{ id: 'w-1', fields: { address: { declared: '192.0.2.14', observed: '192.0.2.40' } } }] },
+    } }]);
+    const hosts = parseHostComparisons({ data: [{ payload: {
+      scope: 'host', host: 'forge', observed_at: '2026-09-28T08:00:00Z', counts: { observed: 1, drift: 1 },
+      findings: { drift: [{ id: 'forge', fields: { memory_gb: { declared: 30, observed: 31 } } }] },
+    } }], total: 1 });
+    const s = estateOf({ comparisons: { kind: 'ready', data: cluster }, hostComparisons: { kind: 'ready', data: hosts } });
+    expect(machineDrift(s, 'forge')).toEqual({ memory_gb: { declared: 30, observed: 31 } });
+    expect(machineDrift(s, 'w-1')).toEqual({ address: { declared: '192.0.2.14', observed: '192.0.2.40' } });
+    expect(machineDrift(s, 'cp-1')).toEqual({});
+    // A comparison read that failed names no drift — the cells then read
+    // the observation alone, and the failure line says why.
+    expect(machineDrift(estateOf({ hostComparisons: { kind: 'failed', error: 'x' } }), 'forge')).toEqual({});
+  });
+
+  test('each cell reads what was seen, and a field the drift finding names says so', () => {
+    const seen = { kind: 'seen', node: { id: 'forge', address: '192.0.2.15', cpu: 16, memory_gb: 31, disk_gb: 480 } } as const;
+    const drift = { memory_gb: { declared: 30, observed: 31 } };
+    expect(MACHINE_FIELDS.map((f) => seenCell(seen, drift, f).text)).toEqual([
+      'seen 192.0.2.15', 'seen 16', 'seen 31G · drifted', 'seen 480G',
+    ]);
+    expect(seenCell(seen, drift, 'memory_gb').drift).toEqual({ declared: 30, observed: 31 });
+    expect(seenCell(seen, drift, 'cpu').drift).toBeNull();
+    // A field the reading did not carry is a dash, never a zero.
+    expect(seenCell({ kind: 'seen', node: { id: 'w-1' } }, {}, 'cpu').text).toBe('seen —');
+    expect(seenCell({ kind: 'absent' }, {}, 'cpu').text).toBe('not seen');
+    expect(seenCell({ kind: 'no-reading' }, {}, 'cpu').text).toBe('no reading');
+    expect(seenCell({ kind: 'unread' }, {}, 'cpu').text).toBe('unread');
+  });
+
+  test('a drift the finding names is marked even when the newest reading has moved on', () => {
+    // The finding is the record of what was compared; the cell shows the
+    // value the comparison judged, so the mark and the number agree.
+    const cell = seenCell({ kind: 'seen', node: { id: 'forge', memory_gb: 30 } }, { memory_gb: { declared: 30, observed: 31 } }, 'memory_gb');
+    expect(cell.text).toBe('seen 31G · drifted');
+  });
+
+  test('the declared value reads as the table always read it', () => {
+    expect(MACHINE_FIELDS.map((f) => machineValue(f, forgeNode[f]))).toEqual(['192.0.2.15', '16', '30G', '500G']);
+    expect(machineValue('cpu', null)).toBe('—');
+  });
+
+  test('the drift finding names the machine and the field in the verdict, not only a count', () => {
+    const [c] = parseComparisons([{ payload: {
+      scope: 'host', host: 'forge', observed_at: '2026-09-28T08:00:00Z', counts: { observed: 1, drift: 1 },
+      findings: { drift: [{ id: 'forge', fields: { memory_gb: { declared: 30, observed: 31 } } }] },
+    } }]);
+    expect(comparisonVerdict(c as Comparison).text).toBe('1 drifted from declaration (forge memory_gb 30 → 31)');
+  });
+});
+
+// OPEN ESTATE ALARMS (backlog 48ef9961; page audit 2cff1d6e, GAP 9). The
+// alarms that explain an amber line were neither shown nor linked here.
+
+function alarmRow(over: Record<string, unknown> = {}, md: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'd3c7eada-0000-0000-0000-000000000000',
+    kind: 'backlog-item',
+    status: 'open',
+    title: 'ESTATE ALARM: disk_tight:boss-gcp persisted 3 consecutive comparisons',
+    opened_at: '2026-09-26T10:25:02Z',
+    metadata: { area: 'estate', estate_finding: 'disk_tight:boss-gcp', scope: 'host', host: 'boss-gcp', ...md },
+    ...over,
+  };
+}
+
+describe('the open estate alarms', () => {
+  test('are read as the raiser keys them: open backlog-items carrying estate_finding', () => {
+    expect(OPEN_ALARMS_READ).toBe('/api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50');
+    // The key lives twice — the raiser writes it and dedups on it, this
+    // page reads it (CLAUDE.md §9a) — so it is pinned to the raiser.
+    const raiser = readFileSync(
+      new URL('../../../../../crates/orchestrators/boss-dispatcher-handlers/src/handlers/estate_alarm.rs', import.meta.url),
+      'utf8',
+    );
+    expect(raiser).toContain('"estate_finding": key');
+    expect(raiser).toContain('metadata_has=estate_finding');
+  });
+
+  test('each alarm carries its finding, its scope and host, and when it opened; the page keeps the total', () => {
+    const page = parseAlarms({ data: [alarmRow(), alarmRow({ id: 'e', title: 'ESTATE ALARM: dev-ssh…' }, { scope: 'door', host: undefined, estate_finding: 'door:dev-ssh' })], total: 2 });
+    expect(page.total).toBe(2);
+    expect(page.rows).toEqual([
+      { id: 'd3c7eada-0000-0000-0000-000000000000', title: 'ESTATE ALARM: disk_tight:boss-gcp persisted 3 consecutive comparisons', finding: 'disk_tight:boss-gcp', scope: 'host', host: 'boss-gcp', at: '2026-09-26T10:25:02Z' },
+      { id: 'e', title: 'ESTATE ALARM: dev-ssh…', finding: 'door:dev-ssh', scope: 'door', host: null, at: '2026-09-26T10:25:02Z' },
+    ]);
+    // A bare array (an older reader) keeps its rows and says it did not count.
+    expect(parseAlarms([alarmRow()]).total).toBeNull();
+  });
+
+  test('a row with no id is refused, not rendered as a link to nowhere', () => {
+    expect(() => parseAlarms({ data: [alarmRow({ id: undefined })], total: 1 })).toThrow();
+  });
+
+  test('the alarms beside a verdict are the ones on its series: same scope, same host', () => {
+    const alarms = { kind: 'ready' as const, data: parseAlarms({ data: [
+      alarmRow(),
+      alarmRow({ id: 'u' }, { scope: 'host-units', estate_finding: 'unit_unhealthy:boss-gcp/x.service' }),
+      alarmRow({ id: 'k' }, { scope: 'kubernetes-nodes', host: undefined, estate_finding: 'unobserved:kubernetes-nodes' }),
+    ], total: 3 }) };
+    expect(alarmsOn(alarms, 'host', 'boss-gcp').map((a) => a.id)).toEqual(['d3c7eada-0000-0000-0000-000000000000']);
+    expect(alarmsOn(alarms, 'host', 'forge')).toEqual([]);
+    expect(alarmsOn(alarms, 'host-units', 'boss-gcp').map((a) => a.id)).toEqual(['u']);
+    expect(alarmsOn(alarms, 'kubernetes-nodes', null).map((a) => a.id)).toEqual(['k']);
+    expect(alarmsOn({ kind: 'failed', error: 'x' }, 'host', 'boss-gcp')).toEqual([]);
+  });
+
+  test('a read that holds fewer alarms than it counted says so; a whole one says nothing', () => {
+    expect(alarmCoverText({ rows: [], total: 0 })).toBeNull();
+    const one = parseAlarms({ data: [alarmRow()], total: 1 });
+    expect(alarmCoverText(one)).toBeNull();
+    expect(alarmCoverText({ ...one, total: 60 })).toBe('The alarm read returned 1 of 60 open estate alarms: the rest are not listed here.');
+    expect(alarmCoverText({ ...one, total: null })).toBeNull();
+  });
+
+  test('fetchEstate reads them once, and a failed read lands failed — never as no alarm', async () => {
+    const asked: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      asked.push(u);
+      if (u.includes('kind=backlog-item')) return new Response('', { status: 503 });
+      return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    expect(asked.filter((u) => u.includes('kind=backlog-item'))).toEqual([OPEN_ALARMS_READ]);
+    expect(s.alarms).toEqual({ kind: 'failed', error: `${OPEN_ALARMS_READ}: HTTP 503` });
+  });
+});
+
 describe('EstatePage renders the door from the module', () => {
   // Source-level pin, the TriageBoard posture: bun test has no Svelte
   // pass, and the coupling this guards against — an address or a
@@ -887,5 +1088,22 @@ describe('EstatePage renders the door from the module', () => {
   test('the bastion route is gone with the door it served', () => {
     expect(code).not.toMatch(/bastion/i);
     expect(code).not.toMatch(/ProxyJump/);
+  });
+});
+
+// A REFUSAL IS NOT AN OUTAGE (backlog e5f7b51e): the estate reads ask
+// policy, so a 401/403 names the session, never a registry that did not answer.
+describe('registryFailure', () => {
+  test('a 403 or 401 says the registry refused this session', () => {
+    for (const code of [401, 403]) {
+      const said = registryFailure(`/api/estate/nodes: HTTP ${code}`);
+      expect(said).toStartWith('The registry refused this session: /api/estate/nodes: HTTP ');
+      expect(said).not.toContain('did not answer');
+    }
+  });
+  test('anything else is the unreachable registry it always was', () => {
+    expect(registryFailure('/api/estate/nodes: HTTP 503')).toBe(
+      'The registry did not answer: /api/estate/nodes: HTTP 503. This page refuses to guess — an unreachable registry is not an empty estate.',
+    );
   });
 });

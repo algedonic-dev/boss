@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# maintenance-recovery-sheet — the daily check that the printed way back
+# in still says what the tree says (design 125d405d §6, car 3; backlog
+# fd6d6c08).
+#
+# WHAT RUNS. infra/cluster/manifests/boss-recovery-sheet.yaml: a CronJob
+# in the boss-ci image (the only one with a browser) that clones
+# origin/main and runs `boss recovery reprint --tree <clone>`, the boss
+# CLI copied in from the boss image. The verb computes the tree's fact
+# hash, reads the version on paper off the newest signed
+# reprint-recovery-sheet packet, and then files a print job, refreshes
+# the open one, or records that the paper is current — and, on a
+# current sheet, files the 90-day existence check
+# (confirm-recovery-sheet-kept) when it is due.
+#
+# THE VERDICT rides this packet through boss-chore.sh: `result=ok` with
+# the verb's `verdict: ` line (both hashes, and the packet it filed or
+# refreshed, if any), `result=failed` with its own words when the sheet
+# did not render, the PDF did not print, or the record could not be
+# read or written. A stale sheet is NOT a failed run: the print job it
+# files is the loud part, in the platform owner's queue. A failed run
+# prints `RED recovery-sheet <half>: <last line>`, and the dispatcher
+# rule file-backlog-items-on-recovery-sheet-red files ONE backlog-item
+# for it while one is open — a check failing every day still arrives,
+# so the silence sweep alone would never say so.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "maintenance-recovery-sheet"
+label = "Recovery sheet check"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The daily comparison of the recovery sheet the tree renders with the version signed onto paper (design 125d405d): files or refreshes ONE reprint-recovery-sheet print job when they differ, and the 90-day confirm-recovery-sheet-kept check when it is due. Its output's verdict line carries both hashes."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "cluster-cronjob" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Compare the tree's recovery sheet with the paper"
+# The automation's step (backlog 4f909642): born assigned to the actor
+# boss-step.sh signs as, so no agent is nominated and no role queue
+# lists it.
+audience = { individual = "automation:boss-step" }
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"ok\""
+title_template = "Checked — see the verdict line"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result != \"ok\""
+title_template = "The check did not run to its verdict"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "failed" }

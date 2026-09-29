@@ -87,6 +87,10 @@ happens next is those protocols' own rows. The department list is READ
 from the registry at fire time rather than declared here, which is why
 this is one rule and not one per department.
 """
+# v2 (backlog 732c3cf9, 2026-09-29): `open_without_protocol` (#753) was
+# edited in at v1, so the seed kept the v1 row and it was not live. A
+# content edit is a version bump.
+version = 2
 schedule = { cadence = "weekly", anchor_date = "2026-09-21" }
 [[rule.do]]
 handler = "retro.open"

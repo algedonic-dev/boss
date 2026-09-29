@@ -1,0 +1,42 @@
+# The trust areas — ONE list of the kinds of change that cross a trust
+# boundary, so a car making one waits at the dock HELD for an
+# adversarial review before it may board (backlog 486dde37).
+#
+# WHY A LIST. On 2026-09-27 the operator marked about ten cars
+# trust-boundary by hand in one day — mutating verbs, gateway routes,
+# policy, credentials — each time by remembering to tell the builder to
+# add `--hold` to its gate. Nothing on the item said so, so `boss
+# dispatch` could not pass it on and `boss gate` could not refuse the
+# gate that forgot it. The fact now rides the item as
+# `metadata.trust_boundary = { area, reason }`: `boss triage
+# --trust-boundary <area> --trust-reason '<why>'` writes it, refusing an
+# area this file does not list, and `boss mark <item> --trust-boundary
+# <area> --trust-reason '<why>'` does the same on an item already
+# triaged (backlog b9352041); `boss brief` / `boss dispatch` print it
+# with the `--hold` the gate needs; and `boss gate` refuses a park-intent
+# gate on a marked item without `--hold`.
+#
+# Adding an area is adding a row here — no code names one. `name` is
+# what the mark records (lowercase, hyphenated: it is quoted inside a
+# shell `--hold '…'` the brief prints); `what` is the sentence a triager
+# matches the change against. A `#` line is a comment.
+
+[[area]]
+name = "mutating-verb"
+what = "an ops or forge verb marked MUTATING, or anything that changes a host, the cluster or the forge on its own authority"
+
+[[area]]
+name = "gateway-route"
+what = "a gateway route, its authentication, or which service a path reaches and as whom"
+
+[[area]]
+name = "policy"
+what = "boss-policy rules, grants and scopes, or who a write is authorised as"
+
+[[area]]
+name = "credentials"
+what = "a credential, token or secret — minting, rotating, storing, or where one is read or written"
+
+[[area]]
+name = "publish"
+what = "publishing outside the estate — the GitHub mirror, the publish request, anything made public"

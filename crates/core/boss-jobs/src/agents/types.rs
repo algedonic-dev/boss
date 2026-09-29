@@ -18,10 +18,11 @@
 //! are CPUs in the same machine), and a step whose audience is
 //! `{ role = X }` resolves to the HOLDERS of X — every reader that
 //! enumerated holders read the employees roster only, so an agent could
-//! be reached by a role audience never, and by id only. Both columns
-//! are Class codes under `(employee, role)` / `(employee, department)`,
-//! the registry rows an employee's are validated against, and the
-//! batch door checks them with the same client (`http.rs`).
+//! be reached by a role audience never, and by id only. The role is a
+//! Class code under `(employee, role)` and the department a code of
+//! the departments registry (an `(employee, department)` Class until
+//! backlog c87e3d6d) — the rows an employee's are validated against —
+//! and the batch door checks both (`http.rs`).
 
 use boss_core::actor::REGISTERED_AGENT_PREFIX;
 use serde::{Deserialize, Serialize};
@@ -47,8 +48,9 @@ pub struct AgentInput {
     /// is "holds no role": reachable by id, never by a role audience.
     #[serde(default)]
     pub role: Option<String>,
-    /// Where it sits in the org — a Class code under `(employee,
-    /// department)`. Carried and validated like an employee's; nothing
+    /// Where it sits in the org — a code of the departments registry
+    /// (an `(employee, department)` Class until backlog c87e3d6d).
+    /// Carried and validated like an employee's; nothing
     /// routes on it until design f5ebd2e1 car 2 makes department a
     /// selector.
     #[serde(default)]
@@ -60,22 +62,30 @@ pub struct AgentInput {
     pub max_concurrent_runs: Option<i32>,
 }
 
-/// Why a declaration is refused. The same check runs in `boss tenant
-/// check`, the batch door and the in-memory adapter, so the refusal
-/// names the same row everywhere.
-pub fn validate_agent(a: &AgentInput) -> Result<(), String> {
-    if a.id.is_empty() {
-        return Err("an agent needs an id (e.g. agent-claude)".into());
-    }
-    let slug = a.id.strip_prefix(REGISTERED_AGENT_PREFIX).unwrap_or("");
-    let slug_ok = slug
-        .chars()
+/// Whether `id` is `agent-<slug>` — the Rust spelling of the SQL CHECK
+/// on `agents.id` (`^agent-[a-z0-9][a-z0-9-]*$`). Read by
+/// `validate_agent` and by the in-memory adapter's refusal, and held to
+/// the CHECK by the adapters-agree suite's Postgres leg (backlog
+/// be459ab9).
+pub fn is_agent_id(id: &str) -> bool {
+    let slug = id.strip_prefix(REGISTERED_AGENT_PREFIX).unwrap_or("");
+    slug.chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && slug
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !slug_ok {
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Why a declaration is refused. The same check runs in `boss tenant
+/// check` and the batch door, so the refusal names the same row
+/// everywhere; the in-memory adapter refuses only what the schema
+/// refuses (`is_agent_id`, the two caps), as Postgres does.
+pub fn validate_agent(a: &AgentInput) -> Result<(), String> {
+    if a.id.is_empty() {
+        return Err("an agent needs an id (e.g. agent-claude)".into());
+    }
+    if !is_agent_id(&a.id) {
         return Err(format!(
             "agent {}: id must be {REGISTERED_AGENT_PREFIX}<slug> (lowercase, digits, hyphens) — \
              a login address or a model-qualified spelling is not an identity (design 6fda05ae)",

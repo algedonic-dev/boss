@@ -215,12 +215,8 @@ const DEDUP_PAGE: usize = 1000;
 const CLEARED_BY: &str = "cadence.silence.sweep";
 
 pub struct CadenceSilenceSweep {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
-    /// The `now` every age is measured against. The dispatcher is not
-    /// on the no-wallclock allowlist, so this comes from the clock
-    /// service like every other stamp.
-    clock: Arc<dyn boss_clock_client::ClockClient>,
     /// The rules the dispatcher is ENFORCING — the roster's second
     /// source (see [`super::cadence_roster`]).
     ///
@@ -246,14 +242,12 @@ pub struct CadenceSilenceSweep {
 impl CadenceSilenceSweep {
     pub fn new(
         jobs_base: impl Into<String>,
-        clock_url: impl Into<String>,
         rules: Vec<RawRule>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
             jobs_base: jobs_base.into(),
-            clock: Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
             rules,
             owner,
         })
@@ -1210,7 +1204,15 @@ impl Handler for CadenceSilenceSweep {
                  rule spawns a packet on a schedule",
             ));
         }
-        let now = boss_clock_client::now_from(&self.clock).await;
+        // THE ANCHOR EVERY AGE IS MEASURED AGAINST, DEFINED ON PURPOSE
+        // (backlog 2b03a2df). The sweep's rule fires as `clock.day`, which
+        // carries its day and no instant (eabc5943), so the anchor is the
+        // midnight that day fell due — a fact of the calendar, the same on
+        // every replay — not the clock service at the moment the
+        // dispatcher consumed the firing, which a catch-up or redelivery
+        // moves and then writes into `silent_for_minutes`. A firing that
+        // carries an instant keeps it; one with neither is refused.
+        let now = ctx.firing_instant_or_day_start()?;
         let evidence = format!(
             "cadence.silence.sweep firing on rule {} (event {} / topic {})",
             ctx.rule_name, ctx.triggering_event_id, ctx.triggering_topic
@@ -2431,14 +2433,12 @@ mod tests {
     // is of a pure decision, so no test could see a read that took an
     // error body for an empty list, or a close the step API refuses.
 
-    /// The sweep at a fixed instant, against `base`.
-    fn sweep_at(base: &str, now: &str) -> CadenceSilenceSweep {
-        let snapshot: boss_clock_client::ClockNow =
-            serde_json::from_value(json!({ "now": now, "simulated": false })).expect("clock now");
+    /// The sweep against `base`. It holds no clock: the instant it
+    /// measures at is the firing's own (2b03a2df) — see [`sweep_ctx`].
+    fn sweep(base: &str) -> CadenceSilenceSweep {
         CadenceSilenceSweep {
             client: api_client(),
             jobs_base: base.to_string(),
-            clock: Arc::new(boss_clock_client::FixedClockClient::new(snapshot)),
             rules: Vec::new(),
             owner: Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         }
@@ -2452,10 +2452,12 @@ mod tests {
 
     fn sweep_ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "cadence-silence-daily".into(),
             triggering_event_id: "clock-2026-09-23".into(),
             triggering_topic: "schedule".into(),
-            event_payload: json!({}),
+            // A firing that carries its instant, [`NOW`], as a tick does.
+            event_payload: json!({ "_at": NOW }),
         }
     }
 
@@ -2468,7 +2470,7 @@ mod tests {
     async fn a_guard_read_with_no_data_array_refuses_rather_than_finding_no_block() {
         use crate::handlers::listing_stub::{no_data_array, serve};
         let stub = serve(vec![("/api/jobs", no_data_array())]).await;
-        let why = sweep_at(&stub.base, NOW)
+        let why = sweep(&stub.base)
             .blocking_packet("ops-request", "github-mirror", "guard", "rule")
             .await
             .expect_err("no `data` array is no answer");
@@ -2495,7 +2497,7 @@ mod tests {
             ("/api/jobs?kind=maintenance-k", no_data_array()),
         ])
         .await;
-        let res = sweep_at(&stub.base, NOW)
+        let res = sweep(&stub.base)
             .invoke(&hourly("maintenance-k"), &sweep_ctx())
             .await;
         assert_eq!(stub.writes(), Vec::<String>::new(), "no alarm raised");
@@ -2519,7 +2521,7 @@ mod tests {
             ),
         ])
         .await;
-        let res = sweep_at(&stub.base, NOW)
+        let res = sweep(&stub.base)
             .invoke(&hourly("maintenance-k"), &sweep_ctx())
             .await;
         assert_eq!(stub.writes(), Vec::<String>::new());
@@ -2555,7 +2557,7 @@ mod tests {
             ),
         ])
         .await;
-        sweep_at(&stub.base, NOW)
+        sweep(&stub.base)
             .invoke(&hourly("maintenance-k"), &sweep_ctx())
             .await
             .expect("the close answered");
@@ -2620,7 +2622,7 @@ mod tests {
         .await;
         let mut args = hourly("maintenance-k");
         args.extend(hourly("maintenance-other"));
-        let res = sweep_at(&stub.base, NOW).invoke(&args, &sweep_ctx()).await;
+        let res = sweep(&stub.base).invoke(&args, &sweep_ctx()).await;
         assert!(
             res.is_ok(),
             "a new silence must raise, not be held: {res:?}"
@@ -2645,5 +2647,69 @@ mod tests {
             "{:?}",
             stub.writes()
         );
+    }
+
+    /// A CLOCK-DAY SWEEP MEASURES FROM ITS DAY'S MIDNIGHT (backlog
+    /// 2b03a2df). The daily rule fires as `clock.day`, whose payload is
+    /// `{"_day": ...}` and nothing else; the sweep read `now` off the
+    /// clock service when it got round to the firing, so a catch-up or a
+    /// redelivery wrote a different `silent_for_minutes` for the same
+    /// day. The anchor is the midnight the day rule fell due; measured
+    /// against the clock service at noon, this test read 5040 minutes.
+    #[tokio::test]
+    async fn a_day_firing_measures_silence_from_its_days_midnight() {
+        use crate::handlers::listing_stub::{empty_listing, serve};
+        let routes = || {
+            vec![
+                (
+                    "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                    empty_listing(),
+                ),
+                (
+                    "/api/jobs?kind=maintenance-k",
+                    json!({ "data": [packet("2026-09-20T00:00:00Z")], "total": 1 }),
+                ),
+            ]
+        };
+        let day = InvocationContext {
+            triggering_event_id: "clock-day:2026-09-23".into(),
+            triggering_topic: "clock.day".into(),
+            event_payload: json!({ "_day": "2026-09-23" }),
+            ..sweep_ctx()
+        };
+        let stub = serve(routes()).await;
+        sweep(&stub.base)
+            .invoke(&hourly("maintenance-k"), &day)
+            .await
+            .expect("the silence raises");
+        let posts: Vec<Value> = stub
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(
+            posts[0]["metadata"]["silent_for_minutes"],
+            json!(3 * 1440),
+            "three days to 2026-09-23T00:00Z, not to the clock's noon"
+        );
+        assert_eq!(
+            posts[0]["metadata"]["last_measured_at"],
+            json!("2026-09-23T00:00:00+00:00")
+        );
+
+        // Neither a day nor an instant: refused, nothing raised.
+        let dark = serve(routes()).await;
+        let none = InvocationContext {
+            event_payload: json!({}),
+            ..day
+        };
+        let err = sweep(&dark.base)
+            .invoke(&hourly("maintenance-k"), &none)
+            .await
+            .expect_err("no anchor");
+        assert!(err.is_permanent(), "{err}");
+        assert_eq!(dark.writes(), Vec::<String>::new());
     }
 }

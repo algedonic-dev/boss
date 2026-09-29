@@ -19,7 +19,6 @@
 
 # --- failed-read-as-number ---------------------------------------------
 failed-read-as-number infra/forge/checkout-lock.sh 1 mtime=0 when stat fails makes the lock look ancient, but the removal still waits on git_holds_checkout finding no live git in the repo, the check that decides
-failed-read-as-number infra/forge/cluster-watchdog.sh 1 an absent state file on the first dark tick IS zero; an unreadable one restarts the dark count, which delays a rollback and never causes one. FOLLOW-UP: tell absent from unreadable
 failed-read-as-number infra/forge/journal-read.sh 1 grep -c exits 1 with 0 on no match, the answer; its producer is printf of a variable, which cannot fail. The curl feeding it is the swallowed-read entry below
 
 # --- swallowed-read -----------------------------------------------------

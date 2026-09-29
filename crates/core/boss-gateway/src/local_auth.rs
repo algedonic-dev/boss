@@ -51,8 +51,12 @@
 //!   the token, rotates the password.
 //!
 //! What's deliberately small:
-//! - No CSRF token. Cookie is `SameSite=Strict`. Production-grade
-//!   tenants front the gateway with a proxy that handles CSRF.
+//! - No CSRF token. The cookie is `SameSite=Lax` (session.rs
+//!   `set_cookie`), and a write a browser marks as coming from another
+//!   origin — a sibling subdomain included — is refused 403 before any
+//!   route by the gateway's cross-site layer (cross_site.rs, backlog
+//!   324fc920). This line said `Strict` until then, which the cookie
+//!   never was.
 //! - No account lockout / brute-force protection. Lives at the
 //!   proxy tier.
 //! - No password policy enforcement. Operators choose; SPA
@@ -359,7 +363,10 @@ fn bootstrap_url(upstream: &str, email: &str) -> Option<String> {
     ))
 }
 
-pub(crate) async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Option<BootstrapScope> {
+pub(crate) async fn bootstrap_email(
+    http: &crate::machine_client::MachineClient,
+    email: &str,
+) -> Option<BootstrapScope> {
     let upstream =
         std::env::var("BOSS_PEOPLE_UPSTREAM").unwrap_or_else(|_| boss_ports::url("people"));
     let url = bootstrap_url(&upstream, email)?;
@@ -497,7 +504,13 @@ impl SessionRole {
 pub struct LocalAuthState {
     pub store: CredentialStore,
     pub session_key: Vec<u8>,
+    /// The IdP's client (OIDC discovery, token, userinfo) — a third
+    /// party, so it never carries the machine token.
     pub http: reqwest::Client,
+    /// The estate's own services — the people bootstrap lookup —
+    /// stamped with the machine token, redirects off (design 6805c764
+    /// car 2, review S2: this lookup sent no token at all).
+    pub machine: crate::machine_client::MachineClient,
     /// Auth events for the edge (docs/architecture-decisions.md
     /// §Policy & auth). Always
     /// present; a deployment without the staging pool carries the
@@ -653,7 +666,7 @@ pub async fn login(
     // set when it did. Surface as 403 with the operator-facing
     // remediation path. Never silently downgrade to
     // audit-readonly, which was an earlier footgun.
-    let scope = match bootstrap_email(&state.http, &email).await {
+    let scope = match bootstrap_email(&state.machine, &email).await {
         Some(s) => s,
         None => {
             state.audit.login_denied(
@@ -722,7 +735,7 @@ pub async fn login(
             email,
             employee_id: sess.employee_id.clone(),
             role: sess.role.clone(),
-            access_tier: sess.access_tier.clone(),
+            access_tier: sess.access_tier().to_string(),
         }),
     )
         .into_response()
@@ -808,7 +821,7 @@ pub async fn guest(State(state): State<Arc<LocalAuthState>>) -> Response {
             email: GUEST_EMAIL.to_string(),
             employee_id: None,
             role: sess.role.clone(),
-            access_tier: sess.access_tier.clone(),
+            access_tier: sess.access_tier().to_string(),
         }),
     )
         .into_response()
@@ -849,7 +862,7 @@ pub async fn me(State(state): State<Arc<LocalAuthState>>, headers: HeaderMap) ->
         email: session.username.clone(),
         employee_id: session.employee_id.clone(),
         role: session.role.clone(),
-        access_tier: session.access_tier.clone(),
+        access_tier: session.access_tier().to_string(),
     })
     .into_response()
 }
@@ -1184,6 +1197,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1290,6 +1305,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
             oidc: None,
@@ -1320,6 +1337,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1392,6 +1411,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1532,6 +1553,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1824,6 +1847,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
             oidc: None,
@@ -2003,6 +2028,8 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: crate::audit::AuthAudit::spawn(rec.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,

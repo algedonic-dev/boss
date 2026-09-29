@@ -10,8 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"] }
+boss-classes = { path = "../../core/boss-classes", features = ["postgres"] }
 boss-search = { path = "../../core/boss-search", features = ["postgres"] }
 boss-views = { path = "../../core/boss-views", features = ["postgres"] }
+# `outbox::wait_for_drain` — each step waits for the relay before its
+# locked log check (design b046f510).
+boss-events = { path = "../../core/boss-events", features = ["postgres"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
@@ -36,6 +40,7 @@ boss-calendar = { path = "../../core/boss-calendar", features = ["postgres"] }
 boss-commerce = { path = "../../modules/boss-commerce", features = ["postgres"] }
 boss-content = { path = "../../core/boss-content", features = ["postgres"] }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
+boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
 
 [lints]
 workspace = true

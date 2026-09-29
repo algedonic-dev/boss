@@ -1,0 +1,183 @@
+# The daily recovery-sheet check — the paper way back in compared with
+# what the tree now says, and a print job filed when they differ
+# (design 125d405d §6, car 3; backlog fd6d6c08, David 2026-09-28: "we
+# are going to maintain the fidelity of those instructions or generate
+# a new print job. The print job can simply be a PDF download to print").
+#
+# WHAT IT RUNS. `boss recovery reprint --tree <a clone of main>`
+# (crates/orchestrators/boss-cli/src/recovery/reprint.rs): the tree's
+# fact hash against the one on the newest presence-signed `print` step
+# of a reprint-recovery-sheet packet. Different: ONE print job, filed or
+# refreshed in place, with the PDF attached to its `print` step. The
+# same: the paper is current, and every 90 days a
+# confirm-recovery-sheet-kept packet asks that the paper be found.
+#
+# WHY THIS SHAPE — the playground crawl's (boss-playground-crawl.yaml),
+# for the design's reason (§6, "the chore, not a dispatcher handler"):
+#   * the boss-ci image, not the boss image: the PDF is printed by
+#     Chromium, which boss-ci bakes at /opt/ms-playwright and the
+#     production image does not carry; baking a browser into production
+#     for one daily print is the larger change by far.
+#   * a clone, not the deployed image's tree: the sheet renders from
+#     origin/main, the one sha every reader can name (decision 3). The
+#     forge is not anonymously readable, so the clone takes `forge-read`,
+#     the gate runner's Secret in this namespace — which is why this
+#     chore lives in boss-dev and is `pipeline` in instance-manifests.txt.
+#   * the `boss` CLI copied in from the boss image by the init container,
+#     with the chore wrapper and its helpers: boss-ci carries neither,
+#     and building the CLI from the clone would be a cold cargo build
+#     every day. The binary links only libc, libm and libgcc_s, and both
+#     images are Debian bookworm, so it runs there as built. It is the
+#     deployed CLI reading main's tree — the gap is one converge.
+#   * prod's jobs door for the packets: the print job is the platform
+#     owner's, in IT's queue, where the conductor in this namespace
+#     writes. The file store is that door's host on the content port
+#     (the boss-jobs-internal Service carries it), which is where
+#     `boss attach` finds it too.
+#   * BOSS_ACTOR names this chore, so every packet it files and every
+#     PDF it attaches credits it, not a person.
+#
+# THE VERDICT. The wrapper records `ok` with the verb's `verdict: `
+# line (both versions, and the packet filed or refreshed), or `failed`
+# with the verb's own words: a sheet that did not render, a PDF that
+# did not print or read back, a record that could not be read or
+# written. A stale sheet is not a failure — its print job is the loud
+# part — and the cadence-silence sweep watches this packet's arrival.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-recovery-sheet
+  namespace: boss-dev
+  labels:
+    boss-chore: "true"
+spec:
+  # After the nightly crawl, before the platform owner's Pacific
+  # morning: a print job filed overnight is waiting when he starts.
+  schedule: "15 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      # The render and the read-back take seconds and the print about
+      # one (2026-09-29, dev pod); the clone is under a minute. Fifteen
+      # minutes is a stuck browser, not a slow one.
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          # No kube API is spoken here — the chore reads the forge and
+          # writes the jobs door — so no token of the namespace's
+          # default ServiceAccount is mounted (review of car 3, finding 5).
+          automountServiceAccountToken: false
+          # The gate runner's uid, for the crawl's reasons: boss-ci has
+          # no passwd entry for 1500, 65534 exists in the base image, and
+          # fsGroup 1500 makes the emptyDirs and the secret readable.
+          securityContext:
+            fsGroup: 1500
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 1500
+            seccompProfile: {type: RuntimeDefault}
+          affinity:
+            nodeAffinity:
+              # A clone and a browser are a write sink; never on a node
+              # that fsyncs for the cluster
+              # (infra/lint/a-build-never-shares-a-node-with-etcd.sh).
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      - {key: boss.dev/purpose, operator: In, values: ["build"]}
+          imagePullSecrets:
+            - {name: forgejo-registry}
+          restartPolicy: Never
+          initContainers:
+            # The chore wrapper, the helpers it resolves next to itself,
+            # the curl helper's lib/ (hence -r), and the boss CLI the
+            # check is — all from the boss image, BEFORE the clone, so a
+            # clone that cannot read the forge is a recorded failure.
+            - name: tools
+              image: 10.20.0.15:3000/david/boss:latest
+              command:
+                - cp
+                - -r
+                - /usr/local/bin/boss-chore.sh
+                - /usr/local/bin/boss-maintenance-wrap.sh
+                - /usr/local/bin/boss-step.sh
+                - /usr/local/bin/boss-api-curl.sh
+                - /usr/local/bin/lib
+                - /usr/local/bin/boss
+                - /tools/
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: tools, mountPath: /tools}
+          containers:
+            - name: check
+              image: 10.20.0.15:3000/david/boss-ci:rust1.96
+              imagePullPolicy: Always
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  # A FAILED RUN NAMES ITSELF (review of car 3, finding 3).
+                  # Each half's output is captured whole and printed; when
+                  # one fails, a `RED recovery-sheet <half>: <its last
+                  # line>` line follows, the shape the rule
+                  # file-backlog-items-on-recovery-sheet-red reads off this
+                  # packet's `run` step — one backlog-item for the
+                  # recovery sheet while one is open, however many days
+                  # it keeps failing. The silence sweep sees only arrivals,
+                  # and a run that fails every day still arrives.
+                  /tools/boss-chore.sh maintenance-recovery-sheet "Recovery sheet check" -- bash -c '
+                    set -uo pipefail
+                    red() { cat /work/half.log; echo "RED recovery-sheet $1: $(tail -n 1 /work/half.log)"; exit 1; }
+                    git clone --depth 1 "$FORGE_URL" /work/boss > /work/half.log 2>&1 || red clone
+                    cat /work/half.log
+                    /tools/boss recovery reprint --tree /work/boss > /work/half.log 2>&1 || red check
+                    cat /work/half.log
+                  '
+              env:
+                - {name: HOME, value: /work}
+                - {name: FORGE_URL, value: http://10.20.0.15:3000/david/boss.git}
+                # git's env-var config channel (the crawl's, boss-dev.yaml's):
+                # the helper exists the moment the container starts and
+                # writes nothing to disk.
+                - {name: GIT_CONFIG_COUNT, value: "1"}
+                - {name: GIT_CONFIG_KEY_0, value: "credential.http://10.20.0.15:3000.helper"}
+                - {name: GIT_CONFIG_VALUE_0, value: "!f() { echo username=x-access-token; echo password=$(cat /etc/forge/token); }; f"}
+                # The record: prod's jobs door, IT's queue; the file store
+                # is the same host's content port.
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                - {name: BOSS_ACTOR, value: "automation:recovery-sheet"}
+              resources:
+                # One headless Chromium printing a few pages; a bounded
+                # Job dies alone if it is wrong.
+                requests: {cpu: 500m, memory: 1Gi}
+                limits: {cpu: "1", memory: 2Gi}
+              volumeMounts:
+                - {name: tools, mountPath: /tools, readOnly: true}
+                - {name: work, mountPath: /work}
+                - {name: forge-token, mountPath: /etc/forge, readOnly: true}
+          volumes:
+            - name: tools
+              emptyDir: {}
+            # The clone; gone with the pod.
+            - name: work
+              emptyDir: {sizeLimit: 2Gi}
+            # Read-only forge credential, the gate runner's Secret.
+            # Optional so an unbootstrapped namespace runs the Job and
+            # RECORDS the clone's refusal instead of holding a pod in
+            # ContainerCreating with no packet.
+            - name: forge-token
+              secret: {secretName: forge-read, optional: true, defaultMode: 0400}

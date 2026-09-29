@@ -16,12 +16,23 @@
 # platform-admin, never an engineering call an agent makes alone.
 #
 # THE ROLLBACK LEVER COMES FIRST. On 2026-09-02 the merge lane ran for
-# 55 minutes while `kubectl rollout undo` to a named last-good revision
-# sat available: the unnamed `auth can-i patch deployment` answered no,
-# the name-scoped grant answers yes only when asked by name. "Roll back"
-# is a target, not a verb — `last_good` must NAME the revision or image
-# rolled to, or say why none exists, and only `no-good-revision` opens
-# the merge lane. A restored service ends the packet there.
+# 55 minutes while a rollback to a named last-good revision sat
+# available. "Roll back" is a target, not a verb — `last_good` must NAME
+# the sha or image rolled to, or say why none exists, and only
+# `no-good-revision` opens the merge lane. A restored service ends the
+# packet there.
+#
+# THE LEVER IS A NAMED BUILD, NOT THE SESSION'S KUBECTL (backlog
+# 978bbd7d, 2026-09-29). This step used to tell its executor to run
+# `kubectl rollout undo` from the dev session, on a name-scoped patch
+# the dev session held on deploy/boss. That patch was a read of every
+# credential the boss pod template names — RBAC cannot scope a patch
+# to fields, and the ReplicaSet controller creates whatever pod the
+# template describes — so it was withdrawn. The levers that remain do
+# not need it: the forge's cluster-watchdog rolls to the last-converged
+# build by name from outside the system of record, and the
+# `rollback-to` ops verb rolls to any named sha and waits for Ready,
+# both on the forge with the converge's kubeconfig.
 #
 # THE EVIDENCE IS A RECEIPT, NOT A CLAIM. `gate-locally` carries the
 # sha the local `infra/gate.sh` run stamped in `.gate-receipt.json` and
@@ -63,7 +74,7 @@ kind = "task"
 ready_when = "steps.declared.done"
 title_template = "Try the rollback lever first"
 authority_role = "platform-admin"
-metadata_defaults = { outage = "{metadata.outage}", procedure = "Before any merge lane: is there a last-known-good artifact to roll to? Ask the NAMED form — `kubectl auth can-i patch deployment/boss -n boss` (the unnamed form answers no for a name-scoped grant) — then read `kubectl rollout history deployment/boss -n boss` and map revisions to IMAGE TAGS: two revisions can carry the same broken image, and undoing between them is a no-op that reads as a rollback. Record in `last_good` the revision and image you rolled to, or why none exists. `restored` means the system of record answers on that artifact; then this packet is done." }
+metadata_defaults = { outage = "{metadata.outage}", procedure = "Before any merge lane: is there a last-known-good artifact to roll to? First read whether one has already been rolled to: the forge's cluster-watchdog reads the system of record from outside the cluster and, after three dark checks, rolls deploy/boss to the last-converged build BY NAME on its own — `kubectl get deploy boss -n boss -o jsonpath='{.spec.template.spec.containers[0].image}'` names what serves now. Otherwise NAME the target: read `kubectl rollout history deployment/boss -n boss` and `kubectl get rs -n boss -o wide` and map revisions to IMAGE TAGS — two revisions can carry the same broken image, and rolling between them is a no-op that reads as a rollback. Roll to that sha with the `rollback-to` ops verb, `boss ops forge rollback-to <sha> --wait`, which waits for the pod to go Ready on it. If the jobs API is too dark to file that ops-request, the same script runs on the forge with the converge's kubeconfig, `infra/forge/rollback-to.sh <sha>` (infra/forge/OPERATIONS.md), which is the admin kubeconfig's holder's act. The dev session holds no write on deploy/boss (backlog 978bbd7d): a pod-template write is a read of every credential the template names, so do not look for one. Record in `last_good` the sha and image rolled to, and by whom (you, the verb, or the watchdog), or why none exists. `restored` means the system of record answers on that artifact; then this packet is done." }
 
 [[workflow.step.fields]]
 name = "outage"

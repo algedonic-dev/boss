@@ -17,7 +17,7 @@ Environment=RUST_LOG=info
 # Pre ensures the open Job (spawns today's, or reuses a standing
 # failure so recovery closes it); Post completes `run` on SUCCESS
 # only — a failed run leaves the Job open and loud.
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-audit-integrity "Audit-log integrity check"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-audit-integrity "Audit-log integrity check"
 ExecStart=/usr/local/bin/boss-audit-integrity-check --config /etc/boss-audit-integrity-check.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-audit-integrity run
 # Runs as root to match the boss-messages-events-purge timer

@@ -54,11 +54,16 @@ repo="$(cd "$here/../.." && pwd)"
 allowlist="$(sh "$repo/infra/ops/verbs-allowlist.sh" "$repo/infra/ops/verbs")" \
     || { echo "FAIL: infra/ops/verbs-allowlist.sh could not assemble infra/ops/verbs/ (see above)" >&2; exit 1; }
 
-python3 - "$repo" "$allowlist" <<'PY' || exit 1
+# The allowlist reaches python on a file descriptor, never as an argv
+# word: one word is capped at 128 KiB (MAX_ARG_STRLEN), and the assembled
+# allowlist crossed that on 2026-09-28 with the three GitHub verbs
+# (backlog 6a8ff89f) — python3 was refused "Argument list too long".
+python3 - "$repo" <(printf '%s' "$allowlist") <<'PY' || exit 1
 import json, os, re, sys
 
 repo = sys.argv[1]
-verbs = json.loads(sys.argv[2])["verbs"]
+with open(sys.argv[2]) as f:
+    verbs = json.load(f)["verbs"]
 # The scanned line every scanner prints (infra/lint/lib/scanned.sh);
 # printed from here because the count lives in this program, with the
 # same refusal on zero the shell helper makes.
@@ -166,7 +171,10 @@ GCP_MUTATING_ADMITTED = {
     # unit file resolves into is refused. Each run needs David's passkey
     # on the plan plan-a-gcp-root-reclaim renders (requires_approval).
     # /var/backups, homes, /usr/local, /opt/boss and /opt/boss-cli are
-    # data and David's call, out of reach by construction. Admitted
+    # data and David's call, out of reach by construction — but for one
+    # file David decided on 2026-09-28 (backlog f44ca628): the retired
+    # second stack's capture, /var/backups/boss/second-stack/
+    # second-stack-<stamp>.sql, its size and sha256 in the plan. Admitted
     # when David authorises this verb: the car stands at the dock under
     # a hold until he does.
     "reclaim-gcp-root": "admitted when David authorises this verb (backlog d3c7eada); each run needs his passkey on the rendered plan",

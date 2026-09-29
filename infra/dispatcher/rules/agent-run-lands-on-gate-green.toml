@@ -19,9 +19,11 @@
 # The rule does NOT free that worktree's cargo target: the scratch is
 # pod-private, so the gate's own waiter frees it on the pod. That opens
 # `reported`, which the rule never touches: it holds the builder's
-# handback, and a summary a rule invents is not the builder's, so the
-# report is written by the operator who read it today and by the runner
-# later. The run's own `landed` terminal fires on the report.
+# handback, and a summary a rule invents is not the builder's. A report
+# the builder sent before this green is already on the packet, and
+# `agent-run-lands-a-report-sent-before-green` copies it onto the step
+# as it opens (b951c00a); otherwise the report is written by whoever
+# reads it. The run's own `landed` terminal fires on the report.
 #
 # A gate-run with no `agent_run` key — every hand-launched gate — is the
 # handler's first return: no declared edge, no obligation, nothing

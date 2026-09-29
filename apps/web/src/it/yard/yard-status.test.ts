@@ -2,6 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  bayTimes,
+  gateStanding,
+  settledGateTimes,
   blockLabel,
   boardHold,
   clockText,
@@ -903,6 +906,80 @@ describe('an active gate carries the server\'s stale flag', () => {
       ], queued: [], typical_seconds: null },
     });
     expect(s.gates.active.map(g => g.stale)).toEqual([true, false]);
+  });
+});
+
+// A GATE-RUN'S AGE IS TWO AGES (backlog 4d088a7e). Gate-run 6d5d85fb
+// waited 46 minutes in line and ran 14, and every surface read "open 60
+// min" — David asked what the gate going for an hour was doing, and the
+// answer took kubectl. The server now carries both ages and its own
+// word for the bay running past twice the median; the page says them.
+describe('an active gate reads its queued and running ages apart', () => {
+  test('the server\'s launch, both ages and its troubled word are read as sent', () => {
+    const s = parseYardStatus({
+      gates: { capacity: 4, typical_seconds: 1080, queued: [], active: [
+        { branch: 'fix/drift', packet_id: 'p1', since: '2026-09-28T01:44:10Z',
+          launched_at: '2026-09-28T02:30:00Z', queued_seconds: 2760, running_seconds: 840, troubled: false },
+        { branch: 'fix/slow', packet_id: 'p2', since: '2026-09-28T01:00:00Z',
+          launched_at: '2026-09-28T01:00:00Z', queued_seconds: 0, running_seconds: 2460, troubled: true },
+      ] },
+    });
+    const [drift, slow] = s.gates.active;
+    expect(drift!.launched_at).toBe('2026-09-28T02:30:00Z');
+    expect(drift!.queued_seconds).toBe(2760);
+    expect(drift!.running_seconds).toBe(840);
+    expect(drift!.troubled).toBe(false);
+    expect(slow!.troubled).toBe(true);
+    expect(bayTimes(drift!, s.gates.typical_seconds)).toBe('queued 46m · running 14m · median 18m');
+    expect(bayTimes(slow!, s.gates.typical_seconds)).toBe('queued 0m · running 41m · median 18m');
+  });
+
+  test('an older server, or an unstamped run: the wait is unknown, never zero, and no alarm is invented', () => {
+    const s = parseYardStatus({
+      gates: { capacity: 3, typical_seconds: null, queued: [], active: [
+        { branch: 'feat/a', packet_id: 'p1', since: '2026-09-07T23:00:00Z' },
+      ] },
+    });
+    const g = s.gates.active[0]!;
+    expect(g.launched_at).toBeNull();
+    expect(g.queued_seconds).toBeNull();
+    expect(g.running_seconds).toBeNull();
+    expect(g.troubled).toBe(false);
+    expect(bayTimes(g, null)).toBe('wait unrecorded · running — · no median measured');
+  });
+
+  test('the packet page finds its packet in a bay, in the line, or nowhere', () => {
+    const s = parseYardStatus({
+      gates: { capacity: 1, typical_seconds: 1080, active: [
+        { branch: 'fix/drift', packet_id: 'p1', since: '2026-09-28T01:44:10Z',
+          launched_at: '2026-09-28T02:30:00Z', queued_seconds: 2760, running_seconds: 840, troubled: true },
+      ], queued: [
+        { branch: 'fix/next', packet_id: 'q1', queued_at: '2026-09-28T02:40:00Z', position: 1,
+          waiting_seconds: 240, estimated_wait_seconds: 240 },
+      ] },
+    });
+    expect(gateStanding(s.gates, 'p1')).toEqual({
+      kind: 'running',
+      text: 'queued 46m · running 14m · median 18m',
+      troubled: true,
+    });
+    expect(gateStanding(s.gates, 'q1')).toEqual({
+      kind: 'queued',
+      text: '#1 in line · waiting 4m · est. ~4m',
+      troubled: false,
+    });
+    expect(gateStanding(s.gates, 'elsewhere')).toBeNull();
+  });
+
+  test('a settled run reads its two ages off its own stamps, and nothing it cannot', () => {
+    expect(settledGateTimes({
+      opened_at: '2026-09-28T01:44:10Z',
+      launched_at: '2026-09-28T02:30:10Z',
+      closed_at: '2026-09-28T02:54:32Z',
+    })).toBe('queued 46m · ran 24m');
+    expect(settledGateTimes({ opened_at: '2026-09-28T01:44:10Z', closed_at: '2026-09-28T02:54:32Z' })).toBeNull();
+    expect(settledGateTimes({ opened_at: '2026-09-28T01:44:10Z', launched_at: '2026-09-28T02:30:10Z' })).toBeNull();
+    expect(settledGateTimes(undefined)).toBeNull();
   });
 });
 

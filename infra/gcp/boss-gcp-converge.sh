@@ -316,7 +316,9 @@ run_summary_field node_id "$NODE_ID"
 # Sourced AFTER read_node_roles above, because has_role is what decides.
 . "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/estate/install-cluster-operator.sh"
 if has_role cluster-operator; then
-    install_cluster_operator
+    # The node id picks which credentials this host is checked for — its
+    # [ops_credentials.<id>] table in estate.toml (backlog f371c749).
+    install_cluster_operator "$NODE_ID"
 fi
 
 log="$(mktemp -t boss-gcp-converge-install.XXXXXX)"
@@ -335,6 +337,43 @@ if [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi
 echo "boss-gcp-converge: units converged on ${after:0:8} ($REMOTE/main)"
+
+# THE JOURNAL BOUND, EVERY TICK (backlog d3c7eada, 2026-09-29). The
+# signed reclaim vacuumed this host's journal from 3.9G to 916M and left
+# root 204 MiB short of its estate floor, and journald's default ceiling
+# grows it back; infra/gcp/journald-cap.conf is the bound and
+# cap-journal.sh puts it down (idempotent: an unchanged drop-in restarts
+# nothing). After the units, so a journald hiccup never holds a unit
+# back; a failure still reds the tick, because a cap that did not land
+# is the disk alarm again in a few weeks.
+log="$(mktemp -t boss-gcp-converge-journal.XXXXXX)"
+jrc=0
+bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/cap-journal.sh" >"$log" 2>&1 || jrc=$?
+sed 's/^/  journal: /' "$log"
+rm -f "$log"
+# NON-FATAL HERE, RED AT THE END (review b5adba9d). journald is not what
+# this loop delivers: exiting now would stop the CLI step on every tick
+# for as long as journald cannot restart — an arm that needs an
+# unrelated patient. So the failure is recorded, the CLI step still
+# runs, and every exit below it turns non-zero (the shape of
+# infra/journal-door-ensure.sh, plus the red, because a cap that did not
+# land is the disk alarm again).
+if [ "$jrc" -ne 0 ]; then
+    echo "boss-gcp-converge: the journal cap FAILED (exit $jrc) — its output is above; the CLI step runs anyway and this tick exits non-zero at the end." >&2
+    run_summary_field journal_cap "failed (exit $jrc)"
+    run_summary_note "journal cap: cap-journal.sh exited $jrc — journald keeps its old ceiling; the next tick retries"
+else
+    run_summary_field journal_cap "$(grep -E '^SystemMaxUse=' "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/journald-cap.conf")"
+fi
+# Every exit from here on goes through this, so a failed cap is never
+# reported as a success — the CLI's exit 0 and its wait's exit 0 alike.
+finish() { # <exit status the CLI step would have had>
+    if [ "$1" -eq 0 ] && [ "$jrc" -ne 0 ]; then
+        echo "boss-gcp-converge: exiting $jrc — the journal cap failed earlier this tick" >&2
+        exit "$jrc"
+    fi
+    exit "$1"
+}
 
 # THE CLI, FROM THE IMAGE AT THE SHA JUST CONVERGED TO. After the units
 # and never instead of them: a CLI step that cannot pull (the forge or
@@ -399,7 +438,7 @@ if [ "$cli_rc" -eq 75 ]; then
         echo "    ${wait_min} min since ${oldest:0:8} landed (limit ${CLI_WAIT_MAX_MIN} min). The deploy runner"
         echo "    builds it after each train; the next tick retries, and /usr/local/bin/boss stays"
         echo "    whatever the previous converge confirmed (cli_result on the packet)."
-        exit 0
+        finish 0
     fi
     run_summary_note "the CLI image is not built ${wait_min} min after ${oldest:0:8} landed (limit ${CLI_WAIT_MAX_MIN} min) — the host's boss is falling behind the tree"
     echo "boss-gcp-converge: the CLI image is still not built ${wait_min} min after ${oldest:0:8} landed" >&2
@@ -415,3 +454,4 @@ if [ "$cli_rc" -ne 0 ]; then
     exit "$cli_rc"
 fi
 echo "boss-gcp-converge: converged on ${after:0:8} ($REMOTE/main) — units and CLI"
+finish 0

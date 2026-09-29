@@ -20,16 +20,20 @@
   import type { Account } from '../accounts/types';
   import { fetchAccountsPage } from '../accounts/api';
   import { formatMoney } from '@boss/web-kit/ui/money';
+  import { INVOICES_LIST_URL } from './api';
+  import { emptyState, type ReadState } from '../data/readState';
+  import ListEmpty from '../data/ListEmpty.svelte';
 
   type Props = {
     invoices: ReadonlyArray<Invoice>;
-    /// Non-null when the invoice load failed — rendered instead of
-    /// the empty state, so an outage never reads as "no invoices"
-    /// (packet 3fba9c35).
-    loadError?: string | null;
+    /// How the invoice read went — a failure is rendered instead of the
+    /// empty state, so an outage never reads as "no invoices" (packet
+    /// 3fba9c35), and a read still in flight says Loading rather than
+    /// blaming the filters for the `[]` it starts as (backlog 0ef5e008).
+    read: ReadState;
     totalCount: number;
   };
-  let { invoices, loadError = null, totalCount }: Props = $props();
+  let { invoices, read, totalCount }: Props = $props();
 
   type StatusFilter = InvoiceStatus | 'all' | 'unpaid';
   type MethodFilter = PaymentMethod | 'all';
@@ -107,6 +111,11 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, no invoices, or the filters hid them (backlog 0ef5e008).
+  let listState = $derived(
+    emptyState([{ source: INVOICES_LIST_URL, state: read }], invoices.length, visible.length),
   );
 
   // 3,491 seeded wholesale orders made fixed-order lists useless
@@ -188,12 +197,8 @@
         hint="Use search or status filters to narrow the list."
       />
     {/if}
-    {#if loadError}
-      <p class="empty load-failed" role="alert">
-        Couldn't load invoices — {loadError}
-      </p>
-    {:else if visible.length === 0}
-      <p class="empty">No invoices match those filters.</p>
+    {#if listState.kind !== 'rows'}
+      <ListEmpty view={listState} words={{ what: 'invoices', noun: 'invoices' }} />
     {:else}
       <table class="data-table data-table-striped">
         <thead>

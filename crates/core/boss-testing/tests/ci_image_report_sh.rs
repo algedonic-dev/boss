@@ -153,6 +153,7 @@ impl Report {
                    case \"$1\" in\n\
                      -D) hdr=\"$2\"; shift ;;\n\
                      -o) body=\"$2\"; shift ;;\n\
+                     -H) case \"$2\" in @*) cat \"${{2#@}}\" >>{calls}.header-files ;; esac; shift ;;\n\
                      http://*) url=\"$1\" ;;\n\
                    esac\n\
                    shift\n\
@@ -215,9 +216,17 @@ fn a_local_tag_that_matches_the_registrys_digest_reads_clean() {
         calls.contains("/v2/token") && calls.contains("/manifests/rust1.96"),
         "the registry must be read through the token flow:\n{calls}"
     );
+    // The token rides in a header FILE (`-H @file`), never in curl's
+    // argv, where every local user reads it in ps (backlog 5f3ad356).
+    let header_files =
+        std::fs::read_to_string(r.dir.join("curl-calls.header-files")).unwrap_or_default();
     assert!(
-        calls.contains("Bearer anon"),
-        "the manifest read must carry the pull token:\n{calls}"
+        header_files.contains("Authorization: Bearer anon"),
+        "the manifest read must carry the pull token, in a header file:\n{header_files}"
+    );
+    assert!(
+        !calls.contains("Bearer anon"),
+        "the pull token must never be in curl's argv:\n{calls}"
     );
 }
 

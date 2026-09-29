@@ -54,7 +54,7 @@ pub trait AssetsClient: Send + Sync {
 /// service can't wedge a delete operation indefinitely.
 pub struct ReqwestAssetsClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestAssetsClient {

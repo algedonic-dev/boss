@@ -1,5 +1,5 @@
 {
-  "about": "MUTATING — roll deploy/boss to a NAMED build and verify it Ready (infra/forge/rollback-to.sh). The lever the 2026-09-05 outage needed a human's shell for: the classifier blocks the agent's kubectl, the converge's own rollback had rolled to the wrong image, and David was asleep. Authorized by David, 2026-09-05: 'it is obvious we need a lot more ad hoc controls while we are still learning'. The sha names an image the registry holds — read it from `rollout history` or the converge's stamp, never guess. Leaves the stamp and main untouched: a rollback buys time for a fix.",
+  "about": "MUTATING — roll deploy/boss to a NAMED build, verify it Ready, and read the image back (infra/forge/rollback-to.sh). The lever the 2026-09-05 outage needed a human's shell for: the classifier blocks the agent's kubectl, the converge's own rollback had rolled to the wrong image, and David was asleep. Authorized by David, 2026-09-05: 'it is obvious we need a lot more ad hoc controls while we are still learning'. The sha names an image the registry holds — read it from `rollout history` or the converge's stamp, never guess. Leaves the stamp and main untouched: a rollback buys time for a fix. THE READ-BACK (backlog 1058e686, car A): rollout status reads the rollout's progress, never the image, so after it the script reads deploy/boss's template image and requires REGISTRY:sha, then lists the ReplicaSets and pods labelled app=boss and requires the current ReplicaSet to hold a Ready pod and every Ready pod of deploy/boss to run that image; only then does it print the effect line ('rolled to', or 'already on' when the image before was already the target). The read-back only reports: the patch and the wait run exactly as before, and a read-back that disagrees or cannot be read exits 1 after the rollback was applied, saying so. Its own timeout: the rollout wait alone is up to 420 s, past the runner's 30 s default.",
   "hosts": [
     "forge"
   ],
@@ -12,5 +12,7 @@
       "name": "sha",
       "pattern": "^[0-9a-f]{7,40}$"
     }
-  ]
+  ],
+  "timeout": 600,
+  "effect": "^rollback-to: (rolled to|already on) .+ — read back: the template and [1-9][0-9]* Ready pod[(]s[)] of replicaset .+ run it"
 }

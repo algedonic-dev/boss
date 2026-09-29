@@ -76,6 +76,12 @@ struct State {
     /// Changes that land on a job row the moment it is next read, set
     /// by [`InMemoryJobs::change_job_after_next_read`].
     job_change_after_read: HashMap<String, JobChange>,
+    /// The Workflow `(kind, version)` pairs a discard has spent — this
+    /// adapter's `workflow_discarded_versions`, kept beside the jobs
+    /// because admission reads it under the same lock it inserts under
+    /// (backlog ce8b7d66, part 4). Written only by
+    /// [`InMemoryJobs::spend_workflow_version_unless_pinned`].
+    discarded_versions: std::collections::HashSet<(String, i32)>,
 }
 
 /// A change another writer lands on a step row (test hook).
@@ -97,6 +103,28 @@ impl InMemoryJobs {
     ) -> Self {
         self.step_plugins = Some(registry);
         self
+    }
+
+    /// The discard's half of the admission/discard ordering (backlog
+    /// ce8b7d66, part 4), called by `InMemoryWorkflows::discard_draft`
+    /// while it holds its own rows: under THIS store's lock, count the
+    /// packets pinned to `(kind, version)` and, when there are none,
+    /// spend the pair, so every later admission onto it is refused
+    /// `VersionDiscarded`. One lock covers the count, the spend and
+    /// every admission's check-and-insert, so an admission is either
+    /// counted here or refused — the ordering the Pg adapter gets from
+    /// `FOR UPDATE` against `FOR KEY SHARE` on the workflows row.
+    pub(crate) fn spend_workflow_version_unless_pinned(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> crate::port::PinnedJobs {
+        let mut state = self.inner.lock().expect("poisoned");
+        let pinned = pinned_to_workflow_locked(&state, kind, version);
+        if pinned.count == 0 {
+            state.discarded_versions.insert((kind.to_string(), version));
+        }
+        pinned
     }
 
     /// Events the outbox paths recorded — test visibility (the
@@ -509,6 +537,27 @@ fn insert_step_locked(state: &mut State, step: &Step, now: chrono::DateTime<chro
     inserted
 }
 
+/// Every packet pinned to `(kind, version)`, read under the lock the
+/// caller holds — the one count the pin read and the discard's spend
+/// share.
+fn pinned_to_workflow_locked(state: &State, kind: &str, version: i32) -> crate::port::PinnedJobs {
+    let pinned: Vec<JobId> = state
+        .jobs
+        .values()
+        .filter(|j| j.kind == kind && j.workflow_version == version)
+        .map(|j| j.id)
+        .collect();
+    // The lowest UUID, as the Pg adapter's ORDER BY id picks it.
+    let first = pinned
+        .iter()
+        .min_by_key(|id| *id.inner().as_uuid())
+        .copied();
+    crate::port::PinnedJobs {
+        count: pinned.len() as i64,
+        first,
+    }
+}
+
 #[async_trait]
 impl JobsRepository for InMemoryJobs {
     async fn create_job_with_steps_at(
@@ -542,6 +591,19 @@ impl JobsRepository for InMemoryJobs {
         let mut recorded = Vec::with_capacity(job_events.len() + step_events.len());
         let admission = {
             let mut state = self.inner.lock().expect("poisoned");
+            // A NUMBER A DISCARD SPENT ADMITS NO PACKET (backlog
+            // ce8b7d66, part 4), judged under the lock the insert below
+            // takes and the discard's spend took — the Pg adapter's
+            // `FOR KEY SHARE` on the row, in memory.
+            if state
+                .discarded_versions
+                .contains(&(job.kind.clone(), job.workflow_version))
+            {
+                return Err(JobsError::VersionDiscarded {
+                    kind: job.kind.clone(),
+                    version: job.workflow_version,
+                });
+            }
             let key = job_key(&job.id);
             let inserted = match state.jobs.entry(key.clone()) {
                 std::collections::hash_map::Entry::Occupied(_) => false,
@@ -653,16 +715,24 @@ impl JobsRepository for InMemoryJobs {
         &self,
         id: &JobId,
         patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no envelope field moves, and the
-        // JOB_UPDATED event is built from the post-merge row.
+        // JOB_UPDATED event is built from the post-merge row. A merge
+        // judged on a read refuses once the row's status or metadata
+        // moved (finding B of the review of car 06973644).
         let merged = {
             let mut state = self.inner.lock().expect("poisoned");
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
+            if let Some(read) = judged_on
+                && (job.status != read.status || job.metadata != read.metadata)
+            {
+                return Err(JobsError::JobChanged { id: *id });
+            }
             let mut md = match &job.metadata {
                 serde_json::Value::Object(m) => m.clone(),
                 _ => serde_json::Map::new(),
@@ -1021,6 +1091,17 @@ impl JobsRepository for InMemoryJobs {
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
+            // A move that writes live rows (un-skipped or inserted) is
+            // true only of a packet still walked: one that finished
+            // since the move was judged is refused whole, nothing
+            // written — the Pg adapter's WHERE, mirrored (review of
+            // 28f3f28a, backlog 4c6b4b74).
+            if plan.opens_rows() && matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) {
+                return Err(JobsError::TerminalJob {
+                    id: *id,
+                    status: format!("{:?}", job.status).to_lowercase(),
+                });
+            }
             job.workflow_version = to_version;
             job.metadata = crate::repin::appended(&job.metadata, record);
             let repinned = job.clone();
@@ -1032,8 +1113,14 @@ impl JobsRepository for InMemoryJobs {
                     return Err(JobsError::StepNotFound(r.step.id));
                 };
                 // A row that finished since the plan was read keeps what
-                // it ran under; only its place in the list moves.
-                let next = if matches!(stored.status, StepStatus::Completed | StepStatus::Skipped) {
+                // it ran under; only its place in the list moves. A
+                // skipped row the plan re-derived as live is the one
+                // exception (backlog 4c6b4b74): it is written pending,
+                // with the target's text, like any live row.
+                let unskip = r.unskipped && stored.status == StepStatus::Skipped;
+                let next = if !unskip
+                    && matches!(stored.status, StepStatus::Completed | StepStatus::Skipped)
+                {
                     Step {
                         sort_order: r.step.sort_order,
                         ..stored.clone()
@@ -1044,7 +1131,11 @@ impl JobsRepository for InMemoryJobs {
                     // (design 87329a13) — or a move to another version
                     // and back would revive them.
                     let mut next = Step {
-                        status: stored.status,
+                        status: if unskip {
+                            StepStatus::Pending
+                        } else {
+                            stored.status
+                        },
                         sign_offs: stored.sign_offs.clone(),
                         ..r.step.clone()
                     };
@@ -1502,21 +1593,7 @@ impl JobsRepository for InMemoryJobs {
         version: i32,
     ) -> Result<crate::port::PinnedJobs, JobsError> {
         let state = self.inner.lock().expect("poisoned");
-        let pinned: Vec<JobId> = state
-            .jobs
-            .values()
-            .filter(|j| j.kind == kind && j.workflow_version == version)
-            .map(|j| j.id)
-            .collect();
-        // The lowest UUID, as the Pg adapter's ORDER BY id picks it.
-        let first = pinned
-            .iter()
-            .min_by_key(|id| *id.inner().as_uuid())
-            .copied();
-        Ok(crate::port::PinnedJobs {
-            count: pinned.len() as i64,
-            first,
-        })
+        Ok(pinned_to_workflow_locked(&state, kind, version))
     }
 
     async fn count_jobs_by_kind(
@@ -1855,6 +1932,64 @@ mod tests {
         assert_eq!(got.status, JobStatus::Open);
     }
 
+    /// The in-memory half of finding B (review of car 06973644): a merge
+    /// judged on a read refuses once the row's metadata moved, writing
+    /// and recording nothing, and lands when judged on the row as it
+    /// stands. The Pg half is in `tests/job_metadata_patch_pg.rs`.
+    #[tokio::test]
+    async fn a_merge_judged_on_a_read_refuses_once_the_row_moved() {
+        let repo = InMemoryJobs::new();
+        let mut job = make_job_with(
+            "protocol-experiment",
+            serde_json::json!({ "candidate_version": 1, "split": 0 }),
+        );
+        job.status = JobStatus::Open;
+        repo.create_job(&job).await.unwrap();
+        let read = repo.get_job(&job.id).await.unwrap().unwrap();
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("test".into()),
+        );
+        let obj = |v: serde_json::Value| match v {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!("test patches are objects"),
+        };
+        repo.merge_job_metadata_at(
+            &job.id,
+            &obj(serde_json::json!({ "candidate_version": 3 })),
+            None,
+            &stamp,
+        )
+        .await
+        .unwrap();
+        let recorded = repo.recorded_events().len();
+
+        let err = repo
+            .merge_job_metadata_at(
+                &job.id,
+                &obj(serde_json::json!({ "split": 100 })),
+                Some(&read),
+                &stamp,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JobsError::JobChanged { .. }), "got: {err}");
+        let stored = repo.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.metadata["split"], 0, "nothing written");
+        assert_eq!(repo.recorded_events().len(), recorded, "nothing recorded");
+
+        let merged = repo
+            .merge_job_metadata_at(
+                &job.id,
+                &obj(serde_json::json!({ "split": 100 })),
+                Some(&stored),
+                &stamp,
+            )
+            .await
+            .unwrap();
+        assert_eq!(merged.metadata["split"], 100);
+    }
+
     /// Backlog 29a7ea09, the shape measured on car 6b23d135: two closers
     /// both read the packet open, a third writer merges a key, the
     /// terminal close lands, and the catch-all close — whose copy of
@@ -1881,6 +2016,7 @@ mod tests {
         repo.merge_job_metadata_at(
             &job.id,
             &obj(serde_json::json!({ "merged_sha": "abc123" })),
+            None,
             &stamp,
         )
         .await

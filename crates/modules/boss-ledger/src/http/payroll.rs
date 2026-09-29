@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -74,12 +73,9 @@ struct PayrollRunDetail {
 
 pub(super) async fn create_payroll_run(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreatePayrollRunBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.lines.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -261,12 +257,9 @@ pub(super) struct SynthesizePayrollBody {
 
 pub(super) async fn synthesize_payroll_run(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<SynthesizePayrollBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.periods_per_year == 0 {
         return (
             StatusCode::BAD_REQUEST,

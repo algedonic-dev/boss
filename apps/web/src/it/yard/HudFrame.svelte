@@ -169,6 +169,7 @@
                 <span class="hud-proto">{l.protocol}</span>
                 <span class="hud-t">{l.title}</span>
                 <span class="hud-sub">{l.stepTitle}</span>
+                {#if l.agentTakes}<span class="plate plate-quiet hud-pri" data-agent-takes>an agent takes this</span>{/if}
                 {#if l.priority !== null}<span class="plate plate-troubled hud-pri">{l.priority}</span>{/if}
                 <span class="hud-sub">{l.age}</span>
               </a>

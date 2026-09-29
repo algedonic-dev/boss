@@ -1,6 +1,7 @@
 <script lang="ts">
   // Invoice detail — port of apps/web/src/finance/InvoicePage.tsx.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
@@ -181,6 +182,7 @@
               <dt>Location</dt><dd>{p.city}, {p.state}</dd>
               <dt>Tier</dt><dd><TierChip tier={p.tier} /></dd>
             </dl>
+            <ClassesReadFailed subjectKind="account" what="account tiers" fallback="Tiers show by code, not by their registry names." />
         </Section>
       {/if}
 

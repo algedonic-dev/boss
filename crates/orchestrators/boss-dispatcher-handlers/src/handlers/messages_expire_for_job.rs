@@ -29,7 +29,7 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use std::sync::Arc;
 
 pub struct MessagesExpireForJob {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     messages_base: String,
 }
 
@@ -41,7 +41,10 @@ impl MessagesExpireForJob {
         })
     }
 
-    pub fn with_client(client: reqwest::Client, messages_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        messages_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             messages_base: messages_base.into(),

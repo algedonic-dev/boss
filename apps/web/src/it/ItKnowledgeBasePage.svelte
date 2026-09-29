@@ -2,47 +2,28 @@
   // /it/kb — IT Knowledge Base.
   //
   // The IT department's reference: the four architecture diagrams,
-  // source-derived (Mermaid SVGs from docs/architecture/) so the
-  // page doesn't drift the way a hardcoded hosts / stack /
-  // providers table would. A prior iteration of this page carried
-  // inline tables for those — they went out of alignment with
-  // reality the moment any of the underlying state changed, so we
-  // deleted them rather than maintain them by hand. The decision
-  // record itself lives in the repo as
+  // drawn in the browser from their Mermaid source in
+  // docs/architecture/*.mmd (KbDiagram.svelte), so the page doesn't
+  // drift the way a hardcoded hosts / stack / providers table would.
+  // A prior iteration of this page carried inline tables for those —
+  // they went out of alignment with reality the moment any of the
+  // underlying state changed, so we deleted them rather than maintain
+  // them by hand. The decision record itself lives in the repo as
   // docs/architecture-decisions.md (one consolidated current-truth
-  // document), not as an in-app catalog.
-  // See `crates/core/boss-core/src/hosts.rs` for the operator host
-  // registry (empty by design in OSS — operators name their own
-  // hosts via `~/.config/boss/hosts.toml`).
+  // document), not as an in-app catalog. Where this instance runs is
+  // its estate registry, rendered at /it/estate.
+  //
+  // The diagrams were committed SVG renders until 4718d918 (page audit
+  // 8cd38edd, gaps 1 and 11): nothing regenerated them, so they drew a
+  // retired service, and this comment cited a regen script and a host
+  // registry file that no longer existed.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../router';
-
-  // Diagrams under it/kb-assets/ — the rendered Mermaid output
-  // colocated with the page that consumes them. Regenerate via
-  // `infra/architecture/regenerate.sh` (or follow
-  // docs/architecture-diagram.md) and copy the SVGs back into
-  // kb-assets/.
-  import stateSurfacesWorkSvg from './kb-assets/00-state-surfaces-work.svg';
-  import primitivesSvg from './kb-assets/01-primitives.svg';
-  import serviceMapSvg from './kb-assets/02-service-map.svg';
-  import deploymentSvg from './kb-assets/03-deployment.svg';
-  import { safeLinkHref } from '@boss/web-kit/links';
+  import KbDiagram from './KbDiagram.svelte';
+  import { kbDiagram } from './kbDiagrams';
 </script>
-
-{#snippet diagram(src: string, alt: string)}
-  <div class="arch-diagram">
-    <img
-      src={safeLinkHref(src)}
-      {alt}
-      style="display:block; margin:0 auto; width:max(100%, 1600px); height:auto"
-    />
-  </div>
-  <div style="font-size:12px; color:var(--static); margin-top:6px; text-align:right">
-    <a href={safeLinkHref(src)} target="_blank" rel="noopener noreferrer">Open at full size ↗</a>
-  </div>
-{/snippet}
 
 <style>
   .layers {
@@ -86,15 +67,6 @@
   .layer-protocols .layer-n { background: var(--ink-raised); }
   .layer-network  { border-left: 4px solid var(--border-strong); }
   .layer-network  .layer-n { background: var(--ink-raised); }
-
-  .arch-diagram {
-    background: var(--ink);
-    border: 1px solid var(--hairline);
-    border-radius: 8px;
-    padding: 16px;
-    overflow: auto;
-    max-height: 75vh;
-  }
 </style>
 
 <div class="catalog theme-it">
@@ -112,9 +84,10 @@
 
   <div style="background:var(--signal-wash); border:1px solid var(--signal); border-radius:8px; padding:14px 16px; margin-bottom:16px; font-size:14px; line-height:1.55; color:var(--fog)">
     <strong style="display:block; margin-bottom:4px">What lives here</strong>
-    The reading frame (§0–1) followed by the four architecture diagrams, rendered from
-    <code>docs/architecture/*.mmd</code> on every diagram-regen — a
-    source-derived reference that doesn't drift. The decision record
+    The reading frame (§0–1) followed by the four architecture diagrams, drawn in
+    your browser from their Mermaid source, <code>docs/architecture/*.mmd</code>,
+    each time this page opens — no picture is stored, so none can fall behind
+    its source. The decision record
     lives in the repo as <code>docs/architecture-decisions.md</code>,
     one consolidated current-truth document. Hosts, software-stack
     tables, and provider lists used to live here too as inline
@@ -221,7 +194,7 @@
         <strong>the network framing wins</strong>, because it is the one that survives
         changing the operating model.
       </p>
-      {@render diagram(stateSurfacesWorkSvg, 'State / Surfaces / Work framing')}
+      <KbDiagram diagram={kbDiagram('00-state-surfaces-work.mmd')} />
     </section>
 
     <section id="it-primitives" class="tab-section tab-section-wide" style="scroll-margin-top:16px">
@@ -243,7 +216,7 @@
         <strong>Policy</strong> is the privilege model: every write passes through
         <code>boss-policy</code>, and its rules are rows.
       </p>
-      {@render diagram(primitivesSvg, 'Primitives and abstractions')}
+      <KbDiagram diagram={kbDiagram('01-primitives.mmd')} />
     </section>
 
     <section id="it-service-map" class="tab-section tab-section-wide" style="scroll-margin-top:16px">
@@ -255,7 +228,7 @@
         only through typed cross-service client crates; no direct DB access between
         services.
       </p>
-      {@render diagram(serviceMapSvg, 'Service map')}
+      <KbDiagram diagram={kbDiagram('02-service-map.mmd')} />
     </section>
 
     <section id="it-deployment" class="tab-section tab-section-wide" style="scroll-margin-top:16px">
@@ -277,7 +250,7 @@
         How this instance runs is data, not a drawing:
         <a href={href('/it/estate')}>This instance's estate, live ↗</a>
       </p>
-      {@render diagram(deploymentSvg, 'Deployment topology')}
+      <KbDiagram diagram={kbDiagram('03-deployment.mmd')} />
     </section>
 
   </div>

@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -57,12 +56,9 @@ fn unprocessable(msg: String) -> Response {
 
 pub(super) async fn create_keg_deposit_settlement(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<KegDepositSettlementBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.job_id.is_empty() {
         return unprocessable("job_id must be non-empty".into());
     }

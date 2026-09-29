@@ -91,6 +91,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/lint/lib/git-answer.sh"
 # shellcheck source=infra/lib/jq.sh
 . "$SELF_DIR/lib/jq.sh"
+# shellcheck source=infra/lib/secret-header.sh
+. "$SELF_DIR/lib/secret-header.sh" \
+    || { echo "$(basename "$0"): $SELF_DIR/lib/secret-header.sh is missing — without it the machine token could only ride in curl's command line; nothing filed" >&2; exit 78; }
 
 NAME="surface-usage"
 KIND="maintenance-surface-usage"
@@ -151,6 +154,11 @@ fi
 API_CURL="$SELF_DIR/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 BOSS_USER='{"id":"automation:surface-usage","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+# The machine token rides to curl in a 0600 file, never in its argv
+# (infra/lib/secret-header.sh; backlog 5f3ad356). Made here, in the
+# script's own shell, because api() runs inside $(…).
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    || { echo "$(basename "$0"): the machine token's header file could not be written — nothing filed, never an unsigned write" >&2; exit 78; }
 
 api() { # <method> <path> [body]
     local method="$1" path="$2" body="${3:-}"
@@ -160,14 +168,14 @@ api() { # <method> <path> [body]
         printf '%s' "$body" > "$bodyfile"
         "$API_CURL" -fsS -X "$method" -H "x-boss-user: $BOSS_USER" \
             -H "content-type: application/json" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary "@$bodyfile" "$BOSS_JOBS_URL$path"
         local rc=$?
         rm -f "$bodyfile"
         return $rc
     else
         "$API_CURL" -fsS -X "$method" -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             "$BOSS_JOBS_URL$path"
     fi
 }

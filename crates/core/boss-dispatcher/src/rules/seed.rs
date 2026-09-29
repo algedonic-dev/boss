@@ -52,6 +52,19 @@
 //!   misbehaving rule off. This is the INSERT-IF-MISSING posture David
 //!   set for the workflow bundle ("drift-healing goes away
 //!   deliberately: it is the feature that reverts operator edits").
+//! - **But never call a different row a match.** A file whose content
+//!   differs from the row at its own version was EDITED WITHOUT A BUMP,
+//!   and its edit is not live. It lands in `drifted`, naming each field
+//!   that differs, and never in `present` (backlog 732c3cf9). Measured
+//!   2026-09-29: four files — among them the org-admin GitHub token's
+//!   per-request key and its org filter — differed from their live v1
+//!   rows while the boot line read "already matches the authored
+//!   directory present=88": a check that answered instead of erroring.
+//!   The row is still not rewritten (a version is append-only, and
+//!   inventing `v+1` here would land a fresh database on a different
+//!   version than a converged one); the file's version is the fix, and
+//!   `infra/lint/a-rule-edit-bumps-its-version.sh` refuses the edit at
+//!   the gate so it cannot land unbumped.
 //! - **Never walk a version back.** An operator publishing live through
 //!   `POST /api/dispatcher/rules` is still supported — that is what
 //!   "registry data, editable without a deploy" means. A live version
@@ -95,7 +108,52 @@ use std::path::Path;
 use sqlx::PgPool;
 
 use super::authoring::validate;
-use super::registry::{RawRule, RegistryError, parse_raw_path};
+use super::registry::{RULE_COLUMNS, RawRule, RegistryError, RuleRow, parse_raw_path};
+
+/// A rule file whose content differs from the row the registry holds at
+/// the file's own version: edited without a version bump, so the edit
+/// is NOT in effect (backlog 732c3cf9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub name: String,
+    /// The version the file declares and the row holds.
+    pub version: u32,
+    /// That row's status — an `active` drift is being enforced in its
+    /// OLD shape right now.
+    pub status: String,
+    /// Which parts differ, in the file's key names (`on_event`,
+    /// `schedule`, `when`, `do`, `delay`), or the one word `unreadable`
+    /// when the row would not read back into a rule to compare.
+    pub fields: Vec<&'static str>,
+}
+
+/// The one line a seed pass is summarised by at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedHeadline {
+    /// The pass inserted or retired rows.
+    Seeded,
+    /// Nothing written, and every authored rule matches its row.
+    Matches,
+    /// Nothing written, and the registry does NOT equal the directory —
+    /// a rule drifted, is behind, or was rejected. Never "matches".
+    Differs,
+}
+
+/// The parts of `file` that differ from `row`, both at the same
+/// version. `why` and `version` are not compared: the row holds no
+/// justification, and the version is what put the two side by side.
+pub fn differing_fields(file: &RawRule, row: &RawRule) -> Vec<&'static str> {
+    [
+        ("on_event", file.on_event != row.on_event),
+        ("schedule", file.schedule != row.schedule),
+        ("when", file.when != row.when),
+        ("do", file.do_steps != row.do_steps),
+        ("delay", file.delay != row.delay),
+    ]
+    .into_iter()
+    .filter_map(|(field, differs)| differs.then_some(field))
+    .collect()
+}
 
 /// What one seed pass did, per rule. Every field names rules rather than
 /// counting them: a count tells the journal something happened, a name
@@ -104,8 +162,13 @@ use super::registry::{RawRule, RegistryError, parse_raw_path};
 pub struct SeedReport {
     /// `(name, version)` published from a file that had no row.
     pub inserted: Vec<(String, u32)>,
-    /// Already present at the authored version — left untouched.
+    /// Present at the authored version WITH THE FILE'S CONTENT — left
+    /// untouched.
     pub present: Vec<String>,
+    /// Present at the authored version with DIFFERENT content: the file
+    /// was edited without a version bump and its edit is not live. Left
+    /// untouched, reported loudly (backlog 732c3cf9).
+    pub drifted: Vec<Drift>,
     /// Retired because no file in the authored registry names them.
     pub retired: Vec<String>,
     /// `(name, authored_version, live_version)` where the live registry
@@ -123,6 +186,20 @@ impl SeedReport {
     /// logs at a higher level when it did.
     pub fn wrote_anything(&self) -> bool {
         !self.inserted.is_empty() || !self.retired.is_empty()
+    }
+
+    /// The boot line's verdict. `Matches` only when nothing was written
+    /// AND nothing differs: "no write" used to be read as "matches",
+    /// which is how four drifted rules and a `behind` one sat under the
+    /// words "already matches the authored directory" (732c3cf9).
+    pub fn headline(&self) -> SeedHeadline {
+        if self.wrote_anything() {
+            SeedHeadline::Seeded
+        } else if self.drifted.is_empty() && self.behind.is_empty() && self.rejected.is_empty() {
+            SeedHeadline::Matches
+        } else {
+            SeedHeadline::Differs
+        }
     }
 }
 
@@ -146,12 +223,29 @@ pub async fn seed_authored_rules(
     // error here, never an empty authored set.
     let authored = parse_raw_path(dir)?;
 
-    let rows: Vec<(String, i32, String, Option<String>)> =
-        sqlx::query_as("SELECT name, version, status, source FROM dispatcher_rules")
-            .fetch_all(pool)
-            .await
-            .map_err(store)?;
+    // Every row WITH ITS CONTENT, so a file at a version the registry
+    // already holds is compared with that row rather than assumed equal
+    // to it (backlog 732c3cf9).
+    #[derive(sqlx::FromRow)]
+    struct SeedRow {
+        status: String,
+        source: Option<String>,
+        #[sqlx(flatten)]
+        rule: RuleRow,
+    }
+    let rows: Vec<SeedRow> = sqlx::query_as(&format!(
+        "SELECT {RULE_COLUMNS}, status, source FROM dispatcher_rules"
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(store)?;
 
+    // `(name, version) -> (status, the row as a rule)`. A row that will
+    // not read back is kept as its error, not dropped: it can only be
+    // compared as `unreadable`, and a history row this seed never needs
+    // to read must not fail the whole pass.
+    type Stored = (String, Result<RawRule, String>);
+    let mut stored: HashMap<(String, i32), Stored> = HashMap::new();
     let mut have: HashSet<(String, i32)> = HashSet::new();
     let mut versions: HashMap<String, BTreeSet<i32>> = HashMap::new();
     // The enforced rows THE TREE OWNS — `source IS NULL` — and only
@@ -171,7 +265,17 @@ pub async fn seed_authored_rules(
     // may take it over the way a tenant takes over a name the product
     // retired. The retired rows stay as history under the name.
     let mut foreign_owner: HashMap<String, String> = HashMap::new();
-    for (name, version, status, source) in rows {
+    for SeedRow {
+        status,
+        source,
+        rule,
+    } in rows
+    {
+        let (name, version) = (rule.name.clone(), rule.version);
+        stored.insert(
+            (name.clone(), version),
+            (status.clone(), rule.into_raw().map_err(|e| e.to_string())),
+        );
         have.insert((name.clone(), version));
         versions.entry(name.clone()).or_default().insert(version);
         match source {
@@ -220,7 +324,24 @@ pub async fn seed_authored_rules(
             continue;
         }
         if have.contains(&(rule.name.clone(), want)) {
-            report.present.push(rule.name.clone());
+            // PRESENT IS A CLAIM ABOUT CONTENT, not about a version
+            // number (732c3cf9). The row is left exactly as it is either
+            // way; only the word changes.
+            let (status, fields) = match stored.get(&(rule.name.clone(), want)) {
+                Some((status, Ok(row))) => (status.clone(), differing_fields(rule, row)),
+                Some((status, Err(_))) => (status.clone(), vec!["unreadable"]),
+                None => (String::new(), vec!["unreadable"]),
+            };
+            if fields.is_empty() {
+                report.present.push(rule.name.clone());
+            } else {
+                report.drifted.push(Drift {
+                    name: rule.name.clone(),
+                    version: rule.version,
+                    status,
+                    fields,
+                });
+            }
             continue;
         }
         // The door's own rule, applied here too: a name a tenant
@@ -266,6 +387,7 @@ pub async fn seed_authored_rules(
 
     report.inserted.sort();
     report.present.sort();
+    report.drifted.sort_by(|a, b| a.name.cmp(&b.name));
     report.retired.sort();
     report.behind.sort();
     report.rejected.sort();
@@ -324,4 +446,86 @@ async fn insert_active(pool: &PgPool, rule: &RawRule, version: i32) -> Result<bo
     }
     tx.commit().await.map_err(store)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::registry::RawRegistry;
+
+    fn rule(toml_src: &str) -> RawRule {
+        let reg: RawRegistry = toml::from_str(toml_src).expect("parse the fixture rule");
+        reg.rules.into_iter().next().expect("one rule")
+    }
+
+    const BASE: &str = r#"
+[[rule]]
+name = "r"
+why = "a reason"
+on_event = "jobs.job.created"
+when = 'kind = "ops-request"'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { secret_key = "\"token\"" }
+"#;
+
+    /// The shape of the 2026-09-29 finding: an arg added to `do` and a
+    /// clause added to `when`, version untouched. Both are named.
+    #[test]
+    fn an_edited_do_and_when_are_named() {
+        let file = rule(
+            &BASE
+                .replace(
+                    r#"'kind = "ops-request"'"#,
+                    r#"'kind = "ops-request" AND metadata.args.0 = "algedonic-dev"'"#,
+                )
+                .replace(
+                    r#"secret_key = "\"token\"""#,
+                    r#"secret_key = "\"token\"", request_id = "id""#,
+                ),
+        );
+        assert_eq!(differing_fields(&file, &rule(BASE)), vec!["when", "do"]);
+    }
+
+    /// The row holds no `why`, and the version is what paired the two:
+    /// neither is a difference, so a prose edit needs no bump.
+    #[test]
+    fn why_and_version_are_not_content() {
+        let mut row = rule(BASE);
+        row.why = None;
+        let file = rule(&BASE.replace("a reason", "a longer, better reason"));
+        assert!(differing_fields(&file, &row).is_empty());
+    }
+
+    #[test]
+    fn a_pass_with_drift_never_reads_as_a_match() {
+        let clean = SeedReport {
+            present: vec!["r".into()],
+            ..SeedReport::default()
+        };
+        assert_eq!(clean.headline(), SeedHeadline::Matches);
+
+        let drifted = SeedReport {
+            drifted: vec![Drift {
+                name: "r".into(),
+                version: 1,
+                status: "active".into(),
+                fields: vec!["do"],
+            }],
+            ..clean.clone()
+        };
+        assert_eq!(drifted.headline(), SeedHeadline::Differs);
+
+        let behind = SeedReport {
+            behind: vec![("r".into(), 1, 2)],
+            ..clean.clone()
+        };
+        assert_eq!(behind.headline(), SeedHeadline::Differs);
+
+        let seeded = SeedReport {
+            inserted: vec![("s".into(), 1)],
+            ..drifted
+        };
+        assert_eq!(seeded.headline(), SeedHeadline::Seeded);
+    }
 }

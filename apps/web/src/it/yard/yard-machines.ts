@@ -15,7 +15,7 @@
 // in one write, so an `active` step is possible but never seen. The
 // packet therefore distinguishes: requested (open, unanswered),
 // running (claimed, or answered and the unit just started), failed
-// (refused, or a non-zero exit), and idle (the last converge on
+// (refused, or a non-zero exit other than the not-yet 75), and idle (the last converge on
 // record). "Done" is not a separate state the packet can tell from
 // idle, so it is not one here.
 //
@@ -24,7 +24,7 @@
 // fetch that fails or answers non-2xx is DARK; that is the reading the
 // 2026-09-05 outage wanted a page to show.
 
-import type { JobLite, StepLite } from './yard';
+import { exitFailed, type JobLite, type StepLite } from './yard';
 import { clockText, elapsedText } from './yard-status';
 
 // ---------------------------------------------------------------------
@@ -65,13 +65,16 @@ const ms = (s: string | null): number => {
 
 /** The reason a converge failed, from the execute step's own record:
  *  a refusal names the allowlist unless the runner wrote a reason; a
- *  non-zero exit carries its code and the first line of output. */
+ *  non-zero exit carries its code and the first line of output. Exit
+ *  75 is NOT a failure (`exitFailed`): the converge verb says "not
+ *  yet" when a converge already running took its start, and that run
+ *  is the one the shed should show. */
 function failure(execute: StepLite | null): string | null {
   const m = execute?.metadata ?? {};
   const output = (str(m.output) ?? '').split('\n')[0]?.trim() ?? '';
   if (m.disposition === 'refused') return output !== '' ? output : 'refused — outside the allowlist';
   const code = str(m.exit_code);
-  if (code !== null && code !== '0') return output !== '' ? `exit ${code} — ${output}` : `exit ${code}`;
+  if (exitFailed(code)) return output !== '' ? `exit ${code} — ${output}` : `exit ${code}`;
   return null;
 }
 

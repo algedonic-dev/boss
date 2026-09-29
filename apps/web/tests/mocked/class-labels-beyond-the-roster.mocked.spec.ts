@@ -8,10 +8,14 @@
 // Operations / IT. people-class-labels pins the roster; this spec pins
 // the rest, and src/people/no-humanized-class-labels.test.ts refuses
 // the next .svelte file that reaches for humanizeClassCode directly.
+//
+// Since backlog c87e3d6d (2026-09-27) a department's label comes from
+// the DEPARTMENTS registry (GET /api/departments); the `(employee,
+// department)` Classes retired, `operations` with them.
 
 import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
-import { installSmokeMocks } from './_smokeMocks';
+import { DEPARTMENTS, DEPARTMENTS_ENDPOINT, installSmokeMocks } from './_smokeMocks';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -37,20 +41,26 @@ function klass(member_attribute: string, code: string, display_name: string, sor
 }
 
 /// Each display_name differs from what humanizeClassCode makes of its
-/// code (Operations, Platform Admin, Lab Tech), so a surface that still
-/// humanizes prints the wrong text rather than a coincidentally right one.
+/// code (Platform Admin, Lab Tech), so a surface that still humanizes
+/// prints the wrong text rather than a coincidentally right one.
 const CLASSES = [
-  klass('department', 'operations', 'Operations / IT', 80),
   klass('role', 'platform-admin', 'Platform admin', 3),
   klass('role', 'lab-tech', 'Laboratory technician', 20),
   klass('status', 'active', 'Active', 10),
 ];
 
-/// A manager and one direct report, both in `operations`: the report's
+/// The departments registry with `sales` under a display name the
+/// humanizer cannot produce from its code (the one the real tenant gave
+/// its sales department), every other row as the smoke mocks serve it.
+const REGISTRY = DEPARTMENTS.map((d) =>
+  d['code'] === 'sales' ? { ...d, display_name: 'Sales & Sponsorships' } : d,
+);
+
+/// A manager and one direct report, both in `sales`: the report's
 /// page has a reporting chain, the manager's has a team table.
 const ROSTER = [
-  emp('emp-lead', 'platform-admin', 'operations', null),
-  emp('emp-lab', 'lab-tech', 'operations', 'emp-lead'),
+  emp('emp-lead', 'platform-admin', 'sales', null),
+  emp('emp-lab', 'lab-tech', 'sales', 'emp-lead'),
 ];
 
 async function install(page: Page): Promise<void> {
@@ -62,9 +72,10 @@ async function install(page: Page): Promise<void> {
     return row ? json(r, row) : json(r, 'not found', 404);
   });
   await page.route(/\/api\/classes(\?|$)/, (r) => json(r, CLASSES));
+  await page.route(DEPARTMENTS_ENDPOINT, (r) => json(r, { data: REGISTRY, total: REGISTRY.length }));
 }
 
-test.describe('department and role labels come from the Class registry beyond the roster', () => {
+test.describe('department and role labels come from their registries beyond the roster', () => {
   test("the Hierarchy view's role line prints the registry's display_name", async ({ page }) => {
     await install(page);
     await mountPage(page, '/ux/people');
@@ -75,7 +86,7 @@ test.describe('department and role labels come from the Class registry beyond th
   test("the employee page's eyebrow, tagline and reporting chain print display_names", async ({ page }) => {
     await install(page);
     await mountPage(page, '/ux/people/emp-lab');
-    await expect(page.locator('.detail-eyebrow')).toContainText('Operations / IT');
+    await expect(page.locator('.detail-eyebrow')).toContainText('Sales & Sponsorships');
     await expect(page.locator('.detail-tagline')).toHaveText('Laboratory technician · emp-lab@a');
     await expect(page.locator('ol.checklist li')).toContainText('Platform admin');
   });
@@ -91,7 +102,7 @@ test.describe('department and role labels come from the Class registry beyond th
     await mountPage(page, '/ux/hr');
     await page.getByRole('tab', { name: 'Headcount', exact: true }).click();
     await expect(page.locator('table.data-table tbody tr').first().locator('td').first())
-      .toHaveText('Operations / IT');
+      .toHaveText('Sales & Sponsorships');
   });
 
   test("QA's staffing table prints the role's display_name", async ({ page }) => {

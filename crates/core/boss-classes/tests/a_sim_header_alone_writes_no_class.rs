@@ -1,24 +1,30 @@
 //! A sim header alone writes no Class (backlog 85e7f10f, 2026-09-25).
 //!
-//! The operator-tier doors — this crate's batch, update and retire, and
+//! The registry write doors — this crate's batch, update and retire
+//! (which now ask policy: Create/Update/Retire on `class`), and
 //! the same shape in locations, calendar and the ledger's chart and tax
 //! registry — each wrote `if !(is_in_sim_chain() || tier_ok) { 403 }`,
 //! so a caller that reached :7800 directly and sent `x-sim-origin: true`
-//! wrote the registry with no identity at all. Each now asks the one
-//! predicate, `boss_policy_client::sim_bypass_allowed`.
+//! wrote the registry with no identity at all. Each then asked the one
+//! predicate, `boss_policy_client::sim_bypass_allowed`; this crate's
+//! doors now ask policy instead (backlog 553cf479), and the sim is
+//! admitted the way every policy-asking service admits it — the binary's
+//! `SimBypassPolicyClient::from_env`, which this test builds the same way.
 //!
 //! Driven through the real request-context middleware, with the header
 //! on the wire, on both instances:
 //!
 //!  - SIM OFF (prod): the anonymous caller with the header is refused
-//!    and nothing lands; an operator-tier seed caller — the identity
-//!    the reset and validate scripts under infra/postgres/ and the
-//!    engines' prepare all sign with, header included — still writes.
+//!    401 and nothing lands; the sim's identity is refused 403 (no
+//!    bypass, and its role holds no grant); the seed caller — the
+//!    platform-admin identity the reset and validate scripts under
+//!    infra/postgres/ and the engines' prepare all sign with, header
+//!    included — still writes.
 //!  - SIM ON (the playground): the anonymous caller is still refused;
 //!    the sim's employee-signed identity, the one its workforce claims
-//!    a step with (an employee id, role `system-sim`,
-//!    USER tier — the one shape the tier check alone would refuse)
-//!    still writes, so the bypass remains exactly for the sim.
+//!    a step with (an employee id, role `system-sim`, USER tier — a
+//!    role the core defaults grant nothing) still writes, so the bypass
+//!    remains exactly for the sim.
 //!
 //! ONE test on a runtime built after the variable is set: the
 //! environment is process-wide, and this file is its own process.
@@ -30,7 +36,7 @@ use axum::http::{Request, StatusCode};
 use boss_classes::InMemoryClasses;
 use boss_classes::http::{ClassesApiState, router};
 use boss_classes::port::ClassRepository;
-use boss_policy_client::SIM_ENABLED_ENV;
+use boss_policy_client::{FakePolicyClient, SIM_ENABLED_ENV, SimBypassPolicyClient};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -38,8 +44,14 @@ const SEED: &str = r#"{"id":"automation:classes-seed","role":"platform-admin","a
 const SIM_AS_EMPLOYEE: &str = r#"{"id":"emp-042","role":"system-sim","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
 
 async fn batch(repo: &Arc<InMemoryClasses>, user: Option<&str>, code: &str) -> StatusCode {
+    // The binary's wiring: the core defaults behind the bypass, which
+    // `from_env` installs only when this instance runs a sim.
+    let policy = SimBypassPolicyClient::from_env(Arc::new(
+        FakePolicyClient::builder().with_default_rules().build(),
+    ));
     let app = router(ClassesApiState {
         classes: repo.clone(),
+        policy,
     })
     .layer(axum::middleware::from_fn(
         boss_policy_client::request_context_middleware,
@@ -74,7 +86,7 @@ async fn held(repo: &Arc<InMemoryClasses>) -> Vec<String> {
 
 async fn with_the_sim_off() {
     let repo = Arc::new(InMemoryClasses::new(vec![]));
-    assert_eq!(batch(&repo, None, "forged").await, StatusCode::FORBIDDEN);
+    assert_eq!(batch(&repo, None, "forged").await, StatusCode::UNAUTHORIZED);
     assert_eq!(
         batch(&repo, Some(SIM_AS_EMPLOYEE), "sim-off").await,
         StatusCode::FORBIDDEN,
@@ -88,7 +100,7 @@ async fn with_the_sim_on() {
     let repo = Arc::new(InMemoryClasses::new(vec![]));
     assert_eq!(
         batch(&repo, None, "forged").await,
-        StatusCode::FORBIDDEN,
+        StatusCode::UNAUTHORIZED,
         "a header is not a caller, even on a sim instance"
     );
     assert_eq!(batch(&repo, Some(SEED), "seeded").await, StatusCode::OK);

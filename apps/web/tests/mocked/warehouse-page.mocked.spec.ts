@@ -207,12 +207,12 @@ test.describe('/ux/warehouse — State A, the warehouse module off (the live ins
       await expect(notice.locator('strong')).toHaveText(ROUTE_CATALOG.warehouse.label);
       await expect(notice.locator('strong')).toHaveText('Inventory');
       await expect(notice).toContainText(
-        "The Inventory module is turned off in this tenant's tenant.toml. The page exists in the platform — the active tenant just doesn't surface it.",
+        "The Inventory module is turned off in this tenant's manifest. The page exists in the platform — the active tenant just doesn't surface it.",
       );
-      // Gap 1 (fa838818): the one instruction names examples/<tenant>,
-      // and this instance's tenant is not in examples/.
+      // Gap 1 (fa838818, fixed): the instruction names the manifest by
+      // what it is, not an examples/<tenant> path this instance lacks.
       await expect(notice).toContainText(
-        'To enable: set warehouse = true in examples/<tenant>/seeds/tenant.toml under [modules], redeploy, and the page comes back.',
+        "To enable: set warehouse = true in the [modules] section of the tenant's manifest, redeploy, and the page comes back.",
       );
       await expect(notice.getByRole('button')).toHaveCount(1);
       await expect(notice.locator('a')).toHaveCount(0);

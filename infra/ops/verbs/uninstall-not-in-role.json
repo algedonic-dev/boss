@@ -16,5 +16,6 @@
       ]
     }
   ],
-  "timeout": 900
+  "timeout": 900,
+  "effect": "^uninstall-not-in-role: (OK — disabled[+]removed [0-9]+ unit[(]s[)] not in role|DRY RUN — would disable[+]remove )"
 }

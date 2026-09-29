@@ -225,7 +225,7 @@ pub(crate) fn clean_completion_fields(
 }
 
 pub struct MaintenanceSweepJudge {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -238,7 +238,10 @@ impl MaintenanceSweepJudge {
     }
 
     /// Tests point the client at a local stand-in for jobs-api.
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -451,6 +454,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: RULE.into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -671,7 +675,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -729,7 +733,7 @@ mod tests {
             sweep("disk-headroom", "active"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -761,7 +765,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -779,7 +783,7 @@ mod tests {
             sweep("image-freshness", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -791,7 +795,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -803,7 +807,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -821,7 +825,7 @@ mod tests {
                 sweep("disk-headroom", "ready"),
             ])
             .await;
-            let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+            let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
             let a = args("disk-headroom", "disk-report");
             h.invoke(&a, &ctx()).await.unwrap();
             h.invoke(&a, &ctx()).await.unwrap();
@@ -842,7 +846,7 @@ mod tests {
             sweep("disk-headroom", "pending"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -855,7 +859,7 @@ mod tests {
             closed,
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -937,7 +941,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -979,7 +983,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -1005,7 +1009,7 @@ mod tests {
             sweep("disk-headroom", "ready"),
         ])
         .await;
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), base);
+        let h = MaintenanceSweepJudge::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args("disk-headroom", "disk-report"), &ctx())
             .await
             .unwrap();
@@ -1032,7 +1036,10 @@ mod tests {
 
     #[test]
     fn the_handler_is_registered_under_its_name() {
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), "http://unused");
+        let h = MaintenanceSweepJudge::with_client(
+            crate::handlers::common::api_client(),
+            "http://unused",
+        );
         assert_eq!(h.name(), "maintenance.sweep.judge");
         let emits = crate::cascade::handler_emits()
             .get("maintenance.sweep.judge")
@@ -1049,7 +1056,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_arg_is_a_missing_arg_error() {
-        let h = MaintenanceSweepJudge::with_client(reqwest::Client::new(), "http://unused");
+        let h = MaintenanceSweepJudge::with_client(
+            crate::handlers::common::api_client(),
+            "http://unused",
+        );
         let err = h.invoke(&[], &ctx()).await.unwrap_err();
         assert!(
             matches!(err, HandlerError::MissingArg(ref a) if a == "target"),

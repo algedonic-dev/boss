@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /it/codebase (and the older /it/design/codebase) — the codebase, read off the daily
+  // /it/codebase — the codebase, read off the daily
   // `maintenance-codebase-metrics` packets (backlog 06048ade).
   //
   // David, 2026-09-11: "once we have code base analysis statistics we
@@ -18,11 +18,22 @@
   // net lines per day and per landing; then the context the row
   // carries. Everything is a function of the packet fields (trend.ts,
   // tested); a null in the row stays a null with the row's reason.
-  import { onMount } from 'svelte';
+  //
+  // THE ROW IS DATED AGAINST THE READER'S CLOCK (a91a39a4, page audit
+  // f82b05a9). The heading said "THE CODEBASE NOW" over whatever row was
+  // newest — measured 11 h old with 15 landings since, on the audit's
+  // read — and a failed newest run showed only as a count in the
+  // footnote. The heading now states the measurement's age and marks it
+  // past 26 h, the same one-daily-cadence-plus-slack the drift tab uses
+  // (one constant, imported), and a newest packet that is not the
+  // measured one is named above the numbers with its outcome, its run's
+  // result and its link. A troubled page must look troubled.
+  import { onDestroy, onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href, navigate } from '../../router';
   import SurfaceUsage from './SurfaceUsage.svelte';
   import type { Remote } from '../../data/remote';
+  import { measurementAge, STALE_AFTER_HOURS } from '../registry/drift';
   import {
     barGeometry,
     deleteAddPct,
@@ -34,6 +45,7 @@
     statsStrip,
     perDay,
     reading,
+    unmeasuredNewest,
     type MetricsPage,
     type Verdict,
   } from './trend';
@@ -52,12 +64,22 @@
   async function refresh(): Promise<void> {
     page = await loadMetricsPackets(PAGE);
   }
+  /** The instant the measurement's age is read against. Ticked each
+   *  minute, so a tab left open across a missed 05:10Z run turns warn
+   *  without a reload — the drift tab's clock (d83886c6). */
+  let now = $state(new Date().toISOString());
+  const clock = setInterval(() => {
+    now = new Date().toISOString();
+  }, 60_000);
   onMount(() => {
     void refresh();
   });
+  onDestroy(() => clearInterval(clock));
 
   const ready = $derived(page.kind === 'ready' ? page.data : null);
   const newest = $derived(ready ? newestMeasured(ready.packets) : null);
+  const age = $derived(newest ? measurementAge(newest.measured.at, now) : null);
+  const newer = $derived(ready ? unmeasuredNewest(ready.latest, newest) : null);
   const stats = $derived(newest ? statsStrip(newest.measured) : []);
   const landings = $derived(ready ? mergeLandings(ready.packets) : []);
   const days = $derived(perDay(landings));
@@ -140,7 +162,25 @@
       measuring, or filed nothing). That is a failed measurement, not an empty series.
     </p>
   {:else}
-    <div class="ct-section">00 — THE CODEBASE NOW · at head {short(newest.measured.head)}, measured {newest.measured.at.slice(0, 16).replace('T', ' ')}Z</div>
+    <div class="ct-section">
+      <span>
+        00 — THE CODEBASE AS LAST MEASURED · at head {short(newest.measured.head)}, measured {when(newest.measured.at)}
+        {#if age}
+          · <span class="ct-age" class:warn={age.stale}
+            >{age.text} ago{age.stale ? ` — past the daily ${STALE_AFTER_HOURS}h, so a 05:10Z run was missed` : ''}</span
+          >
+        {/if}
+      </span>
+    </div>
+    {#if newer}
+      <p class="ct-fail ct-newer">
+        The newest codebase-metrics packet is not the one drawn here:
+        <a href={href(`/jobs/${newer.id}`)} onclick={(e) => { e.preventDefault(); navigate(`/jobs/${newer.id}`); }}>{newer.title}</a>,
+        opened {when(newer.opened_at)},
+        {newer.status === 'open' ? 'is still open — its run has not reported' : `closed ${newer.outcome ?? 'with no outcome recorded'}`},
+        run result {newer.result ?? 'not recorded'}. Everything below is the last row that carried a measurement.
+      </p>
+    {/if}
     <div class="ct-stats">
       {#each stats as c (c.k)}
         <div class="ct-stat">
@@ -381,7 +421,10 @@
     display: flex; align-items: center; gap: 12px;
   }
   .ct-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
-  /* THE CODEBASE NOW — six plain cards, the number large, the breakdown
+  .ct-age.warn { color: var(--warn); }
+  .ct-newer { max-width: 90ch; }
+  .ct-newer a { color: var(--signal); }
+  /* THE CODEBASE — six plain cards, the number large, the breakdown
      small; the reading's verdicts keep their tones below. */
   .ct-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 0.6rem; margin-bottom: 1rem; }
   .ct-stat { border: 1px solid var(--hairline); border-radius: 6px; padding: 0.6rem 0.75rem; background: var(--ink-raised); }

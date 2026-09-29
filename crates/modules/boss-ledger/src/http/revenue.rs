@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -39,12 +38,9 @@ pub(super) struct CreateRevenueScheduleBody {
 /// `recognized_to_date_cents = 0`; the scheduler advances both.
 pub(super) async fn create_revenue_schedule(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreateRevenueScheduleBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     // Basic validation — the CHECKs on the table are the belt, these
     // are the suspenders. A clear 400 beats a Postgres RAISE.
     if body.total_cents < 0 {

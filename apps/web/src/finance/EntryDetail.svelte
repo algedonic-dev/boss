@@ -15,6 +15,8 @@
   import { href } from '../router';
   import { entrySearch } from './financeQuery';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import { financeOffersWrite } from './readOnly';
+  import { permission } from '@boss/web-kit/session/permission.svelte';
 
   type Props = {
     entryId: string;
@@ -49,9 +51,12 @@
     | { kind: 'error'; message: string };
   let reverseState = $state<ReverseState>({ kind: 'idle' });
 
-  let readOnly = $derived(
-    session.value.kind === 'ready' && session.value.user.role === 'auditor',
-  );
+  // The read-only floor (backlog 432f0eb4) AND policy's answer for the
+  // session user (9dad102c): a reversal posts a journal entry, Create on
+  // `ledger`. Hidden until an Allow arrives; the server's 403 stays the
+  // authority.
+  const mayPost = permission('create', 'ledger');
+  let offerReverse = $derived(financeOffersWrite(session, mayPost.value));
 
   async function doReverse(e: LedgerEntryDetail): Promise<void> {
     if (
@@ -80,7 +85,7 @@
     <h4>
       Entry {shortId(e.id)}… &middot; posted {e.posted_on}
       <span class="ruleset-badge">RuleSet v{e.rule_version}</span>
-      {#if !readOnly}
+      {#if offerReverse}
         {#if reverseState.kind === 'posted'}
           <span class="tb-reverse-result">
             Reversal posted: <Link

@@ -46,7 +46,7 @@ pub trait InventoryClient: Send + Sync {
 
 pub struct ReqwestInventoryClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestInventoryClient {

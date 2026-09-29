@@ -101,6 +101,37 @@ pub fn governing_experiment(experiments: &[Job], kind: &str) -> Option<Experimen
         .map(|(_, split)| split)
 }
 
+/// The split a packet puts IN FORCE, paired with the kind it splits:
+/// its declaration read exactly as [`governing_experiment`] reads it,
+/// and only while the packet is an OPEN experiment — the one state in
+/// which admission consults it. `None` for any other packet.
+pub fn split_in_force(job: &Job) -> Option<(String, ExperimentSplit)> {
+    if job.kind != EXPERIMENT_KIND || job.status != JobStatus::Open {
+        return None;
+    }
+    let kind = job.metadata.get("kind_under_test")?.as_str()?.to_string();
+    Some((kind, declared_split(job)?))
+}
+
+/// What a write to a packet NEWLY puts in force: the split `after`
+/// declares, when `before` (`None` for an admission) did not already
+/// have exactly that split in force. `None` when the write leaves every
+/// admission as it was — an annotation on a running experiment, a
+/// close, or any write to a packet that splits nothing.
+///
+/// Backlog ce8b7d66: this is the question the job write doors ask
+/// before an experiment may admit packets to a version that was never
+/// published. A change of `split` counts — 0 to 100 turns a declared
+/// but idle candidate into all of a kind's traffic — and so does
+/// opening the packet, since the window IS the open interval.
+pub fn newly_in_force(before: Option<&Job>, after: &Job) -> Option<(String, ExperimentSplit)> {
+    let now = split_in_force(after)?;
+    match before.and_then(split_in_force) {
+        Some(was) if was == now => None,
+        _ => Some(now),
+    }
+}
+
 /// The arm a packet id lands in under a candidate share of `split`
 /// percent. A pure, fixed function — the same id and split always
 /// yield the same arm, on every host and build, which is what makes
@@ -290,6 +321,49 @@ mod tests {
             older.id,
             "earliest opened_on wins"
         );
+    }
+
+    /// Backlog ce8b7d66: the write doors ask what a write newly puts in
+    /// force. Opening a declaring packet does; re-sending the same
+    /// declaration does not; widening the split or moving an arm does;
+    /// a closed packet or a packet of another kind puts nothing in force.
+    #[test]
+    fn a_write_newly_puts_a_split_in_force_only_when_it_changes_one() {
+        let running = experiment(full_declaration());
+        let (kind, split) = newly_in_force(None, &running).expect("an admission opens it");
+        assert_eq!(kind, running.metadata["kind_under_test"]);
+        assert_eq!((split.control_version, split.candidate_version), (2, 3));
+
+        let mut annotated = running.clone();
+        annotated.metadata["note"] = serde_json::json!("halfway");
+        assert_eq!(
+            newly_in_force(Some(&running), &annotated),
+            None,
+            "an annotation changes no admission"
+        );
+
+        let mut widened = running.clone();
+        widened.metadata["split"] = serde_json::json!(100);
+        assert!(newly_in_force(Some(&running), &widened).is_some());
+
+        let mut moved = running.clone();
+        moved.metadata["candidate_version"] = serde_json::json!(4);
+        assert!(newly_in_force(Some(&running), &moved).is_some());
+
+        let mut held = running.clone();
+        held.status = JobStatus::Draft;
+        assert!(
+            newly_in_force(Some(&held), &running).is_some(),
+            "opening the packet opens the window"
+        );
+
+        let mut closed = running.clone();
+        closed.status = JobStatus::Closed;
+        assert_eq!(newly_in_force(Some(&running), &closed), None);
+
+        let mut other = running.clone();
+        other.kind = "sale".into();
+        assert_eq!(newly_in_force(None, &other), None);
     }
 
     #[test]

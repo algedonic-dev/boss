@@ -13,7 +13,12 @@
 //! seeded row to `DeliveryPolicy::compiled()` directly, so the numbers
 //! are written down once on each side and equality is the test.
 
-use boss_jobs::delivery::{DeliveryPolicyRepository, PgDeliveryPolicy};
+use boss_core::actor::ActorId;
+use boss_jobs::delivery::{
+    DeliveryPolicyError, DeliveryPolicyRegistry, DeliveryPolicyRepository, DeliveryPolicyRow,
+    DeliveryPolicySpec, PgDeliveryPolicy,
+};
+use boss_jobs::registry::WorkflowStatus;
 use boss_testing::TestDb;
 
 const POLICY: &str = "train-conductor";
@@ -99,6 +104,62 @@ async fn two_active_versions_of_one_policy_cannot_coexist() {
         "a second active row must be refused — 'what was the policy when \
          this train departed?' is only answerable while one version is in \
          force at a time"
+    );
+}
+
+/// THE FLOOR (backlog df793bd7, the delivery-policy twin of 1cd85e94).
+/// A declared version at or below the newest the lineage holds is
+/// `Conflict` and retires nothing. Before, only the exact (name,
+/// version) was refused, so a stale bundle's lower version retired the
+/// policy in force and the conductor ran under the older one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_version_below_the_newest_is_refused_and_retires_nothing() {
+    let db = TestDb::new().await;
+    let repo = PgDeliveryPolicy::new(db.pool.clone());
+    let live = repo
+        .active_policy(POLICY)
+        .await
+        .unwrap()
+        .expect("the migrations leave one active policy");
+    let actor = ActorId::Automation("platform-workflow-seed".into());
+    let at = |version: i32| DeliveryPolicySpec {
+        status: WorkflowStatus::Active,
+        row: DeliveryPolicyRow {
+            version,
+            ..live.clone()
+        },
+        created_at: chrono::Utc::now(),
+    };
+    // A newer bundle lands two versions up, leaving numbers below it
+    // that no row holds — the ones only the floor can refuse.
+    let newest = live.version + 3;
+    repo.publish_declared(at(newest), &actor, chrono::Utc::now())
+        .await
+        .expect("above the lineage lands");
+    for below in [newest - 1, newest - 2] {
+        let got = repo
+            .publish_declared(at(below), &actor, chrono::Utc::now())
+            .await;
+        assert!(
+            matches!(got, Err(DeliveryPolicyError::Conflict(_))),
+            "v{below} with v{newest} live: {got:?}"
+        );
+    }
+    assert_eq!(
+        repo.active_policy(POLICY)
+            .await
+            .unwrap()
+            .expect("still one active policy")
+            .version,
+        newest,
+        "a refusal retires nothing"
+    );
+    assert!(
+        repo.policy_version(POLICY, newest - 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refusal writes nothing"
     );
 }
 

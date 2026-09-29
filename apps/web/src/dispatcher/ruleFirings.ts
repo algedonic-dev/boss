@@ -1,7 +1,8 @@
 // When each dispatcher rule last fired, and whether its handler is
 // failing — `GET /api/yard/rule-firings` (boss-jobs
 // http/rule_firings.rs), read by the rules list at /it/registry/rules
-// (backlog 43c4451a, found by page-audit 08a444bc gap 5).
+// (backlog 43c4451a, found by page-audit 08a444bc gap 5), and by the
+// rule editor's summary for one rule (backlog 0034d5ef).
 //
 // WHY. The list showed a rule's trigger and version and nothing about
 // whether it RUNS, so a stalled auto-park-on-gate-green and an idle one
@@ -120,7 +121,7 @@ const UNREAD = 'unknown';
 
 /** The two cells for one rule. Pure, so the stalled-vs-idle rule is
  *  pinned without a DOM. */
-export function ruleActivity(rule: DispatcherRule, read: Remote<RuleFirings>): RuleActivity {
+export function ruleActivity(rule: Pick<DispatcherRule, 'name'>, read: Remote<RuleFirings>): RuleActivity {
   if (read.kind === 'loading') {
     return { lastFired: '…', lastFiredWhy: '', deadLetters: '…', deadLettersWhy: '', deadLetterJob: null, failing: false };
   }

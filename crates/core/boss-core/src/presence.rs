@@ -86,6 +86,19 @@ pub fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// The fingerprint of a stored WebAuthn public key: lowercase hex of
+/// SHA-256 over the exact bytes `webauthn_credentials.public_key` holds.
+/// A `passkey-promotion` packet carries it in the step the owner signs,
+/// and boss-people's promote compares it with the row it flips, so a key
+/// deleted and re-registered under the same credential id with other key
+/// material promotes nothing (review of car b3f6f5b4, 2026-09-28). One
+/// definition, because the gateway that files the packet and the people
+/// service that checks it must compute the same thing (CLAUDE.md §9a).
+pub fn public_key_fingerprint(public_key: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(public_key))
+}
+
 /// A verified assertion, portable for as long as its `e` allows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PresenceTicket {
@@ -101,7 +114,10 @@ pub struct PresenceTicket {
     pub e: u64,
 }
 
-fn mac(key: &[u8], payload_b64: &str) -> Option<Vec<u8>> {
+/// HMAC-SHA256 of `payload_b64` under `key`. Crate-visible so the
+/// passkey-promotion ticket (`crate::passkey_promotion`) is signed with
+/// the same primitive under a domain prefix of its own.
+pub(crate) fn mac(key: &[u8], payload_b64: &str) -> Option<Vec<u8>> {
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).ok()?;
     mac.update(payload_b64.as_bytes());
     Some(mac.finalize().into_bytes().to_vec())
@@ -140,6 +156,16 @@ mod tests {
     use super::*;
 
     const KEY: &[u8] = b"test-session-key";
+
+    /// The published SHA-256 of "abc" (FIPS 180-2), so the fingerprint is
+    /// the plain digest of the stored bytes and nothing else.
+    #[test]
+    fn a_public_key_fingerprint_is_the_sha256_of_its_bytes() {
+        assert_eq!(
+            public_key_fingerprint(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn ticket(e: u64) -> PresenceTicket {
         PresenceTicket {

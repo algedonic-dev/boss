@@ -19,7 +19,7 @@ use boss_dispatcher::rules::registry::{
 };
 use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
-use boss_dispatcher::rules::seed::seed_authored_rules;
+use boss_dispatcher::rules::seed::{SeedHeadline, seed_authored_rules};
 use boss_dispatcher_handlers::handlers::{
     bill_payment_batch::BillPaymentBatch,
     cadence_silence::CadenceSilenceSweep,
@@ -28,6 +28,7 @@ use boss_dispatcher_handlers::handlers::{
     credential_issuer,
     credential_rotate_cloudflare_tunnel::CredentialRotateCloudflareTunnel,
     credential_rotate_forgejo::CredentialRotateForgejo,
+    credential_rotate_github_app::CredentialRotateGitHubApp,
     dns_observe::DnsObserve,
     estate_alarm::EstateAlarm,
     estate_compare::EstateCompare,
@@ -45,9 +46,11 @@ use boss_dispatcher_handlers::handlers::{
     jobs_clear_waiting::JobsClearWaiting,
     jobs_complete_linked_step::JobsCompleteLinkedStep,
     jobs_complete_step::JobsCompleteStep,
+    jobs_complete_step_from_record::JobsCompleteStepFromRecord,
     jobs_complete_step_matching::JobsCompleteStepMatching,
     jobs_flight_overdue::JobsFlightOverdue,
     jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
+    jobs_retract_matching::JobsRetractMatching,
     jobs_run_car_probes::JobsRunCarProbes,
     jobs_subjob_resolve::JobsSubjobResolve,
     ledger_bill_approve::LedgerBillApprove,
@@ -66,10 +69,12 @@ use boss_dispatcher_handlers::handlers::{
     packaging_allocate::PackagingAllocate,
     people_hire::PeopleHire,
     people_terminate::PeopleTerminate,
+    policy_coverage_alarm::PolicyCoverageAlarm,
     products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice,
     products_produce::ProductsProduce,
     retro_open::RetroOpen,
+    rule_drift_alarm,
     sensor_poll::{CredentialValues, SensorPoll, SensorSource},
     shipping_create::ShippingCreate,
     stripe_charges::StripeCharges,
@@ -216,20 +221,57 @@ async fn main() -> Result<()> {
     match cfg.authored_rules_dir.as_deref() {
         Some(dir) => match seed_rules_with_retry(&pool, dir).await {
             Ok(report) => {
-                if report.wrote_anything() {
-                    info!(
+                // "Wrote nothing" is not "matches" (backlog 732c3cf9): the
+                // line said "already matches ... present=88" over four
+                // rules edited without a version bump.
+                match report.headline() {
+                    SeedHeadline::Seeded => info!(
                         dir = %dir.display(),
                         inserted = ?report.inserted,
                         retired = ?report.retired,
                         present = report.present.len(),
+                        drifted = report.drifted.len(),
                         "seeded the dispatcher-rule registry from the authored directory"
-                    );
-                } else {
-                    info!(
+                    ),
+                    SeedHeadline::Matches => info!(
                         dir = %dir.display(),
                         present = report.present.len(),
                         "dispatcher-rule registry already matches the authored directory"
+                    ),
+                    SeedHeadline::Differs => tracing::warn!(
+                        dir = %dir.display(),
+                        present = report.present.len(),
+                        drifted = report.drifted.len(),
+                        behind = report.behind.len(),
+                        rejected = report.rejected.len(),
+                        "dispatcher-rule registry does NOT match the authored directory — \
+                         each rule that differs is named below"
+                    ),
+                }
+                for d in &report.drifted {
+                    tracing::warn!(
+                        rule = %d.name,
+                        version = d.version,
+                        row_status = %d.status,
+                        fields = ?d.fields,
+                        "the authored rule file DIFFERS from the live row at its own version — \
+                         it was edited without a version bump, so its edit is NOT in effect; \
+                         bump `version` in the file"
                     );
+                }
+                // Said as a packet too, beside the boot and never in
+                // front of it: a boot line is read by nobody, and a boot
+                // that waited on the jobs API would be an arm that needs
+                // the patient.
+                if !report.drifted.is_empty() {
+                    let owner: Arc<dyn boss_core::platform_owner::PlatformOwner> = Arc::new(
+                        boss_people_client::ReqwestPlatformOwner::new(cfg.people_api_url.clone()),
+                    );
+                    tokio::spawn(rule_drift_alarm::file_at_boot(
+                        cfg.jobs_api_url.clone(),
+                        owner,
+                        report.drifted.clone(),
+                    ));
                 }
                 for (name, authored, live) in &report.behind {
                     tracing::warn!(
@@ -303,16 +345,16 @@ async fn main() -> Result<()> {
             handlers.register(JobsSpawn::new(cfg.jobs_api_url.clone()));
             // Auto-park: on a gate-run's green `gate-verdict` step, file
             // the car the `--park-*` intent describes, so a gate-green
-            // branch never strands unparked. Needs the clock for a
-            // precise gate-step stamp (dock-queue-time). Inert until a
-            // rule on `step.done.gate-verdict` is published.
+            // branch never strands unparked. Its gate-step stamp
+            // (dock-queue-time) is the green event's own instant, so it
+            // holds no clock (2b03a2df). Inert until a rule on
+            // `step.done.gate-verdict` is published.
             // The raiser the estate series was recorded for: a HARD
             // finding persisting N consecutive comparisons becomes an
             // urgent packet (a5adfb99). Inert until a rule on
             // jobs.estate.compared is published.
             handlers.register(EstateAlarm::new(
                 cfg.jobs_api_url.clone(),
-                cfg.clock_api_url.clone(),
                 platform_owner.clone(),
             ));
             // The half that closes (ef421cd3): an alarm whose finding
@@ -335,16 +377,15 @@ async fn main() -> Result<()> {
             // That is why it is handed the enforced rules: it also reads
             // each one's dedup guard, so a cadence blocked by an
             // undrained packet is reported as SUPPRESSED, naming the
-            // packet. Needs the clock for the ages it measures.
+            // packet. The ages it measures are anchored on its firing
+            // day's midnight, not a clock read (2b03a2df).
             handlers.register(CadenceSilenceSweep::new(
                 cfg.jobs_api_url.clone(),
-                cfg.clock_api_url.clone(),
                 enforced_rules,
                 platform_owner.clone(),
             ));
             handlers.register(JobsAutoPark::new(
                 cfg.jobs_api_url.clone(),
-                cfg.clock_api_url.clone(),
                 platform_owner.clone(),
             ));
             // The week's retros (design 3613f0af, backlog 1dffde5d):
@@ -353,12 +394,11 @@ async fn main() -> Result<()> {
             // GET /api/departments (backlog 80a77466 — it served the
             // employee Class drawer until then), and
             // the platform's own protocol-retro under the same ISO-week
-            // window. Needs the clock for the firing day the window is
-            // judged against. Inert until a scheduled rule names it
+            // window, judged against the firing's own day (`_day`, not a
+            // clock read — 2b03a2df). Inert until a scheduled rule names it
             // (infra/dispatcher/rules/department-retros-weekly.toml).
             handlers.register(RetroOpen::new(
                 cfg.jobs_api_url.clone(),
-                cfg.clock_api_url.clone(),
                 platform_owner.clone(),
             ));
             // D7 delegate-subjob write-back: on a child Job's
@@ -411,6 +451,16 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The coverage backstop (design 1c4e42e1, backlog 47aed706):
+            // hourly, read the policy service's coverage and file one
+            // alarm per control no real person holds — the routes no
+            // write path sees (a migration, a seed, a restore). It
+            // refuses nothing; the guards wait for DR readiness.
+            handlers.register(PolicyCoverageAlarm::new(
+                cfg.policy_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A release packet's `tag` step going ready files the
             // forge's tag-release request itself — v<version> off the
             // packet, the newest closed train's merge_ref off the
@@ -448,12 +498,24 @@ async fn main() -> Result<()> {
             // two steps, the field and the path ride the rule row, and
             // the rule is the tenant's.
             handlers.register(JobsCompleteStepMatching::new(cfg.jobs_api_url.clone()));
+            // A fact that answers a machine-filed item withdraws every
+            // open packet carrying its key — a redelivered or resolved
+            // dead letter closes the item filed for its outbox row
+            // (ac0a0abd). Generic: kind, key, value and what the act
+            // says ride the rule row; the close is common::retraction.
+            handlers.register(JobsRetractMatching::new(cfg.jobs_api_url.clone()));
             // A clock rule completes an open step on every packet of a
             // kind that has gone silent past a bound — an agent-run
             // whose builder died is a packet that ages (c87fb59b car 2).
             // Generic: kind, step, the bound and what to write ride the
             // rule row; the tick's own `_at` is the clock.
             handlers.register(JobsAgeOutStep::new(cfg.jobs_api_url.clone()));
+            // A step going ready is completed from a record its own
+            // packet already holds — an agent-run's pre-green report
+            // lands on the green instead of waiting for a second one
+            // (b951c00a). Generic: kind, step, which key is the record
+            // and which fields it fills ride the rule row.
+            handlers.register(JobsCompleteStepFromRecord::new(cfg.jobs_api_url.clone()));
             // The same age read aimed at REAL WORK (078ddcb0): a step on
             // an agent in a workflow the rule declares, waiting past its
             // bound, files one urgent alarm — a payout post sat 63.6h on
@@ -581,6 +643,30 @@ async fn main() -> Result<()> {
                     cloudflare,
                     secrets.clone(),
                     workloads,
+                ));
+                // The GitHub App issuer (design 76155676, backlog
+                // 81eb6d4d): one-hour installation tokens minted from the
+                // App root — three keys of the same root Secret, whole or
+                // not at all. Incomplete, the handler is registered over
+                // Unconfigured carrying the refusal that names every
+                // missing key, so the refresh cadence records WHAT to
+                // place on every firing instead of tripping UnknownHandler.
+                let github: Arc<dyn credential_issuer::GitHubAppIssuer> =
+                    match credential_issuer::GitHubAppRoot::from_values(
+                        cfg.broker_github_app_id.as_deref(),
+                        cfg.broker_github_app_installation_id.as_deref(),
+                        cfg.broker_github_app_private_key.as_deref(),
+                    )
+                    .and_then(|root| {
+                        credential_issuer::GitHubApi::new(cfg.broker_github_api_url.clone(), root)
+                    }) {
+                        Ok(api) => api,
+                        Err(why) => Arc::new(Unconfigured(why)),
+                    };
+                handlers.register(CredentialRotateGitHubApp::new(
+                    cfg.jobs_api_url.clone(),
+                    github,
+                    secrets.clone(),
                 ));
                 // The zone observer (5e58922c, 198c5fe9): on a
                 // dns-zone-observation packet's observe step, read the
@@ -921,7 +1007,7 @@ async fn main() -> Result<()> {
         // gate, the clock and calendars the schedule runner fires by,
         // and the firing record's one reader.
         policy: boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(cfg.policy_api_url.clone()),
+            boss_policy_client::ReqwestPolicyClient::new("dispatcher", cfg.policy_api_url.clone()),
         )),
         clock: Arc::new(boss_clock_client::ReqwestClockClient::new(
             cfg.clock_api_url.clone(),

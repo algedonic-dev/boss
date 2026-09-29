@@ -8,7 +8,7 @@ After=postgresql.service
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
 Environment=RUST_LOG=info
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-messages-purge "messages_events retention sweep"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-messages-purge "messages_events retention sweep"
 ExecStart=/usr/local/bin/boss-messages-events-purge --config /etc/boss-messages-api.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-messages-purge run
 # Runs as root to match the rest of the boss-*-api units on

@@ -400,7 +400,7 @@ pub(crate) async fn unland(
     dry_run: bool,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a half-unlanded car (5083d6f5).
     if !dry_run {
@@ -795,7 +795,7 @@ pub(crate) mod tests {
                 &format!("{base}:refs/heads/main"),
             ],
         );
-        let wire = crate::steps::Wire::at(serve().await, admin_caller());
+        let wire = crate::steps::Wire::at(serve().await, admin_caller()).unwrap();
         let branch = "fix/a-stamp-cannot-land-on-a-moved-shape";
         let id = landed(&wire, branch, &merge).await;
 
@@ -849,7 +849,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_landing_main_still_carries_is_refused_and_nothing_is_written() {
         let (clone, _base, merge) = forge_that_lost_a_merge("unland-carried");
-        let wire = crate::steps::Wire::at(serve().await, admin_caller());
+        let wire = crate::steps::Wire::at(serve().await, admin_caller()).unwrap();
         let id = landed(&wire, "fix/still-on-main", &merge).await;
         let e = unland_car(&wire, &clone, &id, &merge[..12], false, now())
             .await

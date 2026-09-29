@@ -168,6 +168,18 @@ required = true
 item_keys = ["anchor", "decision"]
 covers = "questions"
 
+# The `review-design` KIND requires `doc_path` at done ("Path to the
+# design doc"), a field from before the packet became the doc: `boss
+# design` sets it on this step (empty when the design rides in
+# `markdown`) and the review surface writes it back. Declared so the
+# step's contract is whole wherever it is read (backlog a14f04b3;
+# tests/a_step_declares_what_its_kind_requires.rs) — whether the kind
+# should still require it is the kind's question, not this row's.
+[[workflow.step.fields]]
+name = "doc_path"
+field_type = "string"
+required = true
+
 # The fold is where a settled doc pays into current truth. Published
 # live as design-doc v4 (2026-09-05) before it reached this bundle;
 # the step text here is that row's, verbatim.

@@ -1,5 +1,6 @@
 //! `maintenance.chore.file_reds` — a chore that closed red opens one
-//! backlog-item per red route it recorded.
+//! backlog-item per red route it recorded, or ONE for the night when
+//! every red route shares a cause (the shell down, one HTTP status).
 //!
 //! The gap this closes (backlog ac3270c7, design 0e07ce64, 2026-09-18).
 //! The nightly playground crawl records its verdict on its `run` step
@@ -43,18 +44,36 @@
 //!    the crawl prints its RED lines last, so up to ~38 red routes
 //!    ride the packet and an omitted-lines marker means the pod log
 //!    holds more.
-//! 3. Dedup by route while one is open: every open backlog-item
-//!    carrying `metadata.red_route` (the paged walk `ops.judge` reads
-//!    the open board with, `common::open_jobs_of_kind`) — a route with
-//!    an open item files nothing, whichever night raised it. A route
-//!    whose item was CLOSED files again: a recurrence after a fix is a
-//!    new fact, the same posture `estate.alarm` takes.
-//! 4. File one backlog-item per remaining route, carrying the route,
-//!    the kind(s), the error text copied not retyped, the design id,
-//!    and `source` = the chore packet's id so a reader follows the
-//!    evidence to the run that saw it.
-//! 5. Note `judged` on the chore's packet naming what was filed and
-//!    what was already open.
+//! 3. ONE CAUSE IS ONE ITEM (backlog c8c6b9a8). When every red route
+//!    shares one cause — every one `no-shell` (the SPA shell painted for
+//!    none of them), or every finding naming the same HTTP status — the
+//!    reds are one finding, not N: file ONE item naming the cause
+//!    (`red_cause`) and listing the routes (`red_routes`), deduped by
+//!    the cause while one is open. Measured 2026-09-28: crawl 55bcf7fb
+//!    ran 04:45:18-04:45:59Z inside converge a10cbaa4 (opened 04:41:01,
+//!    rolled 4f9a588 onto the playground, closed 04:47:18); all 43
+//!    routes read no-shell and this handler filed 43 items, closed stale
+//!    by hand in 43 writes. A route-level item is right only when the
+//!    shell rendered and the route alone failed — a mixed night, or a
+//!    single red route, files per route as before.
+//! 4. Otherwise dedup by route while one is open: every open
+//!    backlog-item carrying `metadata.red_route` (the paged walk
+//!    `ops.judge` reads the open board with, `common::open_jobs_of_kind`)
+//!    — a route with an open item files nothing, whichever night raised
+//!    it. A route whose item was CLOSED files again: a recurrence after
+//!    a fix is a new fact, the same posture `estate.alarm` takes. File
+//!    one backlog-item per remaining route, carrying the route, the
+//!    kind(s), the error text copied not retyped and the design id.
+//! 5. Every item's `source` is `{kind: packet, id: <chore id>}` — the
+//!    structured shape `boss job file --source` records and the
+//!    receiving yard groups by (`boss_jobs::origin`), so one night's
+//!    items read as one group. It was the bare id string until
+//!    c8c6b9a8, which the yard reads as "no recorded source".
+//! 6. Note `judged` on the chore's packet naming what was filed and
+//!    what was already open, and `red_verdict`: `shell down (N routes)`
+//!    / `HTTP <status> on N routes` for a shared cause, `N routes red`
+//!    for route-level reds — so the crawl's own packet says which kind
+//!    of night it was without a reader re-deriving it from the lines.
 
 use super::common::{
     api_client, get_json, open_jobs_of_kind, owner_for_filing, row_or_refuse, write_json,
@@ -75,6 +94,17 @@ pub(crate) const RED_PREFIX: &str = "RED ";
 /// The dedup key a filed item carries — the route, and nothing else,
 /// because "dedup by route while one is open" is the whole rule.
 pub(crate) const RED_ROUTE: &str = "red_route";
+/// The dedup key a shared-cause item carries instead of a route.
+pub(crate) const RED_CAUSE: &str = "red_cause";
+/// The routes a shared-cause item lists, in the order the crawl printed.
+pub(crate) const RED_ROUTES: &str = "red_routes";
+/// The chore's own verdict, noted beside `judged`.
+pub(crate) const RED_VERDICT: &str = "red_verdict";
+/// The finding kind the crawl prints when the shell never painted
+/// (apps/web/tests/live/playground-crawl.spec.ts).
+pub(crate) const NO_SHELL: &str = "no-shell";
+/// The cause every route `no-shell` names.
+pub(crate) const SHELL_DOWN: &str = "shell down";
 
 /// One red route as the crawl reported it: every `(kind, error)` line
 /// it printed for that route, in order.
@@ -130,6 +160,156 @@ pub(crate) fn open_routes(open_jobs: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+/// PURE: the HTTP status an error text names — `status of NNN` (what
+/// Chromium logs for a failed resource) or `HTTP NNN` — as exactly three
+/// digits, or none.
+pub(crate) fn http_status(error: &str) -> Option<u16> {
+    ["status of ", "HTTP "].iter().find_map(|marker| {
+        error.match_indices(marker).find_map(|(at, _)| {
+            let digits: String = error[at + marker.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if digits.len() == 3 {
+                digits.parse().ok()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// PURE: the cause one finding names, if it names one a whole night can
+/// share: the shell never painted, or the gateway answered one status.
+fn cause_of(kind: &str, error: &str) -> Option<String> {
+    if kind == NO_SHELL {
+        Some(SHELL_DOWN.to_string())
+    } else {
+        http_status(error).map(|s| format!("HTTP {s}"))
+    }
+}
+
+/// PURE: the one cause EVERY finding on EVERY red route shares, when
+/// there are at least two red routes — one red route is a route, not a
+/// cause. A finding that names no cause, or two causes on one night,
+/// is route-level reds.
+pub(crate) fn shared_cause(reds: &[RedRoute]) -> Option<String> {
+    if reds.len() < 2 {
+        return None;
+    }
+    let mut causes = reds
+        .iter()
+        .flat_map(|r| r.findings.iter())
+        .map(|(kind, error)| cause_of(kind, error));
+    let first = causes.next().flatten()?;
+    causes
+        .all(|c| c.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+/// PURE: the causes already carried by an open backlog-item.
+pub(crate) fn open_causes(open_jobs: &[serde_json::Value]) -> Vec<String> {
+    open_jobs
+        .iter()
+        .filter_map(|j| j.get("metadata")?.get(RED_CAUSE)?.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// PURE: where every item this handler files came from — the chore
+/// packet, in the structured shape the receiving yard groups by
+/// (`boss_jobs::origin::source_of`; backlog c8c6b9a8).
+fn source_of_chore(chore_id: &str) -> serde_json::Value {
+    json!({ "kind": "packet", "id": chore_id })
+}
+
+/// PURE: the chore's verdict for a shared cause.
+fn cause_verdict(cause: &str, routes: usize) -> String {
+    if cause == SHELL_DOWN {
+        format!("{SHELL_DOWN} ({routes} routes)")
+    } else {
+        format!("{cause} on {routes} routes")
+    }
+}
+
+/// PURE: the chore's verdict for route-level reds.
+fn routes_verdict(routes: usize) -> String {
+    if routes == 1 {
+        "1 route red".to_string()
+    } else {
+        format!("{routes} routes red")
+    }
+}
+
+/// PURE: the ONE backlog-item a shared cause becomes — the cause on the
+/// title and as the dedup key, every route listed, every error copied.
+pub(crate) fn cause_item_body(
+    cause: &str,
+    reds: &[RedRoute],
+    chore_id: &str,
+    chore_kind: &str,
+    chore_title: &str,
+    design: &str,
+    area: &str,
+    owner: &str,
+    ctx: &InvocationContext,
+) -> serde_json::Value {
+    let routes: Vec<&str> = reds.iter().map(|r| r.route.as_str()).collect();
+    let mut kinds: Vec<&str> = reds
+        .iter()
+        .flat_map(|r| r.findings.iter().map(|(k, _)| k.as_str()))
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let errors: Vec<String> = reds
+        .iter()
+        .flat_map(|r| {
+            r.findings
+                .iter()
+                .map(move |(k, e)| format!("{} {k}: {e}", r.route))
+        })
+        .collect();
+    let short = &chore_id[..chore_id.len().min(8)];
+    let n = routes.len();
+    let why = if cause == SHELL_DOWN {
+        "the SPA shell painted for none of them, so the instance, its gateway or a roll is the \
+         finding — not any one route"
+    } else {
+        "every one answered the same status, so what serves them is the finding — not any one \
+         route"
+    };
+    json!({
+        "kind": "backlog-item",
+        "title": format!("{chore_title} red: {cause} on {n} routes"),
+        "subject": {"subject_kind": "custom", "id": "bosspipeline"},
+        "owner_id": owner,
+        "priority": "standard",
+        "status": "open",
+        "tags": [],
+        "metadata": {
+            "input_channel": super::common::lane_label(InputChannel::PipelineFailure),
+            "area": area,
+            "design": design,
+            RED_CAUSE: cause,
+            RED_ROUTES: routes,
+            "red_kind": kinds.join(","),
+            "red_error": errors.join(" | "),
+            "source": source_of_chore(chore_id),
+            "reporter": ctx.rule_name,
+            "triggered_by_event_id": ctx.triggering_event_id,
+            "detail": format!(
+                "Filed by {} (backlog c8c6b9a8, design {design}): the {chore_kind} packet \
+                 {short} closed red with {n} red routes sharing one cause, {cause}: {why}. \
+                 ONE item for the cause, listing every route: {}. While it is open a second \
+                 night with the same cause files nothing. The chore's run step holds the \
+                 whole excerpt.",
+                ctx.rule_name,
+                routes.join(", ")
+            ),
+        },
+    })
+}
+
 /// PURE: the backlog-item one red route becomes.
 pub(crate) fn item_body(
     red: &RedRoute,
@@ -167,8 +347,7 @@ pub(crate) fn item_body(
             RED_ROUTE: red.route,
             "red_kind": kinds,
             "red_error": errors.join(" | "),
-            "source": chore_id,
-            "source_kind": chore_kind,
+            "source": source_of_chore(chore_id),
             "reporter": ctx.rule_name,
             "triggered_by_event_id": ctx.triggering_event_id,
             "detail": format!(
@@ -185,7 +364,7 @@ pub(crate) fn item_body(
 }
 
 pub struct ChoreFileReds {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who the items this handler files are owned by — the platform
     /// owner through the port (backlog 3c23662d), resolved once per
@@ -207,7 +386,7 @@ impl ChoreFileReds {
 
     /// Tests point the client at a local stand-in for jobs-api.
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
@@ -313,56 +492,94 @@ impl Handler for ChoreFileReds {
             return Ok(());
         }
 
-        // 3. Dedup by route while one is open.
         let open = open_jobs_of_kind(&self.client, self.base(), "backlog-item", rule).await?;
-        let already = open_routes(&open);
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
 
-        // 4. One item per route not already open.
+        // 3. One cause, one item, deduped by the cause; 4. otherwise one
+        //    item per route, deduped by the route. Each candidate is its
+        //    dedup key and the body it files.
+        let (verdict, shared, candidates): (String, bool, Vec<(String, serde_json::Value)>) =
+            match shared_cause(&reds) {
+                Some(cause) => {
+                    let body = cause_item_body(
+                        &cause,
+                        &reds,
+                        chore_id,
+                        chore_kind,
+                        chore_title,
+                        design,
+                        area,
+                        &owner,
+                        ctx,
+                    );
+                    (cause_verdict(&cause, reds.len()), true, vec![(cause, body)])
+                }
+                None => (
+                    routes_verdict(reds.len()),
+                    false,
+                    reds.iter()
+                        .map(|red| {
+                            let body = item_body(
+                                red,
+                                chore_id,
+                                chore_kind,
+                                chore_title,
+                                design,
+                                area,
+                                &owner,
+                                ctx,
+                            );
+                            (red.route.clone(), body)
+                        })
+                        .collect(),
+                ),
+            };
+        let already = if shared {
+            open_causes(&open)
+        } else {
+            open_routes(&open)
+        };
+
         let mut filed: Vec<(String, String)> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
-        for red in &reds {
-            if already.iter().any(|r| r == &red.route) {
-                skipped.push(red.route.clone());
+        for (key, body) in &candidates {
+            if already.iter().any(|k| k == key) {
+                skipped.push(key.clone());
                 continue;
             }
-            let body = item_body(
-                red,
-                chore_id,
-                chore_kind,
-                chore_title,
-                design,
-                area,
-                &owner,
-                ctx,
-            );
             let id = super::common::post_json_minted_id(
                 &self.client,
                 &format!("{}/api/jobs", self.base()),
-                &body,
+                body,
                 rule,
             )
             .await?;
-            filed.push((red.route.clone(), id));
+            filed.push((key.clone(), id));
         }
 
-        // 5. The note on the judged chore.
+        // 6. The note on the judged chore, with its verdict.
         let filed_ids: Vec<&str> = filed.iter().map(|(_, id)| id.as_str()).collect();
         let filed_text: Vec<String> = filed
             .iter()
-            .map(|(route, id)| format!("{route} → {}", &id[..id.len().min(8)]))
+            .map(|(key, id)| format!("{key} → {}", &id[..id.len().min(8)]))
             .collect();
+        let shape = if shared {
+            " share one cause, so ONE item lists them"
+        } else {
+            ""
+        };
         self.annotate(
             chore_id,
             json!({
                 JUDGED: format!(
-                    "{rule}: {} red route(s) on step `{step}`; filed {} backlog-item(s) [{}]; \
-                     already open [{}]",
+                    "{rule}: {verdict} — {} red route(s) on step `{step}`{shape}; filed {} \
+                     backlog-item(s) [{}]; already open [{}]",
                     reds.len(),
                     filed.len(),
                     filed_text.join(", "),
                     skipped.join(", ")
                 ),
+                RED_VERDICT: verdict,
                 "filed": filed_ids,
             }),
             rule,
@@ -393,6 +610,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: RULE.into(),
             triggering_event_id: "evt-close-9".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -542,7 +760,7 @@ mod tests {
 
     fn handler(base: String) -> Arc<ChoreFileReds> {
         ChoreFileReds::with_client(
-            reqwest::Client::new(),
+            crate::handlers::common::api_client(),
             base,
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )
@@ -635,8 +853,18 @@ mod tests {
                 .is_some_and(|e| e.starts_with("pageerror: Cannot read properties of null")),
             "{m}"
         );
-        assert_eq!(m["source"], CRAWL);
-        assert_eq!(m["source_kind"], "maintenance-playground-crawl");
+        // THE SOURCE IS STRUCTURED (backlog c8c6b9a8): `{kind: packet,
+        // id}`, the shape `boss job file --source` records and the
+        // receiving yard groups by — a bare id string read as "no
+        // recorded source" on all 43 items of 2026-09-28.
+        assert_eq!(m["source"], json!({"kind": "packet", "id": CRAWL}));
+        let reading = boss_jobs::origin::source_of(m);
+        assert_eq!(
+            reading.basis,
+            boss_jobs::origin::SourceBasis::Recorded,
+            "the receiving yard reads the source as recorded: {m}"
+        );
+        assert_eq!(reading.key.as_deref(), Some(&*format!("packet:{CRAWL}")));
         assert_eq!(m["reporter"], RULE);
         assert!(
             m["detail"].as_str().is_some_and(
@@ -682,6 +910,11 @@ mod tests {
         assert!(
             text.contains("/it/registry/dispatcher → f0000000"),
             "names each filed item by route: {text}"
+        );
+        assert_eq!(
+            note.2[RED_VERDICT], "2 routes red",
+            "the shell rendered and two routes failed on their own: that is `N routes red`, \
+             never `shell down`"
         );
         assert_eq!(
             note.2["filed"],
@@ -750,6 +983,242 @@ mod tests {
         assert!(
             text.contains("no `RED <route> <kind>: <error>` line"),
             "{text}"
+        );
+    }
+
+    // -- one cause, one item (backlog c8c6b9a8) ---------------------------
+
+    /// The night of 2026-09-28 in miniature: train #768's converge rolled
+    /// the playground mid-crawl and no route painted the shell. Each
+    /// route's error names its own URL, so the texts differ; the KIND is
+    /// the shared cause.
+    const SHELL_DOWN_OUTPUT: &str = "crawled 4 routes at http://gw: 4 red, 0 console.error, 0 expected console.error\n\
+RED / no-shell: page.goto: net::ERR_CONNECTION_REFUSED at http://gw/\n\
+RED /it no-shell: Timed out 20000ms waiting for expect(locator).toBeVisible()\n\
+RED /ux/views no-shell: page.goto: net::ERR_CONNECTION_REFUSED at http://gw/ux/views\n\
+RED /ux/views no-shell: page.goto: net::ERR_CONNECTION_REFUSED at http://gw/ux/views\n\
+RED /system/workflows no-shell: Timed out 20000ms waiting for expect(locator).toBeVisible()\n";
+
+    /// Every route threw on the same answer from the gateway.
+    const HTTP_502_OUTPUT: &str = "RED /a pageerror: Failed to load resource: the server responded with a status of 502 (Bad Gateway)\n\
+RED /b pageerror: Failed to load resource: the server responded with a status of 502 (Bad Gateway) | at B.svelte:9\n\
+RED /c pageerror: HTTP 502 from /api/c\n";
+
+    #[test]
+    fn a_shared_cause_is_every_red_route_no_shell_or_one_http_status() {
+        assert_eq!(
+            shared_cause(&red_routes(SHELL_DOWN_OUTPUT)).as_deref(),
+            Some(SHELL_DOWN)
+        );
+        assert_eq!(
+            shared_cause(&red_routes(HTTP_502_OUTPUT)).as_deref(),
+            Some("HTTP 502")
+        );
+        // The shell rendered on the pageerror route: no shared cause.
+        assert_eq!(shared_cause(&red_routes(RED_OUTPUT)), None);
+        // One red route is a route, not a cause — even a no-shell one.
+        assert_eq!(
+            shared_cause(&red_routes("RED /x no-shell: Timed out\n")),
+            None
+        );
+        // Two statuses are two causes.
+        assert_eq!(
+            shared_cause(&red_routes(
+                "RED /a pageerror: status of 502\nRED /b pageerror: status of 503\n"
+            )),
+            None
+        );
+        // A pageerror with no status beside a no-shell route: no cause.
+        assert_eq!(
+            shared_cause(&red_routes(
+                "RED /a no-shell: Timed out\nRED /b pageerror: boom\n"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn an_http_status_is_read_off_the_error_text_or_not_at_all() {
+        assert_eq!(
+            http_status("the server responded with a status of 404 (Not Found)"),
+            Some(404)
+        );
+        assert_eq!(http_status("HTTP 503 from /api/x"), Some(503));
+        assert_eq!(
+            http_status("status of 5020"),
+            None,
+            "four digits is not a status"
+        );
+        assert_eq!(http_status("HTTP/1.1 said nothing"), None);
+        assert_eq!(http_status("Cannot read properties of null"), None);
+    }
+
+    /// Every route no-shell: ONE item naming the cause and listing every
+    /// route, and the chore's verdict says `shell down`, not `4 routes red`.
+    #[tokio::test]
+    async fn every_route_no_shell_files_one_shell_down_item_listing_the_routes() {
+        let (base, writes) = mock_jobs(vec![crawl(SHELL_DOWN_OUTPUT)]).await;
+        handler(base).invoke(&args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "one cause, one item — not four: {w:?}");
+        let item = &filed[0];
+        assert_eq!(
+            item["title"],
+            "Playground crawl red: shell down on 4 routes"
+        );
+        let m = &item["metadata"];
+        assert_eq!(m[RED_CAUSE], SHELL_DOWN);
+        assert_eq!(
+            m[RED_ROUTES],
+            json!(["/", "/it", "/ux/views", "/system/workflows"]),
+            "every route listed, in the order the crawl printed them"
+        );
+        assert!(
+            m.get(RED_ROUTE).is_none(),
+            "a shared-cause item holds no single route, so it never dedups a later night's \
+             route-level red: {m}"
+        );
+        assert_eq!(m["source"], json!({"kind": "packet", "id": CRAWL}));
+        assert_eq!(m["design"], DESIGN);
+        assert!(
+            m["red_error"].as_str().is_some_and(
+                |e| e.contains("/ux/views no-shell: page.goto: net::ERR_CONNECTION_REFUSED")
+            ),
+            "each route's error copied, not retyped: {m}"
+        );
+        let note = w.last().unwrap();
+        assert_eq!(note.0, "PATCH");
+        assert_eq!(note.2[RED_VERDICT], "shell down (4 routes)");
+        let text = note.2[JUDGED].as_str().unwrap_or("");
+        assert!(
+            text.contains("shell down") && text.contains("filed 1 backlog-item(s)"),
+            "{text}"
+        );
+        assert_eq!(
+            note.2["filed"],
+            json!(["f0000000-0000-0000-0000-000000000002"])
+        );
+    }
+
+    /// The same HTTP status on every red route is one cause too.
+    #[tokio::test]
+    async fn one_http_status_on_every_red_route_files_one_item() {
+        let (base, writes) = mock_jobs(vec![crawl(HTTP_502_OUTPUT)]).await;
+        handler(base).invoke(&args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert_eq!(
+            filed[0]["title"],
+            "Playground crawl red: HTTP 502 on 3 routes"
+        );
+        assert_eq!(filed[0]["metadata"][RED_CAUSE], "HTTP 502");
+        assert_eq!(filed[0]["metadata"][RED_ROUTES], json!(["/a", "/b", "/c"]));
+        assert_eq!(w.last().unwrap().2[RED_VERDICT], "HTTP 502 on 3 routes");
+    }
+
+    /// A shell-down item still open dedups the next shell-down night: the
+    /// cause is the key, the way the route is for a route-level item.
+    #[tokio::test]
+    async fn an_open_item_for_the_cause_dedups_it() {
+        let mut open = open_item("aaaaaaaa-0000-0000-0000-000000000009", "");
+        open["metadata"] = json!({ "area": "web", "design": DESIGN, RED_CAUSE: SHELL_DOWN });
+        let (base, writes) = mock_jobs(vec![crawl(SHELL_DOWN_OUTPUT), open]).await;
+        handler(base).invoke(&args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        assert!(posts(&w).is_empty(), "{w:?}");
+        let note = &w.last().unwrap().2;
+        assert_eq!(note[RED_VERDICT], "shell down (4 routes)");
+        let text = note[JUDGED].as_str().unwrap_or("");
+        assert!(
+            text.contains("filed 0 backlog-item(s)") && text.contains("already open [shell down]"),
+            "{text}"
+        );
+    }
+
+    /// One no-shell route while the rest painted is that route's own red.
+    #[tokio::test]
+    async fn a_lone_no_shell_route_is_its_own_item() {
+        let (base, writes) = mock_jobs(vec![crawl("RED /x/1 no-shell: Timed out 20000ms\n")]).await;
+        handler(base).invoke(&args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert_eq!(filed[0]["metadata"][RED_ROUTE], "/x/1");
+        assert!(filed[0]["metadata"].get(RED_CAUSE).is_none());
+        assert_eq!(w.last().unwrap().2[RED_VERDICT], "1 route red");
+    }
+
+    /// The recovery-sheet check (design 125d405d car 3, rule
+    /// file-backlog-items-on-recovery-sheet-red): its manifest prints
+    /// `RED recovery-sheet <half>: <last line>` when a half fails, so
+    /// two failed days in a row — even failing in different halves — are
+    /// ONE item keyed `recovery-sheet`, and the second day notes it
+    /// already open. A check failing every day is loud once, not silent.
+    #[tokio::test]
+    async fn consecutive_failed_recovery_sheet_checks_file_one_item() {
+        let check = |id: &str, red: &str| {
+            json!({
+                "id": id,
+                "kind": "maintenance-recovery-sheet",
+                "title": "Recovery sheet check",
+                "status": "closed",
+                "metadata": {},
+                "steps": [
+                    { "id": format!("{id}-run"), "spec_slug": "run", "status": "completed",
+                      "metadata": { "result": "failed", "exit_status": "1", "output": red } },
+                ],
+            })
+        };
+        let day = |id: &str| InvocationContext {
+            event_timestamp: None,
+            rule_name: "file-backlog-items-on-recovery-sheet-red".into(),
+            triggering_event_id: format!("evt-{id}"),
+            triggering_topic: "jobs.job.closed".into(),
+            event_payload: json!({
+                "id": id, "closed_on": "2026-09-30", "kind": "maintenance-recovery-sheet",
+                "outcome": "failed", "title": "Recovery sheet check",
+                "subject_id": "infra/maintenance-recovery-sheet", "parent_step_id": null,
+            }),
+        };
+        const DAY1: &str = "33333333-3333-3333-3333-333333333331";
+        const DAY2: &str = "33333333-3333-3333-3333-333333333332";
+        let (base, writes) = mock_jobs(vec![
+            check(
+                DAY1,
+                "tree version x\nError: the recovery sheet did not print: no Chromium found\nRED recovery-sheet check: Error: the recovery sheet did not print: no Chromium found\n",
+            ),
+            check(
+                DAY2,
+                "fatal: Authentication failed\nRED recovery-sheet clone: fatal: Authentication failed\n",
+            ),
+        ])
+        .await;
+        let args: Vec<(String, Value)> = [
+            ("step", "run"),
+            ("design", "125d405d"),
+            ("area", "recovery"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.into())))
+        .collect();
+        let h = handler(base);
+        h.invoke(&args, &day(DAY1)).await.unwrap();
+        h.invoke(&args, &day(DAY2)).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "two failed days, one item: {w:?}");
+        assert_eq!(filed[0]["metadata"][RED_ROUTE], "recovery-sheet");
+        assert_eq!(filed[0]["metadata"]["design"], "125d405d");
+        assert_eq!(filed[0]["metadata"]["area"], "recovery");
+        let second = w.last().unwrap();
+        assert_eq!(second.1, format!("/api/jobs/{DAY2}/metadata"));
+        assert!(
+            second.2[JUDGED]
+                .as_str()
+                .is_some_and(|t| t.contains("already open [recovery-sheet]")),
+            "{second:?}"
         );
     }
 

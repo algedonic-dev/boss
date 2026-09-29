@@ -33,7 +33,7 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test, type Download, type Page, type Request, type Route } from './_test';
 import { mountPage } from './_helpers';
-import { installSmokeMocks, servePeopleRows } from './_smokeMocks';
+import { installSmokeMocks, servePeopleRows, signInWithPolicy, type PolicyAnswer } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { parseRoute } from '../../src/router';
@@ -241,7 +241,14 @@ const DEFAULTS: Record<keyof typeof ENDPOINTS, Answer> = {
 /// Every API request the page sends, in order, as "METHOD url".
 type Sent = Readonly<{ method: string; url: string; body: string | null }>;
 
-async function install(page: Page, reads: Reads = {}): Promise<Sent[]> {
+/// Signed in as a writer whose every policy check answers `decide` —
+/// Allow unless a test says otherwise, because the page's writes are
+/// hidden until policy allows them (backlog 9dad102c).
+async function install(
+  page: Page,
+  reads: Reads = {},
+  decide?: (action: string, resource: string) => PolicyAnswer,
+): Promise<Sent[]> {
   // window.print() is the Print / PDF buttons' whole effect: counted,
   // not opened (a headed run would block on the real dialog).
   await page.addInitScript(() => {
@@ -252,6 +259,7 @@ async function install(page: Page, reads: Reads = {}): Promise<Sent[]> {
     };
   });
   await installSmokeMocks(page);
+  await signInWithPolicy(page, decide);
   for (const [name, re] of Object.entries(ENDPOINTS) as [keyof typeof ENDPOINTS, RegExp][]) {
     const answer = name in reads ? reads[name] : DEFAULTS[name];
     await page.route(re, (r) =>
@@ -270,7 +278,9 @@ const prints = (page: Page): Promise<number> =>
   page.evaluate(() => (window as unknown as { __prints: number }).__prints);
 const reads = (sent: ReadonlyArray<Sent>, re: RegExp): string[] =>
   sent.filter((s) => s.method === 'GET' && re.test(s.url)).map((s) => s.url);
-const writes = (sent: ReadonlyArray<Sent>): Sent[] => sent.filter((s) => s.method !== 'GET' && !/surface-opens/.test(s.url));
+/// A policy check is a POST that writes nothing (9dad102c), so it is not one.
+const writes = (sent: ReadonlyArray<Sent>): Sent[] =>
+  sent.filter((s) => s.method !== 'GET' && !/surface-opens|\/api\/policy\/check$/.test(s.url));
 
 /// The catalog entry a link lands under — its own path, or the nearest
 /// catalogued parent of a detail route — read from nav-catalog.ts, and
@@ -610,6 +620,42 @@ test.describe('/ux/finance — Invoices', () => {
     await expect(failed).toContainText("Couldn't load invoices —");
     await expect(failed).toContainText('HTTP 503');
     await expect(panel(page).getByText('No invoices match those filters.')).toHaveCount(0);
+  });
+
+  // Backlog 0ef5e008: the tab had one empty line, the filters sentence,
+  // for an empty book, a read still in flight and a filter that hid
+  // every row alike. The last keeps it (the two tests above); the other
+  // two say what they are.
+  test('an empty book says there are no invoices, not that the filters hid them', async ({ page }) => {
+    await install(page, { invoices: { data: [], total: 0, limit: 1000, offset: 0 } });
+    await mountPage(page, `${PATH}?tab=invoices`);
+    await expect(panel(page).locator('p.empty')).toHaveText('No invoices yet.');
+    await expect(panel(page).getByText('No invoices match those filters.')).toHaveCount(0);
+    await expect(panel(page).locator(FAILURE_MARKER)).toHaveCount(0);
+  });
+
+  test('an invoice read still in flight says Loading, not an empty book', async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await install(page, {
+      invoices: async (r: Route) => {
+        await held;
+        await json(r, DEFAULTS.invoices);
+      },
+    });
+    await mountPage(page, `${PATH}?tab=invoices`);
+    await expect(panel(page).locator('p.empty')).toHaveText('Loading…');
+    release();
+    await expect(ids(page)).toHaveText(['inv-0002', 'inv-0001', 'inv-0003', 'inv-0004']);
+  });
+
+  test('a 200 invoice body that is not the envelope is a failed read naming the read', async ({ page }) => {
+    await install(page, { invoices: INVOICES });
+    await mountPage(page, `${PATH}?tab=invoices`);
+    await expect(panel(page).locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
+      "Couldn't load invoices — /api/commerce/invoices?limit=1000: HTTP 200, but the body is a list, not a {data: [...]} envelope",
+    );
+    await expect(rows(page)).toHaveCount(0);
   });
 });
 
@@ -976,11 +1022,14 @@ test.describe('/ux/finance — Tax liability', () => {
 
 // ---------------------------------------------------------------------------
 // The auditor's page: every write and both create links are withheld.
+// The auditor is `audit-readonly`, the read-only floor role; the page hid
+// its writes for the role string 'auditor' until backlog 432f0eb4, which
+// no one carries, so it hid them from nobody.
 // ---------------------------------------------------------------------------
 
 test.describe('/ux/finance — an auditor reads, and writes nothing', () => {
   const AUDITOR = {
-    id: 'emp-aud', name: 'Ada Auditor', email: 'ada@demo', role: 'auditor', department: 'finance',
+    id: 'emp-aud', name: 'Ada Auditor', email: 'ada@demo', role: 'audit-readonly', department: 'finance',
     hire_date: '2024-01-01', status: 'active', location: 'HQ', employment_type: 'full-time', skills: [], certifications: [],
   };
 
@@ -988,7 +1037,7 @@ test.describe('/ux/finance — an auditor reads, and writes nothing', () => {
     await install(page, { periods: [PERIOD_OPEN, { ...PERIOD_LOCKED, id: 'per-2026-08', starts_on: '2026-08-01' }] });
     await page.route(/\/api\/people$/, (r) => json(r, [AUDITOR]));
     await servePeopleRows(page, [AUDITOR]);
-    await page.route(/\/api\/session$/, (r) => json(r, { username: 'ada', employee_id: AUDITOR.id, role: 'auditor' }));
+    await page.route(/\/api\/session$/, (r) => json(r, { username: 'ada', employee_id: AUDITOR.id, role: 'audit-readonly' }));
     await mountPage(page, `${PATH}?entry=ent-0001`);
 
     await expect(page.getByRole('link', { name: '+ New invoice' })).toHaveCount(0);
@@ -997,6 +1046,62 @@ test.describe('/ux/finance — an auditor reads, and writes nothing', () => {
     await expect(page.locator('.tb-linked-entry .tb-entry-detail h4')).toContainText('Entry ent-0001');
     await expect(page.getByRole('button', { name: 'Reverse this entry' })).toHaveCount(0);
     await expect(panel(page).locator('table.tb-periods tbody tr')).toHaveCount(2);
+    await expect(panel(page).locator('table.tb-periods').getByRole('button')).toHaveCount(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The writes ask policy (backlog 9dad102c). The read-only floor alone let
+// a tenant grant it did not know show buttons that 403 and hid ones that
+// would work; each write now also waits for policy's Allow on its own
+// (action, resource), asked as the gateway's policy_user.
+// ---------------------------------------------------------------------------
+
+test.describe('/ux/finance — each write is offered only when policy allows it', () => {
+  const PERIODS = { periods: [PERIOD_OPEN, { ...PERIOD_LOCKED, id: 'per-2026-08', starts_on: '2026-08-01' }] };
+
+  test('Allow on all four: every write shows, and each question is asked once, as the session', async ({ page }) => {
+    await install(page, PERIODS);
+    const asked: string[] = [];
+    const bodies: unknown[] = [];
+    page.on('request', (r) => {
+      if (/\/api\/policy\/check$/.test(r.url())) {
+        const b = JSON.parse(r.postData() ?? '{}') as { action: string; resource: string; user: unknown };
+        asked.push(`${b.action} ${b.resource}`);
+        bodies.push(b.user);
+      }
+    });
+    await mountPage(page, `${PATH}?entry=ent-0001`);
+
+    await expect(page.getByRole('link', { name: '+ New invoice' })).toBeVisible();
+    await expect(page.getByRole('link', { name: '+ New journal entry' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reverse this entry' })).toBeVisible();
+    await expect(panel(page).locator('table.tb-periods').getByRole('button')).toHaveText(['Lock', 'Unlock']);
+    expect([...asked].sort()).toEqual(['close ledger-period', 'create invoice', 'create ledger', 'update ledger-period']);
+    expect(new Set(bodies.map((u) => JSON.stringify(u)))).toEqual(new Set([JSON.stringify({ id: 'emp-001', role: 'ceo' })]));
+  });
+
+  test('a Deny hides the write it answers, and only that one', async ({ page }) => {
+    await install(page, PERIODS, (action, resource) =>
+      (action === 'create' && resource === 'invoice') || (action === 'close' && resource === 'ledger-period') ? 'deny' : 'allow');
+    await mountPage(page, `${PATH}?entry=ent-0001`);
+
+    await expect(page.getByRole('link', { name: '+ New journal entry' })).toBeVisible();
+    await expect(page.getByRole('link', { name: '+ New invoice' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Reverse this entry' })).toBeVisible();
+    await expect(panel(page).locator('table.tb-periods').getByRole('button')).toHaveText(['Unlock']);
+    await expect(panel(page).locator('table.tb-periods tbody tr').first().locator('td').last()).toHaveText('—');
+  });
+
+  test('a check that fails hides every write it gates', async ({ page }) => {
+    await install(page, PERIODS, () => 503);
+    await mountPage(page, `${PATH}?entry=ent-0001`);
+
+    await expect(page.locator('.tb-linked-entry .tb-entry-detail h4')).toContainText('Entry ent-0001');
+    await expect(panel(page).locator('table.tb-periods tbody tr')).toHaveCount(2);
+    await expect(page.getByRole('link', { name: '+ New invoice' })).toHaveCount(0);
+    await expect(page.getByRole('link', { name: '+ New journal entry' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Reverse this entry' })).toHaveCount(0);
     await expect(panel(page).locator('table.tb-periods').getByRole('button')).toHaveCount(0);
   });
 });

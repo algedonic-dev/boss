@@ -24,21 +24,23 @@
 // registry. This file still serves the drawer to the surfaces whose
 // question it actually is.
 
-type ClassRow = Readonly<{
-  subject_kind: string;
-  code: string;
-  display_name: string;
-  parent_code: string | null;
-  member_attribute: string;
-  metadata: Readonly<Record<string, unknown>>;
-  sort_order: number;
-  retired_at: string | null;
-}>;
+//
+// THE LOAD STATE (backlog e520c794, 2026-09-28). `classesFor` answers []
+// on error as it does while loading, so a page reading only it cannot
+// tell an outage from an empty taxonomy. `classesLoad` answers that
+// question beside it, with the failure's reason; the judging is pure
+// and lives in classes-read.ts, where `bun test` can reach it.
 
-type ClassesState =
-  | { kind: 'loading' }
-  | { kind: 'ready'; rows: ReadonlyArray<ClassRow> }
-  | { kind: 'error' };
+import {
+  classesLoadOf,
+  classesStateOfAnswer,
+  classesUrl,
+  type ClassesLoad,
+  type ClassesState,
+  type ClassRow,
+} from './classes-read';
+
+export type { ClassesLoad } from './classes-read';
 
 // Cache of loaded class sets, keyed by subject_kind. Reassigned (not
 // mutated in place) on each transition so the $derived reads in callers
@@ -63,28 +65,27 @@ export async function loadClasses(subject_kind: string): Promise<void> {
   if (requested.has(subject_kind)) return;
   requested.add(subject_kind);
   classes.value = { ...classes.value, [subject_kind]: { kind: 'loading' } };
+  const url = classesUrl(subject_kind);
+  let st: ClassesState;
   try {
-    const r = await fetch(
-      `/api/classes?subject_kind=${encodeURIComponent(subject_kind)}`,
-    );
-    // An answer that is not a list is an error, not a registry: since
-    // the chrome bar reads departments from here on every page
-    // (ce68f137), a `{data: [], total: 0}` envelope from a wrong
-    // endpoint used to throw inside a derived and take the shell down.
+    const r = await fetch(url);
     const body: unknown = r.ok ? await r.json() : null;
-    if (Array.isArray(body)) {
-      classes.value = {
-        ...classes.value,
-        [subject_kind]: { kind: 'ready', rows: body as ClassRow[] },
-      };
-    } else {
-      requested.delete(subject_kind);
-      classes.value = { ...classes.value, [subject_kind]: { kind: 'error' } };
-    }
-  } catch {
-    requested.delete(subject_kind);
-    classes.value = { ...classes.value, [subject_kind]: { kind: 'error' } };
+    st = classesStateOfAnswer(url, r, body);
+  } catch (e) {
+    st = { kind: 'error', error: `${url}: ${e instanceof Error ? e.message : String(e)}` };
   }
+  if (st.kind === 'error') requested.delete(subject_kind);
+  classes.value = { ...classes.value, [subject_kind]: st };
+}
+
+/// Whether the Class rows for a subject_kind have answered — loading,
+/// ready, or error with its reason — so a page that reads `classesFor`
+/// can say when its options are missing because the read failed. Its one
+/// renderer is ui/ClassesReadFailed.svelte, the shared failure line
+/// (backlog 8d58d250; it replaced a boolean `classesReadFailed` that
+/// knew THAT the read failed and not why).
+export function classesLoad(subject_kind: string): ClassesLoad {
+  return classesLoadOf(classes.value[subject_kind]);
 }
 
 /// Active (non-retired) Class rows for a (subject_kind, member_attribute),

@@ -10,6 +10,7 @@
   // Nothing on this instance produces a requisition; the boss-people
   // API stays for the example tenants.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -17,10 +18,12 @@
   import { appNow } from '@boss/web-kit/sim-clock';
   import {
     classLabel,
+    departmentNames,
     type Department,
     type Employee,
   } from '../people/types';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { departments } from '@boss/web-kit/session/departments.svelte';
   import { tenureYears, expiringCerts } from '../people/utils';
   import {
     workflowSurfaces,
@@ -36,6 +39,7 @@
   import { countedRoster, headcount, rosterHeader } from '../people/roster-counts';
   import { readStateOfLoad } from '../data/readState';
   import { href, navigate } from '../router';
+  import { putStep } from '../steps/stepWrite';
 
   type Tab = 'overview' | 'certs' | 'headcount' | 'workflows';
 
@@ -119,9 +123,10 @@
     }
     return [...m.entries()].sort((a, b) => b[1].active - a[1].active);
   });
-  // Headcount rows are labelled from the department's Class display_name
-  // (backlog 8677728c: `operations` printed Operations for Operations / IT).
-  let departmentClasses = $derived(classesFor('employee', 'department'));
+  // Headcount rows are labelled from the department's registry display
+  // name (backlog 8677728c: `operations` printed Operations for
+  // Operations / IT) — the departments registry since c87e3d6d.
+  let departmentClasses = $derived(departmentNames(departments()));
 
   // ------------------------------------------------------------
   // Workflows tab — HR workflows driven through the canonical
@@ -304,11 +309,9 @@
     // on the Job whose tasks are open (backlog 5b27ed56).
     if (!selectedJob) return;
     const jobId = selectedJob;
-    await fetch(`/api/jobs/${encodeURIComponent(jobId)}/steps/${taskId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status }),
-    });
+    // Through the step door, the one file that builds a step's URL
+    // (backlog e39a9d2a): the reload below shows whatever it answered.
+    await putStep(jobId, taskId, { status });
     await loadTasks(jobId);
     await fetchWorkflows();
   }
@@ -335,6 +338,7 @@
 
 <div class="catalog theme-exec">
   <PageHeader eyebrow="HR admin" title={header.title} subtitle={header.subtitle} />
+  <ClassesReadFailed subjectKind="employee" what="roles" fallback="Roles show by code, and the counts include every role." />
 
   <nav class="tabs" role="tablist">
     {#each TABS as t (t.id)}

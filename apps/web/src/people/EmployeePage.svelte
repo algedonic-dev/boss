@@ -1,6 +1,7 @@
 <script lang="ts">
   // Employee detail — port of apps/web/src/people/EmployeePage.tsx.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
@@ -13,7 +14,14 @@
   import CalendarFeedSection from './CalendarFeedSection.svelte';
   import { calendarFeedAccess } from './calendarFeedAccess';
   import { session } from '@boss/web-kit/session/session.svelte';
-  import { classLabel, employeeRecordRead, employmentTone, type Employee } from './types';
+  import {
+    classLabel,
+    departmentNames,
+    employeeRecordRead,
+    employmentTone,
+    type Employee,
+  } from './types';
+  import { departments } from '@boss/web-kit/session/departments.svelte';
   import { directReports, reportingChain, tenureYears, type ChainEnd } from './utils';
   import { href } from '../router';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
@@ -37,7 +45,8 @@
   // Department and role labels are the registry's display_name, not a
   // title-cased code (backlog 8677728c, after 8a331c9b fixed the roster:
   // `operations` printed Operations where its Class says Operations / IT).
-  let departmentClasses = $derived(classesFor('employee', 'department'));
+  // A department's registry is the departments registry since c87e3d6d.
+  let departmentClasses = $derived(departmentNames(departments()));
   let roleClasses = $derived(classesFor('employee', 'role'));
 
   $effect(() => {
@@ -166,6 +175,7 @@
         </div>
         <h1 class="detail-title">{e.name}</h1>
         <div class="detail-tagline">{classLabel(e.role, roleClasses)} · {e.email}</div>
+        <ClassesReadFailed subjectKind="employee" what="roles" fallback="Roles show by code, not by their registry names." />
         <div class="detail-meta">
           <Meta label="Tenure">{tenure.toFixed(1)} years</Meta>
           <Meta label="Skill level">

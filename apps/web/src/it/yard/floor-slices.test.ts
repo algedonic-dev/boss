@@ -62,6 +62,9 @@ const bay = (index: number): Bay => ({
   since: null,
   elapsed: null,
   stale: false,
+  times: null,
+  launchedAt: null,
+  troubled: false,
   progress: 0,
 });
 

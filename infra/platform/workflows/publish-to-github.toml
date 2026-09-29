@@ -39,8 +39,8 @@
 #   5. `read-checks` is a second MACHINE step, the open-pr shape again:
 #      `ops_verb = "read-publish-checks"`, the rule
 #      `read-publish-checks-on-read-checks-ready` files the forge
-#      request when it goes ready, and the verb waits for the PR head's
-#      check-runs, writes the reading onto this packet as
+#      request when it goes ready, and the verb reads the PR head's
+#      check-runs (once per run; not yet until they end), writes the reading onto this packet as
 #      `code_scanning` (per-check conclusions; the scan's counts by
 #      rule, by file and by level) and completes the step with
 #      `conclusion` / `alerts` / `rules`.
@@ -191,6 +191,15 @@ required = true
 name = "scanned_sha"
 field_type = "string"
 required = true
+# The `checklist` kind's required field ("Checklist items [{label,
+# checked, checked_by, checked_at}]"). Every measure so far wrote it,
+# after a completion refused for it; declared so an agent's brief names
+# it before the refusal does (backlog a14f04b3;
+# tests/a_step_declares_what_its_kind_requires.rs).
+[[workflow.step.fields]]
+name = "items"
+field_type = "array"
+required = true
 
 [[workflow.step]]
 title = "nothing-to-publish"
@@ -213,6 +222,11 @@ metadata_defaults = { human_only = false, procedure = "READ EACH NEWLY PUBLIC FI
 [[workflow.step.fields]]
 name = "newly_public_review"
 field_type = "string"
+required = true
+# The `checklist` kind's required field, as on `measure` above.
+[[workflow.step.fields]]
+name = "items"
+field_type = "array"
 required = true
 
 # (11) A PASSKEY, and (12) a person's step. Both halves of the

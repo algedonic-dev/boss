@@ -402,7 +402,7 @@ test.describe('/it/registry/rules — the controls', () => {
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
 
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     await expect(tabs.nth(2)).toHaveAttribute('aria-current', 'page');
     await expect(tabs.nth(2)).toHaveAttribute('href', PAGE);
     await expect(page.locator('nav.it-tabs button')).toHaveCount(0);

@@ -14,7 +14,11 @@
   } from './types';
   import { href } from '../router';
   import { getLabel } from '@boss/web-kit/session/manifest.svelte';
+  import { emptyState, readStateOfLoad } from '../data/readState';
+  import { readRows } from '../data/shape';
+  import ListEmpty from '../data/ListEmpty.svelte';
 
+  const MODELS_URL = '/api/catalog/models';
   let catalog = $state<DeviceModel[]>([]);
   /// Non-null when the load failed — rendered instead of the empty
   /// state, so an outage never reads as an empty catalog (packet
@@ -30,15 +34,17 @@
     loading = true;
     (async () => {
       try {
-        const r = await fetch('/api/catalog/models');
+        const r = await fetch(MODELS_URL);
         if (r.ok) {
-          const body = await r.json();
+          // A 200 that is not a list shape is a failed read, not an
+          // empty catalog (backlog 0ef5e008).
+          const rows = readRows(MODELS_URL, await r.json()) as DeviceModel[];
           if (!cancelled) {
-            catalog = Array.isArray(body) ? body : (body.data ?? []);
+            catalog = [...rows];
             loadFailed = null;
           }
         } else {
-          if (!cancelled) loadFailed = `HTTP ${r.status}`;
+          if (!cancelled) loadFailed = `${MODELS_URL}: HTTP ${r.status}`;
         }
       } catch (e) {
         if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
@@ -71,6 +77,20 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, nothing catalogued, or the filters hid it (backlog
+  // 0ef5e008). The rows are named by the title's own label
+  // (`catalog.page_title`, which a tenant may set); the sentence
+  // around the name is the helper's, so no tenant label can put the
+  // filters line back on an empty catalog. `catalog.empty_state` is no
+  // longer read.
+  let listState = $derived(
+    emptyState(
+      [{ source: MODELS_URL, state: readStateOfLoad(loading && catalog.length === 0, loadFailed) }],
+      catalog.length,
+      visible.length,
+    ),
   );
 </script>
 
@@ -123,14 +143,11 @@
     </aside>
 
     <section class="catalog-grid">
-      {#if loading && catalog.length === 0}
-        <p class="empty">Loading catalog…</p>
-      {:else if loadFailed}
-        <p class="empty load-failed" role="alert">
-          Couldn't load the catalog — {loadFailed}
-        </p>
-      {:else if visible.length === 0}
-        <p class="empty">{getLabel('catalog.empty_state', 'No devices match those filters.')}</p>
+      {#if listState.kind !== 'rows'}
+        <ListEmpty
+          view={listState}
+          words={{ what: 'the catalog', noun: getLabel('catalog.page_title', 'catalog systems') }}
+        />
       {:else}
         {#each visible as d (d.sku)}
           <Link className="catalog-card" to={href(`/ux/catalog/${d.sku}`)}>

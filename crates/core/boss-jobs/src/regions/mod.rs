@@ -403,8 +403,10 @@ pub struct Region {
     /// each route the map does not draw that a move INTO this region
     /// took in the window, with how many did — from the moves record
     /// (`crate::moves`). Empty when every move in took a drawn route;
-    /// `null` when the record could not be read or is not wired, and on
-    /// an older payload. A reading beside the state, not yet a
+    /// `null` when the record could not be read or is not wired, when
+    /// the caller's scope reads no packets (it is not read for them,
+    /// backlog e5f7b51e), and on an older payload. A reading beside the
+    /// state, not yet a
     /// judgement of it: see [`crate::region_states::MOVES_UNDECLARED`].
     #[serde(default)]
     pub undeclared: Option<Vec<crate::moves::RouteCount>>,

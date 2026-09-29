@@ -1,4 +1,5 @@
-//! `boss-classes-api` service: read-only Class registry over Postgres.
+//! `boss-classes-api` service: the Class registry over Postgres — open
+//! reads, and three policy-gated, evented writes (backlog 553cf479).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -48,7 +49,19 @@ async fn main() -> Result<()> {
         Arc::new(boss_classes::PgClasses::new(pool))
     };
 
-    let state = ClassesApiState { classes };
+    // The three write doors ask policy (backlog 553cf479), wired the way
+    // boss-subject-kinds-api wires its door: the sim bypass is installed
+    // on a sim instance only and admits only a sim caller there
+    // (85e7f10f).
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(
+                "classes",
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+            ),
+        ));
+
+    let state = ClassesApiState { classes, policy };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim

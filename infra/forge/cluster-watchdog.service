@@ -14,9 +14,33 @@ Description=BOSS forge: the cluster watchdog — knows the cluster is working fr
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
 User=david
-Environment=KUBECONFIG_PATH=/home/david/kc.yaml
+# A oneshot's start timeout is infinity by default, so a read a
+# half-dead API server never answered held this unit activating and the
+# timer skipped every tick behind it (backlog cf321ffd). It covers
+# EVERY line of the start phase, the wrap included, and the wrap is
+# slowest exactly when this unit matters: with the API dark,
+# boss-api-curl retries a refused connection for BOSS_API_RETRY_DEADLINE
+# (150 s) before the watchdog starts. The worst roll branch is then
+#   150 wrap + 8 health + 120 image pull (BOSS_OPS_PULL_TIMEOUT_S)
+#   + 20 read + 30 patch + 420 rollout wait + ~60 door probe = ~808 s,
+# so 15 minutes leaves the failing rollback's own "did not go Ready"
+# alert room to be raised before systemd's kill, and ends only what is
+# truly wedged — a stalled docker daemon. Ten minutes left out the wrap
+# and raced that alert (review of 8f50d314, M1). A test derives this
+# sum from the files that set each bound and holds this line above it.
+TimeoutStartSec=15min
+# The admin kubeconfig is NOT named here: the watchdog reads the one
+# David places under /etc/boss-ops through ops-credentials.sh's helper
+# (backlog fb444bbb). This line used to point it at /home/david/kc.yaml,
+# a second copy nothing checked.
 Environment=BOSS_FORGE_LAST_BUILT=/home/david/.boss-last-built
 Environment=WATCHDOG_STATE=/home/david/.boss-watchdog-dark
+Environment=WATCHDOG_BLIND_STATE=/home/david/.boss-watchdog-blind
+# What the run leaves its packet — `cluster_read`, whether it could read
+# the cluster and so could act — merged onto the run step by the
+# ExecStopPost hook. Under
+# $HOME because this unit runs as david and /run is root's.
+Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-watchdog.summary.json
 Environment=WATCHDOG_DARK_LIMIT=3
 # The estate id the wrap stamps on the packet and boss-step records on
 # the run step, rather than whatever the machine calls itself (backlog

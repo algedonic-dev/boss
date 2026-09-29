@@ -67,10 +67,12 @@ test('the Abort control names the terminal, requires a sentence, and completes t
   const steps = [step({}), ABANDONED];
   await baseMocks(page, steps);
 
-  const puts: { url: string; body: Record<string, unknown> }[] = [];
-  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/[^/]+$`), (r) => {
+  // Both doors, in order (backlog e39a9d2a, Stage 2): the reason through
+  // the step merge door, then the status alone through the PUT.
+  const puts: { method: string; url: string; body: Record<string, unknown> }[] = [];
+  await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/[^/]+(/metadata)?$`), (r) => {
     const body = JSON.parse(r.request().postData() ?? '{}') as Record<string, unknown>;
-    puts.push({ url: r.request().url(), body });
+    puts.push({ method: r.request().method(), url: r.request().url(), body });
     return json(r, { ...ABANDONED, ...body });
   });
 
@@ -99,12 +101,12 @@ test('the Abort control names the terminal, requires a sentence, and completes t
   await submit.click();
 
   await expect(modal).toHaveCount(0);
-  expect(puts.length).toBe(1);
-  expect(puts[0]?.url).toContain(`/api/jobs/${JOB_ID}/steps/s9`);
-  expect(puts[0]?.body).toEqual({
-    status: 'completed',
-    metadata: { outcome_kind: 'aborted', reason: 'Filed twice; the other packet carries the work.' },
-  });
+  expect(puts.map((p) => p.method)).toEqual(['PATCH', 'PUT']);
+  expect(puts[0]?.url).toMatch(new RegExp(`/api/jobs/${JOB_ID}/steps/s9/metadata$`));
+  // The reason alone — outcome_kind stays on the row, never re-sent.
+  expect(puts[0]?.body).toEqual({ reason: 'Filed twice; the other packet carries the work.' });
+  expect(puts[1]?.url).toMatch(new RegExp(`/api/jobs/${JOB_ID}/steps/s9$`));
+  expect(puts[1]?.body).toEqual({ status: 'completed' });
 });
 
 test('a job whose workflow declares no aborted terminal shows no control', async ({ page }) => {

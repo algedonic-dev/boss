@@ -506,7 +506,7 @@ fn unavailable() -> Response {
 
 /// The accounts and jobs services as the port, signed as the gateway.
 pub struct Services {
-    http: reqwest::Client,
+    http: boss_gateway::machine_client::MachineClient,
     accounts_base: String,
     jobs_base: String,
 }
@@ -523,10 +523,13 @@ impl Services {
 
     pub fn new(accounts_base: String, jobs_base: String) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            // Stamped per request, redirects off (review of 6fbc7fc7,
+            // finding 1). A built client whose policy follows redirects
+            // would carry the estate token to the host a 302 names.
+            http: boss_gateway::machine_client::MachineClient::build(
+                reqwest::Client::builder().timeout(Duration::from_secs(10)),
+            )
+            .expect("reqwest client always builds"),
             accounts_base,
             jobs_base,
         }
@@ -639,6 +642,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         let root = boss_testing::scratch_dir("gateway-inquiries");
         boss_testing::create_dir(&root);
@@ -942,6 +947,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The site's own form, posted the way a browser posts it from a
+    /// page the site served, through the stack `main` composes — the
+    /// cross-site refusal around this door (backlog 884eee14). Its own
+    /// tests drive a stand-in route; this one holds that the refusal
+    /// lets the site's one write through, and still refuses the same
+    /// form from a sibling subdomain before the door opens anything.
+    #[tokio::test]
+    async fn the_sites_own_form_passes_the_cross_site_refusal() {
+        let origin = format!("https://{HOST}");
+        let send = |app: axum::Router, sec_fetch_site: &'static str, origin: String| async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(PATH)
+                    .header(header::HOST, HOST)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", sec_fetch_site)
+                    .header(header::CONTENT_TYPE, FORM)
+                    .header("cf-connecting-ip", "203.0.113.50")
+                    .body(Body::from(GOOD_FORM))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds")
+        };
+
+        let stub = Stub::new();
+        let resp = send(
+            crate::cross_site::mount(app(stub.clone())),
+            "same-origin",
+            origin,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(THANKS)
+        );
+        assert_eq!(stub.packets().len(), 1, "the door opened the packet");
+
+        let stub = Stub::new();
+        let resp = send(
+            crate::cross_site::mount(app(stub.clone())),
+            "same-site",
+            "https://evil.site.test".to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(stub.accounts().is_empty() && stub.packets().is_empty());
     }
 
     #[test]

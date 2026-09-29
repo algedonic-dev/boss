@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # preflight: serial — reads the live rule registry off the dispatcher through lib/sor-read.sh, waiting out a roll; one reader of the record per pre-flight
+# consist: skip — asks the RUNNING dispatcher about its own image, so its answer is a fact about the estate, not a function of the sha a gate vouches for; the live run belongs after the converge (design d349e0ba)
+#
+# WHY NO GATE RUNS THIS (design d349e0ba, backlog b79054b2, 2026-09-28).
+# Every one of its checks is a statement about the deployment, which no
+# car's tree can change — yet from 2026-09-21 to 2026-09-28 it failed 13
+# gates, all on 2026-09-27 between 11:15Z and 12:33Z, two train gates
+# and eleven car gates, none caused by the branch under test. A gate
+# judges the sha it vouches for; this judges the estate. The comparison
+# stays, and the design moves its live run to the converge's last phase,
+# which files each failure as work. Its static half and its
+# unreachable-registry refusal still run on every scoped gate, through
+# the tree-wide pin `a_lint_that_reads_the_api_waits_out_a_roll.rs`.
 #
 # the-live-rules-are-the-authored-rules — the dispatcher-rule registry
 # the running system enforces is DERIVED from the authored directory, and
@@ -82,12 +94,43 @@
 # names it on the receipt. Unset, the refusal above stands (backlog
 # 3e63662c).
 #
-# Usage:  infra/lint/the-live-rules-are-the-authored-rules.sh
+# Usage:  infra/lint/the-live-rules-are-the-authored-rules.sh [--findings <file>]
+#   --findings  For a caller that FILES what this finds rather than reads
+#               it (infra/forge/registry-drift.sh, the converge's last
+#               phase; design d349e0ba). Each failure above is also
+#               written to <file> as one line, `<check>\t<subject>`:
+#                 wrong-surface                 <url>
+#                 withheld                      <the dispatcher's reason>
+#                 zero-rules                    <url>
+#                 authored-registry-unreadable  <the deployment's error>
+#                 authored-registry-empty       <dir>
+#                 unauthored-rule               <rule name>   (one per rule)
+#               The text report and the exit code are unchanged; the
+#               file is truncated first, so an exit 3 leaves it empty
+#               and an exit 1 with an empty file is a failure of the
+#               TREE half, which the text names.
 #   BOSS_DISPATCHER_URL  read surface base (default: the in-cluster
 #                        machine door, boss-dispatcher-internal:7950,
 #                        backlog a757b72a)
 
 set -uo pipefail
+
+FINDINGS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --findings) FINDINGS="${2:?--findings needs a file}"; shift 2 ;;
+        *) echo "the-live-rules-are-the-authored-rules: unknown argument '$1'" >&2; exit 64 ;;
+    esac
+done
+if [ -n "$FINDINGS" ]; then
+    # Resolved before the cd below, so a relative path means the caller's.
+    case "$FINDINGS" in /*) ;; *) FINDINGS="$PWD/$FINDINGS" ;; esac
+    : > "$FINDINGS" || { echo "the-live-rules-are-the-authored-rules: cannot write $FINDINGS" >&2; exit 3; }
+fi
+# finding CHECK SUBJECT — the failure as one line a caller can file.
+finding() {
+    [ -z "$FINDINGS" ] || printf '%s\t%s\n' "$1" "$(printf '%s' "$2" | tr '\t\n' '  ')" >> "$FINDINGS"
+}
 
 cd "$(dirname "$0")/../.." || exit 1
 # shellcheck source=infra/lint/lib/scanned.sh
@@ -214,6 +257,7 @@ case "$?" in
     3) skip "the response did not parse as JSON — treated as no answer" ;;
     4) fail "$URL answered 200 with no \`rules\` array — a 200 from the wrong \
 surface, or an error body; either way nothing read the registry"
+       finding wrong-surface "$URL"
        exit 1 ;;
     # The dispatcher answered, and said why it gave no registry. That is
     # a statement about this READ, not an empty registry: most often the
@@ -221,12 +265,14 @@ surface, or an error body; either way nothing read the registry"
     # platform's read role for exactly this reason), else policy being
     # unable to answer. Named verbatim, never counted as zero.
     6) fail "$URL answered 200 with an error and no registry: $read_out"
+       finding withheld "$read_out"
        echo "" >&2
        echo "  Nothing about the enforced rules was read, so nothing is claimed" >&2
        echo "  about them. 'withheld' means the caller was not admitted to the" >&2
        echo "  rules: check the x-boss-user lib/sor-read.sh sends (backlog e76582c1)." >&2
        exit 1 ;;
     5) fail "$URL reports ZERO enforced rules"
+       finding zero-rules "$URL"
        echo "" >&2
        echo "  An empty live registry is not a clean comparison. A dispatcher" >&2
        echo "  with no rules runs zero side effects: every step-completion" >&2
@@ -257,6 +303,7 @@ live_names=$(printf '%s\n' "$live_rules" | cut -f2)
 # publish and a fresh database would not have.
 if [ -n "$registry_error" ]; then
     fail "the deployment cannot read its own authored rule registry: $registry_error"
+    finding authored-registry-unreadable "$registry_error"
     echo "" >&2
     echo "  dir as the deployment sees it: ${registry_dir:-<unset>}" >&2
     echo "  That directory IS the definition of the rule registry, so a" >&2
@@ -267,6 +314,7 @@ if [ -n "$registry_error" ]; then
     echo "  BOSS_DISPATCHER_RULES — check both." >&2
 elif [ -z "$registry_count" ] || [ "$registry_count" -lt 1 ]; then
     fail "the deployment reports an EMPTY authored rule registry at ${registry_dir:-<unset>}"
+    finding authored-registry-empty "${registry_dir:-<unset>}"
     echo "" >&2
     echo "  An empty authored registry with a non-empty live one means the" >&2
     echo "  image is missing infra/dispatcher/rules — a packaging fault. The" >&2
@@ -277,6 +325,7 @@ else
         count=$(printf '%s\n' "$unauthored" | wc -l | tr -d ' ')
         fail "the dispatcher enforces $count rule(s) its OWN image does not author:"
         printf '    %s\n' $unauthored >&2
+        for r in $unauthored; do finding unauthored-rule "$r"; done
         echo "" >&2
         echo "  These reach the registry without a file, so each carries no" >&2
         echo "  \`why\`: nothing says which standing exemption it claims" >&2

@@ -31,10 +31,14 @@
 #             `delivered`, an ANALYST's ending — the run executed a step
 #             that ships no car (a measure, a draft, a judgement), so
 #             there is no gate to go green and never was. Both open
-#             `reported`, which records the handback — by the operator
-#             who read it today, by the runner later — and the run lands
-#             on it. No rule ever writes the report, because a summary
-#             the machine invents is not the agent's.
+#             `reported`, which records the handback — by the agent's
+#             own `boss dispatch --report` when the step is open, or,
+#             for a report sent before the green, by the rule
+#             `agent-run-lands-a-report-sent-before-green` copying it
+#             off the packet as the step opens (b951c00a) — and the run
+#             lands on it. No rule ever AUTHORS the report, because a
+#             summary the machine invents is not the agent's; copying
+#             the agent's own words is not inventing them.
 #   unreported — the work is evidenced and the handback never came
 #             (backlog 6a5f4214, 2026-09-22): `building` closed `gated`
 #             or `delivered`, and `reported` then sat open past twice its
@@ -168,8 +172,14 @@ fields = [
 # until this step opens it rides the packet's metadata (`boss job
 # patch`), which any hand can write at any time; this step is the
 # acknowledgement that the report is on the record, and it is what the
-# run lands on. Recorded by the operator who read it today and by the
-# runner later; never by a rule. It follows `building` rather than
+# run lands on. Recorded by `boss dispatch --report` when the step is
+# already open; a report that arrived earlier is copied off the packet
+# (`summary` <- `report`, `spend_usd`, `tokens`, `handback = recorded`)
+# by `agent-run-lands-a-report-sent-before-green` the moment the step
+# opens (backlog b951c00a, 2026-09-28: six runs re-reported by hand
+# after their green, and one aged out as `absent` with its report on
+# the packet). A rule copies the agent's words and never writes its
+# own. It follows `building` rather than
 # sitting beside it because the viability lint proves the `result`
 # fork total by evaluating each successor with ONLY the fork done, and
 # a terminal that also needed this step would read as an orphan

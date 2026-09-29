@@ -61,7 +61,7 @@ async fn send(
             json!({
                 "id": "emp-test",
                 "role": role,
-                "access_tier": role,
+                "access_tier": "user",
                 "territory_account_ids": [],
                 "direct_report_ids": [],
                 "department": null,
@@ -84,12 +84,15 @@ async fn send(
     (status, parsed)
 }
 
+/// Signed: a ledger write names its caller, and an unsigned one is
+/// refused 401 (backlog 34f0a954). The gate is not this file's subject
+/// (tests/a_ledger_write_asks_policy.rs); the router here is permissive.
 async fn post_json(router: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
-    send(router, "POST", path, body, None).await
+    send(router, "POST", path, body, Some("controller")).await
 }
 
 async fn put_json(router: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
-    send(router, "PUT", path, body, None).await
+    send(router, "PUT", path, body, Some("controller")).await
 }
 
 /// The TTB small-brewer curve (26 USC 5051) — the row the brewery
@@ -396,8 +399,22 @@ async fn put_schedule_rejects_malformed_tiers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_writes_are_auditor_gated_and_listable() {
     let db = TestDb::new().await;
+    // Judged against the grants that ship: the external auditor reads
+    // the ledger and writes none of it (backlog 34f0a954 — the check
+    // this replaced refused the role string "auditor", which no one
+    // holds).
+    let shipped = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        policy: Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .build(),
+        ),
+    });
     let (status, _) = send(
-        make_router(&db),
+        shipped,
         "PUT",
         "/api/ledger/excise-rate-schedules",
         json!({
@@ -405,7 +422,7 @@ async fn schedule_writes_are_auditor_gated_and_listable() {
             "effective_from": "2025-01-01",
             "tiers": ttb_tiers(),
         }),
-        Some("auditor"),
+        Some("audit-readonly"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);

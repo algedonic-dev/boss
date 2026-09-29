@@ -323,13 +323,20 @@ fi
 # request), so twenty-four layers cannot each take the full allowance.
 DEADLINE=0
 TOKEN=""
+# The pull token rides to curl as a 0600 header file, never in its argv,
+# where every local user reads it in ps (backlog 5f3ad356): made with
+# infra/lib/secret-header.sh in THIS shell once the token is read,
+# because http_get runs inside $(…).
+TOKEN_HDR=""
+# shellcheck source=infra/lib/secret-header.sh
+. "$SELF_DIR/../lib/secret-header.sh"
 http_get() { # <url> <out-file> <headers-file> <accept|""> -> prints the http code; 0 iff curl ran
     local url="$1" out="$2" hdrs="$3" accept="${4:-}"
     local left=$((DEADLINE - SECONDS))
     [ "$left" -gt 0 ] || { printf '000\n'; echo "curl: the pull's ${PULL_TIMEOUT}s budget is spent before $url" >&2; return 28; }
     local -a args=(-sS -o "$out" -D "$hdrs" -w '%{http_code}' --max-time "$left" -L)
     [ -n "$accept" ] && args+=(-H "Accept: $accept")
-    [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
+    [ -n "$TOKEN_HDR" ] && args+=(-H "$TOKEN_HDR")
     curl "${args[@]}" "$url"
 }
 
@@ -433,6 +440,8 @@ else
                 || refuse_http "the anonymous pull token for $IMAGE_REPO could not be fetched" "$turl" "$code" "$rc" "$pull/token.json" "the forge package $REPO_PATH is public and its token endpoint hands out a pull token with no credentials (verified from the pod 2026-09-16); a non-200 here is the forge or the LAN, not this host. Nothing was installed; $LINK is whatever the previous converge confirmed."
             TOKEN="$(jq -r '.token // .access_token // empty' "$pull/token.json")"
             [ -n "$TOKEN" ] || refuse_http "the token endpoint answered 200 without a token" "$turl" "$code" 0 "$pull/token.json" "expected {\"token\": …}"
+            secret_header TOKEN_HDR "Authorization: Bearer $TOKEN" \
+                || refuse "failed: the pull token's header file could not be written" "infra/lib/secret-header.sh could not make its private directory; the token is never sent in curl's command line"
             ;;
         *) refuse_http "the registry did not answer" "$url" "$code" "$rc" "$pull/ping.body" "the forge registry at $REGISTRY_URL is unreachable from this host, or answered something other than 200/401. Nothing was installed; $LINK is whatever the previous converge confirmed." ;;
     esac

@@ -61,42 +61,59 @@ tenant_module_on() {
     ' "$f"
 }
 
-# service_module <service> — the manifest module a service belongs to,
-# or nothing for a service the manifest does not own. The keys are the
-# tenant contract's (docs/tenant-contract.md, the tenant.toml row):
-#   sim        the /simulator UX (boss-simulator). The brewery tick
-#              daemon (boss-brewery-sim) is NOT listed here: it is the
-#              engine of exactly one tenant and its own switch,
-#              BOSS_SIM_ENABLED, is derived from this same key below.
-#   equipment  the Equipment KB — boss-catalog-api (models) and
-#              boss-assets-api (units).
-#   warehouse  boss-inventory-api.
-#   shipping   boss-shipping-api.
+# service_modules <service> — the manifest modules a service serves,
+# space-separated, or nothing for a service the manifest does not own.
+# The service starts when ANY of them is on. The keys are the tenant
+# contract's (docs/tenant-contract.md, the tenant.toml row):
+#   sim               the /simulator UX (boss-simulator). The brewery
+#                     tick daemon (boss-brewery-sim) is NOT listed here:
+#                     it is the engine of exactly one tenant and its own
+#                     switch, BOSS_SIM_ENABLED, is derived from this same
+#                     key below.
+#   equipment         the Equipment KB — boss-catalog-api (models) and
+#                     boss-assets-api (units).
+#   marketing-assets  the Marketing Asset KB, which boss-catalog-api
+#                     also serves (boss-catalog's marketing_assets
+#                     router).
+#   warehouse         boss-inventory-api.
+#   shipping          boss-shipping-api.
+# WHY a set (backlog c4dc7ea4, page-audit 7cdb095b, decided 2026-09-28):
+# this mapped boss-catalog-api to `equipment` alone, so a tenant with
+# marketing-assets on and equipment off got /ux/marketing-assets and no
+# service behind it — every visit read "Couldn't load marketing assets".
+# The module that shows a surface and the module that starts its service
+# are one fact (CLAUDE.md §9a), so a service's row names every module
+# it serves.
 # boss-commerce-api is the invoices + A/R surface behind /ux/finance,
 # which every tenant's always-on `finance` asks for, so it is not
 # listed; boss-ml-api serves the IT monitoring panel alone (Tier 1
 # core, no module in the contract), so it is not listed either.
-service_module() {
+service_modules() {
     case "$1" in
         boss-simulator) echo sim ;;
-        boss-catalog-api|boss-assets-api) echo equipment ;;
+        boss-catalog-api) echo equipment marketing-assets ;;
+        boss-assets-api) echo equipment ;;
         boss-inventory-api) echo warehouse ;;
         boss-shipping-api) echo shipping ;;
     esac
 }
 
-# service_wanted <service> — 0 to start it. Sets SERVICE_SKIP_REASON
-# when it answers 1, for the launcher's SKIP line.
+# service_wanted <service> — 0 to start it: the service serves no
+# module, there is no manifest, or any module it serves is on. Sets
+# SERVICE_SKIP_REASON when it answers 1, for the launcher's SKIP line,
+# naming every module that would have started it.
 service_wanted() {
-    local module
+    local modules module
     SERVICE_SKIP_REASON=""
-    module="$(service_module "$1")"
-    [[ -n "$module" ]] || return 0
+    modules="$(service_modules "$1")"
+    [[ -n "$modules" ]] || return 0
     tenant_manifest_path >/dev/null || return 0
-    if tenant_module_on "$module"; then
-        return 0
-    fi
-    SERVICE_SKIP_REASON="module $module is not on in the tenant manifest"
+    for module in $modules; do
+        if tenant_module_on "$module"; then
+            return 0
+        fi
+    done
+    SERVICE_SKIP_REASON="module ${modules// / or } is not on in the tenant manifest"
     return 1
 }
 

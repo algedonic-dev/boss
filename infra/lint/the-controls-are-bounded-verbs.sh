@@ -9,11 +9,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; repo="$(cd "$here/../.." &
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # The allowlist is the directory infra/ops/verbs/, assembled by the one
 # script the runner itself uses (5086842d) — read here the same way.
-allowlist="$(sh "$repo/infra/ops/verbs-allowlist.sh" "$repo/infra/ops/verbs")" \
+# BOUNDED_VERBS_DIR is the tests' seam (github_act_sh.rs plants a verb
+# that spells its script another way); the gate reads the tree's own.
+allowlist="$(sh "$repo/infra/ops/verbs-allowlist.sh" "${BOUNDED_VERBS_DIR:-$repo/infra/ops/verbs}")" \
     || fail "infra/ops/verbs-allowlist.sh could not assemble infra/ops/verbs/ (see above)"
-python3 - "$repo" "$allowlist" <<'PY' || exit 1
+# On a file descriptor, never an argv word: one word is capped at 128 KiB
+# (MAX_ARG_STRLEN), and the assembled allowlist crossed that on
+# 2026-09-28 with the three GitHub verbs (backlog 6a8ff89f).
+python3 - "$repo" <(printf '%s' "$allowlist") <<'PY' || exit 1
 import json,re,sys,os
-repo=sys.argv[1]; v=json.loads(sys.argv[2])["verbs"]
+repo=sys.argv[1]; v=json.load(open(sys.argv[2]))["verbs"]
 # THE ROSTER IS DERIVED, not listed here. It used to be four names typed
 # into this loop, which meant every mutating verb added after them —
 # reclaim-disk, converge, mirror-base-images, delete-orphan-object — was
@@ -71,6 +76,43 @@ lits=sorted(w for p in pub["params"] for w in p["one_of"])
 lits==["--check"] or sys.exit(f"FAIL: publish-github-pr must admit exactly the literal --check, got {lits}")
 all(p.get("optional") is True for p in pub["params"]) or sys.exit("FAIL: publish-github-pr's --check must be optional — the real run passes no arg")
 isinstance(pub.get("timeout"), int) and pub["timeout"] >= 120 or sys.exit("FAIL: publish-github-pr must declare a timeout of at least 120s")
+# The GitHub acts (design 76155676 decision 4, backlog 6a8ff89f): every
+# verb that runs infra/forge/github-act.sh is EITHER its plan — a
+# read-only `--plan` render — OR a MUTATING write that runs only under a
+# passkey-signed plan. Derived from the argv, never a list here, so a
+# fourth act inherits the rule. And none takes a credential or a path
+# from the packet: the installation is the request's owner, and its
+# token slot is the script's to derive.
+#
+# A verb is a GitHub verb when ANY argv word reaches the script — by name,
+# or by a path that resolves to it (`infra/forge/./github-act.sh`,
+# `infra/ops/../forge/…`, a wrapping `bash`) — and every such verb must
+# then name it EXACTLY as argv[0]. The adversarial review of 78959555 (M2)
+# found the literal argv[0] match let those spellings slip past, and the
+# runner strips a filer-supplied plan_sha256 only for a requires_approval
+# verb, so an unapproved verb carrying a hash would have written unsigned.
+GHA="infra/forge/github-act.sh"
+gha_real=os.path.realpath(os.path.join(repo, GHA))
+ACTS=("create-repository","set-branch-protection","delete-refs")
+def reaches_gha(argv):
+    return any("github-act" in a or os.path.realpath(os.path.join(repo, a))==gha_real for a in argv)
+ghv=sorted(n for n,s in v.items() if reaches_gha(s["argv"]))
+ghv or sys.exit(f"FAIL: no verb runs {GHA} — the GitHub acts' derivation broke")
+for n in ghv:
+    s=v[n]; argv=s["argv"]
+    argv[0]==GHA or sys.exit(f"FAIL: {n} reaches {GHA} as {argv[:2]} — a GitHub verb names the script exactly as argv[0], so every reader of the allowlist sees what it runs")
+    argv[1:2] and argv[1] in ACTS or sys.exit(f"FAIL: {n} runs {GHA} with act {argv[1:2]} — the acts are {', '.join(ACTS)}")
+    if "--plan" in argv:
+        argv[2:3]==["--plan"] or sys.exit(f"FAIL: {n} carries --plan somewhere other than right after the act")
+        n in mutating and sys.exit(f"FAIL: {n} says MUTATING and passes --plan")
+        s.get("requires_approval") and sys.exit(f"FAIL: {n} is a --plan render that requires approval — a plan must be renderable before anything is signed")
+    else:
+        n in mutating or sys.exit(f"FAIL: {n} runs {GHA} without MUTATING and without --plan — a verb that is not a plan must say it writes")
+        s.get("requires_approval") is True or sys.exit(f"FAIL: {n} acts on GitHub without requires_approval — a GitHub write runs only under a signed plan")
+    names=[p["name"] for p in s["params"]]
+    names[:1]==["owner"] or sys.exit(f"FAIL: {n}'s first param must be owner, the installation it acts as: {names}")
+    [x for x in names if any(k in x for k in ("token","path","file","url"))] and sys.exit(f"FAIL: {n} takes a credential, a path or a URL from the packet: {names}")
+print(f"verbs: {len(ghv)} GitHub verb(s) run github-act.sh, each a --plan render or an approval-gated write")
 # delete-orphan-object: the one verb whose authority is DERIVED rather
 # than granted. There is deliberately no general `kubectl delete` verb,
 # so the properties that keep this one bounded are the properties that
@@ -136,6 +178,14 @@ reason=$(converge_held "$tmp/hold") || fail "the runner's hold check did not see
 bash "$repo/infra/forge/converge-hold.sh" release >/dev/null || fail "release failed"
 converge_held "$tmp/hold" >/dev/null && fail "a released hold still holds"
 bash "$repo/infra/forge/converge-hold.sh" hold 2>/dev/null && fail "a hold with no reason was accepted"
+# A hold that could not be written is NOT HELD, exit 1 (backlog d94d287e):
+# it used to print HELD whatever its write had done, so an operator was
+# told the converge was stopped when nothing stood in its way.
+BOSS_CONVERGE_HOLD="$tmp/absent/hold" bash "$repo/infra/forge/converge-hold.sh" hold never-written >/dev/null 2>&1 \
+    && fail "a hold whose write failed exited 0"
+# install.sh runs prepare as root under systemd — no HOME there either.
+env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/state/hold" BOSS_CONVERGE_HOLD_LEGACY="$tmp/legacy" \
+    bash "$repo/infra/forge/converge-hold.sh" prepare >/dev/null || fail "converge-hold.sh prepare needs HOME (install.sh runs it as root)"
 
 # publish-github-pr: its --check validates inputs with no network, under
 # the runner's environment (no HOME), and a missing token is a refusal
@@ -143,7 +193,27 @@ bash "$repo/infra/forge/converge-hold.sh" hold 2>/dev/null && fail "a hold with 
 pub="$repo/infra/forge/publish-github-pr.sh"
 env -i PATH="$PATH" bash -n "$pub" || fail "publish-github-pr.sh does not parse"
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$pub")" && fail "publish-github-pr.sh reads \$HOME (the ops runner has none)"
-grep -qE '^\s*set .*-x|set -x' <<<"$(grep -vE '^\s*#' "$pub")" && fail "publish-github-pr.sh traces (set -x) — a trace would print the token's environment"
+# Every spelling that turns xtrace on — `set -x`, `set -ex`, `set -euxo
+# pipefail`, `set -o xtrace`, `set -uo xtrace` — not only the first
+# (adversarial review of 78959555, L4).
+XTRACE_ON='(^|[;&|({[:space:]])set[[:space:]]+(-[A-Za-z]*x[A-Za-z]*|-[A-Za-z]*o[[:space:]]+xtrace)([[:space:];]|$)'
+grep -qE "$XTRACE_ON" <<<"$(grep -vE '^\s*#' "$pub")" && fail "publish-github-pr.sh traces (set -x) — a trace would print the token's environment"
+# github-act.sh (the three GitHub verbs) runs under the same environment
+# and carries a token: it must parse, need no HOME, and never trace. Its
+# behaviour is boss-testing/tests/github_act_sh.rs.
+gha="$repo/infra/forge/github-act.sh"
+env -i PATH="$PATH" bash -n "$gha" || fail "github-act.sh does not parse"
+grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$gha")" && fail "github-act.sh reads \$HOME (the ops runner has none)"
+grep -qE "$XTRACE_ON" <<<"$(grep -vE '^\s*#' "$gha")" && fail "github-act.sh traces (set -x) — a trace would print the token's header"
+# And it turns an INHERITED xtrace off before anything else runs.
+[ "$(sed -n '2p' "$gha" | cut -d'#' -f1 | tr -d '[:space:]')" = "set+x" ] \
+    || fail "github-act.sh's first command (line 2) is not set +x — an inherited SHELLOPTS=xtrace would trace the token"
+for bad in 'set -x' 'set -ex' 'set -euxo pipefail' 'set -o xtrace' 'set -uo xtrace' 'foo; set -x'; do
+    grep -qE "$XTRACE_ON" <<<"$bad" || fail "the xtrace pattern misses '$bad'"
+done
+for ok in 'set +x' 'set -uo pipefail' 'set -euo pipefail' 'offset -x'; do
+    grep -qE "$XTRACE_ON" <<<"$ok" && fail "the xtrace pattern refuses '$ok'"
+done
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/etc"
 # --check only asks that gh/jq/curl EXIST (this box may lack jq; the
 # forge and the gate image have it), so stubs stand in for all three.

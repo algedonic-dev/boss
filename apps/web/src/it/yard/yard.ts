@@ -78,6 +78,23 @@ export type CarFacts = Readonly<{
 export const DELIVERY_CHANNELS = ['data', 'config', 'software', 'infra'] as const;
 export type DeliveryChannel = (typeof DELIVERY_CHANNELS)[number];
 
+/** The "not yet" exit (EX_TEMPFAIL): a verb or probe that ran, found
+ *  the world not ready to judge, and said so. It is not a failure —
+ *  the one TypeScript spelling of Rust's `NOT_YET_EXIT`
+ *  (boss-dispatcher-handlers jobs_complete_linked_step.rs), held equal
+ *  to it by yard-machines.test.ts. The converge verb exits 75 when a
+ *  converge already running took its start into itself (backlog
+ *  1058e686, car D); read as a failure, the shed drew a healthy
+ *  pipeline FAILED for about one merge in six. */
+export const NOT_YET_EXIT = 75;
+
+/** Does an answered request's `exit_code` read as a failure? Present,
+ *  not 0, and not {@link NOT_YET_EXIT} — the test `verb_failure`
+ *  applies server-side, so the yard and the judges read one exit one
+ *  way. */
+export const exitFailed = (code: string | null): boolean =>
+  code !== null && code !== '0' && code !== String(NOT_YET_EXIT);
+
 // A car in the yard is a job packet, and it renders as a card (David's
 // call, 2026-08-12): protocol names the color, tags ride along, and a
 // simulated packet is visibly not a real one. The same card grammar is
@@ -186,7 +203,7 @@ function proofAttempt(v: unknown): ProofAttempt | null {
     stderr: text(a.stderr),
     why: text(a.why),
     missingTools: tools,
-    notYet: a.not_yet === true || a.exit === 75,
+    notYet: a.not_yet === true || a.exit === NOT_YET_EXIT,
   };
 }
 

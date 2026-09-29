@@ -12,6 +12,8 @@
 //   6ff3c347  §2 names CLAUDE.md's three supporting concepts, no Composite
 //   b8d1b453  §3 says one example tenant
 //   34717528  §4 draws the quickstart and links this instance's estate
+//   4718d918  gap 1: each diagram is drawn from its Mermaid source on
+//             the page, so it cannot show a service the source retired
 //
 // The page makes no read at all (controls inventory, 8cd38edd), so the
 // smoke mocks are enough to mount it.
@@ -73,6 +75,22 @@ test.describe('/it/kb — the words the audit decided', () => {
     await expect(s4).toContainText('infra/oss-quickstart');
     await expect(s4).not.toContainText('systemd');
     await expect(s4.getByRole('link', { name: "This instance's estate, live ↗" })).toHaveAttribute('href', '/it/estate');
+  });
+
+  test('4718d918: every diagram is rendered from its Mermaid source, not a committed picture', async ({ page }) => {
+    await open(page);
+    for (const id of ['it-framing', 'it-primitives', 'it-service-map', 'it-deployment']) {
+      await expect(section(page, id).locator('.arch-diagram > svg')).toHaveCount(1);
+      await expect(section(page, id).locator('.arch-diagram img')).toHaveCount(0);
+    }
+    // The service map's source names every port-registry row, and
+    // boss-observability was retired from it (467175e7 car B) while the
+    // committed renders went on drawing it.
+    const map = section(page, 'it-service-map').locator('.arch-diagram > svg');
+    await expect(map).toContainText('boss-gateway');
+    await expect(map).not.toContainText('boss-observability');
+    // The caption names the one file a reader edits to change the picture.
+    await expect(section(page, 'it-service-map')).toContainText('docs/architecture/02-service-map.mmd');
   });
 });
 

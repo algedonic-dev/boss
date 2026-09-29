@@ -35,6 +35,36 @@ Environment=BOSS_RUN_SUMMARY_FILE=/run/forge-converge.summary.json
 # only slow part and is a shallow main fetch. A generous ceiling in case
 # the forge is briefly unreachable.
 TimeoutStartSec=10min
+#
+# THE FORGE TOKEN'S HEADER NEVER OUTLIVES ITS RUN (backlog 359a811c,
+# 2026-09-28). forge-converge.sh writes the Authorization header
+# protect-main.sh and offsite-push.sh read into $RUNTIME_DIRECTORY: tmpfs
+# under /run, 0700, which systemd removes when this oneshot run stops —
+# after the SIGKILL the ceiling above sends second too — and a power loss
+# clears. Until this line it lived under the host's shared /tmp and
+# survived both. Without the directory the script writes no header,
+# skips its two readers and ends 78 — but still runs install.sh, so a
+# tick of the new script under an older copy of this unit installs this
+# line and the next tick runs clean (never a whole-run refusal: that
+# would wedge the converge out of installing its own repair).
+# LimitCORE=0: no git or curl of this run dumps a core holding it. The
+# same shape as boss-ops-runner.service (5f77b205).
+#
+# NEVER PrivateTmp=, ProtectSystem=, ReadOnlyPaths= or any other option
+# that gives this unit a mount namespace. This unit IS the host's
+# installer: install.sh, run under it, writes /etc/systemd/system,
+# /etc/boss/sor.env and /usr/local/bin, and the owner's git moves the
+# checkout every other unit runs from. ProtectSystem= or ReadOnlyPaths=
+# would fail those writes outright and leave every unit landed but never
+# installed — the class this converge exists to close. The rest each give
+# the run a mount namespace, which systemd.exec(5) says will "disconnect
+# propagation of mounts from the unit's processes to the host": the
+# unit whose job is changing the host would see it through a view of its
+# own. RuntimeDirectory= creates no namespace. Pinned by
+# crates/core/boss-testing/tests/ops_runner_unit_keeps_the_host_mount_namespace.rs.
+RuntimeDirectory=forge-converge
+RuntimeDirectoryMode=0700
+LimitCORE=0
 # The timer is the executor; the Job is the visibility. ExecStartPre
 # opens (or reuses) the maintenance-forge-converge packet; ExecStopPost
 # records the verdict whether ExecStart succeeded or not, so a failed

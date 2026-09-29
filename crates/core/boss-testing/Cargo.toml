@@ -93,5 +93,9 @@ required-features = ["postgres"]
 name = "a_department_is_a_subject_sql"
 required-features = ["postgres"]
 
+[[test]]
+name = "the_gateway_audit_role_opens_no_session_sql"
+required-features = ["postgres"]
+
 [lints]
 workspace = true

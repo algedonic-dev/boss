@@ -126,6 +126,8 @@ if [[ $WHEN_LINE =~ $when_re ]]; then CRED="${BASH_REMATCH[1]}"; fi
 . "$INFRA/run-summary.sh"
 # shellcheck source=infra/lib/sor.sh
 . "$INFRA/lib/sor.sh"
+# shellcheck source=infra/lib/secret-header.sh
+. "$INFRA/lib/secret-header.sh"
 
 export GIT_TERMINAL_PROMPT=0
 unset GIT_ASKPASS SSH_ASKPASS
@@ -379,7 +381,17 @@ record_delivery() {
         return 0
     fi
     hdrs=(-H "x-boss-user: $BOSS_USER")
-    if [ -n "${BOSS_MACHINE_TOKEN:-}" ]; then hdrs+=(-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"); fi
+    # The machine token rides to curl in a 0600 file, never in its argv,
+    # where every local user reads it in ps — the defect the publish
+    # review of 8d7a3507 found at this line (backlog 5f3ad356). This
+    # runs in the script's own shell, after the EXIT trap above.
+    if [ -n "${BOSS_MACHINE_TOKEN:-}" ]; then
+        if ! secret_header MT_HDR "x-boss-machine-token: $BOSS_MACHINE_TOKEN"; then
+            DELIVERY_STATE="not recorded: the machine token's header file could not be written; the next pass retries"
+            return 0
+        fi
+        hdrs+=(-H "$MT_HDR")
+    fi
     if ! jobs="$("$API_CURL" -fsS "${hdrs[@]}" \
         "$BOSS_JOBS_URL/api/jobs?kind=rotate-a-credential&status=open&limit=500" 2>/dev/null)"; then
         # Not a failure of the deposit: the value is installed and the

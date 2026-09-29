@@ -213,7 +213,10 @@ fi
 # An operator's hold (converge-hold.sh, the hold-converge ops verb)
 # stops the roll before the build: main has moved, and a human said not
 # yet. Loud on every tick, exit 0 — a hold is a decision, not a failure.
-if reason=$(converge_held "${BOSS_CONVERGE_HOLD:-/var/tmp/boss-converge-hold}"); then
+# HOLD_FILE is forge-defaults.sh's, sourced above: this line respelled
+# the default until backlog d94d287e, so moving the hold would have left
+# the runner reading the old path while the verb wrote the new one.
+if reason=$(converge_held "$HOLD_FILE"); then
     echo "cluster-deploy-runner: converge HELD — $reason — main at $HEAD not built or rolled (release-converge lifts it)" >&2
     OUTCOME="converge_held=$reason"
     exit 0
@@ -1076,3 +1079,32 @@ while IFS="$IFS_ROW" read -r iname ins_ns _t _s _h; do
     fi
     run_summary_field "roll_$ins_ns" "$HEAD"
 done <<< "$(instance_rows "$INSTANCES")"
+
+# LAST OF ALL: THE LIVE REGISTRIES AGAINST THE TREE THEY CONVERGED FROM
+# (design d349e0ba car 2, backlog b79054b2). The image is rolled and its
+# boot has run the seeds — the workflow bundle's insert-if-missing, the
+# dispatcher's rules — so this is the one moment the tree, the image and
+# the live registries are supposed to agree, and this host holds the
+# converged checkout. Until car 1 the two lints that ask that question
+# ran in every gate, where the live state decided a car's verdict (14 of
+# 92 failed gates, 2026-09-21..28, none caused by the car); now they run
+# here, and each disagreement becomes ONE backlog-item naming the side
+# that is ahead and the command that resolves it (registry-drift.sh says
+# how). The summary rides the packet as `registry_drift`.
+#
+# NEVER FATAL, by the rule every visibility write here follows: drift is
+# work to queue, not a deploy failure, and the loop that deploys a fix
+# must owe nothing to what it watches. The script exits 0 on every path
+# but a usage error; its status is KEPT rather than swallowed, and a
+# phase that died with no summary is recorded as that, with its exit,
+# rather than as agreement.
+STAGE="registry drift"
+drift_rc=0
+drift_out=$("$REPO/infra/forge/registry-drift.sh" --repo "$REPO" 2>&1) || drift_rc=$?
+printf '%s\n' "$drift_out"
+drift_line=$(printf '%s\n' "$drift_out" | awk '/^registry-drift: / { l = $0 } END { print l }')
+if [ -n "$drift_line" ] && [ "$drift_rc" -eq 0 ]; then
+    run_summary_field registry_drift "${drift_line#registry-drift: }"
+else
+    run_summary_field registry_drift "the phase exited $drift_rc; last said: ${drift_line:-nothing}"
+fi

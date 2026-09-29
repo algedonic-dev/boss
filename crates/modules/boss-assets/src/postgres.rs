@@ -6,7 +6,7 @@
 //! kind tag) for lossless round-trip serialization back to
 //! `AssetEventKind`.
 //!
-//! `append` also maintains the `devices` projection table in the same
+//! `append` also maintains the `assets` projection table in the same
 //! transaction by re-projecting the serial's full event history. This
 //! is the cost of having a queryable current-state view; the alternative
 //! (recomputing on every read) doesn't scale to the per-account and
@@ -115,8 +115,8 @@ impl AssetsRepository for PgAssets {
         } else {
             // Fast path: read just the open ticket ids and apply the
             // new event incrementally. Order matters: upsert the
-            // device row first, then mutate asset_open_tickets
-            // (which has an FK to devices(serial)).
+            // asset row first, then mutate asset_open_tickets
+            // (which has an FK to assets(asset_id)).
             let open_ids = fetch_open_ticket_ids(&mut tx, &serial).await?;
             let (state, ticket_op) = apply_event(&serial, existing.as_ref(), &open_ids, &event);
             upsert_system(&mut tx, &state).await?;
@@ -308,8 +308,10 @@ impl AssetsRepository for PgAssets {
         .await
         .map_err(|e| AssetsError::Storage(e.to_string()))?;
 
+        // The rebuild's decode: a retired kind is skipped and logged, a
+        // known kind that will not decode is still an error (8d5ac7c5).
         rows.into_iter()
-            .map(|r| r.into_system_event())
+            .filter_map(|r| r.into_replayable_event().transpose())
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -513,10 +515,56 @@ struct EventRow {
 }
 
 impl EventRow {
-    fn into_system_event(self) -> Result<AssetEvent, AssetsError> {
-        let kind: AssetEventKind = serde_json::from_value(self.payload)
-            .map_err(|e| AssetsError::Storage(format!("bad event payload: {e}")))?;
-        Ok(AssetEvent {
+    /// Decode for a REPLAY (a full reprojection of a serial) or a READ
+    /// (`events_for`, and `current_state` through it): a row
+    /// whose `kind` names no variant this build knows — a retired kind,
+    /// such as the refurb pipeline's TriageCompleted / RefurbStarted /
+    /// RefurbCompleted / QaPassed (backlog a8991c86) — is `Ok(None)`, to
+    /// be skipped and counted by the caller, and logged here with its id.
+    /// A row of a KNOWN kind whose payload will not decode is still an
+    /// error: that is corruption, not history this build outgrew.
+    ///
+    /// Until backlog df6aedb4 one such row failed the whole `assets`
+    /// step of `boss-rebuild-all`, and with it every caller that gates
+    /// on rebuild-all. `asset_events` is a no-fact store, so the
+    /// migration that retired those kinds could not measure it. The read
+    /// path decoded strictly until backlog 8d5ac7c5, so the same serial
+    /// rebuilt cleanly and then answered its every read with an error;
+    /// the two now agree, and there is one decode.
+    ///
+    /// "Unknown" is serde's own verdict, read off the one error it gives
+    /// for an unmatched tag (`unknown variant `<tag>``) and matched
+    /// against THIS row's tag, so a nested enum field that fails inside
+    /// a known kind is not mistaken for a retired kind.
+    fn into_replayable_event(mut self) -> Result<Option<AssetEvent>, AssetsError> {
+        let tag = self
+            .payload
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .map(str::to_owned);
+        match serde_json::from_value::<AssetEventKind>(std::mem::take(&mut self.payload)) {
+            Ok(kind) => Ok(Some(self.with_kind(kind))),
+            Err(e)
+                if tag.as_deref().is_some_and(|tag| {
+                    e.to_string()
+                        .starts_with(&format!("unknown variant `{tag}`"))
+                }) =>
+            {
+                tracing::warn!(
+                    event_id = %self.id,
+                    asset_id = %self.asset_id,
+                    kind = tag.as_deref().unwrap_or_default(),
+                    "asset_events row of a kind this build does not know: skipped"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(AssetsError::Storage(format!("bad event payload: {e}"))),
+        }
+    }
+
+    /// The envelope around an already-decoded kind.
+    fn with_kind(self, kind: AssetEventKind) -> AssetEvent {
+        AssetEvent {
             id: AssetEventId::new(self.id),
             asset_id: AssetId::new(self.asset_id),
             ts: self.ts,
@@ -537,7 +585,7 @@ impl EventRow {
                 })
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
             kind,
-        })
+        }
     }
 }
 
@@ -666,7 +714,7 @@ async fn apply_ticket_op_to_table(
 async fn full_reproject_system(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     serial: &AssetId,
-) -> Result<Option<AssetCurrentState>, AssetsError> {
+) -> Result<Reprojected, AssetsError> {
     let rows: Vec<EventRow> = sqlx::query_as(
         "SELECT id, asset_id, ts, actor_id, payload \
          FROM asset_events WHERE asset_id = $1 \
@@ -677,15 +725,24 @@ async fn full_reproject_system(
     .await
     .map_err(|e| AssetsError::Storage(e.to_string()))?;
 
-    let events: Vec<AssetEvent> = rows
-        .into_iter()
-        .map(|r| r.into_system_event())
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut events: Vec<AssetEvent> = Vec::with_capacity(rows.len());
+    let mut events_skipped = 0u64;
+    for row in rows {
+        match row.into_replayable_event()? {
+            Some(event) => events.push(event),
+            None => events_skipped += 1,
+        }
+    }
+    let events_processed = events.len() as u64;
     let Some(state) = project(serial, &events) else {
-        return Ok(None);
+        return Ok(Reprojected {
+            state: None,
+            events_processed,
+            events_skipped,
+        });
     };
 
-    // Order matters because asset_open_tickets FKs to devices(serial):
+    // Order matters because asset_open_tickets FKs to assets(asset_id):
     // upsert the projection row first, THEN rebuild the open tickets.
     upsert_system(tx, &state).await?;
 
@@ -741,7 +798,20 @@ async fn full_reproject_system(
         }
     }
 
-    Ok(Some(state))
+    Ok(Reprojected {
+        state: Some(state),
+        events_processed,
+        events_skipped,
+    })
+}
+
+/// One serial's full reprojection: the state it landed at (None when no
+/// event this build can read exists for it) and the rows it folded or
+/// skipped.
+struct Reprojected {
+    state: Option<AssetCurrentState>,
+    events_processed: u64,
+    events_skipped: u64,
 }
 
 /// UPSERT a device row from a projected current-state. Used by both
@@ -797,44 +867,77 @@ async fn upsert_system(
     Ok(())
 }
 
+/// Advisory-lock key for the `assets` rebuild, derived from the
+/// projection name like every other rebuilder's.
+const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("assets");
+
 impl PgAssets {
-    /// One-shot rebuild of the `devices` projection table from the
-    /// `asset_events` log. Walks distinct serials, projects each, and
-    /// upserts the result. Returns the number of rows written.
+    /// One-shot rebuild of the `assets` projection table (and
+    /// `asset_open_tickets`) from the `asset_events` log. Walks distinct
+    /// serials, projects each, and upserts the result. Reports the rows
+    /// written and the events folded or skipped.
     ///
-    /// Used by the `boss assets rebuild-projection` CLI to recover from
-    /// historical data created before append-time projection landed.
+    /// Run as the `assets` step of `boss-rebuild-all` (it was the `boss
+    /// assets rebuild-projection` CLI verb until backlog 05cd6572), to
+    /// recover a stale or empty projection from the log.
     /// Idempotent: running it on a healthy DB is a no-op-equivalent
     /// because the upserts produce identical state.
-    pub async fn rebuild_projection(&self) -> Result<u64, AssetsError> {
+    pub async fn rebuild_projection(&self) -> Result<AssetsRebuildReport, AssetsError> {
+        // One transaction under the per-service advisory lock, as every
+        // other rebuilder in `boss-rebuild-all` holds one — so two
+        // rebuilds of this projection never interleave. Until backlog
+        // df6aedb4 this committed serial by serial and took no lock,
+        // while rebuild-all's header said every step was locked.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AssetsError::Storage(e.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(REBUILD_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AssetsError::Storage(e.to_string()))?;
+
         let serials: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT asset_id FROM asset_events ORDER BY asset_id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| AssetsError::Storage(e.to_string()))?;
 
-        let mut written = 0u64;
+        let mut report = AssetsRebuildReport::default();
         for (serial_str,) in serials {
             let serial = AssetId::new(serial_str);
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| AssetsError::Storage(e.to_string()))?;
-            // full_reproject_system upserts both `devices` and
+            // full_reproject_system upserts both `assets` and
             // `asset_open_tickets` for this serial in the same
             // transaction, so a rebuild keeps both consistent.
-            let Some(_state) = full_reproject_system(&mut tx, &serial).await? else {
-                tx.rollback().await.ok();
-                continue;
-            };
-            tx.commit()
-                .await
-                .map_err(|e| AssetsError::Storage(e.to_string()))?;
-            written += 1;
+            let reprojected = full_reproject_system(&mut tx, &serial).await?;
+            report.events_processed += reprojected.events_processed;
+            report.events_skipped += reprojected.events_skipped;
+            if reprojected.state.is_some() {
+                report.assets_written += 1;
+            }
         }
-        Ok(written)
+        tx.commit()
+            .await
+            .map_err(|e| AssetsError::Storage(e.to_string()))?;
+        Ok(report)
     }
+}
+
+/// What the `assets` step of `boss-rebuild-all` did. The field names
+/// are the ones rebuild-all's tally scrapes off every report's Debug
+/// (`events_processed`, `events_skipped`), so a skipped row is counted
+/// in the run's closing line rather than only here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssetsRebuildReport {
+    /// Serials whose `assets` row (and open tickets) were re-projected.
+    pub assets_written: u64,
+    /// `asset_events` rows decoded and folded into a projection.
+    pub events_processed: u64,
+    /// Rows whose `kind` this build no longer knows — a retired kind —
+    /// left out of the projection and counted here.
+    pub events_skipped: u64,
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -885,7 +988,7 @@ mod tests {
             actor_id: None,
             payload,
         };
-        let event = row.into_system_event().unwrap();
+        let event = row.into_replayable_event().unwrap().unwrap();
         assert_eq!(event.kind, kind);
     }
 }

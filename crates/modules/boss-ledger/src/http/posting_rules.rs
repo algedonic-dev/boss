@@ -15,7 +15,12 @@
 //! whole batch is refused (422, naming the row) before any row lands:
 //! a registry with a half-admitted tenant is worse than a refusal. A
 //! row that lands records its `.declared` fact on the outbox in the
-//! same transaction; a kept row records nothing.
+//! same transaction; a kept row records nothing. Both batches ask
+//! Create on `posting-rule` ([`PostingRuleCreate`], backlog 432f0eb4) —
+//! platform-admin's alone in the core defaults, the role `boss tenant
+//! publish` signs as. They asked Create on `ledger` until then, the
+//! grant a tenant gives its finance leads, and the newest rule version
+//! is the one every later fact posts by.
 //!
 //! A projection whose event family the platform stream does not
 //! ingest (`boss_nats::durable::stream_subjects`) is refused the same
@@ -34,10 +39,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use serde::Deserialize;
 
-use super::{LedgerApiState, ledger_err, reject_if_auditor, storage_err};
+use super::{LedgerApiState, PostingRuleCreate, ledger_err, storage_err};
 use crate::posting_rules::{
     PostingRuleInput, ProjectionRule, list_posting_rules, list_projection_rules,
     publish_posting_rules_in_tx, publish_projection_rules_in_tx, validate_posting_rule,
@@ -64,12 +68,9 @@ pub(super) struct PostingRulesBatch {
 
 pub(super) async fn publish_posting_rules_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    PostingRuleCreate(user): PostingRuleCreate,
     Json(body): Json<PostingRulesBatch>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if let Some(why) = body
         .rules
         .iter()
@@ -115,12 +116,9 @@ pub(super) struct ProjectionRulesBatch {
 
 pub(super) async fn publish_projection_rules_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    PostingRuleCreate(user): PostingRuleCreate,
     Json(body): Json<ProjectionRulesBatch>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if let Some(why) = body
         .rules
         .iter()

@@ -100,7 +100,9 @@ pub async fn rebuild_payroll_in_tx(
     // Pure-projection wipe: no payroll row may live that doesn't trace
     // back to a fact. Both tables in one TRUNCATE so the
     // `payroll_run_lines → payroll_runs` FK is satisfied without
-    // CASCADE.
+    // CASCADE. No log-complete check (design b046f510): the source is
+    // financial_facts, a committed table, not audit_log — nothing
+    // staged in event_outbox is missing from it.
     sqlx::query("TRUNCATE payroll_run_lines, payroll_runs")
         .execute(&mut **tx)
         .await

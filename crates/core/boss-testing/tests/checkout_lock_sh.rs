@@ -341,10 +341,15 @@ fn a_converge_started_by_a_request_reports_its_outcome_on_that_request() {
     let log = root.join("calls");
     // curl's body rides stdin (`--data-binary @-`), so the stub logs it
     // beside the arguments and answers 204 the way the API does.
+    // systemctl answers `show` with an invocation numbered by the starts
+    // it has logged, so the verb's read-back (backlog 1058e686, car D)
+    // sees the new run its start began.
     for (tool, script) in [
         (
             "systemctl",
-            "#!/usr/bin/env bash\necho \"systemctl $*\" >> \"$STUB_LOG\"\n",
+            "#!/usr/bin/env bash\necho \"systemctl $*\" >> \"$STUB_LOG\"\n\
+             case \"$1\" in show) printf 'InvocationID=%032d\\nActiveState=activating\\nResult=success\\n' \
+             \"$(grep -c 'systemctl start' \"$STUB_LOG\")\" ;; esac\n",
         ),
         (
             "curl",

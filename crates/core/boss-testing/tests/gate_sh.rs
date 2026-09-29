@@ -256,6 +256,40 @@ fn gate_script_covers_the_checks() {
     );
 }
 
+/// EVERY `cargo test` THE GATE RUNS REACHES EVERY BINARY (backlog
+/// 3bef4198). Without `--no-fail-fast` cargo stops at the first failing
+/// test binary, so a red names one binary and every later one is never
+/// run. Measured on the public mirror, 2026-09-27 (PR #246): seven tests
+/// were red on the runner and its annotation named one, and runner-only
+/// failures in later workspace crates have never been reached at all.
+/// The gate caps what it NAMES (five annotations plus a summary; the
+/// runner's `fails`/`fails_excerpt` caps), so running everything costs a
+/// red run its remaining binaries and costs a reader nothing.
+#[test]
+fn every_cargo_test_the_gate_runs_carries_no_fail_fast() {
+    let gate = read("infra/gate.sh");
+    let runs: Vec<&str> = gate
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains("cargo test "))
+        .collect();
+    assert!(
+        runs.len() >= 4,
+        "found only {} `cargo test` line(s) in infra/gate.sh — the scan is broken or the \
+         gate stopped testing: {runs:#?}",
+        runs.len()
+    );
+    let stops_early: Vec<&str> = runs
+        .into_iter()
+        .filter(|l| !l.contains("--no-fail-fast"))
+        .map(str::trim)
+        .collect();
+    assert!(
+        stops_early.is_empty(),
+        "these `cargo test` runs stop at the first failing binary, hiding every result \
+         after it: {stops_early:#?}"
+    );
+}
+
 /// `gate.sh --exclusions`, parsed: one `(path, why)` per line, the two
 /// separated by a tab because a reason has spaces in it.
 fn exclusions_of(cmd: &mut std::process::Command) -> Vec<(String, String)> {
@@ -1496,6 +1530,139 @@ fn the_unmarked_tree_walks_found_by_bc978312_now_run_on_a_web_only_car() {
     }
 }
 
+/// THE PACKET (backlog 757a67bd). Car 6bbe1fba added one dispatcher rule
+/// file, `--auto` derived boss-events boss-nats boss-dispatcher
+/// boss-testing, and its gate was green — while the new rule's trigger
+/// had nothing upstream, which boss-dispatcher-handlers'
+/// `every_shipped_trigger_has_something_upstream` exists to refuse. It
+/// reads the rules through `boss_testing::dispatcher_rules_dir()`, a call
+/// the file-input index cannot see, so the red landed on main (#770) and
+/// the next train, scoped off its own consist, missed it too. A rule file
+/// now implies the handlers crate.
+#[test]
+fn a_changed_dispatcher_rule_scopes_the_handlers_crate() {
+    // Built, not spelled, for the reason `a_web_only_car_still_runs_the_
+    // tree_wide_pins` gives: a whole repo-path literal here is indexed.
+    let rule = format!("infra/dispatcher/{}/{}", "rules", "zz-a-scratch-rule.toml");
+    let (stdout, receipt) = auto_scope_of("gate-auto-rule-scopes-handlers", &[&rule]);
+    let scope = scope_of(&receipt);
+    assert!(
+        scope.iter().any(|c| c == "boss-dispatcher-handlers"),
+        "a car that only changes a dispatcher rule file must scope \
+         boss-dispatcher-handlers, whose cascade test reads every rule \
+         (backlog 757a67bd).\nscope: {scope:?}\nstdout: {stdout}"
+    );
+}
+
+/// The crates whose `src/` or `tests/` call `dispatcher_rules_dir(` —
+/// every crate that reads the authored rule registry through the one
+/// helper, found by walking the source rather than listed here.
+fn crates_calling_the_rules_helper() -> Vec<String> {
+    // not a tree-wide pin: it reads crates/ to find the helper's callers,
+    // and what its caller judges is infra/gate.sh's map, which derives
+    // the same set at run time and scopes this crate (backlog a6100e01).
+    fn calls(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                calls(&p)
+            } else {
+                p.extension().is_some_and(|x| x == "rs")
+                    && std::fs::read_to_string(&p)
+                        .map(|s| s.contains("dispatcher_rules_dir("))
+                        .unwrap_or(false)
+            }
+        })
+    }
+    let mut out = Vec::new();
+    for tier in std::fs::read_dir(repo_root().join("crates"))
+        .expect("crates/")
+        .filter_map(Result::ok)
+    {
+        for krate in std::fs::read_dir(tier.path())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
+            let dir = krate.path();
+            if dir.join("Cargo.toml").is_file()
+                && (calls(&dir.join("src")) || calls(&dir.join("tests")))
+            {
+                out.push(krate.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// THE PACKET (backlog a6100e01). The line above was the second crate
+/// added to the rule-file shape by hand after a red: boss-dispatcher-
+/// handlers joined it only once #770 had landed main red. Measured the
+/// day it landed, boss-testing still sat outside it — four of its tests
+/// (`a_judged_verb_declares_its_timeout.rs`, `prune_registry_versions_
+/// sh.rs`, `read_publish_checks_sh.rs`, `tag_release_sh.rs`) read the
+/// rules through `boss_testing::dispatcher_rules_dir()`, no literal names
+/// a rule file for the file-input index to see, and none is a tree-wide
+/// pin, so a car editing the publish-checks or prune rule ran none of
+/// them. A list of callers rots the moment a new one is written; the
+/// scope is DERIVED from the calls, and this holds it to every caller.
+#[test]
+fn a_changed_dispatcher_rule_scopes_every_crate_that_reads_the_rules() {
+    let callers = crates_calling_the_rules_helper();
+    // Non-vacuous: the crate from #770 and the crate this packet found
+    // missing are both callers, so a walk that found neither proves
+    // nothing about the scope below.
+    for must in ["boss-dispatcher-handlers", "boss-testing"] {
+        assert!(
+            callers.iter().any(|c| c == must),
+            "{must} calls boss_testing::dispatcher_rules_dir(), and the walk did not \
+             find it — the walk is broken.\ncallers: {callers:?}"
+        );
+    }
+    let rule = format!("infra/dispatcher/{}/{}", "rules", "zz-a-scratch-rule.toml");
+    let (stdout, receipt) = auto_scope_of("gate-auto-rule-scopes-its-readers", &[&rule]);
+    let scope = scope_of(&receipt);
+    let missing: Vec<&String> = callers
+        .iter()
+        .filter(|c| !scope.iter().any(|s| s == *c))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a car that only changes a dispatcher rule file must scope every crate that \
+         reads the rules through boss_testing::dispatcher_rules_dir(); these call it \
+         and were left out: {missing:?} (backlog a6100e01).\nscope: {scope:?}\n\
+         stdout: {stdout}"
+    );
+}
+
+/// …and, whatever a car or a train changes, the cascade test runs: it
+/// walks the whole rules directory AND every crate's handler emits, so a
+/// red it would see can already be on main — a train scoped off its
+/// consist carried #770's red through #771 green (backlog 757a67bd).
+#[test]
+fn a_web_only_car_runs_the_dispatcher_cascade_pin() {
+    let page = format!("apps/web/src/{}", "zz-a-scratch-page.svelte");
+    let (stdout, receipt) = auto_scope_of("gate-auto-tree-wide-cascade", &[&page]);
+    assert!(
+        !scope_of(&receipt)
+            .iter()
+            .any(|c| c == "boss-dispatcher-handlers"),
+        "the fixture is a web-only car, whose derived scope must NOT already hold \
+         boss-dispatcher-handlers — else this proves nothing.\nstdout: {stdout}"
+    );
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!("a web-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}")
+    });
+    assert!(
+        line.contains("every_shipped_trigger_has_something_upstream"),
+        "the dispatcher cascade test must run on every scoped gate: {line}"
+    );
+}
+
 /// A single test named as a cargo FILTER can match nothing — a test
 /// renamed, a module moved from the binary to the library — and a
 /// filtered run that matched nothing is a green run that tested nothing.
@@ -2482,4 +2649,136 @@ fn a_lint_that_reads_the_live_record_runs_in_the_serial_lane() {
          `# preflight: serial — <why>` in their headers, so they would run beside each other: \
          {missing:?}\n--serial-lane printed:\n{lane}"
     );
+}
+
+/// The live-registry COMPARISONS a gate does not run — design d349e0ba,
+/// car 1, answering backlog b79054b2. Each compares a registry the
+/// running estate holds with what a tree authors, so its answer is a fact
+/// about the estate and not a function of the sha a gate vouches for.
+const LIVE_COMPARISONS_OUT_OF_THE_GATE: [&str; 2] = [
+    "infra/lint/the-live-protocols-are-the-authored-protocols.sh",
+    "infra/lint/the-live-rules-are-the-authored-rules.sh",
+];
+
+/// A GATE'S VERDICT IS A FUNCTION OF THE SHA IT VOUCHES FOR, so the two
+/// live-registry comparisons are out of the pre-flight roster — and with
+/// it out of `a_lint_that_scanned_nothing_is_red.rs`'s re-run, which
+/// reads the same roster — each saying why in its own header.
+///
+/// MEASURED 2026-09-21T14:00Z..2026-09-28T13:57Z (triage run fcd19a26):
+/// 14 of 92 failed gates were failed by these two, and no car caused
+/// any of them. 13 were the rules lint in one 78-minute window on
+/// 2026-09-27 (two train gates, eleven car gates); one was the protocols
+/// lint on gate 2f82e7fa, whose base predated train #782 while the
+/// converge had already seeded `break-glass-enrolment` live — so the age
+/// of a car's base decided its verdict, twice (pre-flight, then `test`).
+/// On 2026-09-28 the same shape reddened at least four more gates
+/// (651480d4 among them). The comparison is not deleted: the lints and
+/// their self-tests stay, and the design moves the live run to the
+/// converge's last phase, which files the drift as work.
+///
+/// ONLY THE LIVE READ LEAVES THE GATE. A lint's tree half (the protocols
+/// lint's `platform_workflows()`-is-empty check, its fixture self-test)
+/// still runs on every scoped gate, through the tree-wide pin
+/// `a_lint_that_reads_the_api_waits_out_a_roll.rs`, which runs both
+/// lints on this tree against a refused registry and wants exit 3 — so a
+/// tree finding (exit 1) reds it. This test holds that file to being a
+/// tree-wide pin that names both, so the skip cannot silently take the
+/// tree half with it.
+///
+/// "Exactly these two" is read among the lints that read the live record
+/// (source `lib/sor-read.sh`): `a-car-stays-under-the-edit-level` reads
+/// the instance's edit level to judge the CAR'S OWN DIFF, a question
+/// about the sha, and stays in the gate. A new live reader therefore
+/// lands in the roster by default and this pin says nothing about it —
+/// but it cannot quietly take one of these two back into the gate.
+#[test]
+fn the_live_registry_comparisons_are_out_of_the_gate_and_say_why() {
+    let excluded = exclusions_of(&mut gate_cmd(&["--exclusions"]));
+    let roster = gate_cmd(&["--roster"])
+        .output()
+        .expect("run gate.sh --roster");
+    assert!(
+        roster.status.success(),
+        "--roster refused: {}",
+        String::from_utf8_lossy(&roster.stderr)
+    );
+    let roster = String::from_utf8_lossy(&roster.stdout).to_string();
+    let rostered: Vec<&str> = roster
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, p)| p))
+        .collect();
+
+    let sources =
+        regex::Regex::new(r"^\s*(?:\.|source)\s+\S*lib/sor-read\.sh").expect("sources regex");
+    let mut live_readers: Vec<String> = std::fs::read_dir(repo_root().join("infra/lint"))
+        .expect("read infra/lint")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sh"))
+        .map(|p| {
+            format!(
+                "infra/lint/{}",
+                p.file_name().expect("a name").to_string_lossy()
+            )
+        })
+        .filter(|rel| read(rel).lines().any(|l| sources.is_match(l)))
+        .collect();
+    live_readers.sort();
+    for lint in LIVE_COMPARISONS_OUT_OF_THE_GATE {
+        assert!(
+            live_readers.iter().any(|r| r == lint),
+            "{lint} no longer reads the live record through lib/sor-read.sh (or is gone) — \
+             this pin's premise changed; read design d349e0ba before editing it. \
+             Live readers now: {live_readers:?}"
+        );
+    }
+
+    let mut skipped_readers: Vec<&str> = live_readers
+        .iter()
+        .map(String::as_str)
+        .filter(|r| excluded.iter().any(|(p, _)| p == r))
+        .collect();
+    skipped_readers.sort();
+    let mut want = LIVE_COMPARISONS_OUT_OF_THE_GATE.to_vec();
+    want.sort();
+    assert_eq!(
+        skipped_readers, want,
+        "of the lints that read the live record, the gate must leave out exactly the two \
+         live-registry comparisons (design d349e0ba): a gate that reads a registry the \
+         estate holds judges the estate, not the sha it vouches for"
+    );
+
+    for lint in LIVE_COMPARISONS_OUT_OF_THE_GATE {
+        assert!(
+            !rostered.contains(&lint),
+            "{lint} is still in the pre-flight roster, so every gate — and the \
+             a_lint_that_scanned_nothing_is_red re-run — would judge a car by live state"
+        );
+        let why = excluded
+            .iter()
+            .find(|(p, _)| p == lint)
+            .map(|(_, w)| w.as_str())
+            .unwrap_or_default();
+        assert!(
+            why.contains("sha") && why.contains("d349e0ba"),
+            "{lint}'s `# consist: skip` reason must say why a gate may not run it — its \
+             answer is not a function of the sha the gate vouches for — and name the \
+             decision (d349e0ba) that moved the live run to the converge; it says: {why:?}"
+        );
+    }
+
+    let tree_half = "crates/core/boss-testing/tests/a_lint_that_reads_the_api_waits_out_a_roll.rs";
+    let text = read(tree_half);
+    assert!(
+        text.lines().any(|l| l.starts_with("//! tree-wide pin")),
+        "{tree_half} is no longer a tree-wide pin, so a scoped gate may skip it — and with \
+         both live comparisons out of the roster, nothing else runs their tree halves on \
+         every gate"
+    );
+    for lint in LIVE_COMPARISONS_OUT_OF_THE_GATE {
+        assert!(
+            text.contains(lint),
+            "{tree_half} no longer runs {lint}, so its tree half and self-test run on no gate"
+        );
+    }
 }

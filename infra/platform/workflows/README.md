@@ -128,12 +128,20 @@ either side of the first differing character.
 
 `owning_team` is deliberately NOT compared: the loader overrides the
 file's key (`spec.owning_team = default_owner`), so a disagreement there
-is a file claiming something no publish could ever make true. Structural
-fields (`steps`, `subject_kinds`, `metadata_schema`, `entitlements`,
-`metadata`) are out as well — they decide what the protocol does, a live
-row legitimately leads its file between a publish and the car that
-writes it down, and comparing them means first applying the same
-normalisation the publish path does.
+is a file claiming something no publish could ever make true.
+
+Every other key is compared as well, since 2026-09-28: the step facets
+(count, titles, required and optional fields, labels, agent blocks),
+every other step key (`ready_when`, `kind`, `metadata_defaults`, …) and
+every other workflow key (`metadata`, `subject_kinds`,
+`metadata_schema`, `entitlements`). Structural keys were out on the
+argument that they need the publish path's normalisation first;
+measured over all 56 live kinds, only a step's `authority_role` did (the
+publish fills it from the owner role, so it is compared only when the
+file names one), and leaving the rest out hid two files whose revisions
+the registry never took — `incident`'s surface and `publish-request`'s
+owner role (backlog 462cdfe3). A file declares no version, so a finding
+names the LIVE version it was measured against.
 
 A drift is **REPORTED, never failed on** under a bare invocation, for
 the same reason the existence check tolerates its own direction: a car

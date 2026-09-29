@@ -20,9 +20,11 @@
 # launched against a main about to be replaced — the measured waste this
 # rule removes — so the verb itself returns without a pass while a
 # pre-merge train is on the track (the same predicate boarding uses).
-# A round launched on a clear track stays valid until the next departure,
-# and train-board-on-dock-depth's `regate_hold_minutes` makes that
-# departure wait for it.
+# A round launched on a clear track stays valid until the next departure.
+# That departure does NOT wait for it: the board never waits on a re-gate
+# (backlog 96f02540), and the boarding rule's `regate_hold_minutes`,
+# which once held it, left the row in its v10 (backlog d1d4275d). A car
+# whose re-gate is still running rides the next train instead.
 #
 # WHY TWO MINUTES. The train-reconcile wall rule is ten, which is most of
 # a gate (median 13.9 min for a dock re-gate that day) spent waiting to

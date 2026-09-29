@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct ShippingCreate {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     shipping_base: String,
 }
 

@@ -15,6 +15,7 @@
   //
   // No new endpoint — this posts to /api/jobs like any other Job.
   import { session } from './session/session.svelte';
+  import { saveStep } from './step-doors';
 
   let open = $state(false);
 
@@ -149,25 +150,20 @@
   /// rendered title and discards the spec slug (backlog item 6c6b9e06);
   /// when that is fixed this should match the slug instead.
   ///
-  /// Metadata is merged, never replaced: `PUT .../steps/{id}` swaps
-  /// `metadata` wholesale, and `authority_role` lives in there — it is
-  /// what keeps a gated step gated.
+  /// The disposition goes through the step merge door and the status
+  /// alone through the PUT (`saveStep`, backlog e39a9d2a): the door
+  /// touches only that key, so `authority_role` — what keeps a gated step
+  /// gated — stays as it stands. It used to be kept by re-sending the
+  /// whole read metadata on the PUT, which replaces metadata wholesale.
   async function triage(jobId: string): Promise<void> {
     const jr = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
     if (!jr.ok) return;
     const job = (await jr.json()) as {
-      steps?: Array<{ id: string; title: string; status: string; metadata?: Record<string, unknown> }>;
+      steps?: Array<{ id: string; title: string; status: string }>;
     };
     const step = job.steps?.find((s) => s.title === 'Triage feedback');
     if (!step || step.status === 'completed' || step.status === 'skipped') return;
-    await fetch(`/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        status: 'completed',
-        metadata: { ...(step.metadata ?? {}), disposition },
-      }),
-    });
+    await saveStep(jobId, step.id, { status: 'completed', metadata: { disposition } });
   }
 
   function onKey(e: KeyboardEvent): void {

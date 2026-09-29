@@ -27,11 +27,10 @@
 # WHAT IT DELIBERATELY CANNOT DO:
 #   - WRITE to the `boss` namespace, where the system of record lives.
 #     (Amended 2026-09-02: the dev-session-ops-read Role at the bottom
-#     of this file grants READ visibility there plus rollout-undo on
-#     the one deployment — the #178 boot-brick incident routed every
-#     diagnostic read through a human terminal. The boundary this
-#     header was written for — exec, workload writes, and any path to
-#     the production Postgres — stands exactly as before.)
+#     of this file grants READ visibility there — the #178 boot-brick
+#     incident routed every diagnostic read through a human terminal.
+#     It also granted a patch on deploy/boss until 2026-09-29, and that
+#     was a workload write the sentence below forbids; see that Role.)
 #   - read Secrets, here or anywhere (the forge token mounts into the
 #     pod; a shell in the pod reads it from the filesystem, and this
 #     credential has no business fetching it over the API) — with ONE
@@ -183,10 +182,25 @@ type: kubernetes.io/service-account-token
 # line, the rollout history — had to route through David's terminal,
 # with outputs pasted back. His words on the record: "I don't want to
 # be a weird command-pasting go-between, when this is pure operational
-# work." READ-ONLY except one deliberately name-scoped write: `patch`
-# on the `boss` deployment alone, which is `kubectl rollout undo` —
-# the incident-response verb this same incident needed twice. No
-# secrets access; the credential boundary stays exactly where it was.
+# work."
+#
+# READ-ONLY, and the reason is a credential, not tidiness (backlog
+# 978bbd7d). Until 2026-09-29 this Role also granted `patch` on the
+# `boss` deployment alone, for `kubectl rollout undo`, under a comment
+# saying the credential boundary stayed where it was. It did not: RBAC
+# scopes a patch to an object, never to a field, and on a Deployment
+# the ReplicaSet controller — not the patcher — creates the pod, so a
+# patch to the pod template starts a pod carrying any Secret in this
+# namespace as env or a volume, and `pods/log` below reads it back.
+# deploy/boss already names the credential broker's root tokens in its
+# own env, so no new reference was even needed. A pod-template write
+# is a read of every credential the template names, which is why this
+# Role writes no workload and no pod — pinned by boss-testing's
+# the_dev_session_writes_no_workload_in_boss. Rolling back is the
+# `rollback-to` ops verb (a NAMED build, run on the forge with the
+# converge's kubeconfig) and, with the system of record dark, the
+# forge's cluster-watchdog, which rolls to the last-converged build
+# from outside; the emergency-merge protocol's first step says so.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -202,10 +216,6 @@ rules:
   - apiGroups: [batch]
     resources: [jobs, cronjobs]
     verbs: [get, list, watch]
-  - apiGroups: [apps]
-    resources: [deployments]
-    resourceNames: [boss]
-    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

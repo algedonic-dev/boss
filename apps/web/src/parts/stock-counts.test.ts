@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { failedRead, loadingRead, okRead } from '../data/readState';
-import { partsHeader } from './stock-counts';
+import { partsHeader, unstockedSkus } from './stock-counts';
 
 describe('partsHeader', () => {
   const counts = { total: 6, attention: 3, out: 1, critical: 1 };
@@ -56,5 +56,28 @@ describe('partsHeader', () => {
       const h = partsHeader(read, 'parts', counts);
       expect(`${h.title} ${h.subtitle}`).not.toMatch(/\d/);
     }
+  });
+});
+
+// Page audit 63d810aa gap 8 (backlog 4cb8c06a, 2026-09-23): the rows
+// were `inventory.map(...)`, so a part catalogued in either source and
+// never stocked was not on the page, while the title named the count as
+// the page's parts. These are the SKUs the page must add as rows.
+describe('unstockedSkus', () => {
+  const stocked = [{ part_sku: 'ING-MALT-01' }, { part_sku: 'SP-GASKET-01' }];
+
+  it('names every catalogued part with no inventory row, flat list first, once each', () => {
+    expect(
+      unstockedSkus(
+        stocked,
+        ['ING-MALT-01', 'ING-YEAST-01', 'PKG-LID-01'],
+        ['SP-GASKET-01', 'SP-VALVE-01', 'PKG-LID-01'],
+      ),
+    ).toEqual(['ING-YEAST-01', 'PKG-LID-01', 'SP-VALVE-01']);
+  });
+
+  it('is empty when everything catalogued is stocked, and never names a stocked SKU', () => {
+    expect(unstockedSkus(stocked, ['ING-MALT-01'], ['SP-GASKET-01'])).toEqual([]);
+    expect(unstockedSkus([], [], [])).toEqual([]);
   });
 });

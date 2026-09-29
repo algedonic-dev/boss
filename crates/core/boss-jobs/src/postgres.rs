@@ -677,6 +677,31 @@ async fn insert_step_in_tx(
     Ok(result.rows_affected())
 }
 
+/// Every packet pinned to one Workflow row, in any status — the one
+/// statement behind `jobs_pinned_to_workflow` AND the Pg registry's
+/// discard, which runs it inside its own transaction (backlog
+/// ce8b7d66), so the two cannot count differently. Served by the
+/// `jobs_kind_version` index; the lowest id is the one named, as the
+/// in-memory adapter picks.
+pub(crate) async fn pinned_to_workflow<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    kind: &str,
+    version: i32,
+) -> Result<crate::port::PinnedJobs, sqlx::Error> {
+    let (count, first): (i64, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(id::text)::uuid FROM jobs \
+         WHERE kind = $1 AND workflow_version = $2",
+    )
+    .bind(kind)
+    .bind(version)
+    .fetch_one(exec)
+    .await?;
+    Ok(crate::port::PinnedJobs {
+        count,
+        first: first.map(JobId::from_uuid),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -708,6 +733,54 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // A PACKET IS NEVER ADMITTED ONTO A VERSION BEING DISCARDED
+        // (backlog ce8b7d66, part 4; finding E of the review of car
+        // 06973644). The route read the version it pins to in another
+        // transaction — an experiment admits to its draft candidate —
+        // and the discard counts pins under `FOR UPDATE` on that row.
+        // Without a lock here the two were unordered: a packet still
+        // uncommitted when the discard counted was not counted, and one
+        // begun after the discard's delete did not wait for its commit.
+        // Either way it landed pinned to a number with no protocol.
+        //
+        // `FOR KEY SHARE` conflicts with the discard's `FOR UPDATE` and
+        // with its DELETE, and with nothing a publish or retire takes
+        // (they change `status`, not the key). Taken FIRST, so it is
+        // held across every write below: a discard that comes after
+        // waits for this commit and then counts this packet. When there
+        // is no row — the discard committed while this waited, or the
+        // number was never a row at all — the spent-number table says
+        // which, read by a fresh statement that sees the discard's
+        // commit; only a SPENT number refuses, so a kind outside the
+        // registry admits as it always has.
+        let row_stands: Option<i32> = sqlx::query_scalar(
+            "SELECT version FROM workflows WHERE kind = $1 AND version = $2 FOR KEY SHARE",
+        )
+        .bind(&job.kind)
+        .bind(job.workflow_version)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if row_stands.is_none() {
+            let spent: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM workflow_discarded_versions
+                                WHERE kind = $1 AND version = $2)",
+            )
+            .bind(&job.kind)
+            .bind(job.workflow_version)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+            if spent {
+                tx.rollback()
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+                return Err(JobsError::VersionDiscarded {
+                    kind: job.kind.clone(),
+                    version: job.workflow_version,
+                });
+            }
+        }
         // Birth-by-job subject kinds (`metadata.birth = "job"` in the
         // SubjectKind registry: `workflow`, `custom`) have no domain
         // table — this Job IS the subject's birth record, so its
@@ -980,6 +1053,7 @@ impl JobsRepository for PgJobs {
         &self,
         id: &JobId,
         patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
         // Split the overlay once: null values are removals, everything
@@ -1000,6 +1074,27 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // A merge judged on a read lands only on that read (finding B
+        // of the review of car 06973644): the row is read under its
+        // lock, parsed as the caller's copy was, and a moved status or
+        // metadata refuses before anything is written. The lock holds
+        // to the UPDATE below, so nothing lands between the two.
+        if let Some(read) = judged_on {
+            let row = sqlx::query_as::<_, JobRow>(
+                "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1 FOR UPDATE",
+            )
+            .bind(*id.inner().as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+            let Some(row) = row else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let current = row_to_job(row);
+            if current.status != read.status || current.metadata != read.metadata {
+                return Err(JobsError::JobChanged { id: *id });
+            }
+        }
         // ONE statement is the atomicity: the merge happens against
         // the row as it stands at write time, never against a copy a
         // caller fetched earlier. The CASE folds a non-object metadata
@@ -1412,6 +1507,7 @@ impl JobsRepository for PgJobs {
                                 || jsonb_build_array($4::jsonb)),
                 updated_at = $3
             WHERE id = $1
+              AND (NOT $5 OR status NOT IN ('closed', 'cancelled'))
             RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
                       status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition
             "#,
@@ -1420,11 +1516,26 @@ impl JobsRepository for PgJobs {
         .bind(to_version)
         .bind(stamp.timestamp)
         .bind(record.clone())
+        .bind(plan.opens_rows())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // No row: there is none, or ($5) the move writes live rows — an
+        // un-skipped or inserted step — and the packet finished since it
+        // was judged, so nothing is written (review of 28f3f28a, backlog
+        // 4c6b4b74). Read which, in the same transaction, so the refusal
+        // names the stored status.
         let Some(row) = row else {
-            return Err(JobsError::NotFound(*id));
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+                    .bind(*id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return Err(match stored {
+                Some(status) => JobsError::TerminalJob { id: *id, status },
+                None => JobsError::NotFound(*id),
+            });
         };
         let job = row_to_job(row);
         let mut events = vec![stamp.event(
@@ -1446,22 +1557,33 @@ impl JobsRepository for PgJobs {
             // would revive them. A terminal row keeps its text under the
             // CASEs below, so its shape does not move and nothing dies.
             let shape_before = shape_under_lock(&mut tx, &s.id).await?;
+            // A skipped row the plan re-derived as live ($12, backlog
+            // 4c6b4b74) is the one terminal row this writes: pending,
+            // with the target's text. Every CASE reads the row as it
+            // stood before this statement, so they agree on which rows
+            // are frozen.
             let row = sqlx::query_as::<_, StepRow>(
                 r#"
                 UPDATE steps SET
                     sort_order = $2,
-                    kind = CASE WHEN status IN ('completed', 'skipped') THEN kind ELSE $3 END,
-                    title = CASE WHEN status IN ('completed', 'skipped') THEN title ELSE $4 END,
-                    assignee_id = CASE WHEN status IN ('completed', 'skipped')
+                    status = CASE WHEN status = 'skipped' AND $12 THEN 'pending' ELSE status END,
+                    kind = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
+                                THEN kind ELSE $3 END,
+                    title = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
+                                 THEN title ELSE $4 END,
+                    assignee_id = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
                                        THEN assignee_id ELSE $5 END,
-                    blocked_by = CASE WHEN status IN ('completed', 'skipped')
+                    blocked_by = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
                                       THEN blocked_by ELSE $6 END,
-                    metadata = CASE WHEN status IN ('completed', 'skipped')
+                    metadata = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
                                     THEN metadata ELSE $7 END,
-                    fields = CASE WHEN status IN ('completed', 'skipped') THEN fields ELSE $8 END,
-                    sign_offs_required = CASE WHEN status IN ('completed', 'skipped')
+                    fields = CASE WHEN status = 'completed' OR (status = 'skipped' AND NOT $12)
+                                  THEN fields ELSE $8 END,
+                    sign_offs_required = CASE WHEN status = 'completed'
+                                                   OR (status = 'skipped' AND NOT $12)
                                               THEN sign_offs_required ELSE $9 END,
-                    assurance_required = CASE WHEN status IN ('completed', 'skipped')
+                    assurance_required = CASE WHEN status = 'completed'
+                                                   OR (status = 'skipped' AND NOT $12)
                                               THEN assurance_required ELSE $10 END,
                     updated_at = $11
                 WHERE id = $1
@@ -1486,6 +1608,7 @@ impl JobsRepository for PgJobs {
                     .and_then(|v| v.as_str().map(str::to_string)),
             )
             .bind(stamp.timestamp)
+            .bind(r.unskipped)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -2372,21 +2495,9 @@ impl JobsRepository for PgJobs {
         kind: &str,
         version: i32,
     ) -> Result<crate::port::PinnedJobs, JobsError> {
-        // Every status, served by the `jobs_kind_version` index; the
-        // lowest id is the one named, as the in-memory adapter picks.
-        let (count, first): (i64, Option<uuid::Uuid>) = sqlx::query_as(
-            "SELECT COUNT(*), MIN(id::text)::uuid FROM jobs \
-             WHERE kind = $1 AND workflow_version = $2",
-        )
-        .bind(kind)
-        .bind(version)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(crate::port::PinnedJobs {
-            count,
-            first: first.map(JobId::from_uuid),
-        })
+        pinned_to_workflow(&self.pool, kind, version)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))
     }
 
     async fn workflow_terminal_report(
@@ -2693,6 +2804,88 @@ impl JobsRepository for PgJobs {
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(rows)
+    }
+
+    async fn kind_ledger(
+        &self,
+        scope: &JobScope,
+    ) -> Result<Vec<crate::kind_ledger::KindLedger>, JobsError> {
+        if matches!(scope, JobScope::None) {
+            return Ok(Vec::new());
+        }
+        // `count_jobs_by_kind`'s scope binds, verbatim; the whole answer
+        // is pinned equal to `kind_ledger::from_jobs` over `list_jobs`'s
+        // rows under every scope shape
+        // (the_kind_ledger_is_the_lists_fold_under_every_scope_pg).
+        let (scope_owner, scope_owners, scope_accounts): (
+            Option<&str>,
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+        ) = match scope {
+            JobScope::All => (None, None, None),
+            JobScope::None => unreachable!("short-circuited above"),
+            JobScope::OwnerIs(u) => (Some(u.as_str()), None, None),
+            JobScope::OwnerIn(us) => (None, Some(us.clone()), None),
+            JobScope::AccountIn(ps) => (None, None, Some(ps.clone())),
+        };
+        let counts: Vec<(String, i32, bool, i64)> = sqlx::query_as(
+            r#"
+            SELECT kind, workflow_version, status = 'open', COUNT(*)::BIGINT FROM jobs
+            WHERE ($1::text IS NULL OR owner_id = $1)
+              AND ($2::text[] IS NULL OR owner_id = ANY($2))
+              AND (
+                $3::text[] IS NULL
+                OR (subject_kind IN ('account', 'employee')
+                    AND subject_id = ANY($3))
+              )
+            GROUP BY kind, workflow_version, status = 'open'
+            "#,
+        )
+        .bind(scope_owner)
+        .bind(scope_owners.as_deref())
+        .bind(scope_accounts.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // The newest closed packet of each kind, in `newest_closed_job`'s
+        // order — one row per kind, not every closed packet.
+        let newest = sqlx::query_as::<_, JobRow>(
+            r#"
+            SELECT DISTINCT ON (kind)
+                   id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
+                   status, priority, opened_on, opened_at, due_on, closed_on, metadata,
+                   tags, partition
+            FROM jobs
+            WHERE status = 'closed'
+              AND ($1::text IS NULL OR owner_id = $1)
+              AND ($2::text[] IS NULL OR owner_id = ANY($2))
+              AND (
+                $3::text[] IS NULL
+                OR (subject_kind IN ('account', 'employee')
+                    AND subject_id = ANY($3))
+              )
+            ORDER BY kind, closed_on DESC NULLS LAST, opened_on DESC, created_at DESC, id
+            "#,
+        )
+        .bind(scope_owner)
+        .bind(scope_owners.as_deref())
+        .bind(scope_accounts.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let counts: Vec<crate::kind_ledger::VersionCount> = counts
+            .into_iter()
+            .map(
+                |(kind, version, open, count)| crate::kind_ledger::VersionCount {
+                    kind,
+                    version,
+                    open,
+                    count,
+                },
+            )
+            .collect();
+        let newest: Vec<Job> = newest.into_iter().map(row_to_job).collect();
+        Ok(crate::kind_ledger::fold(&counts, &newest))
     }
 
     async fn resolve_blockers(

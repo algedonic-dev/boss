@@ -12,6 +12,7 @@
 // `/api/jobs/sim-clock/{pause,resume}` endpoints.
 
 import { appNow, appToday } from '@boss/web-kit/sim-clock';
+import { saveStep } from '../steps/stepWrite';
 
 export type SimLogger = (msg: string) => void;
 
@@ -46,6 +47,18 @@ async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
   const ct = r.headers.get('content-type') ?? '';
   if (ct.includes('application/json')) return r.json();
   return null;
+}
+
+/// Write keys onto a materialized step through the step merge door
+/// (backlog e39a9d2a, Stage 2) — only these keys, never a spread of the
+/// step as it was read. Throws on a refusal, as fetchJson does.
+async function overlayStep(
+  jobId: string,
+  stepId: string,
+  metadata: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  const r = await saveStep(jobId, stepId, { metadata });
+  if (r.kind === 'failed') throw new Error(r.error);
 }
 
 async function createJob(params: {
@@ -148,28 +161,16 @@ export async function placeShopOrder(log: SimLogger): Promise<void> {
   const consumesProducts = [{ sku, qty, location_id: 'loc-brewery-brewhouse' }];
 
   if (shipment) {
-    await fetchJson(`/api/jobs/${jobId}/steps/${shipment.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        metadata: {
-          ...(shipment.metadata ?? {}),
-          line_items: lineItems,
-          consumes_products: consumesProducts,
-        },
-      }),
+    await overlayStep(jobId, shipment.id, {
+      line_items: lineItems,
+      consumes_products: consumesProducts,
     });
     log(`  shipment step overlaid (${shipment.id.slice(0, 8)}…)`);
   }
   if (billing) {
-    await fetchJson(`/api/jobs/${jobId}/steps/${billing.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        metadata: {
-          ...(billing.metadata ?? {}),
-          line_items: lineItems,
-          amount_cents: qty * unitPriceCents,
-        },
-      }),
+    await overlayStep(jobId, billing.id, {
+      line_items: lineItems,
+      amount_cents: qty * unitPriceCents,
     });
     log(`  billing step overlaid (${billing.id.slice(0, 8)}…)`);
   }
@@ -258,28 +259,16 @@ export async function placeWholesaleOrder(log: SimLogger): Promise<void> {
   const consumesProducts = [{ sku, qty, location_id: 'loc-brewery-brewhouse' }];
 
   if (shipment) {
-    await fetchJson(`/api/jobs/${jobId}/steps/${shipment.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        metadata: {
-          ...(shipment.metadata ?? {}),
-          line_items: lineItems,
-          consumes_products: consumesProducts,
-        },
-      }),
+    await overlayStep(jobId, shipment.id, {
+      line_items: lineItems,
+      consumes_products: consumesProducts,
     });
     log(`  shipment step overlaid (${shipment.id.slice(0, 8)}…)`);
   }
   if (billing) {
-    await fetchJson(`/api/jobs/${jobId}/steps/${billing.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        metadata: {
-          ...(billing.metadata ?? {}),
-          line_items: lineItems,
-          amount_cents: qty * unitPriceCents,
-        },
-      }),
+    await overlayStep(jobId, billing.id, {
+      line_items: lineItems,
+      amount_cents: qty * unitPriceCents,
     });
     log(`  billing step overlaid (${billing.id.slice(0, 8)}…)`);
   }

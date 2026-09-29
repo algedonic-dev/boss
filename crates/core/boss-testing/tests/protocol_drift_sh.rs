@@ -131,12 +131,15 @@ fn registry_fixture() -> (String, usize) {
         let doc: toml::Value = toml::from_str(&text).expect("a bundle file parses");
         let wf = &doc["workflow"][0];
         let kind = wf["kind"].as_str().expect("kind").to_string();
-        // The steps ride too, in the row's shape (`steps`, each with
-        // its `fields`), because the lint compares them since
-        // 2026-09-15 (count, titles, required set, label — backlog
-        // 0ccf23ec): a fixture without them would plant a step drift
-        // on every kind and the two DELIBERATE disagreements below
-        // would drown in it.
+        // The WHOLE file rides, in the row's shape (`steps` for the
+        // TOML's `step`, each step with every key it declares), because
+        // the lint compares every key both copies can state since
+        // 2026-09-28 (backlog 462cdfe3) — the step facets since
+        // 2026-09-15 (0ccf23ec), and now `metadata`, `subject_kinds`,
+        // predicates, procedures and the rest. A fixture carrying less
+        // would plant a drift on every kind that declares the key it
+        // left out, and the two DELIBERATE disagreements below would
+        // drown in it.
         let steps: Vec<serde_json::Value> = wf
             .get("step")
             .and_then(|s| s.as_array())
@@ -144,43 +147,22 @@ fn registry_fixture() -> (String, usize) {
                 steps
                     .iter()
                     .map(|s| {
-                        let fields: Vec<serde_json::Value> = s
-                            .get("fields")
-                            .and_then(|f| f.as_array())
-                            .map(|fs| {
-                                fs.iter()
-                                    .map(|f| {
-                                        serde_json::json!({
-                                            "name": f.get("name").and_then(|v| v.as_str()),
-                                            "field_type": f.get("field_type").and_then(|v| v.as_str()),
-                                            "required": f.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
-                                        })
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        serde_json::json!({
-                            "title": s.get("title").and_then(|v| v.as_str()),
-                            "kind": s.get("kind").and_then(|v| v.as_str()),
-                            "ready_when": s.get("ready_when").and_then(|v| v.as_str()),
-                            "title_template": s.get("title_template").and_then(|v| v.as_str()).unwrap_or(""),
-                            "fields": fields,
-                            "agent": agent_as_the_registry_hands_it_back(s.get("agent")),
-                        })
+                        let mut step = serde_json::to_value(s).expect("a step table is JSON");
+                        step["agent"] = agent_as_the_registry_hands_it_back(s.get("agent"));
+                        step
                     })
                     .collect()
             })
             .unwrap_or_default();
-        let mut row = serde_json::json!({
-            "kind": kind,
-            "version": 7,
-            "status": "active",
-            "label": wf.get("label").and_then(|v| v.as_str()),
-            "category": wf.get("category").and_then(|v| v.as_str()),
-            "owning_team": "platform",
-            "description": wf.get("description").and_then(|v| v.as_str()),
-            "steps": steps,
-        });
+        let mut row = serde_json::to_value(wf).expect("a [[workflow]] table is JSON");
+        let obj = row
+            .as_object_mut()
+            .expect("a [[workflow]] table is an object");
+        obj.remove("step");
+        obj.insert("steps".into(), serde_json::json!(steps));
+        obj.insert("version".into(), serde_json::json!(7));
+        obj.insert("status".into(), serde_json::json!("active"));
+        obj.insert("owning_team".into(), serde_json::json!("platform"));
         if kind == DRIFTED_KIND {
             saw_drifted = true;
             row["description"] = serde_json::json!(

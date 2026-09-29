@@ -1,5 +1,6 @@
-//! `boss-subject-kinds-api` service: read-only SubjectKind registry
-//! over Postgres.
+//! `boss-subject-kinds-api` service: the SubjectKind registry over
+//! Postgres — open reads, and one policy-gated, evented write (a kind's
+//! metadata merge, backlog abc2e9d5).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,7 +52,21 @@ async fn main() -> Result<()> {
         Arc::new(boss_subject_kinds::PgSubjectKinds::new(pool))
     };
 
-    let state = SubjectKindsApiState { subject_kinds };
+    // The metadata write door asks policy (backlog abc2e9d5), wired the
+    // way boss-people-api wires it: the sim bypass is installed on a sim
+    // instance only and admits only a sim caller there (85e7f10f).
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(
+                "subject-kinds",
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+            ),
+        ));
+
+    let state = SubjectKindsApiState {
+        subject_kinds,
+        policy,
+    };
     let mut app = router(state);
     // The subjects identity surface (R1): mint + existence probe.
     // Postgres-only — the identity table has no in-memory twin.

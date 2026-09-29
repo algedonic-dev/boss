@@ -444,7 +444,7 @@ fn forge_defaults_derive_every_image_repo_from_the_files_registry_host() {
     assert_eq!(
         r.out.trim(),
         format!(
-            "{reg}/david/boss|{reg}/david/boss|{reg}/david/boss-ci|{reg}/david|/var/tmp/boss-converge-hold|sts/postgres|postgres|boss|.boss-last-built"
+            "{reg}/david/boss|{reg}/david/boss|{reg}/david/boss-ci|{reg}/david|/var/lib/boss/converge-hold|sts/postgres|postgres|boss|.boss-last-built"
         )
     );
     // Every override the verbs used to read still wins, under both
@@ -497,8 +497,9 @@ fn forge_defaults_refuse_an_unknown_registry_by_name_and_only_when_asked() {
     // registry (converge-hold, the census) runs where no file exists.
     let r = defaults("echo \"$HOLD_FILE\"", &[("BOSS_SOR_ENV", a)], &[]);
     assert_eq!(r.code, 0, "{}", r.err);
-    // shared-tmp-ok: the hold's deliberate operational path, read back as an expectation
-    assert_eq!(r.out.trim(), "/var/tmp/boss-converge-hold");
+    // The hold's operational path — root's directory, not a shared temp
+    // one, since backlog d94d287e (converge_hold_sh.rs).
+    assert_eq!(r.out.trim(), "/var/lib/boss/converge-hold");
     // Asking is what refuses — by the name of the missing variable.
     let r = defaults(
         "forge_need REGISTRY; echo REACHED",

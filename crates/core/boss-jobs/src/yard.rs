@@ -885,6 +885,13 @@ pub struct BoardHold {
     /// tick. When several apply the line names one, in the order the
     /// conductor checks them: track, then cooldown, then depth.
     ///
+    /// With none of those in force, the board's OWN last decision, when
+    /// its newest firing recorded a refusal (`BoardDecision::refusal`,
+    /// backlog 96f02540) — `"held: …"` or `"no boardable car: …"`, the
+    /// conductor's journal line verbatim — because the board fires and
+    /// refuses on its own grounds (every car held, a conflict, a consist
+    /// refusal), and `None` here would say it boards.
+    ///
     /// With the dock depth unread and no other hold visible it carries
     /// the admission instead (`"the dock depth could not be read — the
     /// N-car threshold cannot be evaluated"`), because `None` here is
@@ -1285,6 +1292,26 @@ pub fn boarding_hold(
         ));
     }
 
+    // THE BOARD'S OWN LAST WORD (backlog 96f02540). The holds above are
+    // the cadence loop's — they decide whether the board FIRES. Once it
+    // fires, the board decides for itself, and every tick records that
+    // decision on its firing (`board_decision::BoardDecision`). With no
+    // cadence hold in force, the newest board firing's decision is what
+    // holds the dock, stated in the board's own words: from 02:42Z to past
+    // 03:15Z on 2026-09-28 the board refused every tick with seven cars
+    // parked while this block, knowing only the track, the cooldown and
+    // the depth, told `boss orient` "nothing holds it". A firing with no
+    // outcome yet, or one that departed a train, states nothing here.
+    let refused = (holds.is_empty() && admissions.is_empty())
+        .then(|| firings.newest())
+        .flatten()
+        .and_then(|last| {
+            last.board_decision
+                .as_ref()
+                .and_then(crate::board_decision::BoardDecision::refusal)
+                .map(|why| (last.fired_at, why))
+        });
+
     let next_board = if !admissions.is_empty() {
         // Never "boards on the next tick", never "once the dock reaches
         // N": without the rows neither is a sentence this read-model can
@@ -1315,6 +1342,12 @@ pub fn boarding_hold(
                 .map(|(clause, _, _)| clause.as_str())
                 .collect::<Vec<_>>()
                 .join(" and ")
+        )
+    } else if let Some((at, why)) = &refused {
+        format!(
+            "the board refused on its last tick ({}) — {why}; the conductor asks again on its \
+             next tick",
+            at.format("%H:%MZ")
         )
     } else if holds.is_empty() {
         "boards on the next tick".to_string()
@@ -1362,6 +1395,7 @@ pub fn boarding_hold(
             .into_iter()
             .next()
             .map(|(why, _, _)| why)
+            .or_else(|| refused.map(|(_, why)| why))
             .or_else(|| admissions.first().map(|(_, line, _)| line.clone())),
         cooldown_remaining_minutes: cooldown_remaining,
         cooldown_rule,
@@ -1933,6 +1967,13 @@ pub fn held_greens(gate_runs: &[(Job, Vec<Step>)], car_branches: &[String]) -> V
 /// is still running (in-flight). The runner writes exactly one verdict
 /// onto the `record-verdict` step (`green` / `failed` / `lost` /
 /// `unreadable`), so the first non-empty one is the answer.
+/// The verdict a gate-run records when it was stood down before any
+/// runner pod existed — `boss gate --withdraw`, or the conductor's
+/// orphan settle deferring to a car's current green (backlog 8d7d0a2b,
+/// gate-run.toml's `withdrawn` terminal). One spelling, read by the
+/// yard here and written by boss-cli through it.
+pub const WITHDRAWN_VERDICT: &str = "withdrawn";
+
 fn gate_run_verdict(steps: &[Step]) -> Option<&str> {
     steps
         .iter()
@@ -2032,7 +2073,7 @@ fn failed_line(steps: &[Step]) -> Option<String> {
 /// One gate currently being assessed — an open gate-run that has not
 /// reported a verdict. The Approach draws these into its parallel gate
 /// SLOTS so capacity and usage read at a glance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveGate {
     pub branch: String,
     pub packet_id: String,
@@ -2057,6 +2098,53 @@ pub struct ActiveGate {
     /// the train under test rather than as a PR car (2026-09-14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub train: Option<String>,
+    /// The [`LAUNCHED_AT`] stamp — when this run's Job was created —
+    /// as recorded, or `None` on a run filed before 2026-09-28.
+    #[serde(default)]
+    pub launched_at: Option<String>,
+    /// How long the run waited in line before its Job existed, in
+    /// seconds: `launched_at` less `opened_at`. `None` when either is
+    /// missing — an unstamped wait is unknown, never zero.
+    #[serde(default)]
+    pub queued_seconds: Option<i64>,
+    /// How long its Job has been running, in seconds, from
+    /// [`run_started`]. `None` without a clock or a stamp.
+    #[serde(default)]
+    pub running_seconds: Option<i64>,
+    /// The yard's own word that this run has been RUNNING longer than
+    /// [`crate::region_states::RUN_PAST_MEDIAN_TIMES`] of the measured
+    /// median ([`Gates::typical_seconds`]) — the bay worth a look. Its
+    /// wait in line never counts toward it (backlog 4d088a7e: a gate
+    /// queued 46 minutes and running 14 read as "going for an hour").
+    /// False when nothing was measured: no median, no claim.
+    #[serde(default)]
+    pub troubled: bool,
+}
+
+/// The metadata key `boss gate` stamps on a gate-run the moment it has
+/// created the run's Job — the instant the RUN began, as distinct from
+/// `opened_at` (the packet was filed) and [`QUEUED_AT`] (it took a place
+/// in line). ONE DEFINITION, because the verb writes it and this module
+/// reads it (CLAUDE.md §9a).
+///
+/// WHY (backlog 4d088a7e, 2026-09-28). Gate-run 6d5d85fb opened at
+/// 01:44Z, waited 46 minutes five-to-nine deep in the line, and ran 14;
+/// with nothing on the packet saying when its pod started, every surface
+/// could show only the packet's age, and the answer to "what is the gate
+/// that has been going for an hour doing" took kubectl. Its `launched`
+/// trigger step is no substitute: a trigger completes when the packet is
+/// ADMITTED, before any wait.
+pub const LAUNCHED_AT: &str = "launched_at";
+
+/// When a gate-run's Job began running: its [`LAUNCHED_AT`] stamp, else
+/// its `opened_at`. The fallback is exact for the conductor's gates,
+/// which are filed and started in one act and never wait in line, and
+/// over-states only a run a pre-2026-09-28 `boss gate` launched after a
+/// wait — the reading every surface gave before, not a new error.
+pub(crate) fn run_started(g: &Job) -> Option<chrono::DateTime<chrono::Utc>> {
+    meta_str(&g.metadata, LAUNCHED_AT)
+        .and_then(parse_instant)
+        .or_else(|| meta_str(&g.metadata, "opened_at").and_then(parse_instant))
 }
 
 /// The metadata key a gate-run carries while it is WAITING for a
@@ -2133,8 +2221,10 @@ pub struct Gates {
     /// The line, in its own order. Empty on an older payload.
     #[serde(default)]
     pub queued: Vec<QueuedGate>,
-    /// The gate duration this window MEASURED (median seconds), which
-    /// every estimate above is derived from. `None` when no run in the
+    /// The gate duration this window MEASURED (median seconds, from a
+    /// run's Job to its verdict — its RUNNING time, never its wait in
+    /// line, since backlog 4d088a7e), which every estimate above and
+    /// every bay's [`ActiveGate::troubled`] is derived from. `None` when no run in the
     /// window can be measured; a surface then says so rather than
     /// drawing a wait from a constant.
     #[serde(default)]
@@ -2158,8 +2248,10 @@ fn verdict_instant(job: &Job, steps: &[Step]) -> Option<chrono::DateTime<chrono:
         .or_else(|| meta_str(&job.metadata, "closed_at").and_then(parse_instant))
 }
 
-/// Every gate duration this window can MEASURE, in seconds: `opened_at`
-/// to the verdict instant. Only a JUDGED run counts — `lost` and
+/// Every gate duration this window can MEASURE, in seconds: the run's
+/// start ([`run_started`] — its Job, not its filing, since backlog
+/// 4d088a7e: a queue is not a slow gate) to the verdict instant. Only a
+/// JUDGED run counts — `lost` and
 /// `unreadable` measure a death, not a gate — and a span past
 /// [`GATE_MAX_ACTIVE_HOURS`] is a corpse the reaper settled rather than
 /// a slow gate, so it is dropped. A run missing either end is not
@@ -2170,9 +2262,9 @@ fn gate_durations(gate_runs: &[(Job, Vec<Step>)]) -> Vec<i64> {
         .iter()
         .filter(|(_, steps)| matches!(gate_run_verdict(steps), Some("green" | "failed")))
         .filter_map(|(g, steps)| {
-            let opened = meta_str(&g.metadata, "opened_at").and_then(parse_instant)?;
+            let started = run_started(g)?;
             let done = verdict_instant(g, steps)?;
-            Some((done - opened).num_seconds())
+            Some((done - started).num_seconds())
         })
         .filter(|s| *s > 0 && *s <= ceiling)
         .collect()
@@ -2211,7 +2303,12 @@ fn estimated_waits(
     let mut free: Vec<i64> = active
         .iter()
         .map(|a| {
-            let elapsed = parse_instant(&a.since).map_or(0, |t| (now - t).num_seconds());
+            // What the run has SPENT is its running time: a bay does not
+            // free sooner because its run waited in line first (backlog
+            // 4d088a7e).
+            let elapsed = a
+                .running_seconds
+                .unwrap_or_else(|| parse_instant(&a.since).map_or(0, |t| (now - t).num_seconds()));
             (typical - elapsed).max(0)
         })
         .collect();
@@ -2366,6 +2463,9 @@ pub fn gates(
 ) -> Gates {
     // Past this instant a run has outlived the Job meant to be running it.
     let dead_before = now.map(|n| n - chrono::Duration::hours(GATE_MAX_ACTIVE_HOURS));
+    // The measured median RUNNING time, which every bay is judged
+    // against and every estimate in the line is derived from.
+    let typical = typical_gate_seconds(gate_runs);
     let mut active: Vec<ActiveGate> = gate_runs
         .iter()
         .filter(|(g, _)| g.status == JobStatus::Open)
@@ -2379,15 +2479,31 @@ pub fn gates(
             // one on the same day. No stamp or no clock means no claim:
             // absence is not evidence.
             let opened_at = meta_str(&g.metadata, "opened_at").and_then(parse_instant);
+            let launched =
+                meta_str(&g.metadata, LAUNCHED_AT).filter(|s| parse_instant(s).is_some());
+            // The run's own clock starts at its Job (backlog 4d088a7e):
+            // the corpse deadline is the Job's `activeDeadlineSeconds`,
+            // which a wait in line never spent.
+            let started = run_started(g);
+            let running_seconds = now.zip(started).map(|(n, s)| (n - s).num_seconds());
             Some(ActiveGate {
                 branch: branch.to_string(),
                 packet_id: g.id.to_string(),
                 since: opened_since(g),
-                stale: match (dead_before, opened_at) {
+                stale: match (dead_before, started) {
                     (Some(cutoff), Some(at)) => at < cutoff,
                     _ => false,
                 },
                 train: train_of_gate(g),
+                launched_at: launched.map(str::to_string),
+                queued_seconds: launched
+                    .and_then(parse_instant)
+                    .zip(opened_at)
+                    .map(|(l, o)| (l - o).num_seconds().max(0)),
+                running_seconds,
+                troubled: running_seconds
+                    .zip(typical)
+                    .is_some_and(|(r, t)| r > t * crate::region_states::RUN_PAST_MEDIAN_TIMES),
             })
         })
         .collect();
@@ -2545,6 +2661,14 @@ fn unsettled_latest<'a>(
         // no car awaiting rework (garage) and no car nobody judged
         // (limbo) — the held lane makes the same exclusion for a green.
         if crate::stranded::is_train_gate(&g.metadata) {
+            continue;
+        }
+        // A WITHDRAWN run was stood down before any pod existed (backlog
+        // 8d7d0a2b): it said nothing about the branch, so it cannot
+        // replace the run before it as the latest word, and alone it is
+        // no car awaiting anything. Skipped here, where both lanes read,
+        // rather than claimed by either.
+        if gate_run_verdict(steps) == Some(WITHDRAWN_VERDICT) {
             continue;
         }
         match latest.get(branch) {
@@ -2935,12 +3059,13 @@ pub fn build_status_for(
 
 /// The compiled gate-concurrency fallback, mirrored here for the
 /// no-policy case. It equals `boss-cli`'s `DEFAULT_MAX_CONCURRENT` /
-/// `COMPILED_GATE_MAX_CONCURRENT` (3): a page with no policy shows the
+/// `COMPILED_GATE_MAX_CONCURRENT` (4 since policy v3, backlog 366c2ed5,
+/// 2026-09-28): a page with no policy shows the
 /// same bound a gate obeys with an unreachable registry, and the pin
 /// `the_no_policy_capacity_matches_the_cli_compiled_fallback` names this
 /// if it ever drifts (CLAUDE.md §9a — the two live in different crates,
 /// so equality is the mechanism).
-pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 3;
+pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -3107,7 +3232,6 @@ mod tests {
             cadence: None,
             anchor_date: None,
             business_calendar: None,
-            regate_hold_minutes: None,
         }
     }
 
@@ -3728,7 +3852,144 @@ mod tests {
             firing_id: "f".into(),
             fired_at: at(at_rfc3339),
             rc,
+            board_decision: None,
         }
+    }
+
+    // ---- the board's own recorded decision (backlog 96f02540) ----
+
+    /// Every refusal the conductor's board can journal, one of each.
+    fn every_refusal() -> Vec<crate::board_decision::NoDeparture> {
+        use crate::board_decision::NoDeparture;
+        vec![
+            NoDeparture::TrackOccupied {
+                occupant: "train/20260928-0240".into(),
+            },
+            NoDeparture::HostShort {
+                reason: "forge: 3.1 GB free".into(),
+            },
+            NoDeparture::NothingParked,
+            NoDeparture::AllConflicted {
+                branches: "fix/a, fix/b".into(),
+            },
+            NoDeparture::ConsistRefused {
+                reason: "consist check refused — x".into(),
+                cars: 2,
+            },
+            NoDeparture::HeldOnEdges {
+                cars: "aaaaaaaa".into(),
+                needs_human: String::new(),
+            },
+            NoDeparture::HeldOnEdges {
+                cars: "aaaaaaaa, cccccccc".into(),
+                needs_human: "cccccccc".into(),
+            },
+        ]
+    }
+
+    /// THE EQUALITY PIN (backlog 96f02540). Whatever the board decided on
+    /// its last tick, the yard's `held_because` is that decision's own
+    /// sentence — the conductor's journal line verbatim — never "boards on
+    /// the next tick". Measured 2026-09-28: the board refused every tick
+    /// from 02:42Z with seven cars parked while `boss orient` printed
+    /// "train-board due now — nothing holds it". Here: depth 7 over a
+    /// threshold of 1, the track clear, and the idle firing (rc -2) that
+    /// released the cooldown — the three facts this block used to stop at.
+    #[test]
+    fn the_yard_states_the_boards_own_refusal_word_for_word() {
+        use crate::board_decision::BoardDecision;
+        for refusal in every_refusal() {
+            let decision = BoardDecision::from(&refusal);
+            let last = LastFiring {
+                board_decision: Some(decision.clone()),
+                ..fired("2026-09-28T02:47:55Z", Some(-2))
+            };
+            let h = boarding_hold(
+                &[board_rule(1, 30)],
+                BoardFirings {
+                    depth: Some(&last),
+                    clock: None,
+                },
+                Some(7),
+                0,
+                Some(at("2026-09-28T02:48:30Z")),
+                BoardingReadings::default(),
+            );
+            assert_eq!(
+                h.held_because,
+                decision.refusal(),
+                "the yard's hold IS the board's decision: {refusal:?}"
+            );
+            assert!(
+                h.next_board.contains(&decision.line()) && h.next_board.contains("02:47Z"),
+                "the sentence names the refusal and the tick that made it: {}",
+                h.next_board
+            );
+            assert_eq!(
+                h.cooldown_remaining_minutes, None,
+                "an idle board released it"
+            );
+        }
+    }
+
+    /// A board that DEPARTED a train states no refusal, and neither does a
+    /// firing still in flight or one recorded before the decision existed:
+    /// the block says what it said before 96f02540.
+    #[test]
+    fn a_departure_or_an_unrecorded_tick_states_no_refusal() {
+        use crate::board_decision::BoardDecision;
+        let now = Some(at("2026-09-28T02:48:30Z"));
+        let boarded = LastFiring {
+            board_decision: Some(BoardDecision::Boarded { cars: 3 }),
+            ..fired("2026-09-28T01:00:00Z", Some(0))
+        };
+        for last in [boarded, fired("2026-09-28T02:47:55Z", None)] {
+            let h = boarding_hold(
+                &[board_rule(1, 30)],
+                BoardFirings {
+                    depth: Some(&last),
+                    clock: None,
+                },
+                Some(7),
+                0,
+                now,
+                BoardingReadings::default(),
+            );
+            if last.rc.is_none() {
+                // In flight: the cooldown holds, as it always has.
+                assert!(h.held_because.is_some_and(|w| w.starts_with("cooldown")));
+            } else {
+                assert_eq!(h.held_because, None);
+                assert_eq!(h.next_board, "boards on the next tick");
+            }
+        }
+    }
+
+    /// A cadence hold comes first: the board does not even fire while the
+    /// track is held or the cooldown runs, so a refusal it recorded before
+    /// is not what holds the dock now.
+    #[test]
+    fn a_cadence_hold_outranks_the_boards_last_refusal() {
+        use crate::board_decision::{BoardDecision, NoDeparture};
+        let last = LastFiring {
+            board_decision: Some(BoardDecision::from(&NoDeparture::NothingParked)),
+            ..fired("2026-09-28T02:47:55Z", Some(-2))
+        };
+        let h = boarding_hold(
+            &[board_rule(1, 30)],
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
+            Some(7),
+            1,
+            Some(at("2026-09-28T02:48:30Z")),
+            BoardingReadings::default(),
+        );
+        assert_eq!(
+            h.held_because.as_deref(),
+            Some("track occupied (1 open train)")
+        );
     }
 
     /// 2026-09-07, twice: a threshold-met dock, no board, and the only
@@ -5733,6 +5994,85 @@ mod tests {
         );
     }
 
+    /// A GATE-RUN'S AGE IS TWO AGES (backlog 4d088a7e). Measured
+    /// 2026-09-28 on gate-run 6d5d85fb: opened 01:44, its runner pod 14
+    /// minutes old, and every surface read "open 60 min" because the
+    /// packet's age was the only one it had — David asked what the gate
+    /// that had been going for an hour was doing, and the answer took
+    /// kubectl. With `launched_at` stamped when the Job is created, the
+    /// bay says both: 46 minutes in line, 14 running.
+    #[test]
+    fn an_active_gate_reads_its_queued_and_running_ages_apart() {
+        let mut run = gate_run_on("fix/drift-names", 2);
+        run.metadata["opened_at"] = json!("2026-09-28T01:44:00Z");
+        run.metadata[LAUNCHED_AT] = json!("2026-09-28T02:30:00Z");
+        let g = gates(
+            &[(run, vec![in_flight_step()])],
+            3,
+            Some(at("2026-09-28T02:44:00Z")),
+        );
+        let a = &g.active[0];
+        assert_eq!(a.since, "2026-09-28T01:44:00Z", "since stays the filing");
+        assert_eq!(a.launched_at.as_deref(), Some("2026-09-28T02:30:00Z"));
+        assert_eq!(a.queued_seconds, Some(46 * 60), "46 minutes in line");
+        assert_eq!(a.running_seconds, Some(14 * 60), "14 minutes running");
+        assert!(!a.troubled, "no measured median judges nothing");
+    }
+
+    /// A run with no launch stamp — filed before 2026-09-28 — is running
+    /// since it opened, which is the only instant it has; how long it
+    /// waited is UNKNOWN, never zero. No clock is no running age.
+    #[test]
+    fn an_unstamped_run_runs_from_its_opening_and_its_wait_is_unknown() {
+        let mut run = gate_run_on("fix/old", 2);
+        run.metadata["opened_at"] = json!("2026-09-28T01:44:00Z");
+        let runs = vec![(run, vec![in_flight_step()])];
+        let g = gates(&runs, 3, Some(at("2026-09-28T02:44:00Z")));
+        assert_eq!(g.active[0].launched_at, None);
+        assert_eq!(g.active[0].queued_seconds, None);
+        assert_eq!(g.active[0].running_seconds, Some(3600));
+        assert_eq!(gates(&runs, 3, None).active[0].running_seconds, None);
+    }
+
+    /// THE MEDIAN IS RUNNING TIME, AND TWICE IT IS TROUBLE. A judged run
+    /// that waited 40 minutes and ran 20 measures 20, not an hour — a
+    /// queue must not teach the floor that gates are slow. Against that
+    /// median, the bay 41 minutes into its run is the troubled one, and
+    /// the bay that waited two hours to run for 30 is not: nor is it a
+    /// corpse, because the gate Job's deadline counts from the Job.
+    #[test]
+    fn the_median_is_running_time_and_a_run_past_twice_it_is_troubled() {
+        let (mut measured, steps) = finished_run(
+            "feat/measured",
+            "2026-09-28T00:00:00Z",
+            "green",
+            "2026-09-28T01:00:00Z",
+        );
+        measured.metadata[LAUNCHED_AT] = json!("2026-09-28T00:40:00Z");
+        let mut waited = gate_run_on("feat/waited-long", 2);
+        waited.metadata["opened_at"] = json!("2026-09-28T01:00:00Z");
+        waited.metadata[LAUNCHED_AT] = json!("2026-09-28T04:00:00Z");
+        let mut slow = gate_run_on("feat/running-long", 2);
+        slow.metadata["opened_at"] = json!("2026-09-28T03:49:00Z");
+        slow.metadata[LAUNCHED_AT] = json!("2026-09-28T03:49:00Z");
+        let runs = vec![
+            (measured, steps),
+            (waited, vec![in_flight_step()]),
+            (slow, vec![in_flight_step()]),
+        ];
+        let g = gates(&runs, 3, Some(at("2026-09-28T04:30:00Z")));
+        assert_eq!(g.typical_seconds, Some(1200), "launch to verdict, 20m");
+        let by: std::collections::HashMap<&str, &ActiveGate> =
+            g.active.iter().map(|a| (a.branch.as_str(), a)).collect();
+        let waited = by["feat/waited-long"];
+        assert_eq!(waited.queued_seconds, Some(3 * 3600));
+        assert!(!waited.troubled, "30m running < 2 × 20m");
+        assert!(!waited.stale, "3h30 since filing, 30m since its Job");
+        let slow = by["feat/running-long"];
+        assert_eq!(slow.running_seconds, Some(41 * 60));
+        assert!(slow.troubled, "41m running > 2 × 20m");
+    }
+
     /// Nothing measured means no estimate — a wait nobody can derive is
     /// reported as unknown, never as a number the page invented.
     #[test]
@@ -6010,6 +6350,45 @@ mod tests {
         assert!(
             limbo(&runs, &[]).is_empty(),
             "a lost train gate is relaunched by the conductor, not reworked by a builder"
+        );
+    }
+
+    /// Backlog 8d7d0a2b. A WITHDRAWN run never ran — it was stood down
+    /// before any pod existed — so it is no newer word about its branch
+    /// than the run before it. Taken as the latest it would draw the
+    /// branch nowhere (neither lane claims the word) and hide a real red
+    /// under a run that judged nothing; and alone it is no car awaiting
+    /// anything.
+    #[test]
+    fn a_withdrawn_run_is_not_the_latest_word_about_its_branch() {
+        let runs = vec![
+            (
+                gate_run_on("feat/x", 3),
+                vec![verdict_step(
+                    "failed",
+                    json!([{"name": "test", "result": "fail"}]),
+                )],
+            ),
+            (
+                gate_run_on("feat/x", 4),
+                vec![verdict_step("withdrawn", json!([]))],
+            ),
+            (
+                gate_run_on("feat/y", 4),
+                vec![verdict_step("withdrawn", json!([]))],
+            ),
+        ];
+        assert_eq!(
+            garage(&runs, &[])
+                .iter()
+                .map(|c| c.branch.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feat/x"],
+            "the red a withdrawal followed is still the branch's word"
+        );
+        assert!(
+            limbo(&runs, &[]).is_empty(),
+            "a withdrawal is not a run nobody judged — it is no run at all"
         );
     }
 

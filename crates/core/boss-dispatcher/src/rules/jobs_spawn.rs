@@ -52,24 +52,23 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct JobsSpawn {
-    client: reqwest::Client,
+    /// Stamped with the machine token, redirects off. The spawn POST and
+    /// the parent-step PUT went out with no token until review S2 of
+    /// design 6805c764 car 2, so a jobs port in `enforce` would have
+    /// refused every sub-job a rule opened.
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
 impl JobsSpawn {
     /// Construct with the jobs-api base URL (e.g. `http://127.0.0.1:7900`).
+    /// The tests point this at a loopback server; there is no
+    /// constructor taking a caller's `reqwest::Client`, whose redirect
+    /// policy could not be turned off (review of 6fbc7fc7, finding 1).
     pub fn new(jobs_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
-            jobs_base: jobs_base.into(),
-        })
-    }
-
-    /// Construct with a custom reqwest client (tests use this to point
-    /// at a wiremock server; production passes a fresh client).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self {
-            client,
+            client: boss_core::machine_token::Client::build(reqwest::Client::builder())
+                .expect("reqwest client always builds"),
             jobs_base: jobs_base.into(),
         })
     }
@@ -89,7 +88,11 @@ impl JobsSpawn {
 /// entirely, which is what the absent-arg guard in `match_event`
 /// already refuses one level up: a key present with a hole in it
 /// would read as a real value downstream.
-fn metadata_arg_json(v: &Value) -> Option<serde_json::Value> {
+///
+/// `pub` because `jobs.retract_matching` lands its `note.<field>` args
+/// on a packet the same way (backlog ac0a0abd) — one reading of "a
+/// rule arg as JSON", not a second copy (CLAUDE.md §9a).
+pub fn metadata_arg_json(v: &Value) -> Option<serde_json::Value> {
     match v {
         Value::String(s) => Some(json!(s)),
         Value::Int(i) => Some(json!(i)),
@@ -332,6 +335,7 @@ mod tests {
     async fn rejects_missing_kind_arg() {
         let h = JobsSpawn::new("http://127.0.0.1:1");
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "x".into(),
@@ -350,6 +354,7 @@ mod tests {
     async fn rejects_wrong_type_arg() {
         let h = JobsSpawn::new("http://127.0.0.1:1");
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "x".into(),
@@ -468,6 +473,7 @@ mod tests {
         let api = Arc::new(FakeJobsApi::default());
         let h = JobsSpawn::new(serve(api.clone()).await);
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "spawn-subjob-on-delegate-subjob-step-ready".into(),
             triggering_event_id: "evt-ready-1".into(),
             triggering_topic: "step.ready.delegate-subjob".into(),
@@ -629,6 +635,7 @@ mod tests {
         let api = Arc::new(PolicedJobsApi::default());
         let h = JobsSpawn::new(serve_policed(api.clone()).await);
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "spawn-subjob-on-delegate-subjob-step-ready".into(),
             triggering_event_id: "evt-ready-1".into(),
             triggering_topic: "step.ready.delegate-subjob".into(),
@@ -681,6 +688,7 @@ mod tests {
         // pins that the new variant did not open a hole in it.
         let h = JobsSpawn::new("http://127.0.0.1:1");
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "test".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "x".into(),

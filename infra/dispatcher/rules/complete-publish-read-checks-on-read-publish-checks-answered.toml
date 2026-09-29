@@ -6,7 +6,9 @@
 # publish-to-github v7's `read-checks` step is a MACHINE step: the
 # filing rule (read-publish-checks-on-read-checks-ready) spawns an
 # ops-request for the forge the moment open-pr completes, and the verb
-# waits for the mirror PR's check-runs, writes the reading onto the
+# reads the mirror PR's check-runs once (a check still running is
+# `not yet`, exit 75, and reread-publish-pr-every-15-minutes files the
+# verb again; backlog b81ff4ca), writes the reading onto the
 # packet as `code_scanning`, and completes the step with conclusion /
 # alerts / rules by itself. Its last line is the answer:
 #
@@ -21,8 +23,8 @@
 #   this leg usually finds the step already done and writes nothing;
 #   it is the record for the day the verb's own PUT fails after the
 #   reading is on the packet.
-# - a non-zero exit — the deadline passed with a check still running,
-#   or GitHub could not be read: `on_failure = "annotate-and-alert"`
+# - a non-zero exit other than 75 — GitHub could not be read, or a
+#   write failed: `on_failure = "annotate-and-alert"`
 #   writes the verb's last FAILED line onto the still-open step as
 #   `failed` and files an URGENT backlog-item naming the verb, the
 #   request and the line. The step stays open, because it is: the

@@ -59,9 +59,6 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - vendor
-  - "*.mmd"
-  - "*.png"
-  - puppeteer-config.json
 
 # Top-of-page navigation. Mirrors the README's "Where to start"
 # table at a friendlier reading depth. Update as the doc tree

@@ -39,6 +39,10 @@ fn build_router(db: &TestDb) -> Router {
     })
 }
 
+/// The `X-Boss-User` a controller's session carries: the period doors
+/// refuse a request that names no caller (backlog 25a4f7f9).
+const CONTROLLER: &str = r#"{"id":"emp-controller","role":"controller","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"finance"}"#;
+
 /// Drain the outbox through the relay pipeline (outbox → audit_log →
 /// bus → delivered), then count. Every payload SELECT in these tests
 /// follows a count call, so the drain here covers them too.
@@ -55,13 +59,18 @@ async fn count_audit_events(db: &TestDb, kind: &str) -> i64 {
     row.0
 }
 
-async fn post(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
+/// POST as a finance controller: creating a period or a revenue schedule
+/// asks policy for its caller and refuses an unsigned one 401 (backlog
+/// 34f0a954). The lock and unlock below build their own signed requests.
+async fn post_signed(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let signer = r#"{"id":"emp-controller","role":"controller","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"finance"}"#;
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri(path)
                 .header("content-type", "application/json")
+                .header("x-boss-user", signer)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -69,19 +78,17 @@ async fn post(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
         .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, body)
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_period_emits_audit_trail() {
     let db = TestDb::new().await;
     let app = build_router(&db);
-    let (status, body) = post(app, "/api/ledger/periods", json!({"year": 2099})).await;
+    let (status, body) = post_signed(app, "/api/ledger/periods", json!({"year": 2099})).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.get("id").is_some(), "response carries period id");
 
@@ -109,19 +116,27 @@ async fn lock_and_unlock_emit_audit_trail() {
 
     // Create the period via the HTTP path (also lands the
     // create event — we'll filter to lock/unlock kinds below).
-    let (_, body) = post(app.clone(), "/api/ledger/periods", json!({"year": 2098})).await;
+    let (_, body) = post_signed(app.clone(), "/api/ledger/periods", json!({"year": 2098})).await;
     let id = body["id"].as_str().expect("period id").to_string();
 
     // Lock. The locker is the signed caller, not a body field (backlog
-    // 975c228f); this request is unsigned, so it is the platform
-    // automation the event is stamped with.
-    let (status, _) = post(
-        app.clone(),
-        &format!("/api/ledger/periods/{id}/lock"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    // 975c228f). The request must BE signed: closing or reopening a
+    // month asks policy for its caller, and an unsigned one is refused
+    // (backlog 25a4f7f9) — it used to lock as `automation:platform`.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/ledger/periods/{id}/lock"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", CONTROLLER)
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let locked = count_audit_events(&db, "ledger.period.locked").await;
     assert_eq!(locked, 1, "lock event landed exactly once");
@@ -132,7 +147,7 @@ async fn lock_and_unlock_emit_audit_trail() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(payload.0["locked_by"], "automation:platform");
+    assert_eq!(payload.0["locked_by"], "emp-controller");
     assert!(payload.0["checksum"].is_string(), "event carries checksum");
     assert!(payload.0["actor_id"].is_string());
 
@@ -142,6 +157,7 @@ async fn lock_and_unlock_emit_audit_trail() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/ledger/periods/{id}/unlock"))
+                .header("x-boss-user", CONTROLLER)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -177,7 +193,7 @@ async fn create_revenue_schedule_emits_audit_trail() {
     .unwrap();
     let app = build_router(&db);
 
-    let (status, _) = post(
+    let (status, _) = post_signed(
         app,
         "/api/ledger/revenue-schedules",
         json!({

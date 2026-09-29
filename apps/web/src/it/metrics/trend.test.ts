@@ -13,6 +13,7 @@ import {
   recentWindow,
   registryRatio,
   statsStrip,
+  unmeasuredNewest,
   type Landing,
   type MetricsPacket,
 } from './trend';
@@ -115,10 +116,75 @@ describe('parseMetricsPackets', () => {
     expect(m.registry?.code_branches_not_counted_why).toBe('no counter on this machine');
   });
 
-  test('accepts a bare array and tolerates garbage', () => {
+  test('accepts a bare array, and a row it cannot read is counted, not fatal', () => {
     expect(parseMetricsPackets([packet('p1')]).packets).toHaveLength(1);
-    expect(parseMetricsPackets(null).packets).toHaveLength(0);
-    expect(parseMetricsPackets({ data: [{ metadata: { measured: 'nope' } }] }).packets).toHaveLength(0);
+    // The mocked catch-all's shape, and a list endpoint's honest empty.
+    expect(parseMetricsPackets([])).toEqual({ packets: [], unmeasured: 0, total: 0, latest: null });
+    const odd = parseMetricsPackets({ data: [{ metadata: { measured: 'nope' } }] });
+    expect(odd.packets).toHaveLength(0);
+    expect(odd.unmeasured).toBe(1);
+  });
+
+  // b64b3c04 (page audit f82b05a9, gap 3): a body that is neither the
+  // envelope nor a list used to map to total 0, which renders "the 05:10
+  // measurement has not filed" — the honest empty, drawn for a read the
+  // page could not understand. It throws, so fetchRemote says failed.
+  test('an unrecognised envelope throws, naming what it got, rather than reading as no packets', () => {
+    for (const body of [null, 'x', 7, {}, { rows: [] }, { data: 'x' }, { data: { items: [] } }]) {
+      expect(() => parseMetricsPackets(body), JSON.stringify(body)).toThrow(/unrecognised .* envelope/);
+    }
+  });
+});
+
+// a91a39a4 (page audit f82b05a9, gap 2): the page draws the newest
+// MEASURED row, and a failed newest run appeared only as a count. The
+// parse keeps the newest packet of the kind whatever it carries, with
+// its outcome and its run's `result`, so the page can name it.
+describe('the newest packet of the kind, measured or not', () => {
+  const run = (result: string | null) => [
+    { spec_slug: 'scheduled', metadata: {} },
+    { spec_slug: 'run', metadata: result === null ? {} : { result } },
+  ];
+  const failedRun = {
+    id: 'f-new',
+    title: 'Codebase metrics — 2026-09-28',
+    status: 'closed',
+    opened_at: '2026-09-28T05:12:00Z',
+    metadata: { outcome: 'failed', closed_at: '2026-09-28T05:12:09Z' },
+    steps: run('exit-code'),
+  };
+  const measuredRun = { ...packet('p-old'), opened_at: '2026-09-27T05:12:51Z', steps: run('ok') };
+
+  test('is read by opened_at with its outcome and run result, whatever order the API returned', () => {
+    for (const data of [[failedRun, measuredRun], [measuredRun, failedRun]]) {
+      const r = parseMetricsPackets({ data, total: 2 });
+      expect(r.latest).toEqual({
+        id: 'f-new',
+        title: 'Codebase metrics — 2026-09-28',
+        opened_at: '2026-09-28T05:12:00Z',
+        status: 'closed',
+        outcome: 'failed',
+        result: 'exit-code',
+      });
+    }
+  });
+
+  test('an open packet has no outcome yet, and a run with no result says none', () => {
+    const open = { id: 'o1', title: 't', status: 'open', opened_at: '2026-09-28T05:10:00Z', metadata: { outcome: 'x' }, steps: run(null) };
+    const r = parseMetricsPackets([open, measuredRun]);
+    expect(r.latest?.status).toBe('open');
+    expect(r.latest?.outcome).toBeNull();
+    expect(r.latest?.result).toBeNull();
+  });
+
+  test('is named only when it is not the row the page draws', () => {
+    const both = parseMetricsPackets([failedRun, measuredRun]);
+    const drawn = newestMeasured(both.packets);
+    expect(drawn?.id).toBe('p-old');
+    expect(unmeasuredNewest(both.latest, drawn)?.id).toBe('f-new');
+    const healthy = parseMetricsPackets([measuredRun]);
+    expect(unmeasuredNewest(healthy.latest, newestMeasured(healthy.packets))).toBeNull();
+    expect(unmeasuredNewest(null, drawn)).toBeNull();
   });
 });
 
@@ -336,6 +402,13 @@ describe('loadMetricsPackets', () => {
     globalThis.fetch = (async () => new Response('nope', { status: 503 })) as unknown as typeof fetch;
     const r = await loadMetricsPackets(30);
     expect(r.kind).toBe('failed');
+  });
+
+  test('a 200 with an envelope it does not know is a failure too (b64b3c04), with the reason', async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ items: [] }), { status: 200 })) as unknown as typeof fetch;
+    const r = await loadMetricsPackets(30);
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.error).toMatch(/unrecognised .* envelope/);
   });
 });
 

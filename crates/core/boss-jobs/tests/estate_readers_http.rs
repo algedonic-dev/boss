@@ -8,8 +8,19 @@
 //! that surface, and the IT page's data source.
 //!
 //! Properties pinned:
-//! - a GUEST reads both (same posture as /api/estate/nodes — no auth
-//!   gate, these serve the public IT surface);
+//! - each read ASKS POLICY, over the platform's real default rules
+//!   (backlog e5f7b51e): Read on `estate`, at scope ALL. A request with
+//!   no identity (role `guest`), a basic visitor (the OSS default guest
+//!   session), a role granted Read only at a narrowed scope, and a role
+//!   holding `subject` and `event` but not `estate` are refused; David's
+//!   unelevated session (platform-admin at the user tier), the
+//!   break-glass recovery session, the dispatcher and conductor
+//!   (platform-admin at operator), every machine reader
+//!   (`audit-readonly` at the auditor tier) and — on an instance that
+//!   opts in to the audit read, the playground — its guest session
+//!   (`audit-readonly` at the user tier) are answered. Until this
+//!   they were "guest-readable": every host's LAN address, roles and
+//!   disk reading answered a caller with no name;
 //! - an empty log answers `{"data": []}`, not an error;
 //! - each reader serves ONLY its own kind — an observation never
 //!   appears among comparisons and vice versa;
@@ -39,7 +50,7 @@ use boss_core::publisher::DomainPublisher;
 use boss_jobs::InMemoryJobs;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::port::JobsRepository;
-use boss_policy_client::{FakePolicyClient, PolicyClient};
+use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::RecordingEventBus;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -57,9 +68,66 @@ fn operator_header() -> String {
     .expect("a User always serialises")
 }
 
+fn caller(id: &str, role: &str, tier: AccessTier) -> String {
+    serde_json::to_string(&User {
+        id: id.to_string(),
+        role: role.to_string(),
+        access_tier: tier,
+        territory_account_ids: Vec::new(),
+        direct_report_ids: Vec::new(),
+        department: None,
+    })
+    .expect("a User always serialises")
+}
+
+/// The machine reader every in-tree script signs as — node-roles.sh
+/// through `sor_reader_header`, a lint through `lint_sor_read`, a
+/// recorded probe through `boss-sor-read`: the read role at the
+/// auditor tier.
+fn reader_header() -> String {
+    caller(
+        "automation:boss-gcp-converge",
+        boss_core::roles::AUDIT_READONLY_ROLE,
+        AccessTier::Auditor,
+    )
+}
+
+/// A tenant role granted Read on BOTH estate resources, but only at a
+/// narrowed scope — the grant shape a tenant seed gives a manager.
+const NARROWED_ROLE: &str = "estate-team-lead";
+
+/// A role holding Read at scope all on `subject` and `event` — what the
+/// three reads asked before they asked `estate` — and nothing on
+/// `estate`.
+const OLD_RESOURCES_ROLE: &str = "subject-and-event-reader";
+
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
-    let policy: Arc<dyn PolicyClient> = Arc::new(FakePolicyClient::builder().build());
+    // The REAL default rules, not a fake's: who may read the estate is
+    // decided by the grants every install ships, and this is where that
+    // decision is measured. Plus one tenant-shaped narrowed grant, so the
+    // scope-ALL half of the gate is measured too.
+    let policy: Arc<dyn PolicyClient> = Arc::new(
+        FakePolicyClient::builder()
+            .with_default_rules()
+            .allow(NARROWED_ROLE, Action::Read, Resource::estate(), Scope::Team)
+            // Everything the reads USED to ask, at scope all — and not
+            // `estate`. Refused on all three, so each route is pinned to
+            // the resource it asks (review NIT-2).
+            .allow(
+                OLD_RESOURCES_ROLE,
+                Action::Read,
+                Resource::subject(),
+                Scope::All,
+            )
+            .allow(
+                OLD_RESOURCES_ROLE,
+                Action::Read,
+                Resource::event(),
+                Scope::All,
+            )
+            .build(),
+    );
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState::minimal(
@@ -72,17 +140,26 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     (router(state), jobs)
 }
 
-/// GET as a guest — deliberately NO x-boss-user header.
-async fn get_as_guest(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+/// GET as the machine reader the in-tree scripts sign as.
+async fn get_as_reader(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    get_as(app, uri, Some(reader_header())).await
+}
+
+/// GET as `user` — `None` sends NO x-boss-user at all, which is what
+/// the gateway forwards for a sessionless route and what a caller of
+/// the machine door sends when it names nobody.
+async fn get_as(
+    app: &axum::Router,
+    uri: &str,
+    user: Option<String>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder().method("GET").uri(uri);
+    if let Some(u) = user {
+        req = req.header("x-boss-user", u);
+    }
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(req.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -151,16 +228,115 @@ fn markers(body: &serde_json::Value) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn an_empty_log_answers_empty_data_to_a_guest() {
+async fn an_empty_log_answers_empty_data_to_a_reader() {
     let (app, _) = app();
     for uri in ["/api/estate/observations", "/api/estate/comparisons"] {
-        let (status, body) = get_as_guest(&app, uri).await;
-        assert_eq!(status, StatusCode::OK, "{uri} is guest-readable");
+        let (status, body) = get_as_reader(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri} answers a reader");
         assert_eq!(
             body["data"],
             serde_json::json!([]),
             "{uri} answers empty, not an error"
         );
+    }
+}
+
+/// THE ESTATE READS ASK POLICY (backlog e5f7b51e). Until this car all
+/// three answered a request with no identity — every host's LAN
+/// address, its roles and capacity, and every disk and unit reading —
+/// through the `/ics` traversal (1d9b7db7) and the LAN machine door
+/// (2710c8fc) alike. Each read now asks Read on its resource over the
+/// real default rules, so the answer below is the grant matrix every
+/// install ships, not a fake's.
+///
+/// David's rule (packet 62dac114) is the second half: this refuses
+/// callers with no name, never his session. His browser reaches these
+/// through the gateway's `/api/estate/{*rest}` proxy, which sets
+/// `x-boss-user` from the session cookie — platform-admin at the USER
+/// tier until he elevates — so that exact shape is one of the callers
+/// that must be answered.
+#[tokio::test]
+async fn each_estate_read_asks_policy_and_refuses_a_caller_with_no_name() {
+    let (app, _) = app();
+    let refused: &[(&str, Option<String>)] = &[
+        ("a request with no identity", None),
+        (
+            "the `guest` role (what the extractor makes of silence)",
+            Some(caller("anonymous", "guest", AccessTier::User)),
+        ),
+        (
+            "a basic visitor (the OSS default guest session)",
+            Some(caller(
+                "visitor@example.org",
+                boss_core::roles::VISITOR_ROLE,
+                AccessTier::User,
+            )),
+        ),
+        // THE SCOPE-ALL HALF: Read granted, but narrowed. No estate row
+        // has an owner, team or department to match, so a narrowed grant
+        // would read an empty estate — refused instead, never answered
+        // empty (review of 4e9e75e3: collapsing the scope check to
+        // `Allow { .. }` left every other test here green).
+        (
+            "a tenant role granted Read only at a narrowed scope",
+            Some(caller("emp-lead", NARROWED_ROLE, AccessTier::User)),
+        ),
+        (
+            "a role reading subject and event at scope all, but not estate",
+            Some(caller("emp-reader", OLD_RESOURCES_ROLE, AccessTier::User)),
+        ),
+    ];
+    let answered: &[(&str, String)] = &[
+        (
+            "David's unelevated session",
+            caller("emp-david", "platform-admin", AccessTier::User),
+        ),
+        (
+            "the dispatcher's rule actor",
+            caller("rule:estate-alarm", "platform-admin", AccessTier::Operator),
+        ),
+        ("a machine reader (node-roles.sh, a probe)", reader_header()),
+        // An instance that opts in to the audit read (BOSS_GUEST_ACCESS=
+        // audit, the playground) mints its guest session as
+        // audit-readonly at the USER tier, and that guest reads the
+        // estate: the install chose the full audit read for strangers.
+        // THE EMERGENCY SESSION (DR rule 62dac114, review of 5957f14b):
+        // the hardware-key break-glass session reads the machines during
+        // a recovery. It was guest-readable before this car, so a refusal
+        // here would be a new refusal on David's emergency path — and
+        // break-glass holds no `subject`, which the registry read asked
+        // at first.
+        (
+            "the break-glass session (hardware-key recovery)",
+            caller("emp-david", "break-glass", AccessTier::User),
+        ),
+        (
+            "an audit-read guest session (the playground)",
+            caller(
+                "guest@algedonic.dev",
+                boss_core::roles::AUDIT_READONLY_ROLE,
+                AccessTier::User,
+            ),
+        ),
+    ];
+    for uri in [
+        "/api/estate/nodes",
+        "/api/estate/observations",
+        "/api/estate/comparisons",
+    ] {
+        for (who, user) in refused {
+            let (status, body) = get_as(&app, uri, user.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{uri} must refuse {who}: {body}"
+            );
+        }
+        for (who, user) in answered {
+            let (status, body) = get_as(&app, uri, Some(user.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must answer {who}: {body}");
+            assert!(body["data"].is_array(), "{uri} to {who}: {body}");
+        }
     }
 }
 
@@ -170,8 +346,8 @@ async fn each_reader_serves_only_its_own_kind() {
     post_observation(&app, "obs-1").await;
     post_comparison(&app, "cmp-1").await;
 
-    let (_, obs) = get_as_guest(&app, "/api/estate/observations").await;
-    let (_, cmp) = get_as_guest(&app, "/api/estate/comparisons").await;
+    let (_, obs) = get_as_reader(&app, "/api/estate/observations").await;
+    let (_, cmp) = get_as_reader(&app, "/api/estate/comparisons").await;
     assert_eq!(markers(&obs), vec!["obs-1"], "observations reader");
     assert_eq!(markers(&cmp), vec!["cmp-1"], "comparisons reader");
 }
@@ -182,7 +358,7 @@ async fn limit_is_respected_and_rows_come_newest_first() {
     for marker in ["obs-1", "obs-2", "obs-3"] {
         post_observation(&app, marker).await;
     }
-    let (_, body) = get_as_guest(&app, "/api/estate/observations?limit=2").await;
+    let (_, body) = get_as_reader(&app, "/api/estate/observations?limit=2").await;
     assert_eq!(
         markers(&body),
         vec!["obs-3", "obs-2"],
@@ -197,16 +373,16 @@ async fn scope_selects_one_series_out_of_a_mixed_log() {
     post_observation_in(&app, "kubernetes-nodes", "k8s-1").await;
     post_observation_in(&app, "host", "host-1").await;
 
-    let (status, body) = get_as_guest(&app, "/api/estate/observations?scope=codebase").await;
-    assert_eq!(status, StatusCode::OK, "scope= is guest-readable too");
+    let (status, body) = get_as_reader(&app, "/api/estate/observations?scope=codebase").await;
+    assert_eq!(status, StatusCode::OK, "scope= answers a reader too");
     assert_eq!(markers(&body), vec!["code-1"], "only the codebase series");
 
-    let (_, body) = get_as_guest(&app, "/api/estate/observations?scope=host").await;
+    let (_, body) = get_as_reader(&app, "/api/estate/observations?scope=host").await;
     assert_eq!(markers(&body), vec!["host-1"], "only the host series");
 
     // A scope nobody has recorded is empty, not an error and not
     // everything — a typo in a URL must never silently widen the read.
-    let (status, body) = get_as_guest(&app, "/api/estate/observations?scope=nonesuch").await;
+    let (status, body) = get_as_reader(&app, "/api/estate/observations?scope=nonesuch").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["data"],
@@ -239,7 +415,7 @@ async fn a_slow_scope_survives_a_full_ceiling_of_a_fast_one() {
     }
 
     // Unfiltered, even at the hard ceiling, the nightly row is gone.
-    let (_, unfiltered) = get_as_guest(&app, "/api/estate/observations?limit=50").await;
+    let (_, unfiltered) = get_as_reader(&app, "/api/estate/observations?limit=50").await;
     assert!(
         !markers(&unfiltered).contains(&"nightly".to_string()),
         "precondition: the fast scope fills the whole ceiling"
@@ -247,7 +423,7 @@ async fn a_slow_scope_survives_a_full_ceiling_of_a_fast_one() {
 
     // By scope it is reachable — and reachable at the DEFAULT limit,
     // because the filter runs before the limit rather than after it.
-    let (_, scoped) = get_as_guest(&app, "/api/estate/observations?scope=codebase").await;
+    let (_, scoped) = get_as_reader(&app, "/api/estate/observations?scope=codebase").await;
     assert_eq!(
         markers(&scoped),
         vec!["nightly"],
@@ -261,7 +437,7 @@ async fn scope_and_limit_compose_on_the_comparisons_reader_too() {
     post_comparison(&app, "cmp-1").await;
     post_comparison(&app, "cmp-2").await;
 
-    let (_, body) = get_as_guest(
+    let (_, body) = get_as_reader(
         &app,
         "/api/estate/comparisons?scope=kubernetes-nodes&limit=1",
     )
@@ -272,7 +448,7 @@ async fn scope_and_limit_compose_on_the_comparisons_reader_too() {
         "newest of the scope, limited"
     );
 
-    let (_, body) = get_as_guest(&app, "/api/estate/comparisons?scope=codebase").await;
+    let (_, body) = get_as_reader(&app, "/api/estate/comparisons?scope=codebase").await;
     assert_eq!(
         body["data"],
         serde_json::json!([]),
@@ -319,7 +495,7 @@ async fn until_pages_back_past_the_ceiling_and_total_counts_the_window() {
     let (app, jobs) = app();
     record_minutely(&jobs, "host-units", "2026-09-22T00:00:00Z", 120).await;
 
-    let (status, first) = get_as_guest(&app, "/api/estate/observations?limit=50").await;
+    let (status, first) = get_as_reader(&app, "/api/estate/observations?limit=50").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(markers(&first).len(), 50, "the ceiling still holds");
     assert_eq!(markers(&first)[0], "host-units-119", "newest first");
@@ -333,7 +509,7 @@ async fn until_pages_back_past_the_ceiling_and_total_counts_the_window() {
         .as_str()
         .expect("rows carry their timestamp")
         .to_string();
-    let (status, second) = get_as_guest(
+    let (status, second) = get_as_reader(
         &app,
         &format!("/api/estate/observations?limit=50&until={cursor}"),
     )
@@ -351,7 +527,7 @@ async fn until_pages_back_past_the_ceiling_and_total_counts_the_window() {
     assert_eq!(second["total"], 70, "the window before the cursor");
 
     // The oldest rows are reachable at all — the property that was missing.
-    let (_, oldest) = get_as_guest(
+    let (_, oldest) = get_as_reader(
         &app,
         "/api/estate/observations?until=2026-09-22T00:05:00Z&limit=50",
     )
@@ -379,7 +555,7 @@ async fn since_and_until_bound_a_window_that_composes_with_scope() {
     record_minutely(&jobs, "host-units", "2026-09-22T00:00:00Z", 30).await;
     record_minutely(&jobs, "host", "2026-09-22T00:00:30Z", 30).await;
 
-    let (status, body) = get_as_guest(
+    let (status, body) = get_as_reader(
         &app,
         "/api/estate/observations?scope=host-units\
          &since=2026-09-22T00:10:00Z&until=2026-09-22T00:13:00Z",
@@ -395,7 +571,7 @@ async fn since_and_until_bound_a_window_that_composes_with_scope() {
 
     // A window with nothing in it is empty with total 0, not an error.
     let (status, body) =
-        get_as_guest(&app, "/api/estate/comparisons?since=2026-09-22T00:00:00Z").await;
+        get_as_reader(&app, "/api/estate/comparisons?since=2026-09-22T00:00:00Z").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"], serde_json::json!([]));
     assert_eq!(body["total"], 0, "the comparisons reader counts too");
@@ -411,7 +587,7 @@ async fn an_unreadable_instant_is_refused_not_ignored() {
         "/api/estate/observations?until=yesterday",
         "/api/estate/comparisons?since=2026-13-01",
     ] {
-        let (status, _) = get_as_guest(&app, uri).await;
+        let (status, _) = get_as_reader(&app, uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} is refused");
     }
 }
@@ -453,19 +629,19 @@ async fn latest_per_host_answers_every_host_however_slow_its_cadence() {
     record_host_comparisons(&jobs, "forge", "2026-09-24T11:00:00Z", 60).await;
 
     // Precondition: the scope alone is spent by the fast host.
-    let (_, scoped) = get_as_guest(&app, "/api/estate/comparisons?scope=host&limit=50").await;
+    let (_, scoped) = get_as_reader(&app, "/api/estate/comparisons?scope=host&limit=50").await;
     assert!(
         !markers(&scoped).contains(&"boss-gcp-0".to_string()),
         "precondition: forge fills the whole scoped page"
     );
     assert_eq!(scoped["total"], 61);
 
-    let (status, latest) = get_as_guest(
+    let (status, latest) = get_as_reader(
         &app,
         "/api/estate/comparisons?scope=host&latest_per=host&limit=50",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "latest_per is guest-readable");
+    assert_eq!(status, StatusCode::OK, "latest_per answers a reader");
     assert_eq!(
         markers(&latest),
         vec!["forge-59", "boss-gcp-0"],
@@ -474,7 +650,7 @@ async fn latest_per_host_answers_every_host_however_slow_its_cadence() {
     assert_eq!(latest["total"], 2, "total counts HOSTS under latest_per");
 
     // A limit below the host count stays honest: rows < total.
-    let (_, one) = get_as_guest(
+    let (_, one) = get_as_reader(
         &app,
         "/api/estate/comparisons?scope=host&latest_per=host&limit=1",
     )
@@ -483,7 +659,7 @@ async fn latest_per_host_answers_every_host_however_slow_its_cadence() {
     assert_eq!(one["total"], 2, "the truncation is visible, not hidden");
 
     // The window composes: before forge's first row, boss-gcp alone.
-    let (_, before) = get_as_guest(
+    let (_, before) = get_as_reader(
         &app,
         "/api/estate/comparisons?scope=host&latest_per=host&until=2026-09-24T11:00:00Z",
     )
@@ -498,7 +674,7 @@ async fn latest_per_host_answers_every_host_however_slow_its_cadence() {
 #[tokio::test]
 async fn an_unknown_latest_per_key_is_refused_not_ignored() {
     let (app, _) = app();
-    let (status, body) = get_as_guest(
+    let (status, body) = get_as_reader(
         &app,
         "/api/estate/comparisons?scope=host&latest_per=nonesuch",
     )
@@ -567,19 +743,19 @@ async fn host_selects_one_hosts_series_before_the_limit_on_both_readers() {
     jobs.record_events(&events).await.expect("events record");
 
     // Precondition: the page the raiser read holds none of boss-gcp's rows.
-    let (_, scoped) = get_as_guest(&app, "/api/estate/comparisons?scope=host&limit=20").await;
+    let (_, scoped) = get_as_reader(&app, "/api/estate/comparisons?scope=host&limit=20").await;
     assert!(
         !markers(&scoped).iter().any(|m| m.starts_with("boss-gcp")),
         "precondition: forge spends the whole scoped page"
     );
 
     for reader in ["comparisons", "observations"] {
-        let (status, one) = get_as_guest(
+        let (status, one) = get_as_reader(
             &app,
             &format!("/api/estate/{reader}?scope=host&host=boss-gcp&limit=20"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{reader}: host= is guest-readable");
+        assert_eq!(status, StatusCode::OK, "{reader}: host= answers a reader");
         assert_eq!(
             markers(&one),
             vec!["boss-gcp-2", "boss-gcp-1", "boss-gcp-0"],
@@ -588,7 +764,7 @@ async fn host_selects_one_hosts_series_before_the_limit_on_both_readers() {
         assert_eq!(one["total"], 3, "{reader}: total counts that host's rows");
 
         // The limit applies to the host's series, not before the filter.
-        let (_, forge) = get_as_guest(
+        let (_, forge) = get_as_reader(
             &app,
             &format!("/api/estate/{reader}?scope=host&host=forge&limit=2"),
         )
@@ -597,7 +773,7 @@ async fn host_selects_one_hosts_series_before_the_limit_on_both_readers() {
         assert_eq!(forge["total"], 288, "{reader}: rows < total shows the rest");
 
         // Control: a host no row names answers empty, not the scope.
-        let (_, none) = get_as_guest(
+        let (_, none) = get_as_reader(
             &app,
             &format!("/api/estate/{reader}?scope=host&host=nonesuch"),
         )

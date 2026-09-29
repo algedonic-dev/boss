@@ -22,7 +22,7 @@ Environment=RUST_LOG=info
 # Pre ensures the open Job (spawns today's, or reuses a standing
 # failure so recovery closes it); Post completes `run` on SUCCESS
 # only — a failed run leaves the Job open and loud.
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-replay "Ledger replay check"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-replay "Ledger replay check"
 ExecStart=/usr/local/bin/boss-ledger-replay-check --deep --config /etc/boss-ledger-api.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-ledger-replay run
 # Runs as root to match the boss-audit-integrity-check timer pattern. The

@@ -8,8 +8,9 @@
 #
 # One definition for every reader of the forge's repository by path
 # (CLAUDE.md 9a): publish-github-pr.sh (a publish and --measure), and
-# offsite-push.sh (the push of publish/* to the fork, backlog 21d54f4a;
-# main left it in 67931115). Moved here out of publish-github-pr.sh verbatim on
+# offsite-push.sh (the off-site push, backlog 21d54f4a; main left the
+# public fork in 67931115 for the private DR copy, 761bc8a9, and publish/*
+# left it in a2b58aab). Moved here out of publish-github-pr.sh verbatim on
 # 2026-09-26, when the second reader arrived, rather than copied.
 #
 # Inputs (all optional):

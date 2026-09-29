@@ -8,5 +8,6 @@
   "params": [
     { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
   ],
-  "timeout": 900
+  "timeout": 900,
+  "effect": "^move-forgejo-data: OK — Forgejo serves from .+ on the root filesystem again; .+ is left in place$"
 }

@@ -64,7 +64,8 @@ use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::agent_budget::BudgetDoor;
 use boss_jobs::agent_runs::InMemoryAgentRuns;
-use boss_jobs::agents::InMemoryAgents;
+use boss_jobs::agents::types::{AgentInput, AgentRow, AgentsBatchOutcome};
+use boss_jobs::agents::{AgentsError, AgentsRegistry, InMemoryAgents};
 use boss_jobs::audience::Audience;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::owner_resolution::RosterLookup;
@@ -90,11 +91,18 @@ type MoveOnReserve = (Arc<InMemoryJobs>, StepId, &'static str);
 /// deterministic the same way.
 type ClaimOnReserve = (Arc<InMemoryJobs>, StepId, &'static str);
 
+/// A new holder handed a still-READY step between a claim's read and its
+/// CAS — a nomination, not a claim: the last field becomes the holder
+/// and the step stays Ready (backlog ce8b7d66, the review of car
+/// eb2f9b0f, finding 1).
+type HandOnReserve = (Arc<InMemoryJobs>, StepId, &'static str);
+
 #[derive(Default)]
 struct HeldCalendar {
     held: Mutex<Vec<Reservation>>,
     move_on_reserve: Mutex<Option<MoveOnReserve>>,
     claim_on_reserve: Mutex<Option<ClaimOnReserve>>,
+    hand_on_reserve: Mutex<Option<HandOnReserve>>,
 }
 
 impl HeldCalendar {
@@ -123,6 +131,12 @@ impl CalendarClient for HeldCalendar {
         if let Some((jobs, step_id, scheduled_at)) = racing {
             let mut step = jobs.get_step(&step_id).await.unwrap().unwrap();
             step.metadata["scheduled_at"] = serde_json::json!(scheduled_at);
+            jobs.update_step(&step).await.unwrap();
+        }
+        let handed = self.hand_on_reserve.lock().unwrap().take();
+        if let Some((jobs, step_id, holder)) = handed {
+            let mut step = jobs.get_step(&step_id).await.unwrap().unwrap();
+            step.assignee_id = Some(holder.to_string());
             jobs.update_step(&step).await.unwrap();
         }
         let rival = self.claim_on_reserve.lock().unwrap().take();
@@ -286,6 +300,15 @@ fn user(id: &str, role: &str) -> User {
 
 /// Every role here may write steps; only `lead` holds `step-assign`.
 fn build_app() -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
+    build_app_with_agents(Arc::new(
+        InMemoryAgents::new().with_agent(AGENT, [AGENT_LOGIN]),
+    ))
+}
+
+/// [`build_app`], reading the agents registry `agents`.
+fn build_app_with_agents(
+    agents: Arc<dyn AgentsRegistry>,
+) -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let calendar = Arc::new(HeldCalendar::default());
     let bus = RecordingEventBus::new();
@@ -305,7 +328,7 @@ fn build_app() -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         roster: Some(Arc::new(Roster)),
         agent_budget: Some(Arc::new(BudgetDoor {
-            agents: Arc::new(InMemoryAgents::new().with_agent(AGENT, [AGENT_LOGIN])),
+            agents,
             runs: Arc::new(InMemoryAgentRuns::new(vec![])),
         })),
         ..JobsApiState::minimal(
@@ -787,6 +810,181 @@ async fn a_claim_for_displaces_only_the_executor_and_only_when_authorised() {
     assert_eq!(stored.assignee_id.as_deref(), Some(LEAD));
     assert_eq!(stored.status, StepStatus::Ready);
     assert!(calendar.live_for(&step2.id.to_string()).is_empty());
+}
+
+/// The claim-for marker names the holder the claim took the step FROM
+/// (backlog ce8b7d66, S3 of the review of car 5d1c0b7a): `claimed_by`
+/// and `claimed_for` said who acted and for whom, and nothing said that
+/// the declared executor's hold was ended by it. A claim that displaced
+/// no one says so by leaving the key out.
+#[tokio::test]
+async fn the_claim_for_marker_names_the_holder_it_displaced() {
+    let (app, jobs, _calendar) = build_app();
+    let (job, step) = materialised_run(&jobs).await;
+    let (status, body) = claim(&app, &job, &step, &user(LEAD, "lead"), Some(OTHER)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, assigned) = claim_events(&jobs, &step);
+    assert_eq!(assigned["claimed_for"], OTHER);
+    assert_eq!(
+        assigned["displaced"], EXECUTOR,
+        "the marker names whose hold the claim ended: {assigned}"
+    );
+
+    let (job2, step2) = scheduled(&jobs, None, serde_json::json!({})).await;
+    let (status, body) = claim(&app, &job2, &step2, &user(LEAD, "lead"), Some(TECH)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, assigned) = claim_events(&jobs, &step2);
+    assert!(
+        assigned.get("displaced").is_none(),
+        "a step nobody held displaces no one: {assigned}"
+    );
+}
+
+/// A Ready step held by the CALLER's own login is the caller's to hand
+/// on (backlog ce8b7d66, S4 of the review of car 5d1c0b7a): the claim
+/// may displace the caller, and the caller is every spelling the agents
+/// registry ties to it — not only the id the login door signs with. It
+/// answered 409 "held by someone else", naming the caller's own login.
+#[tokio::test]
+async fn a_claim_for_takes_a_step_held_by_the_callers_own_login() {
+    let (app, jobs, _calendar) = build_app();
+    let (job, step) = scheduled(&jobs, Some(AGENT_LOGIN), serde_json::json!({})).await;
+
+    let (status, body) = claim(&app, &job, &step, &user(AGENT, "lead"), Some(OTHER)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id.as_deref(), Some(OTHER));
+    assert_eq!(stored.status, StepStatus::Active);
+    let (_, assigned) = claim_events(&jobs, &step);
+    assert_eq!(assigned["claimed_by"], AGENT);
+    assert_eq!(assigned["displaced"], AGENT_LOGIN, "{assigned}");
+
+    // Someone else's login is still someone else's hold.
+    let (job2, step2) = scheduled(&jobs, Some(LEAD), serde_json::json!({})).await;
+    let (status, body) = claim(&app, &job2, &step2, &user(AGENT, "lead"), Some(TECH)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains(LEAD), "{body}");
+}
+
+/// The assignment markers recorded for `step`, if any.
+fn assigned_markers(jobs: &InMemoryJobs, step: &Step) -> Vec<serde_json::Value> {
+    let sid = step.id.to_string();
+    jobs.recorded_events()
+        .into_iter()
+        .filter(|e| e.kind.starts_with("step.assigned.") && e.payload["step_id"] == sid.as_str())
+        .map(|e| e.payload)
+        .collect()
+}
+
+/// A CLAIM FOR SOMEONE ELSE ENDS ONLY THE HOLD IT READ (backlog
+/// ce8b7d66, the review of car eb2f9b0f, finding 1). The marker names the
+/// holder the claim read as `displaced`, so the CAS may displace that
+/// holder and no other: a step handed, between the claim's read and its
+/// CAS, to another holder the claim would have been AUTHORISED to take
+/// it from — the declared executor, or the caller itself — must not be
+/// taken, or the marker names the wrong hold. Two shapes: the step was
+/// free when read, and it was the executor's. Each answers a 409 naming
+/// the new holder, says the claim may be sent again rather than calling
+/// the caller's own hold someone else's, leaves the step with that
+/// holder, records no assignment marker, and holds none of the
+/// nominee's time. The width the CAS had before this car
+/// (`declared` + caller) answered 200 to both.
+#[tokio::test]
+async fn a_claim_for_ends_only_the_hold_it_read() {
+    for (read, handed_to) in [(None, EXECUTOR), (Some(EXECUTOR), LEAD)] {
+        let (app, jobs, calendar) = build_app();
+        let (job, step) = scheduled_as(&jobs, RUN, read, serde_json::json!({})).await;
+        *calendar.hand_on_reserve.lock().unwrap() = Some((jobs.clone(), step.id, handed_to));
+
+        let (status, body) = claim(&app, &job, &step, &user(LEAD, "lead"), Some(OTHER)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "read {read:?}: {body}");
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            answer["holder"], handed_to,
+            "names who holds it now: {body}"
+        );
+        let error = answer["error"].as_str().unwrap_or_default();
+        assert!(error.contains("send it again"), "retryable: {body}");
+        assert!(!error.contains("someone else"), "{body}");
+
+        let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(stored.assignee_id.as_deref(), Some(handed_to));
+        assert_eq!(stored.status, StepStatus::Ready);
+        assert!(
+            assigned_markers(&jobs, &step).is_empty(),
+            "read {read:?}: a refused claim records no marker"
+        );
+        assert!(
+            calendar.live_for(&step.id.to_string()).is_empty(),
+            "read {read:?}: the nominee's time is handed back"
+        );
+    }
+}
+
+/// An agents registry whose `call`-th `list` fails and every other
+/// answers as `inner` does — a registry that goes dark for one read.
+struct ListFailsOnCall {
+    inner: InMemoryAgents,
+    calls: std::sync::atomic::AtomicUsize,
+    fail_on: usize,
+}
+
+#[async_trait]
+impl AgentsRegistry for ListFailsOnCall {
+    async fn resolve_login(&self, login: &str) -> Result<Option<String>, AgentsError> {
+        self.inner.resolve_login(login).await
+    }
+    async fn list(&self) -> Result<Vec<AgentRow>, AgentsError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == self.fail_on {
+            return Err(AgentsError::Storage("connection reset".into()));
+        }
+        self.inner.list().await
+    }
+    async fn publish(
+        &self,
+        rows: &[AgentInput],
+        mode: boss_core::publish::PublishMode,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<AgentsBatchOutcome, AgentsError> {
+        self.inner.publish(rows, mode, stamp).await
+    }
+}
+
+/// S4's "a registry that cannot answer is judged as before" (the review
+/// of car eb2f9b0f, finding 3). A claim for someone else reads the
+/// registry three times — to resolve the nominee, to name the caller's
+/// logins, and for the holder's row — and the SECOND going dark must
+/// neither refuse the claim nor widen it: the caller's login is not
+/// displaceable (409, the step untouched), and the declared executor
+/// still is (200).
+#[tokio::test]
+async fn a_claim_for_whose_caller_logins_cannot_be_read_is_judged_as_before() {
+    let dark_second_read = || -> Arc<dyn AgentsRegistry> {
+        Arc::new(ListFailsOnCall {
+            inner: InMemoryAgents::new().with_agent(AGENT, [AGENT_LOGIN]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_on: 2,
+        })
+    };
+
+    let (app, jobs, _calendar) = build_app_with_agents(dark_second_read());
+    let (job, step) = scheduled(&jobs, Some(AGENT_LOGIN), serde_json::json!({})).await;
+    let (status, body) = claim(&app, &job, &step, &user(AGENT, "lead"), Some(OTHER)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "not widened: {body}");
+    assert!(body.contains(AGENT_LOGIN), "{body}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id.as_deref(), Some(AGENT_LOGIN));
+    assert_eq!(stored.status, StepStatus::Ready);
+
+    let (app, jobs, _calendar) = build_app_with_agents(dark_second_read());
+    let (job, step) = materialised_run(&jobs).await;
+    let (status, body) = claim(&app, &job, &step, &user(LEAD, "lead"), Some(OTHER)).await;
+    assert_eq!(status, StatusCode::OK, "not refused: {body}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id.as_deref(), Some(OTHER));
+    let (_, assigned) = claim_events(&jobs, &step);
+    assert_eq!(assigned["displaced"], EXECUTOR);
 }
 
 /// A caller naming ITS OWN login as `claimed_for` is claiming for

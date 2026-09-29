@@ -232,7 +232,7 @@ const ALERT_ACTOR: &str = "automation:inventory";
 /// is the sender it claims, so the door's sender match admits it with
 /// no operator tier needed.
 fn low_stock_alert(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     part_sku: &str,
     body: &str,
 ) -> reqwest::RequestBuilder {
@@ -268,7 +268,14 @@ mod low_stock_alert_tests {
 
     #[test]
     fn the_alert_is_signed_as_the_sender_it_claims() {
-        let req = low_stock_alert(&reqwest::Client::new(), "P-1", "b")
+        let client = boss_core::machine_token::Client::build_with_source(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(boss_core::machine_token::Source::fixed(Some(
+                "estate-token".into(),
+            ))),
+        )
+        .unwrap();
+        let req = low_stock_alert(&client, "P-1", "b")
             .build()
             .expect("the request builds");
         let user: boss_policy_client::User = serde_json::from_str(
@@ -283,12 +290,20 @@ mod low_stock_alert_tests {
             serde_json::from_slice(req.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
         assert_eq!(user.id, ALERT_ACTOR);
         assert_eq!(body["sender_id"], user.id.as_str());
+        // And the machine token: the alert sent none until review S2 of
+        // design 6805c764 car 2, so a messages port in enforce refused it.
+        assert_eq!(
+            req.headers().get(boss_core::machine_token::HEADER).unwrap(),
+            "estate-token"
+        );
     }
 }
 
-/// Send a low-stock system signal to the warehouse manager's inbox.
+/// Send a low-stock system signal to the warehouse manager's inbox, on
+/// a client that stamps the machine token and follows no redirect.
 async fn send_low_stock_alert(part_sku: &str, body: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = boss_core::machine_token::Client::build(reqwest::Client::builder())
+        .map_err(|e| e.to_string())?;
     let resp = low_stock_alert(&client, part_sku, body)
         .send()
         .await

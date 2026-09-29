@@ -47,7 +47,8 @@ export type Agent = Readonly<{
   aliases: ReadonlyArray<string>;
   /// A Class code under `(employee, role)`, or null: holds no role.
   role: string | null;
-  /// A Class code under `(employee, department)`, or null.
+  /// A departments-registry code (`GET /api/departments`; an
+  /// `(employee, department)` Class until c87e3d6d), or null.
   department: string | null;
   /// The model a run uses when it does not say, as the rate card spells it.
   defaultModel: string | null;

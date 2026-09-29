@@ -33,6 +33,8 @@ import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
 import { FAILURE_MARKER } from './_routes';
 import {
+  DEPARTMENTS,
+  DEPARTMENTS_ENDPOINT,
   LIVE_MANIFEST_RECORDED_AT,
   MODULES_LIVE,
   MODULES_ON,
@@ -63,6 +65,7 @@ const kind = (
 const KINDS = [
   kind('person', null, 1),
   kind('employee', 'person', 1),
+  kind('department', 'person', 16),
   kind('object', null, 3),
   kind('asset', 'object', 1, { module: 'equipment' }),
   kind('node', 'object', 2),
@@ -93,9 +96,16 @@ const NODE_ROLES = [
 
 const CLASSES_OF = (k: string): RegExp => new RegExp(`/api/classes\\?subject_kind=${k}$`);
 
+/// The four function Classes migration 20260919181324 declares on the
+/// `department` kind — the only Classes that kind has.
+const DEPARTMENT_FUNCTIONS = ['operations', 'revenue', 'support', 'governance'].map((c) =>
+  cls('department', c, 'function'),
+);
+
 type Reads = Readonly<{
   kinds?: (r: Route) => Promise<void>;
   workflows?: (r: Route) => Promise<void>;
+  departments?: (r: Route) => Promise<void>;
   modules?: Readonly<Record<string, boolean>>;
 }>;
 
@@ -108,6 +118,8 @@ async function openSubjects(page: Page, reads: Reads = {}): Promise<void> {
   await page.route(CLASSES_OF('person'), (r) => json(r, []));
   await page.route(CLASSES_OF('employee'), (r) => json(r, [cls('employee', 'ceo', 'role')]));
   await page.route(CLASSES_OF('asset'), (r) => json(r, []));
+  await page.route(CLASSES_OF('department'), (r) => json(r, DEPARTMENT_FUNCTIONS));
+  if (reads.departments) await page.route(DEPARTMENTS_ENDPOINT, reads.departments);
   await page.route(CLASSES_OF('node'), (r) => json(r, NODE_ROLES));
   await page.route(
     /\/api\/workflows$/,
@@ -201,5 +213,46 @@ test.describe('/it/registry/subjects names each kind by its module and the workf
       "Couldn't count the workflows naming employee — HTTP 500",
     );
     await expect(detail(page)).not.toContainText('no active workflow');
+  });
+});
+
+// The department vocabulary lives once (backlog c87e3d6d, decided
+// 2026-09-27 on this page's audit, 9f7ba57d): the departments THEMSELVES
+// are rows of the departments registry, and the `department` kind's
+// only Classes are its four functions. The panel says where the rows
+// are, and how many, beside those four — so the page cannot be read as
+// "this company has four departments", nor send anyone looking for
+// department Classes that retired.
+test.describe('/it/registry/subjects points the department kind at its registry', () => {
+  test("the department kind counts the registry's rows and links the Department Map", async ({ page }) => {
+    await openSubjects(page);
+    await pick(page, 'department').click();
+
+    await expect(detail(page).locator('h3')).toHaveText(['function · 4']);
+    await expect(meta(page)).toContainText(
+      `${DEPARTMENTS.length} departments in the departments registry`,
+    );
+    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toHaveAttribute(
+      'href',
+      '/it',
+    );
+  });
+
+  test('a failed departments read says the count is unknown, never zero', async ({ page }) => {
+    await openSubjects(page, {
+      departments: (r) => json(r, { error: 'registry down' }, 500),
+    });
+    await pick(page, 'department').click();
+
+    await expect(meta(page)).toContainText('department count unknown');
+    await expect(meta(page)).not.toContainText('0 departments');
+    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toBeVisible();
+  });
+
+  test('another kind carries no departments line', async ({ page }) => {
+    await openSubjects(page);
+    await pick(page, 'employee').click();
+
+    await expect(meta(page)).not.toContainText('departments registry');
   });
 });

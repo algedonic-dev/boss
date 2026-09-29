@@ -402,7 +402,7 @@ fn publish_writes(outcome: &Outcome, now: DateTime<Utc>) -> Map<String, Value> {
 /// merge door, then the status alone. The terminals fire from the
 /// workflow; nothing here touches them.
 async fn complete_publish(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     jid: &str,
     step: &Value,
     outcome: &Outcome,
@@ -419,7 +419,7 @@ async fn complete_publish(
 }
 
 async fn drain_one(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     listed: &Value,
     clone: &str,
     remote: &str,
@@ -514,7 +514,7 @@ async fn drain_one(
 /// conductor's run), never from a wallclock read here — the one stamp
 /// this verb writes derives from it.
 pub(crate) async fn run(clone: &str, remote: &str, dry: bool, now: DateTime<Utc>) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let open = rows(
         api(
             &http,

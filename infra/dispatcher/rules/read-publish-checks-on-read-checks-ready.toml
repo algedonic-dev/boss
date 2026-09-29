@@ -2,7 +2,7 @@
 # 2026-09-19). When the protocol's `read-checks` step becomes READY —
 # open-pr completed, the mirror PR is open — spawn an ops-request for
 # host=forge verb=read-publish-checks; the root ops-runner runs the
-# verb (wait for the head's check-runs, read the CodeQL annotations,
+# verb (read the head's check-runs once, read the CodeQL annotations,
 # write the reading onto the packet as `code_scanning`) and completes
 # `read-checks` with conclusion / alerts / rules. The `judge-checks`
 # step that follows is the agent's: a disposition per rule, so David's

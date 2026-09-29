@@ -375,7 +375,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_verb_records_a_correction_a_reader_of_the_step_is_handed() {
         let (base, jobs, job) = serve().await;
-        let wire = Wire::at(base, named());
+        let wire = Wire::at(base, named()).unwrap();
         // By its 8-character prefix, on a CLOSED packet.
         let out = correct(
             &wire,
@@ -420,7 +420,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_servers_refusal_reaches_the_terminal_with_its_reason() {
         let (base, jobs, job) = serve().await;
-        let wire = Wire::at(base, named());
+        let wire = Wire::at(base, named()).unwrap();
         let err = correct(
             &wire,
             "f3e091f0",

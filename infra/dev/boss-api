@@ -233,7 +233,25 @@ ACTOR='{"id":"'"$ACTOR_ID"'","role":"'"$ROLE"'","access_tier":"'"$TIER"'","terri
 
 args=( -sS -X "$METHOD" -H 'Content-Type: application/json' -H "X-Boss-User: $ACTOR" -w '\n%{http_code}' )
 TOK=$(cat "${BOSS_MACHINE_TOKEN_FILE:-/etc/boss/machine-token}" 2>/dev/null || true)
-[ -n "$TOK" ] && args+=( -H "X-Boss-Machine-Token: $TOK" )
+# THE TOKEN RIDES IN A FILE, NEVER IN curl's ARGV (backlog 5f3ad356,
+# 2026-09-28): a command line is world-readable in ps and
+# /proc/<pid>/cmdline while curl runs, and this door put
+# `X-Boss-Machine-Token: $TOK` there under a name a *TOKEN* grep missed.
+# infra/lib/secret-header.sh writes it 0600 and hands curl `-H @file`;
+# infra/lint/a-secret-header-rides-in-a-file.sh keeps it out of argv.
+# Needed only when there IS a token, so a copy of the door on a box
+# with none still runs as before; with one and no lib it refuses.
+if [ -n "$TOK" ]; then
+  SECRET_LIB="$HERE/../lib/secret-header.sh"
+  [ -r "$SECRET_LIB" ] || {
+    echo "boss-api: refusing $METHOD $API_PATH: $SECRET_LIB is missing — without it the machine token would ride in curl's command line, readable in ps by every local user (backlog 5f3ad356)" >&2
+    exit 2
+  }
+  # shellcheck source=../lib/secret-header.sh
+  . "$SECRET_LIB"
+  secret_header TOKEN_HDR "X-Boss-Machine-Token: $TOK"
+  args+=( -H "$TOKEN_HDR" )
+fi
 [ -n "$BODY" ] && args+=( --data-binary "@$BODY" )
 
 # curl, re-sent only while the request never left (the header above

@@ -23,12 +23,39 @@ After=network-online.target
 [Service]
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
-# Reads df/nproc/meminfo and POSTs — nothing here needs root.
+# A oneshot's start timeout is infinity by default. The nodefs line below
+# calls the cluster's API server and each node's Talos API through
+# docker; a stalled daemon or API would hold this unit activating
+# forever, the timer could not start it again, and the forge's OWN host
+# reading — the one the boarding check reads — would stop with it
+# (review of 4327d1a3, finding 3). Ten minutes is far past a healthy run
+# (the host reading takes seconds; five nodes' Talos calls are bounded
+# at 20s each inside their containers).
+TimeoutStartSec=10min
+# Reads df/nproc/meminfo and POSTs — nothing here needs root. The nodefs
+# line below reaches the root-only talosconfig and kubeconfig the way the
+# cluster watchdog does, through `sudo docker run --mount` (ops-credentials.sh),
+# so it runs as david too — and so does the host reading's own credential
+# check, which stats (never reads) the two files through that door when
+# david cannot search /etc/boss-ops (backlog 6296dce1).
 User=david
 Environment=HOST_ID=forge
 # BOSS_JOBS_URL and JOBS_API come from /etc/boss/sor.env (EnvironmentFile=
 # above), rendered by install.sh from infra/estate/estate.toml; the
 # helpers refuse without one, and every Exec line reads the same file.
-ExecStartPre=/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-estate-observe-host "estate host observation (forge)"
+ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-estate-observe-host "estate host observation (forge)"
 ExecStart=/home/david/boss/infra/estate/observe-host.sh
+# Each CLUSTER node's kubelet filesystem, read here through the Talos API
+# with the talosconfig this host holds (backlog eeac3d56): the in-cluster
+# observer used to read it through the kubelet as `get nodes/proxy`,
+# which is exec into any pod, and now carries this reading across
+# instead. SECOND, so the forge's own reading — the one the boarding
+# check reads — never waits on five nodes' Talos calls, and `-` so a
+# failed read never fails this unit: an unread node is recorded as
+# unread, and a reading that stops arriving ages out into
+# `disk_unmeasured` on the kubernetes-nodes observation, where the
+# blind-class alarm reads it. systemd runs no later line after a failed
+# one, so while the host observation cannot post (the record is dark)
+# this is not read either — and it could not have posted.
+ExecStart=-/home/david/boss/infra/estate/observe-nodefs.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-estate-observe-host run

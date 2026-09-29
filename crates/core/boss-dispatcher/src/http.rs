@@ -55,7 +55,7 @@ use boss_calendar_client::CalendarClient;
 use boss_clock_client::ClockClient;
 use boss_core::calendar::BusinessCalendar;
 use boss_jobs::dispatcher_firings::{DispatcherFiringsRepository, RETENTION_DAYS, RuleLastFiring};
-use boss_policy_client::{Action, CurrentUser, Decision, PolicyClient, Predicate, Resource, User};
+use boss_policy_client::{Action, CurrentUser, PolicyClient, Predicate, Resource, User};
 use chrono::{DateTime, Utc};
 
 use crate::cascade;
@@ -760,16 +760,25 @@ async fn retire_rule(
 /// and the ClusterIP machine door (`boss-dispatcher-internal`) reaches
 /// this port from any pod with no gateway in front of it at all.
 ///
-/// Three answers, asked BEFORE the body is read or the table touched:
-/// - no identity (no `x-boss-user`, or one claiming only the no-header
-///   sentinel's role) → 401, because there is no one to ask policy about;
-/// - policy says no → 403 with policy's reason (`dispatcher-rule` is
-///   platform-admin's alone in the core defaults);
+/// Asked BEFORE the table is touched, through the registry-write ladder
+/// the Class and SubjectKind doors share
+/// ([`boss_policy_client::writes::require_registry_write`]; backlog
+/// 59deda40, 2026-09-28):
+/// - no resolvable caller → 401, because there is no one to ask policy
+///   about. The ladder reads the ACTOR and the role both: until then
+///   this door tested `is_anonymous()`, which reads the role alone, so a
+///   header claiming the no-header sentinel's id at a platform role
+///   passed and the row was signed `anonymous` (f5e0670d point 2); a
+///   blank id is no caller either;
+/// - policy says no, or grants narrower than `all` → 403 with policy's
+///   reason (`dispatcher-rule` is platform-admin's alone in the core
+///   defaults, and a rule belongs to no person or department a narrower
+///   scope could reach);
 /// - policy cannot answer → 503 + `Retry-After` (fail closed, D9), its
 ///   detail logged and never handed out (fe9d212c).
 ///
-/// On an allow it returns the caller's id — the one the request was
-/// SIGNED as — which the write stores as its author. The body never
+/// On an allow it returns the actor the request was SIGNED as, in the
+/// log's spelling, which the write stores as its author. The body never
 /// names one: `split_draft_body` refuses any key the registry does not
 /// read, `created_by` included.
 async fn authorize_rule_write(
@@ -777,22 +786,14 @@ async fn authorize_rule_write(
     user: &User,
     action: Action,
 ) -> Result<String, Response> {
-    if user.is_anonymous() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "a dispatcher rule write is signed by its caller, and this request names no caller \
-             (no x-boss-user identity)",
-        )
-            .into_response());
-    }
-    match policy
-        .check(user, action, Resource::dispatcher_rule())
-        .await
-    {
-        Ok(Decision::Allow { .. }) => Ok(user.id.clone()),
-        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
-        Err(e) => Err(e.into_response()),
-    }
+    boss_policy_client::writes::require_registry_write(
+        policy,
+        user,
+        action,
+        Resource::dispatcher_rule(),
+    )
+    .await
+    .map(|actor| actor.to_string())
 }
 
 #[cfg(test)]

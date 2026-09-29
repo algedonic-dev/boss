@@ -87,7 +87,7 @@ pub trait CalendarClient: Send + Sync {
 /// stuck calendar service can't wedge a write indefinitely.
 pub struct ReqwestCalendarClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestCalendarClient {
@@ -123,18 +123,21 @@ impl ReqwestCalendarClient {
         // The machine token too, when the process has one mounted: this
         // client predates `boss_core::http_client::base` and was the one
         // sibling client that would stop at a port whose gate enforces.
+        // Stamped per request by the machine client, so a rotation
+        // reaches it without a restart (design 6805c764 car 2, review S1);
+        // the caller's identity stays a default header — it never changes.
         let mut headers = reqwest::header::HeaderMap::new();
-        boss_core::machine_token::attach(&mut headers);
         if let Some(v) = user.and_then(|u| reqwest::header::HeaderValue::from_str(&u).ok()) {
             headers.insert("x-boss-user", v);
         }
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .default_headers(headers)
-                .build()
-                .expect("building reqwest client"),
+            http: boss_core::machine_token::Client::build(
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .default_headers(headers),
+            )
+            .expect("building reqwest client"),
         }
     }
 }

@@ -968,6 +968,324 @@ fn a_web_suite_red_names_the_failing_spec_and_its_diff() {
     );
 }
 
+/// A `✘` IS NOT A FAILURE UNTIL PLAYWRIGHT SAYS SO (backlog 42981848).
+/// Red gate-run 5b5a04d8 (2026-09-28) quoted "9 playwright verdict
+/// line(s), first 5", and the first four were
+/// `a-page-error-fails-the-spec.mocked.spec.ts` :25, :34, :52 and :62 -
+/// each marked `test.fail(true, …)`, which the list reporter prints with
+/// a `✘` and counts PASSED - while `it-map-routes.mocked.spec.ts:163`,
+/// one of the two specs that really timed out, was cut. The `✘` line
+/// alone cannot say whether a failure was expected; Playwright's own
+/// roll-up can: its `N failed` block lists exactly the tests whose
+/// outcome was unexpected (an expected failure is in `N passed`, a
+/// flaky retry in `N flaky`). The fixture is that run's log in its own
+/// shape - the ✘ and roll-up lines copied from the receipt, including
+/// the trailing space the roll-up prints after each title - with the
+/// passing specs between cut to one.
+const EXPECTED_FAILURE_RED: &str = "\
+::group::gate: web-suite (unit+build+mocked)
+  ✓     5 [chromium] › tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:43:3 › a declared throw › passes when it is the throw the spec declared (212ms)
+  ✘     6 [chromium] › tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:25:1 › an uncaught throw fails a spec that asserts nothing about it (205ms)
+  ✘    11 [chromium] › tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:34:1 › an unhandled rejection fails the spec too (129ms)
+  ✘    13 [chromium] › tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:52:3 › a declared throw › still fails the spec when a DIFFERENT throw arrives beside it (182ms)
+  ✘    14 [chromium] › tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:62:3 › a declared throw › fails the spec when it never arrives, so the declaration cannot outlive its throw (47ms)
+  ✓    15 [chromium] › tests/mocked/pages.mocked.spec.ts:9:3 › a page renders (1.2s)
+  ✘   585 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure (4.0m)
+  ✘   586 [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means (4.0m)
+  ✓  1158 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:532:3 › /it/design — empty, failed and malformed reads › CURRENT, gap 2 (8c0e11d8): the empty claim is unconditional (1.2s)
+
+
+  1) [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure
+
+    Test timeout of 240000ms exceeded while setting up \"page\".
+
+  2) [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means
+
+    Test timeout of 240000ms exceeded while setting up \"page\".
+
+  2 failed
+    [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure
+    [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means
+  1169 passed (9.1m)
+error: script \"test:mocked\" exited with code 1
+::endgroup::
+";
+
+#[test]
+fn an_expected_failure_is_not_quoted_as_a_verdict_and_the_real_ones_are() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite (unit+build+mocked)\",\"result\":\"fail\"}"),
+        EXPECTED_FAILURE_RED,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails().expect("fails is on the receipt");
+    let joined = fails.join("\n");
+    let quoted: Vec<&String> = fails.iter().filter(|e| e.contains("| ✘")).collect();
+
+    assert!(
+        !joined.contains("a-page-error-fails-the-spec"),
+        "a test.fail spec that failed as told PASSED - Playwright counts it in `1169 passed` - \
+         and must not be quoted as a verdict:\n{joined}"
+    );
+    assert_eq!(
+        quoted.len(),
+        2,
+        "exactly the two specs Playwright's roll-up counts failed are quoted:\n{joined}"
+    );
+    assert!(
+        quoted[0].contains("it-design-controls.mocked.spec.ts:522:3")
+            && quoted[0].contains("(4.0m)")
+            && quoted[1].contains("it-map-routes.mocked.spec.ts:163:1")
+            && quoted[1].contains("(4.0m)"),
+        "each real failure is quoted whole, its duration with it - the 4.0m is what says \
+         timeout:\n{joined}"
+    );
+    assert!(
+        joined.contains("4 ✘ line(s) not quoted") && joined.contains("test.fail"),
+        "the ✘ lines set aside are counted and the reason stated, not dropped in \
+         silence:\n{joined}"
+    );
+    assert!(
+        got.replay
+            .contains("a-page-error-fails-the-spec.mocked.spec.ts:25:1"),
+        "the replay is not reduced - it still holds every line the check printed:\n{}",
+        got.replay
+    );
+}
+
+/// With no roll-up - a run killed before Playwright's epilogue - nothing
+/// on the page can tell an expected failure from a real one, so every
+/// `✘` stays quoted and the receipt SAYS it could not tell them apart,
+/// rather than guessing either way.
+#[test]
+fn without_a_roll_up_every_cross_is_quoted_and_the_receipt_says_why() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let (head, _) = EXPECTED_FAILURE_RED
+        .split_once("\n\n\n  1) ")
+        .expect("the fixture has a failure detail");
+    let log = format!("{head}\n::endgroup::\n");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite (unit+build+mocked)\",\"result\":\"fail\"}"),
+        &log,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let joined = got.fails_joined();
+    assert!(
+        joined.contains("| ✘ 6 [chromium]") && joined.contains("it-design-controls"),
+        "every ✘ is still quoted, in order:\n{joined}"
+    );
+    assert!(
+        joined.contains("no Playwright roll-up"),
+        "…and the receipt says why it could not set the expected ones aside:\n{joined}"
+    );
+}
+
+/// A TIMEOUT'S CAUSE RIDES BESIDE ITS `✘` (backlog a766e20d). The same
+/// red gate-run 5b5a04d8, as its receipt's own `fails_excerpt` carried
+/// the web suite - copied from that receipt verbatim, trailing spaces
+/// (`\x20`) and all, dropping only the excerpt's "264 line(s) omitted"
+/// head. Both real failures timed out, and the line that says so,
+/// `Test timeout of 240000ms exceeded while setting up "page".`, matched
+/// no verdict pattern, so `fails` never quoted the CAUSE - of the kind
+/// of red that made 8 same-head reds in 7 days. Meanwhile the two
+/// `Error Context: test-results/…` path lines were quoted as errors,
+/// because `RE_ERROR` takes `Error` followed by a space: a path, not a
+/// verdict, spending two of the five quoted lines.
+const TIMEOUT_RED: &str = "\
+::group::gate: web-suite (unit+build+mocked)
+  ✘   585 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure (4.0m)
+  ✘   586 [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means (4.0m)
+  ✓  1158 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:532:3 › /it/design — empty, failed and malformed reads › CURRENT, gap 2 (8c0e11d8): the empty claim is unconditional — the page reads only the design-doc stations (1.2s)
+  ✓  1157 [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:184:1 › a section with no reading is drawn as a hollow tube, and an undeclared one stays dashed (1.6s)
+  ✓  1159 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:550:3 › /it/design — empty, failed and malformed reads › a refused review-queue read is a failure line in the page's words, never the empty state (859ms)
+  ✓  1160 [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:206:1 › a routes read that fails draws the stations and no guessed track, and says so (915ms)
+  ✓  1161 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:561:3 › /it/design — empty, failed and malformed reads › a review-queue read that never answers (network down) is a failure line too (926ms)
+  ✓  1162 [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:214:1 › a drawn section with no rate yet opens a panel that says what declares it (1.3s)
+  ✓  1163 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:570:3 › /it/design — empty, failed and malformed reads › CURRENT, U3 (UNFILED): a failed read shows the fallback header, whose eyebrow now says IT (839a7f0f) and whose subtitle names the deleted corpus (1.3s)
+  ✓  1164 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:583:3 › /it/design — empty, failed and malformed reads › U2 (3bbb194a) is FIXED — a failed review-queue read leaves WORKING and OUT standing: the decided read is made (944ms)
+  ✓  1165 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:597:3 › /it/design — empty, failed and malformed reads › both reads refused: two failure lines, each in its own words and with its own Retry (861ms)
+  ✓  1166 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:609:3 › /it/design — empty, failed and malformed reads › U4 (3bbb194a) is FIXED — the review queue's Retry re-runs its read, and only its read (971ms)
+  ✓  1167 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:633:3 › /it/design — empty, failed and malformed reads › a review-queue Retry that fails again stays the failure line, with its Retry (1.4s)
+  ✓  1168 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:645:3 › /it/design — empty, failed and malformed reads › a refused decided read is its own failure line, and the review queue still renders (912ms)
+  ✓  1169 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:657:3 › /it/design — empty, failed and malformed reads › U4 (3bbb194a) is FIXED — the decided panel's Retry re-runs its read, and only its read (844ms)
+  ✓  1170 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:681:3 › /it/design — empty, failed and malformed reads › U1 (67825067): a malformed 200 from the review queue is the failure line, never \"Nothing is waiting\" (647ms)
+  ✓  1171 [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:698:3 › /it/design — empty, failed and malformed reads › U1 (67825067): a malformed 200 from the decided station is its own failure line, and the review queue still renders (684ms)
+
+
+  1) [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure\x20
+
+    Test timeout of 240000ms exceeded while setting up \"page\".
+
+    Error Context: test-results/it-design-controls.mocked--648ea--empty-state-and-no-failure-chromium/error-context.md
+
+  2) [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means\x20
+
+    Test timeout of 240000ms exceeded while setting up \"page\".
+
+    Error Context: test-results/it-map-routes.mocked-a-rou-9f9d8-he-key-says-what-that-means-chromium/error-context.md
+
+  2 failed
+    [chromium] › tests/mocked/it-design-controls.mocked.spec.ts:522:3 › /it/design — empty, failed and malformed reads › an empty review queue paints the empty state and no failure\x20
+    [chromium] › tests/mocked/it-map-routes.mocked.spec.ts:163:1 › a route only the moves record supports is drawn dashed red, and the key says what that means\x20
+  1169 passed (9.1m)
+error: script \"test:mocked\" exited with code 1
+::endgroup::
+";
+
+#[test]
+fn a_timed_out_specs_reason_is_quoted_beside_it_and_an_error_context_path_is_not() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite (unit+build+mocked)\",\"result\":\"fail\"}"),
+        TIMEOUT_RED,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails().expect("fails is on the receipt");
+    let joined = fails.join("\n");
+    let quoted: Vec<&String> = fails.iter().filter(|e| e.contains("| ✘")).collect();
+    let reason = "Test timeout of 240000ms exceeded while setting up \"page\".";
+
+    assert_eq!(quoted.len(), 2, "both real failures are quoted:\n{joined}");
+    assert!(
+        quoted[0].contains("it-design-controls.mocked.spec.ts:522:3") && quoted[0].contains(reason),
+        "the first timeout's cause is quoted on its own ✘ entry:\n{joined}"
+    );
+    assert!(
+        quoted[1].contains("it-map-routes.mocked.spec.ts:163:1") && quoted[1].contains(reason),
+        "…and the second's on its own:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Error Context:"),
+        "an `Error Context:` line is the path of a file, not a verdict, and is never quoted \
+         as one:\n{joined}"
+    );
+    assert!(
+        joined.contains("3 playwright verdict line(s)"),
+        "the two ✘ lines (each with its cause) and the roll-up, and nothing else:\n{joined}"
+    );
+    assert!(
+        got.replay
+            .contains("Error Context: test-results/it-map-routes"),
+        "the replay is not reduced - the paths are still in it:\n{}",
+        got.replay
+    );
+}
+
+/// The control for the `Error Context:` refusal: a real `Error:` line in
+/// the same failure block is still quoted, so the refusal is of that
+/// one label and not of every line beginning `Error`.
+#[test]
+fn a_real_error_line_beside_an_error_context_is_still_quoted() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let log = TIMEOUT_RED.replacen(
+        "\n    Error Context: test-results/it-map-routes",
+        "\n    Error: expect(locator).toBeVisible() failed\n\n    Error Context: test-results/it-map-routes",
+        1,
+    );
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"web-suite (unit+build+mocked)\",\"result\":\"fail\"}"),
+        &log,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let joined = got.fails_joined();
+    assert!(
+        joined.contains("| Error: expect(locator).toBeVisible() failed"),
+        "a real error line is a verdict line:\n{joined}"
+    );
+    assert!(!joined.contains("Error Context:"), "{joined}");
+}
+
+/// The same run's `fails_context` spent its budget the same way: the four
+/// `test.fail` specs' error contexts came first, and the one it omitted
+/// was `it-map-routes.mocked.spec.ts:163`'s. Every context is still kept
+/// - the replay has them whole - but the specs Playwright counts failed
+/// are placed first, so a bounded receipt holds THEIR page.
+#[test]
+fn the_error_contexts_of_the_real_failures_come_first() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let check = "web-suite (unit+build+mocked)";
+    let located = |spec: &str, loc: &str| {
+        context_block(spec, 60).replace(&format!("tests/mocked/{spec}.mocked.spec.ts:85:3"), loc)
+    };
+    let body: String = [
+        located(
+            "a-page-error-1",
+            "tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:25:1",
+        ),
+        located(
+            "a-page-error-2",
+            "tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:34:1",
+        ),
+        located(
+            "a-page-error-3",
+            "tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:52:3",
+        ),
+        located(
+            "a-page-error-4",
+            "tests/mocked/a-page-error-fails-the-spec.mocked.spec.ts:62:3",
+        ),
+        located(
+            "it-design-controls",
+            "tests/mocked/it-design-controls.mocked.spec.ts:522:3",
+        ),
+        located(
+            "it-map-routes",
+            "tests/mocked/it-map-routes.mocked.spec.ts:163:1",
+        ),
+    ]
+    .concat();
+    let (receipt, dir) = receipt_with_evidence(check, Some(&body));
+    let got = run_extractor(&receipt, EXPECTED_FAILURE_RED);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    let context = v["fails_context"][check].as_str().unwrap_or_default();
+    assert!(
+        context.contains("it-map-routes.mocked.spec.ts:163:1")
+            && context.contains("it-design-controls.mocked.spec.ts:522:3"),
+        "both real failures' pages ride the receipt:\n{context}"
+    );
+    let real = context
+        .find("it-map-routes.mocked.spec.ts:163:1")
+        .unwrap_or(usize::MAX);
+    assert!(
+        context
+            .find("a-page-error-fails-the-spec.mocked.spec.ts")
+            .is_none_or(|expected| expected > real),
+        "…ahead of the expected failures':\n{context}"
+    );
+    assert!(
+        context.contains("counts failed come first"),
+        "the order is stated:\n{context}"
+    );
+    assert!(
+        context.contains("6 spec context(s) in all"),
+        "the count still names every context there was:\n{context}"
+    );
+    assert!(
+        got.replay
+            .contains("a-page-error-fails-the-spec.mocked.spec.ts:25:1"),
+        "the replay keeps every context whole"
+    );
+}
+
 /// THE BUDGET GOES TO THE MARKER AND THE LAST WORDS (backlog 4077889a).
 /// For a web-suite red the first failure marker is the per-spec `✘`
 /// near the top of Playwright's list, and the `Error:`, the
@@ -1022,5 +1340,403 @@ fn the_web_suite_excerpt_holds_the_failing_spec_line_and_the_verdict_below_it() 
         got.replay.contains("shard 2/4 (31.4s)") && got.replay.contains("2 failed"),
         "the replay holds the ✘ line and the verdict:\n{}",
         got.replay
+    );
+}
+
+/// A `--no-fail-fast` run (backlog 3bef4198): the failing binary's block,
+/// then every later binary's passing output, then cargo's own roll-call
+/// of the targets that failed.
+fn no_fail_fast_log(passing_lines: usize) -> String {
+    let mut log = String::from(
+        "::group::gate: test\n\
+         \x20    Running tests/sweep_spawn_guards.rs (target/debug/deps/sweep_spawn_guards-0a1b)\n\
+         \n\
+         running 2 tests\n\
+         test sweeps::other_thing ... ok\n\
+         test every_sweep_spawner_guards_on_its_own_subject ... FAILED\n\
+         \n\
+         failures:\n\
+         \n\
+         ---- every_sweep_spawner_guards_on_its_own_subject stdout ----\n\
+         \n\
+         thread 'every_sweep_spawner_guards_on_its_own_subject' panicked at crates/core/boss-dispatcher/tests/sweep_spawn_guards.rs:79:5:\n\
+         expected the seven daily sweep spawners, found 6\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         \n\
+         \n\
+         failures:\n\
+         \x20   every_sweep_spawner_guards_on_its_own_subject\n\
+         \n\
+         test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         \n\
+         error: test failed, to rerun pass `-p boss-dispatcher --test sweep_spawn_guards`\n",
+    );
+    for i in 0..passing_lines {
+        if i % 500 == 0 {
+            log.push_str(&format!(
+                "     Running tests/later_{i}.rs (target/debug/deps/later_{i}-ffff)\n\nrunning 500 tests\n"
+            ));
+        }
+        log.push_str(&format!("test later::case_{i:05} ... ok\n"));
+    }
+    log.push_str(
+        "test result: ok. 500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         \n\
+         error: 1 target failed:\n\
+         \x20   `-p boss-dispatcher --test sweep_spawn_guards`\n\
+         ::endgroup::\n",
+    );
+    log
+}
+
+/// THE FAILURE IS NOT THE LAST THING A `--no-fail-fast` RUN SAYS (backlog
+/// 3bef4198). With the gate's `cargo test` running every binary, a
+/// failure in an early binary is followed by thousands of lines of later
+/// binaries passing. The parser read only the last 2 000 lines of a
+/// check and the replay only the last 300, so the failure the flag
+/// exists to keep would have been read by nothing: `fails` would say "no
+/// failing test", and the excerpt would be passing-test chatter. The
+/// whole check is parsed, and every failure block from before the tail
+/// is replayed ahead of it, saying what was left out between.
+#[test]
+fn a_red_early_in_a_no_fail_fast_run_is_still_named_replayed_and_excerpted() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"test\",\"result\":\"fail\"}"),
+        &no_fail_fast_log(6_000),
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails_joined();
+    assert!(
+        fails.contains("every_sweep_spawner_guards_on_its_own_subject")
+            && fails.contains("sweep_spawn_guards.rs:79:5")
+            && fails.contains("found 6"),
+        "a failure 6 000 lines above the end of the check is named with its panic:\n{fails}"
+    );
+    assert!(
+        got.replay
+            .contains("thread 'every_sweep_spawner_guards_on_its_own_subject' panicked")
+            && got.replay.contains(
+                "error: test failed, to rerun pass `-p boss-dispatcher --test sweep_spawn_guards`"
+            ),
+        "the replay carries the early failure block and the binary it came from:\n{}",
+        &got.replay[..got.replay.len().min(4_000)]
+    );
+    assert!(
+        got.replay.contains("error: 1 target failed:"),
+        "…and still the check's last words:\n{}",
+        &got.replay[got.replay.len().saturating_sub(2_000)..]
+    );
+    assert!(
+        got.replay.contains("omitted"),
+        "the passing output left out between them states itself"
+    );
+    assert!(
+        got.replay.len() < 60_000,
+        "the replay is the failure blocks and the tail, not the whole check: {} chars",
+        got.replay.len()
+    );
+    let excerpt = got.excerpt_of("test");
+    assert!(
+        excerpt.contains("sweep_spawn_guards.rs:79:5") && excerpt.contains("1 target failed"),
+        "the excerpt holds the panic and cargo's roll-call of failed targets:\n{excerpt}"
+    );
+}
+
+/// THE 00:01Z TRAIN, 2026-09-28 (backlog 4d928d0a). Train
+/// `train/20260928-0001` was disassembled on `web-suite` and its receipt's
+/// `fails` said only `error: script "test:unit" exited with code 1` —
+/// "no cargo test failure in this check's output; 1 error line(s)" —
+/// while the excerpt beside it named the file and the test that timed
+/// out. `fails` is what the alert and the yard read, so it must name the
+/// unit test: the file bun ran alone, the `(fail)` line, and why. The
+/// first block is that gate's own output, verbatim; the second is bun
+/// 1.3.14's shape for an assertion and a thrown error, captured on the
+/// dev pod (an `error:` line and its `at` location print ABOVE the
+/// `(fail)` line; a timeout's reason prints BELOW it).
+const BUN_UNIT_RED: &str = "\
+::group::gate: web-suite (unit+build+mocked)
+$ bun scripts/each-test-file-alone.ts src scripts
+
+===== ./scripts/bunfig-keys-take-effect.test.ts — exit 1, run alone =====
+bun test v1.3.14 (0d9b296a)
+
+scripts/bunfig-keys-take-effect.test.ts:
+(pass) the bunfig sets exactly the keys this file reads back [1.15ms]
+(pass) [test] preload: the rune shim ran before this file [0.04ms]
+killed 1 dangling process
+(fail) [serve.static] plugins: the dev-server compiles the root component, and an empty bunfig does not [30000.09ms]
+  ^ this test timed out after 30000ms.
+
+ 2 pass
+ 1 fail
+ 2 expect() calls
+Ran 3 tests across 1 file. [30.15s]
+
+===== ./src/jobs/annotations.test.ts — exit 1, run alone =====
+bun test v1.3.14 (0d9b296a)
+
+src/jobs/annotations.test.ts:
+(pass) passes [0.02ms]
+7 | test('compares wrong', () => {
+8 |   expect(1 + 1).toBe(3);
+                    ^
+error: expect(received).toBe(expected)
+
+Expected: 3
+Received: 2
+
+      at <anonymous> (/gate-target/repo/apps/web/src/jobs/annotations.test.ts:8:17)
+(fail) compares wrong [0.12ms]
+11 | test('throws a type error', () => {
+12 |   const o: any = undefined;
+                      ^
+TypeError: undefined is not an object (evaluating '(void 0).x')
+      at <anonymous> (/gate-target/repo/apps/web/src/jobs/annotations.test.ts:12:18)
+(fail) throws a type error [0.06ms]
+
+ 1 pass
+ 2 fail
+Ran 3 tests across 1 file. [74.00ms]
+
+===== ./src/never-loads.test.ts — exit 1, run alone =====
+bun test v1.3.14 (0d9b296a)
+
+src/never-loads.test.ts:
+
+# Unhandled error between tests
+-------------------------------
+error: Cannot find module './gone' from '/gate-target/repo/apps/web/src/never-loads.test.ts'
+-------------------------------
+
+ 0 pass
+ 1 fail
+ 1 error
+Ran 1 test across 1 file. [5.00ms]
+
+each-test-file-alone: 151/154 files passed (2513 tests), each in its own process, 4 at a time, in 38.2s (slowest: ./scripts/bunfig-keys-take-effect.test.ts 30155ms)
+each-test-file-alone: 3 file(s) FAIL when run alone: ./scripts/bunfig-keys-take-effect.test.ts, ./src/jobs/annotations.test.ts, ./src/never-loads.test.ts
+error: script \"test:unit\" exited with code 1
+::endgroup::
+";
+
+#[test]
+fn a_unit_test_red_names_the_file_the_failing_test_and_why() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let check = "web-suite (unit+build+mocked)";
+    let got = run_extractor(
+        &red_receipt(&format!("{{\"name\":\"{check}\",\"result\":\"fail\"}}")),
+        BUN_UNIT_RED,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails().expect("fails is on the receipt");
+    let joined = fails.join("\n");
+    let entry = |needle: &str| fails.iter().find(|e| e.contains(needle)).cloned();
+
+    let timeout = entry("[serve.static] plugins")
+        .unwrap_or_else(|| panic!("the timed-out unit test is named on the receipt:\n{joined}"));
+    assert!(
+        timeout.contains("./scripts/bunfig-keys-take-effect.test.ts")
+            && timeout.contains("timed out after 30000ms"),
+        "…with its file and its reason:\n{timeout}"
+    );
+    let assertion =
+        entry("compares wrong").unwrap_or_else(|| panic!("a failed assertion is named:\n{joined}"));
+    assert!(
+        assertion.contains("./src/jobs/annotations.test.ts")
+            && assertion.contains("error: expect(received).toBe(expected)")
+            && assertion.contains("Received: 2")
+            && assertion.contains("annotations.test.ts:8:17"),
+        "…with its file, the error bun printed above it, and where:\n{assertion}"
+    );
+    let thrown = entry("throws a type error")
+        .unwrap_or_else(|| panic!("a thrown error is named:\n{joined}"));
+    assert!(
+        thrown.contains("TypeError: undefined is not an object"),
+        "…with the error it threw, not the assertion before it:\n{thrown}"
+    );
+    let unloaded = entry("./src/never-loads.test.ts")
+        .unwrap_or_else(|| panic!("a file that failed before any test is named:\n{joined}"));
+    assert!(
+        unloaded.contains("Cannot find module"),
+        "…with the error that stopped it:\n{unloaded}"
+    );
+    assert!(
+        !joined.contains("no cargo test failure"),
+        "a unit-test red is not described by what it is not:\n{joined}"
+    );
+}
+
+/// Where a Playwright error context the gate kept is read from: a file
+/// the receipt names under `evidence`, in a scratch dir of its own.
+fn receipt_with_evidence(check: &str, context: Option<&str>) -> (String, std::path::PathBuf) {
+    let dir = boss_testing::scratch_dir("gate-detail-evidence");
+    let path = dir.join("receipt.error-context.md");
+    if let Some(body) = context {
+        boss_testing::write_file(&path, body);
+    }
+    let receipt = format!(
+        "{{\"verdict\":\"failed\",\"head\":\"abc\",\"mode\":\"full\",\
+         \"evidence\":{{\"{check}\":\"{}\"}},\
+         \"checks\":[{{\"name\":\"{check}\",\"result\":\"fail\"}}]}}",
+        path.display()
+    );
+    (receipt, dir)
+}
+
+/// One spec's error context, in the shape Playwright 1.61 writes
+/// `test-results/<test>/error-context.md`, under the header gate.sh
+/// writes above each one.
+fn context_block(spec: &str, snapshot_lines: usize) -> String {
+    let mut s = format!(
+        "===== apps/web/test-results/{spec}/error-context.md =====\n\
+         # Instructions\n\n- Following Playwright test failed.\n\n\
+         # Test info\n\n- Name: {spec}\n- Location: tests/mocked/{spec}.mocked.spec.ts:85:3\n\n\
+         # Error details\n\n```\nError: expect(locator).toBeVisible() failed\n```\n\n\
+         # Page snapshot\n\n```yaml\n"
+    );
+    for i in 0..snapshot_lines {
+        s.push_str(&format!(
+            "- generic [ref=e{i}]: waiting on /api/yard/shop-floor row {i}\n"
+        ));
+    }
+    s.push_str("```\n\n");
+    s
+}
+
+/// THE PAGE A TIMED-OUT SPEC WAS WAITING ON (backlog 4d928d0a). Dock
+/// re-gate 7b2acdc4 went red on one mocked spec at the 1.0 m test
+/// timeout; Playwright had written what the page showed to
+/// `test-results/…/error-context.md`, the list reporter printed only its
+/// PATH, and the file died with the pod — so the diagnosis rested on
+/// reproducing it, which failed. gate.sh now keeps every such file whole
+/// beside the receipt and names it under `evidence`; the runner copies
+/// it onto the durable record as `fails_context`, and into the replay.
+#[test]
+fn a_web_suite_red_carries_the_error_context_the_receipt_names() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let check = "web-suite (unit+build+mocked)";
+    let body = context_block("it-department-map-stations", 5);
+    let (receipt, dir) = receipt_with_evidence(check, Some(&body));
+    let log = format!(
+        "::group::gate: {check}\n  ✘  1 [chromium] › x (60.0s)\n  1 failed\n::endgroup::\n"
+    );
+    let got = run_extractor(&receipt, &log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    let context = v["fails_context"][check].as_str().unwrap_or_default();
+    assert!(
+        context.contains("waiting on /api/yard/shop-floor row 4")
+            && context.contains("tests/mocked/it-department-map-stations.mocked.spec.ts:85:3"),
+        "the page snapshot rides the receipt, whole when it fits:\n{}",
+        got.receipt
+    );
+    assert!(
+        got.replay.contains("waiting on /api/yard/shop-floor row 4"),
+        "…and the replay:\n{}",
+        got.replay
+    );
+    assert!(
+        v.get("evidence").is_some(),
+        "the receipt still names the file it read:\n{}",
+        got.receipt
+    );
+}
+
+/// Bounded, per spec and in all, and every cut says so — a mass-fail of
+/// sixty specs must not write a receipt nobody can pass along, and must
+/// not quietly drop fifty-seven of them either.
+#[test]
+fn the_error_context_is_bounded_per_spec_and_per_check_and_says_so() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let check = "web-suite (unit+build+mocked)";
+    let body: String = (0..60)
+        .map(|i| context_block(&format!("spec-{i:02}"), 200))
+        .collect();
+    let (receipt, dir) = receipt_with_evidence(check, Some(&body));
+    let log = format!("::group::gate: {check}\n  60 failed\n::endgroup::\n");
+    let got = run_extractor(&receipt, &log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    let context = v["fails_context"][check].as_str().unwrap_or_default();
+    assert!(
+        context.len() <= 6_600,
+        "one check's context is bounded — {} chars",
+        context.len()
+    );
+    assert!(
+        context.contains("spec-00") && context.contains("spec-01"),
+        "the budget is shared between specs, not spent on the first one alone:\n{context}"
+    );
+    assert!(
+        context.contains("omitted"),
+        "every cut states itself:\n{context}"
+    );
+    assert!(
+        context.contains("60 spec context(s)"),
+        "…and says how many there were:\n{}",
+        &context[context.len().saturating_sub(600)..]
+    );
+}
+
+/// A named file that is not there is said, not skipped: an absent key
+/// would read as "Playwright wrote nothing".
+#[test]
+fn an_evidence_file_that_cannot_be_read_is_said_not_skipped() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let check = "web-suite (unit+build+mocked)";
+    let (receipt, dir) = receipt_with_evidence(check, None);
+    let log = format!("::group::gate: {check}\n  1 failed\n::endgroup::\n");
+    let got = run_extractor(&receipt, &log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    let context = v["fails_context"][check].as_str().unwrap_or_default();
+    assert!(
+        context.contains("could not be read"),
+        "an unreadable evidence file is stated on the receipt:\n{}",
+        got.receipt
+    );
+}
+
+/// `fails_context` is always present, `{}` when there is nothing, for
+/// the reason `fails` is `[]` (a missing field and an empty one must not
+/// look the same).
+#[test]
+fn a_receipt_with_no_evidence_carries_an_empty_context_not_a_missing_one() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"test\",\"result\":\"fail\"}"),
+        CARGO_LOG,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let v: Value = serde_json::from_str(&got.receipt).expect("receipt is JSON");
+    assert_eq!(
+        v["fails_context"].as_object().map(|m| m.len()),
+        Some(0),
+        "no evidence named, so `fails_context: {{}}`:\n{}",
+        got.receipt
     );
 }

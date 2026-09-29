@@ -881,10 +881,19 @@
               <dd>{b.since ?? '—'}</dd>
               <dt>elapsed</dt>
               <dd>{b.elapsed ?? '—'}</dd>
+              {#if b.times !== null}
+                <!-- Queued for, running for, the median running time: a
+                     packet's age counts its wait in line, and a gate queued
+                     46m and running 14m read as an hour (backlog 4d088a7e). -->
+                <dt>times</dt>
+                <dd>{b.times}</dd>
+              {/if}
               <dt>state</dt>
               <dd>
                 {#if b.stale}
                   <span class="yard-trouble">STALE — past the runner's usual; the verdict may never reach the packet. Re-gate.</span>
+                {:else if b.troubled}
+                  <span class="yard-trouble">TROUBLED — running past 2× the median running time.</span>
                 {:else}
                   <span class="yard-lamp-dot working"></span>running
                 {/if}

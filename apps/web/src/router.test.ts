@@ -123,6 +123,9 @@ describe('parseRoute — every specific path matches its specific case', () => {
     // The Agents tab (62988516), before the same wildcard for the same
     // reason.
     ['/it/registry/agents', { kind: 'systemAgents' }],
+    // The Credentials tab (851259b9, design 76155676), before the same
+    // wildcard for the same reason.
+    ['/it/registry/credentials', { kind: 'systemCredentials' }],
     // /it/* is the canonical spelling for IT surfaces (0fc8b216); the
     // /system/* rows above stay because bookmarks, the station
     // registry's upstream hrefs and the docs all still use them.

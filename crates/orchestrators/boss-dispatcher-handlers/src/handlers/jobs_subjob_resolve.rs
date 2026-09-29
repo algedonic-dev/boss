@@ -36,7 +36,7 @@ use std::sync::Arc;
 use super::common::{complete_step, dispatcher_reader_header, sim_origin_value};
 
 pub struct JobsSubjobResolve {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -50,7 +50,10 @@ impl JobsSubjobResolve {
 
     /// Construct with a custom reqwest client (tests point it at a
     /// wiremock server).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -167,6 +170,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "resolve-subjob-on-close".into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),

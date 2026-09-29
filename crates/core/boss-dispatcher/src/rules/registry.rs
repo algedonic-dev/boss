@@ -442,33 +442,51 @@ pub const ENFORCED_STATUS: &str = "active";
 /// (replacing the legacy rules.toml file read) and `/api/dispatcher/rules`
 /// serves it. `do_steps` is stored as JSONB matching `RawDoStep`.
 pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, RegistryError> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        name: String,
-        // Nullable now: a schedule-triggered rule has no `on_event`.
-        on_event: Option<String>,
-        when_expr: Option<String>,
-        do_steps: serde_json::Value,
-        delay: Option<String>,
-        version: i32,
-        // Clock-trigger columns (all-or-nothing): cadence + anchor are
-        // both set for a scheduled rule, both NULL for an event rule.
-        schedule_cadence: Option<String>,
-        schedule_anchor: Option<NaiveDate>,
-        schedule_calendar: Option<String>,
-    }
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT name, on_event, when_expr, do_steps, delay, version, \
-                schedule_cadence, schedule_anchor, schedule_calendar \
-         FROM dispatcher_rules WHERE status = $1 ORDER BY name",
-    )
+    let rows: Vec<RuleRow> = sqlx::query_as(&format!(
+        "SELECT {RULE_COLUMNS} FROM dispatcher_rules WHERE status = $1 ORDER BY name"
+    ))
     .bind(ENFORCED_STATUS)
     .fetch_all(pool)
     .await
     .map_err(|e| RegistryError::Storage(e.to_string()))?;
 
-    let mut rules = Vec::with_capacity(rows.len());
-    for r in rows {
+    let rules = rows
+        .into_iter()
+        .map(RuleRow::into_raw)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RawRegistry { rules })
+}
+
+/// The columns a `dispatcher_rules` row carries a rule's CONTENT in —
+/// one list, read by [`load_active_rules`] and by the seed's
+/// same-version comparison (`super::seed`, backlog 732c3cf9), so the two
+/// cannot disagree about what "the row" is.
+pub(crate) const RULE_COLUMNS: &str = "name, on_event, when_expr, do_steps, delay, version, \
+     schedule_cadence, schedule_anchor, schedule_calendar";
+
+/// One `dispatcher_rules` row as [`RULE_COLUMNS`] selects it.
+#[derive(sqlx::FromRow)]
+pub(crate) struct RuleRow {
+    pub(crate) name: String,
+    // Nullable now: a schedule-triggered rule has no `on_event`.
+    on_event: Option<String>,
+    when_expr: Option<String>,
+    do_steps: serde_json::Value,
+    delay: Option<String>,
+    pub(crate) version: i32,
+    // Clock-trigger columns (all-or-nothing): cadence + anchor are
+    // both set for a scheduled rule, both NULL for an event rule.
+    schedule_cadence: Option<String>,
+    schedule_anchor: Option<NaiveDate>,
+    schedule_calendar: Option<String>,
+}
+
+impl RuleRow {
+    /// The row in the raw shape a rule FILE parses into, so a row and a
+    /// file compare with `==`. `why` is always `None`: a table row
+    /// carries no justification.
+    pub(crate) fn into_raw(self) -> Result<RawRule, RegistryError> {
+        let r = self;
         let do_steps: Vec<RawDoStep> = serde_json::from_value(r.do_steps)
             .map_err(|e| RegistryError::Storage(format!("do_steps parse: {e}")))?;
         // Reassemble the schedule from its columns. cadence + anchor must
@@ -495,7 +513,7 @@ pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, Regis
                 )));
             }
         };
-        rules.push(RawRule {
+        Ok(RawRule {
             name: r.name,
             on_event: r.on_event,
             schedule,
@@ -506,9 +524,8 @@ pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, Regis
             // A table row carries no justification; the read surface
             // joins it against the authored directory (`authored_why`).
             why: None,
-        });
+        })
     }
-    Ok(RawRegistry { rules })
 }
 
 // ---------------------------------------------------------------------------

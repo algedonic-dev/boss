@@ -32,13 +32,21 @@
 #      the fork once if it is gone, opens the PR against
 #      algedonic-dev/boss as dauld, and completes the packet's open-pr
 #      step with pr_url and snapshot_commit;
-#   5. closes each OLDER open publish/<date>[-<snapshot>] PR from the
-#      fork as superseded by this one, which contains it (backlog
-#      d4bfe548) — so there is only ever one PR to merge.
+#   5. closes each OLDER open publish PR from the fork as superseded by
+#      this one (backlog d4bfe548) — so there is only ever one PR to
+#      merge — where "older" is read off the record: a packet recorded
+#      that PR on that branch, from a source this run's contains
+#      (backlog 1a2bcf11), and the older packet gets the keys its
+#      `superseded` terminal reads (backlog 78f2fbda);
+#   6. deletes, forge first and then the fork, each publish branch a
+#      packet recorded whose PR GitHub reads closed or merged (1a2bcf11).
+#
+# ONE RUN AT A TIME: a publish and a --measure hold $STATE_DIR/publish.lock
+# (flock) from before the packet is read to exit.
 #
 # THE MERGE ON GITHUB STAYS DAVID'S — the second gate. Nothing here
 # touches the mirror's main; the only PRs it closes are its own older
-# publish snapshots.
+# publish snapshots, and the only branches it deletes are theirs.
 #
 # THE TOKEN. dauld's GitHub token is provisioned by David's token admin
 # at $BOSS_GITHUB_TOKEN_FILE (default /etc/boss-publish/github.token,
@@ -63,8 +71,9 @@
 # the same packet builds the SAME commit, re-pushes the same branch as a
 # no-op, and reuses the PR already open for it. Nothing is ever forced:
 # a branch that already holds a DIFFERENT commit is refused by git, never
-# overwritten. A verb killed mid-way leaves at worst a pushed branch on
-# our own fork.
+# overwritten, and a branch is deleted only leased to the head its closed
+# PR names (step 6). A verb killed mid-way leaves at worst a pushed
+# branch on our own fork.
 #
 # Runs as root under the ops-runner with NO HOME: every path is explicit
 # (state dir, GH_CONFIG_DIR) and nothing reads $HOME.
@@ -127,11 +136,23 @@ MIRROR_URL="${_mirror_url:-${BOSS_MIRROR_URL}.git}"
 # because it also existed on the forge. So the snapshot goes to the forge
 # FIRST, under the same branch name, and the mirror carries it from
 # there. Since backlog 21d54f4a (2026-09-26) that mirror is gone: the
-# forge converge's infra/forge/offsite-push.sh pushes publish/* to the
-# same fork with a plain push that neither forces nor prunes, and
-# deleted the Forgejo push mirror. It pushed main too until backlog
-# 67931115 (2026-09-27): the fork is public, so this verb's secrets scan
-# and approval must be the only way anything reaches it. The forge-first push stays, so the
+# forge converge's infra/forge/offsite-push.sh replaced it with a plain
+# push and deleted the Forgejo push mirror. That push carried main until
+# backlog 67931115 and publish/* until backlog a2b58aab (both 2026-09),
+# and it carries NOTHING to the fork now. The fork is public, so this
+# verb's secrets scan and passkey check must be the only way anything
+# reaches it — and a forge branch NAME vouches for nothing: every holder
+# of a forge write credential for user david (the dev pod's token, the
+# forge host's checkout token, the identity $FORGE_PUSH_AS pushes as
+# below) can push refs/heads/publish/<anything> to the forge, which
+# protects main alone. So nothing carries forge publish/* to the fork;
+# this verb pushes its snapshot there ITSELF (step 4a), with dauld's
+# token, which only root on the forge host reads.
+# offsite_push_sh.rs the_public_fork_receives_nothing_from_the_converge
+# refuses any branch in that declaration. Such a forge branch now goes
+# nowhere; a publisher identity alone on a publish/** allowlist would
+# keep the forge's own publish namespace to this verb (design 76155676,
+# Order step 5). The forge-first push stays, so the
 # forge holds every snapshot it published. This verb runs as root under the ops-runner, and a root push
 # into Forgejo's repository would leave root-owned objects the forge's
 # own user cannot collect — so the push runs as the host user whose
@@ -214,6 +235,15 @@ fail() { echo "$me: FAILED — $*" >&2; exit 1; }
 workdir=$(mktemp -d) || { echo "$me: FAILED — no working directory under ${TMPDIR:-/tmp}" >&2; exit 1; }
 trap 'rm -rf "$workdir"' EXIT
 
+# The machine token rides to curl in a 0600 file, never in its argv,
+# where every local user reads it in ps (backlog 5f3ad356). Made here,
+# in the script's own shell and after the trap above; publish-pr-state.sh
+# reads the same MT_HDR.
+# shellcheck source=infra/lib/secret-header.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/secret-header.sh"
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    || { echo "$me: FAILED — the machine token's header file could not be written" >&2; exit 1; }
+
 # safe.directory, scoped to this one path. The ops-runner executes verbs
 # AS ROOT and this repository belongs to the Forgejo container's
 # account, so since git 2.35.2 every command refuses it as "dubious
@@ -291,6 +321,38 @@ scan_commit() {
     g worktree prune 2>/dev/null || true
 }
 set_remote() { g remote get-url "$1" >/dev/null 2>&1 && g remote set-url "$1" "$2" || g remote add "$1" "$2"; }
+
+# ONE RUN AT A TIME (backlog 1a2bcf11). A publish and a --measure share
+# the private clone above, and two publishes both read the mirror's open
+# PRs before either closes one — so an earlier-forked run could close the
+# PR a later run had just opened. The one-open-packet guard is the DAILY
+# rule's, and a superseding packet is filed beside the one it supersedes
+# (246d597a beside 8d7a3507, 2026-09-27), so nothing else serialises
+# them. The lock is taken before the system of record is read, so the
+# second run sees what the first recorded. `take_publish_lock <on_fail>
+# <var>` waits the seconds named by <var> and then calls <on_fail>,
+# naming the file. fd 9 stays open until exit, so the lock is held for
+# the whole run.
+#
+# THE TWO WAITS DIFFER ON PURPOSE (adversarial review of 8ec86b42). A
+# publish WAITS — BOSS_PUBLISH_LOCK_WAIT, default 300 s, half the verb's
+# 600 s timeout — because its open-pr has nobody to re-file it: a refused
+# publish is David signing again by hand. A --measure YIELDS —
+# BOSS_PUBLISH_MEASURE_LOCK_WAIT, default 30 s, then not yet (75) —
+# because the refresh re-fires on its own cadence, and its verb's 900 s
+# timeout must never be spent holding a queue a publish is waiting in.
+LOCK_FILE="${STATE_DIR}/publish.lock"
+BOSS_PUBLISH_LOCK_WAIT="${BOSS_PUBLISH_LOCK_WAIT:-300}"
+BOSS_PUBLISH_MEASURE_LOCK_WAIT="${BOSS_PUBLISH_MEASURE_LOCK_WAIT:-30}"
+take_publish_lock() {
+    local on_fail="$1" wait_var="$2" wait
+    wait="${!wait_var}"
+    case "$wait" in ''|*[!0-9]*) "$on_fail" "$wait_var is '$wait', not a whole number of seconds" ;; esac
+    command -v flock >/dev/null 2>&1 || "$on_fail" "flock is not on PATH, so this run cannot keep a second publish from overlapping it"
+    exec 9>>"$LOCK_FILE" || "$on_fail" "the lock file $LOCK_FILE cannot be opened"
+    flock -w "$wait" 9 \
+        || "$on_fail" "another publish-github-pr run holds $LOCK_FILE and did not release it within ${wait}s ($wait_var); nothing was read, fetched or pushed"
+}
 
 # ---------------------------------------------------------------------
 # Preconditions — the same list --check reports on.
@@ -472,6 +534,8 @@ if [ "${1:-}" = "--measure" ]; then
     [ -z "$problem" ] || refuse "$problem"
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     [ -w "$STATE_DIR" ] || refuse "state dir $STATE_DIR is not writable (BOSS_PUBLISH_STATE_DIR)"
+    # A publish in flight owns the clone; the refresh is not yet, not wrong.
+    take_publish_lock not_yet BOSS_PUBLISH_MEASURE_LOCK_WAIT
 
     # 0. THE PULL REQUESTS' STATE, ASKED OF GITHUB (backlog a5d4322c).
     #    On 2026-09-22 the publish region called #239 open for 86 hours
@@ -553,7 +617,7 @@ if [ "${1:-}" = "--measure" ]; then
          drift_refreshed_at: $ts}' > "$workdir/refresh" \
         || fail "the refresh could not be rendered as JSON"
     if ! curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/refresh" \
             "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err"; then
         fail "annotating ${job_id:0:8} with the refreshed drift failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -568,7 +632,7 @@ if [ "${1:-}" = "--measure" ]; then
     # their work (ops-request 9340fd6e). A permanently-red check is one
     # nobody reads; a silently-vacuous one is worse.
     if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs/$job_id" > "$workdir/readback" 2>"$workdir/err"; then
         fail "the refresh for ${job_id:0:8} was accepted but the packet could not be read back — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
     fi
@@ -594,6 +658,7 @@ fi
 [ -n "${BOSS_JOBS_URL:-}" ] || refuse "BOSS_JOBS_URL is not set; the ops-runner pins it on its Exec line and a hand run must name the system of record"
 BASE="${BOSS_JOBS_URL%/}"
 check_inputs || refuse "inputs incomplete (see above); nothing was fetched or pushed"
+take_publish_lock refuse BOSS_PUBLISH_LOCK_WAIT
 
 # 1. The packet. One mirror, one open publish packet (149's guard), and
 #    its open-pr must be ready or active — a rule fired on readiness.
@@ -927,12 +992,12 @@ chmod -R a+rX "$CLONE" 2>/dev/null || true
 forge_push_cmd="git -c 'safe.directory=$CLONE' -C '$CLONE' push -q '$FORGE_PUSH_URL' '$snapshot:refs/heads/$BRANCH'"
 if [ -n "$FORGE_PUSH_AS" ]; then
     runuser -l "$FORGE_PUSH_AS" -c "$forge_push_cmd" 2>"$workdir/err" \
-        || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN) as $FORGE_PUSH_AS: $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' '). Without it on the forge, the off-site push (offsite-push.sh) cannot carry it"
-    say "pushed publish/${BRANCH#publish/} to the forge as $FORGE_PUSH_AS ($FORGE_PUSH_URL_SHOWN) — the off-site push carries it too"
+        || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN) as $FORGE_PUSH_AS: $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' '). Nothing was pushed to the fork: the forge holds every snapshot this verb publishes"
+    say "pushed publish/${BRANCH#publish/} to the forge as $FORGE_PUSH_AS ($FORGE_PUSH_URL_SHOWN) — the fork gets it from this verb alone"
 else
     bash -c "$forge_push_cmd" 2>"$workdir/err" \
         || fail "pushing $BRANCH to the forge ($FORGE_PUSH_URL_SHOWN): $(head -c 300 "$workdir/err" | redact_url | tr '\n' ' ')"
-    say "pushed publish/${BRANCH#publish/} to the forge ($FORGE_PUSH_URL_SHOWN) — the off-site push carries it too"
+    say "pushed publish/${BRANCH#publish/} to the forge ($FORGE_PUSH_URL_SHOWN) — the fork gets it from this verb alone"
 fi
 
 # Never forced — the same three outcomes as the forge push above.
@@ -953,16 +1018,30 @@ say "pushed $FORK_OWNER:$BRANCH"
 # compared here. A limit is not a filter: a listing that comes back FULL
 # may hide the PR asked about, so it is refused rather than read as
 # absence.
+#
+# FROM THE FORK means the owner AND the repository (1a2bcf11, finding 3):
+# gh gives the head's owner as `headRepositoryOwner` and its repository
+# as `headRepository` ({id, name}); a PR from another repository of the
+# same owner is not the fork's. `from_fork` is that one test, for every
+# reader of this listing below.
 PR_LIST_LIMIT=200
-gh_t pr list --repo "$MIRROR_SLUG" --state open --limit "$PR_LIST_LIMIT" \
-        --json number,url,headRefName,headRepositoryOwner > "$workdir/open-prs" 2>"$workdir/err" \
-    || fail "listing the mirror's open pull requests failed — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' '); $FORK_OWNER:$BRANCH is pushed (snapshot $snapshot), no PR was opened or reused, open-pr on ${job_id:0:8} stays ready and a re-run pushes the same commit"
-jq_doc_file "$workdir/open-prs" && jq -e 'type == "array"' "$workdir/open-prs" > /dev/null 2>&1 \
-    || fail "gh answered the open-PR listing with no list — nothing was read, so no PR was opened, reused or closed; $FORK_OWNER:$BRANCH is pushed (snapshot $snapshot) and open-pr on ${job_id:0:8} stays ready"
-[ "$(jq 'length' "$workdir/open-prs")" -lt "$PR_LIST_LIMIT" ] \
-    || fail "the mirror has $PR_LIST_LIMIT or more open pull requests, so the listing may not hold the one for $FORK_OWNER:$BRANCH — nothing was opened, reused or closed; $FORK_OWNER:$BRANCH is pushed (snapshot $snapshot)"
-pr_url=$(jq -r --arg owner "$FORK_OWNER" --arg branch "$BRANCH" '
-    first(.[] | select(((.headRepositoryOwner.login // "") | ascii_downcase) == ($owner | ascii_downcase))
+FORK_NAME="${FORK_SLUG#*/}"
+list_open_prs() {
+    gh_t pr list --repo "$MIRROR_SLUG" --state open --limit "$PR_LIST_LIMIT" \
+        --json number,url,headRefName,headRepositoryOwner,headRepository > "$1" 2>"$workdir/err" \
+        || { printf 'gh said: %s' "$(head -c 300 "$workdir/err" | tr '\n' ' ')" > "$workdir/list-why"; return 1; }
+    jq_doc_file "$1" && jq -e 'type == "array"' "$1" > /dev/null 2>&1 \
+        || { printf 'gh answered with no list' > "$workdir/list-why"; return 1; }
+    [ "$(jq 'length' "$1")" -lt "$PR_LIST_LIMIT" ] \
+        || { printf 'the mirror has %s or more open pull requests, so the listing may not hold every one' "$PR_LIST_LIMIT" > "$workdir/list-why"; return 1; }
+}
+FROM_FORK='def from_fork($owner; $repo):
+    ((.headRepositoryOwner.login // "") | ascii_downcase) == ($owner | ascii_downcase)
+    and ((.headRepository.name // "") | ascii_downcase) == ($repo | ascii_downcase);'
+list_open_prs "$workdir/open-prs" \
+    || fail "listing the mirror's open pull requests failed — $(cat "$workdir/list-why"); nothing was read, so no PR was opened, reused or closed; $FORK_OWNER:$BRANCH is pushed (snapshot $snapshot), open-pr on ${job_id:0:8} stays ready and a re-run pushes the same commit"
+pr_url=$(jq -r --arg owner "$FORK_OWNER" --arg repo "$FORK_NAME" --arg branch "$BRANCH" "$FROM_FORK"'
+    first(.[] | select(from_fork($owner; $repo))
               | select((.headRefName // "") == $branch) | .url) // empty' "$workdir/open-prs") \
     || fail "the open-PR listing could not be read as pull requests"
 if [ -n "$pr_url" ]; then
@@ -984,82 +1063,294 @@ fi
 #     more, and #239-#242 had all stood open at once — four PRs to read
 #     where one said everything. So each OLDER open publish PR from our
 #     fork is closed with a comment naming this one, AFTER this one is
-#     open. Only our fork's heads, only `publish/<date>` or
-#     `publish/<date>-<snapshot>` whose date is not after this run's:
-#     a newer-dated PR, somebody else's branch, or a non-publish PR from
-#     the fork is never ours to close. A SAME-day publish on another
-#     branch is older than this one (1f0aa60d: #245 on the date-only
-#     publish/2026-09-27 is exactly that case), because this snapshot is
-#     cut from forge main now, on top of the same mirror main.
+#     open.
+#
+#     WHICH PR IS OLDER IS READ OFF THE RECORD, NOT OFF ITS NAME (backlog
+#     1a2bcf11). Until 2026-09-27 "older" meant any open publish/<date>
+#     [-<snapshot>] PR from the fork's OWNER whose date was not after
+#     this run's. The date cannot order two publishes of one day, and a
+#     superseding packet is filed beside the one it supersedes, so a run
+#     for the older tree could come second and close the newer tree's PR
+#     (finding 2); and the owner alone matched a PR a person opened by
+#     hand from another repository of theirs (finding 3). So a PR is
+#     closed as superseded only when ALL of these hold:
+#
+#       - it comes from the fork: its owner AND its repository (from_fork);
+#       - its branch is publish-shaped — never main, never anything else;
+#       - a publish packet other than this one recorded exactly it on its
+#         open-pr step: this pr_url, on head `<owner>:<its branch>`;
+#       - that packet's source (`source_sha`, or `forge_head` before
+#         02b65d81) is this run's approved commit or an ANCESTOR of it on
+#         forge main — so this PR carries every commit that one carried,
+#         which is exactly what the close comment tells its reader.
+#
+#     Every other publish-shaped PR from the fork's owner is KEPT, and the
+#     run says which and why. Nothing here closes a PR no packet opened.
 #
 #     Order, for a re-run: the older packet is annotated FIRST
 #     (`pr_superseded`, the intent), then the PR closed, then GitHub
 #     read back and ITS answer written as `pr_state` (the effect — the
 #     same key and shape `--measure` writes, which the publish region
-#     reads). Any failure stops the run before open-pr completes, so a
-#     re-run reuses this PR and meets whatever is still open. A PR no
-#     packet recorded is closed all the same and said so by URL.
-jq -c --arg owner "$FORK_OWNER" --arg branch "$BRANCH" --arg url "$pr_url" --arg date "$DATE" '
+#     reads) together with the two keys the workflow's `superseded`
+#     terminal reads, `superseded_by` and `supersession_translation`
+#     (backlog 78f2fbda: written as `pr_superseded` alone, publish
+#     8d7a3507 stood open 95 minutes after its PR closed, until a person
+#     wrote them by hand). They ride the EFFECT, not the intent, so a
+#     close that did not take never closes the older packet. Any failure
+#     stops the run before open-pr completes, so a re-run reuses this PR
+#     and meets whatever is still open.
+#
+# THE RECORD, read once for 4b and 4c: every publish packet's open-pr
+# but this one's, as {job, url, owner, branch, source}. A limit is not a
+# filter — a PR or branch only an unread packet recorded is KEPT, and
+# the run says how many packets it did not read.
+curl -fsS -H "x-boss-user: $BOSS_USER" \
+        "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/published" 2>"$workdir/err" \
+    || fail "jobs API unreachable at $BASE while reading which packets recorded which PRs — $(cat "$workdir/err"); the PR is open at $pr_url, nothing older was closed and nothing pruned; open-pr on ${job_id:0:8} stays ready"
+jq_doc_file "$workdir/published" \
+    || fail "the jobs API answered the publish packets with nothing parseable — the PR is open at $pr_url, nothing older was closed and nothing pruned; open-pr on ${job_id:0:8} stays ready"
+published_listed=$(jq -r '(if type == "object" and has("data") then .data else . end) | length' "$workdir/published")
+published_total=$(jq -r '.total? // empty' "$workdir/published")
+case "${published_total:-empty}" in
+    empty|*[!0-9]*) ;;
+    *) [ "$published_total" -le "$published_listed" ] \
+        || say "read $published_listed of $published_total publish packets — a PR or branch only the $((published_total - published_listed)) oldest recorded is kept" ;;
+esac
+jq -c --arg me "$job_id" '
+    (if type == "object" and has("data") then .data else . end)
+    | [ .[] | select(.id != $me) | .id as $job
+        | ((.steps // []) | map(select(.spec_slug == "open-pr")) | .[0]) as $o
+        | select($o != null)
+        | ($o.metadata // {}) as $m
+        | ($m.head // "") as $h
+        | select(($m.pr_url // "") != "" and ($h | contains(":")))
+        | {job: $job, url: $m.pr_url, owner: ($h | split(":") | .[0]),
+           branch: ($h | split(":") | .[1:] | join(":")),
+           source: ($m.source_sha // $m.forge_head // "")} ]' "$workdir/published" > "$workdir/records" \
+    || fail "the publish packets could not be read as records — the PR is open at $pr_url, nothing older was closed and nothing pruned; open-pr on ${job_id:0:8} stays ready"
+PUBLISH_BRANCH_RE='^publish/[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9a-f]+)?$'
+
+jq -c --arg owner "$FORK_OWNER" --arg repo "$FORK_NAME" --arg branch "$BRANCH" --arg url "$pr_url" \
+      --arg re "$PUBLISH_BRANCH_RE" --slurpfile rec "$workdir/records" "$FROM_FORK"'
     .[] | select(((.headRepositoryOwner.login // "") | ascii_downcase) == ($owner | ascii_downcase))
-        | select((.headRefName // "") | test("^publish/[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9a-f]+)?$"))
-        | select(.headRefName[8:18] <= $date and .headRefName != $branch and .url != $url)
-        | {number, url, head: .headRefName}' "$workdir/open-prs" > "$workdir/older" \
+        | select((.headRefName // "") | test($re))
+        | select(.headRefName != $branch and .url != $url)
+        | . as $pr
+        | {number, url, head: .headRefName, repo: (.headRepository.name // "none"),
+           fork: from_fork($owner; $repo),
+           rec: ([$rec[0][] | select(.url == $pr.url and .branch == $pr.headRefName
+                                     and (.owner | ascii_downcase) == ($owner | ascii_downcase))]
+                 | .[0] // {})}' "$workdir/open-prs" > "$workdir/older" \
     || fail "the PR is open at $pr_url, but the open-PR listing could not be read as pull requests — nothing older was closed; open-pr on ${job_id:0:8} stays ready"
 : > "$workdir/superseded"
-if [ -s "$workdir/older" ]; then
-    curl -fsS -H "x-boss-user: $BOSS_USER" \
-            "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/published" 2>"$workdir/err" \
-        || fail "jobs API unreachable at $BASE while recording superseded PRs — $(cat "$workdir/err"); nothing older was closed"
-    while IFS= read -r row; do
-        old_n=$(printf '%s' "$row" | jq -r '.number')
-        old_url=$(printf '%s' "$row" | jq -r '.url')
-        old_head=$(printf '%s' "$row" | jq -r '.head')
-        old_job=$(jq -r --arg url "$old_url" 'first((if type == "object" and has("data") then .data else . end)
-            | .[] | select(any((.steps // [])[]; .spec_slug == "open-pr" and (.metadata.pr_url // "") == $url))
-            | .id) // empty' "$workdir/published")
-        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        if [ -n "$old_job" ]; then
-            jq -n --arg old "$old_url" --arg new "$pr_url" --arg job "$job_id" --arg ts "$ts" \
-                '{pr_superseded: {pr_url: $old, by_pr_url: $new, by_packet: $job, at: $ts,
-                                  by: "publish-github-pr"}}' > "$workdir/sup"
-            curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-                    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
-                    --data-binary @"$workdir/sup" \
-                    "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
-                || fail "recording on ${old_job:0:8} that $pr_url supersedes $old_url failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); $old_url was not closed"
+while IFS= read -r row; do
+    old_n=$(printf '%s' "$row" | jq -r '.number')
+    old_url=$(printf '%s' "$row" | jq -r '.url')
+    old_head=$(printf '%s' "$row" | jq -r '.head')
+    old_job=$(printf '%s' "$row" | jq -r '.rec.job // empty')
+    old_src=$(printf '%s' "$row" | jq -r '.rec.source // empty')
+    if [ "$(printf '%s' "$row" | jq -r '.fork')" != true ]; then
+        say "kept $old_url ($old_head) — it comes from $FORK_OWNER/$(printf '%s' "$row" | jq -r '.repo'), not the fork $FORK_SLUG, so no publish opened it"
+        continue
+    fi
+    if [ -z "$old_job" ]; then
+        say "kept $old_url ($old_head) — no publish packet recorded this pull request on this branch, so no publish opened it; a PR opened by hand is its author's to close"
+        continue
+    fi
+    if ! [[ "$old_src" =~ ^[0-9a-f]{40}$ ]] || ! g cat-file -e "${old_src}^{commit}" 2>/dev/null; then
+        say "kept $old_url ($old_head) — packet ${old_job:0:8} recorded no source this clone holds (${old_src:-none}), so that this PR carries it cannot be shown"
+        continue
+    fi
+    if ! g merge-base --is-ancestor "$old_src" "$source_sha" 2>/dev/null; then
+        say "kept $old_url ($old_head) — its source ${old_src:0:12} (packet ${old_job:0:8}) is not in this run's ${source_sha:0:12}, so closing it would drop commits only it carries: it is the newer publish, or another line"
+        continue
+    fi
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -n --arg old "$old_url" --arg new "$pr_url" --arg job "$job_id" --arg ts "$ts" \
+        '{pr_superseded: {pr_url: $old, by_pr_url: $new, by_packet: $job, at: $ts,
+                          by: "publish-github-pr"}}' > "$workdir/sup"
+    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
+            --data-binary @"$workdir/sup" \
+            "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
+        || fail "recording on ${old_job:0:8} that $pr_url supersedes $old_url failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); $old_url was not closed"
+    gh_t pr close "$old_n" --repo "$MIRROR_SLUG" \
+            --comment "Superseded by $pr_url — a snapshot of forge main at ${source_sha:0:12}, which contains ${old_src:0:12}, the commit this one ($old_head) published, and every commit since. Closed by machine (BOSS publish-to-github, ops verb publish-github-pr, packet $job_id); the one PR to merge is the newest." \
+            > /dev/null 2>"$workdir/err" \
+        || fail "closing $old_url as superseded by $pr_url — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    # A close is a claim until GitHub is read saying so.
+    gh_t api "repos/$MIRROR_SLUG/pulls/$old_n" > "$workdir/closed" 2>"$workdir/err" \
+        || fail "asked GitHub to close $old_url, and it could not be read back — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    jq_doc_file "$workdir/closed" \
+        || fail "asked GitHub to close $old_url, and the read-back answered nothing parseable"
+    old_state=$(jq -r '.state // "no state"' "$workdir/closed")
+    [ "$old_state" = "closed" ] \
+        || fail "asked GitHub to close $old_url as superseded by $pr_url, and it still reads $old_state"
+    # `unmerged_reason`: a closed-unmerged publish says why (backlog
+    # 663589cd), the same key publish-pr-state.sh writes. The two
+    # terminal keys beside it close the older packet on `superseded` if
+    # it is still open; on a packet already closed they record the same
+    # fact where a reader of the packet looks for it.
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -c --arg url "$old_url" --arg new "$pr_url" --arg ts "$ts" --arg job "$job_id" \
+          --arg head "$old_head" --arg src "$source_sha" --arg old_src "$old_src" '
+        {pr_state: {pr_url: $url, number, state, merged: (.merged == true),
+                    merged_at, closed_at, read_at: $ts,
+                    read_by: "publish-github-pr (superseded)",
+                    unmerged_reason: "superseded by \($new)"},
+         superseded_by: $job,
+         supersession_translation: "\($url) (\($head)) was closed on GitHub by publish-github-pr at \($ts) as superseded by \($new), which publish \($job) opened from forge commit \($src). That commit contains \($old_src), the commit \($url) published, so \($new) carries every change \($url) carried."}' \
+        "$workdir/closed" > "$workdir/pr-state"
+    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
+            --data-binary @"$workdir/pr-state" \
+            "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
+        || fail "$old_url is closed on GitHub, but writing its state onto ${old_job:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    say "superseded $old_url ($old_head) — closed on GitHub, recorded on ${old_job:0:8} as superseded by ${job_id:0:8}"
+    printf '%s\n' "$old_url" >> "$workdir/superseded"
+done < "$workdir/older"
+
+# 4c. THE BRANCHES A CLOSED PR LEAVES (backlog 1a2bcf11, finding 1).
+#     Since 1f0aa60d every publish pushes a branch of its own to the forge
+#     and the fork, and nothing removed one: on 2026-09-27 both held seven
+#     publish/* heads whose PRs (#239-#245) GitHub read closed, three of
+#     them merged, and `boss orient` promised each "stays until GitHub
+#     reports the PR merged or closed" with nothing to keep the promise.
+#     The archive sweep (sweep-archive-branches.sh) was the named
+#     deleter, and cannot be: it judges car branches off an ARCHIVE
+#     database it is handed, runs by hand, and holds no GitHub credential,
+#     while this verb already holds both pushes. So the verb that creates
+#     a publish branch retires it, on each run.
+#
+#     A branch comes off only when ALL of these hold, else it is KEPT and
+#     named with the reason:
+#       - a publish packet recorded it as `<fork owner>:<branch>` on its
+#         open-pr, publish-shaped (never main), and it is not this run's;
+#       - no OPEN PR from the fork stands on it — read AGAIN here, after
+#         4b's closes, never from the listing taken before them;
+#       - the one PR recorded on it reads `closed` (merged or not) when
+#         GitHub is asked now, from the fork's repository, on this branch;
+#       - the branch still holds the head GitHub names for that PR — the
+#         delete is leased to that sha (`--force-with-lease=<ref>:<sha>`
+#         with `--delete`: a delete that the target REFUSES if the ref
+#         moved, never a forced update), and read back after.
+#     The FORGE goes first. That order was needed while the off-site push
+#     (offsite-push.sh) carried publish/* from the forge to the fork, so a
+#     branch deleted only on the fork came back on its next tick; since
+#     backlog a2b58aab it carries nothing there, and the order stays as
+#     the cheaper one to reason about. A branch the forge still holds
+#     is never deleted from the fork. A branch on neither side is nothing
+#     to act on and is not named.
+#
+#     A prune failure does not fail the run: this run's PR is open and the
+#     older ones are closed, and a stale branch costs nothing a re-try at
+#     the next publish does not recover. It is said on the run's output
+#     and rides open-pr as `prune_kept`, beside `pruned_branches`.
+: > "$workdir/pruned"
+: > "$workdir/prune-kept"
+prune_kept() { printf '%s: %s\n' "$1" "$2" >> "$workdir/prune-kept"; say "prune: kept $1 — $2"; }
+prune_side_cmd() {
+    # prune_side_cmd <branch> <sha> — the forge delete, as the forge push runs.
+    printf "git -c 'safe.directory=%s' -C '%s' push -q --force-with-lease='refs/heads/%s:%s' '%s' --delete 'refs/heads/%s'" \
+        "$CLONE" "$CLONE" "$1" "$2" "$FORGE_PUSH_URL" "$1"
+}
+jq -c --arg owner "$FORK_OWNER" --arg branch "$BRANCH" --arg re "$PUBLISH_BRANCH_RE" '
+    [ .[] | select((.owner | ascii_downcase) == ($owner | ascii_downcase))
+          | select(.branch | test($re)) | select(.branch != $branch) ]
+    | group_by(.branch) | .[] | {branch: .[0].branch, urls: (map(.url) | unique)}' \
+    "$workdir/records" > "$workdir/prune-candidates" \
+    || { prune_kept "every publish branch" "the records could not be grouped by branch"; : > "$workdir/prune-candidates"; }
+if [ ! -s "$workdir/prune-candidates" ]; then
+    :
+elif ! list_open_prs "$workdir/open-now"; then
+    prune_kept "every publish branch" "the open-PR listing could not be read again after the supersession ($(cat "$workdir/list-why")), so no branch can be shown to carry no open PR"
+# THE GUARD'S KNOWN POSITIVE (adversarial review of 8ec86b42). The guard
+# below counts open PRs from the fork on each branch, and a listing whose
+# shape stopped matching `from_fork` would count 0 everywhere — a blind
+# guard reads exactly like a clear one. This run's own PR is open by now
+# (opened or reused above), so the listing must show it, once, on this
+# run's branch, or it is trusted to show nothing.
+elif [ "$(jq --arg owner "$FORK_OWNER" --arg repo "$FORK_NAME" --arg b "$BRANCH" "$FROM_FORK"'
+        [.[] | select(from_fork($owner; $repo) and .headRefName == $b)] | length' "$workdir/open-now" 2>/dev/null)" != 1 ]; then
+    prune_kept "every publish branch" "the fresh listing does not show this run's own open PR on $BRANCH, so it cannot be trusted to show any other"
+elif ! forge_git ls-remote "$FORGE_REPO" 'refs/heads/publish/*' > "$workdir/forge-heads" 2>"$workdir/err"; then
+    prune_kept "every publish branch" "the forge's publish heads could not be read from $FORGE_REPO — git said: $(head -c 200 "$workdir/err" | tr '\n' ' ')"
+elif ! g -c "credential.helper=$helper" ls-remote fork 'refs/heads/publish/*' > "$workdir/fork-heads" 2>"$workdir/err"; then
+    prune_kept "every publish branch" "the fork's publish heads could not be read from $FORK_URL — git said: $(head -c 200 "$workdir/err" | tr '\n' ' ')"
+else
+    while IFS= read -r cand; do
+        b=$(printf '%s' "$cand" | jq -r '.branch')
+        # The shape again, in the shell, before the name goes near git: the
+        # records are data the jobs API handed back.
+        [[ "$b" =~ $PUBLISH_BRANCH_RE ]] || { prune_kept "$b" "not a publish branch name"; continue; }
+        forge_sha=$(awk -v r="refs/heads/$b" '$2 == r { print $1 }' "$workdir/forge-heads")
+        fork_sha=$(awk -v r="refs/heads/$b" '$2 == r { print $1 }' "$workdir/fork-heads")
+        [ -n "$forge_sha$fork_sha" ] || continue
+        # A count, not `jq -e`: an unreadable answer is not zero, so it
+        # keeps the branch like an open PR does.
+        standing=$(jq --arg owner "$FORK_OWNER" --arg repo "$FORK_NAME" --arg b "$b" "$FROM_FORK"'
+                [.[] | select(from_fork($owner; $repo) and .headRefName == $b)] | length' "$workdir/open-now") \
+            || standing="an unreadable number of"
+        if [ "$standing" != 0 ]; then
+            prune_kept "$b" "$standing open pull request(s) from the fork stand on it"
+            continue
         fi
-        gh_t pr close "$old_n" --repo "$MIRROR_SLUG" \
-                --comment "Superseded by $pr_url — today's snapshot of forge main, which carries everything in this one ($old_head) and every commit since. Closed by machine (BOSS publish-to-github, ops verb publish-github-pr, packet $job_id); the one PR to merge is the newest." \
-                > /dev/null 2>"$workdir/err" \
-            || fail "closing $old_url as superseded by $pr_url — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
-        # A close is a claim until GitHub is read saying so.
-        gh_t api "repos/$MIRROR_SLUG/pulls/$old_n" > "$workdir/closed" 2>"$workdir/err" \
-            || fail "asked GitHub to close $old_url, and it could not be read back — gh said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
-        jq_doc_file "$workdir/closed" \
-            || fail "asked GitHub to close $old_url, and the read-back answered nothing parseable"
-        old_state=$(jq -r '.state // "no state"' "$workdir/closed")
-        [ "$old_state" = "closed" ] \
-            || fail "asked GitHub to close $old_url as superseded by $pr_url, and it still reads $old_state"
-        if [ -n "$old_job" ]; then
-            # `unmerged_reason`: a closed-unmerged publish says why
-            # (backlog 663589cd), the same key publish-pr-state.sh writes.
-            jq -c --arg url "$old_url" --arg new "$pr_url" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-                {pr_state: {pr_url: $url, number, state, merged: (.merged == true),
-                            merged_at, closed_at, read_at: $ts,
-                            read_by: "publish-github-pr (superseded)",
-                            unmerged_reason: "superseded by \($new)"}}' \
-                "$workdir/closed" > "$workdir/pr-state"
-            curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-                    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
-                    --data-binary @"$workdir/pr-state" \
-                    "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
-                || fail "$old_url is closed on GitHub, but writing its state onto ${old_job:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
-            say "superseded $old_url ($old_head) — closed on GitHub, recorded on ${old_job:0:8}"
-        else
-            say "superseded $old_url ($old_head) — closed on GitHub; no publish packet recorded it, so the close comment is its only record"
+        if [ "$(printf '%s' "$cand" | jq '.urls | length')" -ne 1 ]; then
+            prune_kept "$b" "packets recorded more than one pull request on it ($(printf '%s' "$cand" | jq -r '.urls | join(", ")')), so which head to lease to is not one answer"
+            continue
         fi
-        printf '%s\n' "$old_url" >> "$workdir/superseded"
-    done < "$workdir/older"
+        url=$(printf '%s' "$cand" | jq -r '.urls[0]')
+        n="${url##*/}"
+        case "${n:-empty}" in
+            empty|*[!0-9]*) prune_kept "$b" "its packet recorded '$url', which is not a pull request url"; continue ;;
+        esac
+        if ! gh_t api "repos/$MIRROR_SLUG/pulls/$n" > "$workdir/pull" 2>"$workdir/err" || ! jq_doc_file "$workdir/pull"; then
+            prune_kept "$b" "GitHub did not answer for $url — $(head -c 200 "$workdir/err" | tr '\n' ' ')"
+            continue
+        fi
+        judged=$(jq -c --arg b "$b" --arg fork "$FORK_SLUG" '
+            if .state != "closed" then {why: "GitHub reads \(.state // "no state") for its pull request"}
+            elif (.head.ref // "") != $b then {why: "GitHub names head \(.head.ref // "none") for its pull request, not this branch"}
+            elif ((.head.repo.full_name // "") | ascii_downcase) != ($fork | ascii_downcase) then
+                {why: "GitHub names repository \(.head.repo.full_name // "none") for its pull request, not the fork"}
+            elif ((.head.sha // "") | test("^[0-9a-f]{40}$")) | not then {why: "GitHub names no head sha for its pull request"}
+            else {sha: .head.sha, how: (if .merged == true then "merged" else "closed unmerged" end)} end' "$workdir/pull") \
+            || { prune_kept "$b" "GitHub's answer for $url could not be read"; continue; }
+        why=$(printf '%s' "$judged" | jq -r '.why // empty')
+        [ -z "$why" ] || { prune_kept "$b" "$why ($url)"; continue; }
+        head_sha=$(printf '%s' "$judged" | jq -r '.sha')
+        how=$(printf '%s' "$judged" | jq -r '.how')
+        if [ -n "$forge_sha" ]; then
+            if [ "$forge_sha" != "$head_sha" ]; then
+                prune_kept "$b" "the forge holds ${forge_sha:0:12}, not ${head_sha:0:12}, the head of $url ($how): it moved after the PR closed, so it stays on the forge and the fork"
+                continue
+            fi
+            if [ -n "$FORGE_PUSH_AS" ]; then
+                runuser -l "$FORGE_PUSH_AS" -c "$(prune_side_cmd "$b" "$head_sha")" 2>"$workdir/err"
+            else
+                bash -c "$(prune_side_cmd "$b" "$head_sha")" 2>"$workdir/err"
+            fi || { prune_kept "$b" "PRUNE FAILED on the forge ($FORGE_PUSH_URL_SHOWN): $(head -c 200 "$workdir/err" | redact_url | tr '\n' ' ')"; continue; }
+            # An answer is not an effect.
+            if [ -n "$(forge_git ls-remote "$FORGE_REPO" "refs/heads/$b" 2>/dev/null)" ]; then
+                prune_kept "$b" "PRUNE FAILED: the forge accepted the delete and still lists the branch"
+                continue
+            fi
+        fi
+        if [ -n "$fork_sha" ]; then
+            if [ "$fork_sha" != "$head_sha" ]; then
+                prune_kept "$b" "${forge_sha:+deleted from the forge, but }the fork holds ${fork_sha:0:12}, not ${head_sha:0:12}, the head of $url ($how), so it stays there"
+                continue
+            fi
+            g -c "credential.helper=$helper" push -q --force-with-lease="refs/heads/$b:$head_sha" fork --delete "refs/heads/$b" 2>"$workdir/err" \
+                || { prune_kept "$b" "PRUNE FAILED on the fork ${forge_sha:+(deleted from the forge)}: $(head -c 200 "$workdir/err" | tr '\n' ' ')"; continue; }
+            if [ -n "$(g -c "credential.helper=$helper" ls-remote fork "refs/heads/$b" 2>/dev/null)" ]; then
+                prune_kept "$b" "PRUNE FAILED: the fork accepted the delete and still lists the branch"
+                continue
+            fi
+        fi
+        printf '%s\n' "$b" >> "$workdir/pruned"
+        say "pruned $b — $url is $how; deleted at ${head_sha:0:12} from${forge_sha:+ the forge}${forge_sha:+${fork_sha:+ and}}${fork_sha:+ the fork}, read back gone"
+    done < "$workdir/prune-candidates"
 fi
 
 # 5. Complete open-pr with pr_url. Merge, never replace (the
@@ -1067,16 +1358,19 @@ fi
 printf '%s' "$target" | jq -c --arg url "$pr_url" --arg snap "$snapshot" \
         --arg fh "$forge_head" --arg mh "$mirror_head" --arg br "$FORK_OWNER:$BRANCH" \
         --arg src "$source_sha" --arg by "$approved_by" --arg at "$approved_at" \
-        --rawfile sup "$workdir/superseded" '
+        --rawfile sup "$workdir/superseded" --rawfile pruned "$workdir/pruned" \
+        --rawfile kept "$workdir/prune-kept" '
+    def lines: split("\n") | map(select(. != ""));
     {status: "completed",
      metadata: ((.step.metadata // {})
                 + {pr_url: $url, snapshot_commit: $snap, forge_head: $fh,
                    source_sha: $src, approved_by: $by, approved_at: $at,
                    mirror_head: $mh, head: $br, published_by: "publish-github-pr",
-                   superseded_prs: ($sup | split("\n") | map(select(. != "")))})}' \
+                   superseded_prs: ($sup | lines),
+                   pruned_branches: ($pruned | lines), prune_kept: ($kept | lines)})}' \
     > "$workdir/payload"
 if ! curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-        ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+        ${MT_HDR:+-H "$MT_HDR"} \
         --data-binary @"$workdir/payload" \
         "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err"; then
     fail "the PR is open at $pr_url but completing open-pr on ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); record pr_url on the step by hand"

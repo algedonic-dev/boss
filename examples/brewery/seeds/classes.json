@@ -594,48 +594,6 @@
   },
   {
     "subject_kind": "employee",
-    "code": "production",
-    "display_name": "Production",
-    "member_attribute": "department",
-    "sort_order": 200
-  },
-  {
-    "subject_kind": "employee",
-    "code": "packaging",
-    "display_name": "Packaging",
-    "member_attribute": "department",
-    "sort_order": 210
-  },
-  {
-    "subject_kind": "employee",
-    "code": "distribution",
-    "display_name": "Distribution",
-    "member_attribute": "department",
-    "sort_order": 220
-  },
-  {
-    "subject_kind": "employee",
-    "code": "maintenance",
-    "display_name": "Maintenance",
-    "member_attribute": "department",
-    "sort_order": 230
-  },
-  {
-    "subject_kind": "employee",
-    "code": "taproom",
-    "display_name": "Taproom",
-    "member_attribute": "department",
-    "sort_order": 240
-  },
-  {
-    "subject_kind": "employee",
-    "code": "audit",
-    "display_name": "Audit",
-    "member_attribute": "department",
-    "sort_order": 270
-  },
-  {
-    "subject_kind": "employee",
     "code": "territory-rep",
     "display_name": "Territory Rep",
     "member_attribute": "account_team_role",
@@ -1053,55 +1011,6 @@
     "sort_order": 40
   },
   {
-    "subject_kind": "employee",
-    "code": "executive",
-    "display_name": "Executive",
-    "member_attribute": "department",
-    "sort_order": 10
-  },
-  {
-    "subject_kind": "employee",
-    "code": "sales",
-    "display_name": "Sales",
-    "member_attribute": "department",
-    "sort_order": 20
-  },
-  {
-    "subject_kind": "employee",
-    "code": "qa",
-    "display_name": "QA",
-    "member_attribute": "department",
-    "sort_order": 50
-  },
-  {
-    "subject_kind": "employee",
-    "code": "warehouse",
-    "display_name": "Warehouse",
-    "member_attribute": "department",
-    "sort_order": 60
-  },
-  {
-    "subject_kind": "employee",
-    "code": "finance",
-    "display_name": "Finance",
-    "member_attribute": "department",
-    "sort_order": 70
-  },
-  {
-    "subject_kind": "employee",
-    "code": "people",
-    "display_name": "People",
-    "member_attribute": "department",
-    "sort_order": 80
-  },
-  {
-    "subject_kind": "employee",
-    "code": "marketing",
-    "display_name": "Marketing",
-    "member_attribute": "department",
-    "sort_order": 100
-  },
-  {
     "subject_kind": "location",
     "code": "taproom",
     "display_name": "Taproom",
@@ -1226,5 +1135,54 @@
     "display_name": "Barrel",
     "member_attribute": "category",
     "sort_order": 46
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "photo",
+    "display_name": "Photo",
+    "member_attribute": "kind",
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "video",
+    "display_name": "Video",
+    "member_attribute": "kind",
+    "sort_order": 11
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "doc",
+    "display_name": "Doc",
+    "member_attribute": "kind",
+    "sort_order": 12
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "template",
+    "display_name": "Template",
+    "member_attribute": "kind",
+    "sort_order": 13
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "logo",
+    "display_name": "Logo",
+    "member_attribute": "kind",
+    "sort_order": 14
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "deck",
+    "display_name": "Deck",
+    "member_attribute": "kind",
+    "sort_order": 17
+  },
+  {
+    "subject_kind": "marketing-asset",
+    "code": "one-pager",
+    "display_name": "One-Pager",
+    "member_attribute": "kind",
+    "sort_order": 18
   }
 ]

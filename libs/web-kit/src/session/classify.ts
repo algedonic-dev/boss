@@ -54,6 +54,9 @@ export type SessionEnvelope = {
   /// True for the read-only guest: every read surface renders,
   /// and surfaces that offer writes may hide or soften them.
   readonly: boolean;
+  /// Who this session is to policy (./can) — null until the probe
+  /// answers, and whenever it names no one.
+  policyUser: PolicyUser | null;
 };
 
 
@@ -113,11 +116,32 @@ export function breakGlassOperator(username: string): Employee {
   };
 }
 
+/// The identity a request from this session carries downstream — the
+/// `{id, role}` the gateway signs into `x-boss-user`. It is NOT the
+/// people row: the login maps a role the registry does not know to
+/// `visitor`, and a role edited mid-session is not in the cookie, so the
+/// row and the header can differ, and policy's self-arm admits only the
+/// header's pair (backlog 9dad102c).
+export type PolicyUser = { id: string; role: string };
+
 export type ProbeBody = {
   username?: string;
   employee_id?: string;
   role?: string;
+  /// The gateway's `Session::policy_id` and effective role, answered
+  /// beside the rest so the web never re-derives them.
+  policy_user?: { id?: unknown; role?: unknown };
 };
+
+/// The probe's `policy_user`, or null when it names no one — an older
+/// gateway, or a blank field. Null asks policy nothing, and every write
+/// gated on the answer stays hidden: fail closed.
+export function probePolicyUser(body: ProbeBody): PolicyUser | null {
+  const id = body.policy_user?.id;
+  const role = body.policy_user?.role;
+  if (typeof id !== 'string' || typeof role !== 'string' || !id || !role) return null;
+  return { id, role };
+}
 
 /// What reading the viewer's own people row answered. `absent` is an
 /// ANSWER — no employee id to ask about, or the people service said

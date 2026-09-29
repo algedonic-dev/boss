@@ -41,8 +41,8 @@ grep -q '"title":"first"' "$posted" && grep -q '"title":"second"' "$posted" || f
 [[ "$(grep -n '"title":"first"' "$posted" | cut -d: -f1)" -lt "$(grep -n '"title":"second"' "$posted" | cut -d: -f1)" ]] || fail "replay was not oldest first"
 alert "third" "d3" 2>/dev/null; [[ "$(alert_count)" -eq 0 ]] || fail "an alert with the API up was kept instead of filed"
 # The watchdog raises an alert on every outcome that needs a person, and replays on ok.
-for want in 'alert "cluster restored by the watchdog' 'alert "cluster DARK: hands needed — the rollback' 'alert "cluster DARK: hands needed — the last converged' 'alert_replay'; do
+for want in 'alert "cluster restored by the watchdog' 'alert "cluster DARK: hands needed — the rollback' 'alert "cluster DARK: hands needed — the last converged' 'alert "cluster DARK: hands needed — the watchdog cannot read' 'alert_replay'; do
     grep -qF "$want" "$wd" || fail "cluster-watchdog.sh lacks: $want"
 done
-echo "alerts-are-packets: self-test ok — an alert is an urgent packet for the platform owner (read from the registry, the unit's override winning, nobody when neither answers); kept while the API is down and filed oldest first when it answers; the watchdog raises one on restore and on both hands-needed outcomes"
+echo "alerts-are-packets: self-test ok — an alert is an urgent packet for the platform owner (read from the registry, the unit's override winning, nobody when neither answers); kept while the API is down and filed oldest first when it answers; the watchdog raises one on restore and on all three hands-needed outcomes (rollback failed, dark on the stamp, blind in the dark)"
 exit 0

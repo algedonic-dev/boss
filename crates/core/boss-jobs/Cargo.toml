@@ -89,6 +89,10 @@ name = "a_packet_is_created_whole_or_not_at_all_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_packet_is_never_admitted_onto_a_discarded_version_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "agent_runs_pg"
 required-features = ["postgres"]
 
@@ -161,6 +165,22 @@ name = "the_adapters_agree_on_every_list_filter_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_adapters_agree_on_the_agent_run_log_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_workflow_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_credentials_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_agents_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "platform_seed_loader"
 required-features = ["postgres"]
 
@@ -221,7 +241,27 @@ name = "stations_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_adapters_agree_on_the_station_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "step_plugin_registry_events_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_step_plugin_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_department_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_cadence_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_delivery_policy_registry_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -301,6 +341,10 @@ name = "the_jobs_summary_counts_under_the_callers_scope_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_kind_ledger_is_the_lists_fold_under_every_scope_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "a_node_declares_its_roles_pg"
 required-features = ["postgres"]
 
@@ -310,6 +354,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "job_edges_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_job_edges_registry_pg"
 required-features = ["postgres"]
 
 [[test]]

@@ -161,6 +161,13 @@ fn on_demand() -> String {
     "on-demand".to_string()
 }
 
+/// Every `rotation_policy` the registry admits — the SQL CHECK on
+/// `credentials.rotation_policy` (202609031700) spelled once in Rust,
+/// read by `validate_credential` and by the in-memory adapter's
+/// refusal. The adapters-agree suite's Pg leg publishes each one, so a
+/// value here the CHECK refuses goes red naming it (backlog be459ab9).
+pub const ROTATION_POLICIES: [&str; 2] = ["on-demand", "scheduled"];
+
 /// Why a declaration is refused, named so the refusal says which
 /// check failed; the same check runs in `boss tenant check`, the
 /// batch door and both adapters.
@@ -188,7 +195,7 @@ pub fn validate_credential(c: &CredentialInput) -> Result<(), String> {
             return Err(format!("credential {}: {field} is required", c.id));
         }
     }
-    if c.rotation_policy != "on-demand" && c.rotation_policy != "scheduled" {
+    if !ROTATION_POLICIES.contains(&c.rotation_policy.as_str()) {
         return Err(format!(
             "credential {}: rotation_policy `{}` is neither on-demand nor scheduled",
             c.id, c.rotation_policy

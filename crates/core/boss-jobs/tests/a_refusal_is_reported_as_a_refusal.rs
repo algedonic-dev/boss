@@ -255,7 +255,23 @@ fn the_runner_takes_its_verdict_from_the_receipt_and_falls_back_to_the_exit_stat
         .expect("verdict field")
         .field_type
         .clone();
-    for v in ty.split('|').map(str::trim).filter(|v| !v.is_empty()) {
+    // ONE WORD NO RECEIPT OF gate.sh CAN CARRY: `withdrawn` is recorded
+    // for a run stood down before any pod existed (backlog 8d7d0a2b), so
+    // no runner ever reads a receipt naming it. Its writer is `boss gate
+    // --withdraw` and the conductor's orphan settle, both through
+    // gate.rs's receipt — held here, so the exemption cannot outlive its
+    // writer.
+    let not_the_runners = [boss_jobs::yard::WITHDRAWN_VERDICT];
+    assert!(
+        read("crates/orchestrators/boss-cli/src/gate.rs").contains("WITHDRAWN_VERDICT"),
+        "`withdrawn` is exempt from the runner's set because boss-cli's gate.rs writes \
+         it; gate.rs no longer names it, so the exemption has no writer"
+    );
+    for v in ty
+        .split('|')
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !not_the_runners.contains(v))
+    {
         assert!(
             run.contains(v),
             "the runner's accepted verdicts must cover the protocol's enum; {v:?} is \

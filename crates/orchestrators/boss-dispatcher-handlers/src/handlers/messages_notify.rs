@@ -46,7 +46,7 @@ struct EmployeeLite {
 }
 
 pub struct MessagesNotify {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     people_base: String,
     messages_base: String,
 }
@@ -63,7 +63,7 @@ impl MessagesNotify {
     /// Construct with a custom reqwest client (tests point it at a
     /// mock server; production passes a fresh client).
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         people_base: impl Into<String>,
         messages_base: impl Into<String>,
     ) -> Arc<Self> {
@@ -407,6 +407,7 @@ mod tests {
 
     fn ctx_on(topic: &str, payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "notify-assignee-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: topic.into(),
@@ -423,7 +424,8 @@ mod tests {
     #[tokio::test]
     async fn a_done_topic_announces_done_not_ready() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -549,7 +551,8 @@ mod tests {
     #[tokio::test]
     async fn an_assigned_step_notifies_its_assignee_with_no_role() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let mut payload = ready_payload();
         payload["assignee_id"] = serde_json::json!("emp-bootstrap-admin");
         // No authority_role at all — the case that used to be a no-op.
@@ -571,7 +574,8 @@ mod tests {
     #[tokio::test]
     async fn the_assignee_wins_over_the_role() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let mut payload = ready_payload();
         payload["assignee_id"] = serde_json::json!("emp-named");
         h.invoke(&[], &ctx(payload)).await.expect("notify");
@@ -590,7 +594,8 @@ mod tests {
     #[tokio::test]
     async fn a_step_with_neither_assignee_nor_role_stays_silent() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let mut payload = ready_payload();
         payload["metadata"] = serde_json::json!({});
         h.invoke(&[], &ctx(payload)).await.expect("no-op");
@@ -600,7 +605,8 @@ mod tests {
     #[tokio::test]
     async fn links_to_the_step_not_the_job() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         h.invoke(&[], &ctx(assigned_ready_payload()))
             .await
             .expect("notify");
@@ -627,7 +633,8 @@ mod tests {
     #[tokio::test]
     async fn subject_names_the_subject() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -665,7 +672,8 @@ mod tests {
     #[tokio::test]
     async fn notifies_the_lowest_id_holder_with_a_stable_id() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -689,7 +697,8 @@ mod tests {
     #[tokio::test]
     async fn a_done_step_with_a_role_still_reaches_the_role_not_the_owner() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let mut payload = ready_payload();
         payload["job_owner_id"] = serde_json::json!("emp-owner");
         h.invoke(&[], &ctx_on("step.done.task", payload))
@@ -753,7 +762,8 @@ mod tests {
     #[tokio::test]
     async fn a_marked_done_step_whose_role_nobody_holds_dead_letters() {
         let (people, messages, captured) = mock_services_with(serde_json::json!([])).await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let res = h
             .invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await;
@@ -776,7 +786,8 @@ mod tests {
     #[tokio::test]
     async fn a_ready_step_with_only_a_role_stays_silent_by_design() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let res = h.invoke(&[], &ctx(ready_payload())).await;
         assert!(res.is_ok(), "a role-only ready step is a no-op: {res:?}");
         assert!(captured.lock().unwrap().is_none(), "nothing was sent");
@@ -820,7 +831,8 @@ mod tests {
     #[tokio::test]
     async fn id_prefix_arg_separates_done_notifications_from_ready() {
         let (people, messages, captured) = mock_services().await;
-        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let h =
+            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
         let payload = assigned_ready_payload();
         let args = vec![(
             "id_prefix".to_string(),

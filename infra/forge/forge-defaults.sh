@@ -94,9 +94,19 @@ FAILED_FILE="${BOSS_FORGE_LAST_FAILED:-${HOME:-}/.boss-last-failed}"
 # not $HOME: the ops runner executes verbs as root with no HOME in its
 # environment (2026-09-05: "HOME: unbound variable" on the first
 # release-converge), and the converge reads the hold as david — two
-# homes would be two files. /var/tmp is writable by both and survives
-# a reboot.
-HOLD_FILE="${BOSS_CONVERGE_HOLD:-/var/tmp/boss-converge-hold}"
+# homes would be two files.
+#
+# UNDER /var/lib/boss, NOT /var/tmp (backlog d94d287e, 2026-09-28). The
+# hold lived in /var/tmp because both accounts could write there — and
+# so could every other account: /var/tmp is sticky and world-writable,
+# so anyone on the forge could create the hold first (holding every
+# converge) or plant a symlink the root verbs then read through. The
+# hold is written by ROOT (the ops runner) and only READ by david, so it
+# belongs in a directory root owns and david can read: install.sh makes
+# /var/lib/boss root:root 0755 on every converge (converge-hold.sh
+# prepare, which also carried a hold standing at the old path across,
+# once). Survives a reboot, as /var/tmp did.
+HOLD_FILE="${BOSS_CONVERGE_HOLD:-/var/lib/boss/converge-hold}"
 
 # The instance database, as infra/cluster/manifests/boss.yaml declares
 # it: the StatefulSet `postgres`, container `postgres`, POSTGRES_USER=

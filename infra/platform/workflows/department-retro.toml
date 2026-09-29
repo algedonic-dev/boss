@@ -7,8 +7,10 @@
 # The SAME steps as protocol-retro — collect → analyze → gaps → report →
 # review, `cancelled` for a week with nothing to say — parameterised by
 # `department` on the packet (`metadata_schema` below requires it; the
-# value is a department Class code, an `employee` row whose
-# `member_attribute` is `department`). protocol-retro counts what IT
+# value is a code of the departments registry, `GET /api/departments` —
+# it said a department Class code until backlog c87e3d6d retired those,
+# 2026-09-27, and it was the registry that fed this retro all along).
+# protocol-retro counts what IT
 # did by hand over the platform's protocols; this counts what a
 # department did by hand over ITS protocols, read from the same doors:
 # the kinds whose active workflow row declares `metadata.department =
@@ -21,7 +23,7 @@
 #
 # One packet per department per ISO week, opened by the
 # `department-retros-weekly` clock rule (infra/dispatcher/rules/): the
-# handler reads the department list from the classes registry at fire
+# handler reads the department list from the departments registry at fire
 # time, so a department declared on Tuesday has its first retro on
 # Monday with no edit anywhere. The dedup is a WEEK window on the
 # newest packet, not `NOT open_job_exists` — one retro left open must
@@ -47,8 +49,8 @@ label = "Department retrospective"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
-description = "Weekly review of how ONE department's work actually ran: the terminal reports of its protocols, the packets its sensors opened, and — the point — what was done by hand that should have been a protocol step. Same steps as protocol-retro, parameterised by `department` (a department Class code). The Subject is the department; `metadata.department` carries the same code for the readiness read and the dedup.\n\nTHE TEST IS A COUNT, NOT A FEELING (protocol-retro v3, and it holds here unchanged). How many times was this done by hand this week? Something done ten times with no protocol is a gap however easy each instance felt; something done once is usually not, however badly it went. Difficulty makes work memorable, frequency makes it expensive, and the retro exists to stop the first from crowding out the second.\n\nWHY PER DEPARTMENT (design 3613f0af, 2026-09-18). IT was filled out in one order and it worked: in / working / out surfaces, then a sensor, a rule, a protocol, a probe, a retro. That order IS the scientific method applied to a department, and nothing about it is IT-specific — yet on the day of the design only IT had a retro, and product, support and hosting had no protocol at all. This kind is the review step of that template, one instance per department, so a department nobody reviews is a department whose readiness read says so.\n\nA department with nothing to say this week takes the `cancelled` exit after `collect` — with the counts that say why, because an empty week is a reading too."
-metadata_schema = { type = "object", required = ["department"], properties = { department = { type = "string", description = "The department Class code (subject_kind employee, member_attribute department) this retro reviews." } } }
+description = "Weekly review of how ONE department's work actually ran: the terminal reports of its protocols, the packets its sensors opened, and — the point — what was done by hand that should have been a protocol step. Same steps as protocol-retro, parameterised by `department` (a code of the departments registry, GET /api/departments). The Subject is the department; `metadata.department` carries the same code for the readiness read and the dedup.\n\nTHE TEST IS A COUNT, NOT A FEELING (protocol-retro v3, and it holds here unchanged). How many times was this done by hand this week? Something done ten times with no protocol is a gap however easy each instance felt; something done once is usually not, however badly it went. Difficulty makes work memorable, frequency makes it expensive, and the retro exists to stop the first from crowding out the second.\n\nWHY PER DEPARTMENT (design 3613f0af, 2026-09-18). IT was filled out in one order and it worked: in / working / out surfaces, then a sensor, a rule, a protocol, a probe, a retro. That order IS the scientific method applied to a department, and nothing about it is IT-specific — yet on the day of the design only IT had a retro, and product, support and hosting had no protocol at all. This kind is the review step of that template, one instance per department, so a department nobody reviews is a department whose readiness read says so.\n\nA department with nothing to say this week takes the `cancelled` exit after `collect` — with the counts that say why, because an empty week is a reading too."
+metadata_schema = { type = "object", required = ["department"], properties = { department = { type = "string", description = "The code of the department this retro reviews — a row of the departments registry (GET /api/departments)." } } }
 metadata = { surfaces = ["system-design"] }
 
 [[workflow.step]]

@@ -19,6 +19,8 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
+  import { departmentRoster } from '@boss/web-kit/session/departments.svelte';
+  import { href } from '../../router';
   import type { Remote } from '../../data/remote';
   import {
     listSubjectKinds,
@@ -90,6 +92,16 @@
   let grouped = $derived(classes.kind === 'ready' ? groupClassesByAttribute(classes.data) : []);
   let kindCount = $derived(kindsByCode.size);
   let selectedModule = $derived(selectedKind ? kindModule(selectedKind) : null);
+
+  /** The kind whose ROWS live in a registry of their own (backlog
+   *  c87e3d6d, decided on this page's audit 9f7ba57d): a department's
+   *  Classes are only its four functions, and the departments are the
+   *  `departments` table behind GET /api/departments — the chrome bar's
+   *  roster, read once at boot. The panel says so, with the count, so
+   *  the four function rows are never read as the company's four
+   *  departments. */
+  const REGISTRY_BACKED_KIND = 'department';
+  let departmentCount = $derived(departmentRoster()?.length ?? null);
 
   /** "module off on this instance" is the manifest's word, not the row's
    *  (backlog 92ea2e00): the row says which module, the tenant manifest
@@ -204,6 +216,16 @@
                 >{n === 0
                   ? 'no active workflow names this kind'
                   : `${n} active workflow${n === 1 ? ' names' : 's name'} this kind`}</span
+              >
+            {/if}
+            {#if selectedKind.kind === REGISTRY_BACKED_KIND}
+              <!-- A null roster is a read that has not answered, or failed:
+                   never "0 departments". -->
+              <span
+                >{departmentCount === null
+                  ? 'department count unknown — the departments registry has not answered'
+                  : `${departmentCount} department${departmentCount === 1 ? '' : 's'} in the departments registry`}
+                · <a href={href('/it')}>Department Map</a></span
               >
             {/if}
           </div>

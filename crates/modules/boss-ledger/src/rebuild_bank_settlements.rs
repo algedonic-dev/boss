@@ -98,6 +98,12 @@ pub async fn rebuild_bank_settlements(
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // The truncate may run only against a log that holds every
+    // committed write (design b046f510).
+    boss_events::outbox::lock_and_assert_log_complete(&mut tx, &["bank_settlements"])
+        .await
+        .map_err(LedgerError::Storage)?;
+
     let report = rebuild_bank_settlements_in_tx(&mut tx).await?;
 
     tx.commit()

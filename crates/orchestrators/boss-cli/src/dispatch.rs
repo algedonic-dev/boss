@@ -580,7 +580,10 @@ pub(crate) const EDIT_LEVEL_PATH: &str = "/api/tenant/edit-level";
 /// no level is no door, never a level that admits nothing. Anything
 /// else is an error, because a door that cannot read the level must
 /// not open a run.
-pub(crate) async fn edit_level_at(http: &reqwest::Client, base: &str) -> Result<Option<String>> {
+pub(crate) async fn edit_level_at(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+) -> Result<Option<String>> {
     let url = format!("{base}{EDIT_LEVEL_PATH}");
     // Waits out a jobs-API roll (backlog 034002b3), like every verb.
     let resp = crate::train::send_through_a_roll(
@@ -913,6 +916,7 @@ pub(crate) fn run_section(
     format!(
         "== THE RUN ==\n\n\
          Your run is agent-run {run_id} (profile `{}`, model {}, budget ${}, effort {}).\n\
+         {}\n\
          Before `boss gate`, in the shell you gate from: export {}={run_id}\n\
          The gate-run then records this run, and a green lands it by itself.\n\
          {}\n{}\n{}\n{isolation}",
@@ -920,10 +924,31 @@ pub(crate) fn run_section(
         settings.model,
         settings.budget_usd,
         settings.effort,
+        marker_line(run_id),
         crate::gate::AGENT_RUN_ENV,
         working_dir_line(run_id),
         budget_line(settings.budget_usd),
         effort_line(settings),
+    )
+}
+
+/// WHERE THIS RUN BEGINS IN A SHARED TRANSCRIPT (backlog 11a0998a). The
+/// marker is read back by the report's meter
+/// (`transcript_usage::markers`): the instant this line ARRIVED in the
+/// agent's transcript — the prompt itself, or the tool result of reading
+/// a prompt file or running the claim — is where the run's turns begin,
+/// and the next run's marker is where they end. Without it a batch the
+/// parent reported after one handback billed its first run the whole
+/// transcript and every other run zero. The instruction rides with the
+/// marker because the split is only as true as the moment the prompt is
+/// read: a batch agent that reads every prompt up front gives every run
+/// but the last nothing.
+pub(crate) fn marker_line(run_id: &str) -> String {
+    format!(
+        "{} — if one session runs several runs, read each run's prompt when you START that \
+         run, not all of them up front: the report meters each run from the moment its marker \
+         reaches your transcript to the moment the next one does.",
+        crate::transcript_usage::marker(run_id)
     )
 }
 
@@ -1204,7 +1229,7 @@ pub(crate) fn in_flight_car_refusal(item_id: &str, cars: &[Value]) -> Option<Str
 /// go through. Returns the run and the prompt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     repo: &Path,
     packet_ref: &str,
@@ -1670,7 +1695,7 @@ fn open_unheld(job: &Value) -> impl Iterator<Item = &Value> {
 /// the normal case, not an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn next_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     repo: &Path,
     station: &str,
@@ -1790,7 +1815,7 @@ pub async fn next(
         bail!("--budget must be a positive number of dollars, got {b}");
     }
     next_at(
-        &reqwest::Client::new(),
+        &crate::gate::machine_client().unwrap(),
         &base,
         &repo,
         &station,
@@ -2034,11 +2059,19 @@ pub(crate) fn no_terminal_line(short: &str) -> String {
          complete {short} --step {BUILDING_SLUG} --field result=refused` for a run stopped \
          without building, whether its agent stopped or it was stopped at the operator's \
          direction (the report on the packet carries the reason), or `result=delivered` for \
-         work that ships no car; a run whose gate is still running needs nothing, its green \
-         writes `gated` by itself, and the hourly clock writes `died`. Then run --report \
-         again and the cost is recorded with the outcome it reached"
+         work that ships no car. A run whose gate is still running needs nothing — its green \
+         writes `gated` and this report lands on `{REPORTED_SLUG}` by itself ({LANDING_RULE}), \
+         and the hourly clock writes `died` of a gate that never goes green. The agent_runs \
+         cost row is written only by a --report made once the run has an outcome; the landing \
+         does not write it"
     )
 }
+
+/// The rule that lands a report sent before the run's terminal, named
+/// in the lines that used to ask for a second report (b951c00a). The
+/// file under `infra/dispatcher/rules/` is held to this name by
+/// `the_landing_rule_the_report_names_is_authored`.
+pub(crate) const LANDING_RULE: &str = "agent-run-lands-a-report-sent-before-green";
 
 /// What `--report` says of a run whose `reported` step is neither open
 /// nor completed — read off the terminal `building` reached, because
@@ -2053,16 +2086,25 @@ pub(crate) fn no_terminal_line(short: &str) -> String {
 /// filed an item asking for a `stopped` terminal that `refused`
 /// already is. So a run with no result gets `None` here and the door
 /// alone; the green is named only where a green is what the run is at.
+///
+/// It no longer asks for a second `--report` (backlog b951c00a,
+/// 2026-09-28). It used to end "run --report again once the run is at
+/// reported", and nothing but a hand ever did: six runs were re-reported
+/// that day 32 to 113 minutes after their green, holding slots at the
+/// cap meanwhile. The report this call just put on the packet is what
+/// `agent-run-lands-a-report-sent-before-green` copies onto the step as
+/// it opens, so the line says that and asks for nothing.
 pub(crate) fn reported_waiting_line(short: &str, status: &str, run: &Value) -> Option<String> {
     match building_result(run)? {
         "gated" => Some(format!(
             "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} — it opens on the gate's \
-             green; the report rides the packet, run --report again once the run is at reported"
+             green; the report rides the packet and lands on `{REPORTED_SLUG}` by itself when \
+             it opens ({LANDING_RULE}), no second --report"
         )),
         "delivered" => Some(format!(
             "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} — `{BUILDING_SLUG}` \
-             closed `delivered`, which opens it; the report rides the packet, run --report \
-             again once the run is at reported"
+             closed `delivered`, which opens it; the report rides the packet and lands on \
+             `{REPORTED_SLUG}` by itself when it opens ({LANDING_RULE}), no second --report"
         )),
         ended => Some(format!(
             "boss dispatch: run {short}'s `{REPORTED_SLUG}` is {status} and does not open — \
@@ -2106,6 +2148,93 @@ pub(crate) fn run_branch(run: &Value) -> Option<String> {
         .or_else(|| non_empty(run.pointer(&format!("/metadata/{TENANT_RECEIPT_KEY}/branch"))))
 }
 
+/// The instant a run began: `briefed`'s completion (the prompt handed
+/// over — the same stamp the silence rule reads), else the packet's
+/// `opened_at`. One derivation, read by the record's `started_at` and by
+/// the transcript slice a report counts from (backlog 4f74727b).
+pub(crate) fn run_started_at(run: &Value) -> Option<String> {
+    crate::envelope::steps(run)
+        .into_iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BRIEFED_SLUG))
+        .and_then(|s| s.get("completed_at").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| {
+            run.pointer("/metadata/opened_at")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// The most `agent_runs` rows the earlier-report read asks for. A full
+/// page cannot say which report was last — a limit is not a filter —
+/// so it refuses rather than bound the slice from part of the table.
+const EARLIER_REPORTS_PAGE: usize = 1000;
+
+/// The part of `transcript` this report may count (backlog 4f74727b):
+/// after the later of the run's own start and the last report already
+/// metered from the same file, up to `now`. The earlier reports are the
+/// system of record's — `agent_runs` rows finished since the run began —
+/// so a batch of runs from one agent sums to what the agent spent,
+/// whoever runs the reports. The transcript's own markers cut it first,
+/// when it has them (`transcript_usage::Slice::marked`, backlog 11a0998a).
+pub(crate) async fn transcript_slice_at(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    actor: &str,
+    run_id: &str,
+    transcript: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::transcript_usage::Slice> {
+    let get = |path: String| {
+        let signature = crate::identity::Signature::As(actor.to_string());
+        async move {
+            crate::gate::api_at_signed(http, base, reqwest::Method::GET, &path, None, signature)
+                .await
+        }
+    };
+    let run = get(format!("/api/jobs/{run_id}"))
+        .await?
+        .context("the run read returned no body")?;
+    let started = run_started_at(&run)
+        .with_context(|| format!("run {run_id} has neither a briefed stamp nor opened_at"))?;
+    let started = started
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .with_context(|| format!("run {run_id} started at {started:?}, which is not an instant"))?;
+    // Spelled with `Z`: a `+00:00` in a query string arrives as a space.
+    let since = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let body = get(format!(
+        "/api/agent-runs?since={since}&limit={EARLIER_REPORTS_PAGE}"
+    ))
+    .await?;
+    // The listing's `total` (backlog 11a0998a) says whether the page is
+    // the whole answer; a body without one (a server from before it) is
+    // judged by the page filling, as before.
+    let total = body
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_u64);
+    let rows = crate::train::rows(body)?;
+    let partial = match total {
+        Some(total) => (rows.len() as u64) < total,
+        None => rows.len() >= EARLIER_REPORTS_PAGE,
+    };
+    if partial {
+        bail!(
+            "{} agent_runs rows finished since {since} answered of {}, so which report was last \
+             from {} cannot be read",
+            rows.len(),
+            total.map_or("a full page".to_string(), |t| t.to_string()),
+            transcript.display()
+        );
+    }
+    let earlier = crate::transcript_usage::earlier_reports(&rows, transcript, run_id, now);
+    Ok(crate::transcript_usage::Slice::bounded(
+        Some(started),
+        earlier,
+        now,
+    ))
+}
+
 /// The `agent_runs` record for a run packet: keyed on the run's own id
 /// (idempotent), the CPU as its registered id, the model its transcript
 /// was billed as (else the one its metadata declared) and the packet
@@ -2132,12 +2261,7 @@ pub(crate) fn run_record(
     let run_id = crate::envelope::job_id(run).context("the run has no id")?;
     let md = run.get("metadata").cloned().unwrap_or(Value::Null);
     let text = |k: &str| md.get(k).and_then(Value::as_str).map(str::to_string);
-    let started_at = crate::envelope::steps(run)
-        .into_iter()
-        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BRIEFED_SLUG))
-        .and_then(|s| s.get("completed_at").and_then(Value::as_str))
-        .map(str::to_string)
-        .or_else(|| text("opened_at"))
+    let started_at = run_started_at(run)
         .with_context(|| format!("run {run_id} has neither a briefed stamp nor opened_at"))?;
     let tokens = match r.counted() {
         Some(Tokens::Split { input, output }) => {
@@ -2246,6 +2370,19 @@ pub(crate) fn run_record(
                 // The two readings `model` was derived from, verbatim.
                 "model_ids": m.models.billed,
                 "model_identity": m.models.identity,
+                // WHICH LINES were counted (backlog 4f74727b): turns
+                // after `after` and at or before `until`, judged by each
+                // turn's first line — enough to re-derive the figure
+                // from the file. `zero_reason` says why a read made
+                // found none of this run's turns.
+                "after": m.slice.after.map(|t| t.to_rfc3339()),
+                "after_by": m.slice.after_by,
+                "until": m.slice.until.map(|t| t.to_rfc3339()),
+                // The report, or the next run's marker (backlog 11a0998a).
+                "until_by": m.slice.until_by,
+                "first_line": m.slice.first_line,
+                "last_line": m.slice.last_line,
+                "zero_reason": m.slice.zero_reason,
             }),
         );
     }
@@ -2567,7 +2704,7 @@ pub(crate) fn tenant_receipt_verdict(
 /// [`report_with_receipt_at`], so this exists only under test.
 #[cfg(test)]
 pub(crate) async fn report_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     run_ref: &str,
     report: &Report,
@@ -2581,7 +2718,7 @@ pub(crate) async fn report_at(
 /// [`report_at`] carrying a tenant run's receipt (6a34e9bc).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn report_with_receipt_at(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     run_ref: &str,
     report: &Report,
@@ -2823,7 +2960,7 @@ pub async fn report(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let base = crate::gate::resolve_jobs_base(None)?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client().unwrap();
     // METER THE RUN (backlog e6b2066f): its transcript's four counts
     // are what it consumed, and they supersede a typed count. Read here,
     // at the CLI boundary, because it is filesystem I/O. The week only
@@ -2835,19 +2972,48 @@ pub async fn report(
         .checked_sub(week)
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let root = crate::transcript_usage::projects_root();
-    let meter = match crate::transcript_usage::meter(
-        transcript.as_deref(),
-        root.as_deref(),
-        &run_id,
-        since,
-    ) {
+    // WHICH TURNS (backlog 4f74727b): only the run's own slice of the
+    // file, bounded by its start and the reports already metered from
+    // the same file — one agent can run a batch of runs into one
+    // transcript, and each report used to count it from line 1.
+    let located =
+        crate::transcript_usage::locate(transcript.as_deref(), root.as_deref(), &run_id, since);
+    let metered = match located {
+        Err(why) => Err(why),
+        Ok(path) => match transcript_slice_at(&http, &base, &actor, &run_id, &path, now).await {
+            Err(e) => Err(format!(
+                "the part of {} that is this run's could not be bounded ({e:#}), and counting \
+                 the whole file would record another run's turns as this one's",
+                path.display()
+            )),
+            Ok(slice) => crate::transcript_usage::meter(&path, &run_id, &slice),
+        },
+    };
+    let meter = match metered {
         Ok(m) => {
             let u = m.usage;
             eprintln!(
-                "boss dispatch: metered run {} from {}: model {}, {} turns, {} in / {} cache \
-                 write / {} cache read / {} out = {} processed (final context {}{})",
+                "boss dispatch: metered run {} from {} (lines {} to {}, after {} by {}, until \
+                 {} by {}{}): model {}, {} turns, {} in / {} cache write / {} cache read / {} out \
+                 = {} processed (final context {}{})",
                 &run_id[..8.min(run_id.len())],
                 m.path.display(),
+                m.slice
+                    .first_line
+                    .map_or("-".to_string(), |n| n.to_string()),
+                m.slice.last_line.map_or("-".to_string(), |n| n.to_string()),
+                m.slice
+                    .after
+                    .map_or("the file's start".to_string(), |t| t.to_rfc3339()),
+                m.slice.after_by.as_deref().unwrap_or("nothing"),
+                m.slice
+                    .until
+                    .map_or("the file's end".to_string(), |t| t.to_rfc3339()),
+                m.slice.until_by.as_deref().unwrap_or("nothing"),
+                m.slice
+                    .zero_reason
+                    .as_deref()
+                    .map_or(String::new(), |why| format!("; ZERO — {why}")),
                 m.models
                     .recorded()
                     .unwrap_or_else(|| "unnamed by the transcript".to_string()),
@@ -2923,7 +3089,7 @@ pub async fn run(
         bail!("--budget must be a positive number of dollars, got {b}");
     }
     dispatch_at(
-        &reqwest::Client::new(),
+        &crate::gate::machine_client().unwrap(),
         &base,
         &repo,
         &packet_ref,
@@ -3372,6 +3538,33 @@ mod tests {
         assert!(!s.contains("stop and report before"), "{s}");
     }
 
+    /// THE CLAIM PRINTS THE MARKER THE METER CUTS ON (backlog 11a0998a):
+    /// the section the prompt ends with, arriving in a transcript as the
+    /// agent reads it, is read back as this run's marker and no other's —
+    /// one fact in two modules, so it is pinned end to end rather than
+    /// by spelling the phrase here.
+    #[test]
+    fn the_run_section_carries_the_marker_the_meter_reads_back() {
+        const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+        let s = run_section(RUN, &block(), None);
+        assert!(s.contains(&crate::transcript_usage::marker(RUN)), "{s}");
+        let line = json!({
+            "type": "user",
+            "timestamp": "2026-09-28T13:00:03Z",
+            "message": { "content": [{ "type": "tool_result", "content": s }] },
+        })
+        .to_string();
+        let got = crate::transcript_usage::markers(&line);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].run, RUN);
+        assert_eq!(
+            got[0].at,
+            "2026-09-28T13:00:03Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+    }
+
     /// EVERY RUN GETS A WORKING DIRECTORY OF ITS OWN (backlog dd747b4c).
     /// Measured 2026-09-24: page-audit runs 36f05857 and a3b88dbf were
     /// dispatched together, and neither prompt named a place for working
@@ -3606,6 +3799,15 @@ mod tests {
                     tool_calls: 212,
                     ..Default::default()
                 },
+                slice: crate::transcript_usage::Sliced {
+                    after: Some("2026-09-28T09:56:30Z".parse().unwrap()),
+                    after_by: Some("report of run 412cd6e5".into()),
+                    until: Some("2026-09-28T09:58:31Z".parse().unwrap()),
+                    until_by: Some("marker of run 5cbc1e28".into()),
+                    first_line: Some(143),
+                    last_line: Some(185),
+                    zero_reason: None,
+                },
             }),
             tokens: Some(Tokens::Total(153_746)),
         };
@@ -3631,6 +3833,18 @@ mod tests {
         assert_eq!(rec["detail"]["metered"]["typed_tokens"], 153_746);
         assert_eq!(rec["detail"]["metered"]["final_context_tokens"], 153_121);
         assert_eq!(rec["detail"]["metered"]["turns"], 88);
+        // WHICH LINES were counted (backlog 4f74727b), so the figure can
+        // be re-derived from the file rather than trusted.
+        let m = &rec["detail"]["metered"];
+        assert_eq!(m["after"], "2026-09-28T09:56:30+00:00");
+        assert_eq!(m["after_by"], "report of run 412cd6e5");
+        assert_eq!(m["until"], "2026-09-28T09:58:31+00:00");
+        assert_eq!(m["until_by"], "marker of run 5cbc1e28");
+        assert_eq!(
+            (m["first_line"].clone(), m["last_line"].clone()),
+            (json!(143), json!(185))
+        );
+        assert_eq!(m["zero_reason"], Value::Null);
         // The column the record always had and nobody filled (backlog
         // 2f23f4c6): the transcript counts the calls.
         assert_eq!(rec["tool_calls"], 212);
@@ -4404,7 +4618,7 @@ mod wire_tests {
             ..Overrides::default()
         };
         let prompt = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -4548,6 +4762,51 @@ mod wire_tests {
         assert_eq!(*briefed, json!({ "status": "completed" }));
     }
 
+    /// A TRUST-BOUNDARY ITEM IS DISPATCHED HELD (backlog 486dde37). The
+    /// operator marked about ten cars by hand on 2026-09-27, each by
+    /// remembering to tell the builder; the mark now rides the item and
+    /// the prompt the builder is handed names the hold and the exact
+    /// `--hold` its gate must carry — and the run packet records the
+    /// brief that said so.
+    #[tokio::test]
+    async fn a_trust_boundary_items_dispatch_tells_the_builder_to_gate_held() {
+        let mut packet = packet_without_projection();
+        packet["metadata"]["trust_boundary"] =
+            json!({ "area": "credentials", "reason": "reads the broker's Secret" });
+        let (base, log) = stub(packet, row_with_block(), false).await;
+        let prompt = dispatch_to(&base).await.expect("dispatches").prompt;
+        assert!(prompt.contains("== TRUST BOUNDARY —"), "{prompt}");
+        assert!(prompt.contains("reads the broker's Secret"), "{prompt}");
+        assert!(
+            prompt.contains(&format!(
+                "--hold 'trust-boundary car (area credentials, item {})",
+                &PACKET[..8]
+            )),
+            "the exact flag, beside the park flags: {prompt}"
+        );
+        let filed = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .expect("the run is filed")
+            .2
+            .clone();
+        assert!(
+            filed["metadata"]["brief"]
+                .as_str()
+                .unwrap()
+                .contains("== TRUST BOUNDARY —"),
+            "the record of what the builder was told carries it"
+        );
+
+        // And an unmarked item's prompt carries no such section.
+        let (base, _) = stub(packet_without_projection(), row_with_block(), false).await;
+        let plain = dispatch_to(&base).await.expect("dispatches").prompt;
+        assert!(!plain.contains("== TRUST BOUNDARY —"), "{plain}");
+    }
+
     fn briefed_calls(log: &Log) -> Vec<String> {
         log.calls
             .lock()
@@ -4560,7 +4819,7 @@ mod wire_tests {
 
     async fn dispatch_to(base: &str) -> Result<Dispatched> {
         dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             base,
             &repo(),
             PACKET,
@@ -4701,7 +4960,7 @@ mod wire_tests {
         });
         let (base, log) = stub(packet_without_projection(), row_without, false).await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -4747,7 +5006,7 @@ mod wire_tests {
         ]);
         let (base, log) = stub(packet, row, false).await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -4826,7 +5085,7 @@ mod wire_tests {
         let served = served_repo();
         let (base, log) = stub(packet_in(json!(served.repo)), row_with_block(), false).await;
         let d = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -4895,7 +5154,7 @@ mod wire_tests {
         )
         .await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -4932,7 +5191,7 @@ mod wire_tests {
         )
         .await;
         let d = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5168,7 +5427,7 @@ mod wire_tests {
 
         let (base, log) = report_stub(tenant_run("ready")).await;
         let err = report_with_receipt_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -5188,7 +5447,7 @@ mod wire_tests {
         let pass = receipt(passing_check());
         let (base, log) = report_stub(tenant_run("ready")).await;
         report_with_receipt_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -5253,7 +5512,7 @@ mod wire_tests {
         )
         .await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5288,7 +5547,7 @@ mod wire_tests {
         )
         .await;
         let d = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5329,7 +5588,7 @@ mod wire_tests {
             session: None,
         };
         dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5355,7 +5614,7 @@ mod wire_tests {
             )
             .await;
             dispatch_at(
-                &reqwest::Client::new(),
+                &crate::gate::machine_client().unwrap(),
                 &base,
                 &repo(),
                 PACKET,
@@ -5380,7 +5639,7 @@ mod wire_tests {
     async fn a_held_step_is_refused_and_no_run_is_filed() {
         let (base, log) = stub(packet_without_projection(), row_with_block(), true).await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5444,7 +5703,7 @@ mod wire_tests {
         })
         .await;
         let err = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5535,7 +5794,7 @@ mod wire_tests {
             .await
         };
         dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5634,7 +5893,7 @@ mod wire_tests {
             .await
         };
         let prompt = dispatch_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5733,6 +5992,109 @@ mod wire_tests {
         .await
     }
 
+    /// A BATCH ON ONE TRANSCRIPT (backlog 4f74727b): the report counts
+    /// from the later of the run's start and the last report already
+    /// metered from the same file, read off `agent_runs` since the run
+    /// began — never from line 1, which recorded each batched run as the
+    /// file's running total.
+    #[tokio::test]
+    async fn a_report_bounds_its_slice_at_the_last_report_from_the_same_transcript() {
+        let path = std::path::PathBuf::from("/h/.claude/projects/p/s/subagents/agent-abb.jsonl");
+        let transcript = path.display().to_string();
+        let run = run_packet("ready");
+        let (base, log) = serve(move |method, p, _target, _body| match (method, p) {
+            ("GET", p) if p == format!("/api/jobs/{RUN}") => ("200 OK", run.to_string()),
+            ("GET", "/api/agent-runs") => (
+                "200 OK",
+                json!([
+                    // A sibling of the batch, reported after this run
+                    // began: this run's turns come after it.
+                    { "run_id": "412cd6e5", "finished_at": "2026-09-18T17:20:00Z",
+                      "detail": { "metered": { "transcript": transcript } } },
+                    // Another agent's file: not a bound.
+                    { "run_id": "5cbc1e28", "finished_at": "2026-09-18T17:40:00Z",
+                      "detail": { "metered": { "transcript": "/h/x/subagents/agent-zzz.jsonl" } } },
+                ])
+                .to_string(),
+            ),
+            _ => ("404 Not Found", String::new()),
+        })
+        .await;
+        let now: chrono::DateTime<chrono::Utc> = "2026-09-18T19:00:00Z".parse().unwrap();
+        let slice = transcript_slice_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            "claude@algedonic.dev",
+            RUN,
+            &path,
+            now,
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(slice.after, Some("2026-09-18T17:20:00Z".parse().unwrap()));
+        assert_eq!(slice.after_by.as_deref(), Some("report of run 412cd6e5"));
+        assert_eq!(slice.until, Some(now));
+        // The rows asked for are the ones finished since the run began
+        // (briefed's stamp), spelled with `Z` so no `+` reaches a query.
+        let calls = log.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|(m, t, _)| m == "GET"
+                && t == "/api/agent-runs?since=2026-09-18T17:05:00.000Z&limit=1000"),
+            "{calls:?}"
+        );
+    }
+
+    /// A PAGE IS NOT THE LIST (backlog 11a0998a): the listing's `total`
+    /// says whether the rows the slice is bounded from are all of them.
+    /// Fewer rows than the total is refused — the report then records
+    /// no meter rather than a slice bounded from part of the table — and
+    /// a page that holds the whole total is read however it is spelled.
+    #[tokio::test]
+    async fn the_slice_is_refused_when_the_listing_total_says_the_page_is_partial() {
+        let path = std::path::PathBuf::from("/h/.claude/projects/p/s/subagents/agent-abb.jsonl");
+        let transcript = path.display().to_string();
+        let now: chrono::DateTime<chrono::Utc> = "2026-09-18T19:00:00Z".parse().unwrap();
+        for (total, whole) in [(2, true), (3, false)] {
+            let run = run_packet("ready");
+            let transcript = transcript.clone();
+            let (base, _log) = serve(move |method, p, _target, _body| match (method, p) {
+                ("GET", p) if p == format!("/api/jobs/{RUN}") => ("200 OK", run.to_string()),
+                ("GET", "/api/agent-runs") => (
+                    "200 OK",
+                    json!({ "data": [
+                        { "run_id": "412cd6e5", "finished_at": "2026-09-18T17:20:00Z",
+                          "detail": { "metered": { "transcript": transcript } } },
+                        { "run_id": "5cbc1e28", "finished_at": "2026-09-18T17:40:00Z",
+                          "detail": {} },
+                    ], "total": total })
+                    .to_string(),
+                ),
+                _ => ("404 Not Found", String::new()),
+            })
+            .await;
+            let got = transcript_slice_at(
+                &crate::gate::machine_client().unwrap(),
+                &base,
+                "claude@algedonic.dev",
+                RUN,
+                &path,
+                now,
+            )
+            .await;
+            match whole {
+                true => assert_eq!(
+                    got.expect("the whole list").after_by.as_deref(),
+                    Some("report of run 412cd6e5")
+                ),
+                false => {
+                    let why = format!("{:#}", got.expect_err("a partial page"));
+                    assert!(why.contains("2 agent_runs rows"), "{why}");
+                    assert!(why.contains("answered of 3"), "{why}");
+                }
+            }
+        }
+    }
+
     /// THE WORK PROFILE RIDES THE REPORT (backlog 2f23f4c6): a metered
     /// run's profile is PUT beside its record, keyed on the run id —
     /// telemetry, so it is written whether or not the run has reached
@@ -5761,10 +6123,11 @@ mod wire_tests {
                 },
                 models: crate::transcript_usage::RunModels::default(),
                 profile: profile.clone(),
+                slice: Default::default(),
             }),
         };
         report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -5805,7 +6168,7 @@ mod wire_tests {
             }),
         };
         report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -5894,7 +6257,7 @@ mod wire_tests {
             ),
         };
         report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -5940,7 +6303,7 @@ mod wire_tests {
                                   "status": "ready", "metadata": {} });
         let (base, log) = report_stub(run).await;
         report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -6024,6 +6387,70 @@ mod wire_tests {
         assert!(line.contains("`refused`"), "{line}");
     }
 
+    /// A report sent before the green is not asked for twice (backlog
+    /// b951c00a, 2026-09-28). The lines used to end "run --report again
+    /// once the run is at reported"; six runs were re-reported by hand
+    /// that day, 32 to 113 minutes after their green, holding slots at
+    /// the cap. Neither the waiting line nor the no-terminal door asks
+    /// for a second report now — each names the rule that lands it.
+    #[test]
+    fn a_report_before_the_green_is_never_asked_for_again() {
+        let short = &RUN[..8];
+        let mut delivered = run_packet("pending");
+        delivered["steps"][2]["metadata"]["result"] = json!("delivered");
+        let lines = [
+            reported_waiting_line(short, "pending", &run_packet("pending"))
+                .expect("a line for a gated run"),
+            reported_waiting_line(short, "pending", &delivered)
+                .expect("a line for a delivered run"),
+            no_terminal_line(short),
+        ];
+        for line in &lines {
+            assert!(
+                !line.contains("--report again") && !line.contains("run --report"),
+                "no line asks for a second report: {line}"
+            );
+            assert!(
+                line.contains(LANDING_RULE),
+                "each names the rule that lands it: {line}"
+            );
+        }
+    }
+
+    /// The rule the lines name is one the tree authors, and it lands
+    /// `reported` from the packet's `report` — the key `report_patch`
+    /// writes. Two files, one fact each side reads (CLAUDE.md §9a).
+    #[test]
+    fn the_landing_rule_the_report_names_is_authored() {
+        let path = boss_testing::repo_root()
+            .join("infra/dispatcher/rules")
+            .join(format!("{LANDING_RULE}.toml"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is authored: {e}", path.display()));
+        let rule: toml::Value = toml::from_str(&text).expect("the rule parses");
+        let rule = &rule["rule"][0];
+        assert_eq!(rule["name"].as_str(), Some(LANDING_RULE));
+        let args = &rule["do"][0]["args"];
+        assert_eq!(
+            args["step"].as_str(),
+            Some(format!("\"{REPORTED_SLUG}\"").as_str())
+        );
+        let patched = report_patch(&Report {
+            summary: "s".into(),
+            spend_usd: Some(1.0),
+            tokens: Some(Tokens::Total(1)),
+            meter: None,
+        });
+        let requires = args["requires"]
+            .as_str()
+            .expect("requires")
+            .trim_matches('"');
+        assert!(
+            patched.get(requires).is_some(),
+            "the rule lands from `{requires}`, which --report writes: {patched}"
+        );
+    }
+
     /// Before the green, `reported` is pending: the report rides the
     /// packet and the finish is recorded; the step is left for the
     /// green to open. Nothing is written to a step that is not open.
@@ -6037,7 +6464,7 @@ mod wire_tests {
             tokens: Some(Tokens::Total(1000)),
         };
         report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -6075,7 +6502,7 @@ mod wire_tests {
         run["metadata"]["agent"] = json!("stranger@example.test");
         let (base, log) = report_stub(run).await;
         let err = report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -6134,7 +6561,7 @@ mod wire_tests {
         })
         .await;
         let err = report_at(
-            &reqwest::Client::new(),
+            &crate::gate::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -6302,7 +6729,7 @@ mod wire_tests {
 
         async fn take_next(base: &str) -> Result<Option<Dispatched>> {
             next_at(
-                &reqwest::Client::new(),
+                &crate::gate::machine_client().unwrap(),
                 base,
                 &repo(),
                 STATION,

@@ -24,7 +24,8 @@
 //!     `Value::List`.
 //!   - Identifiers: bareword — resolved against caller-supplied state
 //!     (typically a JSON-shaped event payload, or a synthesized
-//!     step-state bag for Workflow v2 predicates)
+//!     step-state bag for Workflow v2 predicates). A segment of digits
+//!     reads one element of a payload array: `metadata.args.0`.
 //!   - Function calls: name(arg, ...) — resolved against a helper-function
 //!     table the caller registers
 //!
@@ -715,14 +716,26 @@ fn resolve_identifier(path: &[String], payload: &serde_json::Value) -> Result<Va
     // 7b756357 each of these was an `UnknownIdentifier` that a step's
     // `ready_when` could not survive — the step held pending forever and
     // the dispatcher dead-lettered its side effect.
+    //
+    // A segment of ASCII digits steps INTO an array by position
+    // (`metadata.args.0`), because an ops-request's arguments are a
+    // positional array and a rule must be able to ask which organisation
+    // a GitHub request names (backlog bf8726c9). It is the reading a View
+    // filter already gets from its Postgres pushdown (`#>> '{args,0}'`).
+    // The array itself still resolves to `Absent`; past its end is
+    // `Absent` too.
     let mut cur = payload;
     for segment in path {
-        match cur {
-            serde_json::Value::Object(map) => match map.get(segment) {
-                Some(v) => cur = v,
-                None => return Ok(Value::Absent),
-            },
-            _ => return Ok(Value::Absent),
+        let next = match cur {
+            serde_json::Value::Object(map) => map.get(segment),
+            serde_json::Value::Array(items) if segment.bytes().all(|b| b.is_ascii_digit()) => {
+                segment.parse::<usize>().ok().and_then(|i| items.get(i))
+            }
+            _ => None,
+        };
+        match next {
+            Some(v) => cur = v,
+            None => return Ok(Value::Absent),
         }
     }
     Ok(json_to_value(cur).unwrap_or(Value::Absent))
@@ -1592,6 +1605,45 @@ mod tests {
         assert_eq!(
             eval(&parse("tags").unwrap(), &ctx(&payload)).unwrap(),
             Value::Absent
+        );
+    }
+
+    #[test]
+    fn a_numeric_segment_reads_one_element_of_a_payload_array() {
+        // An ops-request's arguments are a positional array, and the
+        // per-act GitHub mint must fire only for a request naming its
+        // organisation — `metadata.args.0 = "algedonic-dev"` (backlog
+        // bf8726c9). The array itself stays Absent (above); one element
+        // of it is a scalar like any other, the reading Postgres's
+        // `#>> '{args,0}'` already gives a View filter's pushdown.
+        let payload = json!({"metadata": {"args": ["algedonic-dev", "boss-dr", 7]}});
+        let c = ctx(&payload);
+        let is = |src: &str| eval(&parse(src).unwrap(), &c).unwrap();
+        assert_eq!(is("metadata.args.0"), Value::String("algedonic-dev".into()));
+        assert_eq!(is("metadata.args.2"), Value::Int(7));
+        assert_eq!(is("metadata.args.0 = \"algedonic-dev\""), Value::Bool(true));
+        assert_eq!(
+            is("metadata.args.1 = \"algedonic-dev\""),
+            Value::Bool(false)
+        );
+        // Past the end, not a number, or a sign: nothing, never an error.
+        assert_eq!(is("metadata.args.3"), Value::Absent);
+        assert_eq!(is("metadata.args.first"), Value::Absent);
+        assert_eq!(is("metadata.args.-1"), Value::Absent);
+        assert_eq!(
+            is("metadata.args.3 = \"algedonic-dev\""),
+            Value::Bool(false)
+        );
+        // An empty array, and a numeric key on an OBJECT, read as before.
+        let empty = json!({"metadata": {"args": [], "by": {"0": "zero"}}});
+        let c = ctx(&empty);
+        assert_eq!(
+            eval(&parse("metadata.args.0").unwrap(), &c).unwrap(),
+            Value::Absent
+        );
+        assert_eq!(
+            eval(&parse("metadata.by.0").unwrap(), &c).unwrap(),
+            Value::String("zero".into())
         );
     }
 }

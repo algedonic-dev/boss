@@ -65,6 +65,16 @@ pub async fn rebuild_commerce(pool: &PgPool) -> Result<RebuildReport, RebuildErr
     // now a projection of audit_log in its own right — see
     // boss_ledger::rebuild_bank_settlements, which runs after this step
     // in boss-rebuild-all.
+    //
+    // Only against a log that holds every committed write: a live
+    // invoice whose fact is still in event_outbox would be truncated
+    // and never replayed (design b046f510).
+    boss_events::outbox::lock_and_assert_log_complete(
+        &mut tx,
+        &["invoices", "invoice_line_items", "service_agreements"],
+    )
+    .await
+    .map_err(RebuildError::Storage)?;
     sqlx::query("TRUNCATE invoices, invoice_line_items, service_agreements CASCADE")
         .execute(&mut *tx)
         .await

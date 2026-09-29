@@ -175,7 +175,7 @@ pub async fn fetch_all(reader: &dyn ClosedSponsorships) -> Result<Vec<Value>, St
 /// The jobs API as the port: `GET /api/jobs?kind=…&status=closed`,
 /// signed as the gateway's own actor.
 pub struct JobsApi {
-    http: reqwest::Client,
+    http: boss_gateway::machine_client::MachineClient,
     base: String,
 }
 
@@ -188,10 +188,13 @@ impl JobsApi {
 
     pub fn new(base: String) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            // Stamped per request, redirects off (review of 6fbc7fc7,
+            // finding 1). A built client whose policy follows redirects
+            // would carry the estate token to the host a 302 names.
+            http: boss_gateway::machine_client::MachineClient::build(
+                reqwest::Client::builder().timeout(Duration::from_secs(10)),
+            )
+            .expect("reqwest client always builds"),
             base,
         }
     }
@@ -212,19 +215,10 @@ impl ClosedSponsorships for JobsApi {
             "{}/api/jobs?kind={KIND}&status=closed&full=true&limit={limit}&offset={offset}",
             self.base
         );
-        let mut rb = self.http.get(&url).header(
-            "x-boss-user",
-            serde_json::json!({
-                "id": "automation:gateway",
-                "role": "platform-admin",
-                "access_tier": "operator",
-            })
-            .to_string(),
-        );
-        if let Some(token) = boss_core::machine_token::current() {
-            rb = rb.header(boss_core::machine_token::HEADER, token);
-        }
-        let resp = rb
+        // The machine client stamps the token from the process's watched
+        // source — a lock, not a file read on the request path (review
+        // S5 of design 6805c764 car 2).
+        let resp = boss_gateway::passkey::sign_as_gateway(self.http.get(&url))
             .send()
             .await
             .map_err(|e| format!("jobs unreachable: {e}"))?;
@@ -454,6 +448,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         let root = boss_testing::scratch_dir("gateway-sponsors");
         boss_testing::create_dir(&root);
@@ -728,6 +724,8 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         let root = boss_testing::scratch_dir("gateway-sponsors-unwired");
         boss_testing::create_dir(&root);

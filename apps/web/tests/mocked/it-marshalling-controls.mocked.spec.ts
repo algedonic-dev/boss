@@ -15,8 +15,10 @@
 //
 // The inventory, measured on origin/main 507d2308 on 2026-09-25 and
 // re-read for car N3:
-//   links     3 kinds — one per row of the waits table, up to 12 (→ the
-//                        job detail surface); one per failed or unjudged
+//   links     4 kinds — one per row of the waits table, up to 12 (→ the
+//                        job detail surface); one per siding whose station
+//                        names a Workflow kind (→ that kind's Bottlenecks
+//                        drill-down, c7c5c1de); one per failed or unjudged
 //                        machine in the HUD frame (→ that machine's
 //                        region, selected on the map: /it?at=<region>);
 //                        the panel's close (→ /it)
@@ -50,9 +52,12 @@
 //   11 8dcd28ce  FIXED   — server (stations.rs readable_predicate: a
 //                         denied scope is a 403, train #600); the refusal
 //                         is the load's failure line here
-//   12 371aa184  open    — the failure lines are pinned HERE (that half is
-//                         this car's); the envelope's window_hours and
-//                         unsequenced window reads are still current
+//   12 371aa184  FIXED   — the failure lines are pinned HERE (the page
+//                         audit's car); the envelope's window_hours is
+//                         the window judged in, and a superseded window
+//                         read is dropped (2026-09-28). The fourth
+//                         rendering the item named, the flow line in the
+//                         region SVG, retired with the floor page (N3)
 
 import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
@@ -146,7 +151,10 @@ const LOAD = {
     { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, wip_limit: 24, over_limit: true, oldest_age_days: 6, capability_roles: ['platform-admin'], also_elsewhere: 213 },
     { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, wip_limit: null, over_limit: false, oldest_age_days: 5, capability_roles: ['platform-admin'], also_elsewhere: 213 },
     { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, wip_limit: null, over_limit: false, oldest_age_days: 2, capability_roles: ['platform-admin'], also_elsewhere: 0 },
-    { station: 'loading-dock', kind: 'batch', depth: 1, wip_limit: 24, over_limit: false, oldest_age_days: null, capability_roles: null, also_elsewhere: 0 },
+    // The one station here whose predicate names a Workflow kind — the
+    // live registry's shape, where the constraint queues span kinds and
+    // name none (c7c5c1de).
+    { station: 'loading-dock', kind: 'batch', workflow_kind: 'ship-a-change', depth: 1, wip_limit: 24, over_limit: false, oldest_age_days: null, capability_roles: null, also_elsewhere: 0 },
     { station: 'q.platform-admin.checklist', kind: 'constraint', depth: 0, wip_limit: null, over_limit: false, oldest_age_days: null, capability_roles: ['platform-admin'], also_elsewhere: 0 },
   ],
   total: 5,
@@ -352,7 +360,7 @@ test.describe('the marshalling station — the selection, and the words it says'
   test('CURRENT, gap 4 (f49f21b7): the dock\'s own station stands on the marshalling board', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
-    await expect(sidingRows(page).nth(3).locator('td').first()).toHaveText('loading-dock');
+    await expect(sidingRows(page).nth(3).locator('td').first().locator('.my-station')).toHaveText('loading-dock');
   });
 
   test('CURRENT, gap 7 (f9b75688): a claimed obligation reads exactly like a ready one — no WORKING split', async ({ page }) => {
@@ -364,14 +372,40 @@ test.describe('the marshalling station — the selection, and the words it says'
     await expect(board(page)).not.toContainText(/\bactive\b|\bclaimed\b|\bworking\b/i);
   });
 
-  test('CURRENT, gap 9 (fdc0ea0b): no station opens its queue — the only links on the board are the packets', async ({ page }) => {
+  test('CURRENT, gap 9 (fdc0ea0b): no station opens its queue — the links on the board are the packets and one kind’s drill-down', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
     const links = board(page).locator('a');
-    await expect(links).toHaveCount(3);
+    await expect(links).toHaveCount(4);
     const hrefs = await links.evaluateAll((as) => as.map((a) => a.getAttribute('href')));
-    expect(hrefs).toEqual([`/jobs/${WAIT_ACTIVE}`, `/jobs/${WAIT_FLOOR}`, `/jobs/${WAIT_READY}`]);
+    // The drill-down (c7c5c1de) opens the per-kind Bottlenecks view,
+    // not the station's queue, so gap 9 stands.
+    expect(hrefs).toEqual([
+      '/it/operate/bottlenecks?kind=ship-a-change',
+      `/jobs/${WAIT_ACTIVE}`,
+      `/jobs/${WAIT_FLOOR}`,
+      `/jobs/${WAIT_READY}`,
+    ]);
     await expect(board(page).locator('.my-constraint a, .my-blind a, .my-clear a')).toHaveCount(0);
+  });
+
+  test('a siding whose station holds one Workflow kind links to that kind’s Bottlenecks drill-down (c7c5c1de)', async ({ page }) => {
+    await install(page);
+    // The registry the drill-down opens against holds the dock's kind.
+    await page.route(/\/api\/workflows$/, (r) => json(r, [{ kind: 'ship-a-change', version: 1, status: 'active', steps: [] }]));
+    await mountPage(page, PATH, TITLE);
+    const dock = sidingRows(page).nth(3).locator('td').first();
+    const drill = dock.getByRole('link', { name: 'ship-a-change by step' });
+    await expect(drill).toHaveAttribute('href', '/it/operate/bottlenecks?kind=ship-a-change');
+    expect(parseRoute('/it/operate/bottlenecks', '?kind=ship-a-change')).toEqual({ kind: 'systemFleet' });
+    // The constraint queues span kinds: their row's `kind` is the
+    // STATION kind, and no link is made of it.
+    await expect(sidingRows(page).nth(0).locator('a')).toHaveCount(0);
+
+    await drill.click();
+    await expect(page).toHaveURL(/\/it\/operate\/bottlenecks\?kind=ship-a-change$/);
+    await expect(page.locator('h1').first()).toHaveText('Bottlenecks');
+    await expect(page.locator('.fleet-pick select')).toHaveValue('ship-a-change');
   });
 });
 
@@ -455,7 +489,12 @@ test.describe('the marshalling station — every control', () => {
     }
   });
 
-  test('CURRENT, gap 12 (371aa184): the envelope\'s own window_hours is parsed and ignored — a clamped answer is judged in the pressed hours', async ({ page }) => {
+  // Gap 12 (371aa184), FIXED: the board judges in the window the server
+  // COUNTED — the envelope's window_hours — and says so beside the
+  // buttons when that is not the window pressed. It used to parse the
+  // envelope's window and then judge in the pressed hours, so a clamped
+  // 72 h count read as "30 served in the last 168h".
+  test('gap 12 (371aa184): a clamped answer is judged in the window the envelope counted, and the board says it is not the one pressed', async ({ page }) => {
     await install(page, {
       flow: (r) => {
         const hours = Number(new URL(r.request().url()).searchParams.get('window_hours'));
@@ -464,14 +503,24 @@ test.describe('the marshalling station — every control', () => {
       },
     });
     await mountPage(page, PATH, TITLE);
-    await board(page).locator('.my-controls button', { hasText: '7 d' }).click();
+    // An unclamped answer says nothing about its window.
     await expect(board(page).locator('.my-asof')).toHaveText('read clamped');
+    await expect(board(page).locator('.my-window')).toHaveCount(0);
+    await board(page).locator('.my-controls button', { hasText: '7 d' }).click();
+    await expect(board(page).locator('.my-window')).toHaveText('counted over 72h, not the 168h pressed');
+    await expect(board(page).locator('.my-controls button', { hasText: '7 d' })).toHaveAttribute('aria-pressed', 'true');
     await expect(board(page).locator('.my-constraint-why')).toHaveText(
-      '6 waiting against 30 served in the last 168h: 34h to clear at the rate it is actually being worked, longer than any other counted queue.',
+      '6 waiting against 30 served in the last 72h: 14h to clear at the rate it is actually being worked, longer than any other counted queue.',
     );
+    await expect(sidingRows(page).nth(2).locator('td').nth(6)).toHaveText('14 h');
+    await expect(board(page)).not.toContainText('168h:');
   });
 
-  test('CURRENT, gap 12 (371aa184): window reads are not sequenced — a slow 24 h answer lands under a pressed 7 d', async ({ page }) => {
+  // Gap 12 (371aa184), FIXED: each refresh carries a generation, and an
+  // answer a later refresh superseded is dropped whole. It used to be
+  // assigned whenever it landed, so a slow 24 h read painted its count
+  // under a pressed 7 d, judged in the 7 d's hours.
+  test('gap 12 (371aa184): a slow 24 h answer that a 7 d click superseded is dropped, never painted under the pressed 7 d', async ({ page }) => {
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
     await install(page, {
@@ -485,12 +534,16 @@ test.describe('the marshalling station — every control', () => {
     await expect(board(page).locator('.my-quiet')).toHaveText('Reading the network…');
     await board(page).locator('.my-controls button', { hasText: '7 d' }).click();
     await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (168h)`);
+    const stale = page.waitForResponse((res) => /window_hours=24$/.test(res.url()));
     release();
-    // The 24 h answer, which the 7 d click superseded, lands last and wins.
-    await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (24h)`);
+    // The superseded answer has reached the page; give its handler the
+    // turn it would have painted on, then read what stands.
+    await (await stale).finished();
+    await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 250)));
+    await expect(board(page).locator('.my-asof')).toHaveText(`read ${AS_OF_24} (168h)`);
     await expect(board(page).locator('.my-controls button', { hasText: '7 d' })).toHaveAttribute('aria-pressed', 'true');
     await expect(board(page).locator('.my-constraint-why')).toHaveText(
-      '6 waiting against 5 served in the last 168h: 202h to clear at the rate it is actually being worked, longer than any other counted queue.',
+      '6 waiting against 30 served in the last 168h: 34h to clear at the rate it is actually being worked, longer than any other counted queue.',
     );
   });
 

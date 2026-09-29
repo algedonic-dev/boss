@@ -231,6 +231,14 @@ impl FromStr for ActorId {
 /// CHECK constraint spells the same thing in SQL.
 pub const REGISTERED_AGENT_PREFIX: &str = "agent-";
 
+/// The gateway's own service identity on the wire: the actor its
+/// server-side calls sign as (`boss_gateway::passkey::GATEWAY_ACTOR` is
+/// this constant). Spelled once (CLAUDE.md §9a) because two crates
+/// decide trust on it and neither may depend on the other: the gateway
+/// signs as it, and boss-people's passkey promote accepts no other
+/// caller (design 2cb6256f D5).
+pub const GATEWAY_ACTOR_ID: &str = "automation:gateway";
+
 impl Serialize for ActorId {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {

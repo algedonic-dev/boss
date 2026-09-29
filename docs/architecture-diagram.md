@@ -1,38 +1,19 @@
 # BOSS Architecture Diagrams
 
 Four views of the system, ordered from conceptual to concrete. Each
-diagram is authored as Mermaid source in `docs/architecture/*.mmd`
-and rendered to SVG + PNG alongside. Regenerate with:
+diagram exists once, as Mermaid source in `docs/architecture/*.mmd`.
+The in-app IT Knowledge Base (`/it/kb`) draws them in the browser from
+that source every time it opens, and any Mermaid renderer
+([mermaid.live](https://mermaid.live), `mmdc`) draws them from the
+same file. No rendered SVG or PNG is committed.
 
-```bash
-for f in 00-state-surfaces-work 01-primitives 02-service-map 03-deployment; do
-  npx -y -p @mermaid-js/mermaid-cli@latest mmdc \
-    -i docs/architecture/${f}.mmd \
-    -o docs/architecture/${f}.svg -b transparent \
-    -p docs/architecture/puppeteer-config.json
-  npx -y -p @mermaid-js/mermaid-cli@latest mmdc \
-    -i docs/architecture/${f}.mmd \
-    -o docs/architecture/${f}.png -b white \
-    -p docs/architecture/puppeteer-config.json -w 2400
-done
-```
-
-(The shared `puppeteer-config.json` is committed at
-`docs/architecture/puppeteer-config.json` and just passes
-`--no-sandbox` args. Puppeteer auto-discovers Chrome in its default
-cache; if your environment doesn't have one, it'll install on first
-run.)
-
-After regenerating, mirror the updated SVGs into the web app so the
-in-app `/system/kb` (IT Knowledge Base) view picks them up:
-
-```bash
-cp docs/architecture/{00-state-surfaces-work,01-primitives,02-service-map,03-deployment}.svg \
-   apps/web/src/it/kb-assets/
-```
-
-The next train's image build carries the updated diagrams to the
-browser (the SPA build runs inside `infra/oss-quickstart/Dockerfile`).
+Renders used to be committed here and copied into the web app, three
+files per diagram with nothing comparing them. Nobody's environment
+could regenerate them, so after a service was retired from the source
+every picture went on drawing it (backlog 4718d918). A picture made at
+view time has no copy to fall behind, and
+`apps/web/src/it/kbDiagrams.test.ts` fails if a render is committed
+again or a source is added that the page does not draw.
 
 ---
 
@@ -54,7 +35,7 @@ highest level it splits into three things:
   through the same claim door as humans (`boss dispatch`), and policy (row-level authorization as rows, not
   code).
 
-<img src="architecture/00-state-surfaces-work.svg" alt="state surfaces work" width="900">
+Diagram: [`architecture/00-state-surfaces-work.mmd`](architecture/00-state-surfaces-work.mmd) (drawn at `/it/kb`, §1).
 
 This is MVC stretched to company scale, with one important caveat:
 classic MVC's "Controller" is a thin router between Model and View.
@@ -78,7 +59,7 @@ instead of new code paths, puts hexagonal ports between domain and
 infrastructure, and emits every state change as an immutable fact onto
 a single event backbone.
 
-<img src="architecture/01-primitives.svg" alt="primitives" width="900">
+Diagram: [`architecture/01-primitives.mmd`](architecture/01-primitives.mmd) (drawn at `/it/kb`, §2).
 
 **Load-bearing choices:**
 
@@ -116,7 +97,7 @@ registry row as `<name> :<port>`, and `boss-ports`'s
 a row not drawn, or a node with no row, fails by name (backlog
 f1d84e3f).
 
-<img src="architecture/02-service-map.svg" alt="service map" width="1100">
+Diagram: [`architecture/02-service-map.mmd`](architecture/02-service-map.mmd) (drawn at `/it/kb`, §3).
 
 **How to read it:**
 
@@ -186,7 +167,7 @@ which runs cleanly today (0 violations across 27 core crates).
 the quickstart, `infra/oss-quickstart/` (backlog 34717528, decided
 2026-09-25).
 
-<img src="architecture/03-deployment.svg" alt="deployment" width="900">
+Diagram: [`architecture/03-deployment.mmd`](architecture/03-deployment.mmd) (drawn at `/it/kb`, §4).
 
 **Key facts:**
 
@@ -213,9 +194,9 @@ the quickstart, `infra/oss-quickstart/` (backlog 34717528, decided
 These diagrams are part of the repo. Update the `.mmd` source in the
 same commit as whatever architectural change triggered the update —
 if a new client crate lands, the service map should reflect it; if a
-new primitive or rail lands, the primitives diagram should too. SVG +
-PNG renders are committed alongside so GitHub / the web view show the
-latest picture without a build step.
+new primitive or rail lands, the primitives diagram should too. There
+is nothing to regenerate: the `.mmd` is the diagram, and `/it/kb`
+shows the edit on the next deploy.
 
 Stale architecture diagrams are worse than none — if this file drifts
 from reality, mark it so and open a TODO to resync.

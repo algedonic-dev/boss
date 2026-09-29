@@ -26,6 +26,7 @@ import type { InboundRow } from '../receiving/receiving';
 
 const siding = (over: Partial<Siding> & Pick<Siding, 'station' | 'depth'>): Siding => ({
   kind: 'batch',
+  workflowKind: null,
   wipLimit: null,
   overLimit: false,
   oldestAgeDays: null,

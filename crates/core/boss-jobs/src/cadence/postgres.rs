@@ -13,7 +13,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
 use super::port::{CadenceError, CadenceRegistry, CadenceRepository};
-use super::types::{CadenceRuleRow, CadenceRuleSpec, LastFiring, NewFiring};
+use super::types::{CadenceRuleRow, CadenceRuleSpec, FiringOutcome, LastFiring, NewFiring};
 use crate::registry::WorkflowStatus;
 
 pub struct PgCadence {
@@ -39,7 +39,7 @@ fn storage(e: sqlx::Error) -> CadenceError {
 /// the loop cannot read, and (since the bundle seed reads the same
 /// list) a column the equality pin cannot compare.
 const RULE_COLUMNS: &str = "name, verb, basis, every_minutes, at_times, min_dock_depth, \
-     cooldown_minutes, cadence, anchor_date, business_calendar, regate_hold_minutes";
+     cooldown_minutes, cadence, anchor_date, business_calendar";
 
 fn rule_of(row: &PgRow) -> Result<CadenceRuleRow, CadenceError> {
     Ok(CadenceRuleRow {
@@ -53,15 +53,21 @@ fn rule_of(row: &PgRow) -> Result<CadenceRuleRow, CadenceError> {
         cadence: row.try_get("cadence").map_err(storage)?,
         anchor_date: row.try_get("anchor_date").map_err(storage)?,
         business_calendar: row.try_get("business_calendar").map_err(storage)?,
-        regate_hold_minutes: row.try_get("regate_hold_minutes").map_err(storage)?,
     })
 }
 
 #[async_trait]
 impl CadenceRepository for PgCadence {
     async fn active_rules(&self) -> Result<Vec<CadenceRuleRow>, CadenceError> {
+        // "Name-ordered" is BYTE order (`COLLATE "C"`): the database's
+        // locale ignores `-` at first level, so `suite-ab` served before
+        // `suite-a-z` here and after it in memory — the defect the
+        // Workflow, credentials, station and department registries'
+        // suites found the same way (backlog be459ab9, found by the
+        // adapters-agree suite).
         let rows = sqlx::query(&format!(
-            "SELECT {RULE_COLUMNS} FROM cadence_rules WHERE status = 'active' ORDER BY name"
+            "SELECT {RULE_COLUMNS} FROM cadence_rules WHERE status = 'active' \
+             ORDER BY name COLLATE \"C\""
         ))
         .fetch_all(&self.pool)
         .await
@@ -75,8 +81,10 @@ impl CadenceRepository for PgCadence {
         // firing with no outcome yet has no `rc` key and reads as NULL —
         // which is the "still in flight" case evaluation must distinguish
         // from a failure.
+        // The board's decision rides in `detail` beside `rc` (backlog
+        // 96f02540), read back through the one reader of the key.
         let row = sqlx::query(
-            "SELECT firing_id, fired_at, (detail->>'rc')::int AS rc FROM cadence_firings \
+            "SELECT firing_id, fired_at, (detail->>'rc')::int AS rc, detail FROM cadence_firings \
              WHERE rule_name = $1 ORDER BY fired_at DESC LIMIT 1",
         )
         .bind(rule)
@@ -90,11 +98,21 @@ impl CadenceRepository for PgCadence {
                 firing_id: r.try_get("firing_id").map_err(storage)?,
                 fired_at: r.try_get("fired_at").map_err(storage)?,
                 rc: r.try_get("rc").map_err(storage)?,
+                board_decision: crate::board_decision::BoardDecision::of_detail(
+                    &r.try_get::<serde_json::Value, _>("detail")
+                        .map_err(storage)?,
+                ),
             })),
         }
     }
 
     async fn claim_firing(&self, new: &NewFiring) -> Result<bool, CadenceError> {
+        // A JSON-null detail was stored as jsonb `null`, and
+        // `record_outcome`'s `detail || $2` then built an ARRAY, so the rc
+        // read back as "no outcome yet" for ever (backlog be459ab9, found
+        // by the adapters-agree suite). `claim_detail` lands `{}` instead
+        // and refuses a non-object — the rule the double applies too.
+        let detail = super::types::claim_detail(&new.detail).map_err(CadenceError::BadRequest)?;
         let fired_at: DateTime<Utc> = new.fired_at;
         let res = sqlx::query(
             "INSERT INTO cadence_firings (firing_id, rule_name, verb, basis, fired_at, detail) \
@@ -106,7 +124,7 @@ impl CadenceRepository for PgCadence {
         .bind(&new.basis)
         // boss-clock time, bound by the caller — never the DB wallclock.
         .bind(fired_at)
-        .bind(&new.detail)
+        .bind(&detail)
         .execute(&self.pool)
         .await
         .map_err(storage)?;
@@ -117,12 +135,11 @@ impl CadenceRepository for PgCadence {
     async fn record_outcome(
         &self,
         firing_id: &str,
-        rc: i32,
-        runtime_secs: u64,
+        outcome: &FiringOutcome,
     ) -> Result<(), CadenceError> {
         sqlx::query("UPDATE cadence_firings SET detail = detail || $2 WHERE firing_id = $1")
             .bind(firing_id)
-            .bind(serde_json::json!({ "rc": rc, "runtime_secs": runtime_secs }))
+            .bind(outcome.detail_patch())
             .execute(&self.pool)
             .await
             .map_err(storage)?;
@@ -160,6 +177,10 @@ impl CadenceRegistry for PgCadence {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<CadenceRuleSpec, CadenceError> {
+        // The table's CHECKs, judged before the transaction so a row they
+        // refuse is the 400 it is over either adapter, naming the column,
+        // rather than a 500 naming a constraint (backlog be459ab9).
+        super::types::check_rule(&spec.row).map_err(CadenceError::BadRequest)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
 
         // The newest version the lineage holds, any status — the same
@@ -202,7 +223,7 @@ impl CadenceRegistry for PgCadence {
         let r = &spec.row;
         sqlx::query(&format!(
             "INSERT INTO cadence_rules (version, status, created_at, {RULE_COLUMNS}) \
-             VALUES ($1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
+             VALUES ($1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
         ))
         .bind(spec.version)
         .bind(spec.created_at)
@@ -216,7 +237,6 @@ impl CadenceRegistry for PgCadence {
         .bind(&r.cadence)
         .bind(r.anchor_date)
         .bind(&r.business_calendar)
-        .bind(r.regate_hold_minutes)
         .execute(&mut *tx)
         .await
         .map_err(storage)?;

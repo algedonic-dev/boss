@@ -76,10 +76,11 @@ impl<S: ServiceLabel> std::error::Error for HttpClientError<S> {}
 /// Build the canonical `(base_url, http)` pair a `Reqwest*Client`
 /// holds: the base URL with any trailing slash trimmed (so
 /// `format!("{base}/api/…")` never doubles the slash) plus a
-/// `reqwest::Client` carrying the shared [`CLIENT_TIMEOUT`].
+/// [`machine_token::Client`](crate::machine_token::Client) carrying the
+/// shared [`CLIENT_TIMEOUT`].
 ///
 /// ```ignore
-/// pub struct ReqwestFooClient { base_url: String, http: reqwest::Client }
+/// pub struct ReqwestFooClient { base_url: String, http: boss_core::machine_token::Client }
 /// impl ReqwestFooClient {
 ///     pub fn new(base_url: impl Into<String>) -> Self {
 ///         let (base_url, http) = boss_core::http_client::base(base_url);
@@ -87,18 +88,20 @@ impl<S: ServiceLabel> std::error::Error for HttpClientError<S> {}
 ///     }
 /// }
 /// ```
-pub fn base(base_url: impl Into<String>) -> (String, reqwest::Client) {
+pub fn base(base_url: impl Into<String>) -> (String, crate::machine_token::Client) {
     let base_url = base_url.into().trim_end_matches('/').to_string();
     // Every folded client carries the machine token when the process
-    // has one configured (machine_token.rs) — attaching here is what
+    // has one mounted (machine_token.rs) — building it here is what
     // makes "wire every writer" one definition instead of a checklist.
-    let mut headers = reqwest::header::HeaderMap::new();
-    crate::machine_token::attach(&mut headers);
-    let http = reqwest::Client::builder()
-        .timeout(CLIENT_TIMEOUT)
-        .default_headers(headers)
-        .build()
-        .expect("building reqwest client");
+    // Stamped per request from the process's watched source, not baked
+    // into default headers, so a rotation reaches a client built at
+    // boot (review S1 of design 6805c764 car 2, 2026-09-26).
+    // Redirects off too, as every machine client is: a 3xx comes back
+    // as a response rather than carrying the token to the host it
+    // names (review of 6fbc7fc7, 2026-09-28, finding 1).
+    let http =
+        crate::machine_token::Client::build(reqwest::Client::builder().timeout(CLIENT_TIMEOUT))
+            .expect("building reqwest client");
     (base_url, http)
 }
 
@@ -106,7 +109,10 @@ pub fn base(base_url: impl Into<String>) -> (String, reqwest::Client) {
 /// into `T`. Maps transport failures to `Unreachable`, non-2xx to
 /// `UnexpectedStatus`, and decode failures to `MalformedBody` — the
 /// exact ladder the folded adapters wrote by hand.
-pub async fn get_json<S, T>(http: &reqwest::Client, url: &str) -> Result<T, HttpClientError<S>>
+pub async fn get_json<S, T>(
+    http: &crate::machine_token::Client,
+    url: &str,
+) -> Result<T, HttpClientError<S>>
 where
     S: ServiceLabel,
     T: DeserializeOwned,
@@ -128,7 +134,10 @@ where
 /// `exists` field out of the JSON object. The hot-path validation
 /// primitive the registry clients (locations, subject-kinds, classes,
 /// people) all share.
-pub async fn get_exists<S>(http: &reqwest::Client, url: &str) -> Result<bool, HttpClientError<S>>
+pub async fn get_exists<S>(
+    http: &crate::machine_token::Client,
+    url: &str,
+) -> Result<bool, HttpClientError<S>>
 where
     S: ServiceLabel,
 {

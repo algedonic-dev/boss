@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 pub(super) struct Conductor {
     pub(super) cfg: Config,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
     forge: Box<dyn Forge>,
     /// Who the conductor's packets are filed to — the platform owner,
     /// read from the people registry through the port and cached for
@@ -39,24 +39,25 @@ pub(super) struct DockPass {
     pub(super) boardable: Vec<(Value, String)>,
     /// The left-behind record for every car held this pass.
     pub(super) left_behind: Vec<Value>,
-    /// The dock's re-gates in flight — what a departure may wait for
-    /// (`dock_regate::departure_hold`).
-    pub(super) round: Vec<dock_regate::InRound>,
     /// The ids of the cars the DOCK held this walk — a red or in-flight
     /// re-gate, a stale receipt, a missing branch; not a struck car, not
     /// a declared ordering edge — what a departure counts as left behind
     /// (backlog 2fccbfd6, `Conductor::count_left_behind`).
     pub(super) held: Vec<String>,
+    /// The head the dock JUDGED each boardable car at, by job id — the
+    /// sha assembly merges, so what rides is what was judged, not what
+    /// the branch name resolves to later (backlog b7b02024, review F4).
+    pub(super) judged: std::collections::HashMap<String, String>,
 }
 
-/// A car the dock holds this pass: why, the `base_regate` stamp to
-/// record when this pass launched or refused a re-gate, and the re-gate
-/// it has in flight, if it has one.
+/// A car the dock holds this pass: why, and the `base_regate` stamp to
+/// record when this pass launched or refused a re-gate. (It carried the
+/// re-gate in flight too, for the round a departure waited on; the board
+/// no longer waits on a re-gate — backlog 96f02540.)
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DockHold {
     pub(super) reason: String,
     pub(super) stamp: Option<Value>,
-    pub(super) in_round: Option<dock_regate::InRound>,
     /// The main the dock is waiting for a free gate bay to re-gate this
     /// car on — its claim ahead of every builder place (design 42279fb2
     /// D3, `gate::DOCK_WAITING`). `None` when it is not waiting for one.
@@ -69,28 +70,92 @@ impl DockHold {
         DockHold {
             reason,
             stamp: None,
-            in_round: None,
             waiting: None,
         }
     }
 }
 
+/// A gate launch that failed, and the gate-run it had already filed when
+/// it did (backlog 7919fdcc, item 11). `filed` is `None` when the failure
+/// came before the POST — nothing exists to reference — and names the
+/// run otherwise, which the launch has already settled `lost`, so a
+/// caller can stamp it rather than file a twin on its next pass.
+#[derive(Debug)]
+pub(super) struct GateLaunchFailed {
+    pub(super) filed: Option<String>,
+    pub(super) cause: anyhow::Error,
+}
+
+impl GateLaunchFailed {
+    fn unfiled(cause: anyhow::Error) -> Self {
+        GateLaunchFailed { filed: None, cause }
+    }
+}
+
+/// The cause verbatim, and the run it filed when it filed one. No
+/// `source()`: the cause's chain is already in this text, and anyhow would
+/// print it twice.
+impl std::fmt::Display for GateLaunchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.filed {
+            Some(run) => write!(
+                f,
+                "{:#} (gate-run {} was filed first, and is settled lost)",
+                self.cause,
+                id8(run)
+            ),
+            None => write!(f, "{:#}", self.cause),
+        }
+    }
+}
+
+impl std::error::Error for GateLaunchFailed {}
+
 /// PURE: the hold a red's retry launch leaves, given how many reds in a
 /// row the car had BEFORE the red being retried. The retry of a garaged
-/// car (`reds_before > 0`) claims no bay and joins no round (the
-/// re-review of car 5eb1967e, B): its red is likely its own, so it waits
-/// its turn like a builder's gate and no departure waits 15-30 minutes
-/// for it. A first red's retry keeps both — its red may well be main's,
-/// and the next train is better for carrying it.
+/// car (`reds_before > 0`) claims no bay (the re-review of car 5eb1967e,
+/// B): its red is likely its own, so it waits its turn like a builder's
+/// gate. A first red's retry keeps its claim — its red may well be
+/// main's.
 pub(super) fn retry_hold(hold: DockHold, reds_before: u32) -> DockHold {
     if reds_before == 0 {
         return hold;
     }
     DockHold {
-        in_round: None,
         waiting: None,
         ..hold
     }
+}
+
+/// The stamp to write for an EDGE-HELD car whose stamp carries a red its
+/// receipt has since answered — the receipt vouches for the head the forge
+/// carries for its branch (backlog 7919fdcc, item 9). `None` when there is
+/// nothing to clear, the receipt vouches for nothing there, or the head
+/// cannot be read — a red left a pass too long, never one cleared on a
+/// guess.
+fn edge_held_red_to_clear(car: &Value, clone: &str) -> Option<Value> {
+    // No red, no read: most edge-held cars cost nothing here.
+    dock_regate::cleared_stamp(car)?;
+    let branch = car
+        .pointer("/metadata/branch")
+        .and_then(Value::as_str)
+        .filter(|b| !b.is_empty())?;
+    let out = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("origin/{branch}"),
+    ])
+    .ok()
+    .filter(|o| o.status.success())?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if head.is_empty() || receipt_skip_reason(car, Some(&head)).is_some() {
+        return None;
+    }
+    dock_regate::cleared_stamp(car)
 }
 
 /// Does the car already carry every one of these metadata values? A hold
@@ -129,27 +194,23 @@ pub(crate) fn claims_to_withdraw(cars: &[Value], settled: &HashSet<String>) -> V
 /// verb is never silent about whether it did anything.
 fn refresh_line(pass: &DockPass) -> String {
     format!(
-        "refresh: {} car(s) boardable, {} held, {} re-gate(s) in flight — nothing assembled, \
-         nothing departed",
+        "refresh: {} car(s) boardable, {} held — nothing assembled, nothing departed",
         pass.boardable.len(),
         pass.left_behind.len(),
-        pass.round.len()
     )
 }
 
 impl Conductor {
     pub(super) fn new(cfg: Config, forge: Box<dyn Forge>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .default_headers({
-                // Machine token (7fcd78fa phase 1): rides as a default
-                // header so every jobs-API verb the conductor runs
-                // carries it once the operator configures one.
-                let mut h = reqwest::header::HeaderMap::new();
-                boss_core::machine_token::attach(&mut h);
-                h
-            })
-            .build()?;
+        // The machine token is stamped per request from the process's one
+        // watched source, so a conductor that outlives a rotation sends
+        // the new value without a restart; it was read once into default
+        // headers until car 2's CLI slice (design 6805c764, review S1).
+        // The machine client follows no redirect. The forge is reached
+        // through `forge`, on its own plain client — never this one.
+        let http = crate::gate::machine_client_with(
+            reqwest::Client::builder().timeout(Duration::from_secs(30)),
+        )?;
         // Built on the compiled fallback so the conductor can make the
         // very API call that resolves the real one; `with_policy`
         // replaces it before any decision is taken.
@@ -1076,6 +1137,9 @@ impl Conductor {
     async fn record_no_departure(&self, refusal: &NoDeparture) -> Result<()> {
         let line = no_departure_line(refusal);
         log(&line);
+        // The decision first, before anything here can fail: it is what
+        // the yard states in place of "nothing holds it" (96f02540).
+        record_board_decision(&BoardDecision::from(refusal));
         if !crate::train::boarding::refusal_persists(refusal) || self.cfg.dry {
             return Ok(());
         }
@@ -1338,6 +1402,86 @@ impl Conductor {
             .and_then(Value::as_str)
             .unwrap_or("(no branch)")
             .to_string();
+        let sha = metadata_map(&run)
+            .get("sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let verdict_step = find_step(&run, "record-verdict", "Record the gate verdict");
+        // WITHDRAWN, NOT LOST, WHEN A CAR ALREADY VOUCHES FOR THE HEAD
+        // (backlog b1c82a82; 8d7d0a2b gave the protocol the word). Gate-run
+        // 8c2f644a was queued for a head car 59e1f436 already carried
+        // green; its waiter died and this settle closed it `lost` — a
+        // dead runner on the record for a run nobody needed, while orient
+        // advised a re-gate the twin-car guard refuses. The question is
+        // the guard's own (`gate::vouching_car`), so the three readers
+        // cannot answer it differently, and nothing about the answer
+        // needs a human. A car list that cannot be read settles NOTHING
+        // this pass: "could not tell" is neither word.
+        let cars = match list_all_pages(|offset| async move {
+            self.api(
+                Method::GET,
+                &format!(
+                    "/api/jobs?kind=ship-a-change&status=open&full=true&limit={PAGE_LIMIT}&offset={offset}"
+                ),
+                None,
+            )
+            .await
+        })
+        .await
+        {
+            Ok(cars) => cars,
+            Err(e) => {
+                log(format!(
+                    "reconcile: gate-run {} ({branch}) is an orphan, but the open cars could not \
+                     be read to ask whether one already carries {sha} ({e:#}) — settled next pass",
+                    id8(rid)
+                ));
+                return Ok(());
+            }
+        };
+        let vouch = crate::gate::vouching_car(&branch, &sha, &cars);
+        if vouch.is_some() && !crate::gate::admits_withdrawn(&run) {
+            log(format!(
+                "reconcile: gate-run {} ({branch}) is already carried by a car, but its \
+                 protocol version cannot say `withdrawn` — settling as lost",
+                id8(rid)
+            ));
+        }
+        if let Some(vouch) = vouch.filter(|_| crate::gate::admits_withdrawn(&run)) {
+            let because = crate::gate::vouched_reason(&vouch);
+            log(format!(
+                "reconcile: gate-run {} ({branch}) has no gate Job in {ns} and nothing has held \
+                 it for {} min — WITHDRAWN: {because}",
+                id8(rid),
+                orphan.idle_minutes,
+            ));
+            let receipt = crate::gate::withdrawal_receipt(&because, Some(&vouch));
+            match self
+                .complete_step(
+                    &run,
+                    verdict_step,
+                    &[
+                        ("verdict", Some(crate::gate::WITHDRAWN_VERDICT.to_string())),
+                        ("receipt", Some(receipt.to_string())),
+                    ],
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                // A packet admitted under gate-run v2 materialized the
+                // four-word verdict enum, so it cannot say `withdrawn` and
+                // the completion is refused. Settle it as this pass always
+                // did — `lost`, below, whose write replaces the merged
+                // verdict — rather than leave the orphan to the three-hour
+                // clock.
+                Err(e) => log(format!(
+                    "reconcile: gate-run {} could not record `withdrawn` ({e:#}) — its \
+                     protocol version predates the word; settling as lost",
+                    id8(rid)
+                )),
+            }
+        }
         log(format!(
             "reconcile: gate-run {} ({branch}) has no gate Job in {ns} and nothing has held it \
              for {} min (last: {} {}) — settling as lost",
@@ -1346,7 +1490,6 @@ impl Conductor {
             orphan.last_alive_key,
             orphan.last_alive,
         ));
-        let verdict_step = find_step(&run, "record-verdict", "Record the gate verdict");
         self.complete_step(
             &run,
             verdict_step,
@@ -1756,6 +1899,60 @@ impl Conductor {
     ///
     /// BEST-EFFORT and silent-proof: every refusal logs a line naming
     /// the car and why, and nothing here can abort the cancel.
+    /// Stamp `regate_owed` on each car aboard red train `tid` that the
+    /// failure reaches (`dock_regate::owed_by`) — the dock's one remaining
+    /// re-gate trigger (backlog 96f02540). `failing` is the red's located
+    /// files; empty means it named none, and then every car is owed one,
+    /// which was the dock's behaviour for every car on every landing.
+    ///
+    /// INFALLIBLE BY SIGNATURE, for `hold_named_cars`'s reason: this is on
+    /// the auto-cancel path, and a marker that cannot be written costs one
+    /// re-gate, never the cancel.
+    async fn mark_regates_owed(&self, t: &Value, tid: &str, failing: &[String]) {
+        let cars = self.boarded_cars(t).await;
+        let now = Utc::now();
+        for car in releasable_cars(&cars, tid) {
+            let Some(cid) = car.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let files = boarded_head(car)
+                .map(|head| self.car_changed_files(head))
+                .unwrap_or_default();
+            let Some(reached) = dock_regate::owed_by(&files, failing) else {
+                log(format!(
+                    "car {}: the red is in {} — none of its files, so no re-gate is owed",
+                    id8(cid),
+                    failing.join(", ")
+                ));
+                continue;
+            };
+            let stamp = dock_regate::owed_stamp(tid, failing, &reached, now);
+            if self.cfg.dry {
+                log(format!("DRY: would owe car {} a re-gate", id8(cid)));
+                continue;
+            }
+            match self
+                .merge_job_metadata(cid, vec![(dock_regate::REGATE_OWED, stamp)])
+                .await
+            {
+                Ok(()) => log(format!(
+                    "car {}: owed a re-gate by red train {} ({})",
+                    id8(cid),
+                    id8(tid),
+                    if failing.is_empty() {
+                        "the red named no path".to_string()
+                    } else {
+                        format!("its files meet {}", reached.join(", "))
+                    }
+                )),
+                Err(e) => log(format!(
+                    "car {}: its re-gate could not be owed (non-fatal; it boards as gated): {e}",
+                    id8(cid)
+                )),
+            }
+        }
+    }
+
     async fn hold_named_cars(
         &self,
         t: &Value,
@@ -1913,6 +2110,10 @@ impl Conductor {
             crate::train_gate::packet_marks(tid, title),
         )
         .await
+        // The train counts its failed launches and names the cause
+        // (48f7aba1); a run filed before the failure is settled lost by
+        // the launch itself, and its id rides in this error's text.
+        .map_err(anyhow::Error::from)
     }
 
     /// File a gate-run for `branch@sha`, stamp `marks` on it, and create
@@ -1925,79 +2126,186 @@ impl Conductor {
         sha: &str,
         who: crate::gate::Requester,
         marks: Value,
-    ) -> Result<String> {
-        let manifest_text =
-            std::fs::read_to_string(&self.cfg.gate_manifest).with_context(|| {
-                format!(
-                    "reading the gate runner manifest {} ({}=…)",
-                    self.cfg.gate_manifest,
-                    crate::train_gate::MANIFEST_ENV
-                )
-            })?;
-        let ns = self.cfg.gate_namespace.as_str();
-        let max = crate::gate::max_concurrent(&self.http).await?;
-        let live = crate::gate::running_gates(ns)?;
-        // The train is admitted AT the bound (48f7aba1), a car's re-gate
-        // below it: the one predicate `boss gate` also consults.
-        if !crate::gate::admits(live.len(), max, who) {
-            bail!(
-                "the cluster is at its gate bound ({} running of {max}: {})",
-                live.len(),
-                live.join(", ")
-            );
+    ) -> std::result::Result<String, GateLaunchFailed> {
+        let admitted: Result<String> = async {
+            let manifest_text =
+                std::fs::read_to_string(&self.cfg.gate_manifest).with_context(|| {
+                    format!(
+                        "reading the gate runner manifest {} ({}=…)",
+                        self.cfg.gate_manifest,
+                        crate::train_gate::MANIFEST_ENV
+                    )
+                })?;
+            let ns = self.cfg.gate_namespace.as_str();
+            let max = crate::gate::max_concurrent(&self.http).await?;
+            let live = crate::gate::running_gates(ns)?;
+            // The train is admitted AT the bound (48f7aba1), a car's re-gate
+            // below it: the one predicate `boss gate` also consults.
+            if !crate::gate::admits(live.len(), max, who) {
+                bail!(
+                    "the cluster is at its gate bound ({} running of {max}: {})",
+                    live.len(),
+                    live.join(", ")
+                );
+            }
+            Ok(manifest_text)
         }
-        let owner = self.owner_for_filing().await;
-        let created = self
-            .api(
-                Method::POST,
-                "/api/jobs",
-                Some(crate::gate::gate_run_body(
+        .await;
+        let manifest_text = admitted.map_err(GateLaunchFailed::unfiled)?;
+        let ns = self.cfg.gate_namespace.clone();
+        let start = |run_id: &str| -> Result<()> {
+            let job = crate::gate::render_job(&manifest_text, branch, run_id, "--auto")?;
+            let mut child = crate::gate::kubectl(&ns)
+                .args(["create", "-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .context("spawning kubectl create — is kubectl in the conductor's image?")?;
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .context("kubectl stdin")?
+                    .write_all(job.as_bytes())?;
+            }
+            let out = child.wait_with_output()?;
+            if !out.status.success() {
+                bail!(
+                    "kubectl create failed for the gate of {}: {}",
                     branch,
-                    sha,
-                    &self.cfg.gate_manifest,
-                    None,
-                    &owner,
-                )),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        };
+        self.file_and_start_gate(branch, sha, marks, &start).await
+    }
+
+    /// The half of a launch that FILES something: POST the gate-run, stamp
+    /// `marks` on it, and `start` its Job (`kubectl create` in production;
+    /// a parameter so the failure below is driven by a test).
+    ///
+    /// A GATE-RUN FILED IS A GATE-RUN ANSWERED (backlog 7919fdcc, item 11).
+    /// Until 2026-09-28 a failure AFTER the POST — the marks refused, the
+    /// manifest unrenderable, `kubectl create` refused — returned a bare
+    /// error, so the caller never learned the packet existed: the dock
+    /// stamped `gate_run ''` and its next pass, two minutes later, filed
+    /// another, open and unreferenced, every pass until the fault cleared
+    /// (the orphan reaper closed each only after its own window). Now the
+    /// run is settled `lost` here, with the cause as its receipt, and the
+    /// error NAMES it (`GateLaunchFailed::filed`), so the dock can stamp it
+    /// and let the red rule bound the retry instead of the two-minute
+    /// cadence. A settle that cannot be written is journalled: the run is
+    /// then one the orphan reaper closes, as before.
+    async fn file_and_start_gate(
+        &self,
+        branch: &str,
+        sha: &str,
+        marks: Value,
+        start: &(dyn Fn(&str) -> Result<()> + Sync),
+    ) -> std::result::Result<String, GateLaunchFailed> {
+        let owner = self.owner_for_filing().await;
+        let filed: Result<String> = async {
+            let created = self
+                .api(
+                    Method::POST,
+                    "/api/jobs",
+                    Some(crate::gate::gate_run_body(
+                        branch,
+                        sha,
+                        &self.cfg.gate_manifest,
+                        None,
+                        &owner,
+                    )),
+                )
+                .await?;
+            Ok(created
+                .as_ref()
+                .and_then(|c| c.get("data").unwrap_or(c).get("id"))
+                .and_then(Value::as_str)
+                .with_context(|| format!("the jobs API returned no id for {branch}'s gate-run"))?
+                .to_string())
+        }
+        .await;
+        let run_id = filed.map_err(GateLaunchFailed::unfiled)?;
+        let started: Result<()> = async {
+            self.api(
+                Method::PATCH,
+                &format!("/api/jobs/{run_id}/metadata"),
+                Some(marks),
             )
-            .await?;
-        let run_id = created
-            .as_ref()
-            .and_then(|c| c.get("data").unwrap_or(c).get("id"))
-            .and_then(Value::as_str)
-            .with_context(|| format!("the jobs API returned no id for {branch}'s gate-run"))?
-            .to_string();
-        self.api(
-            Method::PATCH,
-            &format!("/api/jobs/{run_id}/metadata"),
-            Some(marks),
-        )
-        .await
-        .with_context(|| format!("marking gate-run {} for {branch}", id8(&run_id)))?;
-        let job = crate::gate::render_job(&manifest_text, branch, &run_id, "--auto")?;
-        let mut child = crate::gate::kubectl(ns)
-            .args(["create", "-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("spawning kubectl create — is kubectl in the conductor's image?")?;
-        {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .context("kubectl stdin")?
-                .write_all(job.as_bytes())?;
+            .await
+            .with_context(|| format!("marking gate-run {} for {branch}", id8(&run_id)))?;
+            start(&run_id)
         }
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "kubectl create failed for the gate of {}: {}",
-                branch,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        .await;
+        match started {
+            Ok(()) => {
+                // The run's Job exists: stamp it launched, as `boss gate`
+                // does (backlog 4d088a7e), so every run carries the one
+                // reading the yard dates a bay from. Never fatal — the
+                // Job is running either way, and a run without it is
+                // read from its filing, which for this path (filed and
+                // started in one act, never queued) is seconds apart.
+                if let Err(e) = self
+                    .api(
+                        Method::PATCH,
+                        &format!("/api/jobs/{run_id}/metadata"),
+                        Some(crate::gate::launched_patch(Utc::now())),
+                    )
+                    .await
+                {
+                    log(format!(
+                        "gate-run {} for {branch}: could not stamp {} ({e:#}) — it is running",
+                        id8(&run_id),
+                        crate::gate::LAUNCHED_AT
+                    ));
+                }
+                Ok(run_id)
+            }
+            Err(cause) => {
+                self.settle_unstarted_gate_run(&run_id, branch, &cause)
+                    .await;
+                Err(GateLaunchFailed {
+                    filed: Some(run_id),
+                    cause,
+                })
+            }
         }
-        Ok(run_id)
+    }
+
+    /// Settle a gate-run this conductor filed and could not start: `lost`,
+    /// the cause as its receipt (`unstarted_receipt`). NEVER FATAL — the
+    /// launch has already failed, and a settle that cannot be written
+    /// leaves the run to the orphan reaper, which is said here once.
+    async fn settle_unstarted_gate_run(&self, run_id: &str, branch: &str, cause: &anyhow::Error) {
+        let settled: Result<()> = async {
+            let run = self.get_job(run_id).await?;
+            let verdict_step = find_step(&run, "record-verdict", "Record the gate verdict");
+            self.complete_step(
+                &run,
+                verdict_step,
+                &[
+                    ("verdict", Some("lost".to_string())),
+                    ("receipt", Some(unstarted_receipt(branch, cause))),
+                ],
+            )
+            .await
+        }
+        .await;
+        match settled {
+            Ok(()) => log(format!(
+                "gate-run {} for {branch} was filed but never started ({cause:#}) — settled lost",
+                id8(run_id)
+            )),
+            Err(e) => log(format!(
+                "gate-run {} for {branch} was filed but never started ({cause:#}), and could not \
+                 be settled ({e:#}) — the orphan reaper closes it",
+                id8(run_id)
+            )),
+        }
     }
 
     pub(super) async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {
@@ -2373,6 +2681,23 @@ impl Conductor {
                     )
                     .await;
                 }
+                // THE ONE RE-GATE LEFT (backlog 96f02540): a red that
+                // judged the cars owes a re-gate to the cars it released
+                // whose files intersect the failure — or, when the red
+                // names no path, to every car it released. Before the
+                // release, like the hold above, and best-effort like it.
+                if strike && !outside_release {
+                    self.mark_regates_owed(
+                        &t,
+                        &tid,
+                        &verdict_located_files(
+                            &gate_fails,
+                            &gate_excerpt,
+                            info.get("statusCheckRollup"),
+                        ),
+                    )
+                    .await;
+                }
                 if self.cfg.dry {
                     log(format!("DRY: would cancel {} ({reason})", id8(&tid)));
                 } else {
@@ -2716,26 +3041,119 @@ impl Conductor {
             if self.cfg.dry {
                 continue;
             }
-            let job = self
-                .api(Method::GET, &format!("/api/jobs/{id}"), None)
+            self.close_alarm_stale(&id, "stranded-green", stranded_clear_writes(&branch, &why))
                 .await?;
-            let Some(job) = job else { continue };
-            let Some(step) = find_step(&job, "triage", "Measure the claim, choose a route") else {
-                // A packet with no triage step cannot close itself. Say
-                // so once rather than silently leaving a false alarm.
+        }
+        // THE LEFT-BEHIND ALARM CLOSES ITSELF TOO (backlog 7919fdcc, item
+        // 6), off the two reads this pass has already made: every open
+        // backlog-item and every car.
+        self.clear_left_behind_alarms(&open_alarms, &cars).await;
+        Ok(())
+    }
+
+    /// Close each open left-behind alarm whose car's streak has ended
+    /// (`left_behind_alarms_to_clear`) on its `stale` terminal. NEVER
+    /// FATAL: the stranded half of this pass has already run, and an
+    /// alarm that could not be closed is closed by the next pass, which
+    /// finds the same car in the same state.
+    async fn clear_left_behind_alarms(&self, open_alarms: &[Value], cars: &[Value]) {
+        for (id, branch, why) in left_behind_alarms_to_clear(open_alarms, cars) {
+            log(format!(
+                "reconcile: left-behind alarm {} for {branch} no longer holds ({why}); closing it",
+                id8(&id)
+            ));
+            if self.cfg.dry {
+                continue;
+            }
+            if let Err(e) = self
+                .close_alarm_stale(&id, "left-behind", left_behind_clear_writes(&branch, &why))
+                .await
+            {
                 log(format!(
-                    "reconcile: stranded-green alarm {} has no triage step; left open",
+                    "reconcile: left-behind alarm {} could not be closed ({e:#}) — the next \
+                     pass tries again",
                     id8(&id)
                 ));
-                continue;
-            };
-            let Some(step_id) = step.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            for (method, path, body) in
-                step_completion_writes(&id, step_id, stranded_clear_writes(&branch, &why))
-            {
-                self.api(method, &path, Some(body)).await?;
+            }
+        }
+    }
+
+    /// Close an alarm backlog-item the conductor filed, with `writes`
+    /// (its `stale` disposition, evidence and `cleared_by`), at the step
+    /// the packet is WAITING ON — the one close both self-clearing alarms
+    /// use.
+    ///
+    /// NOT ALWAYS `triage` (backlog e61093a1). This completed the triage
+    /// step only, so once a person had routed an alarm to `build` the
+    /// merge door refused the write 409 as a write to a terminal step:
+    /// measured 2026-09-28 07:10Z on LEFT BEHIND alarms 11ea6b8b and
+    /// 80b961bf, each urgent and unclosable, every pass. Where it closes
+    /// now is the dispatcher's own judgement,
+    /// [`boss_dispatcher_handlers::handlers::common::retraction`], which
+    /// cured the same defect in the sensor and estate closers (a2d8bad3):
+    /// an open `triage` (what `boss triage <id> stale` does), else a
+    /// READY `measure`/`build` completed `stale` — both reach the row's
+    /// `stale` terminal — else the packet is told once, in metadata,
+    /// that its claim ended: an ACTIVE step belongs to its executor, and
+    /// completing a dispatched run's step would land the run as delivered.
+    async fn close_alarm_stale(
+        &self,
+        id: &str,
+        what: &str,
+        writes: Map<String, Value>,
+    ) -> Result<()> {
+        use boss_dispatcher_handlers::handlers::common::{
+            RECOVERED_AT, Retraction, recovery_note, retraction,
+        };
+        let Some(job) = self
+            .api(Method::GET, &format!("/api/jobs/{id}"), None)
+            .await?
+        else {
+            return Ok(());
+        };
+        match retraction(&job) {
+            None => {
+                // A packet with no triage step cannot close itself. Say
+                // so rather than silently leaving a false alarm.
+                log(format!(
+                    "reconcile: {what} alarm {} has no triage step; left open",
+                    id8(id)
+                ));
+            }
+            Some(Retraction::Complete { slug, step_id }) => {
+                for (method, path, body) in step_completion_writes(id, &step_id, writes) {
+                    self.api(method, &path, Some(body)).await?;
+                }
+                log(format!(
+                    "reconcile: {what} alarm {} closed stale at `{slug}`",
+                    id8(id)
+                ));
+            }
+            // Told once: a packet already carrying the note is not
+            // rewritten every pass.
+            Some(Retraction::Annotate { .. })
+                if job
+                    .pointer(&format!("/metadata/{RECOVERED_AT}"))
+                    .is_some_and(|v| !v.is_null()) => {}
+            Some(Retraction::Annotate { why_open }) => {
+                let text = |k: &str| writes.get(k).and_then(Value::as_str).unwrap_or_default();
+                let note = recovery_note(
+                    text("evidence"),
+                    text("cleared_by"),
+                    &Utc::now().to_rfc3339(),
+                    &why_open,
+                );
+                self.api(
+                    Method::PATCH,
+                    &format!("/api/jobs/{id}/metadata"),
+                    Some(Value::Object(note)),
+                )
+                .await?;
+                log(format!(
+                    "reconcile: {what} alarm {} has ended but stays open ({why_open}); told \
+                     the packet",
+                    id8(id)
+                ));
             }
         }
         Ok(())
@@ -2883,7 +3301,10 @@ impl Conductor {
                     co.push((other.clone(), files));
                 }
             }
-            let fresh = dp::preview_payload(&vs_main[i], &co, &main_sha, &set, &stamp);
+            // `pairs` was pushed in step with `cars.retain`, so index i
+            // is this car's measured head.
+            let head = pairs.get(i).map(|(_, h)| h.as_str()).unwrap_or_default();
+            let fresh = dp::preview_payload(&vs_main[i], &co, &main_sha, head, &set, &stamp);
             let stored = job.pointer("/metadata/merge_preview");
             if dp::changed(stored, &fresh) && !self.cfg.dry {
                 self.merge_job_metadata(jid, vec![("merge_preview", fresh)])
@@ -3373,8 +3794,8 @@ impl Conductor {
     async fn candidates(&self) -> Result<DockPass> {
         let mut out = Vec::new();
         let mut left_behind = Vec::new();
-        let mut round = Vec::new();
         let mut held = Vec::new();
+        let mut judged = std::collections::HashMap::new();
         // EVERY open car, not just page one. A car opened days ago but
         // parked today sorts to the tail (`ORDER BY opened_on DESC`), so
         // a bare `limit=` boards nothing from the tail once the backlog
@@ -3435,6 +3856,21 @@ impl Conductor {
                 let kv = vec![("skip_reason", json!(hold.reason))];
                 if !self.cfg.dry && !metadata_already(&j, &kv) {
                     self.merge_job_metadata(&jid, kv).await?;
+                }
+                // A RED THE RECEIPT HAS ANSWERED COMES OFF HERE TOO (backlog
+                // 7919fdcc, item 9). The clear below sits past this
+                // `continue`, so an edge-held car whose builder repaired
+                // and re-gated it kept the old red — drawn "not boardable"
+                // by the yard and orient — until its predecessor released
+                // it. Judged against the FORGE's head, not the fork's: this
+                // path publishes nothing, the forge is where both the
+                // builder's repair and the dock's replay are pushed, and a
+                // receipt vouches only for a sha that went green, which a
+                // red replay never did.
+                if !self.cfg.dry
+                    && let Some(stamp) = edge_held_red_to_clear(&j, &self.cfg.clone)
+                {
+                    self.clear_red(&jid, stamp).await;
                 }
                 continue;
             }
@@ -3537,6 +3973,17 @@ impl Conductor {
             // just published is judged on what actually landed there
             // rather than on what was offered.
             let boards = fork_head(&self.cfg.clone, &branch)?;
+            // THE REVIEW HOLD, RE-JUDGED HERE (backlog b7b02024 car 1).
+            // Every road onto the dock ends at this walk, including the
+            // four that skip the CLI's judge; the diff of the head that
+            // will ride is judged before the receipt check can spend a
+            // bay re-gating a car that waits on a person. Not counted
+            // into `held`: like a struck car, it waits on a review, not
+            // on the dock.
+            if let Some(reason) = self.review_hold(&j, &jid, boards.as_deref()).await {
+                left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
+                continue;
+            }
             // THE DOCK'S RE-GATE (backlog 969a1092) owns two of the holds
             // below: a receipt the DOCK outran — it replayed the branch
             // onto main, and the re-gate's green has not refreshed the
@@ -3567,7 +4014,6 @@ impl Conductor {
             if let Some(DockHold {
                 reason,
                 stamp,
-                in_round,
                 waiting,
             }) = hold
             {
@@ -3575,17 +4021,25 @@ impl Conductor {
                 // A GARAGED car is marked on the record: the dock stops
                 // re-gating it at this head, so a window of nothing else
                 // needs a person (`empty_dock_refusal`, review M2).
-                let garaged = dock_regate::hold_garaged(stamp.as_ref(), &j);
+                // Read off what THIS pass writes: its stamp, or the stamp its
+                // red is cleared to — never the pre-clear snapshot (L1 of the
+                // round-3 review of car 5eb1967e, backlog f8383a38).
+                let garaged = dock_regate::hold_garaged(stamp.as_ref(), cleared.as_ref(), &j);
                 left_behind.push(json!({
                     "car_id_short": id8(&jid),
                     "reason": reason.as_str(),
                     GARAGED: garaged,
                 }));
                 held.push(jid.clone());
-                round.extend(in_round);
                 settled.insert(jid.clone());
                 if !self.cfg.dry {
                     let mut kv = vec![("skip_reason", json!(reason))];
+                    // A re-gate a red train owed this car is paid the pass
+                    // a gate is FILED for it (backlog 96f02540): one
+                    // re-gate per red, never one per landing after it.
+                    if let Some(w) = stamp.as_ref().and_then(|s| dock_regate::owed_paid(&j, s)) {
+                        kv.push((dock_regate::REGATE_OWED, w));
+                    }
                     match (stamp, cleared) {
                         (Some(stamp), _) => kv.push((dock_regate::BASE_REGATE, stamp)),
                         (None, Some(stamp)) => self.clear_red(&jid, stamp).await,
@@ -3625,6 +4079,25 @@ impl Conductor {
             {
                 self.clear_red(&jid, stamp).await;
             }
+            // Boardable, so no re-gate is owed it any more: the red train
+            // that owed one found it current, untouched, or re-gated green.
+            // Best-effort, like `clear_red`: a marker left a pass too long
+            // re-asks the base of one car, never refuses the cars behind it.
+            if dock_regate::owes_regate(&j)
+                && !self.cfg.dry
+                && let Err(e) = self
+                    .merge_job_metadata(&jid, vec![(dock_regate::REGATE_OWED, Value::Null)])
+                    .await
+            {
+                log(format!(
+                    "{}: boardable, but its owed re-gate marker could not be cleared ({e:#}) — \
+                     the next pass tries again",
+                    id8(&jid)
+                ));
+            }
+            if let Some(h) = boards.clone() {
+                judged.insert(jid.clone(), h);
+            }
             out.push((j, branch));
         }
         // Every car this walk held for anything but a bay — two strikes,
@@ -3636,9 +4109,185 @@ impl Conductor {
         Ok(DockPass {
             boardable: out,
             left_behind,
-            round,
             held,
+            judged,
         })
+    }
+
+    /// Does the car's own diff, at the head the fork carries, wait for
+    /// its adversarial review? `None` = board it; `Some` = the reason it
+    /// stays off this train, which is also the left-behind entry.
+    ///
+    /// THE ONE ROAD EVERY CAR TRAVELS (backlog b7b02024 finding 8,
+    /// design 7cedfa29 D1). `mutating_verb::judge` ran only at the CLI's
+    /// doors, so a car parked by an older binary, a hand-PATCHed park
+    /// intent, the dock's own re-gate or the dispatcher's rerail-a-car
+    /// rule boarded unheld: `parked_ready` reads only the marker. It is
+    /// judged HERE, in the collector that holds the clone, and not in
+    /// `parked_ready`, which stays a pure predicate because the cadence
+    /// loop shares it for dock depth.
+    ///
+    /// HELD, NOT SKIPPED. The hold is written on the review step —
+    /// the marker the yard, orient, the loading-dock row and the cadence
+    /// count all read — with the head it judged beside it (`hold_sha`).
+    ///
+    /// A RELEASE IS A VERDICT AT A HEAD (design 7cedfa29 D6). A car that
+    /// records a release boards only when that release is at the head the
+    /// fork carries AND the review run it names vouches for the car
+    /// there — read in one GET, by `review_verdict::vouches`, the same
+    /// check `boss release --review` made. A release at another head, or
+    /// a review hold cleared without one, is held again. None of it asks
+    /// who wrote a key; the shared token makes actor ids forgeable.
+    ///
+    /// FAILS CLOSED, NEVER FATAL. An unreadable diff is a hold. A review
+    /// run that cannot be READ keeps the car off this train without a
+    /// hold — a blip is not a finding, and a hold would cost the release
+    /// that was valid. A hold that cannot be written still keeps the car
+    /// off THIS train — the write is the record, the `Some` is the brake
+    /// — and the failure rides in the reason, so it reaches the train's
+    /// books; the next pass judges and writes again. Nothing here returns
+    /// an error to the walk (CLAUDE.md: a fallible write in reconcile
+    /// froze ALL landings).
+    async fn review_hold(&self, car: &Value, jid: &str, head: Option<&str>) -> Option<String> {
+        use crate::mutating_verb::Dock;
+        let head = head.unwrap_or_default();
+        let clone = Path::new(&self.cfg.clone);
+        let dock = crate::mutating_verb::dock(
+            car,
+            head,
+            || crate::mutating_verb::judge_on_main(clone, "origin/main", head),
+            |from, to| crate::mutating_verb::same_change(clone, "origin/main", from, to),
+        );
+        let (reason, bind) = match dock {
+            Dock::Board => return None,
+            Dock::Hold { reason, bind } => (reason, bind),
+            Dock::Check {
+                review,
+                reviewed,
+                carry,
+            } => {
+                let named = |why: String| {
+                    format!(
+                        "conductor re-judge at {}: its release names review run {}, which does \
+                         not vouch for this head ({why}); boss review, then boss release --review",
+                        &head[..12.min(head.len())],
+                        id8(&review)
+                    )
+                };
+                match self
+                    .api(Method::GET, &format!("/api/jobs/{review}"), None)
+                    .await
+                {
+                    Ok(Some(run)) => match crate::review_verdict::vouches(&run, car, &reviewed) {
+                        Ok(()) => {
+                            if let Some(patch_id) = carry {
+                                self.carry_release(car, jid, head, &patch_id).await;
+                            }
+                            return None;
+                        }
+                        Err(why) => (named(why), true),
+                    },
+                    Ok(None) => (
+                        named("the system of record serves nothing for it".into()),
+                        true,
+                    ),
+                    Err(e) if is_no_such_job(&e) => (named("no such packet".into()), true),
+                    Err(e) => {
+                        let why = short_cause(&e, self.policy.blip_cause_budget);
+                        log(format!(
+                            "{}: its release's review run {} could not be read ({why}) — kept \
+                             off this train, not held",
+                            id8(jid),
+                            id8(&review)
+                        ));
+                        return Some(format!(
+                            "its release's review run {} could not be read ({why}): kept off \
+                             this train; the next pass reads it again",
+                            id8(&review)
+                        ));
+                    }
+                }
+            }
+        };
+        log(format!("{}: {reason} — holding at the dock", id8(jid)));
+        if self.cfg.dry {
+            log(format!("DRY: would hold car {} ({reason})", id8(jid)));
+            return Some(reason);
+        }
+        let written =
+            match crate::mutating_verb::review_hold_write(car, &reason, bind.then_some(head)) {
+                Ok(Some((path, body))) => self
+                    .api(Method::PATCH, &path, Some(body))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:#}")),
+                // Held already between the read and this write: its reason stands.
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            };
+        match written {
+            Ok(()) => Some(reason),
+            Err(e) => {
+                log(format!(
+                    "{}: the review hold could not be written ({e}) — kept off this train anyway; \
+                     the next pass writes it again",
+                    id8(jid)
+                ));
+                Some(format!(
+                    "{reason} [the hold could not be written: {e}; kept off this train]"
+                ))
+            }
+        }
+    }
+
+    /// Record a release the dock's replay carried to `head` (review F3):
+    /// the release moves to the replayed head and keeps the head its
+    /// review read. BEST-EFFORT — the car was already proved boardable
+    /// this pass; a write that fails leaves the stamp that proved it, and
+    /// the next pass carries it again.
+    async fn carry_release(&self, car: &Value, jid: &str, head: &str, patch_id: &str) {
+        let Some(release) = crate::review_verdict::release_on(car) else {
+            return;
+        };
+        let record = crate::review_verdict::carried_forward(&release, head, patch_id);
+        log(format!(
+            "{}: its release at {} carried to the dock's replay {} — the car's own diff is \
+             unchanged (patch-id {})",
+            id8(jid),
+            id8(release.sha),
+            id8(head),
+            id8(patch_id)
+        ));
+        if self.cfg.dry {
+            return;
+        }
+        let path = match crate::steps::holdable(car) {
+            Ok(step) => format!(
+                "/api/jobs/{jid}/steps/{}/metadata",
+                step.get("id").and_then(Value::as_str).unwrap_or_default()
+            ),
+            Err(e) => {
+                log(format!(
+                    "{}: the carried release was not recorded ({e})",
+                    id8(jid)
+                ));
+                return;
+            }
+        };
+        if let Err(e) = self
+            .api(
+                Method::PATCH,
+                &path,
+                Some(json!({ boss_jobs::car::RELEASE: record })),
+            )
+            .await
+        {
+            log(format!(
+                "{}: the carried release was not recorded ({e:#}) — the next pass carries it \
+                 again",
+                id8(jid)
+            ));
+        }
     }
 
     /// Does this car's DECLARED ORDERING EDGE hold it back?
@@ -3687,6 +4336,17 @@ impl Conductor {
     /// refused a re-gate, the `base_regate` stamp to record (backlog
     /// 969a1092 — the rule and the bound are `dock_regate`'s).
     ///
+    /// ONLY A CAR A RED TRAIN OWES A RE-GATE IS ASKED (backlog 96f02540).
+    /// The re-gate ON LANDING is off: every landing used to re-judge every
+    /// parked car against the new main, and on 2026-09-28 five of seven
+    /// cars queued 40-60 minutes behind saturated bays for a test the TRAIN
+    /// gate runs anyway on the assembled consist (design 128b5496) — a
+    /// cost that grew as (parked cars) x (landings). A car carries
+    /// `regate_owed` only when a red train released it and its files
+    /// intersect the failure (or the red named nothing), and for that car
+    /// the judgement below is today's, unchanged. Every other car whose
+    /// receipt vouches for its head boards as gated.
+    ///
     /// INFALLIBLE BY SIGNATURE, for `edge_hold`'s reason: this runs inside
     /// the loop that boards every train, and a base git cannot read is not
     /// a finding about the car. It boards, and the journal says why.
@@ -3697,6 +4357,9 @@ impl Conductor {
         branch: &str,
         head: &str,
     ) -> Option<DockHold> {
+        if !dock_regate::owes_regate(car) {
+            return None;
+        }
         let reading = match dock_regate::read_base(&self.cfg.clone, head) {
             Ok(r) => r,
             Err(e) => {
@@ -3766,13 +4429,10 @@ impl Conductor {
         touched: &[String],
         reds: u32,
     ) -> Option<DockHold> {
-        // The misses a departure counted on the car's last stamp ride on
-        // to this one (backlog d9530df2): this launch is what follows one.
         let stamp = dock_regate::RegateStamp {
             base: reading.base.clone(),
             reds,
             ..dock_regate::RegateStamp::for_main(&reading.main, touched)
-                .carrying(dock_regate::RegateStamp::of(car).as_ref())
         };
         if self.cfg.dry {
             log(format!(
@@ -3828,7 +4488,6 @@ impl Conductor {
                 return Some(DockHold {
                     reason: dock_regate::refused_reason(jid, &stamp),
                     stamp: Some(stamp.to_value(Utc::now())),
-                    in_round: None,
                     waiting: None,
                 });
             }
@@ -3843,6 +4502,7 @@ impl Conductor {
         };
         let stamp = dock_regate::RegateStamp {
             head: rebased.new_head.clone(),
+            from: rebased.old_head.clone(),
             ..stamp
         };
         log(format!(
@@ -3885,24 +4545,33 @@ impl Conductor {
                 DockHold {
                     reason: dock_regate::launched_reason(&stamp),
                     stamp: Some(stamp.to_value(at)),
-                    // A gate is running for it now: this departure's round.
-                    in_round: Some(dock_regate::InRound {
-                        car: jid.to_string(),
-                        main: stamp.main.clone(),
-                        since: at,
-                        missed: stamp.missed,
-                    }),
                     waiting: None,
                 }
             }
-            // No gate is running for it, so nothing will turn it green
-            // before the next pass files it: no departure waits on it.
-            Err(e) => DockHold {
-                reason: dock_regate::unfiled_reason(&stamp, &format!("{e:#}")),
+            // No gate is running for it: the next pass files it.
+            Err(GateLaunchFailed { filed: None, cause }) => DockHold {
+                reason: dock_regate::unfiled_reason(&stamp, &format!("{cause:#}")),
                 stamp: Some(stamp.to_value(at)),
-                in_round: None,
                 waiting: None,
             },
+            // Filed, then never started (backlog 7919fdcc, item 11): the
+            // run is named on the stamp, so the next pass reads its `lost`
+            // verdict and the red rule (`dock_regate::after_red`) bounds
+            // the retry — never a fresh packet every two minutes.
+            Err(GateLaunchFailed {
+                filed: Some(run),
+                cause,
+            }) => {
+                let stamp = dock_regate::RegateStamp {
+                    gate_run: run,
+                    ..stamp
+                };
+                DockHold {
+                    reason: dock_regate::unstarted_reason(&stamp, &format!("{cause:#}")),
+                    stamp: Some(stamp.to_value(at)),
+                    waiting: None,
+                }
+            }
         }
     }
 
@@ -3954,8 +4623,8 @@ impl Conductor {
     /// against a main about to be replaced — the measured waste this
     /// verb exists to remove (19:26 on 2026-09-25: a car replayed onto
     /// 22c1a876 in the pass that departed train #686, whose merge changed
-    /// four of its files). A round launched on a clear track stays valid
-    /// until the next departure, and `board` holds that departure for it.
+    /// four of its files). Since backlog 96f02540 the dock re-gates only a
+    /// car a red train owes one, and `board` never waits for it.
     ///
     /// Before this, re-gates launched only inside `board`, which fires at
     /// most once per cooldown after a departure: 42 of 58 left-behind rows
@@ -3995,100 +4664,16 @@ impl Conductor {
         Ok(())
     }
 
-    /// Does this departure wait for the dock's re-gate round? `None` =
-    /// depart. The rule is `dock_regate::departure_hold`; this reads its
-    /// two inputs — the main in the clone, and the bound from the cadence
-    /// registry (`cadence::regate_hold_minutes`).
-    ///
-    /// INFALLIBLE BY SIGNATURE, for `edge_hold`'s reason: this runs inside
-    /// the loop that boards every train, and a hold nobody can read is not
-    /// a reason to stop landing. Either read failing departs, and says so.
-    async fn departure_hold(
-        &self,
-        round: &[dock_regate::InRound],
-        now: DateTime<Utc>,
-    ) -> Option<dock_regate::RoundHold> {
-        if round.is_empty() {
-            return None;
-        }
-        let main = match self.origin_main() {
-            Ok(main) => main,
-            Err(e) => {
-                log(format!(
-                    "{} re-gate(s) in flight, but main could not be read ({e:#}) — departing \
-                     without waiting for them",
-                    round.len()
-                ));
-                return None;
-            }
-        };
-        let minutes = match self.regate_hold_minutes().await {
-            Ok(minutes) => minutes,
-            Err(e) => {
-                log(format!(
-                    "{} re-gate(s) in flight, but the cadence registry could not be read \
-                     ({e:#}) — departing without waiting for them",
-                    round.len()
-                ));
-                return None;
-            }
-        };
-        dock_regate::departure_hold(round, &main, now, minutes)
-    }
-
-    /// A train has DEPARTED leaving every car in `round` behind while its
-    /// re-gate was in flight: count the miss on each car's stamp
-    /// (`base_regate.missed`), so the next departure on its main waits for
-    /// its own verdict (backlog d9530df2, `dock_regate::departure_hold`).
-    ///
-    /// INFALLIBLE BY SIGNATURE: the train has already left, and a count
-    /// that cannot be written is not a reason to fail the departure after
-    /// the fact (a fallible write in the boarding loop froze every landing
-    /// once). Each failure is journalled with the car it concerns; the
-    /// cost is one more oldest-first wait for that car.
-    async fn count_misses(&self, round: &[dock_regate::InRound]) {
-        for r in round {
-            let car = match self.get_job(&r.car).await {
-                Ok(car) => car,
-                Err(e) => {
-                    log(format!(
-                        "{}: left behind mid-re-gate, but the car could not be read to count \
-                         the miss ({e:#})",
-                        id8(&r.car)
-                    ));
-                    continue;
-                }
-            };
-            let Some(stamp) = dock_regate::missed_stamp(&car) else {
-                continue;
-            };
-            let missed = stamp["missed"].as_u64().unwrap_or_default();
-            match self
-                .merge_job_metadata(&r.car, vec![(dock_regate::BASE_REGATE, stamp)])
-                .await
-            {
-                Ok(()) => log(format!(
-                    "{}: left behind while its re-gate was in flight ({missed}x) — the next \
-                     departure on its main waits for its own verdict",
-                    id8(&r.car)
-                )),
-                Err(e) => log(format!(
-                    "{}: left behind mid-re-gate, but the miss could not be counted ({e:#})",
-                    id8(&r.car)
-                )),
-            }
-        }
-    }
-
     /// A train has DEPARTED leaving every car the dock held behind: count
     /// one more on each car's own dock streak (`LEFT_BEHIND_TRAINS`, apart
     /// from assembly's `skips`; cleared on boarding), and alarm on a car
     /// the streak has carried to `LEFT_BEHIND_ALARM_TRAINS` (backlog
     /// 2fccbfd6; review of car 5eb1967e, M3).
     ///
-    /// INFALLIBLE BY SIGNATURE, for `count_misses`'s reason: the train has
-    /// left, and a count or an alarm that cannot be written is journalled
-    /// with the car it concerns rather than failing the departure.
+    /// INFALLIBLE BY SIGNATURE: the train has left, and a count or an
+    /// alarm that cannot be written is journalled with the car it concerns
+    /// rather than failing the departure (a fallible write in the boarding
+    /// loop froze every landing once).
     async fn count_left_behind(&self, held: &[String]) {
         for id in held {
             let car = match self.get_job(id).await {
@@ -4271,32 +4856,11 @@ impl Conductor {
                 .red_regate(car, jid, branch, stamp, verdict, run.as_ref())
                 .await;
         }
-        // Still running: part of the round a departure on its main waits
-        // for, dated from the launch its stamp recorded. A red verdict is
-        // nothing to wait for, and neither, for a car in its first round,
-        // is a green not yet copied. But a car a departure has already
-        // left behind mid-re-gate waits for that copy too (backlog
-        // d9530df2): train 14:39 of 2026-09-26 departed 49 s after this
-        // car's green and before the refresh had copied it, and a wait
-        // for "its own verdict" that ends at the green would lose it the
-        // same way. The bound in `departure_hold` still caps it.
-        let in_round = match standing {
-            dock_regate::InFlight::Running => true,
-            dock_regate::InFlight::GreenNotCopied => stamp.missed > 0,
-            _ => false,
-        }
-        .then(|| dock_regate::launched_at(car))
-        .flatten()
-        .map(|since| dock_regate::InRound {
-            car: jid.to_string(),
-            main: stamp.main.clone(),
-            since,
-            missed: stamp.missed,
-        });
+        // Still running (or green and not yet copied): the car stays on
+        // the dock, and no departure waits for it (backlog 96f02540).
         DockHold {
             reason: dock_regate::in_flight_reason(jid, &stamp, &standing),
             stamp: None,
-            in_round,
             waiting: None,
         }
     }
@@ -4337,24 +4901,12 @@ impl Conductor {
                 None
             }
         };
-        let hold_minutes = match self.regate_hold_minutes().await {
-            Ok(m) => m,
-            Err(e) => {
-                log(format!(
-                    "{}: its re-gate is red, and the cadence registry could not be read \
-                     ({e:#}) — no bound this pass, only a main move retries it",
-                    id8(jid)
-                ));
-                0
-            }
-        };
         let red_at = run
             .and_then(dock_regate::red_closed_at)
             .or_else(|| dock_regate::launched_at(car));
         let held_on = |red: boss_jobs::dock_red::RegateRed, reason: String| DockHold {
             reason,
             stamp: dock_regate::red_stamp(car, &red),
-            in_round: None,
             waiting: None,
         };
         let fresh_base = match dock_regate::after_red(
@@ -4363,7 +4915,6 @@ impl Conductor {
             main_now.as_deref(),
             red_at,
             Utc::now(),
-            hold_minutes,
         ) {
             dock_regate::AfterRed::Garage => {
                 let red = boss_jobs::dock_red::RegateRed {
@@ -4395,8 +4946,12 @@ impl Conductor {
         // stood on, not a fresh one (round-2 re-review of car 5eb1967e,
         // N1) — or a retry that could not launch would read as a red the
         // dock still retries, and the board would call the window idle.
+        // "Already garaged" is the car's own recorded red, not `reds > 0`:
+        // a first retry of a LOST red carries the one judged red before
+        // it, and a relaunch that failed marked it garaged without its
+        // earning it (L2 of the round-3 review, backlog f8383a38).
         let red = boss_jobs::dock_red::RegateRed {
-            garaged: stamp.reds > 0,
+            garaged: dock_regate::car_garaged(car),
             ..red
         };
         if self.cfg.dry {
@@ -4470,16 +5025,6 @@ impl Conductor {
             "origin/main",
         ])?;
         Ok(stdout_str(&out).trim().to_string())
-    }
-
-    /// The registry's dock re-gate hold (`cadence::regate_hold_minutes`).
-    async fn regate_hold_minutes(&self) -> Result<u32> {
-        let v = self.api(Method::GET, "/api/cadence/rules", None).await?;
-        let rows = serde_json::from_value::<Vec<boss_jobs::cadence::CadenceRuleRow>>(
-            v.unwrap_or(Value::Null),
-        )
-        .context("parsing /api/cadence/rules")?;
-        Ok(crate::cadence::regate_hold_minutes(&rows))
     }
 
     async fn open_train_job(&self, train_branch: &str, window: &str) -> Result<Option<Value>> {
@@ -4610,9 +5155,11 @@ impl Conductor {
         // it by ancestry — holding for it deadlocked delivery twice on
         // 2026-09-07 (f3796323). No packet is opened for a hold — it is
         // not a refusal, the yard is not empty, and the next tick after
-        // the track clears departs.
+        // the track clears departs. It is still a DECISION, and recorded
+        // like every other (backlog 96f02540): a hand-run board says why.
         if let Some(occupant) = self.track_occupant().await? {
-            log(format!("BOARDING HELD — track occupied by {occupant}"));
+            self.record_no_departure(&NoDeparture::TrackOccupied { occupant })
+                .await?;
             return Ok(());
         }
 
@@ -4658,8 +5205,8 @@ impl Conductor {
         let DockPass {
             boardable: cands,
             mut left_behind,
-            round,
             held,
+            judged,
         } = self.candidates().await?;
         if self.cfg.dry {
             log(format!("DRY: candidates: {}", py_pairs(&cands)));
@@ -4681,29 +5228,15 @@ impl Conductor {
             return Ok(());
         }
 
-        // THE ROUND A DEPARTURE WAITS FOR (D2 of design 42279fb2; the
-        // rule is `dock_regate::departure_hold`). Cars are ready, but the
-        // dock has re-gates in flight on the main this train would move:
-        // departing now re-stales every one of them. Hold — bounded by the
-        // registry's `regate_hold_minutes` from the OLDEST re-gate, or by
-        // twice that from its own launch for a car a departure already
-        // left behind mid-re-gate (d9530df2, counted by `count_misses`) — and
-        // the next board, a minute away, departs with every car the round
-        // turned green. A held board boards nothing, so the cadence loop
-        // records it idle and the cooldown does not start from it.
-        if let Some(hold) = self.departure_hold(&round, now).await {
-            self.record_no_departure(&NoDeparture::AwaitingRegates {
-                cars: cands.len(),
-                in_flight: hold.in_flight,
-                main: hold.main,
-                oldest_minutes: hold.oldest_minutes,
-                hold_minutes: hold.hold_minutes,
-                missed: hold.missed,
-                more_minutes: hold.more_minutes,
-            })
-            .await?;
-            return Ok(());
-        }
+        // THE BOARD NEVER WAITS ON A RE-GATE (backlog 96f02540). It held
+        // here for the dock's re-gate round (D2 of design 42279fb2) until
+        // 2026-09-28, when a 15-minute hold anchored to the oldest re-gate
+        // IN FLIGHT became a moving target under saturated bays: each
+        // finished re-gate launched the next in the same pass and moved the
+        // anchor, and the board refused every tick from 02:37Z while cars
+        // that were current sat beside it. A car mid-re-gate stays on the
+        // dock (its receipt does not vouch for its head); every car whose
+        // receipt does, boards now.
 
         let clone = &self.cfg.clone;
         sh(&[
@@ -4722,8 +5255,15 @@ impl Conductor {
         let mut boarded: Vec<(Value, String, String)> = Vec::new();
         let mut skipped: Vec<(Value, String)> = Vec::new();
         for (j, branch) in cands {
-            let head_out = sh(&["git", "-C", clone, "rev-parse", &format!("fork/{branch}")])?;
-            let head = stdout_str(&head_out).trim().to_string();
+            let jid = job_id(&j)?.to_string();
+            let head = match judged_head(clone, &judged, &jid, &branch)? {
+                Ok(head) => head,
+                Err(reason) => {
+                    log(format!("{branch}: {reason}"));
+                    left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
+                    continue;
+                }
+            };
             let r = sh_unchecked(&[
                 "git",
                 "-C",
@@ -4732,7 +5272,7 @@ impl Conductor {
                 "--no-ff",
                 "-m",
                 &format!("train: merge {branch}"),
-                &format!("fork/{branch}"),
+                &head,
             ])?;
             if r.status.success() {
                 boarded.push((j, branch, head));
@@ -5004,7 +5544,6 @@ impl Conductor {
             ],
         )
         .await?;
-        self.count_misses(&round).await;
         // Every car the DOCK held is left behind by THIS train: one more
         // on its dock streak, and an alarm at the threshold (2fccbfd6).
         // Assembly's conflicts are not counted here — they count `skips`,
@@ -5142,7 +5681,7 @@ impl Conductor {
                     ("train", json!(train_id.as_str())),
                     ("boarded_head", json!(head.as_str())),
                     ("skip_reason", Value::Null),
-                    ("skips", Value::Null),
+                    (boss_jobs::car::SKIPS, Value::Null),
                     // The dock's streak and its alarm go with it: the next
                     // streak is a new fact and may file its own (2fccbfd6).
                     (LEFT_BEHIND_TRAINS, Value::Null),
@@ -5157,6 +5696,9 @@ impl Conductor {
             id8(&train_id),
             boarded.len()
         ));
+        record_board_decision(&BoardDecision::Boarded {
+            cars: boarded.len(),
+        });
 
         // THE TRAIN GATE, FILED IN THIS PASS (backlog 95c349a5). Until
         // 2026-09-14 the gate was filed only from the ci-step block in
@@ -5609,12 +6151,21 @@ mod tests {
     /// Walk the dock once over `cars` (and `others`, readable by id but
     /// not listed), and return every job-metadata merge it sent.
     async fn walk_dock(cars: Vec<Value>, others: Vec<Value>) -> Vec<(String, Value)> {
+        let (_g, clone) = clone_fixture("dock-hold-unchanged");
+        walk_dock_in(&clone, cars, others).await
+    }
+
+    /// `walk_dock` over a clone the caller has already given branches.
+    async fn walk_dock_in(
+        clone: &std::path::Path,
+        cars: Vec<Value>,
+        others: Vec<Value>,
+    ) -> Vec<(String, Value)> {
         use axum::extract::Path;
         use axum::routing::{get, patch};
         use axum::{Json, Router};
         use std::sync::{Arc, Mutex};
 
-        let (_g, clone) = clone_fixture("dock-hold-unchanged");
         let merges: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
         let rec = merges.clone();
         let listed = cars.clone();
@@ -5652,7 +6203,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut c = dock_conductor(&clone);
+        let mut c = dock_conductor(clone);
         c.cfg.jobs = format!("http://{addr}");
         let pass = c.candidates().await.expect("the walk completes");
         assert!(pass.boardable.is_empty(), "every car here is held");
@@ -5707,6 +6258,68 @@ mod tests {
             written(&walk_dock(cars, vec![pred]).await),
             vec![("new".to_string(), json!(hold.reason))],
             "the car already saying it is not written; the control is"
+        );
+    }
+
+    /// ITEM 9 OF BACKLOG 7919fdcc. An edge-held car whose builder repaired
+    /// it — the receipt now vouches for the head the forge carries — has
+    /// its old dock re-gate red taken off while it waits on its edge, not
+    /// only once the edge releases it: the yard and orient read that red as
+    /// "not boardable" for as long as it stands. The control carries the
+    /// same red with a receipt for another sha, and keeps it.
+    #[tokio::test]
+    async fn an_edge_held_car_whose_receipt_vouches_again_has_its_red_cleared() {
+        let (_g, clone) = clone_fixture("dock-edge-red");
+        let repaired = park_car(&clone, "feat/repaired", "a/repaired.rs");
+        park_car(&clone, "feat/still-red", "a/still-red.rs");
+        let main = rev(&clone, "origin/main");
+        let pred = json!({"id": "pred", "status": "open", "metadata": {"branch": "feat/pred"}});
+        let EdgeOutcome::Hold(hold) =
+            boards_after_outcome("pred", &Predecessor::Found(pred.clone()))
+        else {
+            panic!("an open predecessor holds the car");
+        };
+        let red_car = |id: &str, vouches_for: &str| {
+            let mut stamp = dock_regate::RegateStamp {
+                head: "0dead0replay0".into(),
+                gate_run: "gr-red".into(),
+                reds: 1,
+                ..dock_regate::RegateStamp::for_main(&main, &[])
+            }
+            .to_value(Utc::now());
+            stamp[boss_jobs::dock_red::RED] = boss_jobs::dock_red::RegateRed {
+                gate_run: "gr-red".into(),
+                head: "0dead0replay0".into(),
+                verdict: "failed".into(),
+                ..Default::default()
+            }
+            .to_value();
+            parked_car(
+                id,
+                json!({
+                    "branch": format!("feat/{id}"),
+                    boss_jobs::car::BOARDS_AFTER: "pred",
+                    "skip_reason": hold.reason,
+                    "regate_receipt": json!({"verdict": "green", "dirty": false,
+                                             "head": vouches_for}).to_string(),
+                    dock_regate::BASE_REGATE: stamp,
+                }),
+            )
+        };
+        let cars = vec![red_car("repaired", &repaired), red_car("still-red", &main)];
+        let want = dock_regate::cleared_stamp(&cars[0]).expect("a red to clear");
+        let merges = walk_dock_in(&clone, cars, vec![pred]).await;
+        let cleared: Vec<(String, Value)> = merges
+            .iter()
+            .filter_map(|(id, b)| {
+                b.get(dock_regate::BASE_REGATE)
+                    .map(|s| (id.clone(), s.clone()))
+            })
+            .collect();
+        assert_eq!(
+            cleared,
+            vec![("repaired".to_string(), want)],
+            "only the car whose receipt vouches for the forge's head loses its red"
         );
     }
 
@@ -5867,7 +6480,7 @@ mod tests {
                 gate_required: false,
                 dry: false,
             },
-            http: reqwest::Client::new(),
+            http: crate::gate::machine_client().unwrap(),
             forge,
             owner: crate::owner::resolver("http://jobs.invalid"),
             policy: policy(),
@@ -6342,6 +6955,22 @@ mod tests {
         String,
         std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
     ) {
+        settle_api_with_cars(reread, refuse_step_put, Some(Vec::new()), false).await
+    }
+
+    /// [`settle_api`], also serving the open-car list the orphan settle
+    /// reads before it chooses `withdrawn` over `lost` (backlog
+    /// 8d7d0a2b). `None` answers that list 403 — an answer the blip
+    /// guard does not retry.
+    async fn settle_api_with_cars(
+        reread: Value,
+        refuse_step_put: bool,
+        cars: Option<Vec<Value>>,
+        refuse_withdrawn: bool,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
+    ) {
         use axum::extract::Path;
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
@@ -6350,8 +6979,41 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let writes: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
-        let (w1, w2, w3) = (writes.clone(), writes.clone(), writes.clone());
+        let (w1, w2, w3, w4) = (
+            writes.clone(),
+            writes.clone(),
+            writes.clone(),
+            writes.clone(),
+        );
+        // A create answers with the id of the run it serves, so a launch
+        // that files a gate-run files THIS one (backlog 7919fdcc).
+        let created = reread["id"].clone();
         let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(move || {
+                    let cars = cars.clone();
+                    async move {
+                        match cars {
+                            Some(c) => {
+                                let total = c.len();
+                                Json(json!({ "data": c, "total": total })).into_response()
+                            }
+                            None => (StatusCode::FORBIDDEN, "denied").into_response(),
+                        }
+                    }
+                })
+                .post(move |Json(b): Json<Value>| {
+                    let w = w4.clone();
+                    let id = created.clone();
+                    async move {
+                        w.lock()
+                            .unwrap()
+                            .push(("POST".into(), "/api/jobs".into(), b));
+                        (StatusCode::CREATED, Json(json!({"id": id})))
+                    }
+                }),
+            )
             .route(
                 "/api/jobs/{id}",
                 get(move || {
@@ -6395,7 +7057,15 @@ mod tests {
                     move |Path((id, sid)): Path<(String, String)>, Json(b): Json<Value>| {
                         let w = w3.clone();
                         async move {
-                            if refuse_step_put {
+                            // An in-flight packet admitted under gate-run
+                            // v2 declares no `withdrawn`: the completion
+                            // after that metadata write is refused 422.
+                            let last_says_withdrawn = w
+                                .lock()
+                                .unwrap()
+                                .last()
+                                .is_some_and(|(_, _, b)| b["verdict"] == "withdrawn");
+                            if refuse_step_put || (refuse_withdrawn && last_says_withdrawn) {
                                 return (StatusCode::CONFLICT, "refused").into_response();
                             }
                             w.lock().unwrap().push((
@@ -6534,6 +7204,127 @@ mod tests {
         );
     }
 
+    /// An orphan queued for a head a car already vouches for.
+    fn vouched_orphan(now: DateTime<Utc>) -> (Value, Value) {
+        const HEAD: &str = "1c82e857aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut run = idle_gate_run(now, 40);
+        run["metadata"]["sha"] = json!(HEAD);
+        run["metadata"]["queued_at"] =
+            json!(crate::gate::stamp(now - chrono::Duration::minutes(40)));
+        let receipt =
+            format!("{{\"verdict\": \"green\", \"head\": \"{HEAD}\", \"mode\": \"auto\"}}");
+        let car = json!({
+            "id": "59e1f436-0000-4000-8000-000000000000", "kind": "ship-a-change",
+            "status": "open",
+            "metadata": { "branch": "fix/orphan" },
+            "steps": [
+                {"spec_slug": "gate", "title": boss_jobs::car::GATE, "status": "completed",
+                 "metadata": {"receipt": receipt}},
+                {"spec_slug": "review", "title": boss_jobs::car::REVIEW, "status": "ready"},
+            ]
+        });
+        (run, car)
+    }
+
+    /// Backlog b1c82a82's acceptance. Gate-run 8c2f644a (2026-09-28) was
+    /// queued for a head car 59e1f436 already carried green, its waiter
+    /// died, and this settle closed it `lost` — a dead runner on the
+    /// record for a run nobody needed. When the head is already vouched
+    /// for, the settle WITHDRAWS instead, naming the car it defers to;
+    /// no human decision is involved.
+    #[tokio::test]
+    async fn an_orphan_whose_head_a_car_already_carries_is_withdrawn_not_lost() {
+        let now = Utc::now();
+        let (run, car) = vouched_orphan(now);
+        let (jobs, writes) = settle_api_with_cars(run.clone(), false, Some(vec![car]), false).await;
+        let cluster = |_: &str, _: &str| -> Result<Vec<String>> { Ok(vec![]) };
+        settle_conductor(jobs)
+            .settle_orphaned_gate_run("orph", &run, now, &cluster)
+            .await
+            .expect("a vouched orphan is withdrawn");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w[0].1, "/api/jobs/orph/steps/s-v/metadata", "{w:?}");
+        assert_eq!(w[0].2["verdict"], "withdrawn", "{w:?}");
+        let receipt: Value =
+            serde_json::from_str(w[0].2["receipt"].as_str().expect("a JSON string")).unwrap();
+        assert_eq!(receipt["verdict"], "withdrawn");
+        assert_eq!(
+            receipt["defers_to"]["car"],
+            "59e1f436-0000-4000-8000-000000000000"
+        );
+        assert!(
+            receipt["withdrawn_because"]
+                .as_str()
+                .is_some_and(|s| s.contains("car 59e1f436")),
+            "{receipt}"
+        );
+        assert_eq!(
+            w[1].1, "/api/jobs/orph/steps/s-v",
+            "the status flip follows"
+        );
+    }
+
+    /// With no car carrying the head the settle is unchanged — lost —
+    /// and when the car list cannot be read it settles NOTHING this pass:
+    /// "could not tell" is neither withdrawn nor lost.
+    #[tokio::test]
+    async fn an_unvouched_orphan_is_still_lost_and_an_unread_car_list_settles_nothing() {
+        let now = Utc::now();
+        let (run, _) = vouched_orphan(now);
+        let cluster = |_: &str, _: &str| -> Result<Vec<String>> { Ok(vec![]) };
+        let (jobs, writes) = settle_api_with_cars(run.clone(), false, Some(vec![]), false).await;
+        settle_conductor(jobs)
+            .settle_orphaned_gate_run("orph", &run, now, &cluster)
+            .await
+            .expect("settled");
+        assert_eq!(writes.lock().unwrap()[0].2["verdict"], "lost");
+
+        let (jobs, writes) = settle_api_with_cars(run.clone(), false, None, false).await;
+        settle_conductor(jobs)
+            .settle_orphaned_gate_run("orph", &run, now, &cluster)
+            .await
+            .expect("an unread car list is logged and retried next pass");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "nothing is settled on a list nobody read: {:?}",
+            writes.lock().unwrap()
+        );
+    }
+
+    /// A PACKET ADMITTED UNDER gate-run v2 CANNOT SAY `withdrawn`: its
+    /// verdict field was materialized from the four-word enum, so the
+    /// completion is refused. The settle then does what it did before
+    /// this car — `lost`, in the same pass — rather than leaving the
+    /// orphan open to the three-hour clock, which would be a regression
+    /// dressed as a refinement.
+    #[tokio::test]
+    async fn a_refused_withdrawal_falls_back_to_lost_in_the_same_pass() {
+        let now = Utc::now();
+        let (run, car) = vouched_orphan(now);
+        let (jobs, writes) = settle_api_with_cars(run.clone(), false, Some(vec![car]), true).await;
+        let cluster = |_: &str, _: &str| -> Result<Vec<String>> { Ok(vec![]) };
+        settle_conductor(jobs)
+            .settle_orphaned_gate_run("orph", &run, now, &cluster)
+            .await
+            .expect("the fallback settles");
+        let w = writes.lock().unwrap().clone();
+        let verdicts: Vec<&Value> = w
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p.ends_with("/steps/s-v/metadata"))
+            .map(|(_, _, b)| &b["verdict"])
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![&json!("withdrawn"), &json!("lost")],
+            "withdrawn tried, lost written: {w:?}"
+        );
+        assert!(
+            w.iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/api/jobs/orph/steps/s-v"),
+            "and the lost verdict completed the step: {w:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_step_write_leaves_no_evidence_on_the_open_packet() {
         let now = Utc::now();
@@ -6553,6 +7344,115 @@ mod tests {
             "no orphan evidence rides a packet whose step did not complete: {:?}",
             writes.lock().unwrap()
         );
+    }
+
+    /// A GATE-RUN FILED IS A GATE-RUN ANSWERED (backlog 7919fdcc, item
+    /// 11). The POST succeeded and the Job could not be started: the run
+    /// is settled `lost` with the cause as its receipt, and the error
+    /// names the run, so the dock can stamp it instead of filing a twin
+    /// on its next pass — which it did every two minutes before.
+    #[tokio::test]
+    async fn a_gate_run_filed_but_never_started_is_settled_lost_and_named() {
+        let run = idle_gate_run(Utc::now(), 0);
+        let (jobs, writes) = settle_api(run, false).await;
+        let start = |_: &str| -> Result<()> {
+            Err(anyhow!(
+                "kubectl create failed for the gate of fix/orphan: forbidden"
+            ))
+        };
+        let err = settle_conductor(jobs)
+            .file_and_start_gate(
+                "fix/orphan",
+                "abc1234",
+                json!({"regate_of_car": "c"}),
+                &start,
+            )
+            .await
+            .expect_err("a Job that never started is a failed launch");
+        assert_eq!(err.filed.as_deref(), Some("orph"), "the run is named");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("forbidden") && text.contains("orph"),
+            "{text}"
+        );
+        let w = writes.lock().unwrap().clone();
+        let order: Vec<(String, String)> =
+            w.iter().map(|(m, p, _)| (m.clone(), p.clone())).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("POST".into(), "/api/jobs".into()),
+                ("PATCH".into(), "/api/jobs/orph/metadata".into()),
+                ("PATCH".into(), "/api/jobs/orph/steps/s-v/metadata".into()),
+                ("PUT".into(), "/api/jobs/orph/steps/s-v".into()),
+            ],
+            "filed, marked, then settled"
+        );
+        assert_eq!(w[2].2["verdict"], "lost");
+        let receipt = w[2].2["receipt"].as_str().expect("a receipt");
+        assert!(
+            receipt.contains("forbidden") && receipt.contains("fix/orphan"),
+            "the cause is the receipt, verbatim: {receipt}"
+        );
+    }
+
+    /// The control: a launch that starts its Job settles nothing.
+    #[tokio::test]
+    async fn a_gate_run_that_starts_is_not_settled() {
+        let run = idle_gate_run(Utc::now(), 0);
+        let (jobs, writes) = settle_api(run, false).await;
+        let started = std::sync::Mutex::new(Vec::new());
+        let start = |id: &str| -> Result<()> {
+            started.lock().unwrap().push(id.to_string());
+            Ok(())
+        };
+        let run_id = settle_conductor(jobs)
+            .file_and_start_gate(
+                "fix/orphan",
+                "abc1234",
+                json!({"regate_of_car": "c"}),
+                &start,
+            )
+            .await
+            .expect("launched");
+        assert_eq!(run_id, "orph");
+        assert_eq!(*started.lock().unwrap(), vec!["orph".to_string()]);
+        let w = writes.lock().unwrap().clone();
+        assert!(
+            w.iter().all(|(_, p, _)| !p.contains("/steps/")),
+            "no verdict is written for a run that started: {w:?}"
+        );
+        // And it is stamped launched, AFTER the marks and the start — the
+        // key the yard dates a bay's running age from (backlog 4d088a7e).
+        let last = w.last().expect("writes");
+        assert_eq!(
+            (last.0.as_str(), last.1.as_str()),
+            ("PATCH", "/api/jobs/orph/metadata")
+        );
+        assert!(
+            last.2
+                .get(crate::gate::LAUNCHED_AT)
+                .and_then(Value::as_str)
+                .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+            "the run is stamped launched: {w:?}"
+        );
+    }
+
+    /// And the dock's side of it: the run the launch filed rides the stamp,
+    /// so the next pass reads its `lost` verdict and the red rule bounds
+    /// the retry — the stamp never goes back to `gate_run ''`.
+    #[test]
+    fn an_unstarted_regate_names_its_run_and_how_it_is_retried() {
+        let stamp = dock_regate::RegateStamp {
+            head: "4ba3a93d5555".into(),
+            gate_run: "9f1e2d3c4b5a".into(),
+            ..dock_regate::RegateStamp::for_main("0c0ffee12345", &[])
+        };
+        let why = "kubectl create failed for the gate of feat/g: forbidden";
+        let line = dock_regate::unstarted_reason(&stamp, why);
+        for want in ["9f1e2d3c", "forbidden", "settled lost", "main moves"] {
+            assert!(line.contains(want), "{want}: {line}");
+        }
     }
 
     /// f2ba226e: pr-train 06e5610f was admitted with nine of its ten
@@ -7929,6 +8829,13 @@ mod tests {
         rev(&origin, &format!("refs/heads/{branch}"))
     }
 
+    /// The `regate_owed` marker a red train's cancel leaves on a car it
+    /// released (backlog 96f02540) — what sends a car through the dock's
+    /// judgement at all.
+    fn owed() -> Value {
+        dock_regate::owed_stamp("t-red", &[], &[], Utc::now())
+    }
+
     fn dock_conductor(clone: &std::path::Path) -> Conductor {
         let mut c = cleanup_conductor(
             "forgejo",
@@ -7953,13 +8860,54 @@ mod tests {
         let head = park_car(&clone, "feat/g", "apps/web/src/it/yard/phone-strip.ts");
         land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
         let c = dock_conductor(&clone);
-        let car = json!({"id": "car-g", "metadata": {"branch": "feat/g", "summary": "G"}});
+        let car = json!({"id": "car-g", "metadata": {
+            "branch": "feat/g", "summary": "G", dock_regate::REGATE_OWED: owed(),
+        }});
         assert_eq!(
             c.base_hold(&car, "car-g-000", "feat/g", &head).await,
             None,
             "a failure of the means must never freeze a landing"
         );
         assert_eq!(forge_branch(&clone, "feat/g"), head, "nothing was replayed");
+    }
+
+    /// THE RE-GATE ON LANDING IS OFF (backlog 96f02540). Car G's shape
+    /// again — main landed a change beside its file after its gate — but
+    /// no red train owes it a re-gate: it boards as gated, and the dock
+    /// neither replays it nor reads its base. On 2026-09-28 this was five
+    /// of seven parked cars queued 40-60 minutes behind saturated bays for
+    /// a test the train gate runs again on the assembled consist.
+    #[tokio::test]
+    async fn a_car_main_moved_beside_boards_as_gated_unless_a_red_owes_it_a_regate() {
+        let (_g, clone) = clone_fixture("dock-landing-off");
+        let head = park_car(&clone, "feat/g", "apps/web/src/it/yard/phone-strip.ts");
+        land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
+        let c = dock_conductor(&clone);
+        let car = json!({"id": "car-g", "metadata": {"branch": "feat/g", "summary": "G"}});
+        assert_eq!(
+            c.base_hold(&car, "car-g-000", "feat/g", &head).await,
+            None,
+            "no red owes it a re-gate: it boards"
+        );
+        assert_eq!(forge_branch(&clone, "feat/g"), head, "nothing was replayed");
+        // Control: the same car, owed a re-gate by a red train, and the
+        // bound already spent on this main, is HELD — the judgement runs.
+        let main = rev(&clone, "origin/main");
+        let refused = dock_regate::RegateStamp {
+            refused: "boss gate --rebase: REFUSED — hit a conflict in: x".into(),
+            ..dock_regate::RegateStamp::for_main(&main, &[])
+        };
+        let owing = json!({"id": "car-g", "metadata": {
+            "branch": "feat/g",
+            dock_regate::REGATE_OWED: owed(),
+            dock_regate::BASE_REGATE: refused.to_value(Utc::now()),
+        }});
+        assert!(
+            c.base_hold(&owing, "car-g-000", "feat/g", &head)
+                .await
+                .is_some(),
+            "a car a red train owes a re-gate is judged as before"
+        );
     }
 
     /// The bound, end to end: a car already re-gated for the main it would
@@ -7977,13 +8925,13 @@ mod tests {
         };
         let car = json!({"id": "car-g", "metadata": {
             "branch": "feat/g",
+            dock_regate::REGATE_OWED: owed(),
             dock_regate::BASE_REGATE: stamp.to_value(Utc::now()),
         }});
         let c = dock_conductor(&clone);
         let DockHold {
             reason,
             stamp: write,
-            in_round,
             waiting,
         } = c
             .base_hold(&car, "car-g-000", "feat/g", &head)
@@ -7995,10 +8943,6 @@ mod tests {
             "held on the recorded answer, it waits for no bay, so it claims none"
         );
         assert!(write.is_none(), "the recorded answer is not rewritten");
-        assert!(
-            in_round.is_none(),
-            "a refused replay has no gate running, so no departure waits for it"
-        );
         assert_eq!(forge_branch(&clone, "feat/g"), head);
     }
 
@@ -8033,35 +8977,6 @@ mod tests {
         );
     }
 
-    /// D2's hold must never freeze a landing: with a re-gate in flight on
-    /// the very main in the clone, a cadence registry that cannot be read
-    /// departs rather than waits — the bound it would wait against is a
-    /// number nobody could read. And an empty round reads nothing at all.
-    #[tokio::test]
-    async fn a_departure_whose_hold_cannot_be_read_departs() {
-        let (_g, clone) = clone_fixture("dock-hold-unreadable");
-        let main = rev(&clone, "origin/main");
-        let c = dock_conductor(&clone);
-        let now = Utc::now();
-        assert_eq!(c.departure_hold(&[], now).await, None);
-        let round = [dock_regate::InRound {
-            car: "c-1".into(),
-            main: main.clone(),
-            since: now,
-            missed: 0,
-        }];
-        assert_eq!(
-            dock_regate::departure_hold(&round, &main, now, 15).map(|h| h.in_flight),
-            Some(1),
-            "control: the same round, with a readable bound, holds"
-        );
-        assert_eq!(
-            c.departure_hold(&round, now).await,
-            None,
-            "the registry is unreachable (jobs.invalid): depart, loudly"
-        );
-    }
-
     /// A car main moved nowhere near, and a car on current main, board
     /// exactly as before this rule existed.
     #[tokio::test]
@@ -8071,7 +8986,8 @@ mod tests {
         land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
         let fresh = park_car(&clone, "feat/fresh", "apps/web/src/it/yard/phone-strip.ts");
         let c = dock_conductor(&clone);
-        let car = |b: &str| json!({"id": b, "metadata": {"branch": b}});
+        let car =
+            |b: &str| json!({"id": b, "metadata": {"branch": b, dock_regate::REGATE_OWED: owed()}});
         assert_eq!(
             c.base_hold(&car("feat/far"), "far", "feat/far", &far).await,
             None
@@ -8086,41 +9002,19 @@ mod tests {
 
     // -- a red dock re-gate is retried, then garaged (backlog 2fccbfd6) --
 
-    /// A jobs API that answers two reads: every gate-run is `run`, and the
-    /// cadence registry declares a 15-minute re-gate hold on the depth
-    /// board — the live row's value.
+    /// A jobs API that answers one read: every gate-run is `run`. (It
+    /// served the cadence rules too, for the re-gate hold the red retry's
+    /// bound was read from; that bound is fixed since backlog 96f02540.)
     async fn red_regate_api(run: Value) -> String {
         use axum::routing::get;
         use axum::{Json, Router};
-        let rules = serde_json::to_value(vec![boss_jobs::cadence::CadenceRuleRow {
-            name: "train-board-on-dock-depth".into(),
-            verb: "board".into(),
-            basis: "queue-depth".into(),
-            every_minutes: None,
-            at_times: None,
-            min_dock_depth: Some(1),
-            cooldown_minutes: Some(30),
-            cadence: None,
-            anchor_date: None,
-            business_calendar: None,
-            regate_hold_minutes: Some(15),
-        }])
-        .expect("rules");
-        let app = Router::new()
-            .route(
-                "/api/jobs/{id}",
-                get(move || {
-                    let r = run.clone();
-                    async move { Json(r) }
-                }),
-            )
-            .route(
-                "/api/cadence/rules",
-                get(move || {
-                    let r = rules.clone();
-                    async move { Json(r) }
-                }),
-            );
+        let app = Router::new().route(
+            "/api/jobs/{id}",
+            get(move || {
+                let r = run.clone();
+                async move { Json(r) }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -8182,10 +9076,6 @@ mod tests {
             "{}",
             still.reason
         );
-        assert_eq!(
-            still.in_round, None,
-            "a red is nothing a departure waits for"
-        );
         let written = json!({"metadata": {
             dock_regate::BASE_REGATE: still.stamp.clone().expect("the red is written"),
         }});
@@ -8229,6 +9119,12 @@ mod tests {
         );
         assert_eq!(red.checks, vec!["test"]);
 
+        // The next pass reads the car as the first one LEFT it — garaged
+        // red and all — since "already garaged" is read off the car's own
+        // red (backlog f8383a38, L2), not off its red count.
+        let mut car = car;
+        car["metadata"][dock_regate::BASE_REGATE] =
+            written["metadata"][dock_regate::BASE_REGATE].clone();
         land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
         let moved = c.regate_in_flight(&car, "car-g-000", "feat/g", stamp).await;
         assert!(
@@ -8246,6 +9142,38 @@ mod tests {
             boss_jobs::dock_red::regate_red(&still["metadata"]).is_some_and(|r| r.garaged),
             "{still}"
         );
+    }
+
+    /// L2 OF THE ROUND-3 REVIEW OF CAR 5eb1967e (backlog f8383a38), end to
+    /// end. The car's first red was judged and retried (so its stamp
+    /// carries `reds: 1`); the retry came back LOST — an unjudged red,
+    /// which never garages. Main moves, the retry is owed, and here it
+    /// cannot launch: the red it is held on must still say NOT garaged,
+    /// because nothing garaged it. `reds > 0` said it was.
+    #[tokio::test]
+    async fn a_lost_retry_that_cannot_relaunch_is_not_garaged() {
+        let (_g, clone) = clone_fixture("dock-lost-retry");
+        let head = park_car(&clone, "feat/g", "apps/web/src/it/yard/phone-strip.ts");
+        let main = rev(&clone, "origin/main");
+        let (car, stamp) = replayed_car(&main, &head, 1);
+        let mut lost = red_run(5);
+        lost["steps"][0]["metadata"] = json!({"verdict": "lost"});
+        lost["metadata"]["outcome"] = json!("lost");
+        let mut c = dock_conductor(&clone);
+        c.cfg.jobs = red_regate_api(lost).await;
+        land_on_main(&clone, "apps/web/src/it/yard/regions.ts");
+        let moved = c.regate_in_flight(&car, "car-g-000", "feat/g", stamp).await;
+        assert!(
+            moved.reason.contains("could not launch"),
+            "main moved: the retry is attempted — {}",
+            moved.reason
+        );
+        let still = json!({"metadata": {
+            dock_regate::BASE_REGATE: moved.stamp.expect("the red is written"),
+        }});
+        let red = boss_jobs::dock_red::regate_red(&still["metadata"]).expect("a red");
+        assert_eq!(red.verdict, "lost", "{still}");
+        assert!(!red.garaged, "a lost red garages nothing: {still}");
     }
 
     /// A jobs API with state: jobs by id, a list door filtered by `kind`
@@ -8271,6 +9199,33 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+        /// Apply `f` to step `sid` of job `id`: 204, 404 when either is
+        /// not there, and 409 when the step is terminal — the real step
+        /// API's rule (e39a9d2a), which this fake used to wave through,
+        /// so a close aimed at a finished triage step passed here and
+        /// failed live (backlog e61093a1).
+        fn with_step(
+            &self,
+            id: &str,
+            sid: &str,
+            f: impl FnOnce(&mut Value),
+        ) -> axum::http::StatusCode {
+            let mut jobs = self.jobs.lock().unwrap();
+            let step = jobs.get_mut(id).and_then(|j| {
+                j["steps"]
+                    .as_array_mut()?
+                    .iter_mut()
+                    .find(|s| s["id"] == json!(sid))
+            });
+            match step {
+                Some(step) if step_done(Some(step)) => axum::http::StatusCode::CONFLICT,
+                Some(step) => {
+                    f(step);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+                None => axum::http::StatusCode::NOT_FOUND,
+            }
+        }
         async fn serve(&self) -> String {
             use axum::extract::{Path, Query};
             use axum::http::StatusCode;
@@ -8279,6 +9234,7 @@ mod tests {
             use std::collections::HashMap;
             let (list, create, one, merge) =
                 (self.clone(), self.clone(), self.clone(), self.clone());
+            let (step_merge, step_put) = (self.clone(), self.clone());
             let app = Router::new()
                 .route(
                     "/api/jobs",
@@ -8354,6 +9310,36 @@ mod tests {
                             StatusCode::NO_CONTENT
                         }
                     }),
+                )
+                // The step doors a close uses: the merge door, then the
+                // status PUT (`step_completion_writes`).
+                .route(
+                    "/api/jobs/{id}/steps/{sid}/metadata",
+                    axum::routing::patch(
+                        move |Path((id, sid)): Path<(String, String)>, Json(b): Json<Value>| {
+                            let s = step_merge.clone();
+                            async move {
+                                s.with_step(&id, &sid, |step| {
+                                    for (k, v) in b.as_object().cloned().unwrap_or_default() {
+                                        step["metadata"][k] = v;
+                                    }
+                                })
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/api/jobs/{id}/steps/{sid}",
+                    axum::routing::put(
+                        move |Path((id, sid)): Path<(String, String)>, Json(b): Json<Value>| {
+                            let s = step_put.clone();
+                            async move {
+                                s.with_step(&id, &sid, |step| {
+                                    step["status"] = b["status"].clone();
+                                })
+                            }
+                        },
+                    ),
                 );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -8416,6 +9402,276 @@ mod tests {
         );
     }
 
+    /// THE CONDUCTOR RE-JUDGES EVERY CAR'S DIFF WHERE IT BOARDS (backlog
+    /// b7b02024 car 1, design 7cedfa29 D1), end to end on a real clone:
+    /// a car that reached the dock unheld and touches the ops runner is
+    /// HELD on its review step — the marker every dock reader reads, and
+    /// the head it judged beside it — rather than skipped in silence; a
+    /// car released at the head it was held at boards; a release at
+    /// another head is judged again; and a docs car boards, the control
+    /// that shows the walk reached boarding at all. Car 2 of the design:
+    /// the release boards only when it is at the fork's head AND the
+    /// review run it names recorded RELEASE there (read in one GET); a
+    /// run whose verdict was CHANGES, or a review hold cleared bare, is
+    /// held again.
+    #[tokio::test]
+    async fn the_dock_holds_an_unheld_car_whose_diff_touches_an_ops_verb() {
+        use crate::review_verdict::{RELEASE, release_record, review_record};
+        let (_g, clone) = clone_fixture("dock-rejudge");
+        let ops = park_car(&clone, "feat/ops", "infra/ops/ops-runner.sh");
+        let released = park_car(&clone, "feat/released", "infra/ops/released.sh");
+        let moved = park_car(&clone, "feat/moved", "infra/ops/moved.sh");
+        let bare = park_car(&clone, "feat/bare", "infra/ops/bare.sh");
+        let changes = park_car(&clone, "feat/changes", "infra/ops/changes.sh");
+        park_car(&clone, "feat/docs", "docs/notes.md");
+        let sor = Sor::default();
+        let at = |id: &str, branch: &str, review_md: Value| {
+            let mut car = parked_at_review(id, branch, json!({}));
+            car["steps"][0]["metadata"] = review_md;
+            car
+        };
+        // Two reviewer runs: one recorded RELEASE at feat/released's
+        // head, the other CHANGES at feat/changes's.
+        let run = |id: &str, car: &Value, head: &str, verdict: &str| {
+            json!({"id": id, "kind": "agent-run", "status": "open", "metadata": {
+                crate::review_verdict::REVIEW_KEY: review_record(car, head, verdict, "", "t")}})
+        };
+        let release_by = |review: &str, head: &str| {
+            json!({ boss_jobs::car::HOLD_SHA: head,
+                    boss_jobs::car::RELEASE: release_record(head, review, "emp-david", "t", head) })
+        };
+        let car_released = at(
+            "car-released",
+            "feat/released",
+            release_by("run-rel", &released),
+        );
+        let car_changes = at(
+            "car-changes",
+            "feat/changes",
+            release_by("run-chg", &changes),
+        );
+        sor.put(run("run-rel", &car_released, &released, RELEASE));
+        sor.put(run("run-chg", &car_changes, &changes, "changes"));
+        sor.put(car_released);
+        sor.put(car_changes);
+        sor.put(at("car-ops", "feat/ops", json!({})));
+        sor.put(at(
+            "car-moved",
+            "feat/moved",
+            release_by("run-rel", &"0".repeat(40)),
+        ));
+        sor.put(at(
+            "car-bare",
+            "feat/bare",
+            json!({boss_jobs::car::HOLD_SHA: bare}),
+        ));
+        sor.put(at("car-docs", "feat/docs", json!({})));
+        let mut c = dock_conductor(&clone);
+        c.cfg.jobs = sor.serve().await;
+
+        let pass = c.candidates().await.expect("the walk reads the dock");
+        let boards: Vec<&str> = pass
+            .boardable
+            .iter()
+            .map(|(j, _)| j["id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(boards, vec!["car-docs", "car-released"], "{boards:?}");
+        assert_eq!(
+            pass.judged.get("car-released"),
+            Some(&released),
+            "assembly is handed the head the dock judged (F4)"
+        );
+
+        for (id, head, why) in [
+            ("car-ops", &ops, "touches an ops verb"),
+            ("car-moved", &moved, "released at 000000000000"),
+            ("car-bare", &bare, "cleared with no release"),
+            ("car-changes", &changes, "not \"release\""),
+        ] {
+            let review = sor.get(id)["steps"][0]["metadata"].clone();
+            let hold = boss_jobs::stranded::hold_reason(&review)
+                .unwrap_or_else(|| panic!("{id} carries the hold every reader reads: {review}"));
+            assert!(
+                hold.starts_with(&format!("conductor re-judge at {}", &head[..12])),
+                "{hold}"
+            );
+            assert!(hold.contains(why), "{id}: {why} in {hold}");
+            assert_eq!(review[crate::mutating_verb::HOLD_SHA], json!(head));
+            assert!(
+                pass.left_behind
+                    .iter()
+                    .any(|l| l["car_id_short"] == json!(id8(id))
+                        && l["reason"].as_str().is_some_and(|r| r == hold)),
+                "the train's books name {id}: {:?}",
+                pass.left_behind
+            );
+        }
+        assert!(
+            pass.held.is_empty(),
+            "a review hold waits on a person, not the dock: {:?}",
+            pass.held
+        );
+        assert!(
+            !parked_ready(&sor.get("car-ops")),
+            "so the next pass and the cadence count no longer see it"
+        );
+    }
+
+    /// A RELEASE SURVIVES THE DOCK'S OWN REPLAY (review F3), end to end on
+    /// a real clone. Two released cars, both replayed onto a main that
+    /// moved: one replay carries the car's change unchanged and boards,
+    /// its release recorded at the new head and still naming the head the
+    /// review READ; the other's replay also changed the car's own file,
+    /// and it is held for a review of the new head.
+    #[tokio::test]
+    async fn a_release_is_carried_over_the_docks_replay_and_nothing_else() {
+        use crate::review_verdict::{RELEASE, release_record, review_record};
+        let (_g, clone) = clone_fixture("dock-release-carry");
+        let h1 = park_car(&clone, "feat/carry", "infra/ops/carry.sh");
+        let e1 = park_car(&clone, "feat/edited", "infra/ops/edited.sh");
+        land_on_main(&clone, "apps/web/src/other.ts");
+        // The dock's replay of each car onto the new main.
+        let replay = |branch: &str, h: &str, extra: Option<&str>| -> String {
+            git_ok(&clone, &["checkout", "-q", "-B", branch, "main"]);
+            git_ok(&clone, &["cherry-pick", h]);
+            if let Some(path) = extra {
+                std::fs::write(clone.join(path), "and more").expect("write");
+                git_ok(&clone, &["commit", "-qam", "the replay changed it"]);
+            }
+            git_ok(&clone, &["push", "-qf", "fork", branch]);
+            git_ok(&clone, &["push", "-qf", "origin", branch]);
+            git_ok(&clone, &["checkout", "-q", "main"]);
+            rev(&clone, branch)
+        };
+        let h2 = replay("feat/carry", &h1, None);
+        let e2 = replay("feat/edited", &e1, Some("infra/ops/edited.sh"));
+        let sor = Sor::default();
+        let car = |id: &str, branch: &str, from: &str, to: &str, run: &str| {
+            let mut car = parked_at_review(
+                id,
+                branch,
+                json!({ dock_regate::BASE_REGATE: {"main": "m", "base": "b", "head": to,
+                                                   "from": from} }),
+            );
+            car["steps"][0]["metadata"] = json!({ boss_jobs::car::HOLD_SHA: from,
+                boss_jobs::car::RELEASE: release_record(from, run, "emp-david", "t", from) });
+            car
+        };
+        let carried = car("car-carry", "feat/carry", &h1, &h2, "run-a");
+        let edited = car("car-edited", "feat/edited", &e1, &e2, "run-b");
+        for (run, c, h) in [("run-a", &carried, &h1), ("run-b", &edited, &e1)] {
+            sor.put(
+                json!({"id": run, "kind": "agent-run", "status": "open", "metadata": {
+                crate::review_verdict::REVIEW_KEY: review_record(c, h, RELEASE, "", "t")}}),
+            );
+        }
+        sor.put(carried);
+        sor.put(edited);
+        let mut c = dock_conductor(&clone);
+        c.cfg.jobs = sor.serve().await;
+
+        let pass = c.candidates().await.expect("the walk reads the dock");
+        let boards: Vec<&str> = pass
+            .boardable
+            .iter()
+            .map(|(j, _)| j["id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(boards, vec!["car-carry"], "{boards:?}");
+        let rel = sor.get("car-carry")["steps"][0]["metadata"][boss_jobs::car::RELEASE].clone();
+        assert_eq!(
+            rel["sha"],
+            json!(h2),
+            "the release moved to the replayed head"
+        );
+        assert_eq!(
+            rel["reviewed_sha"],
+            json!(h1),
+            "and names the head its review read"
+        );
+        assert_eq!(rel["carried_from"], json!(h1));
+
+        let review = sor.get("car-edited")["steps"][0]["metadata"].clone();
+        let hold = boss_jobs::stranded::hold_reason(&review).expect("held");
+        assert!(hold.contains("its own diff changed"), "{hold}");
+        assert_eq!(review[boss_jobs::car::HOLD_SHA], json!(e2));
+    }
+
+    /// WHAT RIDES IS WHAT WAS JUDGED (review F4, N3 of its re-review). The
+    /// dock judges a docs car boardable; its fork branch then moves
+    /// before assembly. Assembly is handed the judged head, finds the
+    /// fork no longer carries it, and leaves the car for the next walk —
+    /// it never merges the unjudged head.
+    #[tokio::test]
+    async fn a_car_whose_fork_head_moved_after_the_judge_is_left_behind() {
+        let (_g, clone) = clone_fixture("dock-judged-head");
+        let judged_at = park_car(&clone, "feat/docs", "docs/notes.md");
+        let sor = Sor::default();
+        sor.put(parked_at_review("car-docs", "feat/docs", json!({})));
+        let mut c = dock_conductor(&clone);
+        c.cfg.jobs = sor.serve().await;
+        let pass = c.candidates().await.expect("the walk reads the dock");
+        assert_eq!(pass.judged.get("car-docs"), Some(&judged_at));
+        let clone_s = clone.display().to_string();
+        assert_eq!(
+            judged_head(&clone_s, &pass.judged, "car-docs", "feat/docs").unwrap(),
+            Ok(judged_at.clone()),
+            "control: unmoved, the judged head is what rides"
+        );
+
+        // The branch moves on the fork after the judge (a builder's push).
+        git_ok(&clone, &["checkout", "-q", "feat/docs"]);
+        std::fs::write(clone.join("docs/unjudged.md"), "an unjudged change\n").expect("write");
+        git_ok(&clone, &["add", "-A"]);
+        git_ok(&clone, &["commit", "-qm", "an unjudged change"]);
+        git_ok(&clone, &["push", "-q", "fork", "feat/docs"]);
+        git_ok(&clone, &["checkout", "-q", "main"]);
+        git_ok(&clone, &["fetch", "-q", "fork"]);
+
+        let left = judged_head(&clone_s, &pass.judged, "car-docs", "feat/docs")
+            .unwrap()
+            .expect_err("the moved head does not ride");
+        assert!(left.contains(&judged_at[..8]), "{left}");
+        assert!(left.contains("judged again next window"), "{left}");
+        // Never judged at all: nothing rides.
+        assert!(
+            judged_head(&clone_s, &Default::default(), "car-docs", "feat/docs")
+                .unwrap()
+                .is_err()
+        );
+        // And assembly calls it before any merge.
+        let src = include_str!("conductor.rs");
+        let loop_at = src
+            .find("for (j, branch) in cands {")
+            .expect("the assembly loop");
+        let body = &src[loop_at..];
+        assert!(
+            body.find("judged_head(clone, &judged, &jid, &branch)?")
+                .expect("the guard")
+                < body.find("\"merge\",").expect("the merge"),
+            "assembly asks for the judged head before it merges"
+        );
+    }
+
+    /// A HOLD THAT CANNOT BE WRITTEN STILL KEEPS THE CAR OFF THIS TRAIN.
+    /// The dock here has no step door at all, so the write fails; the car
+    /// does not board, the walk completes, and the failure rides in the
+    /// train's books beside the reason.
+    #[tokio::test]
+    async fn a_failed_review_hold_write_still_keeps_the_car_off_the_train() {
+        let (_g, clone) = clone_fixture("dock-rejudge-unwritable");
+        park_car(&clone, "feat/ops", "infra/ops/ops-runner.sh");
+        let merges = walk_dock_in(
+            &clone,
+            vec![parked_car("car-ops", json!({"branch": "feat/ops"}))],
+            vec![],
+        )
+        .await;
+        assert!(
+            merges.is_empty(),
+            "no job-metadata write stands in for the hold: {merges:?}"
+        );
+    }
+
     /// A DOCK OF A GARAGED CAR IS NOT SILENT (the re-review of car
     /// 5eb1967e, A), end to end. The first walk of the dock garages a car
     /// whose re-gate went red twice on an unmoved main and writes the red
@@ -8457,7 +9713,7 @@ mod tests {
         let first = c.candidates().await.expect("the refresh walks the dock");
         assert!(first.boardable.is_empty());
         assert_eq!(
-            crate::cadence::probe_dock_depth(&reqwest::Client::new(), &c.cfg.jobs)
+            crate::cadence::probe_dock_depth(&crate::gate::machine_client().unwrap(), &c.cfg.jobs)
                 .await
                 .expect("the probe reads the dock"),
             1,
@@ -8477,28 +9733,20 @@ mod tests {
         assert!(refusal_persists(&refusal), "so the stall alarm is reached");
     }
 
-    /// A GARAGED CAR'S RETRY IS AT BUILDER PRIORITY AND HOLDS NO TRAIN
-    /// (the re-review of car 5eb1967e, B). Its once-per-main-move re-gate
-    /// goes through the same launch as any dock re-gate, which would claim
-    /// the next bay ahead of every builder (`waiting`) and, launched, join
-    /// the round a departure waits up to 15-30 minutes for (`in_round`).
-    /// For a car whose red is likely its own, neither is owed: the retry
-    /// still happens, and waits its turn like a builder's gate.
+    /// A GARAGED CAR'S RETRY IS AT BUILDER PRIORITY (the re-review of car
+    /// 5eb1967e, B). Its once-per-main-move re-gate goes through the same
+    /// launch as any dock re-gate, which would claim the next bay ahead of
+    /// every builder (`waiting`). For a car whose red is likely its own,
+    /// that is not owed: the retry still happens, and waits its turn like
+    /// a builder's gate.
     #[test]
-    fn a_garaged_cars_retry_claims_no_bay_and_joins_no_round() {
+    fn a_garaged_cars_retry_claims_no_bay() {
         let launched = DockHold {
             reason: "re-gating on current main".into(),
             stamp: Some(json!({"main": "m2"})),
-            in_round: Some(dock_regate::InRound {
-                car: "car-g".into(),
-                main: "m2".into(),
-                since: Utc::now(),
-                missed: 0,
-            }),
             waiting: Some("m2".into()),
         };
         let garaged = retry_hold(launched.clone(), 1);
-        assert_eq!(garaged.in_round, None, "no departure waits for it");
         assert_eq!(garaged.waiting, None, "no bay is claimed ahead of builders");
         assert_eq!(
             garaged.stamp, launched.stamp,
@@ -8508,7 +9756,7 @@ mod tests {
         assert_eq!(
             retry_hold(launched.clone(), 0),
             launched,
-            "a first red's retry keeps the round and the claim: its red may be main's"
+            "a first red's retry keeps its claim: its red may be main's"
         );
     }
 
@@ -8549,6 +9797,238 @@ mod tests {
         c.count_left_behind(&["car-a".to_string()]).await;
         assert_eq!(sor.posts.lock().unwrap().len(), 1, "adopted, not twinned");
         assert_eq!(sor.get("car-a")["metadata"][LEFT_BEHIND_ALARM], "alarm-1");
+    }
+
+    /// ITEM 6 OF BACKLOG 7919fdcc, end to end: the reconcile pass closes a
+    /// left-behind alarm whose car has boarded — on its `stale` terminal,
+    /// marked as the machine's clear — and leaves the alarm of a car still
+    /// being left behind exactly as it is. Before this, boarding took the
+    /// streak and the alarm's id off the car and the alarm stayed open,
+    /// urgent, naming a car that had left.
+    #[tokio::test]
+    async fn a_left_behind_alarm_closes_itself_once_its_car_boards() {
+        let sor = Sor::default();
+        for (alarm, car) in [("alarm-1", "car-a"), ("alarm-2", "car-b")] {
+            sor.put(json!({
+                "id": alarm, "kind": "backlog-item", "status": "open",
+                "metadata": {"left_behind_car": car, "left_behind_branch": "feat/x"},
+                "steps": [{"id": format!("{alarm}-triage"), "spec_slug": "triage",
+                           "title": "Measure the claim, choose a route",
+                           "status": "ready", "metadata": {}}],
+            }));
+        }
+        sor.put(
+            json!({"id": "car-a", "kind": "ship-a-change", "status": "open",
+                       "metadata": {"branch": "feat/a", "train": "train-1"}}),
+        );
+        sor.put(
+            json!({"id": "car-b", "kind": "ship-a-change", "status": "open",
+                       "metadata": {"branch": "feat/b", LEFT_BEHIND_TRAINS: 3,
+                                    LEFT_BEHIND_ALARM: "alarm-2"}}),
+        );
+        settle_conductor(sor.serve().await)
+            .alarm_stranded_greens(Utc::now())
+            .await
+            .expect("the pass runs");
+
+        let closed = sor.get("alarm-1")["steps"][0].clone();
+        assert_eq!(closed["status"], "completed", "{closed}");
+        assert_eq!(closed["metadata"]["disposition"], "stale");
+        assert_eq!(closed["metadata"]["cleared_by"], LEFT_BEHIND_CLEARED_BY);
+        assert!(
+            closed["metadata"]["evidence"]
+                .as_str()
+                .is_some_and(|e| e.contains("feat/a") && e.contains("boarded")),
+            "{closed}"
+        );
+        let standing = sor.get("alarm-2")["steps"][0].clone();
+        assert_eq!(standing["status"], "ready", "still left behind: {standing}");
+        assert!(sor.posts.lock().unwrap().is_empty(), "nothing is filed");
+    }
+
+    /// File a LEFT BEHIND alarm for `car` through the real body, on the
+    /// real jobs router, and return its id.
+    async fn file_left_behind_alarm(c: &Conductor, car: &Value) -> String {
+        let made = c
+            .api(
+                Method::POST,
+                "/api/jobs",
+                Some(left_behind_alarm_body(
+                    car,
+                    LEFT_BEHIND_ALARM_TRAINS,
+                    Utc::now(),
+                    "emp-bootstrap-admin",
+                )),
+            )
+            .await
+            .expect("the alarm is filed")
+            .expect("with a body");
+        made["id"].as_str().expect("an id").to_string()
+    }
+
+    /// Every open backlog-item, as the reconcile pass reads them.
+    async fn open_backlog_items(c: &Conductor) -> Vec<Value> {
+        let page = c
+            .api(
+                Method::GET,
+                "/api/jobs?kind=backlog-item&status=open&limit=100",
+                None,
+            )
+            .await
+            .expect("the list reads")
+            .expect("with a body");
+        assert_eq!(
+            page["total"].as_u64(),
+            page["data"].as_array().map(|d| d.len() as u64),
+            "one page holds them all: {page:#}"
+        );
+        page["data"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// BACKLOG e61093a1, against the REAL jobs router and the real
+    /// backlog-item row. Measured 2026-09-28 07:10Z: the conductor found
+    /// alarms 11ea6b8b and 80b961bf ended (their cars had left the dock)
+    /// and could not close either — both had been triaged to `build`
+    /// hours earlier, and the close PATCHed the COMPLETED triage step,
+    /// which the step API refuses 409 as terminal. So an alarm closes at
+    /// the step its packet is waiting on: `triage` while it is open, a
+    /// READY `build` with `disposition = stale` once a route opened it
+    /// (the row's `stale` terminal reads both), and an ACTIVE `build` —
+    /// an executor holds it — is told once on the packet rather than
+    /// completed from under its executor. Every close carries the
+    /// machine's `cleared_by`, and a closed alarm drops out of the open
+    /// list the next pass judges, so nothing retries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_left_behind_alarm_closes_on_its_own_terminal_wherever_its_route_stands() {
+        let c = settle_conductor(crate::car_unland::tests::serve().await);
+        let car = |id: &str| {
+            json!({"id": id, "kind": "ship-a-change", "status": "open",
+                   "metadata": {"branch": format!("feat/{id}"),
+                                "skip_reason": "main moved into this car's files"}})
+        };
+        let (at_triage, at_build, held) = (car("car-t"), car("car-b"), car("car-h"));
+        let alarm_t = file_left_behind_alarm(&c, &at_triage).await;
+        let alarm_b = file_left_behind_alarm(&c, &at_build).await;
+        let alarm_h = file_left_behind_alarm(&c, &held).await;
+
+        // Two of them routed to `build` by a person, as 11ea6b8b was.
+        for alarm in [&alarm_b, &alarm_h] {
+            let job = c.get_job(alarm).await.unwrap();
+            c.complete_step(
+                &job,
+                find_step(&job, "triage", ""),
+                &[
+                    ("disposition", Some("build".to_string())),
+                    ("evidence", Some("measured: the car is held".to_string())),
+                ],
+            )
+            .await
+            .expect("triaged to build");
+        }
+        // And one of those two claimed by an executor.
+        let job = c.get_job(&alarm_h).await.unwrap();
+        let build = find_step(&job, "build", "").expect("a build step");
+        assert_eq!(build["status"], "ready", "{job:#}");
+        let bid = build["id"].as_str().unwrap().to_string();
+        c.api(
+            Method::POST,
+            &format!("/api/jobs/{alarm_h}/steps/{bid}/claim"),
+            Some(json!({})),
+        )
+        .await
+        .expect("the executor claims the build");
+
+        // Every car has left the dock: every alarm's claim has ended.
+        let gone: Vec<Value> = [&at_triage, &at_build, &held]
+            .into_iter()
+            .map(|c| {
+                let mut c = c.clone();
+                c["status"] = json!("closed");
+                c
+            })
+            .collect();
+        let open = open_backlog_items(&c).await;
+        assert_eq!(open.len(), 3, "{open:#?}");
+        c.clear_left_behind_alarms(&open, &gone).await;
+
+        // Which terminal the packet reached. An `outcome` step is a
+        // marker: it goes READY here and the dispatcher's
+        // `complete-marker-on-step-ready` completes it live, closing the
+        // packet — this router has no dispatcher, so READY is the read.
+        let reached = |job: &Value| -> Vec<String> {
+            ["stale", "closed", "duplicate", "declined"]
+                .into_iter()
+                .filter(|s| find_step(job, s, "").is_some_and(|st| st["status"] == "ready"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        // AT TRIAGE: closed `stale` through the triage step.
+        let t = c.get_job(&alarm_t).await.unwrap();
+        assert_eq!(reached(&t), vec!["stale"], "{t:#}");
+        let triage = find_step(&t, "triage", "").unwrap();
+        assert_eq!(triage["metadata"]["disposition"], "stale");
+        assert_eq!(triage["metadata"]["cleared_by"], LEFT_BEHIND_CLEARED_BY);
+
+        // AT BUILD: closed `stale` through the build step; the person's
+        // route on the triage step is left exactly as they recorded it.
+        let b = c.get_job(&alarm_b).await.unwrap();
+        assert_eq!(reached(&b), vec!["stale"], "{b:#}");
+        let build = find_step(&b, "build", "").unwrap();
+        assert_eq!(build["status"], "completed", "{build:#}");
+        assert_eq!(build["metadata"]["disposition"], "stale");
+        assert_eq!(build["metadata"]["cleared_by"], LEFT_BEHIND_CLEARED_BY);
+        assert!(
+            build["metadata"]["evidence"]
+                .as_str()
+                .is_some_and(|e| e.contains("feat/car-b") && e.contains("left the dock")),
+            "{build:#}"
+        );
+        let triage = find_step(&b, "triage", "").unwrap();
+        assert_eq!(triage["metadata"]["disposition"], "build");
+        assert!(triage["metadata"].get("cleared_by").is_none(), "{triage:#}");
+
+        // HELD BY AN EXECUTOR: open, told once on the packet.
+        let h = c.get_job(&alarm_h).await.unwrap();
+        assert_eq!(h["status"], "open", "{h:#}");
+        assert!(reached(&h).is_empty(), "{h:#}");
+        assert_eq!(
+            find_step(&h, "build", "").unwrap()["status"],
+            "active",
+            "never completed from under its executor"
+        );
+        assert_eq!(h["metadata"]["recovered_by"], LEFT_BEHIND_CLEARED_BY);
+        let told_at = h["metadata"]["recovered_at"].clone();
+        assert!(
+            h["metadata"]["recovery"]
+                .as_str()
+                .is_some_and(|r| r.contains("active")),
+            "{h:#}"
+        );
+
+        // The marker rule's half, done here as it is live: the ready
+        // `stale` terminal completes, and the packet CLOSES on it.
+        for alarm in [&alarm_t, &alarm_b] {
+            let job = c.get_job(alarm).await.unwrap();
+            c.complete_step(&job, find_step(&job, "stale", ""), &[])
+                .await
+                .expect("the marker completes");
+            let job = c.get_job(alarm).await.unwrap();
+            assert_eq!(job["status"], "closed", "{job:#}");
+            assert_eq!(job["metadata"]["outcome"], "stale", "{job:#}");
+        }
+
+        // THE NEXT PASS: the two closed alarms are no longer open, so no
+        // pass judges them again; the held one is not told twice.
+        let open = open_backlog_items(&c).await;
+        let still: Vec<String> = left_behind_alarms_to_clear(&open, &gone)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(still, vec![alarm_h.clone()]);
+        c.clear_left_behind_alarms(&open, &gone).await;
+        let h = c.get_job(&alarm_h).await.unwrap();
+        assert_eq!(h["metadata"]["recovered_at"], told_at, "told once");
     }
 
     /// A red on a main that never moves is re-gated at the SAME head once

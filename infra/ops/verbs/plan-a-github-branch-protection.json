@@ -1,0 +1,13 @@
+{
+  "about": "READ-ONLY: renders what `github-set-branch-protection` WOULD set on a GitHub repository, and changes nothing (infra/forge/github-act.sh set-branch-protection --plan; design 76155676, backlog 6a8ff89f). It reads, as the GitHub App's installation on <owner>, the repository and its own rulesets (one page, refused when full), finds the ONE ruleset this verb owns for the pattern — named `boss: refs/heads/<pattern>` — and renders it as it stands and as it would be: the fixed rules (creation, update restricted, deletion, non_fast_forward, and required_status_checks when checks are named), the push allowlist as bypass actors (app:<App id>, team:<team id>, or none), and the act — POST a new ruleset, PUT that one whole, or none when it already reads as desired. Two rulesets under that name, an archived, moved or invisible repository, a malformed pattern, allowlist or check list, or an unusable token slot is a refusal, exit 78, not a plan. No clock and no token in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/github-act.sh", "set-branch-protection", "--plan", "{1}", "{2}", "{3}", "{4}", "{5}"],
+  "params": [
+    { "name": "owner", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+    { "name": "repo", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$" },
+    { "name": "pattern", "pattern": "^[A-Za-z0-9_*][A-Za-z0-9._/*-]{0,199}$" },
+    { "name": "push_allow", "pattern": "^(none|(app|team):[0-9]{1,12}(,(app|team):[0-9]{1,12}){0,9})$" },
+    { "name": "checks", "pattern": "^(none|[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}(,[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}){0,19})$" }
+  ],
+  "timeout": 120
+}

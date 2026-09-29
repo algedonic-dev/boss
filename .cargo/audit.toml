@@ -5,20 +5,26 @@
 # `cargo audit` scans Cargo.lock entries; the lockfile records
 # every package the resolver considered (including OPTIONAL
 # dependencies that aren't actually compiled in any of our
-# binaries). The rsa entry below is exactly that case.
+# binaries). The rsa entry below USED to be that case; since design
+# 76155676 it is compiled in, and its entry says why it is still
+# accepted.
 
 [advisories]
 ignore = [
     # rsa 0.9.10 carries the Marvin Attack timing sidechannel
-    # (RUSTSEC-2023-0071). Pulled by sqlx-mysql 0.8.6, which sqlx
-    # 0.8 lists as an OPTIONAL dependency. Every sqlx dep in this
-    # workspace declares `default-features = false` + an explicit
-    # feature list that includes only `postgres` — so sqlx-mysql
-    # (and therefore rsa) is never compiled into any binary.
-    # `cargo audit` walks the lockfile not the build graph, so
-    # it still flags rsa as present.
-    # Revisit when: sqlx releases a version that stops resolving
-    # sqlx-mysql in Cargo.lock under default-features = false.
+    # (RUSTSEC-2023-0071). It IS compiled in: boss-dispatcher-handlers
+    # uses it to sign the credential broker's GitHub App JWTs (design
+    # 76155676, backlog 81eb6d4d; until then only an optional sqlx-mysql
+    # dependency named it, never built). Why the advisory does not
+    # reach that use: Marvin recovers a key by timing many DECRYPTIONS
+    # of attacker-chosen ciphertexts. The broker only SIGNS (PKCS#1 v1.5
+    # over a JWT it authors itself — no attacker-chosen input), about a
+    # hundred times a day, on the dispatcher's clock and on rotation
+    # packets, off any request path an outsider can drive or time.
+    # Revisit when: RustCrypto `rsa` ships a release with constant-time
+    # private-key operations (the 0.10 line; the advisory's own fix
+    # note) — then take it and drop this ignore — or the moment any
+    # code DECRYPTS with rsa, or signs input an outsider supplies.
     "RUSTSEC-2023-0071",
     # The rustls-webpki 0.101.7 advisories (RUSTSEC-2026-0098 /
     # -0099 / -0104) were removed: the AWS SDK that pulled

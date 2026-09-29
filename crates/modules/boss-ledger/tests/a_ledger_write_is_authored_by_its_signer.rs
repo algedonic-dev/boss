@@ -246,10 +246,12 @@ async fn a_manual_entry_naming_its_own_signer_is_admitted() {
     assert_eq!(fact_rows(&db, "finance.manual.entry").await[0].3, "emp-cfo");
 }
 
-/// An unsigned write is credited to the same actor its event is stamped
-/// with (`automation:platform`), never to a word the body chose.
+/// An unsigned write has no author to record, so it is refused 401 and
+/// writes nothing (backlog 34f0a954: posting asks policy for its
+/// caller). It used to be credited to `automation:platform`, an author
+/// no one had named.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unsigned_manual_entry_is_credited_as_its_event_is() {
+async fn an_unsigned_manual_entry_is_refused_and_writes_nothing() {
     let db = TestDb::new().await;
     let (status, body) = post_as(
         &db,
@@ -258,11 +260,9 @@ async fn an_unsigned_manual_entry_is_credited_as_its_event_is() {
         manual_entry(json!({})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        fact_rows(&db, "finance.manual.entry").await[0].3,
-        "automation:platform"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(fact_rows(&db, "finance.manual.entry").await.is_empty());
+    assert_eq!(staged(&db, "ledger.manual_entry.submitted").await, 0);
 }
 
 // --- COGS recognition (7bf42e2b) --------------------------------------------

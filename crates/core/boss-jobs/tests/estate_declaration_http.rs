@@ -54,7 +54,8 @@ fn launcher() -> String {
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
-    let policy: Arc<dyn PolicyClient> = Arc::new(FakePolicyClient::builder().build());
+    let policy: Arc<dyn PolicyClient> =
+        Arc::new(FakePolicyClient::builder().with_default_rules().build());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState::minimal(
@@ -103,7 +104,7 @@ fn declaration() -> Value {
 #[tokio::test]
 async fn a_declaration_lands_and_the_estate_read_serves_it() {
     let (app, jobs) = app();
-    let (status, body, _) = send(&app, "GET", "/api/estate/nodes", None, None).await;
+    let (status, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"], json!([]), "a fresh registry declares nothing");
 
@@ -121,7 +122,7 @@ async fn a_declaration_lands_and_the_estate_read_serves_it() {
         json!({ "received": 2, "inserted": 2, "roles_inserted": 1 })
     );
 
-    let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, None).await;
+    let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
     let nodes = body["data"].as_array().unwrap();
     assert_eq!(nodes.len(), 2);
     let forge = nodes.iter().find(|n| n["id"] == "forge").unwrap();
@@ -200,7 +201,7 @@ async fn a_role_added_later_lands_on_a_kept_node_and_the_fact_says_so() {
         body,
         json!({ "received": 2, "inserted": 0, "roles_inserted": 1 })
     );
-    let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, None).await;
+    let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
     let forge = body["data"]
         .as_array()
         .unwrap()

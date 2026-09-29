@@ -122,6 +122,11 @@ export type UngatedSurfaceId =
   // of the family it sits in, as Drift does, rather than widening the
   // RouteName vocabulary.
   | 'system-agents'
+  // 'system-credentials' (the Credentials tab on Registry): the
+  // credentials registry drawn, its lifecycle filed as packets (backlog
+  // 851259b9). It borrows the `workflows` gate of the family it sits in,
+  // as Agents does; the registry read itself is operator-tier upstream.
+  | 'system-credentials'
   | 'system-fleet'
   | 'hr'
   | 'watchlist'
@@ -182,6 +187,10 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // Agents live here and never on the People roster (David, 2026-09-26,
   // answering 6a123f1f; backlog 62988516).
   'system-agents':           { id: 'system-agents',           label: 'Agents',              path: '/it/registry/agents', permKey: 'workflows',            owner: 'it', unlisted: true },
+  // What the estate holds access with — declared, rotated and retired as
+  // packets, never a value on the page (David 2026-09-27, design
+  // 76155676 step 3; backlog 851259b9).
+  'system-credentials':      { id: 'system-credentials',      label: 'Credentials',         path: '/it/registry/credentials', permKey: 'workflows',       owner: 'it', unlisted: true },
   'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true },
   // The editor's path is a PATTERN, spelled the way surface-opens records
   // every open of it (routePattern). It shared the list's path until

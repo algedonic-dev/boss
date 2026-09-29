@@ -63,7 +63,18 @@ export function yardAlerts(s: Scene, status: YardStatus | null, nowMs: number): 
           text: `gate bay ${b.index + 1} · ${b.branch} STALE — past the runner's usual; the verdict may never reach the packet; re-gate`,
           since: b.since,
         }]
-      : [],
+      : // The bay the gates region calls troubled: RUNNING past twice the
+        // median, dated from its Job — never a run merely old in line
+        // (backlog 4d088a7e).
+        b.troubled && b.branch !== null
+        ? [{
+            id: `bay:${b.index}`,
+            subject: `bay:${b.index}`,
+            sev: 'warn',
+            text: `gate bay ${b.index + 1} · ${b.branch} TROUBLED — running past 2× the median${b.times !== null ? ` (${b.times})` : ''}`,
+            since: b.launchedAt ?? b.since,
+          }]
+        : [],
   );
 
   // The garage, one alert per car, in the server's words for the check

@@ -13,9 +13,12 @@
 // overflow banner.
 //
 // The envelope is the only accepted shape. A bare-array response is
-// a contract violation and normalises to an empty page, so the
-// regression shows up as a visibly empty list rather than an
-// unnoticed uncapped one.
+// a contract violation: `fetchPaged` answers it as a failed read naming
+// what came back (backlog 0ef5e008), because the empty page `normalise`
+// makes of it was painted as "nothing exists" — a visibly empty list is
+// still a false one.
+
+import { readEnvelope } from './shape';
 
 export type Paged<T> = Readonly<{
   data: ReadonlyArray<T>;
@@ -37,6 +40,11 @@ export async function fetchPaged<T>(url: string): Promise<PagedResult<T>> {
     const resp = await fetch(url);
     if (!resp.ok) return { kind: 'failed', error: `${url}: HTTP ${resp.status}` };
     const body = (await resp.json()) as unknown;
+    // A 200 that is not the envelope is a failed read, not an empty
+    // page (backlog 0ef5e008): `normalise` alone answered `[]` for it,
+    // and every list page painted that as its empty state. The throw
+    // names the url and what came back instead.
+    readEnvelope(url, body);
     return { kind: 'ready', page: normalise<T>(body) };
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);

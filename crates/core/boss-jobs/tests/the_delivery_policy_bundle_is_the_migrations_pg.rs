@@ -1,6 +1,11 @@
 //! The platform delivery-policy bundle (`infra/platform/delivery-policy/`)
-//! declares exactly the ACTIVE row the migrations produce — every
-//! column — and can be the registry's only home.
+//! declares every ACTIVE row the migrations produce — at that version,
+//! column for column, or at a later version — and can be the registry's
+//! only home. Since 2026-09-28 it LEADS them: `train-conductor` v3 (the
+//! fourth gate bay, backlog 366c2ed5) exists in the bundle alone, the
+//! edit path migrations-declare-schema-only leaves — the same rule the
+//! cadence (cab50f4c) and station (08372fdb) pins settled on their own
+//! first bundle-only bumps.
 //!
 //! MEASURED 2026-09-18 on origin/main 478231fb (backlog 393d3234,
 //! consolidation H4, car 4 of 4 — the last registry). Two migrations
@@ -20,14 +25,14 @@
 //!
 //! TWO PINS, in the order the move needs them:
 //!
-//!   1. The bundle is COMPLETE before it becomes the home: the active
-//!      rows a TestDb holds after the migrations equal the rows the
-//!      bundle declares, name for name and column for column
-//!      (`created_at` excepted — it is when the deployment was built,
-//!      not part of the declaration).
+//!   1. The bundle is COMPLETE: every active row a TestDb holds after
+//!      the migrations has a file, at that version or ahead of it, and
+//!      where the versions match, column for column (`created_at`
+//!      excepted — it is when the deployment was built, not part of the
+//!      declaration).
 //!   2. The bundle can be the ONLY home: with the `delivery_policy`
 //!      table emptied, the seed's publish function recreates the
-//!      migration row exactly — same version, same columns, active.
+//!      BUNDLE exactly — same version, same columns, active.
 //!
 //! And the three edges of the decision table: a bundle row that
 //! differs from the live active row of the same (name, version) is
@@ -96,8 +101,23 @@ async fn every_name(db: &TestDb) -> Vec<String> {
         .expect("names")
 }
 
+/// How many bundle rows sit at a HIGHER version than the live active
+/// row of their name — the rows a seed over `live` PUBLISHES. Derived,
+/// never assumed zero: the pins below took it as zero until 2026-09-28,
+/// which was true only while no policy had changed since the cutover;
+/// the first bundle-only bump (v3, backlog 366c2ed5) made it one.
+fn ahead_of(live: &[DeliveryPolicySpec]) -> usize {
+    let live: BTreeMap<&str, i32> = live.iter().map(|s| (s.name(), s.version())).collect();
+    bundle()
+        .iter()
+        .filter(|s| live.get(s.name()).is_some_and(|v| s.version() > *v))
+        .count()
+}
+
 /// PIN 1 — every active row the migrations produce is declared in the
-/// bundle, column for column, and the bundle declares nothing else.
+/// bundle, at its version or AHEAD of it, and where the versions match,
+/// column for column; the bundle declares no name the migrations do
+/// not (one pipeline, one policy).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundle_declares_every_active_row_the_migrations_produce() {
     let db = TestDb::new().await;
@@ -116,24 +136,54 @@ async fn the_bundle_declares_every_active_row_the_migrations_produce() {
          the migrations seed and the bundle does not declare has no home once \
          migrations declare schema only)"
     );
+    // THE BUNDLE MAY BE AHEAD; IT MAY NEVER BE BEHIND; AND WHERE THE
+    // VERSIONS MATCH, EVERY COLUMN MUST AGREE — the rule the cadence
+    // pin settled on its own first bump (backlog cab50f4c, David chose
+    // it over plain equality) and the station pin followed (08372fdb).
     for (name, migrated) in &from_migrations {
         let declared = &from_bundle[name];
-        assert_eq!(
-            declared, migrated,
-            "infra/platform/delivery-policy/{name}.toml must equal the active row the \
-             migrations produce, every column (left = bundle, right = migrations)"
+        let dv = declared["version"].as_i64().expect("a bundle version");
+        let mv = migrated["version"].as_i64().expect("a migration version");
+        assert!(
+            dv >= mv,
+            "infra/platform/delivery-policy/{name}.toml declares v{dv}, BEHIND the v{mv} \
+             the migrations produce — a fresh database would serve the older row and \
+             history would silently win"
         );
+        if dv == mv {
+            assert_eq!(
+                declared, migrated,
+                "infra/platform/delivery-policy/{name}.toml is at the migrations' version \
+                 but differs from it — a column changed without the version bump that says \
+                 so (left = bundle, right = migrations)"
+            );
+        }
     }
+
+    // And what a booted deployment then SERVES is the bundle: the seed
+    // over the migrations publishes the rows that lead.
+    seed_delivery_policies(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("the bundle seeds over the migrations");
+    assert_eq!(
+        declarations(&active_rows(&registry, &every_name(&db).await).await),
+        from_bundle,
+        "after the seed, the active rows are the bundle, every column"
+    );
 }
 
 /// PIN 2 — with the table emptied, the seed alone rebuilds exactly the
-/// migration row: same version, same columns, active.
+/// bundle: same version, same columns, active.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
     let db = TestDb::new().await;
     let registry = PgDeliveryPolicy::new(db.pool.clone());
     let names = every_name(&db).await;
-    let expected = declarations(&active_rows(&registry, &names).await);
+    // WHAT THE SEED MUST REBUILD IS THE BUNDLE, because the bundle is
+    // the home. Reading the expectation off the migrations would assert
+    // that an emptied registry comes back as HISTORY rather than as the
+    // current declaration (the cadence and station pins' same fix).
+    let expected = declarations(&bundle());
 
     sqlx::query("DELETE FROM delivery_policy")
         .execute(&db.pool)
@@ -157,7 +207,7 @@ async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
     assert_eq!(
         declarations(&after),
         expected,
-        "the seed must recreate the migration row exactly — the bundle can be the only home"
+        "the seed must recreate the BUNDLE exactly — the bundle can be the only home"
     );
     for row in &after {
         let versions = registry
@@ -176,21 +226,51 @@ async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
         .iter()
         .find(|r| r.name() == POLICY)
         .expect("the conductor's policy is active");
+    let declared = bundle()
+        .into_iter()
+        .find(|s| s.name() == POLICY)
+        .expect("the bundle declares the conductor's policy")
+        .version();
     assert_eq!(
         policy.version(),
-        2,
-        "the policy lands at the version two migrations produced, not at v1"
+        declared,
+        "the policy lands at the version the bundle declares, with no history below it"
     );
 }
 
-/// On a registry the migrations already filled, the seed inserts
-/// nothing and says every row is present — the insert-if-missing
-/// posture every boot relies on.
+/// On a registry the migrations already filled, the first seed
+/// publishes exactly the rows the bundle moved ahead and inserts
+/// nothing; the next boot then finds every row present and writes
+/// nothing — the insert-if-missing posture every boot relies on.
+///
+/// Until 2026-09-28 this asserted that the FIRST seed found everything
+/// present, which assumed no policy had changed since the cutover. The
+/// first bundle-only bump (v3, backlog 366c2ed5) moved the one row
+/// ahead, so the property is now stated on the boot AFTER the one that
+/// delivers the change — which is the boot every later restart is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_present_registry_is_left_untouched() {
     let db = TestDb::new().await;
     let registry = PgDeliveryPolicy::new(db.pool.clone());
     let names = every_name(&db).await;
+    // BEFORE the seed, because the seed is what changes it.
+    let ahead = ahead_of(&active_rows(&registry, &names).await);
+
+    let first = seed_delivery_policies(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("a present registry is not a failure");
+    assert_eq!(
+        first.count(|o| matches!(o, SeedOutcome::Published { .. })),
+        ahead,
+        "exactly the rows the bundle moved ahead are published: {first}"
+    );
+    assert_eq!(
+        first.count(|o| matches!(o, SeedOutcome::Present)),
+        bundle().len() - ahead,
+        "every bundle row at the live version is already present: {first}"
+    );
+    assert_eq!(first.count(|o| matches!(o, SeedOutcome::Inserted)), 0);
+
     let before = declarations(&active_rows(&registry, &names).await);
     let rows_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_policy")
         .fetch_one(&db.pool)
@@ -203,7 +283,7 @@ async fn a_present_registry_is_left_untouched() {
     assert_eq!(
         report.count(|o| matches!(o, SeedOutcome::Present)),
         bundle().len(),
-        "every bundle row is already present: {report}"
+        "on the next boot every bundle row is present: {report}"
     );
     assert_eq!(report.count(|o| matches!(o, SeedOutcome::Inserted)), 0);
 
@@ -223,6 +303,13 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
     let db = TestDb::new().await;
     let registry = PgDeliveryPolicy::new(db.pool.clone());
     let names = every_name(&db).await;
+    // Bring the registry to the bundle first, so the live active row is
+    // at the version the edited row below still claims — the bundle
+    // itself may lead the migrations (see `ahead_of`), and an edit to a
+    // row that leads would publish rather than refuse.
+    seed_delivery_policies(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("the bundle seeds over the migrations");
     let before = declarations(&active_rows(&registry, &names).await);
 
     let mut specs = bundle();
@@ -230,7 +317,8 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         .iter_mut()
         .find(|s| s.name() == POLICY)
         .expect("the bundle declares the conductor's policy");
-    edited.row.gate_max_concurrent = 4;
+    let declared = edited.version();
+    edited.row.gate_max_concurrent += 1;
 
     let err = seed_delivery_policies(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -239,7 +327,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         DeliveryPolicySeedError::Refused { rows: refusals, .. } => {
             assert_eq!(refusals.len(), 1, "{err}");
             assert_eq!(refusals[0].name, POLICY);
-            assert_eq!(refusals[0].version, 2);
+            assert_eq!(refusals[0].version, declared);
             assert_eq!(
                 refusals[0].fields,
                 vec!["gate_max_concurrent".to_string()],
@@ -271,6 +359,12 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
 async fn a_version_bump_publishes_and_retires_the_live_row() {
     let db = TestDb::new().await;
     let registry = PgDeliveryPolicy::new(db.pool.clone());
+    // Bring the registry to the bundle first, so the ONE bump this test
+    // makes is the only thing the seed below can publish — the bundle
+    // itself may lead the migrations (see `ahead_of`).
+    seed_delivery_policies(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("the bundle seeds over the migrations");
     let live = registry
         .live_versions(POLICY)
         .await
@@ -278,6 +372,9 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .into_iter()
         .find(|r| r.status == WorkflowStatus::Active)
         .expect("the policy is active");
+    // A value the live row does not hold, so the served row can only
+    // carry it if the bump published.
+    let raised = live.row.gate_max_concurrent + 1;
 
     let mut specs = bundle();
     let bumped = specs
@@ -285,7 +382,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .find(|s| s.name() == POLICY)
         .expect("the bundle declares the conductor's policy");
     bumped.row.version = live.version() + 1;
-    bumped.row.gate_max_concurrent = 4;
+    bumped.row.gate_max_concurrent = raised;
 
     let report = seed_delivery_policies(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -302,7 +399,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .find(|r| r.status == WorkflowStatus::Active)
         .expect("the policy is active");
     assert_eq!(now_active.version(), live.version() + 1);
-    assert_eq!(now_active.row.gate_max_concurrent, 4);
+    assert_eq!(now_active.row.gate_max_concurrent, raised);
     let old = lineage
         .iter()
         .find(|r| r.version() == live.version())
@@ -319,7 +416,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
     .fetch_all(&db.pool)
     .await
     .expect("the active row");
-    assert_eq!(served, vec![(live.version() + 1, 4)]);
+    assert_eq!(served, vec![(live.version() + 1, raised)]);
 }
 
 /// A lineage with NO active row is one an operator retired, and a

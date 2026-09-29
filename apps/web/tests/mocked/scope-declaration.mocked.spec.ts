@@ -151,12 +151,9 @@ test('declaring the boundary writes both fields and completes the step', async (
     patch = r.request().postDataJSON() as Record<string, unknown>;
     return r.fulfill({ status: 204, body: '' });
   });
-  // …then the plugin reads the row back and completes with THAT — so
-  // this mock serves back exactly what the PATCH landed, and the
-  // completion assertions below attest the true merged shape.
-  await page.route('**/api/jobs/job-car-1/steps', (r) =>
-    r.fulfill({ json: [{ ...SCOPE_STEP, metadata: patch ?? {} }] }),
-  );
+  // …then the plugin completes with the status ALONE (backlog e39a9d2a):
+  // the step PUT keeps every field its body omits, and it is closing to
+  // any metadata body, so the merge above is what the step completes with.
   await page.route('**/api/jobs/job-car-1/steps/step-scope', (r) => {
     put = r.request().postDataJSON() as Record<string, unknown>;
     return r.fulfill({ json: { ...SCOPE_STEP, status: 'completed' } });
@@ -177,11 +174,9 @@ test('declaring the boundary writes both fields and completes the step', async (
   // around it.
   expect(merged['excludes']).toBe('Not the other pages — a sibling car owns them.');
 
-  const body = put as unknown as { status: string; metadata: Record<string, string> };
-  expect(body.status).toBe('completed');
-  // The completion carried the read-back row, not the snapshot.
-  expect(body.metadata['summary']).toBe('Fix the marketing-asset tag chips.');
-  expect(body.metadata['excludes']).toBe('Not the other pages — a sibling car owns them.');
+  // The completion carried the status and nothing else — no row, fresh
+  // or snapshot, and no metadata.
+  expect(put).toEqual({ status: 'completed' });
 });
 
 test('a declared boundary reads back as the two halves it was asked in', async ({ page }) => {

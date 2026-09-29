@@ -636,7 +636,7 @@ test.describe('/it/registry/dispatcher — links, reads and writes', () => {
     await mountGraph(page);
 
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     await expect(tabs.nth(1)).toHaveAttribute('aria-current', 'page');
     await expect(tabs.nth(1)).toHaveAttribute('href', PAGE);
     expect(catalogued(PAGE)).toBe('system-dispatcher');

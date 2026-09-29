@@ -1,0 +1,480 @@
+# infra/recovery/re-entry.toml — THE RECOVERY SHEET'S SOURCE: every road
+# back into the system, in the order to try them, for the one human
+# holding the paper when things are broken (design 125d405d, backlog
+# fd6d6c08; David 2026-09-28: "we are going to maintain the fidelity of
+# those instructions or generate a new print job").
+#
+# RENDERED, NEVER RETYPED. `boss recovery sheet` reads this file and
+# prints it (`--facts`, `--hash`, `--html`, `--pdf FILE`). No host, port, URL, path or
+# name is written here: a FACT line names the file that decides the
+# value and where in it, and the renderer prints what it reads there.
+# A human act is a signature on rendered bytes, never a transcription.
+#
+# FOUR KINDS OF LINE, each exactly one of:
+#
+#   fact           label + file + (key | pattern | neither) [+ fields]
+#                  key      a path into a .toml or .json file:
+#                           `a.b`, `node[id=boss-gcp].address` (the ONE
+#                           table whose field equals the value),
+#                           `node[roles~cluster-operator].id` (EVERY
+#                           table whose field is or holds it), `node.id`
+#                           (the field of every table in the list)
+#                  pattern  a regex with ONE capture group, for a file
+#                           whose consumer is a shell or kubectl rather
+#                           than a parser (a manifest, a unit, a script);
+#                           every match must capture the same value
+#                  neither  the fact is the file itself: it must exist,
+#                           and its path is what prints
+#                  fields   for a list of tables: which of each one's
+#                           fields print, in order
+#   command        label + a template + `with`: every `{name}` in the
+#                  template is filled from the fact `with.name` names, so
+#                  a command typed under stress is whole on the paper and
+#                  every value in it was read. The words around the
+#                  placeholders are held to the prose rule.
+#   prose          procedure text. It may state no host, port, URL,
+#                  path, address or dotted name — the renderer refuses
+#                  one, so a fact cannot be retyped into prose.
+#   not_tree_held  printed as "NOT HELD BY THE TREE: <why>". The sheet
+#                  says out loud what the tree does not know rather than
+#                  going silent about it.
+#
+# A road's `needs` is DERIVED, not written: for a `host`, the renderer
+# reads what stands in front of it (infra/cluster/dns/access.toml), what
+# routes it (infra/cluster/instances.toml, tunnel-origins.toml, the
+# connector's manifest) and what the gateway serves on the LAN
+# (boss.yaml); for a `workload`, the Deployment the road lands in, so
+# the road says the cluster must be up. When those change, the sheet
+# changes by itself. A road's `proven_by` names the packet that last
+# exercised it; without one it prints NOT EXERCISED ON RECORD — no
+# evidence is not a pass.
+#
+# WHAT THE PAPER MAY CARRY (David, design 125d405d Q1): LOCATIONS,
+# ADDRESSES and ORDER only. Never a secret, a PIN, a recovery code or
+# any value; every artifact that is itself a credential or restores
+# state lives in the recovery kit. The renderer refuses a resolved value
+# shaped like key material, and every string in this file — title,
+# label, prose, not_tree_held, command, key, pattern — shaped like a
+# secret: key material, "the PIN is …", a bare number of four or more
+# digits, "the key on the blue keychain opens the door". Those are
+# tripwires for the shapes a regex can see, not a proof.
+#
+# Q3 IS ENFORCED BY REVIEW ONLY. Which private key opens which door, and
+# which device holds it, is never declared here — and no regex can
+# refuse every way of writing it down. Every change to this file is a
+# credentials-area car and waits for an adversarial review that reads
+# each line for exactly that (review of car 67e78997, F6).
+#
+# THE VERSION is a sha256 over the sorted fact set — every resolved
+# line with its file and key, every prose and not-held line with its
+# road and position — never over rendered bytes, which carry their own
+# timestamps.
+
+[[road]]
+id = "dev-door-anywhere"
+title = "The dev workspace, from anywhere — try this door first"
+needs = { host = { file = "apps/web/src/it/estate/dev-door.json", key = "host" } }
+
+[[road.line]]
+prose = "Needs a laptop with a browser and ssh. Nothing long-lived is stored on the laptop: the edge issues a certificate for the session."
+
+[[road.line]]
+label = "Workspace host"
+file = "apps/web/src/it/estate/dev-door.json"
+key = "host"
+
+[[road.line]]
+label = "Client setup, in order (the first two once per machine)"
+file = "apps/web/src/it/estate/dev-door.json"
+key = "steps"
+fields = ["what", "command", "why"]
+
+[[road.line]]
+label = "Cloudflare Access application type"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS dev].type"
+
+[[road.line]]
+label = "Identity the edge admits"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS dev].policy[name=operators].include.emails"
+
+[[road.line]]
+label = "Session length"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS dev].session_duration"
+
+[[road.line]]
+not_tree_held = "the client keepalive (ServerAliveInterval). Backlog d4c8e9bf adds it to the same data file as the steps above; until then a quiet session may drop, and running the last step again reconnects."
+
+[[road]]
+id = "durable-session"
+title = "Inside the workspace: the durable session"
+needs = { workload = "infra/cluster/manifests/boss-dev.yaml" }
+
+[[road.line]]
+label = "tmux session"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = 'exec tmux new-session -A -s (\S+)$'
+
+[[road.line]]
+label = "Attach with"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = "cat > (\\S+) <<'LS'$"
+
+[[road.line]]
+label = "Remote Control session name"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = 'exec claude --remote-control (\S+)'
+
+[[road.line]]
+label = "Kubernetes namespace of the workspace"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = '^\s+namespace: ([a-z0-9-]+)$'
+
+[[road.line]]
+prose = "Detach with ctrl-b then d; the session keeps running, and attaching again lands in the same one. The workspace disk survives a restart of the pod. If both ssh doors are dark, the cluster-admin road below opens the same session through the cluster."
+
+[[road]]
+id = "bastion"
+title = "The bastion hub — reaching the home network from outside"
+
+[[road.line]]
+label = "Bastion public address"
+file = "infra/estate/estate.toml"
+key = "node[id=boss-gcp].address"
+
+[[road.line]]
+label = "WireGuard port (UDP)"
+file = "infra/cluster/wireguard/setup-hub.sh"
+pattern = '^PORT=(\d+)$'
+
+[[road.line]]
+label = "Hub overlay address"
+file = "infra/cluster/wireguard/setup-hub.sh"
+pattern = '^HUB_IP="([^"]+)"$'
+
+[[road.line]]
+prose = "Joined to the overlay, a laptop reaches the home network as though it were there: the key door below, the forge, and the cluster. Or use the bastion as an ssh jump host, as the cluster-admin road does."
+
+[[road.line]]
+not_tree_held = "the cloud project, zone and instance name of the bastion, and the ssh user on it. A later car of design 125d405d declares them (question 3); until then they are known only from memory."
+
+[[road.line]]
+prose = "If the laptop key for the bastion is lost, a new public key is added from the cloud console of the bastion's project; that account's own sign-in is the anchor."
+
+[[road]]
+id = "dev-door-lan"
+title = "The dev workspace, from the home network — the key door"
+needs = { workload = "infra/cluster/manifests/boss-dev.yaml" }
+
+[[road.line]]
+prose = "Key authentication, from a machine on the home network or on the bastion's overlay. Kept as the door that needs no Cloudflare, and not advertised."
+
+[[road.line]]
+label = "LAN address"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = 'loadBalancerIP: (\S+)$'
+
+[[road.line]]
+label = "Port"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = '- name: ssh\n\s+port: (\d+)$'
+
+[[road.line]]
+label = "Secret holding the public keys it accepts"
+file = "infra/cluster/manifests/boss-dev.yaml"
+pattern = '\{secretName: ([a-z-]*authorized-keys),'
+
+[[road.line]]
+not_tree_held = "which private key opens this door, and which device holds it. Never declared, by decision (design 125d405d, question 3): the key lives on your own device, and a copy is in the recovery kit."
+
+[[road]]
+id = "web-sign-in"
+title = "The web app: sign in"
+needs = { host = { file = "infra/cluster/manifests/boss.yaml", pattern = '\{name: BOSS_PUBLIC_URL, value: "([^"]+)"\}' } }
+
+[[road.line]]
+label = "Address"
+file = "infra/cluster/manifests/boss.yaml"
+pattern = '\{name: BOSS_PUBLIC_URL, value: "([^"]+)"\}'
+
+[[road.line]]
+label = "Sign-in provider"
+file = "infra/cluster/manifests/boss.yaml"
+pattern = '\{name: BOSS_AUTH_PROVIDER, value: ([^}\s]+)\}'
+
+[[road.line]]
+label = "Identity the edge admits"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS].policy[name=operators].include.emails"
+
+[[road.line]]
+label = "Edge session length"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS].session_duration"
+
+[[road.line]]
+prose = "Sign in with your passkey. If the passkey is gone, take the break-glass road next."
+
+[[road]]
+id = "break-glass"
+title = "Break-glass — the hardware-key door"
+proven_by = "c5ce1aeb"
+needs = { host = { file = "infra/cluster/manifests/boss.yaml", pattern = '\{name: BOSS_PUBLIC_URL, value: "([^"]+)"\}' }, path = { file = "crates/core/boss-gateway/src/main.rs", pattern = '^\s+"(/break-glass)",$' } }
+
+[[road.line]]
+label = "On the host"
+file = "infra/cluster/manifests/boss.yaml"
+pattern = '\{name: BOSS_PUBLIC_URL, value: "([^"]+)"\}'
+
+[[road.line]]
+label = "Open the path"
+file = "crates/core/boss-gateway/src/main.rs"
+pattern = '^\s+"(/break-glass)",$'
+
+[[road.line]]
+prose = "Touch either hardware key, primary or backup. The session that opens is narrow: it can repair sign-in, not run the company."
+
+[[road.line]]
+label = "The keys' public records (no secret lives in them)"
+file = "infra/cluster/manifests/boss-break-glass-credentials.yaml"
+
+[[road.line]]
+prose = "It is the door for a lockout INSIDE the system. It does NOT open a dark Cloudflare edge, a dark mailbox or a dark cluster: for a dark edge or mailbox, take the key door from the home network or through the bastion's overlay; for a dark cluster, the cluster-admin road (design c5ce1aeb)."
+
+[[road]]
+id = "apple-passkey-delegate"
+title = "The Apple Passkey Delegate — the second person, in an emergency"
+needs = { host = { file = "infra/cluster/manifests/boss.yaml", pattern = '\{name: BOSS_PUBLIC_URL, value: "([^"]+)"\}' } }
+
+[[road.line]]
+prose = "The Apple Passkey Delegate is a role, not a name: the second person who holds a passkey on their own Apple phone, for emergency use only (DR readiness 62dac114, item 4). This paper names the role and never the person (backlog 41c5ddaf)."
+
+[[road.line]]
+prose = "The delegate takes the ordinary edge road: the web app sign-in above, with their own passkey. It is never the break-glass road. The break-glass enrolment accepts only hardware-attested keys, so a phone passkey is refused there by design."
+
+[[road.line]]
+label = "Identity the edge admits"
+file = "infra/cluster/dns/access.toml"
+key = "application[name=BOSS].policy[name=operators].include.emails"
+
+[[road.line]]
+prose = "CAN: sign in to the web app through the edge, with their own passkey, once the edge admits their address above; then act with exactly what their standing grants hold, and no more."
+
+[[road.line]]
+prose = "CANNOT: open the break-glass door, the key door, the bastion, or either cluster credential; none of those accepts a phone passkey."
+
+[[road.line]]
+not_tree_held = "who holds this role, which the paper never names; whether the edge admits the delegate today, which is the address line above and nothing else; and how the role is revoked, which is the design of DR readiness item 4."
+
+[[road]]
+id = "cluster-admin"
+title = "The cluster: admin credentials, the watchdog, rolling back"
+
+[[road.line]]
+label = "Admin kubeconfig and talosconfig live in"
+file = "infra/estate/install-cluster-operator.sh"
+pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$'
+
+[[road.line]]
+not_tree_held = "whether the forge's admin kubeconfig is in place today. The forge's own observer reports its operator credentials unmeasured: the directory above is root's alone, and the observer does not run as root. Until a reader proves it there, treat this road as unproven and check the directory yourself before you need it."
+
+[[road.line]]
+label = "On the host (the forge only; the bastion holds the scoped credential of the next road, which cannot open a shell)"
+file = "infra/estate/estate.toml"
+key = "node[id=forge].id"
+
+[[road.line]]
+label = "Reach the forge through the bastion (as the watchdog unit's run-as user, which is not a declared login)"
+command = "ssh -J {bastion} {user}@{forge}"
+with = { bastion = { file = "infra/estate/estate.toml", key = "node[id=boss-gcp].address" }, user = { file = "infra/forge/cluster-watchdog.service", pattern = '^User=(\S+)$' }, forge = { file = "infra/estate/estate.toml", key = "forge_host" } }
+
+[[road.line]]
+prose = "Give the jump the bastion's own ssh user if it differs from your laptop's; the bastion road says that user is not held by the tree."
+
+[[road.line]]
+label = "On the forge, open the workspace when both ssh doors are dark"
+command = "sudo docker run --rm -it --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} exec -it deploy/{deployment} -c {container} -- {attach}"
+with = { image = { file = "infra/cluster/manifests/boss-estate-observe.yaml", pattern = 'image: (alpine/k8s:\S+)$' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' }, deployment = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: (\S+)$' }, container = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^      containers:\n        - name: (\S+)$' }, attach = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = "cat > (\\S+) <<'LS'$" } }
+
+[[road.line]]
+prose = "The forge has no kubectl of its own and the kubeconfig is root's alone, so the line above runs it under sudo inside the kubectl image the estate already uses."
+
+[[road.line]]
+not_tree_held = "the cluster API's virtual address as a key a reader can take. A later car of design 125d405d declares it (question 3)."
+
+[[road.line]]
+label = "The watchdog runs every"
+file = "infra/forge/cluster-watchdog.timer"
+pattern = '^OnUnitActiveSec=(\S+)$'
+
+[[road.line]]
+label = "Last known-good build is stamped at"
+file = "infra/forge/cluster-watchdog.service"
+pattern = '^Environment=BOSS_FORGE_LAST_BUILT=(\S+)$'
+
+[[road.line]]
+label = "Roll to a named build"
+file = "infra/forge/rollback-to.sh"
+
+[[road.line]]
+label = "The same roll through the ops door"
+file = "infra/ops/verbs/rollback-to.json"
+
+[[road.line]]
+prose = "Roll to a NAMED last-known-good build, read from the stamp above, never to the previous revision: the previous revision may carry the same broken image."
+
+[[road]]
+id = "bastion-cluster-credential"
+title = "The bastion's scoped cluster credential — when the forge is down"
+
+[[road.line]]
+label = "On the host"
+file = "infra/estate/estate.toml"
+key = "node[id=boss-gcp].id"
+
+[[road.line]]
+label = "At the same path as the forge's admin credentials"
+file = "infra/estate/install-cluster-operator.sh"
+pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$'
+
+[[road.line]]
+label = "Declared in"
+file = "infra/cluster/manifests/boss-break-glass-operator.yaml"
+
+[[road.line]]
+prose = "It can see whether the cluster is working and roll a workload back to the last image that worked. It cannot open a shell in a pod, read a credential, deploy or delete: for those, the forge's admin credential."
+
+[[road.line]]
+not_tree_held = "whether the bastion's copy of this credential is in place today (backlog 7336cb5f). Try the forge first."
+
+[[road]]
+id = "emergency-merge"
+title = "Shipping a fix while the system of record is down"
+
+[[road.line]]
+label = "The lane"
+file = "infra/platform/workflows/emergency-merge.toml"
+key = "workflow[kind=emergency-merge].label"
+
+[[road.line]]
+label = "Its steps and outcomes, in order"
+file = "infra/platform/workflows/emergency-merge.toml"
+key = "workflow[kind=emergency-merge].step.title"
+
+[[road.line]]
+prose = "Roll back to a NAMED last-good build first; only when none exists does the lane go on to a local gate, a signed bypass of the train, and a fast-forward merge. It is not the break-glass door: that one is for a locked-out person, this one for a fix the pipeline cannot carry."
+
+[[road]]
+id = "forge-and-record"
+title = "The forge, the system of record, and the source"
+
+[[road.line]]
+label = "Forge: git, the image registry, CI"
+file = "infra/estate/estate.toml"
+key = "forge_url"
+
+[[road.line]]
+label = "Forge journal door"
+file = "infra/estate/estate.toml"
+key = "forge_journal"
+
+[[road.line]]
+label = "System of record, from the home network"
+file = "infra/estate/estate.toml"
+key = "sor_url"
+
+[[road.line]]
+label = "Public mirror of the source"
+file = "infra/estate/estate.toml"
+key = "mirror_url"
+
+[[road.line]]
+label = "Machines the estate declares"
+file = "infra/estate/estate.toml"
+key = "node.id"
+
+[[road.line]]
+prose = "The source is also on the public mirror, so losing every machine still leaves the tree that rebuilds them. The tree does not hold the data: the next road does."
+
+[[road]]
+id = "restore-the-record"
+title = "The record's backups — what a rebuild restores from"
+
+[[road.line]]
+label = "Nightly dump runs at (cron, UTC)"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = '^  schedule: "([^"]+)"'
+
+[[road.line]]
+label = "In-cluster copies, on volume"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = '- name: backups\n\s+persistentVolumeClaim: \{claimName: (\S+)\}$'
+
+[[road.line]]
+label = "In-cluster copies kept (days)"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = '''-name '[^']*sql[^']*' -mtime \+(\d+) -print -delete$'''
+
+[[road.line]]
+label = "Offsite copy one: shipped to"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = '-o ConnectTimeout=20 (\S+)$'
+
+[[road.line]]
+label = "Into the directory (stated in the manifest's header)"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = 'into (/var/backups/[a-z-]+) on boss-gcp'
+
+[[road.line]]
+label = "Offsite copy two: a cloud bucket, named in the Secret"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = '\{secretName: ([a-z-]*gcs[a-z-]*),'
+
+[[road.line]]
+label = "Offsite dumps kept in the bucket (the header states the bastion keeps as many)"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = "prune '[^']*sql[^']*' (\\d+)$"
+
+[[road.line]]
+label = "File-store archives kept in the bucket"
+file = "infra/cluster/manifests/boss-backup.yaml"
+pattern = "prune '[^']*files[^']*' (\\d+)$"
+
+[[road.line]]
+prose = "A restore is the newest dump plus the file-store archive stamped beside it. The bastion's copy holds dumps only, so a restore from it alone brings back rows without their files."
+
+[[road.line]]
+not_tree_held = "the receiver on the bastion that stamps and prunes the shipped dumps. Its script is not in the tree, so the directory and the count it keeps are the manifest header's word, not a read of the receiver."
+
+[[road.line]]
+not_tree_held = "the bucket's own name, which lives only in that Secret, and the order to restore in. A later car of design 125d405d declares the order with the recovery kit."
+
+[[road]]
+id = "recovery-kit"
+title = "The recovery kit"
+
+[[road.line]]
+prose = "The kit is a PIN-protected stick. It holds every artifact that is itself a credential or restores state; this sheet holds none of them, and the PIN never appears here."
+
+[[road.line]]
+not_tree_held = "what the kit holds and the order to restore it. The kit is not built yet (backlog c1bb822e); a later car of design 125d405d declares both, by name only."
+
+[[road]]
+id = "who-to-call"
+title = "Who and where to call"
+
+[[road.line]]
+label = "Cloudflare account zone"
+file = "infra/cluster/dns/access.toml"
+key = "account_zone"
+
+[[road.line]]
+prose = "The last anchor is being in the room: each machine's own console, and Talos maintenance mode to bootstrap a node again when nothing else answers."
+
+[[road.line]]
+not_tree_held = "which sign-in owns the Cloudflare account, the domain registrar, and the mail provider that receives the Access one-time code. A later car of design 125d405d declares them as locations (question 3)."
+
+[[road.line]]
+not_tree_held = "which sign-in owns the GitHub account that holds the public mirror of the source."

@@ -148,6 +148,21 @@ done
 [[ -n "$clock_ok" ]] || { echo "ERROR: clock-api /configure failed — aborting reset" >&2; exit 1; }
 
 echo "==> [5/9] seeding brewery Class registry via /api/classes"
+# The classes door asks boss-policy-api (Create on class) and answers 503
+# while policy cannot be asked; step 3 restarted it, so wait for health.
+POLICY_READY=0
+for i in $(seq 1 60); do
+    if curl -s -f -m 2 http://127.0.0.1:7250/api/policy/health >/dev/null 2>&1; then
+        POLICY_READY=1
+        echo "    boss-policy-api ready (after ${i}s)"
+        break
+    fi
+    sleep 1
+done
+if [ "$POLICY_READY" -ne 1 ]; then
+    echo "ERROR: boss-policy-api health-check didn't reach 200 within 60s" >&2
+    exit 1
+fi
 # Classes (roles, departments, account types) are the taxonomy employee +
 # account writes validate against, so they must land before the operator +
 # tenant seeds. Loaded through the public API (POST /api/classes/batch),
@@ -185,8 +200,9 @@ PATH="$REPO_ROOT/target/release:$PATH" \
     "$REPO_ROOT/infra/seed-brewery-tenant.sh"
 
 echo "==> [8/9] rebuilding projections + GL from audit_log"
+# The GL is rebuild-all's `ledger-journal` step; the `boss ledger
+# rebuild` that followed repeated it and is gone (backlog 05cd6572).
 "$REPO_ROOT/target/release/boss-rebuild-all" --database-url "$DB_URL" 2>&1 | tail -5
-"$REPO_ROOT/target/release/boss" ledger rebuild --postgres-url "$DB_URL" 2>&1 | tail -3
 
 echo "==> [9/9] starting boss-brewery-sim + bringing the edge back up"
 systemctl start boss-brewery-sim

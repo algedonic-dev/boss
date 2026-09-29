@@ -317,7 +317,7 @@ pub fn alarms_by_key(rows: &[Json]) -> BTreeMap<String, Json> {
 }
 
 pub struct JobsFlightOverdue {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who the alarms are owned by — the platform owner through the port;
     /// never a literal.
@@ -529,6 +529,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "a-flight-past-its-period-is-an-alarm".into(),
             triggering_event_id: format!("clock-tick:{NOW}"),
             triggering_topic: "clock.tick".into(),

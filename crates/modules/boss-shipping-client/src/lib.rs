@@ -58,7 +58,7 @@ pub trait ShippingClient: Send + Sync {
 
 pub struct ReqwestShippingClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestShippingClient {

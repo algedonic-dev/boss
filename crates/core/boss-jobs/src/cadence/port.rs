@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::types::{CadenceRuleRow, CadenceRuleSpec, LastFiring, NewFiring};
+use super::types::{CadenceRuleRow, CadenceRuleSpec, FiringOutcome, LastFiring, NewFiring};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CadenceError {
@@ -40,15 +40,15 @@ pub trait CadenceRepository: Send + Sync {
     /// two conductors racing the same window cannot both win.
     async fn claim_firing(&self, new: &NewFiring) -> Result<bool, CadenceError>;
 
-    /// Merge the verb's exit code and runtime into the firing's
-    /// `detail`. Merging (not replacing) preserves whatever the claim
-    /// recorded — e.g. the dock depth that triggered a queue-depth
-    /// rule.
+    /// Merge the verb's outcome — exit code, runtime, and a board's
+    /// decision when it made one (`FiringOutcome::detail_patch`) — into
+    /// the firing's `detail`. Merging (not replacing) preserves whatever
+    /// the claim recorded — e.g. the dock depth that triggered a
+    /// queue-depth rule.
     async fn record_outcome(
         &self,
         firing_id: &str,
-        rc: i32,
-        runtime_secs: u64,
+        outcome: &FiringOutcome,
     ) -> Result<(), CadenceError>;
 }
 

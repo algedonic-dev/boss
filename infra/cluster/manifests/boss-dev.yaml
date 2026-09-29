@@ -667,10 +667,11 @@ spec:
           # David's interactive session: measured 2026-09-14, memory
           # 15.85/16 GiB and cpu.stat throttled 2,177 periods (~10 min)
           # in one afternoon, felt as lag in his shell. w-1 is 32 CPU /
-          # 64 GiB and the three gate slots request 12 / 24Gi; with this
-          # pod at 4 / 8Gi requested the node holds 16 / 32Gi of
-          # requests, and the limits overcommit the way each gate's
-          # (20 CPU / 32Gi) already does.
+          # 64 GiB and the four gate slots (policy v3, backlog 366c2ed5,
+          # 2026-09-28; three before) request 16 / 32Gi; with this pod
+          # at 4 / 8Gi requested the node holds 20 / 40Gi of requests,
+          # and the limits overcommit the way each gate's (20 CPU /
+          # 32Gi) already does.
           #
           # EPHEMERAL STORAGE, because a request of none made this pod the
           # kubelet's first eviction under disk pressure (see the
@@ -680,7 +681,7 @@ spec:
           # this container's writable layer (~10G at the 2026-09-23
           # eviction) and pgdata. A request, not a limit: exceeding it
           # evicts nothing on its own; it only decides the order under
-          # pressure. Beside three gate slots at 90Gi each it fits w-1.
+          # pressure. Beside the gate slots at 90Gi each it fits w-1.
           #
           # 150Gi, RE-MEASURED 2026-09-25 (backlog 80f083bc) with the
           # 100Gi in force: /scratch held 99.5 GB over NINE per-worktree
@@ -695,8 +696,9 @@ spec:
           # bound of its own short of the node-level floor, so no fixed
           # request tracks it, and the scratch floor is what holds that
           # (the_dev_pod_is_not_the_first_evicted.rs).
-          # Every tree-declared request on w-1 then sums to 424Gi (this
-          # pod 154, three gates 270) of ~790Gi allocatable (929 GiB
+          # Every tree-declared request on w-1 then sums to 514Gi (this
+          # pod 154, four gates 360 — 424Gi with the three gates before
+          # policy v3, backlog 366c2ed5) of ~790Gi allocatable (929 GiB
           # nodefs less the kubelet's 15% line). No disk LIMIT, here or
           # on either sidecar: the kubelet sums the containers' limits
           # into the POD's ceiling and measures /scratch against it.

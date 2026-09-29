@@ -45,10 +45,9 @@ there.
 | `boss emit <kind> [payload]` | Emit an event to NATS |
 | `boss script list` | List registered agent scripts |
 | `boss script info <id>` | Show script details |
-| `boss fleet rebuild-projection` | Rebuild the `systems` projection from `system_events` |
 | `boss inspect ...` | Read-only diagnostic HTTP probes through the gateway |
 | `boss audit ...` | Query the audit log for domain events |
-| `boss ledger ...` | Ledger operations (rebuild the GL projection) |
+| `boss ledger periods\|lock\|unlock` | List ledger periods, lock or unlock a month, through boss-ledger-api signed as `BOSS_ACTOR` |
 | `boss sim ...` | Run the simulator (thin wrapper around `boss-sim`) |
 
 The fresh-box setup walkthrough lives in

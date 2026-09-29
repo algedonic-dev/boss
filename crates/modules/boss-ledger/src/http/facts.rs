@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,12 +50,9 @@ struct ManualEntryResponse {
 
 pub(super) async fn create_manual_entry(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<ManualEntryBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let created_by = match super::author::author(&user, "created_by", body.created_by.as_deref()) {
         Ok(a) => a,
         Err(refused) => return refused.into_response(),
@@ -246,12 +242,9 @@ struct CogsRecognizedResponse {
 
 pub(super) async fn cogs_recognized_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CogsRecognizedBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let created_by = match super::author::author(&user, "created_by", body.created_by.as_deref()) {
         Ok(a) => a,
         Err(refused) => return refused.into_response(),
@@ -409,7 +402,7 @@ struct InventoryTransferredResponse {
 
 pub(super) async fn inventory_transferred_handler(
     State(state): State<Arc<LedgerApiState>>,
-    user: CurrentUser,
+    user: LedgerCreate,
     Json(body): Json<InventoryTransferredBody>,
 ) -> Response {
     post_inventory_movement(
@@ -431,7 +424,7 @@ pub(super) async fn inventory_transferred_handler(
 /// same value-movement shape.
 pub(super) async fn inventory_capitalized_handler(
     State(state): State<Arc<LedgerApiState>>,
-    user: CurrentUser,
+    user: LedgerCreate,
     Json(body): Json<InventoryTransferredBody>,
 ) -> Response {
     post_inventory_movement(
@@ -447,17 +440,15 @@ pub(super) async fn inventory_capitalized_handler(
 /// Shared body for the inventory value-movement endpoints (transfer +
 /// capitalization): validate, record the fact, post the JE, and emit the
 /// audit event the rebuild registry re-projects from. Parameterized on
-/// the fact + event kind.
+/// the fact + event kind. Both doors are Create on `ledger`, asked by
+/// their extractor before the body was read.
 async fn post_inventory_movement(
     state: Arc<LedgerApiState>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     body: InventoryTransferredBody,
     fact_kind: &'static str,
     event_kind: &'static str,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.total_cost_cents <= 0 {
         return (
             StatusCode::BAD_REQUEST,
@@ -617,13 +608,10 @@ struct SupersedeResponse {
 ///     first (a separate, audited action).
 pub(super) async fn supersede_fact_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Path(fact_id): Path<Uuid>,
     Json(body): Json<SupersedeBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.reason.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,

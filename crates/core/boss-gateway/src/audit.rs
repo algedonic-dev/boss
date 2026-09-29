@@ -8,9 +8,10 @@
 //! cookie, not a row: there is no domain write for the event to join,
 //! and what the pool buys is membership in the one pipeline — durable
 //! staging, relay ordering, replay, the ref-check trigger — not
-//! atomicity. The connection is expected to run as an INSERT-only
-//! Postgres role (111-gateway-audit-events.sql); the internet-facing
-//! edge gets the least privilege that can stage an event.
+//! atomicity. The pool connects to the service database
+//! ([`AUDIT_SINK_URL_VAR`]); the INSERT-only role Q1 first chose
+//! (111-gateway-audit-events.sql) is retired, and why is on that
+//! constant.
 //!
 //! Q2: three kinds, registered in `event_kinds` with source
 //! `gateway`. `auth.login.denied` carries a closed reason and NO
@@ -31,6 +32,14 @@
 //! `auth.credential.written` (onboard: created or overwritten) and
 //! `auth.reset.issued` (issue-reset), each naming the target email and
 //! the acting session — never a password or a token.
+//!
+//! `auth.session.elevated` joined with the owner's passkey elevation
+//! (backlog 3c92c5b8, 2026-09-27): the platform owner's session raised
+//! to the operator tier by a verified assertion from an operator-tier
+//! key — the one change of trust a live session can undergo, and the one
+//! emission RECORDED before its act rather than staged beside it. With
+//! it, `auth.passkey.enrolled`: a self-service enrolment, the act the
+//! adversarial review found left no trace (car 0bde9b99, H1).
 //!
 //! Failure posture (the LogTransport principle): emitting never
 //! blocks and never fails a login. The handler hands the event to a
@@ -139,6 +148,17 @@ impl AdminActor<'_> {
     }
 }
 
+/// What an elevation event names — see [`AuthAudit::session_elevated`].
+#[derive(Debug, Clone, Copy)]
+pub struct Elevation<'a> {
+    pub email: &'a str,
+    pub employee_id: &'a str,
+    pub elevated_at: u64,
+    pub expires_at: u64,
+    pub credential_label: &'a str,
+    pub credential_registered_at: &'a str,
+}
+
 /// Depth of the hand-off channel. Logins are a handful per user per
 /// day against a relay that drains thousands of rows a second; if
 /// this ever fills, the DB is down and the warn backstop is the
@@ -156,6 +176,11 @@ type Staged = (&'static str, serde_json::Value);
 #[derive(Clone)]
 pub struct AuthAudit {
     tx: Option<tokio::sync::mpsc::Sender<Staged>>,
+    /// The same recorder the drain task owns, for the one emission that
+    /// must be RECORDED before the act it describes may happen — a
+    /// session elevation (review of car 0bde9b99, L2: no silent grant).
+    /// Every other emission stays fire-and-forget.
+    recorder: Option<Arc<dyn EventRecorder>>,
 }
 
 impl AuthAudit {
@@ -163,13 +188,17 @@ impl AuthAudit {
     /// structured warn line — exactly the record this deployment had
     /// before the module existed.
     pub fn disabled() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            recorder: None,
+        }
     }
 
     /// Spawn the drain task over a recorder. The task owns it and
     /// runs until the last `AuthAudit` clone drops.
     pub fn spawn(recorder: Arc<dyn EventRecorder>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Staged>(QUEUE_DEPTH);
+        let direct = recorder.clone();
         tokio::spawn(async move {
             while let Some((kind, payload)) = rx.recv().await {
                 let event = Event::new("gateway", kind, payload, boss_clock_client::wall_now());
@@ -182,7 +211,10 @@ impl AuthAudit {
                 }
             }
         });
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            recorder: Some(direct),
+        }
     }
 
     /// An authentication decision went against the caller.
@@ -201,7 +233,15 @@ impl AuthAudit {
             "reason": reason.as_str(),
         });
         if let Some(e) = email_claimed {
-            payload["email_claimed"] = json!(e);
+            // The claim is caller-controlled and unauthenticated: keep a
+            // bounded prefix and say it was cut (see EMAIL_CLAIMED_MAX).
+            if e.chars().count() > EMAIL_CLAIMED_MAX {
+                let cut: String = e.chars().take(EMAIL_CLAIMED_MAX).collect();
+                payload["email_claimed"] = json!(cut);
+                payload["email_claimed_truncated"] = json!(true);
+            } else {
+                payload["email_claimed"] = json!(e);
+            }
         }
         if let Some(i) = idp {
             payload["idp"] = json!(i);
@@ -219,16 +259,29 @@ impl AuthAudit {
         method: AuthMethod,
         downgrade: Option<Downgrade<'_>>,
     ) {
-        let mut payload = json!({
-            "email": email,
-            "method": method.as_str(),
-        });
-        if let Some(id) = employee_id {
-            payload["employee_id"] = json!(id);
-        }
-        if let Some(d) = downgrade {
-            payload["downgrade"] = json!({ "from": d.from, "to": d.to });
-        }
+        self.emit(
+            "auth.login.succeeded",
+            succeeded_payload(email, employee_id, method, downgrade),
+        );
+    }
+
+    /// An emergency session was minted by a verified break-glass
+    /// assertion. The same `auth.login.succeeded` as every other method,
+    /// plus WHICH key asserted: its `credential_id` (the WebAuthn public
+    /// handle) and the `label` of the committed record holding it
+    /// (`primary`/`backup`), both public by construction. Until backlog
+    /// 9bbfb244 (2026-09-29) the event carried only `{email, method}`, so
+    /// the record could not show that both keys open the door. `label`
+    /// is asserted as null when no committed record holds the id.
+    pub fn break_glass_login_succeeded(
+        &self,
+        email: &str,
+        credential_id: &str,
+        label: Option<&str>,
+    ) {
+        let mut payload = succeeded_payload(email, None, AuthMethod::BreakGlass, None);
+        payload["credential_id"] = json!(credential_id);
+        payload["label"] = json!(label);
         self.emit("auth.login.succeeded", payload);
     }
 
@@ -275,6 +328,71 @@ impl AuthAudit {
         self.emit("auth.reset.issued", payload);
     }
 
+    /// A passkey was enrolled through the self-service ceremony
+    /// (`register_finish`). Enrolling a key is an auth act and left no
+    /// trace until the review of car 0bde9b99 (H1); `access_tier` says
+    /// what the key may do — a self-service key is `user`, which never
+    /// elevates a session. Never a credential id or any key material.
+    pub fn passkey_enrolled(&self, email: &str, employee_id: &str, label: &str, access_tier: &str) {
+        self.emit(
+            "auth.passkey.enrolled",
+            json!({
+                "email": email,
+                "employee_id": employee_id,
+                "label": label,
+                "access_tier": access_tier,
+            }),
+        );
+    }
+
+    /// A session was elevated to the operator tier by a verified
+    /// assertion from the platform owner's operator-tier passkey (backlog
+    /// 3c92c5b8). The one trust change a live session can undergo, so it
+    /// is RECORDED before the grant, not staged beside it: `Err` when no
+    /// recorder is configured or the outbox insert fails, and the caller
+    /// refuses the elevation (review of car 0bde9b99, L2 — no silent
+    /// grant). Names who, when the assertion was verified, when the
+    /// elevation ends (the session's own expiry — never extended), and
+    /// which key: its label and registration time, neither secret. Both
+    /// instants are RFC 3339 UTC. Never a credential id or any assertion
+    /// material.
+    pub async fn session_elevated(&self, elevation: Elevation<'_>) -> Result<(), String> {
+        let instant = |secs: u64| {
+            i64::try_from(secs)
+                .ok()
+                .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        };
+        let payload = json!({
+            "email": elevation.email,
+            "employee_id": elevation.employee_id,
+            "method": "passkey",
+            "access_tier": "operator",
+            "elevated_at": instant(elevation.elevated_at),
+            "expires_at": instant(elevation.expires_at),
+            "credential_label": elevation.credential_label,
+            "credential_registered_at": elevation.credential_registered_at,
+        });
+        let kind = "auth.session.elevated";
+        let Some(recorder) = &self.recorder else {
+            warn_unrecorded(
+                kind,
+                &payload,
+                "no audit staging configured — elevation refused",
+            );
+            return Err("no audit staging configured".to_string());
+        };
+        let event = Event::new("gateway", kind, payload, boss_clock_client::wall_now());
+        recorder.record(&event).await.map_err(|e| {
+            warn_unrecorded(
+                kind,
+                &event.payload,
+                &format!("outbox insert failed — elevation refused: {e}"),
+            );
+            format!("outbox insert failed: {e}")
+        })
+    }
+
     fn emit(&self, kind: &'static str, payload: serde_json::Value) {
         match &self.tx {
             None => warn_unrecorded(kind, &payload, "no audit staging configured"),
@@ -291,6 +409,64 @@ impl AuthAudit {
             }
         }
     }
+}
+
+/// The `auth.login.succeeded` payload every method shares: `email` and
+/// `method`, plus `employee_id` and `downgrade` only when they are
+/// `Some` — omitted, not asserted as null.
+fn succeeded_payload(
+    email: &str,
+    employee_id: Option<&str>,
+    method: AuthMethod,
+    downgrade: Option<Downgrade<'_>>,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "email": email,
+        "method": method.as_str(),
+    });
+    if let Some(id) = employee_id {
+        payload["employee_id"] = json!(id);
+    }
+    if let Some(d) = downgrade {
+        payload["downgrade"] = json!({ "from": d.from, "to": d.to });
+    }
+    payload
+}
+
+/// The most of a claimed email a denied-login event keeps, in
+/// characters: RFC 5321's 254-character path limit, so no real address
+/// is ever cut. The claim is whatever an unauthenticated caller sent,
+/// and an unbounded one staged an outbox row larger than NATS publishes
+/// — a row the relay cannot deliver and every later event waits behind
+/// (adversarial review of the d49b4355 car, 2026-09-28).
+pub const EMAIL_CLAIMED_MAX: usize = 254;
+
+/// The variable the auth-event sink's database URL is read from: the
+/// service database every binary in the container reads, which the
+/// cluster manifest sets from the `database-url` key of `boss-secrets`.
+///
+/// It had its own variable until 2026-09-28, meant to carry an
+/// INSERT-only role (111-gateway-audit-events.sql). Two things were
+/// true of that (backlog d49b4355, 7ec7113b): only the retired
+/// bare-metal drop-in ever set it, so in the cluster every auth event
+/// was a warn line and `/api/events/tail?source=gateway` answered
+/// nothing; and the role's password was its own name, published in the
+/// tree. The least privilege it promised was never real in the
+/// container either — the launcher starts the gateway with the whole
+/// container environment, `BOSS_POSTGRES_URL` included — so the
+/// variable collapsed onto the one the environment already carries
+/// (CLAUDE.md §9a). That URL is the Postgres SUPERUSER `boss`, so the
+/// gateway's pool is two superuser connections until the gateway gets
+/// an environment of its own (docs/architecture-decisions.md, §Policy
+/// & auth). The role is left unable to log in by
+/// 20260928012747-the-gateway-audit-role-opens-no-session.sql.
+pub const AUDIT_SINK_URL_VAR: &str = "BOSS_POSTGRES_URL";
+
+/// The auth-event sink's URL, read through `lookup` (the process
+/// environment in `main`); `None` — no sink, every event a warn line —
+/// when it is unset or blank.
+pub fn audit_sink_url(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    lookup(AUDIT_SINK_URL_VAR).filter(|url| !url.trim().is_empty())
 }
 
 /// The backstop record. Structured and greppable so a deployment
@@ -364,6 +540,46 @@ mod tests {
         assert!(e.payload.get("employee_id").is_none());
     }
 
+    /// Adversarial review of the d49b4355 car (2026-09-28): the claimed
+    /// email is whatever an UNAUTHENTICATED caller sent, and once the
+    /// sink is live a megabyte of it becomes an outbox row larger than
+    /// NATS's 1 MiB max_payload — which the relay cannot publish, and
+    /// every later event queues behind it. The record keeps a bounded
+    /// prefix and says it was cut.
+    #[tokio::test]
+    async fn a_claimed_email_is_capped_and_says_so() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        let huge = format!("{}@example.com", "é".repeat(1_500_000));
+        audit.login_denied(
+            Some(&huge),
+            AuthMethod::Password,
+            DeniedReason::BadCredentials,
+            None,
+        );
+        audit.login_denied(
+            Some("who@example.com"),
+            AuthMethod::Password,
+            DeniedReason::BadCredentials,
+            None,
+        );
+        let events = drain(&cap, 2).await;
+        let cut = events[0].payload["email_claimed"]
+            .as_str()
+            .expect("a capped email is still a string");
+        assert_eq!(cut.chars().count(), EMAIL_CLAIMED_MAX);
+        assert!(
+            huge.starts_with(cut),
+            "the cap keeps a prefix, not a rewrite"
+        );
+        assert_eq!(events[0].payload["email_claimed_truncated"], true);
+        assert_eq!(events[1].payload["email_claimed"], "who@example.com");
+        assert!(
+            events[1].payload.get("email_claimed_truncated").is_none(),
+            "an ordinary email is not marked"
+        );
+    }
+
     #[tokio::test]
     async fn idp_refusal_needs_no_claimed_email() {
         let cap = Arc::new(Captured::default());
@@ -384,6 +600,44 @@ mod tests {
         assert_eq!(e.kind, "auth.login.succeeded");
         assert_eq!(e.payload["method"], "password");
         assert_eq!(e.payload["employee_id"], "emp-1");
+    }
+
+    /// Backlog 9bbfb244: an emergency sign-in names the key that asserted
+    /// — its credential id and its label, both public — so the record
+    /// alone shows that each enrolled key opens the door (DR 62dac114
+    /// item 1 needed David's word on 2026-09-29, because two events read
+    /// only `{email, method}`). A label no committed record holds is
+    /// asserted as null, not omitted: the key verified and the record
+    /// could not name it, which is itself the finding. Key set whole.
+    #[tokio::test]
+    async fn a_break_glass_login_names_the_key_that_asserted() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        audit.break_glass_login_succeeded("break-glass-operator", "cred-b", Some("backup"));
+        audit.break_glass_login_succeeded("break-glass-operator", "cred-x", None);
+        let events = drain(&cap, 2).await;
+        assert_eq!(events.len(), 2);
+        let e = &events[0];
+        assert_eq!(e.kind, "auth.login.succeeded");
+        assert_eq!(e.source, "gateway");
+        assert_eq!(e.payload["email"], "break-glass-operator");
+        assert_eq!(e.payload["method"], "break-glass");
+        assert_eq!(e.payload["credential_id"], "cred-b");
+        assert_eq!(e.payload["label"], "backup");
+        let mut keys: Vec<&str> = e
+            .payload
+            .as_object()
+            .expect("object payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["credential_id", "email", "label", "method"]);
+        assert_eq!(events[1].payload["credential_id"], "cred-x");
+        assert_eq!(
+            events[1].payload.get("label"),
+            Some(&serde_json::Value::Null)
+        );
     }
 
     /// Backlog 8f45e0b4 item (3): a downgraded mint says what the row
@@ -418,6 +672,56 @@ mod tests {
         assert_eq!(events[1].kind, "auth.login.denied");
         assert_eq!(events[1].payload["reason"], "role_unconfirmed");
         assert!(events[1].payload.get("employee_id").is_none());
+    }
+
+    /// Review of car 0bde9b99, H1: a self-service enrolment is on the
+    /// record — who, which label, and the tier it was stored at — and
+    /// carries no credential id or key material. Key set asserted whole.
+    #[tokio::test]
+    async fn an_enrolment_names_the_employee_label_and_tier_only() {
+        let cap = Arc::new(Captured::default());
+        let audit = AuthAudit::spawn(cap.clone());
+        audit.passkey_enrolled("op@example.com", "emp-1", "yubikey", "user");
+        let events = drain(&cap, 1).await;
+        let e = &events[0];
+        assert_eq!(e.kind, "auth.passkey.enrolled");
+        assert_eq!(e.source, "gateway");
+        assert_eq!(e.payload["access_tier"], "user");
+        let mut keys: Vec<&str> = e
+            .payload
+            .as_object()
+            .expect("object payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["access_tier", "email", "employee_id", "label"]);
+    }
+
+    /// Review L2: an elevation is RECORDED or refused — with no staging
+    /// configured it answers `Err`, so the caller cannot grant silently.
+    #[tokio::test]
+    async fn an_elevation_with_no_staging_is_an_error_not_a_warn_line() {
+        let elevation = Elevation {
+            email: "op@example.com",
+            employee_id: "emp-1",
+            elevated_at: 1,
+            expires_at: 2,
+            credential_label: "yubikey",
+            credential_registered_at: "2026-09-01T12:00:00Z",
+        };
+        assert!(
+            AuthAudit::disabled()
+                .session_elevated(elevation)
+                .await
+                .is_err()
+        );
+        let cap = Arc::new(Captured::default());
+        AuthAudit::spawn(cap.clone())
+            .session_elevated(elevation)
+            .await
+            .expect("recorded");
+        assert_eq!(cap.0.lock().unwrap().len(), 1, "recorded before returning");
     }
 
     #[tokio::test]
@@ -544,5 +848,46 @@ mod tests {
         // Emit must not error or panic; the drain task warns.
         audit.login_succeeded("op@example.com", None, AuthMethod::Password, None);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    /// An environment holding exactly the given pairs.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// The sink is the service database every binary in the container
+    /// already reads — the cluster sets it from the `database-url` key of
+    /// `boss-secrets` (backlog d49b4355: the sink's own variable was set
+    /// only by a bare-metal drop-in, so the cluster staged nothing).
+    #[test]
+    fn the_sink_is_the_service_database() {
+        let url = "postgres://svc@postgres/boss";
+        assert_eq!(
+            audit_sink_url(env(&[("BOSS_POSTGRES_URL", url)])).as_deref(),
+            Some(url)
+        );
+    }
+
+    /// The drop-in's variable carried a role whose password was its own
+    /// name (backlog 7ec7113b); setting it configures nothing now, so a
+    /// copy of that URL left on some host cannot bring the role back.
+    #[test]
+    fn the_retired_drop_in_variable_configures_nothing() {
+        let retired = concat!("BOSS_GATEWAY_", "AUDIT_DB_URL");
+        assert_eq!(
+            audit_sink_url(env(&[(retired, "postgres://r@127.0.0.1/boss")])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_blank_url_is_no_sink() {
+        assert_eq!(audit_sink_url(env(&[("BOSS_POSTGRES_URL", "  ")])), None);
+        assert_eq!(audit_sink_url(env(&[])), None);
     }
 }

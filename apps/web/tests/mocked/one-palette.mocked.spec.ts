@@ -41,7 +41,7 @@ const ASSET = {
   // The reported element. Several, because a single chip could pass on
   // an accident of where it landed.
   tags: ['seasonal', 'winter-2026', 'launch', 'brand-reviewed'],
-  linked_device_skus: [],
+  linked_skus: [],
   linked_account_ids: [],
   linked_campaign_ids: [],
   owner_id: EMP.id,

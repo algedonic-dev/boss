@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -62,12 +61,9 @@ impl From<crate::bank_settlements::BankSettlement> for BankSettlementView {
 
 pub(super) async fn create_bank_settlement(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreateBankSettlementBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.amount_cents <= 0 {
         return (
             StatusCode::BAD_REQUEST,
@@ -223,7 +219,9 @@ pub(super) struct FromPaidInvoiceBody {
 
 pub(super) async fn create_bank_settlement_from_paid_invoice(
     State(state): State<Arc<LedgerApiState>>,
-    user: CurrentUser,
+    // Create on `ledger`, asked before the invoice is read: this door
+    // hands its admitted caller to `create_bank_settlement`.
+    user: LedgerCreate,
     Json(body): Json<FromPaidInvoiceBody>,
 ) -> Response {
     // Two legitimate drive shapes converge here, and the
@@ -327,13 +325,10 @@ pub(super) struct SettleBody {
 
 pub(super) async fn settle_bank_settlement(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Path(id): Path<String>,
     Json(body): Json<SettleBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let stamp = super::event_stamp(&state, &user).await;
     match settle_one(&state.pool, &stamp, &id, body.settled_on).await {
         Ok(view) => Json(view).into_response(),
@@ -365,12 +360,9 @@ struct SweepResponse {
 
 pub(super) async fn sweep_bank_settlements(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Query(q): Query<SweepQuery>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let as_of = q
         .as_of
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());

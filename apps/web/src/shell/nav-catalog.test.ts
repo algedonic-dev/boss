@@ -34,34 +34,38 @@ import { appForRoute, withRoster } from './sections';
 import { parseRoute, type Route } from '../router';
 import { readFileSync } from 'node:fs';
 
-/// Department Classes, read from the files that seed them rather
-/// than restated here — restating is the drift this test exists to
-/// catch.
+/// The departments registry's rows, read from the files that seed them
+/// rather than restated here — restating is the drift this test exists
+/// to catch.
 ///
 /// They come from TWO places, which is itself worth knowing: the
-/// platform ships eleven (`01-registries.sql`), and the playground
-/// tenant adds its own (`examples/brewery/seeds/classes.json`). Since
-/// ce68f137 the SPA reads them from `/api/classes` at boot, so these
-/// tests hand the seeded set to `appsFor` the way the shell hands it
-/// the fetched one.
+/// migration seeds thirteen on every instance
+/// (`20260919181324-a-department-is-a-subject.sql`, `it` among them —
+/// the platform's), and the playground tenant declares its roster
+/// (`examples/brewery/seeds/departments.toml`). The SPA reads them from
+/// `GET /api/departments` at boot, so these tests hand the seeded set
+/// to `appsFor` the way the shell hands it the fetched one. They were
+/// read from the `(employee, department)` Classes until backlog
+/// c87e3d6d retired those (2026-09-27).
 function registryDepartments(): ReadonlyArray<string> {
   const core = readFileSync(
-    new URL('../../../../infra/postgres/schema/01-registries.sql', import.meta.url),
+    new URL(
+      '../../../../infra/postgres/schema/20260919181324-a-department-is-a-subject.sql',
+      import.meta.url,
+    ),
     'utf8',
   );
   const coreCodes = [
-    ...core.matchAll(/\(\s*'employee',\s*'([a-z-]+)',\s*'[^']*',\s*'department'/g),
+    ...core.matchAll(
+      /\(\s*'([a-z-]+)',\s*'[^']*',\s*'(?:operations|revenue|support|governance)',\s*\d+\s*\)/g,
+    ),
   ].map((m) => m[1]!);
 
-  const tenant = JSON.parse(
-    readFileSync(
-      new URL('../../../../examples/brewery/seeds/classes.json', import.meta.url),
-      'utf8',
-    ),
-  ) as ReadonlyArray<{ member_attribute?: string; code?: string }>;
-  const tenantCodes = tenant
-    .filter((c) => c.member_attribute === 'department' && c.code)
-    .map((c) => c.code!);
+  const tenant = readFileSync(
+    new URL('../../../../examples/brewery/seeds/departments.toml', import.meta.url),
+    'utf8',
+  );
+  const tenantCodes = [...tenant.matchAll(/^code = "([a-z-]+)"$/gm)].map((m) => m[1]!);
 
   const all = [...new Set([...coreCodes, ...tenantCodes])];
   // A parser that silently matched nothing would make every
@@ -178,6 +182,10 @@ describe('nav catalog — app assignment', () => {
     // (backlog 62988516; David 2026-09-26: agents get a page in IT,
     // never the People roster). A TAB, not a row, gated like Drift.
     'system-agents',
+    // The Credentials tab on Registry — the credentials registry drawn,
+    // with rotate / retire / declare filed as packets (backlog 851259b9;
+    // design 76155676 step 3). A TAB, not a row, gated like Agents.
+    'system-credentials',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {
@@ -540,7 +548,11 @@ describe('departments map to apps', () => {
     // David's reason was that tenants connect at the boundary through
     // agreed protocols rather than sharing one multi-tenant shell. The
     // DEPARTMENT still exists and its people still exist.
-    expect(bare).toEqual(['audit', 'packaging', 'refurb', 'taproom']);
+    // Since c87e3d6d the roster is the departments registry, not the
+    // employee Classes: `refurb` and `audit` were Classes and never
+    // departments rows, and packaging and taproom are the brewery's
+    // declared departments with no screen yet.
+    expect(bare).toEqual(['packaging', 'taproom']);
   });
 
   // THE PIN the packet names (backlog 64656a46, car 2 of design

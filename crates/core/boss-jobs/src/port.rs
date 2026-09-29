@@ -45,6 +45,16 @@ pub enum JobsError {
     /// (backlog 570e72bd, road 5).
     #[error("job {id} is {status} — a finished packet's status does not move")]
     TerminalJob { id: JobId, status: String },
+    /// A metadata merge was judged on a read of the packet, and the
+    /// row's status or metadata moved before the merge took its lock
+    /// (the review of car 06973644, finding B). The metadata door
+    /// decides whether a patch puts an experiment's split in force on
+    /// the row as the patch would leave it; merged into a row another
+    /// writer changed since, the decision would be about a row that
+    /// never existed. Refused atomically with the row lock; nothing is
+    /// written or recorded, and the caller re-reads and re-sends.
+    #[error("job {id} changed since this merge was judged — nothing was written")]
+    JobChanged { id: JobId },
     /// A whole-row step write was computed from a read of a version the
     /// row no longer is: another writer (the merge door, a claim, a
     /// completion) wrote it between that read and this write. Written,
@@ -84,6 +94,18 @@ pub enum JobsError {
     /// lock with the shape check, and nothing is written.
     #[error("step {id} has already been stamped with presence ticket nonce {nonce}")]
     NonceSpent { id: StepId, nonce: String },
+    /// An admission pins its packet to a Workflow `(kind, version)` a
+    /// discard has removed (backlog ce8b7d66, part 4). The route read
+    /// the draft before the discard committed — an experiment admits to
+    /// its draft candidate — and admitted after; written, the packet
+    /// would run a number no protocol answers to. Refused in the
+    /// admission's own transaction, after it has waited out any discard
+    /// holding the row; nothing is written. The caller re-reads the
+    /// kind and admits onto what it now serves.
+    #[error(
+        "{kind} v{version} was discarded — a packet is never admitted onto a version no protocol answers to"
+    )]
+    VersionDiscarded { kind: String, version: i32 },
 }
 
 /// The nonce `stamp` would spend, if a stamp already on the step spent
@@ -361,6 +383,30 @@ pub enum JobScope {
 pub struct PinnedJobs {
     pub count: i64,
     pub first: Option<JobId>,
+}
+
+impl PinnedJobs {
+    /// The one sentence a discard of a pinned draft is refused with —
+    /// by the route, which asks the jobs port so every adapter answers,
+    /// and by the Pg registry, which asks again inside the discard's
+    /// own transaction (backlog ce8b7d66). One wording, so the two
+    /// refusals cannot drift apart.
+    pub fn discard_refusal(&self, kind: &str, version: i32) -> String {
+        let named = self
+            .first
+            .map(|id| format!(" (e.g. {id})"))
+            .unwrap_or_default();
+        let noun = if self.count == 1 {
+            "packet is"
+        } else {
+            "packets are"
+        };
+        format!(
+            "{kind} v{version} cannot be discarded: {} {noun} pinned to it{named}, \
+             and a pinned packet runs the text it was admitted under",
+            self.count
+        )
+    }
 }
 
 /// One cohort's block in the per-kind terminal report — Tier 1 of
@@ -960,6 +1006,20 @@ pub trait JobsRepository: Send + Sync {
     /// test can hold it — the Pg test is its only pin. What returns is
     /// the same either way. A new adapter that keeps subject
     /// identities must mint them here and say so.
+    ///
+    /// A DISCARDED VERSION ADMITS NOTHING (backlog ce8b7d66, part 4). A
+    /// packet pinned to a Workflow `(kind, version)` a discard has spent
+    /// is refused [`JobsError::VersionDiscarded`] and nothing is written.
+    /// The admission is ORDERED against the discard, not merely checked
+    /// beside it: the Pg adapter takes `FOR KEY SHARE` on the workflows
+    /// row first thing in its transaction — the discard holds `FOR
+    /// UPDATE` on it while it counts pins — and asks
+    /// `workflow_discarded_versions` when the row is gone; the in-memory
+    /// adapter checks its spent pairs under the lock the discard spends
+    /// them under (`InMemoryWorkflows::with_packets`). A version no row
+    /// and no discard names admits as before. Pinned on both adapters by
+    /// `the_adapters_agree_on_the_workflow_registry_pg`, and the two
+    /// interleavings by `a_packet_is_never_admitted_onto_a_discarded_version_pg`.
     async fn create_job_with_steps_at(
         &self,
         job: &Job,
@@ -1049,10 +1109,21 @@ pub trait JobsRepository: Send + Sync {
     /// Same precedent as the workflow registry's `publish_authored`
     /// recording WORKFLOW_PUBLISHED beside the row it describes. The
     /// stamp's `timestamp` is the write's timestamp.
+    ///
+    /// `judged_on`, when given, is the copy of the packet the caller
+    /// judged this patch against: the merge lands only while the row's
+    /// `status` and `metadata` are still that copy's, and otherwise
+    /// refuses with [`JobsError::JobChanged`], writing and recording
+    /// nothing (finding B of the review of car 06973644 — the door that
+    /// asks Publish of a split put in force judged a row the merge
+    /// never touched). `None` merges against the row as it stands,
+    /// which is the whole contract for a caller whose decision does not
+    /// read the other keys.
     async fn merge_job_metadata_at(
         &self,
         id: &JobId,
         patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
@@ -1752,8 +1823,8 @@ pub trait JobsRepository: Send + Sync {
     /// and its record goes on reading it. Discarding a draft asks this
     /// first and refuses a row any packet is pinned to (backlog
     /// ce8b7d66): an experiment admits packets to its draft candidate,
-    /// and `boss job convert --to vN` can move one onto a draft, so a
-    /// draft is not always pre-history.
+    /// and `boss job convert --to vN` could move one onto a draft until
+    /// it refused draft targets, so a draft is not always pre-history.
     async fn jobs_pinned_to_workflow(
         &self,
         kind: &str,
@@ -1778,6 +1849,28 @@ pub trait JobsRepository: Send + Sync {
         status: Option<JobStatus>,
         scope: &JobScope,
     ) -> Result<Vec<(String, i64)>, JobsError>;
+
+    /// Every kind's ledger under the caller's `scope`: packets ever,
+    /// open packets by the version each is pinned to, and the newest
+    /// terminal — what /it/registry reads to show version lag and a
+    /// never-run kind (backlogs 112c0535, 5eacf6db). Kinds with no
+    /// packet in scope are absent. `scope` is applied exactly as
+    /// `list_jobs` applies `JobFilter::scope`.
+    ///
+    /// The default impl is [`crate::kind_ledger::from_jobs`] over every
+    /// packet in scope — the definition, but O(packets); the Postgres
+    /// adapter answers with two grouped reads and is pinned equal to it.
+    async fn kind_ledger(
+        &self,
+        scope: &JobScope,
+    ) -> Result<Vec<crate::kind_ledger::KindLedger>, JobsError> {
+        let filter = JobFilter {
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;
+        Ok(crate::kind_ledger::from_jobs(&jobs))
+    }
 
     // ----- Cross-job dependency resolution (D10) -----
 

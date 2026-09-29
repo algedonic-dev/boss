@@ -309,6 +309,8 @@ test('a genuinely empty roster still reads as empty, not as a failure', async ({
   await peopleMocks(page, (r) => json(r, []));
 
   await page.goto('/ux/people');
-  await expect(page.getByText('No employees match those filters.')).toBeVisible();
+  // Empty, and said as empty — not as the filters' doing (0ef5e008).
+  await expect(page.getByText('No employees yet.')).toBeVisible();
+  await expect(page.getByText('No employees match those filters.')).toHaveCount(0);
   await expect(page.locator('.load-failed')).toHaveCount(0);
 });

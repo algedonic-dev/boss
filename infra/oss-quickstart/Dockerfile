@@ -114,6 +114,11 @@ COPY infra/platform/workflows ./infra/platform/workflows
 # declares its route in (design e765b3fc car R2) — so the routes it
 # serves need no file at run time.
 COPY infra/platform/yard/handoffs.toml ./infra/platform/yard/handoffs.toml
+# boss-dispatcher-handlers' estate.compare `include_str!`s the estate
+# declaration for its [ops_credentials.<host>] tables — which credentials
+# each cluster-operator holds and who brings each into being — the same
+# file the hosts' shell check reads (backlog f371c749).
+COPY infra/estate/estate.toml ./infra/estate/estate.toml
 
 # NO `ENV BOSS_BUILD_COMMIT` HERE — see the stage header; it is set in
 # the runtime stage so this layer keys on the sources alone.
@@ -191,6 +196,12 @@ RUN bun install --frozen-lockfile
 COPY apps/web ./apps/web
 COPY apps/simulator ./apps/simulator
 COPY libs/web-kit ./libs/web-kit
+# /it/kb draws the architecture diagrams from their Mermaid source, which
+# apps/web/src/it/kbDiagrams.ts imports as text from OUTSIDE apps/web
+# (backlog 4718d918): without these files the SPA build cannot resolve
+# the import. The .mmd files are the whole directory — no render is
+# committed beside them any longer.
+COPY docs/architecture ./docs/architecture
 
 # Both `src/build.ts` scripts shell out to `boss-ports-list` for the
 # canonical service-port table (single-source-of-truth shared with
@@ -394,6 +405,11 @@ COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh infra/boss-api-curl.sh in
 # refuses without it (backlog c51967b5);
 # crates/core/boss-testing/tests/a_chore_write_is_sent_once.rs pins it.
 COPY infra/lib/curl-through-a-roll.sh /usr/local/bin/lib/curl-through-a-roll.sh
+# boss-step.sh and boss-maintenance-wrap.sh hand the machine token to
+# curl as a 0600 header file, never in its argv, through the lib beside
+# them, and refuse without it (backlog 5f3ad356);
+# crates/core/boss-testing/tests/secret_header_sh.rs pins this line.
+COPY infra/lib/secret-header.sh /usr/local/bin/lib/secret-header.sh
 # The platform's conservation-invariant sweep and the helper it sources,
 # for the hourly boss-conservation-invariants CronJob (H12, backlog
 # 236529aa) — the brewery's own sweep rides in with `COPY examples`

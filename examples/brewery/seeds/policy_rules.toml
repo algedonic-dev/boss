@@ -16,11 +16,14 @@
 #   - "territory"               accounts on the caller's account team
 #   - "department:<name>"       rows scoped to a named department
 #
-# Department names follow the `employee` department Classes seeded
-# platform-side in `infra/postgres/schema/01-registries.sql`:
-# slugs: executive / brewhouse / packaging / cellar / lab /
-# warehouse / distribution / taproom / sales / marketing / hr /
-# finance / it / maintenance.
+# Department names are codes of the departments registry — this
+# tenant's seeds/departments.toml plus the platform's `it` (backlog
+# c87e3d6d; they were `employee` department Classes until 2026-09-27).
+# A scope naming a code no row holds matches no employee, silently:
+# five grants here named brewhouse, lab and hr until backlog f7daf124
+# (2026-09-28) repointed them to production, qa and people, where
+# their holders sit. crates/core/boss-testing/tests/
+# a_department_is_a_registry_row_not_a_class.rs refuses such a code.
 
 # ------------------------------------------------------------------
 # Executives — broad Read across every resource.
@@ -86,13 +89,13 @@ scope = "all"
 role = "head-brewer"
 resources = ["job", "step"]
 actions = ["read", "update", "close"]
-scope = "department:brewhouse"
+scope = "department:production"
 
 [[grants]]
 role = "head-brewer"
 resource = "step"
 action = "sign-off"
-scope = "department:brewhouse"
+scope = "department:production"
 
 [[grants]]
 role = "head-brewer"
@@ -128,7 +131,7 @@ scope = "self"
 role = "lab-tech"
 resource = "step"
 action = "sign-off"
-scope = "department:lab"
+scope = "department:qa"
 
 [[grants]]
 role = "qa-supervisor"
@@ -140,7 +143,7 @@ scope = "all"
 role = "qa-supervisor"
 resource = "step"
 action = "sign-off"
-scope = "department:lab"
+scope = "department:qa"
 
 [[grants]]
 role = "qa-tech"
@@ -417,7 +420,7 @@ scope = "all"
 role = "recruiter"
 resource = "employee"
 actions = ["read", "create"]
-scope = "department:hr"
+scope = "department:people"
 
 [[grants]]
 role = "benefits-coord"
@@ -756,15 +759,29 @@ scope = "all"
 # The finance read surface.
 #
 # `/api/ledger/*` — accounts, trial balance, the three statements,
-# journal entries, tax liability, bills — had NO read gate at all:
-# `reject_if_auditor` guards writes, so anyone who could reach the
-# port could read the company's books. `ledger` is all-or-nothing by
-# nature; a balance sheet is a company-wide aggregate with no owner to
-# narrow by.
+# journal entries, tax liability, bills — had NO read gate at all, so
+# anyone who could reach the port could read the company's books.
+# `ledger` is all-or-nothing by nature; a balance sheet is a
+# company-wide aggregate with no owner to narrow by.
 #
 # Granted to the roles whose work is the books, plus audit-readonly
 # (which picks it up from the platform defaults, not here).
 # ------------------------------------------------------------------
+
+# Posting to the books (backlog 34f0a954, 2026-09-28): a door that adds
+# a row — a journal entry, a bill, a settlement, a payroll run, a tax
+# filing — asks `create` on `ledger`, and one that changes
+# a row — paying, settling, remitting, superseding a fact — asks
+# `update`. Until then every door asked for the read grant below and
+# nothing more, so every clerk and analyst could post to the books. The
+# finance leads hold both; platform-admin holds both from the platform
+# defaults, which is what the dispatcher's rules and this tenant's
+# prepare sign as. A clerk who books day to day is one row more.
+[[grants]]
+roles = ["controller", "cfo"]
+resource = "ledger"
+actions = ["create", "update"]
+scope = "all"
 
 [[grants]]
 roles = [
@@ -773,6 +790,20 @@ roles = [
 ]
 resource = "ledger"
 action = "read"
+scope = "all"
+
+# Closing a month (`close`, the /ux/finance Lock button) and reopening
+# one (`update`, Unlock) on `ledger-period` (backlog 25a4f7f9,
+# 2026-09-28). Both doors asked for the read grant above and nothing
+# more, so every clerk and analyst could freeze a month or reopen one.
+# The month-end close is the controller's; the CFO holds it too.
+# Opening a fiscal year (`create`, POST /api/ledger/periods) is the same
+# resource (backlog 34f0a954), so one grant covers a year's whole life.
+# platform-admin holds all three from the platform defaults.
+[[grants]]
+roles = ["controller", "cfo"]
+resource = "ledger-period"
+actions = ["create", "close", "update"]
 scope = "all"
 
 # ------------------------------------------------------------------

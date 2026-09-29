@@ -187,6 +187,7 @@ async fn run_server<R: AssetsRepository + 'static>(
     // 85e7f10f).
     let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
         boss_policy_client::ReqwestPolicyClient::new(
+            "assets",
             std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
         ),
     ));

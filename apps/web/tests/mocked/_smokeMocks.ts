@@ -109,11 +109,14 @@ export async function installTenantManifest(
   }
 }
 
-/// The platform's department Classes (01-registries.sql) as `/api/classes`
-/// rows — the EMPLOYEE DRAWER: the values an employee's `department`
-/// column may take, which the policy flyout's scope picker reads.
-/// The chrome bar stopped deriving its tabs from these in dc5788ba;
-/// `DEPARTMENTS` below is what it reads now.
+/// The department Classes 01-registries.sql seeds, as `/api/classes`
+/// rows — the EMPLOYEE DRAWER's old department axis. NOTHING in the SPA
+/// reads them any longer: the chrome bar stopped deriving its tabs from
+/// them in dc5788ba, and the roster, the employee page, HR and the
+/// policy flyout's scope picker in c87e3d6d, when the department
+/// Classes retired and an employee's department became a row of
+/// `DEPARTMENTS` below. Kept as the code list `DEPARTMENTS` is built
+/// from, and as drawer rows a spec may still serve without effect.
 export const DEPARTMENT_CLASSES: ReadonlyArray<Record<string, unknown>> = [
   ['it', 'IT'], ['executive', 'Executive'], ['sales', 'Sales'], ['service', 'Service'],
   ['refurb', 'Refurb'], ['qa', 'QA'], ['warehouse', 'Warehouse'], ['finance', 'Finance'],
@@ -170,7 +173,7 @@ const WORKFLOW = {
 // A marketing asset with every OPTIONAL field omitted (kind, description,
 // file_url, owner_id, *_at-by, supersedes_id). Required arrays present.
 const MARKETING_ASSET = {
-  id: 'ma-1', title: 'Brand deck', tags: [], linked_device_skus: [],
+  id: 'ma-1', title: 'Brand deck', tags: [], linked_skus: [],
   linked_account_ids: [], linked_campaign_ids: [],
   created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
 };
@@ -217,6 +220,9 @@ export const JOBS_SUMMARY = /\/api\/jobs\/summary(\?|$)/;
 /// and paints a list as a failed read, so the empty leg answers the
 /// empty queue the server gives (page audit a1d62870, 2026-09-27).
 export const JOBS_ASSIGNMENTS = /\/api\/jobs\/assignments(\?|$)/;
+/// The per-kind ledger (`{ kinds }`, backlog 112c0535): /it/registry
+/// reads a bare `[]` as a failed read, not as no packets ever.
+export const JOBS_KINDS = /\/api\/jobs\/kinds$/;
 export const YARD_STATUS = /\/api\/yard\/status$/;
 export const YARD_REGIONS = /\/api\/yard\/regions(\?|$)/;
 export const YARD_BORDERS = /\/api\/yard\/borders(\?|$)/;
@@ -302,6 +308,36 @@ export async function servePeopleRows(
     await page.route(new RegExp(`/api/people/${id}$`), (r) => json(r, row));
   }
 }
+
+/// A policy answer as a spec states it: a decision, or a status the
+/// check refuses with.
+export type PolicyAnswer = 'allow' | 'deny' | number;
+
+/// Sign the page in as EMP — the gateway's probe with its `policy_user`,
+/// and EMP's people row — and answer every `POST /api/policy/check` with
+/// `decide(action, resource)` (backlog 9dad102c: a write the web gates
+/// on policy is hidden until the check allows it). Returns the checks the
+/// page asked, as `action resource` strings. The floor answers an
+/// unmocked check with `[]`, which is no decision, so a spec that signs
+/// in without this sees every policy-gated write hidden.
+export async function signInWithPolicy(
+  page: Page,
+  decide: (action: string, resource: string) => PolicyAnswer = () => 'allow',
+): Promise<string[]> {
+  await page.route(/\/api\/session$/, (r) => json(r, {
+    username: EMP.email, employee_id: EMP.id, role: EMP.role, policy_user: { id: EMP.id, role: EMP.role },
+  }));
+  await page.route(EMPLOYEE_DETAIL, (r) => json(r, EMP));
+  const asked: string[] = [];
+  await page.route(/\/api\/policy\/check$/, (r) => {
+    const body = JSON.parse(r.request().postData() ?? '{}') as { action: string; resource: string };
+    asked.push(`${body.action} ${body.resource}`);
+    const answer = decide(body.action, body.resource);
+    if (typeof answer === 'number') return json(r, 'refused', answer);
+    return json(r, answer === 'allow' ? { decision: 'allow', scope: 'all' } : { decision: 'deny', reason: 'no rule' });
+  });
+  return asked;
+}
 /// The audit log's size-and-growth read (boss-events AuditStats). The
 /// fixture /it/operate/audit sat in DEFERRED waiting for ("snapshot .length
 /// needs a faithful fixture"; page audit 65a273d5, gap 0398c4d0): a `[]`
@@ -352,6 +388,24 @@ export const EMPTY_ASSETS_SUMMARY = {
 export const EMPTY_AP_AGING = {
   buckets: [], total_outstanding_cents: 0, total_invoice_count: 0, currency: 'USD',
 } as const;
+/// The list reads the SPA takes through `fetchPaged`, which answer the
+/// `{data, total, limit, offset}` envelope. Since backlog 0ef5e008 a 200
+/// that is not the envelope is a FAILED read there — `normalise` used to
+/// turn the catch-all's `[]` into an empty page, and a page painted that
+/// as its empty source — so the floor and the empty leg answer these the
+/// empty page a server with no rows gives. Each pattern stops at the
+/// collection: `/api/assets/summary` and a detail path are other reads.
+export const PAGED_ENDPOINTS: ReadonlyArray<RegExp> = [
+  /\/api\/people\/accounts(\?|$)/,
+  /\/api\/assets(\?|$)/,
+  /\/api\/shipping\/shipments(\?|$)/,
+  /\/api\/commerce\/invoices(\?|$)/,
+  /\/api\/commerce\/open-ar(\?|$)/,
+  // The department's packets (AccountsList, SupportPage, and the
+  // department thirds, whose parser reads the envelope too).
+  /\/api\/jobs\?(?:[^#]*&)?department=/,
+];
+export const EMPTY_PAGE = { data: [], total: 0, limit: 0, offset: 0 } as const;
 /// The empty-but-valid body of each ledger statement (apps/web/src/finance
 /// ledger.ts's types), keyed by the path LEDGER_STATEMENTS matched. The
 /// cash-flow path answers two shapes, told apart by `?method=direct`.
@@ -417,6 +471,8 @@ export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
   // than an empty one — deliberately, so the org chart cannot go
   // missing quietly (libs/web-kit/src/nav.ts).
   DEPARTMENTS_ENDPOINT,
+  // `{ kinds }`, the per-kind ledger /it/registry reads (112c0535).
+  JOBS_KINDS,
 ];
 
 /// The floor under every mocked spec's backend (backlog f88e7908,
@@ -485,6 +541,9 @@ export async function installApiFloor(page: Page): Promise<void> {
   // Live job state (objects, not lists — `[]` would break these).
   await page.route(JOBS_LIVE, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(JOBS_SUMMARY, (r) => json(r, { counts: {}, total: 0 }));
+  // The per-kind ledger (112c0535): `{ kinds }`, because the registry
+  // reads a bare `[]` as a failed read rather than as no packets ever.
+  await page.route(JOBS_KINDS, (r) => json(r, { kinds: [] }));
   // The churn watchlist's scores: `{ accounts }` (RiskScoreListSchema).
   // Under the `[]` catch-all the page parses a wrong shape and says so on
   // the failure marker (sweep c3e4edcc) — right for a broken backend,
@@ -555,6 +614,13 @@ export async function installApiFloor(page: Page): Promise<void> {
   await page.route(AP_AGING, (r) => json(r, EMPTY_AP_AGING));
   await page.route(LEDGER_STATEMENTS, (r) => json(r, emptyLedgerStatement(r.request().url())));
   await page.route(ASSETS_SUMMARY, (r) => json(r, EMPTY_ASSETS_SUMMARY));
+  // The paged list reads, an empty page each (see PAGED_ENDPOINTS). GET
+  // only: a POST to a collection path (an invoice create) is a write the
+  // floor has no answer for beyond the catch-all's.
+  for (const paged of PAGED_ENDPOINTS) {
+    await page.route(paged, (r) =>
+      r.request().method() === 'GET' ? json(r, EMPTY_PAGE) : r.fallback());
+  }
   // The envelope reads, well-formed and empty: every station answered
   // and nothing stands, so the board paints its clear state and the
   // design page its two empty lines (backlog 67825067).
@@ -674,6 +740,9 @@ export async function installSmokeMocks(page: Page): Promise<void> {
       matched: 1, truncated: false, scope: 'all',
     }),
   );
-  await page.route(/\/api\/shipping\/shipments(\?|$)/, (r) => json(r, [SHIPMENT]));
+  // The envelope the server answers: a bare list here is a failed read
+  // to `fetchPaged` since backlog 0ef5e008 (see PAGED_ENDPOINTS).
+  await page.route(/\/api\/shipping\/shipments(\?|$)/, (r) =>
+    json(r, { data: [SHIPMENT], total: 1, limit: 1000, offset: 0 }));
   await page.route(SHIPMENT_DETAIL, (r) => json(r, SHIPMENT));
 }

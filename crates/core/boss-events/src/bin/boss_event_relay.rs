@@ -139,7 +139,18 @@ async fn main() -> Result<()> {
             Ok(stats) => {
                 total_delivered += stats.delivered;
                 since_heartbeat += stats.delivered;
-                if stats.delivered == 0 {
+                if stats.dead_lettered > 0 {
+                    // Loud here too: the drain logged each row, and the
+                    // alarm event it staged files the packet
+                    // (backlog e4019cbc).
+                    error!(
+                        dead_lettered = stats.dead_lettered,
+                        "outbox rows dead-lettered — the bus refused them"
+                    );
+                }
+                // Idle only when nothing moved: a batch that
+                // dead-lettered its only rows made progress.
+                if stats.moved() == 0 {
                     if cli.once {
                         info!(total_delivered, "outbox empty — exiting (--once)");
                         return Ok(());

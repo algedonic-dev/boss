@@ -961,7 +961,7 @@ fn the_target_and_the_hold_file_are_the_ones_the_tree_declares() {
     let hold = std::fs::read_to_string(repo_root().join("infra/forge/converge-hold.sh")).unwrap();
     // The hold path lives once, in forge-defaults.sh; both verbs source it.
     assert!(hold.contains("forge-defaults.sh"));
-    assert!(defaults.contains("${BOSS_CONVERGE_HOLD:-/var/tmp/boss-converge-hold}"));
+    assert!(defaults.contains("${BOSS_CONVERGE_HOLD:-/var/lib/boss/converge-hold}"));
     // boss-init carries NO PGDATABASE literal since the sibling car
     // (fix/boss-init-reads-its-database-from-the-secret, 2026-09-16):
     // its database is derived from DATABASE_URL, the Secret this verb

@@ -20,6 +20,17 @@
 # Declared here since 2026-09-18 (backlog 393d3234, consolidation H4,
 # car 4 of 4); see README.md for what that means.
 #
+# Version 3 is the first version declared ONLY here (backlog 366c2ed5,
+# David 2026-09-28 02:50Z, 'Go to 4'): gate_max_concurrent 3 -> 4, bumped
+# from the LIVE newest (v2, read off /api/delivery/policy/train-conductor
+# on 2026-09-28), which the seed publishes over the migrations' v2 at the
+# next converge. Three bays had been saturated most of the day before —
+# a queue of 7-11 gates, the oldest waiting 51-69 min. Four is one step
+# short of the measured cliff at FIVE (2026-08-26: w-1 I/O pressure 65%,
+# CPU pressure 0.00, a ~35-min gate took ~93) and was never measured
+# itself, so a day of gate duration and w-1 I/O pressure is recorded on
+# that packet before five is considered.
+#
 # The compiled fallback in delivery_policy.rs is held equal to this
 # file by `the_bundle_equals_the_compiled_fallback` (boss-cli): the
 # conductor runs on these numbers whether or not the registry answers,
@@ -30,7 +41,7 @@
 
 [[delivery_policy]]
 name = "train-conductor"
-version = 2
+version = 3
 status = "active"
 # THE HOLD: red trains a car may be released from before boarding
 # leaves it behind until a human looks.
@@ -52,5 +63,6 @@ blip_cause_budget = 80
 # must show before boarding assembles a consist.
 ci_host_floor_gb = 40
 # How many gates `boss gate` admits at once before it refuses — the
-# number the CLI obeys and the number the yard draws as slots.
-gate_max_concurrent = 3
+# number the CLI obeys and the number the yard draws as slots. Four
+# since v3 (see the header).
+gate_max_concurrent = 4

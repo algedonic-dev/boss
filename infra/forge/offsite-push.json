@@ -1,4 +1,16 @@
 {
-  "remote": "https://github.com/dauld/boss-mirror.git",
-  "branches": ["publish/*"]
+  "targets": [
+    {
+      "remote": "https://github.com/algedonic-dev/boss-dr.git",
+      "branches": ["main"],
+      "credential": "github-dr-push-token",
+      "token_file": "/etc/boss-publish/github-dr.token"
+    },
+    {
+      "remote": "https://github.com/dauld/boss-mirror.git",
+      "branches": [],
+      "credential": "dauld-github-token",
+      "token_file": "/etc/boss-publish/github.token"
+    }
+  ]
 }

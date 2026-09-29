@@ -24,11 +24,9 @@
 // behind a `subject_kind` the departments table does not have.
 
 import { departmentsFrom, type Department } from '../nav';
+import { departmentsReadFailedOf, type DepartmentsState } from './departments-read';
 
-type RegistryState =
-  | { kind: 'loading' }
-  | { kind: 'ready'; rows: ReadonlyArray<Department> }
-  | { kind: 'error' };
+type RegistryState = DepartmentsState;
 
 // Reassigned, never mutated in place, so the `$derived` reads in the
 // chrome bar re-run when the roster arrives.
@@ -81,4 +79,14 @@ export function departments(): ReadonlyArray<Department> {
 export function departmentRoster(): ReadonlyArray<Department> | null {
   const st = registry.value;
   return st.kind === 'ready' ? st.rows : null;
+}
+
+/// Whether the registry read FAILED — the one state neither reader above
+/// can say: `departments()` is [] and `departmentRoster()` null both
+/// while loading and on error. The policy flyout's department scopes
+/// vanished on a failed read with a warning keyed to the retired
+/// `(employee, department)` Classes (backlog 720d6345); it says so on
+/// this answer now. The judging is pure and lives in departments-read.ts.
+export function departmentsReadFailed(): boolean {
+  return departmentsReadFailedOf(registry.value);
 }

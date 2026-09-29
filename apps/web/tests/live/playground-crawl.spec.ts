@@ -68,10 +68,10 @@ const EXPECTED_CONSOLE_ERRORS: ReadonlyArray<{ route: string; status: number; re
   { route: '/ux/marketing-assets/ma-1', status: 404, reason: GUEST_REFUSED },
   { route: '/it', status: 404, reason: GUEST_REFUSED },
   { route: '/it/codebase', status: 403, reason: GUEST_REFUSED },
-  // Measured on the crawl's first scheduled run (packet 304960d9,
-  // 2026-09-19 04:45Z): the one unexplained line, the same class as
-  // its sibling /it/codebase.
-  { route: '/it/design/codebase', status: 403, reason: GUEST_REFUSED },
+  // /it/design/codebase's 403 entry (packet 304960d9) left on 2026-09-27
+  // (818cd10c): the route was retired with no alias by car N3 of design
+  // e765b3fc and now renders not-found, so the entry could only hide a
+  // new error on that path.
 ];
 
 /// PURE: the expected entry a console.error matches, if any.

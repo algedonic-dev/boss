@@ -25,6 +25,15 @@ pub const EMPLOYEE_CHANGE_RECORDED: &str = "people.employee.change-recorded";
 /// the ON CONFLICT DO UPDATE path the handler already uses.
 pub const REQUISITION_OPENED: &str = "people.requisition.opened";
 
+/// A stored passkey was promoted to the operator tier — the one write
+/// of that tier, by the gateway alone, at the end of a
+/// `passkey-promotion` ceremony (design 2cb6256f D5-D6). Recorded in
+/// the flip's own transaction. `auth.` rather than `people.` because it
+/// is the auth vocabulary the gateway's `auth.passkey.enrolled` and
+/// `auth.session.elevated` already speak: a reader of one key's life
+/// finds enrolment, promotion and every elevation under one prefix.
+pub const PASSKEY_PROMOTED: &str = "auth.passkey.promoted";
+
 /// Resolve the outbox event stamp for a request. People write
 /// handlers carry no CurrentUser-derived actor; the publisher's
 /// `default_actor` resolves the request identity from the task-local

@@ -639,7 +639,9 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
     await expect(filters(page).getByRole('button')).toHaveText([
       'Waiting on you (0)', 'All (0)', 'Unread (0)', 'Direct (0)', 'Signals (0)',
     ]);
-    await expect(empty(page)).toHaveText('No messages match those filters.');
+    // Empty, and said as empty — not as the filters' doing (0ef5e008).
+    await expect(empty(page)).toHaveText('No messages yet.');
+    await expect(page.getByText('No messages match those filters.')).toHaveCount(0);
     await expect(bulk(page)).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
@@ -671,7 +673,10 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
       "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 500"],
     ['forbidden (403)', (r) => json(r, 'forbidden', 403),
       "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 403"],
-    ['unreachable', (r) => r.abort('connectionrefused'), "Couldn't load your inbox — Failed to fetch"],
+    // The line names the read even when the browser's message does not
+    // (backlog 0ef5e008).
+    ['unreachable', (r) => r.abort('connectionrefused'),
+      "Couldn't load your inbox — /api/messages/inbox/emp-001: Failed to fetch"],
     ['not JSON', (r) => r.fulfill({ status: 200, contentType: 'application/json', body: 'not json' }),
       /^\s*Couldn't load your inbox — \S.*\S\s*$/],
     // (c) A changed response shape — an envelope where the list was due

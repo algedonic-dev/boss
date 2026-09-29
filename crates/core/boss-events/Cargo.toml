@@ -80,6 +80,14 @@ name = "outbox_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "outbox_http"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_log_complete_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "subject_edges_pg"
 required-features = ["postgres"]
 

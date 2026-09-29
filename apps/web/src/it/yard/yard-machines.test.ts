@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import type { JobLite } from './yard';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { exitFailed, NOT_YET_EXIT, type JobLite } from './yard';
 import {
   CONVERGE_USUAL_MINUTES,
   clusterLabel,
@@ -115,6 +117,37 @@ describe('runnerMachine — the deploy-runner shed, from the converge packets', 
       at: '2026-09-08T02:30:40Z',
       reason: 'exit 1 — Failed to start cluster-deploy-runner.service: Unit not found.',
     });
+  });
+
+  test('exit 75 is not yet, not failed: a converge already running took the start, and the shed shows that run', () => {
+    // backlog 1058e686, car D: converge-now.sh exits 75 when the unit's
+    // invocation did not change — about one merge in six. Read as a
+    // failure, the shed drew FAILED until the next merge.
+    const out = 'converge-now: noted request 19df6925 in /home/david/boss/.git/boss-converge-requests\nconverge-now: not yet: …';
+    const inside = runnerMachine([answered('n1', '2026-09-08T02:31:56Z', '2026-09-08T02:32:35Z', '75', out)], NOW);
+    expect(inside).toEqual({ kind: 'running', id: 'n1', since: '2026-09-08T02:32:35Z', host: 'forge' });
+    const closedAt = new Date(NOW - (CONVERGE_USUAL_MINUTES + 1) * 60_000).toISOString();
+    const past = runnerMachine([answered('n2', '2026-09-08T02:20:56Z', closedAt, '75', out)], NOW);
+    expect(past).toEqual({ kind: 'idle', last: { id: 'n2', at: closedAt, host: 'forge' } });
+    // Every other non-zero exit is still a failure.
+    expect(exitFailed('75')).toBe(false);
+    expect(exitFailed('0')).toBe(false);
+    expect(exitFailed(null)).toBe(false);
+    for (const code of ['1', '2', '74', '76', '124']) expect(exitFailed(code)).toBe(true);
+  });
+
+  test('NOT_YET_EXIT equals the Rust NOT_YET_EXIT that verb_failure reads (CLAUDE.md §9a)', () => {
+    const src = readFileSync(
+      join(
+        import.meta.dir,
+        '..', '..', '..', '..', '..',
+        'crates', 'orchestrators', 'boss-dispatcher-handlers', 'src', 'handlers', 'jobs_complete_linked_step.rs',
+      ),
+      'utf8',
+    );
+    const rust = src.match(/pub\(crate\) const NOT_YET_EXIT: &str = "(\d+)";/);
+    expect(rust, 'jobs_complete_linked_step.rs is where the server spells NOT_YET_EXIT').not.toBeNull();
+    expect(String(NOT_YET_EXIT)).toBe(rust![1]!);
   });
 
   test('the newest converge packet by opened_at wins, whatever order the rows arrive in', () => {

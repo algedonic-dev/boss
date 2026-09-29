@@ -60,6 +60,7 @@ import {
   blockLabel,
   clockText,
   elapsedText,
+  bayTimes,
   gateSlots,
   journeyText,
   queueLabel,
@@ -192,7 +193,16 @@ export type Bay = Readonly<{
   since: string | null;
   elapsed: string | null;
   stale: boolean;
-  /** Elapsed over the runner's usual duration, 0–1 — the shed's bar. */
+  /** Queued for, running for, and the median running time, in the
+   *  server's reading (`bayTimes`) — null from an older server, which
+   *  carries only the packet's age (backlog 4d088a7e). */
+  times: string | null;
+  /** When its Job was created, when the server recorded it. */
+  launchedAt: string | null;
+  /** The server's word that this run is RUNNING past twice the median. */
+  troubled: boolean;
+  /** Running time over the measured median (the runner's usual when
+   *  nothing is measured), 0–1 — the shed's bar. */
   progress: number;
 }>;
 
@@ -894,16 +904,24 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
   const slots = status ? gateSlots(status.gates) : [];
   const bays: Bay[] = slots.map((s, i) => {
     if (s.kind !== 'occupied') {
-      return { index: i, busy: false, branch: null, packetId: null, wagonId: null, tag: null, since: null, elapsed: null, stale: false, progress: 0 };
+      return { index: i, busy: false, branch: null, packetId: null, wagonId: null, tag: null, since: null, elapsed: null, stale: false, times: null, launchedAt: null, troubled: false, progress: 0 };
     }
     const g = s.gate;
     const car = carByBranch.get(g.branch);
     const id = car && !claimedIds.has(car.id) ? car.id : g.packet_id;
-    const elapsed = sinceText(g.since, nowMs);
+    // The RUN's age, from its Job, when the server read one — the
+    // packet's age counts its wait in line too, and a gate queued 46
+    // minutes and running 14 read "gating · 1h" here (backlog 4d088a7e).
+    const running = g.running_seconds ?? null;
+    const elapsed = running !== null ? journeyText(running) : sinceText(g.since, nowMs);
+    const typical = status?.gates.typical_seconds ?? null;
+    const times = running !== null ? bayTimes(g, typical) : null;
+    const troubled = g.troubled === true;
     const startedMs = isInstant(g.since) ? Date.parse(g.since) : Number.NaN;
-    const progress = Number.isNaN(startedMs)
+    const spentMs = running !== null ? running * 1000 : nowMs - startedMs;
+    const progress = Number.isNaN(spentMs)
       ? 0
-      : Math.min(Math.max(nowMs - startedMs, 0) / (GATE_USUAL_MINUTES * 60_000), 1);
+      : Math.min(Math.max(spentMs, 0) / ((typical ?? GATE_USUAL_MINUTES * 60) * 1000), 1);
     // A TRAIN's gate (128b5496) is the train being tested, not a car
     // being gated: it takes the train's id, the `train gate` tag and
     // its own kind, so the bay never reads as a PR car in the gates
@@ -921,11 +939,13 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
         station: 'gate',
         slot: i,
         trainId: tg?.trainId ?? null,
-        tone: g.stale ? 'warn' : 'ok',
-        lamp: g.stale ? 'warn' : 'working',
+        tone: g.stale || troubled ? 'warn' : 'ok',
+        lamp: g.stale || troubled ? 'warn' : 'working',
         status: g.stale
-          ? `${tg ? 'testing the train' : 'gating'} · ${elapsed} · STALE — past the runner's usual; the verdict may never reach the packet, re-gate`
-          : `${tg ? 'testing the train' : 'gating'} · ${elapsed}`,
+          ? `${tg ? 'testing the train' : 'gating'} · ${times ?? elapsed} · STALE — past the runner's usual; the verdict may never reach the packet, re-gate`
+          : troubled
+            ? `${tg ? 'testing the train' : 'gating'} · ${times ?? elapsed} · TROUBLED — running past 2× the median`
+            : `${tg ? 'testing the train' : 'gating'} · ${times ?? elapsed}`,
         since: g.since,
       });
     }
@@ -939,6 +959,9 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       since: g.since,
       elapsed,
       stale: g.stale,
+      times,
+      launchedAt: g.launched_at ?? null,
+      troubled,
       progress,
     };
   });

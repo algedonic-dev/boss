@@ -420,6 +420,35 @@ describe('putStep', () => {
     expect((seenInit?.headers as Record<string, string>)['x-presence-ticket']).toBe('ticket-1');
     expect(JSON.parse(String(seenInit?.body))).toEqual({ status: 'completed' });
   });
+
+  // Backlog e39a9d2a, Stage 2: metadata never rides the step PUT from
+  // the web. The type refuses it at compile time; this is the runtime
+  // half, for a body built as `unknown` or cast past the type.
+  test('refuses a body carrying metadata, and sends nothing', async () => {
+    let calls = 0;
+    stubFetch(async () => {
+      calls += 1;
+      return new Response('{}', { status: 200 });
+    });
+    const body = { status: 'completed', metadata: { reason: 'x' } } as unknown as {
+      status: string;
+    };
+    const res = await putStep('job-1', 'step-9', body);
+    expect(res.kind).toBe('failed');
+    if (res.kind === 'failed') expect(res.error).toContain('saveStep');
+    expect(calls).toBe(0);
+  });
+
+  test('takes the retry policy it is handed', async () => {
+    let calls = 0;
+    stubFetch(async () => {
+      calls += 1;
+      return new Response('', { status: calls === 1 ? 503 : 200 });
+    });
+    const res = await putStep('job-1', 'step-9', { status: 'ready' }, undefined, noWait);
+    expect(res.kind).toBe('ok');
+    expect(calls).toBe(2);
+  });
 });
 
 // Design 611fbffd, clause (b) of backlog 6ef4a36b item (2): a step

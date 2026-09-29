@@ -351,6 +351,33 @@ pub enum StationError {
     Storage(String),
 }
 
+/// `terminal_window_days` as the `stations.terminal_window_days` INT
+/// column holds it, or `Invalid` naming the station when it cannot.
+///
+/// The row carries a `u32` and Postgres has no unsigned INT, so a
+/// window past `i32::MAX` days has no stored spelling. The Pg adapter
+/// used to clamp it to `i32::MAX` on the way in: the write answered the
+/// window it was handed, recorded that window on its fact, and stored a
+/// different one, while the double stored it as handed — so the row,
+/// the fact and the other adapter each said something else (backlog
+/// be459ab9, found by the adapters-agree suite on 2026-09-29). Both
+/// adapters now refuse it before writing anything, through this one
+/// check.
+pub(crate) fn window_column(spec: &StationSpec) -> Result<Option<i32>, StationError> {
+    spec.terminal_window_days
+        .map(|days| {
+            i32::try_from(days).map_err(|_| {
+                StationError::Invalid(format!(
+                    "station {}: terminal_window_days {days} exceeds the widest window \
+                     a row can hold ({} days)",
+                    spec.name,
+                    i32::MAX
+                ))
+            })
+        })
+        .transpose()
+}
+
 // ---------------------------------------------------------------------------
 // Port
 // ---------------------------------------------------------------------------
@@ -363,7 +390,8 @@ pub trait StationRegistry: Send + Sync {
     /// Specific historical version.
     async fn get_version(&self, name: &str, version: i32) -> Result<StationSpec, StationError>;
 
-    /// Every active station, name-ordered.
+    /// Every active station, name-ordered byte for byte (`-` before a
+    /// letter) — never by a database's locale.
     async fn list_active(&self) -> Result<Vec<StationSpec>, StationError>;
 
     /// Every version of one name (oldest first). Includes drafts +
@@ -377,6 +405,10 @@ pub trait StationRegistry: Send + Sync {
     /// corresponding event via `events::station_registry_event` and
     /// records it atomically with the row. Records
     /// `jobs.station.draft_saved` (payload = the stored draft).
+    ///
+    /// `Invalid`, writing nothing, when the row cannot be stored as
+    /// written (a `terminal_window_days` past `i32::MAX`); `publish_declared`
+    /// refuses the same.
     async fn create_draft(
         &self,
         spec: StationSpec,
@@ -417,9 +449,12 @@ pub trait StationRegistry: Send + Sync {
     /// In one transaction: the viability gate, retire any active row
     /// of the same name, INSERT the row active at `spec.version` with
     /// `created_at = now`, record `jobs.station.published` (payload =
-    /// the row written). `Conflict` when (name, version) already
-    /// exists — the caller decides what an existing row means, this
-    /// never overwrites one.
+    /// the row written). `Conflict`, writing nothing, when
+    /// `spec.version` is not above the newest version the name holds in
+    /// any status — an existing row is never overwritten, and a live
+    /// row is never retired for a lower one; the caller's classify is a
+    /// read taken before this write, so the floor lives here (backlog
+    /// df793bd7, `crate::declared_version`).
     async fn publish_declared(
         &self,
         spec: StationSpec,
@@ -535,6 +570,7 @@ impl StationRegistry for InMemoryStations {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<StationSpec, StationError> {
+        window_column(&spec)?;
         let next = self.max_version(&spec.name).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Draft;
@@ -629,13 +665,22 @@ impl StationRegistry for InMemoryStations {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<StationSpec, StationError> {
+        window_column(&spec)?;
         crate::station_lint::gate_active(&spec).map_err(StationError::Unviable)?;
         let mut rows = self.rows.lock().unwrap();
         let key = (spec.name.clone(), spec.version);
-        if rows.contains_key(&key) {
-            return Err(StationError::Conflict(format!(
-                "row already exists: {}@{}",
-                spec.name, spec.version
+        // The floor, under the one lock every write takes — the Pg
+        // adapter's rule (backlog df793bd7).
+        let newest = crate::declared_version::newest(
+            rows.keys()
+                .filter(|(n, _)| *n == spec.name)
+                .map(|(_, v)| *v),
+        );
+        if spec.version <= newest {
+            return Err(StationError::Conflict(crate::declared_version::not_above(
+                &spec.name,
+                spec.version,
+                newest,
             )));
         }
         for ((n, _), row) in rows.iter_mut() {
@@ -775,11 +820,19 @@ mod pg {
         }
 
         async fn list_active(&self) -> Result<Vec<StationSpec>, StationError> {
-            let rows: Vec<Row> =
-                sqlx::query_as(&format!("{SELECT} WHERE status = 'active' ORDER BY name"))
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| StationError::Storage(e.to_string()))?;
+            // BYTE order, `COLLATE "C"`: the port promises "name-ordered",
+            // and a bare `ORDER BY name` sorts by the database's locale,
+            // which ignores `-` at first level — `suite-ab` listed before
+            // `suite-a-z` here and after it in the double. Byte order is
+            // the one both adapters can hold (backlog be459ab9, found by
+            // the adapters-agree suite; the Workflow and credentials
+            // registries were fixed the same way).
+            let rows: Vec<Row> = sqlx::query_as(&format!(
+                "{SELECT} WHERE status = 'active' ORDER BY name COLLATE \"C\""
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))?;
             rows.into_iter().map(row_to_spec).collect()
         }
 
@@ -799,6 +852,7 @@ mod pg {
             actor: &boss_core::actor::ActorId,
             now: DateTime<Utc>,
         ) -> Result<StationSpec, StationError> {
+            let window = window_column(&spec)?;
             let mut tx = self
                 .pool
                 .begin()
@@ -829,10 +883,7 @@ mod pg {
             .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
             .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
             .bind(spec.wip_limit)
-            .bind(
-                spec.terminal_window_days
-                    .map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
-            )
+            .bind(window)
             .bind(
                 spec.capability
                     .as_ref()
@@ -1001,6 +1052,7 @@ mod pg {
             // The viability gate before the transaction opens: an
             // unviable bundle row never occupies the ACTIVE slot, not
             // even for the length of a transaction.
+            let window = window_column(&spec)?;
             crate::station_lint::gate_active(&spec).map_err(StationError::Unviable)?;
 
             let mut tx = self
@@ -1009,17 +1061,20 @@ mod pg {
                 .await
                 .map_err(|e| StationError::Storage(e.to_string()))?;
 
-            let exists: Option<(i32,)> =
-                sqlx::query_as("SELECT version FROM stations WHERE name = $1 AND version = $2")
-                    .bind(&spec.name)
-                    .bind(spec.version)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StationError::Storage(e.to_string()))?;
-            if exists.is_some() {
-                return Err(StationError::Conflict(format!(
-                    "row already exists: {}@{}",
-                    spec.name, spec.version
+            // THE FLOOR, inside the write (backlog df793bd7): the
+            // newest version of the name, any status, read after every
+            // other declared write of it has committed or waits behind
+            // this one (`crate::declared_version`).
+            let newest = crate::declared_version::lock_and_read_newest(
+                &mut tx, "stations", "name", &spec.name,
+            )
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))?;
+            if spec.version <= newest {
+                return Err(StationError::Conflict(crate::declared_version::not_above(
+                    &spec.name,
+                    spec.version,
+                    newest,
                 )));
             }
 
@@ -1052,10 +1107,7 @@ mod pg {
             .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
             .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
             .bind(spec.wip_limit)
-            .bind(
-                spec.terminal_window_days
-                    .map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
-            )
+            .bind(window)
             .bind(
                 spec.capability
                     .as_ref()

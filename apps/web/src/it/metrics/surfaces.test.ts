@@ -2,8 +2,17 @@
 // every number on the Surfaces section is a pure function of the
 // roll-up rows, and the never-opened list is the catalog minus them.
 
-import { describe, expect, test } from 'bun:test';
-import { catalogPaths, neverOpened, parseRollup, perActor, windowFor, type RouteCount } from './surfaces';
+import { afterEach, describe, expect, test } from 'bun:test';
+import {
+  catalogPaths,
+  loadSurfaceRollup,
+  neverOpened,
+  parseRollup,
+  perActor,
+  uncatalogued,
+  windowFor,
+  type RouteCount,
+} from './surfaces';
 import { ROUTE_CATALOG } from '../../shell/nav-catalog';
 
 const row = (actor_id: string, route: string, opens: number, last_at = '2026-09-16T12:00:00Z'): RouteCount => ({
@@ -30,6 +39,29 @@ describe('parseRollup', () => {
 
   test("a mock's bare array is an empty roll-up with no window, not a crash", () => {
     expect(parseRollup([])).toEqual({ since: null, until: null, rows: [] });
+  });
+
+  // b64b3c04 (page audit f82b05a9, gap 3): an object with no `rows` used
+  // to read as zero rows — "No surface open is recorded" — for a body
+  // the page did not understand. It throws, so fetchRemote says failed.
+  test('an unrecognised envelope throws, naming what it got, rather than reading as a quiet week', () => {
+    for (const body of [null, 'x', 7, {}, { data: [] }, { rows: 'x' }]) {
+      expect(() => parseRollup(body), JSON.stringify(body)).toThrow(/unrecognised .* envelope/);
+    }
+  });
+});
+
+describe('loadSurfaceRollup', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test('a 200 with an envelope it does not know is a failed read, with the reason', async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ data: [] }), { status: 200 })) as unknown as typeof fetch;
+    const r = await loadSurfaceRollup(7, new Date('2026-09-27T12:00:00Z'));
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.error).toMatch(/unrecognised .* envelope/);
   });
 });
 
@@ -78,6 +110,22 @@ describe('neverOpened', () => {
 
   test('with no rows every catalogued surface is a candidate — and the page says why', () => {
     expect(neverOpened([], catalogPaths())).toEqual(catalogPaths());
+  });
+
+  // 13ded76c part (a): the roster is the nav catalog, so a route the
+  // router serves and the catalog omits can never be a candidate. The
+  // section lists the ones opened this week on their own rather than
+  // letting the scope pass for the whole app.
+  test('the opened routes the roster does not hold, once each, sorted', () => {
+    const roster = ['/it', '/it/codebase'];
+    const rows = [
+      row('emp-david', '/it', 3),
+      row('emp-david', '/ux/jobs/:jobId', 2),
+      row('emp-032', '/ux/jobs/:jobId', 1),
+      row('emp-032', '/audit', 1),
+    ];
+    expect(uncatalogued(rows, roster)).toEqual(['/audit', '/ux/jobs/:jobId']);
+    expect(uncatalogued([], roster)).toEqual([]);
   });
 
   test('the roster is every catalog path once (CLAUDE.md 9a: one catalog)', () => {

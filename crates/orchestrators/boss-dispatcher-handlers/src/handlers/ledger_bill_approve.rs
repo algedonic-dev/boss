@@ -16,7 +16,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct LedgerBillApprove {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     ledger_base: String,
 }
 

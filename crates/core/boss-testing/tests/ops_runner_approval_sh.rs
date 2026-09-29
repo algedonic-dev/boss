@@ -882,6 +882,155 @@ fn a_fresh_presence_approval_bound_to_the_plan_runs_the_write_once() {
     );
 }
 
+/// THE MACHINE-FILED SHAPE (backlog 3df309bf). The dispatcher rule
+/// `file-reclaim-gcp-root-while-disk-tight-boss-gcp` files a request for a
+/// write whose ONLY param is `plan_sha256`, so it carries `args: []` —
+/// an empty list, since `jobs.spawn` lands a list literal whole — beside
+/// the keys every spawn stamps (`spawned_by_rule`, `triggered_by_*`) and
+/// its own `requested_by` and `remedies`. Every other case here files
+/// `wipe target-a`, so the arg-count check (`args` must be an array of
+/// exactly params - 1) was never run at zero, and none carried the
+/// spawn's keys. Both halves, through the real runner: a ready approve
+/// step gets the plan rendered for `[]`, and the approved request runs
+/// the write with the signed plan's hash as its one and only arg.
+#[test]
+fn a_machine_filed_request_with_no_args_renders_its_plan_and_runs_on_approval() {
+    needs_tools!();
+    let f = Fixture::new("machine-filed-no-args");
+    let plan_sh = f.root.join("plan.sh");
+    let apply_sh = f.root.join("apply.sh");
+    f.verb_file(
+        "reclaim",
+        json!({"about": "MUTATING — test fixture.", "hosts": ["forge"],
+               "requires_approval": true, "plan_verb": "plan-reclaim",
+               "approvers": [APPROVER],
+               "argv": [apply_sh.display().to_string(), "{1}"],
+               "params": [{"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}]}),
+    );
+    f.verb_file(
+        "plan-reclaim",
+        json!({"about": "READ-ONLY: renders what reclaim would do.", "hosts": ["forge"],
+               "argv": [plan_sh.display().to_string()], "params": []}),
+    );
+    let title = "Approve the plan: reclaim on forge";
+    let machine_filed = |approve_status: &str, meta: Value, sign_offs: Value, exec: &str| {
+        let mut j = job(approve_status, meta, sign_offs, exec);
+        j["metadata"] = json!({
+            "host": "forge", "verb": "reclaim", "args": [], "requires_approval": true,
+            "requested_by": "automation:dispatcher", "remedies": "disk_tight:forge",
+            "spawned_by_rule": "file-reclaim-gcp-root-while-disk-tight-boss-gcp",
+            "triggered_by_event_id": "b7c2d05a-b23b-4a91-b537-03fc38160347",
+            "triggered_by_topic": "jobs.estate.compared"
+        });
+        j["steps"][1]["title"] = json!(title);
+        j
+    };
+
+    // 1. The approve step is ready: the plan is rendered for `[]`.
+    f.packet(machine_filed(
+        "ready",
+        approve_meta(None),
+        json!([]),
+        "pending",
+    ));
+    let (out, writes) = f.run(&[]);
+    assert!(
+        f.applied().is_none(),
+        "rendering a plan runs no write: {out}"
+    );
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("no plan was written onto the approve step: {writes:?}\n{out}"));
+    assert_eq!(patch["body"]["plan"], PLAN, "{patch}");
+    assert_eq!(patch["body"]["verb"], "reclaim", "{patch}");
+    assert_eq!(
+        patch["body"]["args"],
+        json!([]),
+        "the plan is signed with the request's own empty args: {patch}"
+    );
+    assert!(
+        writes_to(&writes, "s-refused").is_empty(),
+        "an empty args list is not refused at the plan: {writes:?}\n{out}"
+    );
+
+    // 2. Approved: the write runs with the signed plan's hash alone.
+    let mut meta = approve_meta(Some(PLAN));
+    meta["verb"] = json!("reclaim");
+    meta["args"] = json!([]);
+    let shape = boss_core::job::step_shape_hash(title, &meta);
+    f.packet(machine_filed(
+        "completed",
+        meta,
+        json!([stamp("platform-admin", "presence", &shape, 60)]),
+        "ready",
+    ));
+    let (out, writes) = f.run(&[]);
+    let plan_sha = sha256_hex(PLAN.as_bytes());
+    assert_eq!(
+        f.applied(),
+        Some(vec![plan_sha.clone()]),
+        "args [] passes the arg-count check, and the write gets the SIGNED plan's hash as its only arg: {out}"
+    );
+    let md = execute_completion(&writes, &out);
+    assert_eq!(md["disposition"], "answered", "{md}\n{out}");
+    assert_eq!(md["approved_plan_sha256"], plan_sha, "{md}");
+
+    // The control: the check is live at zero. The same approved request
+    // with `args` ABSENT — what a rule whose list arg resolved to nothing
+    // would file — is refused by name and runs nothing.
+    let mut meta = approve_meta(Some(PLAN));
+    meta["verb"] = json!("reclaim");
+    meta["args"] = json!([]);
+    let shape = boss_core::job::step_shape_hash(title, &meta);
+    let mut absent = machine_filed(
+        "completed",
+        meta,
+        json!([stamp("platform-admin", "presence", &shape, 60)]),
+        "ready",
+    );
+    absent["metadata"].as_object_mut().unwrap().remove("args");
+    f.packet(absent);
+    let (out, writes) = f.run(&[]);
+    // Named as missing, never as a count: "carries 0 arg(s) where it
+    // takes 0" was the old text, a refusal that named no defect.
+    assert_refused(
+        &f,
+        &out,
+        &writes,
+        &[
+            "reclaim",
+            "carries no args list (args is null)",
+            "an empty list",
+        ],
+    );
+    assert!(
+        !out.contains("where it takes 0"),
+        "a missing args list is not reported as a count: {out}"
+    );
+
+    // And a value that is there but not a list is named by its type.
+    let mut meta = approve_meta(Some(PLAN));
+    meta["verb"] = json!("reclaim");
+    meta["args"] = json!([]);
+    let shape = boss_core::job::step_shape_hash(title, &meta);
+    let mut stringly = machine_filed(
+        "completed",
+        meta,
+        json!([stamp("platform-admin", "presence", &shape, 60)]),
+        "ready",
+    );
+    stringly["metadata"]["args"] = json!("");
+    f.packet(stringly);
+    let (out, writes) = f.run(&[]);
+    assert_refused(
+        &f,
+        &out,
+        &writes,
+        &["carries no args list (args is string)"],
+    );
+}
+
 /// THE d5efbb3c SHAPE (2026-09-22): the first presence-assured step in
 /// the system completed with `sign_offs: []` and no ceremony, and the
 /// host then ran the verb. A completed step is not an approval.

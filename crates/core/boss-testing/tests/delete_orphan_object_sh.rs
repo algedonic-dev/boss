@@ -281,6 +281,18 @@ get)
         esac
     done
     forbidden "$kind" "$ns" && { echo "Error from server (Forbidden): $kind is forbidden" >&2; exit 1; }
+    # The read-back after a delete, when the case says the API server
+    # stopped answering: a failure that is NOT NotFound.
+    if [ -n "$name" ] && [ -s "$STUB_DELETED" ] && [ "${STUB_AFTER_DELETE:-}" = unreachable ]; then
+        echo "Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout" >&2
+        exit 1
+    fi
+    # ...or the server answered, but not NotFound: the credential lost
+    # the get between the delete and the read.
+    if [ -n "$name" ] && [ -s "$STUB_DELETED" ] && [ "${STUB_AFTER_DELETE:-}" = forbidden ]; then
+        echo "Error from server (Forbidden): $kind \"$name\" is forbidden: User \"system:serviceaccount:boss:ops\" cannot get resource" >&2
+        exit 1
+    fi
     if [ -z "$name" ]; then
         live "$kind" "$ns"
         exit 0
@@ -300,6 +312,7 @@ delete)
     while [ $# -gt 0 ]; do case "$1" in -n) ns="$2"; shift 2 ;; *) shift ;; esac; done
     printf '%s\t%s\t%s\n' "$kind" "$ns" "$name" >> "$STUB_DELETED"
     f="$STUB_LIVE/$kind.$ns"
+    [ "${STUB_AFTER_DELETE:-}" = kept ] && f=/nonexistent
     [ -f "$f" ] && { grep -v "^$name	" "$f" > "$f.new" || true; mv "$f.new" "$f"; }
     echo "$kind \"$name\" deleted" ;;
 *)
@@ -487,9 +500,87 @@ fn deletes_the_one_object_the_tree_proves_undeclared() {
     );
     contains_all(
         &out,
-        &["undeclared", "boss-docs-internal", "kind: Service"],
+        &[
+            "undeclared",
+            "boss-docs-internal",
+            "kind: Service",
+            "is gone from `boss` (read back: NotFound)",
+        ],
         "the orphan case",
     );
+}
+
+/// GONE IS NotFound, NOT "THE GET FAILED" (backlog 1058e686, car B). The
+/// read-back after the delete used to count ANY failed get as gone, so
+/// an API server that stopped answering between the delete and the read
+/// printed OK. Now the delete has happened, nothing showed the object
+/// gone, and the run says exactly that and fails.
+#[test]
+fn a_read_back_that_is_not_notfound_is_not_gone() {
+    let c = Case::new(
+        "unproven-gone",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    let (rc, out) = c.run_env(
+        &["Service/boss/boss-docs-internal"],
+        &[("STUB_AFTER_DELETE", "unreachable".to_string())],
+    );
+    assert_eq!(rc, 1, "an unanswered read-back passed:\n{out}");
+    assert_eq!(
+        c.deletions().trim(),
+        "Service\tboss\tboss-docs-internal",
+        "the delete itself still ran:\n{out}"
+    );
+    contains_all(
+        &out,
+        &["CANNOT ANSWER — deleted, not proven gone", "i/o timeout"],
+        "the unproven case",
+    );
+    assert!(!out.contains(": OK — "), "no OK line:\n{out}");
+}
+
+/// The SERVER answering is not the server answering NotFound. An auth
+/// error after the delete is also "Error from server", so a read-back
+/// loosened to that prefix would print OK here — the mutation car B's
+/// review ran, which every other case survived (backlog 1058e686,
+/// note_2026_09_29_timeouts).
+#[test]
+fn an_auth_error_on_the_read_back_is_not_gone() {
+    let c = Case::new(
+        "forbidden-read-back",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    let (rc, out) = c.run_env(
+        &["Service/boss/boss-docs-internal"],
+        &[("STUB_AFTER_DELETE", "forbidden".to_string())],
+    );
+    assert_eq!(rc, 1, "a forbidden read-back passed:\n{out}");
+    contains_all(
+        &out,
+        &[
+            "CANNOT ANSWER — deleted, not proven gone",
+            "Error from server (Forbidden)",
+        ],
+        "the forbidden case",
+    );
+    assert!(!out.contains(": OK — "), "no OK line:\n{out}");
+}
+
+/// A delete that answered success over an object that is still there is
+/// named, not read as gone.
+#[test]
+fn an_object_still_there_after_the_delete_fails_by_name() {
+    let c = Case::new(
+        "still-there",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    let (rc, out) = c.run_env(
+        &["Service/boss/boss-docs-internal"],
+        &[("STUB_AFTER_DELETE", "kept".to_string())],
+    );
+    assert_eq!(rc, 1, "{out}");
+    contains_all(&out, &["is STILL THERE"], "the still-there case");
+    assert!(!out.contains(": OK — "), "no OK line:\n{out}");
 }
 
 /// `--dry-run` reaches the same verdict and deletes nothing: the way to
@@ -968,6 +1059,38 @@ fn the_runner_answers_a_dry_run() {
         "the output is not the dry run's:\n{output}"
     );
     assert_eq!(c.deletions(), "", "a dry run deleted something:\n{text}");
+    assert!(
+        meta["effect"]
+            .as_str()
+            .is_some_and(|e| e.contains("DRY RUN — would delete Service")),
+        "the runner did not judge the dry run's line as its effect: {meta}"
+    );
+}
+
+/// Through the door, a real delete's effect is the read-back line —
+/// judged by the runner against the verb file's declared `effect`
+/// (backlog 1058e686, car B: the verb left `effect_unread`).
+#[test]
+fn the_runner_records_a_real_deletes_read_back_as_its_effect() {
+    if !has("jq") {
+        eprintln!("skipping: the ops-runner is sh + jq and this box has no jq");
+        return;
+    }
+    let c = Case::new(
+        "runner-for-real",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    let verbs = rewritten_verbs(&c.root);
+    let (text, meta) = run_runner(&c, &verbs, r#"["Service/boss/boss-docs-internal"]"#);
+    let meta = meta.expect("the runner completed the execute step");
+    assert_eq!(meta["exit_code"], "0", "{text}");
+    assert!(
+        meta["effect"].as_str().is_some_and(|e| e.contains(
+            "delete-orphan-object: OK — Service `boss-docs-internal` is gone from `boss` (read back: NotFound)"
+        )),
+        "the effect is not the read-back line: {meta}"
+    );
+    assert!(meta["effect_unread"].is_null(), "{meta}");
 }
 
 /// The real `infra/ops/verbs/` — one file per verb — copied verbatim:

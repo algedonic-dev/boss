@@ -26,7 +26,7 @@ struct ReceivedItem {
 }
 
 pub struct InventoryReceive {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     inventory_base: String,
     ledger_base: String,
 }

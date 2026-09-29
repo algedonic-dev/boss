@@ -164,7 +164,7 @@ fn no_files_root_leaves_the_file_store_off() {
 // reservation hook was a no-op everywhere and no step could reserve.
 // The service it points at runs in the same container on every tenant:
 // the launcher gates boss-calendar-api on no module (tenant-modules.sh
-// `service_module` lists none for it), so a tenant's `calendar = false`
+// `service_modules` lists none for it), so a tenant's `calendar = false`
 // hid the SPA's Release calendar entry and nothing else — and since that
 // page retired (design 2ea444f5, 2026-09-24) it hides nothing.
 
@@ -197,7 +197,7 @@ fn the_jobs_api_reaches_the_calendar_on_the_port_boss_ports_gives_it() {
 // its SubjectKinds client ONLY when `subject_kinds_api_url` is set, and
 // this generator never wrote it, so the live instance admitted a packet
 // on any subject-kind string. boss-subject-kinds-api runs in the same
-// container on every tenant (tenant-modules.sh `service_module` gates it
+// container on every tenant (tenant-modules.sh `service_modules` gates it
 // on no module), ahead of the jobs API in the launcher's roster.
 //
 // Measured before enabling it on live: all 15,800 packets the live jobs

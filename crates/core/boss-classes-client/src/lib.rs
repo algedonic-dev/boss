@@ -174,7 +174,7 @@ pub trait ClassesClient: Send + Sync {
 /// registry can't wedge a write indefinitely.
 pub struct ReqwestClassesClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestClassesClient {

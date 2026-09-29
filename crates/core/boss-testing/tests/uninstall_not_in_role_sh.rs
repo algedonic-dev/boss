@@ -233,7 +233,7 @@ esac
         );
         write_exec(
             &bin.join("curl"),
-            "#!/bin/sh\n# stub curl: the estate registry's /api/estate/nodes\ncat \"$STUB_NODES\"\n",
+            "#!/bin/sh\n# stub curl: the estate registry's /api/estate/nodes, answered the way\n# real curl answers node-roles.sh's `-w '\\n%{http_code}'`: the body, then the code.\ncat \"$STUB_NODES\"; printf '\\n200'\n",
         );
         write_file(
             &nodes,
@@ -740,7 +740,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         &[
             "#!/bin/sh\n",
             boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
-            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
+            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; printf '\\n200'; exit 0;; esac; done\n\
              cat \"$STUB_JOBS\"\n",
         ]
         .concat(),

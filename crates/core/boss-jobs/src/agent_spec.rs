@@ -151,6 +151,24 @@ pub fn projected(metadata: &serde_json::Value) -> Option<AgentSpec> {
     })
 }
 
+/// Whether the step's OWN declaration hands it to an agent: it carries
+/// a projected block ([`projected`]) and its protocol does not also
+/// require a person ([`crate::human_only::declared`] — a human-only
+/// step stays a person's whatever resourcing it names).
+///
+/// WHY (backlog 1dd6d7ad, David 2026-09-27): the publish review step of
+/// 246d597a is kind `checklist`, whose registry `completion` is human,
+/// so every queue split on the kind filed it as work waiting on him —
+/// "I thought you were ready for me because it was in my backlog" —
+/// while its own block said an analyst runs it. The kind cannot tell
+/// such a step from a person's checklist; only the step can. It reads
+/// the step AS IT STANDS, not [`resolved`]: a queue row describes the
+/// packet, and a block the pinned version never declared is routing
+/// for the claim door, not a fact the row should assert.
+pub fn agent_takes(metadata: &serde_json::Value) -> bool {
+    projected(metadata).is_some() && !crate::human_only::declared(metadata)
+}
+
 /// **THE resolution of a step's agent block** (backlog 51aef4dd): the
 /// projection the step carries, else the block its kind's ACTIVE
 /// Workflow row declares for the step's `spec_slug`, laid over the
@@ -378,6 +396,38 @@ mod tests {
         half.as_object_mut().unwrap().remove(BUDGET_KEY);
         assert_eq!(projected(&half), None, "half a projection is none");
         assert_eq!(projected(&serde_json::json!({})), None);
+    }
+
+    /// Backlog 1dd6d7ad: a block hands the step to an agent unless its
+    /// protocol also requires a person; no block (or half of one) is a
+    /// person's step, as it always read.
+    #[test]
+    fn an_agent_takes_a_step_whose_own_block_says_so_and_no_human_only_forbids_it() {
+        let with = |extra: serde_json::Value| {
+            let mut m: serde_json::Map<String, serde_json::Value> = projection(&builder())
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            if let serde_json::Value::Object(e) = extra {
+                m.extend(e);
+            }
+            serde_json::Value::Object(m)
+        };
+        assert!(agent_takes(&with(serde_json::json!({}))));
+        // The live spelling on 246d597a's review step.
+        assert!(agent_takes(&with(
+            serde_json::json!({ "human_only": "False" })
+        )));
+        assert!(!agent_takes(&with(
+            serde_json::json!({ "human_only": true })
+        )));
+        assert!(!agent_takes(&with(
+            serde_json::json!({ "human_only": "true" })
+        )));
+        assert!(!agent_takes(&serde_json::json!({ "human_only": false })));
+        let mut half = with(serde_json::json!({}));
+        half.as_object_mut().unwrap().remove(MODEL_KEY);
+        assert!(!agent_takes(&half));
     }
 
     /// THE 51aef4dd CASE: a step pinned to a version with no block, whose

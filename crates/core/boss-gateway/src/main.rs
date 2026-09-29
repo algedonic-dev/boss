@@ -11,6 +11,7 @@ mod a_path_cannot_climb_out_of_its_route;
 #[cfg(test)]
 mod a_read_only_session_cannot_write;
 mod api;
+mod cross_site;
 mod dot_segments;
 mod inquiries;
 mod plugin_files;
@@ -62,24 +63,32 @@ pub(crate) struct AppState {
     /// the mounted `current` slot every service's gate accepts from,
     /// re-read in the background (design 6805c764, car 2).
     pub machine_token: Arc<boss_core::machine_token::Source>,
+    /// The gateway's own server-side reads made for a session (the
+    /// page's flights read): stamped, redirects off by type. The flights
+    /// read rode `proxy_client` and was redirect-free only because
+    /// main() happened to build that client with `Policy::none()`
+    /// (review of 39949355, 2026-09-28).
+    pub machine: boss_gateway::machine_client::MachineClient,
 }
 
 /// Auth-event staging (docs/architecture-decisions.md §Policy &
-/// auth). The URL is its
-/// own variable — not BOSS_POSTGRES_URL — because it is expected to
-/// carry the INSERT-only `boss_gateway_audit` role
-/// (111-gateway-audit-events.sql), not the service superuser. Absent
-/// → the disabled emitter, whose record is the structured warn line.
+/// auth). The URL is the service database's
+/// (`boss_gateway::audit::AUDIT_SINK_URL_VAR`, which says why it is no
+/// longer a variable of its own). Absent → the disabled emitter,
+/// whose record is the structured warn line.
 /// `connect_lazy` on purpose: the edge must come up whether or not
 /// the database is reachable, and a failed INSERT already degrades
 /// to the warn backstop.
 fn build_auth_audit() -> boss_gateway::audit::AuthAudit {
-    match std::env::var("BOSS_GATEWAY_AUDIT_DB_URL") {
-        Err(_) => {
-            tracing::info!("BOSS_GATEWAY_AUDIT_DB_URL unset — auth events degrade to warn lines");
+    match boss_gateway::audit::audit_sink_url(|k| std::env::var(k).ok()) {
+        None => {
+            tracing::info!(
+                var = boss_gateway::audit::AUDIT_SINK_URL_VAR,
+                "no audit sink URL — auth events degrade to warn lines"
+            );
             boss_gateway::audit::AuthAudit::disabled()
         }
-        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+        Some(url) => match sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy(&url)
         {
@@ -166,6 +175,10 @@ async fn main() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("local-auth http client")?,
+            machine: boss_gateway::machine_client::MachineClient::build(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+            )
+            .context("local-auth machine client")?,
             audit: build_auth_audit(),
             // One flag, one question: does this deployment hand out
             // a read-only session to anyone who asks?
@@ -206,9 +219,12 @@ async fn main() -> Result<()> {
         session_key,
         proxy_client,
         perf: Arc::new(PerfCollector::new()),
-        machine_token: boss_core::machine_token::Source::watch(
-            boss_core::machine_token::token_dir(),
-        ),
+        // The process's one watched source (design 6805c764 car 2,
+        // review S1/S5): the per-request stamp below, the passkey and
+        // sponsor calls and every sibling client read one observation.
+        machine_token: boss_core::machine_token::shared(),
+        machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+            .context("building the gateway's machine client")?,
     });
 
     // The sessionless read set — the tenant's declaration, resolved
@@ -285,6 +301,13 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(|host| inquiries::Door::new(host, Arc::new(inquiries::Services::from_env())));
     let app = inquiries::mount(app, door);
+
+    // No write from another origin reaches a handler (cross_site.rs,
+    // backlog 324fc920): a POST/PUT/PATCH/DELETE a browser marks as
+    // cross-site or same-site — a sibling subdomain — or whose Origin is
+    // not this host is answered 403 here, around the site's write and
+    // every route. Non-browser callers send neither header and pass.
+    let app = cross_site::mount(app);
 
     // The door every request enters, OUTERMOST (dot_segments.rs,
     // backlog 1d9b7db7): a path with a `.` or `..` segment, raw or
@@ -574,6 +597,18 @@ fn build_router(
             "/api/agents",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // The credentials registry's list — the IT Credentials tab's one
+        // registry read (backlog 851259b9; design 76155676 step 3). It
+        // serves LOCATIONS, never values, and is operator/auditor-tier
+        // upstream (boss-jobs trust.rs `can_read`), so a user-tier
+        // session is refused there, not here. Bare and GET only: the
+        // declaration door (`POST /api/credentials/batch`, `boss tenant
+        // publish`) and the broker's rotation phases reach
+        // boss-jobs-api directly, so they stay catch-all misses here.
+        .route(
+            "/api/credentials",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // Surface opens (backlog 628f182b): the SPA posts each route
         // open here and the Codebase page reads the roll-up. The write
         // is credited to the SESSION — this proxy strips any
@@ -833,10 +868,31 @@ fn build_router(
         // to "no passkey routes", never crash the front door. The route
         // list is `passkey_router`'s, the one the tests drive; it was
         // spelled out here as well until backlog 3bddce66 (2026-09-23).
-        let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
-            Ok(pk) => app.merge(boss_gateway::passkey::passkey_router(std::sync::Arc::new(
-                pk,
-            ))),
+        let mut passkey_parts = None;
+        let app = match boss_gateway::passkey::PasskeyState::from_env(
+            la.session_key.clone(),
+            la.audit.clone(),
+        ) {
+            Ok(pk) => {
+                let pk = std::sync::Arc::new(pk);
+                // The owner's operator-tier elevation rides the same
+                // verifier, challenge ledger and audit (backlog
+                // 3c92c5b8); who the owner is, the people roster ALONE
+                // says — `RosterPlatformOwner` reads no override.
+                let owner: std::sync::Arc<dyn boss_core::platform_owner::PlatformOwner> =
+                    std::sync::Arc::new(boss_gateway::elevation::RosterPlatformOwner::new(
+                        pk.http.clone(),
+                        pk.people_base.clone(),
+                    ));
+                passkey_parts = Some((pk.clone(), owner.clone()));
+                let elevation = boss_gateway::elevation::ElevationState {
+                    passkey: pk.clone(),
+                    owner,
+                };
+                app.merge(boss_gateway::passkey::passkey_router(pk)).merge(
+                    boss_gateway::elevation::elevation_router(std::sync::Arc::new(elevation)),
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "passkey ceremony not mounted");
                 app
@@ -854,6 +910,20 @@ fn build_router(
         ) {
             Ok(bg) => {
                 let bg = std::sync::Arc::new(bg);
+                // Promoting one of the owner's passkeys to the operator
+                // tier (design 2cb6256f): it needs both verifiers — the
+                // passkey that is promoted, the break-glass key that
+                // vouches — so it mounts only where both did.
+                let app = match passkey_parts.take() {
+                    Some((pk, owner)) => app.merge(boss_gateway::promotion::ceremony_router(
+                        std::sync::Arc::new(boss_gateway::promotion::PromotionState::new(
+                            pk,
+                            bg.clone(),
+                            owner,
+                        )),
+                    )),
+                    None => app,
+                };
                 app.route(
                     "/break-glass",
                     axum::routing::get(boss_gateway::break_glass::ceremony_page),
@@ -883,57 +953,71 @@ fn build_router(
                 app
             }
         };
-        app.route(
-            "/api/auth/login",
-            axum::routing::post(local_auth::login).with_state(la.clone()),
-        )
-        .route("/api/auth/logout", axum::routing::post(local_auth::logout))
-        .route(
-            "/api/auth/me",
-            axum::routing::get(local_auth::me).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/guest",
-            axum::routing::get(local_auth::guest_available)
-                .post(local_auth::guest)
-                .with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/onboard",
-            axum::routing::post(local_auth::onboard).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/issue-reset",
-            axum::routing::post(local_auth::issue_reset).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/forgot",
-            axum::routing::post(local_auth::forgot).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/reset",
-            axum::routing::post(local_auth::reset).with_state(la.clone()),
-        )
-        // The IdP front door (idm-kanidm.md): probe, redirect,
-        // callback. Same state as local auth on purpose — OIDC is
-        // another way to authenticate an email, and everything after
-        // the email is the local-login pipeline.
-        .route(
-            "/api/auth/oidc/available",
-            axum::routing::get(boss_gateway::oidc::available).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/oidc/login",
-            axum::routing::get(boss_gateway::oidc::login).with_state(la.clone()),
-        )
-        .route(
-            "/api/auth/oidc/callback",
-            axum::routing::get(boss_gateway::oidc::callback).with_state(la),
-        )
+        // Every door below answers a caller with no session, and a
+        // denied login stages what it sent as an outbox row. axum's 2 MB
+        // default let one request stage a row larger than NATS's 1 MiB
+        // max_payload, which the relay cannot publish and every later
+        // event queues behind (adversarial review of the d49b4355 car,
+        // 2026-09-28). An email, a password, a reset token fit in a
+        // few KB; the layer covers exactly these routes.
+        let auth = axum::Router::new()
+            .route(
+                "/api/auth/login",
+                axum::routing::post(local_auth::login).with_state(la.clone()),
+            )
+            .route("/api/auth/logout", axum::routing::post(local_auth::logout))
+            .route(
+                "/api/auth/me",
+                axum::routing::get(local_auth::me).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/guest",
+                axum::routing::get(local_auth::guest_available)
+                    .post(local_auth::guest)
+                    .with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/onboard",
+                axum::routing::post(local_auth::onboard).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/issue-reset",
+                axum::routing::post(local_auth::issue_reset).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/forgot",
+                axum::routing::post(local_auth::forgot).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/reset",
+                axum::routing::post(local_auth::reset).with_state(la.clone()),
+            )
+            // The IdP front door (idm-kanidm.md): probe, redirect,
+            // callback. Same state as local auth on purpose — OIDC is
+            // another way to authenticate an email, and everything after
+            // the email is the local-login pipeline.
+            .route(
+                "/api/auth/oidc/available",
+                axum::routing::get(boss_gateway::oidc::available).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/oidc/login",
+                axum::routing::get(boss_gateway::oidc::login).with_state(la.clone()),
+            )
+            .route(
+                "/api/auth/oidc/callback",
+                axum::routing::get(boss_gateway::oidc::callback).with_state(la),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT));
+        app.merge(auth)
     } else {
         app
     }
 }
+
+/// The body limit on the sessionless local-auth doors, in bytes (see
+/// where `build_router` mounts them).
+const AUTH_BODY_LIMIT: usize = 8 * 1024;
 
 /// Anything under `/api` that matched no service above is a routing
 /// miss, and says so in JSON.
@@ -1094,6 +1178,8 @@ mod routing_tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         });
         build_router(local_auth, reads).with_state(state)
     }
@@ -1249,6 +1335,10 @@ mod routing_tests {
             // the jobs upstream since f56155f0 and first fetched by the
             // IT Agents tab, so routed in the car that reads it.
             "/api/agents",
+            // The credentials registry's list (backlog 851259b9): served
+            // by the jobs upstream since 7ee101aa and first fetched by the
+            // IT Credentials tab, so routed in the car that reads it.
+            "/api/credentials",
             // Surface opens (628f182b): the SPA's write and the
             // Codebase page's roll-up read, both on the jobs upstream.
             // Listed on the day they shipped, so the fourth instance
@@ -1362,6 +1452,8 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1518,8 +1610,16 @@ mod routing_tests {
     #[tokio::test]
     async fn the_agent_run_reads_refuse_a_sessionless_caller() {
         // The registry's list rides the same rule (backlog 62988516): it
-        // carries each agent's hourly budget, the other half of cost.
-        for path in ["/api/agent-runs", "/api/agent-runs/cost", "/api/agents"] {
+        // carries each agent's hourly budget, the other half of cost. The
+        // credentials registry too (backlog 851259b9): locations, never
+        // values, but where every credential lives is a map no sessionless
+        // caller gets.
+        for path in [
+            "/api/agent-runs",
+            "/api/agent-runs/cost",
+            "/api/agents",
+            "/api/credentials",
+        ] {
             let (status, body) = get(app(), path).await;
             assert_eq!(
                 status,
@@ -1630,6 +1730,8 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1652,6 +1754,66 @@ mod routing_tests {
         }
     }
 
+    /// The local-auth doors are reachable WITHOUT a session, and what a
+    /// caller sends can end up in an outbox row (a denied login stages
+    /// the claimed email). axum's default 2 MB body limit let one request
+    /// stage a row larger than NATS publishes (adversarial review of the
+    /// d49b4355 car, 2026-09-28), so these routes take a few KB, which
+    /// is more than any email, password or reset token needs.
+    #[tokio::test]
+    async fn an_oversized_auth_body_is_refused_before_the_handler() {
+        let store = CredentialStore::load("/nonexistent/boss-test-credentials.toml")
+            .expect("empty credential store");
+        let la = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![0u8; 32],
+            http: reqwest::Client::new(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
+            audit: boss_gateway::audit::AuthAudit::disabled(),
+            guest_access: GuestAccess::Basic,
+            oidc: None,
+            mail: boss_gateway::mail::from_env(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+        let big = format!(
+            r#"{{"email":"{}@example.com","password":"x"}}"#,
+            "a".repeat(64 * 1024)
+        );
+        for path in ["/api/auth/login", "/api/auth/forgot", "/api/auth/reset"] {
+            let resp = app_with(Some(la.clone()))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(big.clone()))
+                        .unwrap(),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "`{path}` accepted a 64 KB body from an unauthenticated caller"
+            );
+        }
+        // An ordinary bad login still reaches the handler (401, not 413).
+        let resp = app_with(Some(la))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"who@example.com","password":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// The break-glass ceremony routes are registered on the same
     /// conditionally-built router as local auth; they too must beat
     /// the /api catch-all, and the ceremony page must beat the SPA
@@ -1665,6 +1827,8 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
             oidc: None,

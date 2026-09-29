@@ -143,8 +143,21 @@
       saving = true;
       updateDerived();
       try {
-        const nextMeta = {
-          ...meta,
+        // Two doors, one per kind of write (backlog e39a9d2a, design
+        // 93d2bddb): the keys this surface owns go to the step merge
+        // door, which merges them against the row as it stands (a null
+        // DELETES its key — a cleared box clears it), and the status
+        // alone goes to the step PUT. This used to PUT the whole drawn
+        // step with `{ ...meta, ownKeys }` as its metadata, and the PUT
+        // replaces metadata wholesale, so a key written to the step
+        // after this page loaded went back out with the snapshot; the
+        // step PUT is closing to any metadata body, so it must not ride
+        // there at all. A draft is the merge alone — it sends no status
+        // and no holder, so it cannot release a claim (backlog
+        // 6ef4a36b). A failed merge moves no status; the host refresh
+        // below shows server truth either way, as the one unchecked PUT
+        // did before.
+        const ownKeys = {
           account_id: accountInput.value.trim() || null,
           device_serial: deviceInput.value.trim() || null,
           failure_description: failureInput.value.trim() || null,
@@ -154,23 +167,24 @@
           jira_issue_key: jiraInput.value.trim() || null,
           triage_outcome: outcome || null,
         };
-        // A draft save sends NO status and NO holder (backlog 6ef4a36b).
-        // It sent the status drawn at page load (`status || step.status`)
-        // beside the drawn holder, so a page read while the step was
-        // Ready, saved after someone claimed it, sent the release body
-        // `{status: ready, assignee_id: null}` and took the step off its
-        // holder. The server keeps both as they stand; only Complete
-        // names a status.
-        const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
-        const body = { ...drawn, job_id: jobId, metadata: nextMeta, ...(status ? { status } : {}) };
-        await fetch(
-          `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
+        const merged = await fetch(
+          `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}/metadata`,
           {
-            method: 'PUT',
+            method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
+            body: JSON.stringify(ownKeys),
           },
         );
+        if (merged.ok && status) {
+          await fetch(
+            `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status }),
+            },
+          );
+        }
         if (onUpdate) onUpdate();
       } finally {
         saving = false;

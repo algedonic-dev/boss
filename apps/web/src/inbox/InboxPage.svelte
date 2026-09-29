@@ -1,6 +1,7 @@
 <script lang="ts">
   // Inbox — port of apps/web/src/inbox/InboxPage.tsx.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
@@ -14,6 +15,8 @@
   import { classesFor, loadClasses } from '@boss/web-kit/session/classes.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
   import { parseInbox } from './read';
+  import { emptyState, loadingRead, readStateOf } from '../data/readState';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import { postEach, postWrite, type BulkOutcome } from './writes';
   import { safeLinkHref } from '@boss/web-kit/links';
 
@@ -75,11 +78,15 @@
     session.value.kind === 'ready' ? session.value.user.id : '',
   );
 
+  function inboxPath(user: string): string {
+    return `/api/messages/inbox/${encodeURIComponent(user)}`;
+  }
+
   async function refreshInbox(): Promise<void> {
     if (!userId) return;
     // Only a list is an inbox: any other 200 is a failed read, never
     // an empty one (backlog e2679b23 (c); ./read.ts).
-    const path = `/api/messages/inbox/${encodeURIComponent(userId)}`;
+    const path = inboxPath(userId);
     inbox = await fetchRemote(path, parseInbox(path));
   }
 
@@ -142,6 +149,15 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, no messages, or the filters hid them (backlog 0ef5e008).
+  let listState = $derived(
+    emptyState(
+      [{ source: inboxPath(userId), state: inbox.kind === 'loading' ? loadingRead : readStateOf(inbox) }],
+      messages.length,
+      visible.length,
+    ),
   );
 
   /// What the bulk bar acts on is always what is SHOWN: a row checked
@@ -305,6 +321,7 @@
         ? 'Your inbox could not be read.'
         : 'Loading…'}
   />
+  <ClassesReadFailed subjectKind="employee" what="roles" fallback="Roles show by code, not by their registry names." />
 
   <div style="padding:0 32px 12px">
     <!-- The composer's entry stands behind the readonly gate: a guest
@@ -424,18 +441,15 @@
           {bulkNote.text}
         </p>
       {/if}
-      {#if inbox.kind === 'loading'}
-        <p class="empty">Loading…</p>
-      {:else if inbox.kind === 'failed'}
-        <!-- A failed load is a failure, distinct from an empty inbox. -->
-        <p class="empty load-failed" role="alert">
-          Couldn't load your inbox — {inbox.error}
-        </p>
-        <div style="padding:0 32px">
-          <button class="btn btn-sm" onclick={() => void refreshInbox()}>Retry</button>
-        </div>
-      {:else if visible.length === 0}
-        <p class="empty">No messages match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <!-- A failed load is a failure, an empty inbox is not the
+             filters' doing, and neither is "no match" (0ef5e008). -->
+        <ListEmpty view={listState} words={{ what: 'your inbox', noun: 'messages' }} />
+        {#if listState.kind === 'failed'}
+          <div style="padding:0 32px">
+            <button class="btn btn-sm" onclick={() => void refreshInbox()}>Retry</button>
+          </div>
+        {/if}
       {:else}
         <!-- The bulk bar acts on what is shown (backlog 5963a322). It
              and the rows stand behind ONE gate: each row's Mark read,

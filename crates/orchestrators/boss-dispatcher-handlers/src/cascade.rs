@@ -220,6 +220,26 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // packet to its own terminal; nothing listens for a run's
         // close, so the loop ends at the packet.
         ("jobs.age_out_step", vec!["jobs.step.completed"]),
+        // A step going ready is completed from a record its own packet
+        // already holds (b951c00a: a builder's pre-green report lands
+        // on the green). The completion carries the packet to its own
+        // terminal, as the clock's does.
+        (
+            "jobs.complete_step_from_record",
+            vec!["jobs.step.completed"],
+        ),
+        // A fact that answers a machine-filed item withdraws the open
+        // packets carrying its key (ac0a0abd: a redelivered or
+        // resolved dead letter closes the item filed for its outbox
+        // row): the act merged onto the packet (`jobs.job.updated`),
+        // then the step it waits on completed `stale`
+        // (`jobs.step.completed`), which carries the item to its own
+        // terminal. Nothing listens for that close, so the loop ends
+        // at the packet.
+        (
+            "jobs.retract_matching",
+            vec!["jobs.job.updated", "jobs.step.completed"],
+        ),
         // The real-work watch (078ddcb0): an hourly clock rule that
         // files (`jobs.job.created`) one backlog-item alarm per step
         // held by an agent past its workflow's declared bound, and
@@ -333,6 +353,16 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             "credential.rotate.cloudflare-tunnel",
             vec!["jobs.step.completed"],
         ),
+        // Third issuer, same shape (design 76155676): on a rotation
+        // packet it completes that packet's `task` steps, never a
+        // credential-rotation step. Its clock firing (`phase =
+        // "refresh"`) completes no step at all — it writes the Secret
+        // and records `credential.installed` through the registry's
+        // rotation door, a kind no rule listens on.
+        (
+            "credential.rotate.github-app-installation",
+            vec!["jobs.step.completed"],
+        ),
         // The zone observer (5e58922c): fires on a dns-zone-observation
         // packet's `observe` step, reads the zone with the broker's
         // Cloudflare root token, runs the tree's comparator, and
@@ -378,6 +408,21 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // an ops-request, so it cannot make the queue it watches move.
         (
             "ops.queue.alarm",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
+        // The coverage backstop (design 1c4e42e1): an hourly clock rule
+        // that reads the policy service's coverage and files
+        // (`jobs.job.created`) one backlog-item alarm per control no
+        // real person holds, and withdraws it through the step the
+        // alarm waits on (`jobs.step.completed`) or a note
+        // (`jobs.job.updated`) once the control is held. Every write is
+        // to its OWN alarm; it grants and refuses nothing.
+        (
+            "policy.coverage.alarm",
             vec![
                 "jobs.job.created",
                 "jobs.job.updated",
@@ -513,13 +558,37 @@ pub struct OutsideOrigin {
     pub label: &'static str,
 }
 
-pub const OUTSIDE_ORIGINS: &[OutsideOrigin] = &[OutsideOrigin {
-    // Each host's observer (infra/estate/observe-lib.sh) POSTs what it
-    // found to /api/estate/observation on its own timer; nothing a rule
-    // does causes an observation (59ef456a).
-    topic: boss_jobs::events::ESTATE_OBSERVED,
-    label: "a host's estate observer records what machines it found",
-}];
+pub const OUTSIDE_ORIGINS: &[OutsideOrigin] = &[
+    OutsideOrigin {
+        // Each host's observer (infra/estate/observe-lib.sh) POSTs what it
+        // found to /api/estate/observation on its own timer; nothing a rule
+        // does causes an observation (59ef456a).
+        topic: boss_jobs::events::ESTATE_OBSERVED,
+        label: "a host's estate observer records what machines it found",
+    },
+    OutsideOrigin {
+        // The outbox relay stages this when NATS refuses one event
+        // outright (over max_payload, invalid subject) and it sets the
+        // row aside; the cause is the bus, not any rule (e4019cbc,
+        // landed on #770 without this entry — 923e42e1).
+        topic: boss_events::outbox::DEAD_LETTERED_KIND,
+        label: "the outbox relay sets aside an event the bus refused",
+    },
+    OutsideOrigin {
+        // An operator's `boss events redeliver <outbox id>` puts a dead
+        // letter back on the relay's queue and records this; the cause
+        // is a person's act on boss-events, not any rule (e22b692e,
+        // read back onto the item by ac0a0abd).
+        topic: boss_events::outbox::REDELIVERED_KIND,
+        label: "an operator redelivers a dead-lettered event",
+    },
+    OutsideOrigin {
+        // The same verb's `--resolve` arm: the dead letter stays off the
+        // bus by an operator's recorded decision (e22b692e, ac0a0abd).
+        topic: boss_events::outbox::RESOLVED_KIND,
+        label: "an operator resolves a dead letter as audit-only",
+    },
+];
 
 /// Everything this build declares about the handlers it registers, in the
 /// one shape core's read surface serves ([`boss_dispatcher::http::HttpState`]).
@@ -596,6 +665,11 @@ mod tests {
     /// topic a shipped rule listens on must now be caused by something
     /// the graph draws — a handler's emit, a system edge — or be named
     /// an outside origin, so a root on the page is a true root.
+    // tree-wide pin — it reads every rule under infra/dispatcher/rules
+    // through a call, not a literal, and scans crates/ for handler
+    // emits, so a red it sees can ride in from any car or already sit on
+    // main; every scoped gate, car and train, runs it (`tree_wide_pins`
+    // in infra/gate.sh; backlog 757a67bd, #770 landed red past two).
     #[test]
     fn every_shipped_trigger_has_something_upstream() {
         let path = boss_testing::dispatcher_rules_dir();
@@ -642,7 +716,7 @@ mod tests {
     }
 
     /// Every jobs-API topic the cascade names — either end of a
-    /// jobs-api edge, a handler's `jobs.*` emit, an outside origin —
+    /// jobs-api edge, a handler's `jobs.*` emit, a `jobs.*` outside origin —
     /// is a kind boss-jobs declares, so a renamed or invented topic
     /// cannot draw an edge nothing travels.
     #[test]
@@ -660,7 +734,15 @@ mod tests {
                     .flatten()
                     .filter(|t| t.starts_with("jobs.")),
             )
-            .chain(OUTSIDE_ORIGINS.iter().map(|o| o.topic))
+            // An outside origin need not be a jobs topic: the outbox's
+            // dead letter is boss-events' own (923e42e1), named there by
+            // constant, so only the jobs.* ones are this test's to check.
+            .chain(
+                OUTSIDE_ORIGINS
+                    .iter()
+                    .map(|o| o.topic)
+                    .filter(|t| t.starts_with("jobs.")),
+            )
             .collect();
         let unknown: Vec<_> = named.into_iter().filter(|t| !is_published(t)).collect();
         assert!(

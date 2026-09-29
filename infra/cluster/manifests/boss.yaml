@@ -30,6 +30,38 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: baseline
 ---
+# Every pod in the namespace that names no ServiceAccount runs as
+# `default` — postgres, nats, the chores' CronJobs, cloudflared — and
+# none of them calls the Kubernetes API. So `default` hands out no
+# token (backlog 28367b57, 2026-09-28): until then every one of them
+# mounted a token that could read and overwrite every Secret the
+# credential broker writes, because the broker's Roles were bound to
+# `default`. The control plane creates this object in every namespace;
+# declaring it here only sets the one field, in every instance (this
+# file is rendered per instance). A pod that needs the API names its
+# own ServiceAccount, as the boss pod below does.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: boss
+automountServiceAccountToken: false
+---
+# The boss pod's own identity. The dispatcher inside it is the
+# credential broker, and its KubeSecretStore::in_cluster reads this
+# SA's mounted token (credential_issuer.rs); the broker's name-scoped
+# Roles are bound to THIS account, not to `default`
+# (boss-credential-broker.yaml). Declared here rather than beside the
+# Roles because this file renders per instance: a serviceAccountName
+# whose account is absent from the playground's namespace would refuse
+# the playground's pod. There, the account exists and holds no grant.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: boss
+  namespace: boss
+automountServiceAccountToken: true
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -254,6 +286,12 @@ spec:
     metadata:
       labels: {app: boss}
     spec:
+      # Its own ServiceAccount (declared at the top of this file), with
+      # its token mounted: the dispatcher's credential broker is the one
+      # in-cluster reader of the broker's Secrets. The namespace's
+      # `default` mounts nothing (backlog 28367b57).
+      serviceAccountName: boss
+      automountServiceAccountToken: true
       # The SoR app rides its data: control-plane nodes only, never a
       # flaky worker. Unpinned, this Deployment landed on w-1 and was
       # evicted when w-1 shed pods — :7900 went dark for minutes on a
@@ -606,6 +644,19 @@ spec:
             # this variable instead of failing silently.
             - name: BOSS_BROKER_STRIPE_KEY
               valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: stripe-restricted-read, optional: true}}
+            # The GitHub App root (design 76155676, backlog 81eb6d4d): the
+            # App id, its installation id on algedonic-dev and its private
+            # key, three more keys in the SAME root Secret, placed once by
+            # David. Same `optional: true` reasoning; until all three exist
+            # the credential.rotate.github-app-installation handler refuses
+            # every firing naming the keys it lacks. Read at pod start: a
+            # root placed later is taken up by the next roll of this pod.
+            - name: BOSS_BROKER_GITHUB_APP_ID
+              valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: github-app.id, optional: true}}
+            - name: BOSS_BROKER_GITHUB_APP_INSTALLATION_ID
+              valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: github-app.installation-id, optional: true}}
+            - name: BOSS_BROKER_GITHUB_APP_PRIVATE_KEY
+              valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: github-app.private-key.pem, optional: true}}
             # Bind all interfaces so the Service can reach the gateway;
             # the default 127.0.0.1 is right for systemd+Caddy, wrong here.
             - {name: BOSS_LISTEN, value: "0.0.0.0:4443"}
@@ -653,14 +704,16 @@ spec:
             # boss-break-glass-credentials.yaml). The DIR is the
             # ConfigMap mount below — public records, re-read per
             # ceremony so a committed record propagates without a
-            # restart. The TOKEN arms the one-time bootstrap
-            # enrollment window; the Secret exists only for the
-            # duration of David's enrollment ceremony (`optional` —
-            # absent means the window is closed, which is the steady
-            # state). A VALUE, not a path.
+            # restart. AUTHORISERS is who may authorise an enrolment
+            # with a passkey over a `break-glass-enrolment` packet
+            # (design 03451237 q2: a NAMED LIST of employee ids,
+            # changed by a car someone reviews — never a role, which is
+            # registry data). Empty is nobody. The bootstrap token that
+            # used to sit here (BOSS_BREAK_GLASS_ENROLL_TOKEN, Secret
+            # boss-break-glass-enroll) RETIRED with that design (q4).
             - {name: BOSS_BREAK_GLASS_DIR, value: /etc/boss/break-glass}
-            - name: BOSS_BREAK_GLASS_ENROLL_TOKEN
-              valueFrom: {secretKeyRef: {name: boss-break-glass-enroll, key: token, optional: true}}
+            # employee-id-ok: design 03451237 q2 decided an in-tree named list
+            - {name: BOSS_BREAK_GLASS_AUTHORISERS, value: "emp-david"}
             - {name: RUST_LOG, value: info}
           ports:
             - {containerPort: 4443, name: gateway}

@@ -421,7 +421,10 @@ pub(crate) fn closed_rows_to_read(total: usize) -> usize {
 /// are live work), then closed — page by page, newest opening date
 /// first, up to [`RESOLVE_CLOSED_MAX`] rows — stopping at the first
 /// page that matches.
-pub(crate) async fn fetch_and_resolve(http: &reqwest::Client, job_ref: &str) -> Result<String> {
+pub(crate) async fn fetch_and_resolve(
+    http: &boss_core::machine_token::Client,
+    job_ref: &str,
+) -> Result<String> {
     if looks_like_uuid(job_ref) {
         return Ok(job_ref.to_string());
     }
@@ -481,7 +484,7 @@ where
 }
 
 pub async fn get(job_ref: &str, raw: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
     let job = crate::gate::api(
         &http,
@@ -506,7 +509,7 @@ pub async fn get(job_ref: &str, raw: bool) -> Result<()> {
 /// reading a station wants one spelling for the packet's id, and the
 /// raw body is one `boss-api` call away if it wants the envelope.
 pub async fn station(name: &str, raw: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let body = crate::gate::api(
         &http,
         reqwest::Method::GET,
@@ -673,7 +676,7 @@ pub async fn list(
     has: Vec<String>,
 ) -> Result<()> {
     let path = list_query(kind.as_deref(), &status, limit, &wheres, &has)?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let body = crate::gate::api(&http, reqwest::Method::GET, &path, None).await?;
     let total = body
         .as_ref()
@@ -902,7 +905,7 @@ pub(crate) async fn file_on(
 }
 
 pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let sent: Value = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
@@ -1015,7 +1018,7 @@ pub(crate) fn render_move(body: &Value) -> String {
 /// `repins` record grew by one.
 pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<()> {
     let to = to.map(parse_version).transpose()?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
     let query = to.map(|v| format!("?to_version={v}")).unwrap_or_default();
     let preview = crate::gate::api(
@@ -1164,7 +1167,7 @@ pub(crate) fn owed_outcome(
 /// door for a packet closed before it did — not a hand PATCH of a value
 /// someone read off the steps. Confirmed by reading the packet back.
 pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
     let job = crate::gate::api(
         &http,
@@ -1871,7 +1874,7 @@ mod tests {
         use boss_jobs::{
             InMemoryJobs, InMemoryWorkflows, JobFilter, JobsRepository, WorkflowRegistry,
         };
-        use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+        use boss_policy_client::{FakePolicyClient, PolicyClient};
         use serde_json::json;
 
         use super::super::{Filing, Origin, file_on};
@@ -1885,15 +1888,11 @@ mod tests {
         async fn serve() -> (String, Arc<InMemoryJobs>) {
             let jobs = Arc::new(InMemoryJobs::new());
             let policy: Arc<dyn PolicyClient> = Arc::new(
-                FakePolicyClient::builder()
-                    .allow(
-                        "platform-admin",
-                        Action::Create,
-                        Resource::job(),
-                        Scope::All,
-                    )
-                    .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
-                    .build(),
+                // The SHIPPED platform grants (`default_rules`), not a
+                // hand-picked few: the human-road test below must fail if
+                // the platform-admin a person signs in as cannot take a
+                // step of it (backlog b7b02024, re-review D1).
+                FakePolicyClient::builder().with_default_rules().build(),
             );
             let bus = boss_testing::RecordingEventBus::new();
             let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
@@ -1936,6 +1935,7 @@ mod tests {
                     source: crate::identity::Source::Env,
                 }),
             )
+            .unwrap()
         }
 
         fn filing(metadata: Option<serde_json::Value>) -> Filing<'static> {
@@ -1981,6 +1981,165 @@ mod tests {
                 report.contains(AGENT),
                 "the report names the filer: {report}"
             );
+        }
+
+        /// THE OPERATOR'S ROAD, WITH NO AGENT RUNNING (backlog b7b02024,
+        /// DR rule 62dac114, re-review D1). A car held for its review
+        /// carries `hold_sha`, so only a release naming an agent-run
+        /// whose verdict is RELEASE at its head lets it board. Every
+        /// agent-run on the live stack was opened by an agent; this walks
+        /// the three commands `boss release --help` names, as the HUMAN
+        /// `emp-david`, through the real jobs router, its admission and
+        /// the login door: `boss job file --kind agent-run`, then `boss
+        /// review`, then `boss release --review`. It fails if any link
+        /// refuses a human — admission of an agent-run filed by one, a
+        /// verdict recorded on a run no agent opened, a release by a
+        /// person — and it ends at the dock: the conductor's own `dock()`
+        /// and `vouches` board the car.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_human_alone_releases_a_review_held_car_through_the_three_verbs() {
+            const HUMAN: &str = "emp-david";
+            const CAR: &str = "c0ffee00-0000-4000-8000-00000000ca25";
+            const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+            const HEAD: &str = "1111111111111111111111111111111111111111";
+            const MAIN: &str = "2222222222222222222222222222222222222222";
+            let (base, jobs) = serve().await;
+            // The car at the dock: gated green, its review held for a
+            // finding at HEAD, built by an agent run.
+            let mut car = boss_core::job::Job::new(
+                "ship-a-change",
+                boss_core::job::Subject::new("custom", "bosspipeline"),
+                "a held car",
+                HUMAN,
+                boss_core::job::Priority::Standard,
+                chrono::NaiveDate::from_ymd_opt(2026, 9, 29).expect("a date"),
+            );
+            car.id = serde_json::from_value(json!(CAR)).expect("a car id");
+            car.status = boss_core::job::JobStatus::Open;
+            car.metadata = json!({"branch": "feat/held", "agent_run": BUILDER});
+            let step = |slug: &str, status: &str, md: serde_json::Value| {
+                serde_json::from_value::<boss_core::job::Step>(json!({
+                    "id": uuid::Uuid::new_v4().to_string(), "job_id": CAR,
+                    "title": if slug == "review" { boss_jobs::car::REVIEW } else { slug },
+                    "spec_slug": slug, "status": status, "metadata": md,
+                }))
+                .expect("a step")
+            };
+            let steps = [
+                step("gate", "completed", json!({})),
+                step(
+                    "review",
+                    "ready",
+                    json!({"hold": "touches an ops verb", boss_jobs::car::HOLD_SHA: HEAD}),
+                ),
+            ];
+            let stamp = boss_core::publisher::EventStamp::new(
+                "jobs",
+                boss_core::actor::ActorId::Automation("test".into()),
+            );
+            let step_events: Vec<_> = steps
+                .iter()
+                .map(|s| {
+                    stamp.event(
+                        boss_jobs::events::STEP_CREATED,
+                        boss_jobs::events::step_state_payload(s),
+                    )
+                })
+                .collect();
+            let _admitted = jobs
+                .create_job_with_steps_at(&car, &steps, stamp.timestamp, &[], &step_events)
+                .await
+                .expect("the car stands at the dock");
+            let wire = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: HUMAN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let forge = |r: &str| -> anyhow::Result<String> {
+                Ok(if r == "refs/heads/main" { MAIN } else { HEAD }.to_string())
+            };
+
+            // 1. `boss job file --kind agent-run --title '…'`
+            let report = file_on(
+                &wire,
+                Filing {
+                    kind: "agent-run",
+                    title: "Review of feat/held by emp-david",
+                    priority: None,
+                    subject_id: None,
+                    channel: None,
+                    metadata: None,
+                },
+                Origin {
+                    source: None,
+                    area: None,
+                },
+            )
+            .await
+            .expect("admission takes an agent-run a human files");
+            let run = report
+                .split_whitespace()
+                .skip_while(|w| *w != "filed")
+                .nth(1)
+                .expect("the report names the run")
+                .to_string();
+            // 2. `BOSS_AGENT_RUN=<run> boss review feat/held --verdict release`
+            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
+                .await
+                .expect("a human records a verdict on the run they opened");
+            // 3. `boss release feat/held --review <run>`
+            crate::review_verdict::release(&wire, "feat/held", &run, forge)
+                .await
+                .expect("a human releases on that verdict");
+
+            // The dock: the conductor's own two readers board the car.
+            let after = wire.packet(CAR).await.expect("the car");
+            assert!(crate::train::parked_ready(&after), "unheld: {after}");
+            let never = || -> crate::mutating_verb::Judgement {
+                panic!("a car with a release is not judged")
+            };
+            let unasked = |_: &str, _: &str| -> Result<String, String> {
+                panic!("a release at the head it reviewed proves nothing further")
+            };
+            assert_eq!(
+                crate::mutating_verb::dock(&after, HEAD, never, unasked),
+                crate::mutating_verb::Dock::Check {
+                    review: run.clone(),
+                    reviewed: HEAD.into(),
+                    carry: None,
+                }
+            );
+            let run_packet = wire.packet(&run).await.expect("the run");
+            assert_eq!(
+                crate::review_verdict::vouches(&run_packet, &after, HEAD),
+                Ok(()),
+                "the dock's check passes a run a human opened: {run_packet}"
+            );
+        }
+
+        /// The road the test above walks is the road `boss release --help`
+        /// tells the operator to walk — the three verbs, in order, and the
+        /// test that pins them. A help line that drifts from the chain is
+        /// a dead end found at exactly the wrong moment.
+        #[test]
+        fn release_help_names_the_three_verbs_the_human_road_walks() {
+            let help = include_str!("steps.rs");
+            let at = |needle: &str| {
+                help.find(needle)
+                    .unwrap_or_else(|| panic!("boss release --help names {needle:?}"))
+            };
+            let file = at("1. boss job file --kind agent-run --title 'Review of <car> by <you>'");
+            let review = at("2. BOSS_AGENT_RUN=<that id> boss review <car> --verdict release");
+            let release = at("3. boss release <car> --review <that id>");
+            assert!(file < review && review < release, "in order");
+            assert!(
+                help[release..].contains("`died`"),
+                "the side effect is named"
+            );
+            at("a_human_alone_releases_a_review_held_car_through_the_three_verbs");
         }
 
         /// The CLI no longer judges the filer; admission does, once. A

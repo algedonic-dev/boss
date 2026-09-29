@@ -57,8 +57,19 @@ async fn main() -> Result<()> {
     );
 
     let engine = Arc::new(PolicyEngine::new(repo.clone()));
+    // The coverage read (design 1c4e42e1): the roster and its passkeys
+    // from the people API, the active workflows from the jobs API — the
+    // same env-over-port-table defaults every consumer takes.
+    let sources = Arc::new(boss_policy::coverage::HttpCoverageSources::new(
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+    ));
+    let coverage = boss_policy::coverage::router(boss_policy::coverage::CoverageApiState {
+        repo: repo.clone(),
+        sources,
+    });
     let state = PolicyApiState { repo, engine };
-    let app: Router = router(state);
+    let app: Router = router(state).merge(coverage);
 
     // Default port pulled from boss_ports — single source of truth
     // shared with the config generator + every BOSS_POLICY_URL

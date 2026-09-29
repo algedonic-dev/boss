@@ -182,6 +182,20 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 API_CURL="$(dirname "$0")/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 
+# The machine token rides to curl in a 0600 file, never in its argv,
+# where every local user reads it in ps (backlog 5f3ad356). The lib is
+# found the way the curl helper is — lib/ next to this file, which is
+# infra/lib in a checkout and /usr/local/bin/lib in the image (the
+# Dockerfile COPYs it; the playground crawl copies lib/ whole).
+SECRET_LIB="$(dirname "$0")/lib/secret-header.sh"
+if [ ! -r "$SECRET_LIB" ]; then
+    echo "boss-step: $SECRET_LIB is missing — the machine token cannot be sent without putting it in curl's command line; '$STEP_TITLE' not recorded" >&2
+    exit 1
+fi
+# shellcheck source=infra/lib/secret-header.sh
+. "$SECRET_LIB"
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}
+
 if ! jobs_json=$("$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" \
         "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null); then
     echo "boss-step: jobs-api unreachable at $BASE — '$STEP_TITLE' not recorded" >&2
@@ -254,7 +268,7 @@ step_id=$(printf '%s' "$step" | jq -r '.id')
 url="$BASE/api/jobs/$job_id/steps/$step_id"
 if ! put_err=$("$API_CURL" -fsS -X PUT -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
-        ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+        ${MT_HDR:+-H "$MT_HDR"} \
         -d "$payload" "$url" 2>&1 >/dev/null); then
     echo "boss-step: PUT failed — $put_err" >&2
     exit 1

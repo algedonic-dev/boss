@@ -80,9 +80,14 @@ kind = "checklist"
 ready_when = "steps.opened.done"
 title_template = "Inspect: {metadata.target}"
 authority_role = "platform-admin"
+# `items` is the `checklist` kind's required field ("Checklist items
+# [{label, checked, checked_by, checked_at}]"); the judging rule writes
+# it. Declared so the step's contract is whole wherever it is read
+# (backlog a14f04b3; tests/a_step_declares_what_its_kind_requires.rs).
 fields = [
   { name = "findings", field_type = "string", required = true },
   { name = "measured", field_type = "string", required = true },
+  { name = "items", field_type = "array", required = true },
 ]
 
 [[workflow.step]]

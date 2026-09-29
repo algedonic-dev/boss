@@ -100,11 +100,26 @@ export type MetricsPacket = Readonly<{
   landings: ReadonlyArray<Landing>;
 }>;
 
+/** The newest packet of the kind, measured or not — what the page names
+ *  when it is not the row it draws (a91a39a4). `outcome` is the
+ *  packet's own (null while it is open); `result` is its run step's,
+ *  which boss-step.sh records from the unit's exit. */
+export type LatestRun = Readonly<{
+  id: string;
+  title: string;
+  opened_at: string | null;
+  status: string | null;
+  outcome: string | null;
+  result: string | null;
+}>;
+
 export type MetricsPage = Readonly<{
   packets: ReadonlyArray<MetricsPacket>;
   /** Packets of the kind that carry no measurement (a failed run). */
   unmeasured: number;
   total: number;
+  /** Newest by `opened_at` of every packet read; null for an empty kind. */
+  latest: LatestRun | null;
 }>;
 
 // ---------------------------------------------------------------------
@@ -220,11 +235,43 @@ function parseMeasured(v: unknown): Measured | null {
   };
 }
 
-/** The jobs-API page for the kind: `{data, total}` or a bare array. */
+function parseLatest(v: unknown): LatestRun | null {
+  const r = rec(v);
+  const id = r ? str(r.id) : null;
+  if (!r || !id) return null;
+  const status = str(r.status);
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  const runStep = rec(steps.find((s) => rec(s)?.spec_slug === 'run'));
+  return {
+    id,
+    title: str(r.title) ?? id,
+    opened_at: str(r.opened_at),
+    status,
+    outcome: status === 'open' ? null : str(rec(r.metadata)?.outcome),
+    result: str(rec(runStep?.metadata)?.result),
+  };
+}
+
+/** The jobs-API page for the kind: `{data, total}` or a bare array.
+ *  Anything else THROWS (b64b3c04, page audit f82b05a9): it used to map
+ *  to total 0, which the page draws as "the 05:10 measurement has not
+ *  filed" — the honest empty, for a body nobody read. fetchRemote turns
+ *  the throw into `failed`. A bare `[]` stays empty: it is the mocked
+ *  catch-all's shape, and a list endpoint can legitimately answer it. */
 export function parseMetricsPackets(raw: unknown): MetricsPage {
   const env = rec(raw);
-  const list: unknown[] = Array.isArray(raw) ? raw : env && Array.isArray(env.data) ? env.data : [];
+  if (!Array.isArray(raw) && !(env && Array.isArray(env.data))) {
+    throw new Error(`unrecognised codebase-metrics envelope: expected {data: [...]} or a list, got ${envelopeShape(raw)}`);
+  }
+  const list: unknown[] = Array.isArray(raw) ? raw : (env?.data as unknown[]);
   const total = env ? (num(env.total) ?? list.length) : list.length;
+  // Newest by opened_at; the API's own order (newest first) breaks a
+  // tie or a missing stamp.
+  const openedLater = (p: LatestRun, best: LatestRun): boolean =>
+    p.opened_at !== null && (best.opened_at === null || p.opened_at > best.opened_at);
+  const latest = list
+    .flatMap((j) => parseLatest(j) ?? [])
+    .reduce<LatestRun | null>((best, p) => (best === null || openedLater(p, best) ? p : best), null);
   const packets = list.flatMap((j): MetricsPacket[] => {
     const r = rec(j);
     const id = r ? str(r.id) : null;
@@ -234,7 +281,25 @@ export function parseMetricsPackets(raw: unknown): MetricsPage {
     const landings = meta && Array.isArray(meta.landings) ? meta.landings.flatMap((l) => parseLanding(l) ?? []) : [];
     return [{ id, title: str(r.title) ?? id, measured, landings }];
   });
-  return { packets, unmeasured: list.length - packets.length, total };
+  return { packets, unmeasured: list.length - packets.length, total, latest };
+}
+
+/** What an unrecognised body was, for the failure line: its type, and
+ *  an object's keys, so the reader sees the envelope that arrived. */
+export function envelopeShape(raw: unknown): string {
+  if (raw === null) return 'null';
+  if (Array.isArray(raw)) return 'a list';
+  const r = rec(raw);
+  if (r) return `an object with keys [${Object.keys(r).join(', ')}]`;
+  return typeof raw;
+}
+
+/** The newest packet of the kind when it is NOT the row the page draws
+ *  — a run that failed, or one still open — so the page names it rather
+ *  than drawing the last measured row as though it were today's
+ *  (a91a39a4). Null when the newest packet is the measured one. */
+export function unmeasuredNewest(latest: LatestRun | null, drawn: MetricsPacket | null): LatestRun | null {
+  return latest !== null && latest.id !== drawn?.id ? latest : null;
 }
 
 /** The whole kind, newest first. Each run files one packet, so a page
@@ -252,8 +317,9 @@ export function loadMetricsPackets(limit: number): Promise<Exclude<Remote<Metric
  *  and the one-line breakdown under it. */
 export type StatCard = Readonly<{ k: string; v: string; sub: string }>;
 
-/** THE CODEBASE NOW — the plain numbers off the newest row, before any
- *  reading of them. Feedback 9827c699 (David, 2026-09-14): "add a page
+/** Section 00, the codebase — the plain numbers off the newest measured
+ *  row, before any reading of them (dated against the reader's clock on
+ *  the page since a91a39a4; it was headed "NOW" over any row's age). Feedback 9827c699 (David, 2026-09-14): "add a page
  *  to the IT department showing the Code base stats" — the trend page
  *  existed as a Design tab and opened on the delete:add verdict, so the
  *  stats a person wanted were three sections down and one tab in. This

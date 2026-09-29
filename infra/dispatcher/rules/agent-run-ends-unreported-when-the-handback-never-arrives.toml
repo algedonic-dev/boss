@@ -49,6 +49,18 @@
 # never overwritten, and a completed step is not open, so the next
 # tick finds nothing.
 #
+# A REPORT ON THE PACKET IS NOT AN ABSENCE (v2, backlog b951c00a). The
+# template above only fills the STEP's absent keys, and a handback sent
+# before the green lives on the PACKET (`metadata.report`) until the
+# step opens — so on 2026-09-28 this rule completed run e737a54f's
+# `reported` with `handback = absent` and "No handback was recorded"
+# while the builder's full handback sat on that packet: a false record.
+# `unless_job_holds = "report"` spares such a run. With
+# `agent-run-lands-a-report-sent-before-green` in place the step lands
+# from that report the moment it opens, so this should never find one;
+# if it does, the run stays open and counted on the shop floor for a
+# hand, which is a truer record than an absence.
+#
 # NO RECLAIM FOLLOWS THIS ONE, BY CONSTRUCTION. The step the run was
 # executing is already completed: `reported` cannot even open unless
 # `building` closed `gated` (the gate went green and the car merged,
@@ -81,8 +93,8 @@ completes `reported` with `handback = absent` on every run whose
 report never came, and the protocol's own `unreported` terminal closes
 it.
 """
-version = 1
+version = 2
 schedule = { cadence = "hourly", anchor_date = "2026-09-22" }
 [[rule.do]]
 handler = "jobs.age_out_step"
-args = { kind = "\"agent-run\"", step = "\"reported\"", hours = "\"2\"", done_metadata = '"{\"handback\": \"absent\", \"summary\": \"No handback was recorded. This line is the clock rule agent-run-ends-unreported-when-the-handback-never-arrives, not the agent: the run built, its work is evidenced on `building`, and nothing reported within the bound, so the slot it held was released and the run ends `unreported`. See `aged_out` beside this for the silence measured.\"}"' }
+args = { kind = "\"agent-run\"", step = "\"reported\"", hours = "\"2\"", unless_job_holds = "\"report\"", done_metadata = '"{\"handback\": \"absent\", \"summary\": \"No handback was recorded. This line is the clock rule agent-run-ends-unreported-when-the-handback-never-arrives, not the agent: the run built, its work is evidenced on `building`, and nothing reported within the bound, so the slot it held was released and the run ends `unreported`. See `aged_out` beside this for the silence measured.\"}"' }

@@ -13,10 +13,12 @@
 # is updated on the declared fields that differ, and the publish names
 # each change (09887242).
 #
-# `role` and `department` are Class codes under (employee, role) and
-# (employee, department) in seeds/classes.json — the same rows an
-# employee's are checked against (ab192a9f). A step whose audience is
-# { role = "engineering-agent" } reaches this agent through them.
+# `role` is a Class code under (employee, role) in seeds/classes.json
+# and `department` a code of the departments registry
+# (seeds/departments.toml) — the same rows an employee's are checked
+# against (ab192a9f; the department since c87e3d6d). A step whose
+# audience is { role = "engineering-agent" } reaches this agent
+# through them.
 
 [[agent]]
 id = "agent-claude"
@@ -24,6 +26,6 @@ display_name = "Claude (engineering)"
 default_model = "opus-5[1m]"
 aliases = ["claude@algedonic.dev"]
 role = "engineering-agent"
-department = "engineering"
+department = "it"
 # Caps are unset until the first month's spend is measured — an
 # unbudgeted agent is admitted, never refused (the boot-guard rule).

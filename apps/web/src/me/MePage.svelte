@@ -485,8 +485,9 @@
         {#if shown.notMineToDo.length > 0}
           <Section title="Waiting on automation" wide>
             <div class="myday-automation-note">
-              The protocol says these complete without a person. They are
-              on your role's queue because nothing has picked them up.
+              The protocol says these complete without a person — an agent
+              takes them, or automation does. They are on your role's queue
+              because nothing has picked them up.
             </div>
             <div class="myday-jobs-list">
               {#each shown.notMineToDo as row (row.step.id)}

@@ -96,6 +96,9 @@ test.describe('the receiving board groups the untriaged by source and area', () 
     const mine = asked.filter((u) => u.includes('simulated=false&closed_within='));
     expect(mine.length).toBeGreaterThan(0);
     expect(mine.filter((u) => !(u.includes('origin=true') && u.includes('lane=true')))).toEqual([]);
+    // SLIM rows (backlog ea80b5fd): the failed-verb note is the server's
+    // reading, so the board never asks every step's metadata for it.
+    expect(mine.filter((u) => !u.includes('failed_verbs=true') || u.includes('full=true'))).toEqual([]);
   });
 
   test('one track per source, largest first, and the unrecorded stand in one visible group', async ({ page }) => {

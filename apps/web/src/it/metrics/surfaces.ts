@@ -14,9 +14,11 @@
 // does the GROUP BY server-side, so the page and the packet cannot
 // disagree by summing differently; everything here is a pure function
 // of the rows it returns. The never-opened list compares those rows
-// against the nav catalog's paths — the catalog is the roster of
-// surfaces, so a path it lists that no row names is a surface with no
-// reader in the window.
+// against the nav catalog's paths — the catalog is the roster, so a
+// path it lists that no row names is a surface with no reader in the
+// window. The roster is NOT every route the router serves, and the
+// section says so and lists the opened routes outside it
+// (`uncatalogued`, 13ded76c).
 //
 // EVERY NUMBER IS A FUNCTION OF THE ROWS. A failed read is a failure
 // (rendered as such, never as "nobody opened anything"); an empty
@@ -25,6 +27,7 @@
 
 import { fetchRemote, type Remote } from '../../data/remote';
 import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+import { envelopeShape } from './trend';
 
 export type RouteCount = Readonly<{ actor_id: string; route: string; opens: number; last_at: string }>;
 
@@ -49,10 +52,17 @@ function parseRow(v: unknown): RouteCount | null {
 }
 
 /// The roll-up envelope `{since, until, rows}`. A bare array (a mock's
-/// catch-all) is an empty roll-up with no window stated.
+/// catch-all) is its rows with no window stated — `[]` an empty
+/// roll-up. Anything else THROWS (b64b3c04, page audit f82b05a9): an
+/// object without `rows` used to read as zero rows, which the section
+/// draws as "No surface open is recorded", and fetchRemote turns the
+/// throw into the failed arm instead.
 export function parseRollup(raw: unknown): Rollup {
   const env = rec(raw);
-  const list: unknown[] = env && Array.isArray(env.rows) ? env.rows : [];
+  if (!Array.isArray(raw) && !(env && Array.isArray(env.rows))) {
+    throw new Error(`unrecognised surface roll-up envelope: expected {rows: [...]} or a list, got ${envelopeShape(raw)}`);
+  }
+  const list: unknown[] = Array.isArray(raw) ? raw : (env?.rows as unknown[]);
   return {
     since: env ? str(env.since) : null,
     until: env ? str(env.until) : null,
@@ -116,4 +126,16 @@ export function catalogPaths(): ReadonlyArray<string> {
 export function neverOpened(rows: ReadonlyArray<RouteCount>, paths: ReadonlyArray<string>): ReadonlyArray<string> {
   const opened = new Set(rows.map((r) => r.route));
   return paths.filter((p) => !opened.has(p));
+}
+
+/// The routes some row names that the roster does not hold, once each,
+/// sorted — surfaces in use that `neverOpened` cannot see, because its
+/// roster is the nav catalog and the router serves more than the
+/// catalog lists (13ded76c part a; measured at the audit, 20 of the 45
+/// patterns opened in a week). Comparing against every pattern the
+/// router serves needs the router to export its pattern table, which is
+/// its own car (13ded76c part b), so the page states this scope instead.
+export function uncatalogued(rows: ReadonlyArray<RouteCount>, paths: ReadonlyArray<string>): ReadonlyArray<string> {
+  const roster = new Set(paths);
+  return [...new Set(rows.map((r) => r.route))].filter((r) => !roster.has(r)).sort();
 }

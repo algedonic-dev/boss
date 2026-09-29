@@ -16,7 +16,7 @@ impl PgMarketingAssets {
 
     pub async fn create(&self, new: NewMarketingAsset) -> Result<MarketingAsset, KbError> {
         let tags = serde_json::to_value(&new.tags).unwrap_or(serde_json::json!([]));
-        let skus = serde_json::to_value(&new.linked_device_skus).unwrap_or(serde_json::json!([]));
+        let skus = serde_json::to_value(&new.linked_skus).unwrap_or(serde_json::json!([]));
         let accounts =
             serde_json::to_value(&new.linked_account_ids).unwrap_or(serde_json::json!([]));
         let campaigns =
@@ -38,7 +38,7 @@ impl PgMarketingAssets {
         let row = sqlx::query(
             "INSERT INTO marketing_assets \
                 (id, title, kind, description, file_url, tags, \
-                 linked_device_skus, linked_account_ids, linked_campaign_ids, \
+                 linked_skus, linked_account_ids, linked_campaign_ids, \
                  owner_id, brand_reviewed_by, brand_reviewed_at, supersedes_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT (id) DO UPDATE SET \
@@ -47,7 +47,7 @@ impl PgMarketingAssets {
                 description = EXCLUDED.description, \
                 file_url = EXCLUDED.file_url, \
                 tags = EXCLUDED.tags, \
-                linked_device_skus = EXCLUDED.linked_device_skus, \
+                linked_skus = EXCLUDED.linked_skus, \
                 linked_account_ids = EXCLUDED.linked_account_ids, \
                 linked_campaign_ids = EXCLUDED.linked_campaign_ids, \
                 owner_id = EXCLUDED.owner_id, \
@@ -130,9 +130,9 @@ impl PgMarketingAssets {
             description: patch.description.or(existing.description.clone()),
             file_url: patch.file_url.or(existing.file_url.clone()),
             tags: patch.tags.unwrap_or_else(|| existing.tags.clone()),
-            linked_device_skus: patch
-                .linked_device_skus
-                .unwrap_or_else(|| existing.linked_device_skus.clone()),
+            linked_skus: patch
+                .linked_skus
+                .unwrap_or_else(|| existing.linked_skus.clone()),
             linked_account_ids: patch
                 .linked_account_ids
                 .unwrap_or_else(|| existing.linked_account_ids.clone()),
@@ -204,7 +204,7 @@ fn row_to_asset(row: &PgRow) -> MarketingAsset {
         description: row.try_get("description").ok(),
         file_url: row.try_get("file_url").ok(),
         tags: as_strings("tags"),
-        linked_device_skus: as_strings("linked_device_skus"),
+        linked_skus: as_strings("linked_skus"),
         linked_account_ids: as_strings("linked_account_ids"),
         linked_campaign_ids: as_strings("linked_campaign_ids"),
         owner_id: row.try_get("owner_id").ok(),

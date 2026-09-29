@@ -461,8 +461,11 @@ WITH cells AS (
     GROUP BY 1, 2, 3, 4
 ),
 ob AS (
-    SELECT (${LOG_MARKER_SQL}) AS sim, (delivered_at IS NULL) AS pending, count(*) AS n
-    FROM event_outbox GROUP BY 1, 2
+    SELECT (${LOG_MARKER_SQL}) AS sim,
+           (delivered_at IS NULL AND dead_lettered_at IS NULL) AS pending,
+           (dead_lettered_at IS NOT NULL AND dead_letter_resolved_at IS NULL) AS dead_lettered,
+           count(*) AS n
+    FROM event_outbox GROUP BY 1, 2, 3
 ),
 ef AS (
     SELECT (${LOG_MARKER_SQL}) AS sim, count(*) AS n
@@ -492,8 +495,9 @@ SELECT json_build_object(
     'event_outbox', json_build_object(
         'rows', (SELECT coalesce(sum(n), 0)::bigint FROM ob),
         'pending', (SELECT coalesce(sum(n), 0)::bigint FROM ob WHERE pending),
+        'dead_lettered', (SELECT coalesce(sum(n), 0)::bigint FROM ob WHERE dead_lettered),
         'by_simulated', (SELECT coalesce(json_object_agg(sim, n ORDER BY sim), '{}'::json) FROM (SELECT sim, sum(n)::bigint AS n FROM ob GROUP BY 1) x),
-        'note', 'the same envelope as audit_log: the relay copies each row into audit_log and stamps delivered_at, and nothing prunes delivered rows (02-events.sql), so rows here are the log since the outbox landed, pending is the relay lag, and a marker split that differs from audit_log over the same era is a relay gap'
+        'note', 'the same envelope as audit_log: the relay copies each row into audit_log and stamps delivered_at, and nothing prunes delivered rows (02-events.sql), so rows here are the log since the outbox landed, pending is the relay lag, and a marker split that differs from audit_log over the same era is a relay gap. dead_lettered is apart from pending: rows the bus refused and the relay set aside, in audit_log but never published, and not yet redelivered or resolved (boss events redeliver) — not lag, since the relay has finished with them'
     ),
     'event_facts', json_build_object(
         'rows', (SELECT coalesce(sum(n), 0)::bigint FROM ef),

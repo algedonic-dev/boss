@@ -1,0 +1,63 @@
+# A car the conductor has left behind on a merge conflict three trains
+# running gets a machine-filed repair (design b35456ac, answering
+# user-feedback ff4ae3d2).
+#
+# WHAT HAPPENED. On 2026-09-28 the dock held exactly two cars, 05ade1cc
+# and d89bafeb, and both were refused on conflicts after train #778
+# landed changes to the same files. The refusal was correct and named its
+# cause; the conductor had already rebased each car onto the consist
+# before stamping it (`rerail_onto_consist`), so every stamped conflict
+# is one `git rebase` could not resolve. What was missing was the next
+# actor: each car stayed behind until an operator dispatched `boss
+# rerail` by hand — d89bafeb read `skips = 13` by then.
+#
+# THE TRIGGER IS THE CAR'S OWN COUNT. The conductor writes `skips` beside
+# `skip_reason` through the job metadata door on every conflict refusal,
+# and that door's `jobs.job.updated` carries the whole post-merge row, so
+# the count is in the payload and no read is needed to judge it. `skips`
+# counts CONSECUTIVE refusals: boarding clears it, and so does a re-park
+# (`boss_jobs::car::regate_patch`).
+#
+# EXACTLY 3, NOT >= 3. One write per streak carries 3, so this files once
+# per streak by construction: a repair that ended `refused` belongs to a
+# person, and must not be re-filed as the count climbs to 4, 5, 6.
+# `NOT open_job_exists` is the second guard, for a later write (any key)
+# that lands while the count still reads 3. Three matches the conductor's
+# `LEFT_BEHIND_ALARM_TRAINS` for the same repetition, and N = 1 would
+# dispatch on routine noise: 39% of trains carry a skip that clears
+# itself (measured 2026-09-22).
+#
+# THE PREFIX. A car's `skip_reason` carries a dock hold, a strike, a
+# missing branch or a consist refusal as well, and a consist refusal is
+# stamped WITHOUT touching `skips` — so a car at 3 can later read a
+# reason that is not a conflict. Only `conflict:` (the conductor's
+# `skip_reason_conflict`, pinned to this file by boss-cli's
+# `the_conflict_trigger_reads_the_prefix_the_conductor_writes`) is a
+# repair a builder can author.
+#
+# `kind` is the first conjunct on purpose: AND short-circuits, and this
+# topic is every packet write in the system.
+#
+# WHAT IT FILES IS WORK, NOT A RUN. A `rerail-a-car` packet whose `rerail`
+# step carries a builder agent block; the run is opened at the claim by
+# `boss dispatch`, like every run. An agent-run filed here with nobody
+# claiming it would age out as `died`. If this event is lost, the car's
+# left-behind and stall alarms still fire: a missed trigger degrades to
+# the behaviour before this rule, never to silence.
+[[rule]]
+name = "rerail-a-car-left-behind-on-a-conflict"
+why = """
+A CROSS-PROTOCOL REACTOR and a THRESHOLD: a `ship-a-change` car's
+count of consecutive conflict refusals reaching three files a
+`rerail-a-car` packet — two protocols, so no single Workflow can
+declare it, and the condition is a level on the car's metadata, not a
+step transition. Measured 2026-09-28 (ff4ae3d2): two cars sat refused
+on conflicts until an operator ran `boss rerail` by hand, one of them
+13 trains in a row, while the alarm that named them went unread.
+"""
+version = 1
+on_event = "jobs.job.updated"
+when = "kind = \"ship-a-change\" AND metadata.skips = 3 AND starts_with(metadata.skip_reason, \"conflict:\") AND NOT open_job_exists(\"rerail-a-car\", subject.id)"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"rerail-a-car\"", subject_kind = "\"custom\"", subject = "subject.id", title = "\"Rerail a car left behind on a merge conflict three trains running\"", "metadata.car" = "id", "metadata.branch" = "metadata.branch", "metadata.skip_reason" = "metadata.skip_reason" }

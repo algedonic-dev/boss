@@ -33,7 +33,7 @@ pub trait DispatcherRules: Send + Sync {
 /// `rules` array.
 pub struct ReqwestDispatcherRules {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestDispatcherRules {

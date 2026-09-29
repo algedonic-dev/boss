@@ -235,4 +235,24 @@ fn main_enters_the_gateway_through_the_refusal_last() {
         "the dot-segment refusal must wrap the finished app, after inquiries::mount and \
          before axum::serve"
     );
+    // Order alone let a layer sit after the refusal and before serve,
+    // ahead of it, with this test green (backlog 884eee14): the only
+    // rebinding after the inquiry door is the cross-site refusal, and
+    // the refusal's app goes straight to serve.
+    let rebinds: Vec<&str> = main
+        [inquiries + "let app = inquiries::mount(app, door);".len()..refusal]
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("let app ="))
+        .collect();
+    assert_eq!(
+        rebinds,
+        ["let app = cross_site::mount(app);"],
+        "between the inquiry door and the dot-segment refusal only the cross-site refusal \
+         may wrap the app"
+    );
+    crate::cross_site::tests::assert_app_goes_straight_to_serve(
+        main,
+        refusal + "let app = dot_segments::mount(app);".len(),
+    );
 }

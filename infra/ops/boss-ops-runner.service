@@ -33,6 +33,27 @@ After=network-online.target
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
 #
+# A MUTATING VERB'S TOKEN NEVER OUTLIVES ITS RUN (backlog 5f77b205,
+# 2026-09-28). github-act.sh writes its GitHub installation token's
+# header file into $RUNTIME_DIRECTORY: tmpfs under /run, 0700, which
+# systemd removes when this oneshot run stops (so after a SIGKILL or an
+# OOM kill too) and a power loss clears. Until this line it lived under
+# the host's shared /tmp and survived all three. LimitCORE=0: no verb's
+# git or curl dumps a core holding what it read.
+#
+# NEVER PrivateTmp=, ProtectSystem=, ReadOnlyPaths= or any other option
+# that gives this unit a mount namespace. systemd.exec(5): those
+# "disconnect propagation of mounts from the unit's processes to the
+# host", and three verbs this unit runs INSTALL mounts on the host —
+# commission-a-disk (mount), move-forgejo-data (mount --fstab) and
+# roll-back-forgejo-data-move (umount). Under a namespace each would
+# mount inside the run only, pass its own findmnt check, and report a
+# mount the host never saw. Pinned by
+# crates/core/boss-testing/tests/ops_runner_unit_keeps_the_host_mount_namespace.rs.
+RuntimeDirectory=boss-ops-runner
+RuntimeDirectoryMode=0700
+LimitCORE=0
+#
 # No boss-maintenance-wrap pair, deliberately: this fires every minute
 # and a packet per firing would drown the board. Its product IS
 # packets — the ops-requests it answers — and its failure modes are

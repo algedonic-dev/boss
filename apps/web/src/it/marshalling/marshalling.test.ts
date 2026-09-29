@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  answeredHours,
   constraintOf,
   drainHours,
   joinSidings,
@@ -12,6 +13,7 @@ import {
   waitText,
   waitsCountLine,
   whyNotMoving,
+  windowLine,
   type Siding,
 } from './marshalling';
 
@@ -124,6 +126,23 @@ describe('parseStationLoad / parseStationFlow', () => {
     expect(() => parseStationFlow({ nope: true })).toThrow(
       '/api/stations/flow: HTTP 200, but the body is an object with no data list',
     );
+  });
+
+  test('a row carries the Workflow kind its station holds apart from the station kind, and null when it names none (c7c5c1de)', () => {
+    const rows = parseStationLoad({
+      data: [
+        { station: 'loading-dock', kind: 'batch', workflow_kind: 'ship-a-change', depth: 1 },
+        { station: 'q.platform-admin.task', kind: 'constraint', workflow_kind: null, depth: 2 },
+        { station: 'older-server', kind: 'batch', depth: 0 },
+      ],
+    });
+    expect(rows.map((r) => [r.kind, r.workflowKind])).toEqual([
+      ['batch', 'ship-a-change'],
+      ['constraint', null],
+      ['batch', null],
+    ]);
+    const joined = joinSidings(rows, { rows: [], windowHours: 24, asOf: null });
+    expect(joined.find((s) => s.station === 'loading-dock')?.workflowKind).toBe('ship-a-change');
   });
 
   test('a well-formed envelope with no rows is the only empty', () => {
@@ -245,6 +264,28 @@ describe('drainHours', () => {
   test('an empty queue clears in no time at all', () => {
     expect(drainHours(0, 0, 24)).toBe(0);
     expect(drainHours(0, 5, 24)).toBe(0);
+  });
+});
+
+// Backlog 371aa184: the envelope's window_hours was parsed and then
+// ignored, so a clamped answer was judged in the hours the button asked.
+describe('answeredHours / windowLine', () => {
+  const envelope = (windowHours: number | null) => ({ rows: [], windowHours, asOf: null });
+
+  test('the window the server counted is the window the board judges in', () => {
+    expect(answeredHours(envelope(72), 168)).toBe(72);
+    expect(answeredHours(envelope(24), 24)).toBe(24);
+  });
+
+  test('an envelope that does not say falls back to the hours the read asked for', () => {
+    expect(answeredHours(envelope(null), 168)).toBe(168);
+    // A zero or negative window is not a window; it cannot be judged in.
+    expect(answeredHours(envelope(0), 72)).toBe(72);
+  });
+
+  test('a counted window that is not the pressed one is said; an equal one says nothing', () => {
+    expect(windowLine(72, 168)).toBe('counted over 72h, not the 168h pressed');
+    expect(windowLine(24, 24)).toBeNull();
   });
 });
 

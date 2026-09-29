@@ -87,10 +87,13 @@ pub fn declare(source: &Path, gateway: Option<&str>, dry_run: bool) -> Result<St
         "x-boss-user",
         reqwest::header::HeaderValue::from_static(ESTATE_SEED_USER),
     );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .default_headers(headers)
-        .build()?;
+    // The machine token is stamped per request, and no redirect is
+    // followed (design 6805c764 car 2, the CLI slice).
+    let client = boss_core::machine_token::BlockingClient::build(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .default_headers(headers),
+    )?;
     let resp = client
         .post(&url)
         .json(&boss_jobs::port::EstateNodeBatch { nodes: rows })

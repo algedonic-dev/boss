@@ -21,6 +21,9 @@
   // Renders only when a step carries an `arrival_report` — a train's
   // landing report. Every other Job renders exactly as before.
   import ArrivalReport from '../it/yard/ArrivalReport.svelte';
+  // Renders only when the packet carries a gate lifecycle stamp
+  // (`launched_at` / `queued_at`) — a gate-run's two ages (4d088a7e).
+  import GateTimes from '../it/yard/GateTimes.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -320,6 +323,7 @@
 
     <div class="tab-grid">
       <ArrivalReport job={j} />
+      <GateTimes jobId={j.id} open={j.status === 'open'} metadata={j.metadata} />
       {#if annotations.length > 0}
         <!-- The packet's own annotations, first after an arrival report:
              an alarm plan (owner, plan, ETA, what needs David) is the

@@ -164,9 +164,13 @@ pub trait StepPluginRegistry: Send + Sync {
     /// In one transaction: retire any active row of the same kind,
     /// INSERT the row active at `spec.version` with `created_at =
     /// now`, record `jobs.step_plugin.published` (payload = the row
-    /// written). `Conflict` when (kind, version) already exists — the
-    /// caller decides what an existing row means, this never
-    /// overwrites one.
+    /// written). `Conflict`, writing nothing, when `spec.version` is
+    /// not above the newest version the kind holds in any status — an
+    /// existing row is never overwritten, and a live row is never
+    /// retired for a lower one. The caller's classify is a read taken
+    /// before this write, so the floor is enforced HERE, inside it
+    /// (backlog 1cd85e94: two overlapping converges let the older
+    /// retire the newer's version; `crate::declared_version`).
     async fn publish_declared(
         &self,
         spec: StepPluginSpec,
@@ -380,11 +384,17 @@ impl StepPluginRegistry for InMemoryStepPlugins {
     ) -> Result<StepPluginSpec, StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
         let key = (spec.kind.clone(), spec.version);
-        if rows.contains_key(&key) {
-            return Err(StepPluginError::Conflict(format!(
-                "row already exists: {}@{}",
-                spec.kind, spec.version
-            )));
+        // The floor, under the one lock every write takes — the Pg
+        // adapter's rule (backlog 1cd85e94).
+        let newest = crate::declared_version::newest(
+            rows.keys()
+                .filter(|(k, _)| *k == spec.kind)
+                .map(|(_, v)| *v),
+        );
+        if spec.version <= newest {
+            return Err(StepPluginError::Conflict(
+                crate::declared_version::not_above(&spec.kind, spec.version, newest),
+            ));
         }
         for ((k, _), row) in rows.iter_mut() {
             if *k == spec.kind && row.status == WorkflowStatus::Active {
@@ -497,19 +507,28 @@ mod pg {
             &self,
             category: Option<&str>,
         ) -> Result<Vec<StepPluginSpec>, StepPluginError> {
+            // BYTE order, `COLLATE "C"`: a bare `ORDER BY kind` sorted by
+            // the database's locale, which ignores `-` at first level, so
+            // `suite-ab` listed before `suite-a-z` here and after it in
+            // the double, which sorts by kind as Rust compares strings
+            // (backlog be459ab9, found by the adapters-agree suite,
+            // 2026-09-29 — the Workflow and station registries' fix).
             let rows: Vec<Row> = match category {
                 Some(c) => {
                     sqlx::query_as(&format!(
-                        "{SELECT} WHERE status = 'active' AND category = $1 ORDER BY kind"
+                        "{SELECT} WHERE status = 'active' AND category = $1 \
+                         ORDER BY kind COLLATE \"C\""
                     ))
                     .bind(c)
                     .fetch_all(&self.pool)
                     .await
                 }
                 None => {
-                    sqlx::query_as(&format!("{SELECT} WHERE status = 'active' ORDER BY kind"))
-                        .fetch_all(&self.pool)
-                        .await
+                    sqlx::query_as(&format!(
+                        "{SELECT} WHERE status = 'active' ORDER BY kind COLLATE \"C\""
+                    ))
+                    .fetch_all(&self.pool)
+                    .await
                 }
             }
             .map_err(|e| StepPluginError::Storage(e.to_string()))?;
@@ -715,18 +734,23 @@ mod pg {
                 .await
                 .map_err(|e| StepPluginError::Storage(e.to_string()))?;
 
-            let exists: Option<(i32,)> =
-                sqlx::query_as("SELECT version FROM step_plugins WHERE kind = $1 AND version = $2")
-                    .bind(&spec.kind)
-                    .bind(spec.version)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StepPluginError::Storage(e.to_string()))?;
-            if exists.is_some() {
-                return Err(StepPluginError::Conflict(format!(
-                    "row already exists: {}@{}",
-                    spec.kind, spec.version
-                )));
+            // THE FLOOR, inside the write (backlog 1cd85e94): the
+            // newest version of the kind, any status, read after every
+            // other declared write of it has committed or waits behind
+            // this one — see `declared_version` for why the lock comes
+            // first and the read second.
+            let newest = crate::declared_version::lock_and_read_newest(
+                &mut tx,
+                "step_plugins",
+                "kind",
+                &spec.kind,
+            )
+            .await
+            .map_err(|e| StepPluginError::Storage(e.to_string()))?;
+            if spec.version <= newest {
+                return Err(StepPluginError::Conflict(
+                    crate::declared_version::not_above(&spec.kind, spec.version, newest),
+                ));
             }
 
             // RETIRE FIRST, THEN INSERT: `step_plugins_one_active_per_kind`

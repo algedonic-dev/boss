@@ -45,12 +45,14 @@
 # record, and a fact staged here would duplicate the history it reads.
 # ---------------------------------------------------------------------
 not-a-fact file crates/core/boss-calendar/src/rebuild.rs -- projection rebuilder: replays calendar events from audit_log into calendar_reservations
+not-a-fact file crates/core/boss-classes/src/rebuild.rs -- projection rebuilder: replays class.declared, class.updated and class.retired from audit_log onto the migration-seeded classes rows
 not-a-fact file crates/core/boss-content/src/files/rebuild.rs -- projection rebuilder: replays content.file.* events from audit_log into file_refs
 not-a-fact file crates/core/boss-content/src/rebuild.rs -- projection rebuilder: replays content.bulletin.* events from audit_log into bulletins and dismissals
 not-a-fact file crates/core/boss-jobs/src/agent_runs/rebuild.rs -- projection rebuilder: replays agents.run.recorded from audit_log into agent_runs
 not-a-fact file crates/core/boss-jobs/src/rebuild.rs -- projection rebuilder: replays jobs.* events from audit_log into jobs and steps
 not-a-fact file crates/core/boss-jobs/src/scheduling/rebuild.rs -- projection rebuilder: replays scheduling events from audit_log into the scheduling tables
 not-a-fact file crates/core/boss-search/src/rebuild.rs -- projection rebuilder: search_index is rebuilt from the identity projections, themselves rebuilt from audit_log
+not-a-fact file crates/core/boss-subject-kinds/src/rebuild.rs -- projection rebuilder: replays subject_kind.updated from audit_log onto the migration-seeded subject_kinds rows
 not-a-fact file crates/core/boss-subject-kinds/src/bin/boss_subjects_rebuild.rs -- projection rebuilder: boss-subjects-rebuild reproduces the subjects identity rows from audit_log
 not-a-fact fn crates/core/boss-subject-kinds/src/subjects.rs::rebuild_subjects -- projection rebuilder: TRUNCATE-and-replay of subjects from audit_log
 not-a-fact file crates/core/boss-views/src/rebuild_event_facts.rs -- projection rebuilder: event_facts is a windowed projection of audit_log
@@ -79,7 +81,6 @@ not-a-fact fn crates/modules/boss-assets/src/postgres.rs::PgAssets::rebuild_proj
 # ---------------------------------------------------------------------
 not-a-fact fn crates/core/boss-events/src/audit_pg.rs::PgAuditWriter::write -- this IS the log: the legacy direct audit_log writer behind DomainPublisher; the row is the fact, not a write that owes one
 not-a-fact fn crates/core/boss-events/src/audit_pg.rs::PgAuditWriter::write_batch -- this IS the log: the batch form of the legacy direct audit_log writer
-not-a-fact fn crates/core/boss-events/src/outbox.rs::drain_outbox_once -- outbox bookkeeping: the relay copies an already-staged event into audit_log and stamps its delivered_at
 not-a-fact fn crates/core/boss-events/src/messages_events_pg.rs::PgMessagesEventWriter::write -- this IS a log: the messages trail, kept apart from audit_log so its PII can be purged on a retention horizon
 not-a-fact fn crates/core/boss-events/src/messages_events_pg.rs::PgMessagesEventWriter::write_batch -- this IS a log: the batch form of the messages trail writer
 not-a-fact file crates/modules/boss-messages/src/bin/boss_messages_events_purge.rs -- retention: the daily sweep that expires the messages trail past its tenant-declared horizon
@@ -140,7 +141,6 @@ not-a-fact fn crates/core/boss-testing/src/test_db.rs::TestDb::declare_revenue_c
 # ---------------------------------------------------------------------
 # Registries written with no fact, where workflows, stations and step
 # plugins stage a *.published event for the same kind of write:
-gap fn crates/core/boss-calendar/src/postgres.rs::PgCalendar::publish_business_calendars -- business calendars (and their closed days) are published with no event
 gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::create_draft -- a dispatcher rule draft is authored with no event
 gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::publish -- a dispatcher rule is published, retiring the prior version, with no event
 gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::retire -- a dispatcher rule is retired with no event

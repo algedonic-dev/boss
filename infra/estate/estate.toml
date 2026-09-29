@@ -178,3 +178,47 @@ cpu = 4
 memory_gb = 15
 disk_gb = 48
 notes = "WireGuard bastion and the public edge. Second cluster-operator since 2026-09-20: the only estate node that is neither the forge nor inside the cluster, so a forge window does not leave the estate with no talosctl/kubectl. Its credential is SCOPED (break-glass ServiceAccount, infra/cluster/manifests/boss-break-glass-operator.yaml), not the forge's admin kubeconfig — the public edge gets read plus roll-to-last-known-good, not cluster-admin. Hosted the second, older BOSS stack until it was retired on 2026-09-15 (7912c9ae). The conductor moved into the cluster on 2026-09-04. 48GB is the smallest disk in the estate."
+
+
+# THE OPS CREDENTIALS EACH CLUSTER-OPERATOR HOLDS — one table per host
+# that declares the `cluster-operator` role, one line per credential
+# under its /etc/boss-ops (design 835c0c9c, decision 3: "a host declares
+# the credential set it is expected to hold"; backlog f371c749).
+#
+# WHY IT IS DATA. Until 2026-09-29 the one check
+# (infra/estate/ops-credentials.sh) looked for the forge's set on every
+# host that ran it, so boss-gcp read `talosconfig:absent
+# kubeconfig:absent` for three days and the estate alarm told David to
+# place BOTH there by hand. For the public edge both halves were wrong:
+# a talosconfig has no scoped form, so a full one there is the unbounded
+# grant the break-glass scoping exists to avoid; and its kubeconfig is
+# SCOPED, derivable from what admin already holds, so a hand placement
+# is the ceremony the credential broker exists to refuse (CLAUDE.md
+# §Doors).
+#
+# `material` is who can bring the credential into being:
+#   "root"    cannot be minted from anything the estate holds — placing
+#             it is David's act, and the alarm says so;
+#   "scoped"  derivable, so the credential broker delivers it: `delivery`
+#             names the packet that builds or runs that delivery and
+#             `delivery_title` its title, both quoted by the alarm, which
+#             never tells a person to place it. A talosconfig is never
+#             "scoped" (it has no scoped form; the comparator refuses it).
+#
+# TWO READERS, ONE SPELLING: the shell check reads the credential NAMES
+# (sed, at the start of each line of the host's table — so keep each
+# credential on ONE line), and `estate.compare` reads the whole table
+# with the toml crate, compiled in. A test runs both over every table
+# here and holds them equal (a_host_declares_the_ops_credentials_it_holds).
+# A cluster-operator with no table here is reported UNDECLARED by both —
+# never checked against another host's set, never read as present.
+
+[ops_credentials.forge]
+talosconfig = { material = "root" }
+kubeconfig = { material = "root" }
+
+[ops_credentials.boss-gcp]
+# The break-glass ServiceAccount's kubeconfig
+# (infra/cluster/manifests/boss-break-glass-operator.yaml): read, plus
+# roll back to the last known-good image. No talosconfig, ever.
+kubeconfig = { material = "scoped", delivery = "7336cb5f", delivery_title = "Deliver the break-glass kubeconfig to boss-gcp" }

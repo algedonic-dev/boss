@@ -598,7 +598,19 @@ impl ScheduleRunner {
         // so audit provenance chains the spawned work back to the
         // calendar day that produced it.
         let event_id = format!("clock-day:{}", day.format("%Y-%m-%d"));
-        match handler::dispatch(&matched, &self.handlers, &event_id, "clock.day", &payload).await {
+        // No instant: a day firing is about a DAY (`_day`), and a
+        // handler that stamps a time off one is refused by name rather
+        // than handed the dispatcher's clock (eabc5943).
+        match handler::dispatch(
+            &matched,
+            &self.handlers,
+            &event_id,
+            "clock.day",
+            &payload,
+            None,
+        )
+        .await
+        {
             Ok(results) => {
                 let mut fired = 0u64;
                 let mut failed = 0u64;
@@ -680,7 +692,17 @@ impl ScheduleRunner {
         // the instant, so a packet a poll opens chains back to the tick
         // that produced it, the way a day-spawn chains to its day.
         let event_id = format!("clock-tick:{}", now.to_rfc3339());
-        match handler::dispatch(&matched, &self.handlers, &event_id, "clock.tick", &payload).await {
+        // The tick's instant, the same one its payload carries as `_at`.
+        match handler::dispatch(
+            &matched,
+            &self.handlers,
+            &event_id,
+            "clock.tick",
+            &payload,
+            Some(now),
+        )
+        .await
+        {
             Ok(results) => {
                 for r in &results {
                     match &r.outcome {

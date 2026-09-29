@@ -19,6 +19,8 @@
 #   image     the deployment's boss image tag right now
 #   stamp     the last converged tag (the runner's stamp file) or "none"
 #   dark      consecutive checks the API has been down (this one included)
+#   blind     why this tick could not read deploy/boss, or empty when it
+#             could (a sixth fact, backlog cf321ffd)
 # and the threshold DARK_LIMIT (checks; at a 5-minute cadence, 3 = a
 # deploy's worth of dark plus margin):
 #   ok               the API answers — say so, do nothing
@@ -28,11 +30,19 @@
 #                    there by name — the named lever, run by the machine
 #   hands            dark past the threshold on the last converged build
 #                    itself (or with no stamp to roll to): nothing this
-#                    loop can safely do — say so as loudly as it can
+#                    loop can safely do — say so as loudly as it can.
+#                    Also when BLIND past the threshold: it cannot tell
+#                    what is served, and a patch through the credential
+#                    that just failed to read cannot land. Until
+#                    cf321ffd a blind tick's empty image differed from
+#                    the stamp, so it "rolled", failed, and filed
+#                    "rollback did not go Ready" every five minutes — an
+#                    alarm naming a rollback nobody could have made.
 watchdog_decision() {
-    local live="$1" image="$2" stamp="$3" dark="$4" limit="${5:-3}"
+    local live="$1" image="$2" stamp="$3" dark="$4" limit="${5:-3}" blind="${6:-}"
     if [ "$live" = "up" ]; then echo ok; return; fi
     if [ "$dark" -lt "$limit" ]; then echo wait; return; fi
+    if [ -n "$blind" ]; then echo hands; return; fi
     if [ -n "$stamp" ] && [ "$stamp" != "none" ] && [ "$image" != "$stamp" ]; then
         echo roll-to-stamp; return
     fi

@@ -14,6 +14,7 @@ pub mod postgres;
 
 pub mod authority;
 pub mod bootstrap;
+pub mod coverage;
 pub mod http;
 
 // Re-export everything from boss-policy-client so the historical

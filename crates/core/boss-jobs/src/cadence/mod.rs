@@ -27,6 +27,6 @@ pub use port::{CadenceError, CadenceRegistry, CadenceRepository};
 #[cfg(feature = "postgres")]
 pub use postgres::PgCadence;
 pub use types::{
-    CadenceRuleRow, CadenceRuleSpec, ClaimResult, FiringOutcome, LastFiring, NewFiring,
-    departs_a_train,
+    BASIS_COLUMNS, CONDUCTOR_VERBS, CadenceRuleRow, CadenceRuleSpec, ClaimResult, FiringOutcome,
+    LastFiring, NewFiring, OPEN_VERB_PREFIX, check_rule, claim_detail, departs_a_train,
 };

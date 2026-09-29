@@ -102,6 +102,22 @@
 # The read is SIGNED, as `automation:disk-floor-sweep`. See the
 # empty-page note above: an unnamed read would not fail, it would
 # silently retire the whole mechanism.
+#
+# THE MACHINE TOKEN RIDES IN A FILE, never in curl's argv, where every
+# local user reads it in ps (backlog 5f3ad356; infra/lib/secret-header.sh).
+# The file is made HERE, when this lib is sourced, because the disk sweep
+# calls `landed_train_shas` inside $(…) and the helper makes its
+# directory only in the script's own shell. So SOURCE THIS AFTER your own
+# `trap … EXIT`: the helper's cleanup is chained in front of the trap
+# that stands when it is made. A lib that cannot be read, or a file that
+# cannot be made, leaves LTS_MT_HDR empty, and a token that is set but
+# has no file is a read that cannot answer (prune less, never more).
+# shellcheck source=infra/lib/secret-header.sh
+if . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" 2>/dev/null; then
+    secret_header LTS_MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} || LTS_MT_HDR=""
+else
+    LTS_MT_HDR=""
+fi
 
 train_sha_sets() {
     local curl_cmd="$1" jobs_url="$2" lookback="$3" prefix="$4" closed_f="$5" open_f="$6"
@@ -130,9 +146,13 @@ train_sha_sets() {
     # --max-time, because the sweep is on a timer and a hung read must
     # not hold the disk remediation behind it. No retry: the next tick is
     # an hour away and the age window covers this pass either way.
+    if [ -n "${BOSS_MACHINE_TOKEN:-}" ] && [ -z "${LTS_MT_HDR:-}" ]; then
+        TRAIN_SETS_WHY="BOSS_MACHINE_TOKEN is set but its header file could not be made (infra/lib/secret-header.sh, beside this lib), and the token is never sent in curl's command line"
+        return 1
+    fi
     reply="$("$curl_cmd" -fsS --max-time 20 \
         -H "x-boss-user: $boss_user" \
-        ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+        ${LTS_MT_HDR:+-H "$LTS_MT_HDR"} \
         "$jobs_url/api/jobs?kind=pr-train&limit=$lookback&full=true" 2>&1)" || rc=$?
     if [ "$rc" -ne 0 ]; then
         TRAIN_SETS_WHY="reading $jobs_url failed (curl exit $rc): ${reply:-no reply}"

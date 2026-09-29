@@ -18,6 +18,7 @@ import { paintedOrThrew, readsSettled, recordPageRequests } from './_helpers';
 // the drift test at the bottom of this file exists to stop (CLAUDE.md
 // §9a — collapse, do not pin).
 import { DEFERRED, ROUTES } from './_routes';
+import { scaled } from '../../src/dev-load';
 
 
 // DEFERRED, group 1 — aggregation dashboards that read OBJECT-shaped
@@ -96,7 +97,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
           // SPA we only need the navigation to commit; the real readiness
           // signal is the AppShell painting, asserted next.
           await page.goto(r, { waitUntil: 'commit' });
-          await expect(page.locator('.app-shell')).toBeVisible({ timeout: 20_000 });
+          await expect(page.locator('.app-shell')).toBeVisible({ timeout: scaled(20_000) });
           shellOk = true;
         } catch (e) {
           if (attempt === 2) {
@@ -130,7 +131,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
   });
 
   test('Workflow authoring workspace renders a serde-omitted terminal (StepDagEditor)', async ({ page }) => {
-    test.setTimeout(60_000);
+    test.setTimeout(scaled(60_000));
     // _mockApi.seedSpec() now omits `terminal` on the non-terminal step —
     // the exact shape that crashed StepDagEditor before the fix.
     await installAuthoringMocks(page);

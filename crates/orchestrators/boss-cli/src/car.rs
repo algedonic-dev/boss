@@ -139,7 +139,7 @@ impl ItemAnswer {
     /// validates would otherwise record provenance pointing at nothing,
     /// and the next reader would have no way to tell that from a real
     /// link (never write an id you did not read).
-    async fn resolve_ids(self, http: &reqwest::Client) -> Result<Self> {
+    async fn resolve_ids(self, http: &boss_core::machine_token::Client) -> Result<Self> {
         if self.backlog_item.is_none() && self.partial_item.is_none() {
             return Ok(self);
         }
@@ -360,7 +360,7 @@ pub(crate) async fn open(
     // answer costs a line of output rather than a half-filled packet. The
     // refusal is the GATE'S OWN (see `ItemAnswer::check`).
     item.check(summary, excludes)?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
 
     // The actor FIRST, before anything is created: a write nobody names
     // is refused, and the refusal names both fixes (backlog 5083d6f5).
@@ -565,7 +565,7 @@ pub(crate) async fn waits_on(
     if !clear {
         fields.update()?;
     }
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let (found, branch) = crate::rerail::find_car(&http, given).await?;
     let id = found
         .get("id")

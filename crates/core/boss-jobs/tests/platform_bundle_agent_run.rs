@@ -289,6 +289,99 @@ fn the_unreported_bound_is_twice_the_reports_duration() {
     assert!(done.contains("No handback"), "{done}");
 }
 
+/// Read one authored dispatcher rule's first action args.
+fn rule_args(name: &str) -> toml::Value {
+    let path = boss_testing::repo_root()
+        .join("infra/dispatcher/rules")
+        .join(format!("{name}.toml"));
+    let rule: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name} is authored: {e}")),
+    )
+    .expect("the rule file parses");
+    rule["rule"][0]["do"][0]["args"].clone()
+}
+
+fn unquoted(v: &toml::Value) -> &str {
+    v.as_str().expect("an expression string").trim_matches('"')
+}
+
+/// A rule arg holding a JSON object: the expression is a string
+/// literal whose inner quotes are escaped, so it is read as one — the
+/// value the dispatcher's evaluator hands the handler — then parsed.
+fn json_arg(v: &toml::Value) -> serde_json::Value {
+    let text: String = serde_json::from_str(v.as_str().expect("an expression string"))
+        .expect("the arg is a quoted string literal");
+    serde_json::from_str(&text).expect("the arg's value is JSON")
+}
+
+/// A REPORT SENT BEFORE THE GREEN LANDS ON THE GREEN, AND IS NEVER AN
+/// ABSENCE (backlog b951c00a, 2026-09-28). Two rules read the same
+/// packet key from two sides: the landing rule completes `reported`
+/// from `metadata.report` as the step opens, and the clock spares a
+/// run holding it rather than writing `handback = absent` — which it
+/// wrote of run e737a54f with the builder's handback on the packet.
+/// The key lives twice, so it is held equal here (CLAUDE.md §9a); and
+/// what the landing writes has to be what the step declares, routed
+/// to `landed` and never to `unreported`.
+#[test]
+fn a_report_on_the_packet_lands_the_run_and_is_never_aged_out() {
+    let run = bundled("agent-run");
+    let landing = rule_args("agent-run-lands-a-report-sent-before-green");
+    let clock = rule_args("agent-run-ends-unreported-when-the-handback-never-arrives");
+    assert_eq!(unquoted(&landing["kind"]), "agent-run");
+    assert_eq!(unquoted(&landing["step"]), "reported");
+    assert_eq!(
+        unquoted(&landing["requires"]),
+        unquoted(&clock["unless_job_holds"]),
+        "the clock spares exactly the record the landing rule lands"
+    );
+
+    // Every field the landing fills is one `reported` declares, and the
+    // required `summary` is among them — from the packet's `report`.
+    let record = json_arg(&landing["record"]);
+    let record = record.as_object().expect("record is a JSON object");
+    let declared: Vec<&str> = step(&run, "reported")
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    for field in record.keys() {
+        assert!(
+            declared.contains(&field.as_str()),
+            "{field} is not declared: {declared:?}"
+        );
+    }
+    assert_eq!(record["summary"], json!(unquoted(&landing["requires"])));
+
+    // What it writes routes to `landed`, never to `unreported`.
+    let done = json_arg(&landing["done_metadata"]);
+    let handback = done["handback"]
+        .as_str()
+        .expect("the landing says which hand");
+    let admitted = step(&run, "reported")
+        .fields
+        .iter()
+        .find(|f| f.name == "handback")
+        .expect("reported declares `handback`")
+        .field_type
+        .clone();
+    assert!(
+        admitted.split('|').any(|v| v == handback),
+        "`{handback}` is a value `{admitted}` admits"
+    );
+    let mut md = done.clone();
+    md["summary"] = json!("the agent's own words");
+    let gated = json!({ "result": "gated" });
+    assert!(reaches_with_report(
+        &run,
+        "landed",
+        gated.clone(),
+        true,
+        md.clone()
+    ));
+    assert!(!reaches_with_report(&run, "unreported", gated, true, md));
+}
+
 /// A green gate alone does not land a run: the report must be on the
 /// record too. No rule writes the report, so a landing without one
 /// would be a summary nobody gave.

@@ -1,0 +1,37 @@
+# The daily recovery-sheet check is judged by its own record (design
+# 125d405d car 3; review of car 3, run ff8ffd04, finding 3). The chore
+# (infra/cluster/manifests/boss-recovery-sheet.yaml, kind
+# maintenance-recovery-sheet) records its verdict on its `run` step
+# through boss-chore.sh, and a failed half — the clone of main, or `boss
+# recovery reprint` itself — prints `RED recovery-sheet <half>: <its
+# last line>`. This rule fires when a check packet closes `failed` and
+# hands it to the same judge the playground crawl uses
+# (maintenance.chore.file_reds, file-backlog-items-on-playground-crawl-
+# red): ONE backlog-item keyed by the route `recovery-sheet`, deduped
+# while it is open, so a check that fails every day is one loud item
+# rather than a daily `failed` nobody reads — and a closed item files
+# again, because a recurrence after a fix is a new fact.
+[[rule]]
+name = "file-backlog-items-on-recovery-sheet-red"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-recovery-sheet -> backlog-item,
+which no single Workflow consequence can express — the chore's protocol
+records its own failure but cannot open another kind's packet. The
+cadence-silence sweep watches ARRIVAL only, and boss-chore.sh opens
+and closes the packet `failed` every day, so a check broken every day
+(Chromium gone from boss-ci, forge-read revoked, a policy refusal for
+automation:recovery-sheet) arrives on time and raises nothing: the
+paper then goes stale with no print job filed and no one told, which
+is the failure this chore exists to prevent (review of car 3, run
+ff8ffd04). No authority widened: the handler is the crawl's judge
+(maintenance.chore.file_reds), its only writes are standard
+backlog-items on the queue the kind's owner_role answers for and one
+`judged` note on the chore's own packet, and the dedup key is the one
+route the chore prints, so consecutive failures are ONE item until
+someone closes it.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "maintenance-recovery-sheet" AND outcome = "failed"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"125d405d\"", area = "\"recovery\"" }

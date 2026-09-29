@@ -13,7 +13,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct InventoryBillApprove {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     inventory_base: String,
 }
 

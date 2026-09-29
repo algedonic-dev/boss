@@ -158,7 +158,7 @@ pub async fn run(want: &str) -> Result<()> {
     // Shared with the other read verbs via gate::resolve_jobs_base.
     let base = crate::gate::resolve_jobs_base(None)?;
     let url = format!("{base}/api/jobs?kind=user-feedback&limit=200&full=true");
-    let client = reqwest::Client::new();
+    let client = crate::gate::machine_client()?;
     // Waits out a jobs-API roll (backlog 034002b3), like every verb.
     let user = crate::identity::header(&crate::identity::reader());
     let resp = crate::train::send_through_a_roll(&format!("GET {url}"), || {

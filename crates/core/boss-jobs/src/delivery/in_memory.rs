@@ -100,16 +100,21 @@ impl DeliveryPolicyRegistry for InMemoryDeliveryPolicy {
         _actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<DeliveryPolicySpec, DeliveryPolicyError> {
+        // The table's CHECKs, which this double enforced none of until
+        // the adapters-agree suite (backlog be459ab9).
+        super::types::check_policy(&spec.row).map_err(DeliveryPolicyError::BadRequest)?;
         let mut rows = self.rows.write().await;
-        if rows
-            .iter()
-            .any(|r| r.name() == spec.name() && r.version() == spec.version())
-        {
-            return Err(DeliveryPolicyError::Conflict(format!(
-                "row already exists: {}@{}",
-                spec.name(),
-                spec.version()
-            )));
+        // The floor, under the one lock every write takes — the Pg
+        // adapter's rule (backlog df793bd7).
+        let newest = crate::declared_version::newest(
+            rows.iter()
+                .filter(|r| r.name() == spec.name())
+                .map(|r| r.version()),
+        );
+        if spec.version() <= newest {
+            return Err(DeliveryPolicyError::Conflict(
+                crate::declared_version::not_above(spec.name(), spec.version(), newest),
+            ));
         }
         // Mirrors the Pg adapter: retire by name, then insert.
         for r in rows.iter_mut() {
@@ -244,6 +249,36 @@ mod tests {
                 Err(DeliveryPolicyError::Conflict(_))
             ),
             "a row already at (name, version) is a conflict, not an overwrite"
+        );
+    }
+
+    /// THE FLOOR (backlog df793bd7): a declared version below the newest
+    /// is refused and retires nothing. Before, only the exact (name,
+    /// version) was, so an older converge's `v2` retired a live `v3`
+    /// and the conductor ran under the older policy.
+    #[tokio::test]
+    async fn a_declared_version_below_the_newest_is_refused_and_retires_nothing() {
+        let repo = InMemoryDeliveryPolicy::new(vec![stored(1, "retired"), stored(3, "active")]);
+        let actor = boss_core::actor::ActorId::Automation("platform-workflow-seed".into());
+        let older = DeliveryPolicySpec {
+            status: WorkflowStatus::Active,
+            row: row(2),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let got = repo
+            .publish_declared(older, &actor, DateTime::<Utc>::UNIX_EPOCH)
+            .await;
+        assert!(
+            matches!(got, Err(DeliveryPolicyError::Conflict(_))),
+            "{got:?}"
+        );
+        let lineage = repo.live_versions("train-conductor").await.unwrap();
+        assert_eq!(
+            lineage
+                .iter()
+                .map(|r| (r.version(), r.status))
+                .collect::<Vec<_>>(),
+            vec![(1, WorkflowStatus::Retired), (3, WorkflowStatus::Active)]
         );
     }
 }

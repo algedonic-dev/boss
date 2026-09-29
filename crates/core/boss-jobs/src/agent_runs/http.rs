@@ -93,6 +93,15 @@ impl From<RunQuery> for RunFilter {
     }
 }
 
+/// The listing's page when the caller names none, and the most one
+/// listing answers. The Postgres adapter applied both unasked until
+/// 2026-09-28, to every read — the cost roll-up's included, which then
+/// summed a page (backlog be459ab9). They are the LISTING's bounds, so
+/// they live on the listing's route; the store answers what it is
+/// asked, as the port says.
+const LISTING_PAGE: i64 = 200;
+const LISTING_CEILING: i64 = 1000;
+
 /// What a POST answers with.
 #[derive(Debug, Serialize)]
 pub struct RecordResponse {
@@ -122,12 +131,34 @@ async fn list_runs(
     if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match state.log.list_runs(&q.into()).await {
-        Ok(runs) => {
-            Json(runs.into_iter().map(AgentRunView::from).collect::<Vec<_>>()).into_response()
-        }
-        Err(e) => err_response(e),
+    // The bounds the store used to apply, applied here and only here:
+    // the listing's page is unchanged, and the cost roll-up below, which
+    // shares the query string, no longer inherits it.
+    let filter = RunFilter {
+        limit: Some(q.limit.unwrap_or(LISTING_PAGE).clamp(1, LISTING_CEILING)),
+        ..q.into()
+    };
+    let (runs, total) = tokio::join!(state.log.list_runs(&filter), state.log.count_runs(&filter));
+    match (runs, total) {
+        (Ok(runs), Ok(total)) => Json(RunPage {
+            data: runs.into_iter().map(AgentRunView::from).collect(),
+            total,
+        })
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => err_response(e),
     }
+}
+
+/// What `GET /api/agent-runs` answers with: one page of runs and how
+/// many the filter matches (backlog 11a0998a). It answered the bare
+/// array until 2026-09-28, so a reader holding a full page could not
+/// tell it from the whole table — the report's slice refused any page
+/// of 1000 outright. `{data, total}` is the envelope the other lists on
+/// this API answer, and every reader of this one already took `data`.
+#[derive(Debug, Serialize)]
+pub struct RunPage {
+    pub data: Vec<AgentRunView>,
+    pub total: u64,
 }
 
 async fn record_run(
@@ -504,7 +535,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         let rows: serde_json::Value = serde_json::from_str(&body).expect("the list is JSON");
-        let row = &rows[0];
+        let row = &rows["data"][0];
         assert_eq!(row["actor_id"], "claude:opus-5[1m]");
         assert_eq!(
             row["branch"],
@@ -530,6 +561,69 @@ mod tests {
         // blended from measured only by re-deriving the server's rule
         // from `input_tokens` and `usd_micros` itself.
         assert_eq!(row["pricing_basis"], "blended", "body: {body}");
+    }
+
+    /// A PAGE SAYS WHAT IT IS A PAGE OF (backlog 11a0998a). The listing
+    /// answered a bare array, so a reader holding 1000 rows could not
+    /// tell the whole table from its newest page — the report's slice
+    /// had to refuse any full page outright. It answers `{data, total}`
+    /// now, the envelope every other list on this API answers: `total`
+    /// is every run the filter matches, whatever `limit` kept.
+    #[tokio::test]
+    async fn the_list_answers_its_page_and_the_total_the_filter_matches() {
+        let log =
+            InMemoryAgentRuns::new(card()).with_registered_agent("agent-claude", "opus-5[1m]");
+        let later = NewAgentRun {
+            run_id: "2026-09-10-a-later-run".into(),
+            finished_at: a_run().finished_at + Duration::minutes(5),
+            ..a_run()
+        };
+        for run in [a_run(), later] {
+            log.record_run(&run, &ActorId::Automation("platform".into()))
+                .await
+                .expect("the fixture run records");
+        }
+        let app = router(AgentRunsApiState { log: Arc::new(log) });
+        let read = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::get(path)
+                            .header(
+                                "x-boss-user",
+                                header("platform-admin", AccessTier::Operator),
+                            )
+                            .body(Body::empty())
+                            .expect("request builds"),
+                    )
+                    .await
+                    .expect("the router answers");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body collects")
+                    .to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&bytes).expect("the list is JSON")
+            }
+        };
+
+        let page = read("/api/agent-runs?limit=1").await;
+        assert_eq!(page["total"], 2, "{page}");
+        let rows = page["data"].as_array().expect("the rows ride `data`");
+        assert_eq!(rows.len(), 1, "{page}");
+        assert_eq!(rows[0]["run_id"], "2026-09-10-a-later-run", "newest first");
+
+        let whole = read("/api/agent-runs").await;
+        assert_eq!(whole["total"], 2, "{whole}");
+        assert_eq!(whole["data"].as_array().map(Vec::len), Some(2));
+
+        // The total is the FILTER's, not the table's.
+        let narrow = read("/api/agent-runs?branch=no-such-branch").await;
+        assert_eq!(narrow["total"], 0, "{narrow}");
+        assert_eq!(narrow["data"], serde_json::json!([]));
     }
 
     /// The POST's answer is a single run too, and a caller reading it
@@ -800,8 +894,7 @@ mod tests {
         let user = Some(header("platform-admin", AccessTier::Operator));
         let (_, mine) = get("/api/agent-runs?actor_id=claude:opus-5[1m]", user.clone()).await;
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&mine)
-                .expect("JSON")
+            serde_json::from_str::<serde_json::Value>(&mine).expect("JSON")["data"]
                 .as_array()
                 .map(Vec::len),
             Some(1),
@@ -809,8 +902,7 @@ mod tests {
         );
         let (_, theirs) = get("/api/agent-runs?actor_id=claude:haiku-4-5", user).await;
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&theirs)
-                .expect("JSON")
+            serde_json::from_str::<serde_json::Value>(&theirs).expect("JSON")["data"]
                 .as_array()
                 .map(Vec::len),
             Some(0),
@@ -899,6 +991,70 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "a window that holds nothing"
+        );
+    }
+
+    /// The listing pages; the roll-up sums everything its filter keeps
+    /// (backlog be459ab9). Until 2026-09-28 the Postgres adapter chose
+    /// the page — 200 when no limit was asked for — and so capped the
+    /// roll-up too: live, `/api/agent-runs/cost` answered `runs: 200`
+    /// while `?limit=1000` listed 1000. The page is this door's choice
+    /// now and the store answers what it is asked, so the two routes
+    /// part here, on a store one run past the page.
+    #[tokio::test]
+    async fn the_listing_pages_and_the_cost_roll_up_sums_every_run() {
+        let log = InMemoryAgentRuns::new(card());
+        let past_the_page = LISTING_PAGE + 1;
+        for i in 0..past_the_page {
+            let run = NewAgentRun {
+                run_id: format!("run-{i:03}"),
+                finished_at: a_run().finished_at + Duration::seconds(i),
+                ..a_run()
+            };
+            log.record_run(&run, &ActorId::Automation("platform".into()))
+                .await
+                .expect("records");
+        }
+        let app = router(AgentRunsApiState { log: Arc::new(log) });
+        let operator = header("platform-admin", AccessTier::Operator);
+        let read = |path: &str| {
+            Request::get(path)
+                .header("x-boss-user", operator.clone())
+                .body(Body::empty())
+                .expect("request builds")
+        };
+        let body = |resp: Response| async move {
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON")
+        };
+
+        let listed = body(app.clone().oneshot(read("/api/agent-runs")).await.unwrap()).await;
+        assert_eq!(
+            listed["data"].as_array().map(Vec::len),
+            Some(usize::try_from(LISTING_PAGE).unwrap()),
+            "the listing's page"
+        );
+        assert_eq!(
+            listed["total"], past_the_page,
+            "and the page says it is one (backlog 11a0998a)"
+        );
+        let listed = body(
+            app.clone()
+                .oneshot(read("/api/agent-runs?limit=5000"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            listed["data"].as_array().map(Vec::len),
+            Some(usize::try_from(past_the_page).unwrap()),
+            "a page asked for under the ceiling"
+        );
+
+        let cost = body(app.oneshot(read("/api/agent-runs/cost")).await.unwrap()).await;
+        assert_eq!(
+            cost["summary"]["runs"], past_the_page,
+            "the roll-up counts every run, not a page of them"
         );
     }
 }

@@ -203,6 +203,21 @@ pub const GATES_LINE_LONG: Band = band(
 /// A run active past the gate Job's own deadline
 /// (`yard::GATE_MAX_ACTIVE_HOURS`): a corpse holding a bay.
 pub const GATES_CORPSE: Band = band("gates-corpse", "gates", Troubled, "the gate deadline", 0);
+/// How many of the measured median RUNNING times a gate may run before
+/// its bay is the troubled one (`yard::ActiveGate::troubled`).
+pub const RUN_PAST_MEDIAN_TIMES: i64 = 2;
+/// A run RUNNING longer than [`RUN_PAST_MEDIAN_TIMES`] of the median
+/// gate running time — the bay worth a look (backlog 4d088a7e). Its age
+/// is read from its Job (`yard::LAUNCHED_AT`), never from its filing:
+/// on 2026-09-28 a gate queued 46 minutes and running 14 read as "going
+/// for an hour", and the region could flag only the oldest WAIT.
+pub const GATES_RUN_LONG: Band = band(
+    "gates-run-long",
+    "gates",
+    Troubled,
+    "2× the median gate running time",
+    0,
+);
 
 // --- a train, wherever it stands --------------------------------------
 //
@@ -454,7 +469,7 @@ pub const MOVES_UNDECLARED: Band = band(
 /// EVERY BAND, once. A region names a band by referring to its constant,
 /// so an undeclared band cannot be named at all; this list is what the
 /// uniqueness and coverage pins read.
-pub const BANDS: [Band; 29] = [
+pub const BANDS: [Band; 30] = [
     UNREAD,
     MACHINE_FAILED,
     FULL,
@@ -463,6 +478,7 @@ pub const BANDS: [Band; 29] = [
     DOCK_EDGE_NEVER_CLEARS,
     GATES_LINE_LONG,
     GATES_CORPSE,
+    GATES_RUN_LONG,
     TRACK_BLOCKED,
     TRACK_GATE_FALLBACK,
     TRACK_GATE_WAITING,
@@ -830,6 +846,7 @@ mod tests {
                 format!("{STILL_AFTER_GAPS}× the out-route's mean gap"),
             ),
             (GATES_LINE_LONG, format!("{LINE_PAST_SERVICE_TIMES}×")),
+            (GATES_RUN_LONG, format!("{RUN_PAST_MEDIAN_TIMES}×")),
         ] {
             assert!(
                 b.band.contains(&says),

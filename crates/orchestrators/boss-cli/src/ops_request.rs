@@ -267,6 +267,13 @@ pub(crate) struct Answer {
     pub exit_code: Option<String>,
     pub output: String,
     pub runner_host: String,
+    /// The runner's judgement of the verb's declared effect on an exit 0
+    /// (backlog fdbb447e part 1): the read-back line it matched…
+    pub effect: Option<String>,
+    /// …or why the run did not show it…
+    pub effect_unproven: Option<String>,
+    /// …or the verb file's own reason it declares no read-back yet.
+    pub effect_unread: Option<String>,
 }
 
 /// Read the `execute` step's record off a packet, or `None` while the
@@ -298,6 +305,9 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            effect: None,
+            effect_unproven: None,
+            effect_unread: None,
         })
     };
     // Only a COMPLETED execute answers (the review of car 24eb9471). The
@@ -314,6 +324,7 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
         return closed_refused();
     };
     let disposition = disposition.to_string();
+    let text = |key: &str| md.get(key).and_then(Value::as_str).map(str::to_string);
     Some(Answer {
         disposition,
         exit_code: md
@@ -330,19 +341,40 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        effect: text("effect"),
+        effect_unproven: text("effect_unproven"),
+        effect_unread: text("effect_unread"),
     })
 }
 
 /// The one-line verdict `--wait` ends with, and whether it is a success.
+///
+/// An exit 0 is read WITH the effect the runner recorded beside it
+/// (backlog fdbb447e part 1): one that did not show its declared effect
+/// fails, loudly, naming what was looked for — the verb has already run,
+/// so this refuses nothing; it declines to call the run a success. A
+/// verb that declares no read-back yet (`effect_unread`) still succeeds
+/// and says so in capitals, so exit 0 is never mistaken for more than it
+/// proves.
 pub(crate) fn verdict_line(id8: &str, v: &Validated, a: &Answer) -> (String, bool) {
     match (a.disposition.as_str(), a.exit_code.as_deref()) {
-        ("answered", Some("0")) => (
-            format!(
+        ("answered", Some("0")) => {
+            let head = format!(
                 "boss ops: answered — {} on {} (packet {id8}, exit 0)",
                 v.verb, a.runner_host
-            ),
-            true,
-        ),
+            );
+            match (&a.effect, &a.effect_unproven, &a.effect_unread) {
+                (_, Some(why), _) => (format!("{head}, but its EFFECT NOT SHOWN: {why}"), false),
+                (Some(line), _, _) => (format!("{head}; effect shown: {line}"), true),
+                (_, _, Some(why)) => (
+                    format!(
+                        "{head}; EFFECT UNREAD — this verb prints no read-back of what it changed, so exit 0 is all this run proves: {why}"
+                    ),
+                    true,
+                ),
+                _ => (head, true),
+            }
+        }
         ("answered", code) => (
             format!(
                 "boss ops: answered — {} on {} (packet {id8}, exit {})",
@@ -391,7 +423,7 @@ pub async fn run(
         );
         return Ok(());
     }
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let owner = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let body = crate::job::envelope(
         "ops-request",
@@ -821,6 +853,69 @@ mod tests {
                 &json!({"steps": [{"spec_slug": "execute", "status": "ready", "metadata": {}}]})
             )
             .is_none()
+        );
+    }
+
+    /// AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1). The runner
+    /// judges a verb's declared `effect` on the run's output and records
+    /// the verdict on the step; `--wait` reads it rather than re-deriving
+    /// it. An exit 0 that did not show its declared effect is NOT a
+    /// success — the verb ran, and nothing says it changed what it exists
+    /// to change. A verb that declares no read-back yet still succeeds on
+    /// exit 0, and says out loud that exit 0 is all the run proves.
+    #[test]
+    fn an_exit_0_is_judged_with_the_effect_the_runner_recorded() {
+        let v = validate(&fixture(), "forge", "uptime", &[]).unwrap();
+        let answered = |extra: Value| {
+            let mut md = json!({"disposition": "answered", "exit_code": "0",
+                                "output": "acts: deleted 3\n", "runner_host": "forge"});
+            md.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            answer_of(&json!({"steps": [{"spec_slug": "execute", "status": "completed", "metadata": md}]}))
+                .unwrap()
+        };
+
+        let shown = answered(json!({"effect": "acts: deleted 3, re-listed 7 left"}));
+        let (line, ok) = verdict_line("abcd1234", &v, &shown);
+        assert!(ok, "{line}");
+        assert!(
+            line.contains("exit 0")
+                && line.contains("effect shown: acts: deleted 3, re-listed 7 left"),
+            "{line}"
+        );
+
+        let unproven = answered(
+            json!({"effect_unproven": "exit 0, and no line of the output matches the effect this verb declares (^acts: deleted)"}),
+        );
+        let (line, ok) = verdict_line("abcd1234", &v, &unproven);
+        assert!(
+            !ok,
+            "an exit 0 whose effect was not shown is not a success: {line}"
+        );
+        assert!(
+            line.contains("EFFECT NOT SHOWN") && line.contains("^acts: deleted"),
+            "the verdict names what it looked for: {line}"
+        );
+
+        let unread = answered(json!({"effect_unread": "prints no re-list after it deletes"}));
+        let (line, ok) = verdict_line("abcd1234", &v, &unread);
+        assert!(
+            ok,
+            "a verb admitted without a read-back is not refused: {line}"
+        );
+        assert!(
+            line.contains("EFFECT UNREAD") && line.contains("prints no re-list after it deletes"),
+            "{line}"
+        );
+
+        // A read-only verb's answer carries none of the three, and reads
+        // as it always did.
+        let plain = answered(json!({}));
+        let (line, ok) = verdict_line("abcd1234", &v, &plain);
+        assert!(
+            ok && !line.contains("EFFECT") && !line.contains("effect"),
+            "{line}"
         );
     }
 

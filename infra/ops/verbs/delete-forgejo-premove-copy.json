@@ -8,5 +8,6 @@
   "params": [
     { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
   ],
-  "timeout": 3600
+  "timeout": 3600,
+  "effect": "^move-forgejo-data: OK — .+ is deleted; Forgejo serves .+ through .+, and that copy is now the only one$"
 }

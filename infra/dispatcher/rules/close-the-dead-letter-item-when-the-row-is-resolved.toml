@@ -1,0 +1,38 @@
+# An operator resolved a dead letter as audit-only, and the item filed
+# for it closes on that decision (backlog ac0a0abd, the follow-up to
+# e22b692e).
+#
+# `boss events redeliver <outbox id> --resolve --reason-file PATH`
+# stamps the row resolved and records `events.outbox.resolved` with the
+# operator's reason: the fact stays in audit_log and off the bus BY
+# DECISION, and a resolution is final. Until this rule nothing read that
+# fact back onto the backlog-item `open-a-packet-when-an-event-is-dead-
+# lettered` filed for the row, so the item still asked for a decision
+# the record already held.
+#
+# `jobs.retract_matching` finds every OPEN backlog-item whose
+# `outbox_id` is the row's, writes the act onto it as `answered_by`
+# (act, actor, the event, and the `resolution` verbatim), and withdraws
+# it at the step it is waiting on — the same close, and the same
+# reasoning, as its sibling
+# `close-the-dead-letter-item-when-the-row-is-redelivered`. `stale` is
+# the right terminal here too: the item claimed an OPEN dead letter
+# awaiting a decision, and the decision is on the record.
+[[rule]]
+name = "close-the-dead-letter-item-when-the-row-is-resolved"
+why = """
+EXTERNAL INGRESS, and a CROSS-PROTOCOL REACTOR. The cause is an
+operator's decision recorded on the event outbox (boss-events), not a
+step of any packet: no Workflow `on` consequence can see an
+events-service fact, and the backlog-item protocol cannot know which
+outbox row was resolved. Measured 2026-09-28 on origin/main (backlog
+ac0a0abd): the resolve door recorded `events.outbox.resolved` with the
+reason and no rule read it, so the item filed for that row stayed open
+at triage asking for a decision already made. No authority widened: the
+only writes are to the backlog-item the dead-letter rule filed, through
+that item's own stale terminal, stamped with the rule.
+"""
+on_event = "events.outbox.resolved"
+[[rule.do]]
+handler = "jobs.retract_matching"
+args = { kind = "\"backlog-item\"", match_key = "\"outbox_id\"", value = "outbox_id", act = "\"resolved\"", "note.resolution" = "resolution", because = "\"An operator resolved the dead letter (boss events redeliver --resolve): the fact stays in audit_log and off the bus by decision, with the reason under answered_by.resolution, and a resolution is final. The open dead letter this item was filed for is answered on the record.\"" }

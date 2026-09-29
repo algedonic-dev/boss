@@ -1,0 +1,17 @@
+{
+  "about": "MUTATING — deletes NAMED refs from a GitHub repository, and nothing else (infra/forge/github-act.sh delete-refs). Design 76155676 decision 4 (David 2026-09-27: GitHub acts are bounded verbs, plan then passkey-approved write, each proving by reading GitHub back; backlog 6a8ff89f); first exercise, the stale branches on the public fork. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape: it declares requires_approval with plan-a-github-ref-delete as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-lists the repository and acts only while the bytes — every ref's sha among them — hash alike, so a ref that moved since the approval voids it and a second run of an applied plan is a refusal. Its bound is the script's: each ref is named in full (heads/<branch> or tags/<tag>, no pattern, at most 200); the act is ONE atomic git push of deletes, each leased (--force-with-lease=<ref>:<sha>) to the sha the signed plan names, so a ref moved in the instant before the push refuses the whole push; the default branch is always refused, and heads/main or heads/master only with a reason (a slug); a named ref already absent is left. It pushes nothing but deletes. It authenticates as the GitHub App's INSTALLATION on <owner> (username x-access-token), from the slot /etc/boss-publish/github-app/<owner>.token the forge converge renders from the broker's installation token — per-owner data, never a constant — through a credential helper that answers only https://github.com; a slot that is absent, loose, not root's, empty or expired is a refusal before GitHub is called, and the token is never printed. Proof: git ls-remote lists none of the deleted refs — one still listed is exit 1.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-github-ref-delete",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/github-act.sh", "delete-refs", "{1}", "{2}", "{3}", "{4}", "{5}"],
+  "params": [
+    { "name": "owner", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+    { "name": "repo", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$" },
+    { "name": "refs", "pattern": "^(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._/-]*(,(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._/-]*)*$" },
+    { "name": "reason", "pattern": "^(none|[a-z0-9][a-z0-9-]{7,79})$" },
+    { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
+  ],
+  "timeout": 120,
+  "effect": "^github-act: proven — ([0-9]+ ref[(]s[)] deleted from .+, and git ls-remote lists none of them|every named ref is absent from .+; nothing was pushed)$"
+}

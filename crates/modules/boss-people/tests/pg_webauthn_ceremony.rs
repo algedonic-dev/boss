@@ -227,6 +227,244 @@ async fn an_ordinary_session_is_refused_at_the_storage_door() {
         .assert_status(StatusCode::FORBIDDEN);
 }
 
+// Backlog e199c02d (2026-09-28). The storage door used to admit any
+// caller whose ROLE was platform-admin — and the gateway's
+// /api/people/{*rest} proxy forwards the session's own role, so the
+// owner's user-tier browser cookie, and every agent (which signs as
+// platform-admin, 91971374), could store, remove or rekey a passkey and
+// mint or spend challenges around the ceremony. The caller is judged by
+// ID now, the way the promote door judges it: only the gateway's own
+// actor passes. Each of the six handlers is refused for a platform-admin
+// that is not the gateway, and the refusal writes nothing.
+#[tokio::test]
+async fn a_platform_admin_that_is_not_the_gateway_is_refused_on_every_handler() {
+    const GATEWAY: &str = boss_core::actor::GATEWAY_ACTOR_ID;
+    const BACKUP_ID: &str = "YmFja3VwLWNyZWRlbnRpYWwtaWQ";
+    let (db, router) = app().await;
+    seed_employee(&db, "emp-wa-8").await;
+    for id in [CRED_ID, BACKUP_ID] {
+        TestRequest::post("/api/people/emp-wa-8/webauthn-credentials")
+            .json(&json!({"credential_id": id, "public_key": PUB_KEY}))
+            .as_user(GATEWAY, "platform-admin")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+    TestRequest::post("/api/people/presence-challenges")
+        .json(&json!({"id": "ch-8", "employee_id": "emp-wa-8",
+                      "challenge": PUB_KEY, "flow": "presence"}))
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    const NEW_ID: &str = "cGxhbnRlZC1jcmVkZW50aWFsLWlk";
+    let attempts: [(TestRequest, &str); 6] = [
+        (
+            TestRequest::get("/api/people/emp-wa-8/webauthn-credentials"),
+            "list",
+        ),
+        (
+            TestRequest::post("/api/people/emp-wa-8/webauthn-credentials")
+                .json(&json!({"credential_id": NEW_ID, "public_key": PUB_KEY})),
+            "register",
+        ),
+        (
+            TestRequest::delete(format!(
+                "/api/people/emp-wa-8/webauthn-credentials/{CRED_ID}"
+            )),
+            "remove",
+        ),
+        (
+            TestRequest::post("/api/people/webauthn-credentials/used")
+                .json(&json!({"credential_id": CRED_ID, "sign_count": 99})),
+            "used",
+        ),
+        (
+            TestRequest::post("/api/people/presence-challenges").json(&json!({
+                "id": "ch-planted", "employee_id": "emp-wa-8",
+                "challenge": PUB_KEY, "flow": "presence"})),
+            "mint",
+        ),
+        (
+            TestRequest::post("/api/people/presence-challenges/ch-8/consume"),
+            "consume",
+        ),
+    ];
+    for (req, handler) in attempts {
+        // The owner's own id, carrying the role his cookie carries.
+        let resp = req
+            .as_user("emp-wa-8", "platform-admin")
+            .send(&router)
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        let text = resp.body_text();
+        assert!(
+            text.contains("only the gateway") && text.contains("whatever its role"),
+            "{handler}: the refusal names the rule in the promote door's terms: {text}"
+        );
+    }
+
+    // Nothing moved: both keys stand, the use was not recorded, no
+    // challenge was planted, and the live one is still unspent.
+    let creds: Vec<(Vec<u8>, i32)> = sqlx::query_as(
+        "SELECT credential_id, sign_count FROM webauthn_credentials
+          WHERE employee_id = 'emp-wa-8' ORDER BY credential_id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(creds.len(), 2, "no key was removed or planted: {creds:?}");
+    assert!(
+        creds.iter().all(|(_, n)| *n == 0),
+        "no use was recorded: {creds:?}"
+    );
+    let challenges: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT id, used_at IS NOT NULL FROM webauthn_challenges
+          WHERE employee_id = 'emp-wa-8' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        challenges,
+        vec![("ch-8".to_string(), false)],
+        "no challenge was minted or spent"
+    );
+
+    // The same six calls, signed as the gateway, pass.
+    let resp = TestRequest::get("/api/people/emp-wa-8/webauthn-credentials")
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+    TestRequest::post("/api/people/emp-wa-8/webauthn-credentials")
+        .json(&json!({"credential_id": NEW_ID, "public_key": PUB_KEY}))
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::CREATED);
+    TestRequest::delete(format!(
+        "/api/people/emp-wa-8/webauthn-credentials/{CRED_ID}"
+    ))
+    .as_user(GATEWAY, "platform-admin")
+    .send(&router)
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+    TestRequest::post("/api/people/webauthn-credentials/used")
+        .json(&json!({"credential_id": BACKUP_ID, "sign_count": 3}))
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    TestRequest::post("/api/people/presence-challenges")
+        .json(&json!({"id": "ch-8b", "employee_id": "emp-wa-8",
+                      "challenge": PUB_KEY, "flow": "presence"}))
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::CREATED);
+    TestRequest::post("/api/people/presence-challenges/ch-8/consume")
+        .as_user(GATEWAY, "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::OK);
+}
+
+// Backlog 1d9970d1 (2026-09-28). The POST used to take `access_tier`
+// from its body, and its only gate is the platform-admin ROLE — which the
+// owner's user-tier browser session carries through the gateway's
+// /api/people proxy. So that cookie could store an OPERATOR-tier key of
+// its own making and then elevate with it: H1 (review of car 0bde9b99)
+// reached one layer below the ceremony. The body no longer names a tier.
+// A body that tries is REFUSED, not quietly ignored, so a caller that
+// still believes it can choose learns otherwise loudly — and nothing is
+// stored.
+#[tokio::test]
+async fn a_body_cannot_choose_the_tier_a_credential_is_stored_at() {
+    let (db, router) = app().await;
+    seed_employee(&db, "emp-wa-7").await;
+
+    for tier in ["operator", "user"] {
+        TestRequest::post("/api/people/emp-wa-7/webauthn-credentials")
+            .json(&json!({
+                "credential_id": CRED_ID,
+                "public_key": PUB_KEY,
+                "access_tier": tier,
+            }))
+            .as_user("automation:gateway", "platform-admin")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let resp = TestRequest::get("/api/people/emp-wa-7/webauthn-credentials")
+        .as_user("automation:gateway", "platform-admin")
+        .send(&router)
+        .await;
+    let creds: serde_json::Value = resp.assert_json();
+    assert_eq!(
+        creds.as_array().map(Vec::len),
+        Some(0),
+        "a refused body stores nothing: {creds}"
+    );
+
+    // The ordinary enrolment — what the gateway's register_finish sends —
+    // still stores, and what it stores is user tier.
+    TestRequest::post("/api/people/emp-wa-7/webauthn-credentials")
+        .json(&json!({"credential_id": CRED_ID, "public_key": PUB_KEY, "label": "macbook"}))
+        .as_user("automation:gateway", "platform-admin")
+        .send(&router)
+        .await
+        .assert_status(StatusCode::CREATED);
+    let resp = TestRequest::get("/api/people/emp-wa-7/webauthn-credentials")
+        .as_user("automation:gateway", "platform-admin")
+        .send(&router)
+        .await;
+    let creds: serde_json::Value = resp.assert_json();
+    assert_eq!(creds.as_array().map(Vec::len), Some(1));
+    assert_eq!(creds[0]["access_tier"], "user");
+}
+
+// The pin behind the test above: no request body in the credential
+// storage module can carry the tier at all. The only writer of an
+// operator-tier row is to be a separate, recorded promotion act (design
+// answering 2a228d0c), never a field on a body. A body struct that grows
+// the field, or a handler that takes an untyped JSON body (which would
+// carry any key it liked), fails here and names itself.
+#[test]
+fn no_request_body_in_the_credential_store_names_the_tier() {
+    let src = include_str!("../src/webauthn.rs");
+    let bodies: Vec<&str> = src
+        .match_indices("#[derive(Deserialize")
+        .map(|(at, _)| {
+            let rest = &src[at..];
+            let end = rest.find("\n}\n").map_or(rest.len(), |e| e + 3);
+            &rest[..end]
+        })
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("struct RegisterCredentialBody")),
+        "the pin must see the credential POST's body struct; it found: {bodies:#?}"
+    );
+    for body in &bodies {
+        assert!(
+            !body.contains("access_tier"),
+            "a request body in webauthn.rs carries access_tier — a caller could \
+             choose the tier its credential is stored at (backlog 1d9970d1):\n{body}"
+        );
+    }
+    for untyped in ["Json<serde_json::Value>", "Json<Value>"] {
+        assert!(
+            !src.contains(untyped),
+            "webauthn.rs takes an untyped `{untyped}` body, which can carry \
+             access_tier past the struct pin above"
+        );
+    }
+}
+
 // David, feedback 16414d99 (2026-09-10): "Let me manage the passkeys on
 // my account… Important so users can add a backup key, but don't let
 // them delete all their keys." Removal exists so a lost or retired
@@ -288,4 +526,70 @@ async fn a_passkey_can_be_removed_but_never_the_last_one() {
     .send(&router)
     .await
     .assert_status(StatusCode::NOT_FOUND);
+}
+
+// Design 1c4e42e1 (backlog 47aed706): the coverage read needs who holds
+// a key and at which tier — a real person is an active employee with a
+// bound passkey, and the operator tier is a platform-admin with an
+// operator-tier one. The tier counts answer exactly that and nothing
+// else, to a caller at the operator or auditor tier: machinery, and the
+// owner's own ELEVATED session (which the gateway signs at operator) —
+// never a user-tier session, and a header claim until 2710c8fc.
+#[tokio::test]
+async fn the_tier_counts_answer_machinery_with_counts_and_no_key_material() {
+    const BACKUP_ID: &str = "YmFja3VwLWNyZWRlbnRpYWwtaWQ";
+    let (db, router) = app().await;
+    seed_employee(&db, "emp-wa-9").await;
+    seed_employee(&db, "emp-wa-10").await;
+    for id in [CRED_ID, BACKUP_ID] {
+        TestRequest::post("/api/people/emp-wa-9/webauthn-credentials")
+            .json(&json!({"credential_id": id, "public_key": PUB_KEY}))
+            .as_user(boss_core::actor::GATEWAY_ACTOR_ID, "platform-admin")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+    // Asked by the contract crate's spelling of the path, which is what
+    // the policy service reads: a router literal that drifted from it
+    // answers 404 here. (An operator-tier row is written only by the
+    // promotion's own transaction, and only that module spells its mark;
+    // the tier split is pinned on the reading side, boss-policy
+    // `keys_from_row`.)
+    use boss_policy_client::coverage::TIER_COUNTS_PATH;
+    let machinery =
+        r#"{"id":"automation:policy-coverage","role":"platform-admin","access_tier":"operator"}"#;
+    let resp = TestRequest::get(TIER_COUNTS_PATH)
+        .header("x-boss-user", machinery)
+        .send(&router)
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: serde_json::Value = resp.assert_json();
+    assert_eq!(
+        body["total"], 1,
+        "the keyless employee is not listed: {body}"
+    );
+    assert_eq!(
+        body["data"][0],
+        json!({"employee_id": "emp-wa-9", "user": 2, "operator": 0}),
+        "counts only — no credential id, key, label or time: {body}"
+    );
+    let auditor = r#"{"id":"automation:audit","role":"audit-readonly","access_tier":"auditor"}"#;
+    TestRequest::get(TIER_COUNTS_PATH)
+        .header("x-boss-user", auditor)
+        .send(&router)
+        .await
+        .assert_status(StatusCode::OK);
+
+    // A user-tier session is refused, whatever its role — the owner's
+    // unelevated cookie carries platform-admin at the user tier.
+    for who in [
+        ("emp-wa-9", "platform-admin"),
+        (boss_core::actor::GATEWAY_ACTOR_ID, "platform-admin"),
+    ] {
+        TestRequest::get(TIER_COUNTS_PATH)
+            .as_user(who.0, who.1)
+            .send(&router)
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
 }

@@ -48,6 +48,11 @@ fn build_router(db: &TestDb) -> Router {
     })
 }
 
+/// The caller every write here is signed as: a ledger write names its
+/// caller, and an unsigned one is refused 401 (backlog 34f0a954). The
+/// gate is not this file's subject (tests/a_ledger_write_asks_policy.rs).
+const SIGNER: &str = r#"{"id":"emp-controller","role":"controller","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"finance"}"#;
+
 async fn post(db: &TestDb, path: &str, body: Value) -> (StatusCode, String) {
     let resp = build_router(db)
         .oneshot(
@@ -55,6 +60,7 @@ async fn post(db: &TestDb, path: &str, body: Value) -> (StatusCode, String) {
                 .method("POST")
                 .uri(path)
                 .header("content-type", "application/json")
+                .header("x-boss-user", SIGNER)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )

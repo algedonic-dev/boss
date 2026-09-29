@@ -120,7 +120,7 @@ pub(crate) fn lines(reader: &Result<Reader, String>) -> Vec<String> {
 /// fails becomes the named reason, never an early return that drops the
 /// section.
 pub(crate) async fn read(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     owner: &dyn PlatformOwner,
     people_base: &str,
     locations_base: &str,
@@ -146,7 +146,7 @@ pub(crate) async fn read(
 /// [`read`] against the service ports the jobs base implies — the same
 /// host, each service on its `boss_ports` prod port (the rule
 /// `owner::people_base_from` already applies for filing).
-pub(crate) async fn section(http: &reqwest::Client) -> Vec<String> {
+pub(crate) async fn section(http: &boss_core::machine_token::Client) -> Vec<String> {
     let base = match crate::gate::resolve_jobs_base(None) {
         Ok(b) => b,
         Err(e) => return lines(&Err(e.to_string())),
@@ -159,7 +159,11 @@ pub(crate) async fn section(http: &reqwest::Client) -> Vec<String> {
 }
 
 /// A GET through the signed door, as a named reason on failure.
-async fn get(http: &reqwest::Client, base: &str, path: &str) -> Result<Value, String> {
+async fn get(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    path: &str,
+) -> Result<Value, String> {
     match crate::gate::api_at(http, base, reqwest::Method::GET, path, None).await {
         Ok(Some(v)) => Ok(v),
         Ok(None) => Err(format!("GET {path} answered no JSON")),
@@ -302,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn the_read_follows_owner_to_employee_to_location() {
         let base = stub().await;
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
         let r = read(&http, &Fixed("emp-ada".into()), &base, &base)
             .await
             .unwrap();

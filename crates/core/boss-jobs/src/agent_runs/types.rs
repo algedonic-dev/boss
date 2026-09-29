@@ -689,7 +689,10 @@ pub struct RunFilter {
     #[serde(default)]
     pub since: Option<DateTime<Utc>>,
     /// Row ceiling. A limit is not a filter — the roll-up below
-    /// reports `runs` so a truncated page is visible as one.
+    /// reports `runs` so a truncated page is visible as one. `None` is
+    /// no ceiling and zero or below keeps nothing, on BOTH adapters
+    /// (`the_adapters_agree_on_the_agent_run_log_pg.rs`, backlog
+    /// be459ab9): a listing's page size is its handler's to choose.
     #[serde(default)]
     pub limit: Option<i64>,
 }

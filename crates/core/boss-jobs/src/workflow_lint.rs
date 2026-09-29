@@ -54,7 +54,9 @@
 //!   an empty string, a principal whose door is not mounted yet — would
 //!   lock the key against every caller and wedge a required one's
 //!   completion. Refused naming the field and the resolvable principals
-//!   (backlog 6c9183de, review S4).
+//!   (backlog 6c9183de, review S4). And a step never defaults a key it
+//!   reserves: the default is the protocol writing it, at admission and
+//!   into a step a re-pin inserts (review S1).
 //!
 //! Runs at author time (`POST /api/workflows/_validate`), publish
 //! time (every registry path that can set a row ACTIVE — see
@@ -1163,6 +1165,22 @@ fn check_writers_are_resolvable(
         let Some(writer) = field.writer.as_deref() else {
             continue;
         };
+        // THE PROTOCOL IS NOT THE DECLARED WRITER (backlog 6c9183de,
+        // review S1): a default projects into the key at admission and
+        // into a step a re-pin inserts, so the row itself would write a
+        // key it reserves to someone else.
+        if step.metadata_defaults.get(&field.name).is_some() {
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
+                step: step.title.clone(),
+                reason: format!(
+                    "field '{}' declares writer `{writer}` and the step's metadata_defaults \
+                     project a value into it: only `{writer}` may write that key, and a default \
+                     is the protocol writing it at admission",
+                    field.name
+                ),
+            });
+        }
         if resolvable.contains(&writer) {
             continue;
         }
@@ -1806,6 +1824,21 @@ mod tests {
         let mut plain = spec_with("runner:ops");
         plain.steps[1].fields[0].writer = None;
         assert!(validate_workflow(&plain, &reg).is_empty());
+
+        // THE PROTOCOL IS NOT THE DECLARED WRITER (backlog 6c9183de,
+        // review S1): a default projected into a reserved key is the row
+        // writing it — at admission, and into a step a re-pin inserts —
+        // so a resolvable writer whose key the step also defaults is
+        // refused, naming the key.
+        let mut defaulted = spec_with("runner:ops");
+        defaulted.steps[1].metadata_defaults = serde_json::json!({ "plan": "PLAN wipe" });
+        let mut errs = Vec::new();
+        check_writers_are_resolvable(&defaulted, &defaulted.steps[1], &["runner:ops"], &mut errs);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].reason.contains("'plan'") && errs[0].reason.contains("metadata_defaults"),
+            "{errs:?}"
+        );
     }
 
     /// `covers` must relate two array fields on the same step; each way

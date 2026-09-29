@@ -19,12 +19,13 @@
 # the converge packet through it; a child process cannot.
 #
 #   . "$REPO/infra/estate/install-cluster-operator.sh"
-#   has_role cluster-operator && install_cluster_operator
+#   has_role cluster-operator && install_cluster_operator "$NODE_ID"
 #
-# CREDENTIALS ARE CHECKED, NEVER WRITTEN. /etc/boss-ops/talosconfig and
-# /etc/boss-ops/kubeconfig are placed once by David — token admin is his
-# — and must be root:root 0600. Anything else is reported on the
-# converge packet as absent-or-wrong until fixed. The estate's own
+# CREDENTIALS ARE CHECKED, NEVER WRITTEN. The node's declared set under
+# /etc/boss-ops (estate.toml [ops_credentials.<node-id>]) must be
+# root:root 0600: root material there is placed by David, a scoped
+# credential is delivered by the broker. Anything else is reported on
+# the converge packet as absent-or-wrong until fixed. The estate's own
 # converge never writes a credential, on any host.
 
 # The Talos client is the ONLY interface to the nodes (no ssh) and must
@@ -38,9 +39,9 @@ BOSS_TALOSCTL_SHA256="406b56f9e4ff03b1557cc941b1f163aec8a6ebb36e28f0bbbe6d083589
 # or writes /etc.
 BOSS_OPS_DIR="${BOSS_OPS_DIR:-/etc/boss-ops}"
 
-install_cluster_operator() {
+install_cluster_operator() { # <node-id>
     _co_talosctl
-    _co_credentials
+    _co_credentials "${1:-}"
 }
 
 # talosctl, pinned by sha. Absent-or-wrong is reported and does not
@@ -65,17 +66,21 @@ _co_talosctl() {
 # The check itself is infra/estate/ops-credentials.sh, which the host
 # observer reads too, so the estate compare can raise the absence this
 # field only records (backlog 714bc71f). Not-ready is recorded and never
-# fails the converge: only David can place root material.
+# fails the converge: no converge can place a credential. WHICH ones the
+# node is checked for is its [ops_credentials.<node-id>] table in the
+# estate.toml beside this file (backlog f371c749) — boss-gcp's is the
+# scoped kubeconfig alone, which the broker delivers, not a person.
 # shellcheck source=infra/estate/ops-credentials.sh
 . "$(dirname "${BASH_SOURCE[0]}")/ops-credentials.sh"
+BOSS_ESTATE_SOURCE="${BOSS_ESTATE_SOURCE:-$(dirname "${BASH_SOURCE[0]}")/estate.toml}"
 
-_co_credentials() {
+_co_credentials() { # <node-id>
     local state
-    state="$(ops_credentials_state)"
+    state="$(ops_credentials_state "$1")"
     if [ "$state" = "present" ]; then
         echo "install-cluster-operator: credentials present (root:root 600)"
     else
-        echo "install-cluster-operator: credentials ${state} (want root:root 600 under $BOSS_OPS_DIR; placed by hand, never by this script)"
+        echo "install-cluster-operator: credentials ${state} (want root:root 600 under $BOSS_OPS_DIR; never written by this script)"
     fi
     if declare -F run_summary_field >/dev/null; then run_summary_field ops_credentials "$state"; fi
 }

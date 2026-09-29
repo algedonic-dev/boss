@@ -11,6 +11,7 @@
 
 import type { WorkflowSpec, StepSpec } from './workflowTypes';
 import type { Job, Step } from '../jobs/types';
+import { putStep, saveStep } from '../steps/stepWrite';
 
 export const DESIGN_KIND = 'workflow-design';
 export const PUBLISH_STEP_KIND = 'workflow-publish';
@@ -138,10 +139,12 @@ export async function startDesignJob(
   return jobId;
 }
 
-/// Persist the working spec onto the publish step's metadata. The step
-/// PATCH replaces the `metadata` field wholesale, so we send the COMPLETE
-/// object — preserving any existing keys and (optionally) stamping
-/// `previous_kind_version` for a new version of an existing kind.
+/// Persist the working spec onto the publish step's metadata, through
+/// the step merge door (backlog e39a9d2a, Stage 2): only `workflow_spec`
+/// and, for a new version of an existing kind, `previous_kind_version`.
+/// It used to PUT a spread of the step's metadata as the page last read
+/// it, so a key written since — a claim, a concurrent autosave's — went
+/// back as it was, and under the omission rule a new one was refused.
 export async function persistSpec(
   jobId: string,
   publishStep: Step,
@@ -149,35 +152,16 @@ export async function persistSpec(
   previousVersion?: number,
 ): Promise<void> {
   const metadata: Record<string, unknown> = {
-    ...publishStep.metadata,
     workflow_spec: spec,
+    ...(previousVersion != null ? { previous_kind_version: previousVersion } : {}),
   };
-  if (previousVersion != null) metadata['previous_kind_version'] = previousVersion;
-  const r = await fetch(
-    `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(publishStep.id)}`,
-    {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ metadata }),
-    },
-  );
-  if (!r.ok) {
-    throw new Error(`persist spec: HTTP ${r.status}: ${await r.text()}`);
-  }
+  const r = await saveStep(jobId, publishStep.id, { metadata });
+  if (r.kind === 'failed') throw new Error(`persist spec: ${r.error}`);
 }
 
 export async function completeStep(jobId: string, stepId: string): Promise<void> {
-  const r = await fetch(
-    `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(stepId)}`,
-    {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ status: 'completed' }),
-    },
-  );
-  if (!r.ok) {
-    throw new Error(`complete step: HTTP ${r.status}: ${await r.text()}`);
-  }
+  const r = await putStep(jobId, stepId, { status: 'completed' });
+  if (r.kind === 'failed') throw new Error(`complete step: ${r.error}`);
 }
 
 /// Stamp a required sign-off role on a sign-off step. Must precede

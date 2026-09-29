@@ -33,6 +33,7 @@
   import { currentStep, groupByPosition, positionOf } from './position';
   import type { Job } from './types';
   import { fetchEvery, wholeOrThrow } from '../data/paginated';
+  import { saveStep } from '../steps/stepWrite';
 
   type Props = Readonly<{
     kind: string;
@@ -168,18 +169,15 @@
     busy = true;
     error = null;
     try {
-      // PUT overlays top-level fields and replaces metadata wholesale
-      // — merge with the existing keys (authority_role lives there;
-      // see TriageBoard's patchStep for the incident this prevents).
-      const r = await fetch(`/api/jobs/${j.id}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          status: 'completed',
-          metadata: { ...(step.metadata ?? {}), [edge.condition.field]: edge.condition.value },
-        }),
+      // The routed field through the step merge door, then the status
+      // alone (backlog e39a9d2a, Stage 2). The door leaves every other
+      // key as it stands — authority_role lives there; see TriageBoard's
+      // patchStep for the incident a replaced metadata caused.
+      const r = await saveStep(j.id, step.id, {
+        status: 'completed',
+        metadata: { [edge.condition.field]: edge.condition.value },
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      if (r.kind === 'failed') throw new Error(r.error);
       selectedJobId = null;
       await load();
     } catch (e) {

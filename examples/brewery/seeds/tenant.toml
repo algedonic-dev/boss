@@ -206,11 +206,16 @@ support     = false  # Field-service ticketing — device-shop
                      # separate field-service queue.
 marketing-assets = true  # Marketing-asset library seeded under
                      # examples/brewery/data/marketing-assets.json —
-                     # 44 assets covering brand foundation, per-beer
-                     # label artwork (12oz cans + 1/2-BBL + sixtel
-                     # keg stickers across 5 SKUs), tap handles,
-                     # wholesale sales sheets, social-post templates,
-                     # distributor pricing, seasonal release artwork.
+                     # brand foundation, per-beer label artwork (12oz
+                     # cans + 1/2-BBL + sixtel keg stickers across 5
+                     # SKUs), tap handles, wholesale sales sheets,
+                     # social-post templates, distributor pricing,
+                     # seasonal release artwork. The file holds the
+                     # count (this comment said 44 of 43, d9bce191).
+                     # No asset is seeded brand-reviewed: a review is
+                     # a step's output, not a seed's (d9bce191). The
+                     # kinds they wear are declared in
+                     # seeds/classes.json (9b28f849).
                      # Image files are placeholder URLs — wire a real
                      # image-gen pipeline post-launch.
 sim         = true   # Simulator surface (admin-gated)

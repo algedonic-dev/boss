@@ -9,8 +9,18 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { formatRelative } from '@boss/web-kit/ui/date';
   import {
+    alarmCoverText,
+    alarmsOn,
+    CLUSTER_SCOPE,
     comparisonVerdict,
     DEV_DOOR_HOST,
+    HOST_SCOPE,
+    MACHINE_FIELDS,
+    machineDrift,
+    machineSight,
+    machineValue,
+    seenCell,
+    UNITS_SCOPE,
     devDoorSteps,
     fetchEstate,
     freshnessText,
@@ -21,6 +31,7 @@
     loopAge,
     loopHost,
     missingHostText,
+    registryFailure,
     seriesAbsentText,
     seriesFreshness,
     unitsVerdict,
@@ -63,6 +74,14 @@
   const doorSteps = devDoorSteps();
 </script>
 
+<!-- The open alarms on one verdict line's series (48ef9961), each a link
+     to its packet, its title as the tooltip. -->
+{#snippet alarmLinks(scope: string, host: string | null)}
+  {#each estate ? alarmsOn(estate.alarms, scope, host) : [] as a (a.id)}
+    <a class="estate-alarm-link" href={`/ux/jobs/${a.id}`} title={a.title}>alarm</a>
+  {/each}
+{/snippet}
+
 <div class="estate-root">
   <PageHeader
     eyebrow="IT · Hardware"
@@ -75,23 +94,39 @@
   {:else}
     <div class="estate-section">00 — THE MACHINES</div>
     {#if estate.nodes.kind === 'failed'}
-      <p class="estate-fail load-failed">The registry did not answer: {estate.nodes.error}. This page refuses to guess — an unreachable registry is not an empty estate.</p>
+      <p class="estate-fail load-failed">{registryFailure(estate.nodes.error)}</p>
     {:else if estate.nodes.kind === 'ready'}
+      <!-- DECLARED BESIDE OBSERVED (ab3c54d7): each value cell is the
+           declared value, then what the newest reading of the machine's
+           own series saw; a field the newest comparison names as drift
+           reads amber, with both sides in its tooltip. -->
+      <p class="estate-legend">
+        Each value is what the registry declares, then what the newest observation saw. A field a
+        comparison names as drift reads amber.
+      </p>
       <table class="estate-table">
         <thead>
           <tr><th>machine</th><th>role</th><th>address</th><th>cpu</th><th>mem</th><th>disk</th></tr>
         </thead>
         <tbody>
           {#each estate.nodes.data.filter((n) => !n.retired) as n (n.id)}
+            {@const sight = machineSight(estate, n)}
+            {@const drift = machineDrift(estate, n.id)}
             <tr title={n.notes ?? ''}>
               <td class="estate-id">{n.id}</td>
               <td>
                 {n.role}{#if n.roles.length > 0}<span class="estate-roles"> · {n.roles.join(' · ')}</span>{/if}
               </td>
-              <td class="estate-addr">{n.address ?? '—'}</td>
-              <td class="estate-num">{n.cpu ?? '—'}</td>
-              <td class="estate-num">{n.memory_gb != null ? `${n.memory_gb}G` : '—'}</td>
-              <td class="estate-num">{n.disk_gb != null ? `${n.disk_gb}G` : '—'}</td>
+              {#each MACHINE_FIELDS as f (f)}
+                {@const seen = seenCell(sight, drift, f)}
+                <td
+                  class={f === 'address' ? 'estate-addr' : 'estate-num'}
+                  data-drift={seen.drift ? f : undefined}
+                  title={seen.drift ? `drift: declared ${machineValue(f, seen.drift.declared)}, observed ${machineValue(f, seen.drift.observed)}` : undefined}
+                >
+                  {machineValue(f, n[f])} <span class={seen.drift ? 'estate-seen estate-drift' : 'estate-seen'}>{seen.text}</span>
+                </td>
+              {/each}
             </tr>
           {/each}
         </tbody>
@@ -99,6 +134,30 @@
     {/if}
 
     <div class="estate-section">01 — OBSERVED vs DECLARED</div>
+    <!-- THE OPEN ALARMS (48ef9961): every open packet estate.alarm filed,
+         linked, above the lines they explain — and each also beside the
+         verdict of its own series below. The page had no link to one. -->
+    <div class="estate-alarms">
+      {#if estate.alarms.kind === 'failed'}
+        <p class="estate-fail load-failed">Estate alarms unavailable: {estate.alarms.error}</p>
+      {:else if estate.alarms.kind === 'ready'}
+        {#each estate.alarms.data.rows as a (a.id)}
+          <div class="estate-alarm-row">
+            <span class="estate-scope">open alarm</span>
+            <a class="estate-drift" href={`/ux/jobs/${a.id}`}>{a.title}</a>
+            <span class="estate-when">{loopAge(a.at, loadedAt)}</span>
+          </div>
+        {:else}
+          {#if !estate.alarms.data.total}
+            <p class="estate-alarm-none">No estate alarm is open.</p>
+          {/if}
+        {/each}
+        {@const alarmCover = alarmCoverText(estate.alarms.data)}
+        {#if alarmCover}
+          <p class="estate-alarm-cover">{alarmCover}</p>
+        {/if}
+      {/if}
+    </div>
     <!-- ONE READ PER SERIES (75027a93): the cluster's, and per host its
          `host` and `host-units` series. Each series fails, or says it
          was never recorded, on its own line — and "never recorded" only
@@ -174,6 +233,7 @@
             <div class="estate-obs-row">
               <span class="estate-scope">host units</span>
               <span class={v.ok ? 'estate-ok' : 'estate-drift'}>{hs.host}: {v.text}</span>
+              {@render alarmLinks(UNITS_SCOPE, hs.host)}
               <span class={w.stale ? 'estate-when estate-drift' : 'estate-when'}>{w.text}</span>
             </div>
           {:else}
@@ -188,6 +248,7 @@
         <div class="estate-obs-row">
           <span class="estate-scope">comparison</span>
           <span class={v.ok ? 'estate-ok' : 'estate-drift'}>{v.text}</span>
+          {@render alarmLinks(CLUSTER_SCOPE, null)}
           <span class="estate-when">{formatRelative(clusterCmp.observed_at, loadedAt)}</span>
         </div>
       {/if}
@@ -209,12 +270,14 @@
             <div class="estate-obs-row">
               <span class="estate-scope">host comparison</span>
               <span class={v.ok ? 'estate-ok' : 'estate-drift'}>{l.host ?? 'host not named on the row'}: {v.text}</span>
+              {@render alarmLinks(HOST_SCOPE, l.host)}
               <span class="estate-when">{formatRelative(l.cmp.observed_at, loadedAt)}</span>
             </div>
           {:else}
             <div class="estate-obs-row">
               <span class="estate-scope">host comparison</span>
               <span class="estate-drift">{l.host}: {missingHostText(hc)}</span>
+              {@render alarmLinks(HOST_SCOPE, l.host)}
             </div>
           {/if}
         {:else}
@@ -336,6 +399,14 @@
   .estate-age { color: var(--static); font-size: 12px; margin-left: 8px; }
   .estate-ok { color: var(--signal); }
   .estate-drift { color: var(--warn); }
+  /* The observed half of a machine cell sits under the declared one. */
+  .estate-seen { display: block; font-size: 11px; color: var(--static); }
+  .estate-seen.estate-drift { color: var(--warn); }
+  .estate-legend { color: var(--static); font-size: 12px; max-width: 60ch; margin: 0 0 6px; }
+  .estate-alarms { display: flex; flex-direction: column; gap: 6px; font-size: 13px; margin-bottom: 10px; }
+  .estate-alarm-row { display: flex; gap: 16px; align-items: baseline; }
+  .estate-alarm-none, .estate-alarm-cover { color: var(--static); font-size: 12px; margin: 0; }
+  .estate-alarm-link { color: var(--warn); font-size: 12px; }
   .estate-door { display: flex; flex-direction: column; gap: 8px; }
   .estate-hint, .estate-cover { color: var(--static); font-size: 12px; max-width: 60ch; }
   .estate-cover { margin: 0; }

@@ -365,7 +365,7 @@ async fn run_server<R: JobsRepository + 'static>(
     // 85e7f10f — the header alone used to pass every check).
     let policy: Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(policy_url),
+            boss_policy_client::ReqwestPolicyClient::new("jobs", policy_url),
         ));
     // The cadence door's publish / retire ask the same client the
     // workflow routes do; clone before the state takes it.
@@ -531,6 +531,10 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::agents::http::AgentsApiState {
             registry: agents.clone(),
             classes: agent_classes,
+            // An agent's department is a row of the departments
+            // registry this service serves — the list an employee's is
+            // validated against too (backlog c87e3d6d).
+            departments: departments.clone(),
         },
     ));
     // The departments the departments registry holds (the table, not
@@ -581,6 +585,20 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::agents::resolve_login,
     ));
     info!("login door mounted: agent logins resolve through actor_aliases (window open)");
+    // The credential door (design f623e425 Q1, option A; backlog
+    // 6c9183de): a runner that PRESENTS its host's credential is known to
+    // the declared-writer check as that runner, whatever `x-boss-user`
+    // says. It refuses nothing; with no slot directory mounted — until
+    // the broker's Secret is — every request passes uncredentialed, as
+    // every request did before it.
+    let runner_slots = boss_jobs::runner_credential::dir();
+    info!(
+        dir = %runner_slots.display(),
+        "credential door mounted: {} resolves to runner:ops for its host (+ GET {})",
+        boss_jobs::runner_credential::HEADER,
+        boss_jobs::runner_credential::WHOAMI_PATH,
+    );
+    let app = boss_jobs::runner_credential::mount(app, runner_slots);
     // The machine gate (design 6805c764; it was 7fcd78fa phase 1 here
     // alone): the shared boss-core middleware every service port
     // mounts, reading its mode and token slots from mounted files —
